@@ -95,8 +95,18 @@ void pulsar_tokens_free(pulsar_tokens *tv) {
 
 
 void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
+    /* Reserve once and memcpy: the push loop this replaced called xrealloc O(n)
+     * times on the first copy into an empty vector, and the spec bank carry
+     * copies a whole 100k-token history several times per round (L219).  The
+     * growth policy is unchanged so allocation behavior does not shift. */
     dst->len = 0;
-    for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
+    if (src->len <= 0) return;
+    if (dst->cap < src->len) {
+        while (dst->cap < src->len) dst->cap = dst->cap ? dst->cap * 2 : 16;
+        dst->v = (int *)xrealloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
+    }
+    memcpy(dst->v, src->v, (size_t)src->len * sizeof(dst->v[0]));
+    dst->len = src->len;
 }
 
 
