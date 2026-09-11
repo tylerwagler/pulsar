@@ -24,9 +24,14 @@ review box). Every item below still owes its A/B or byte-baseline re-anchor on
 the GB10 before it can merge.
 
 Host-only verification actually run on the branch (in addition to the full
-build of all five binaries, clean): `./pulsar-eval --self-test-extractors`
-PASS, `./pulsar_agent_test` PASS, `make seam-check` PASS (83 host files
-CUDA-API clean). No GPU-backed gate has run.
+build of all five binaries, clean):
+`./pulsar_test --server` PASS (its min_p out-of-range case exercises A3's new
+clamp warning), `./pulsar_test --sampler` PASS (169 shape x config combos,
+2496 fixed-seed trials), `./pulsar_test --sampler-prefilter` PASS,
+`./pulsar_test --spec-math --lib-utf8 --lib-think --ctxmem` PASS,
+`./pulsar-eval --self-test-extractors` PASS, `./pulsar_agent_test` PASS,
+`make seam-check` PASS (83 host files CUDA-API clean). No GPU-backed gate has
+run.
 
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
 - A2 payload digest, format v10 (`117541f7`)
