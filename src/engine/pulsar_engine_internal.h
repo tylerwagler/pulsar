@@ -327,6 +327,70 @@ typedef struct {
     uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
+/** ---- Engram n-gram hashing (L218 phase 0c / V4.1 phase 4) ------------------
+ *
+ * Engram is NEW IN V4.1 -- 0731 has no such layers (PLAN 95's delta table lists
+ * it as "none" for 0731).  V4.1 adds it at layers 1 and 14 as ~203 GB (189 GiB)
+ * of FP8 tables that are DISK-RESIDENT BY DESIGN: per layer an `embed`
+ * [384M, 256] fp8 with a [384M, 8] scale plane, a `wkv` [25600, 6144] fp8 and
+ * `q_weight`/`k_weight` [4, 5120] bf16.  That is far too large to bind into the
+ * 121 GiB the box has, so those tables are NOT in the GGUF artifact today (the
+ * V4.1 build skipped them) and a V4.1 forward currently runs WITHOUT Engram.
+ *
+ * What makes a table this size viable at all is that its ADDRESSES ARE KNOWN
+ * BEFORE THE FORWARD: the hash below depends only on token ids, so the rows a
+ * token will need can be prefetched from NVMe while earlier layers compute.  The
+ * hash runs on the HOST for exactly that reason.  (A drafter's ids are known one
+ * step early too, which is where verify-time prefetch would come from.)
+ *
+ * The tables are addressed by an n-gram hash of the COMPRESSED token ids:
+ * (max_ngram-1) x n_heads = 24 bucket rows per token per layer, one column per
+ * (n-gram order, hash head).
+ *
+ * The layout (compressed token map, the per-layer primes, the bucket offsets and
+ * the hash multipliers) is emitted by the artifact tooling and carried in the
+ * manifest; gate-baseline/l218-v41/engram_hash.py is the reference that produced
+ * it and gate-baseline/l218-v41/engram-layout-v41.json is its output.  The
+ * compressed vocab is 99,092 and the bucket layout reproduces both table sizes
+ * to the row (384,006,168 / 384,016,682).
+ *
+ * The hash is INTEGER arithmetic on non-negative values, and the bit patterns
+ * are the point: `rolling` is an XOR, not a sum.  What makes the arithmetic
+ * safe is that every multiplier is strictly positive and every compressed id is
+ * in [0, compressed_vocab), so no product has its sign bit set and an XOR of
+ * non-negative int64 is itself non-negative.  The layout guarantees the size
+ * half of that (`mult = 2v+1` with `v < (INT64_MAX / compressed_vocab) / 2`, so
+ * `tok * mult < INT64_MAX`); pulsar_engram_hash_pos enforces the range half.  A
+ * plain `%` is therefore exact -- there is no floor-versus-truncate divergence
+ * to defend against, and a `rolling` that came out negative would mean the
+ * layout is corrupt, which is a refusal, not a different modulo. */
+#define PULSAR_ENGRAM_MAX_NGRAM  4u
+#define PULSAR_ENGRAM_N_HEADS    8u
+/** (n-gram orders 2..max) x heads: the columns one token contributes. */
+#define PULSAR_ENGRAM_N_COLS     ((PULSAR_ENGRAM_MAX_NGRAM - 1u) * PULSAR_ENGRAM_N_HEADS)
+#define PULSAR_ENGRAM_MAX_LAYERS 2u
+
+/** Everything the hash needs, as the artifact carries it.  All pointers are
+ * length-indexed as marked; none are owned here. */
+typedef struct {
+    uint32_t n_vocab;            ///< length of token_map (the model's token ids)
+    uint32_t compressed_vocab;   ///< every token_map value is in [0, compressed_vocab)
+    uint32_t pad_compressed_id;  ///< the id used for positions before the sequence starts
+    uint32_t n_layers;           ///< engram layers (2)
+    const int32_t  *token_map;      ///< [n_vocab] token id -> compressed id
+    const int64_t  *multipliers;    ///< [n_layers][max_ngram] odd hash multipliers
+    const uint32_t *primes;         ///< [n_layers][max_ngram-1][n_heads] bucket moduli
+    const uint64_t *offsets;        ///< [n_layers][n_cols] bucket base per column
+    const uint64_t *num_embeddings; ///< [n_layers] rows in each layer's table
+} pulsar_engram_layout;
+
+/** Write layer `layer`'s PULSAR_ENGRAM_N_COLS bucket rows for the token at
+ * `pos` into `cols`, all in [0, num_embeddings[layer]).  Mirrors engram.py's
+ * `NgramHashState.forward`. */
+void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
+                            const int32_t *ids, uint32_t n_ids, uint32_t pos,
+                            uint32_t *cols);
+
 /** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
  *
  * `qs` is not raw quants -- it packs indices INTO a fixed grid of 8-value

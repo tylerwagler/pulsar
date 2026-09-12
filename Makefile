@@ -416,6 +416,23 @@ cuda-attn-pack-gate: tests/attn_pack_gate
 attn-pack-fixture-check: tests/attn_pack_fixture_test
 	./tests/attn_pack_fixture_test
 
+# The Engram n-gram hash gate (L218 phase 0c) -- HOST ONLY, no device and no
+# model, so it runs anywhere the tree builds.  The hash is integer arithmetic
+# over a fixed layout, which makes it one of the few pieces of the V4.1 work
+# that can be proven correct before a GPU exists.  tests/engram_hash_fixture.h
+# is GENERATED from the real layout (see gen_engram_fixture.py); engram.cpp is
+# compiled beside log.cpp because pulsar_die() lives there and the gate checks
+# the refusals, not just the arithmetic.
+tests/engram_hash_test: tests/engram_hash_test.cpp tests/engram_hash_fixture.h \
+                        src/engine/engram.cpp src/engine/log.cpp Makefile \
+                        src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/engram_hash_test.cpp \
+	    src/engine/engram.cpp src/engine/log.cpp
+
+.PHONY: engram-hash-check
+engram-hash-check: tests/engram_hash_test
+	./tests/engram_hash_test
+
 # Single-pass mHC hand-over (L218): the fused split collapses with the pre it
 # was handed and leaves its own behind; two chained calls vs a host oracle.
 # Built the way the engine builds the TU (--use_fast_math).

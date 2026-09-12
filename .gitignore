@@ -102,3 +102,4 @@ docs/api/
 tests/gates_runner
 tests/runner/
 tests/dspark_batch_gate
+/tests/engram_hash_test
