@@ -121,7 +121,13 @@ def build_layer(layer_id: int, vl: bool, seed: int):
         g.weight.zero_()
         row_perm = np.empty(N_EXPERT, dtype=np.int64)
         row_perm[order] = np.arange(N_EXPERT)
-        g.weight[:, :N_EXPERT] = torch.from_numpy(logits[row_perm].astype(np.float32))
+        # weight[:, r] is what x's r-th one-hot row reads, so every column must
+        # hold the per-EXPERT vector.  A bare (N_EXPERT,) assignment broadcasts
+        # along the LAST axis instead, giving every expert the same logit -- the
+        # top-6 then become exact ties that torch and the kernel order
+        # differently.  Say the axis out loud.
+        per_expert = torch.from_numpy(logits[row_perm].astype(np.float32))
+        g.weight[:, :N_EXPERT] = per_expert.reshape(N_EXPERT, 1).expand(N_EXPERT, N_EXPERT)
         if g.bias is not None:
             g.bias.copy_(torch.from_numpy(bias))
         if g.bias_vl is not None:
@@ -209,11 +215,13 @@ def main():
         ids = torch.tensor(tokens, dtype=torch.long)
         with torch.no_grad():
             w, idx = g(x, ids)
+            # Dump the logits the reference ACTUALLY saw, not the ones we meant
+            # to give it: the engine is fed these, so any difference between the
+            # construction and the reference's arithmetic would grade the engine
+            # against a batch the reference never ran.
+            logits = torch.nn.functional.linear(x.float(), g.weight.float()).numpy().astype(np.float32)
         w = w.numpy().astype(np.float32)
         idx = idx.numpy().astype(np.int32)
-        # every row of a case sees the SAME logits: the rows differ only in
-        # their token, which is what isolates the bias choice
-        logits = np.stack([logits_all] * n_rows).astype(np.float32)
         margin = margin_of(g, logits, np.asarray(tokens, dtype=np.int64))
 
         has_text_bias = not g.hash
