@@ -350,6 +350,26 @@ dropped with the reason.
   <0.5% of decode (L219 census), so the end-to-end prize is ~1-2%, and the
   change alters top-k selection.  Selection is now graded (D2 below), so the
   selection oracle is the gate to build it against.
+  **Recon (2026-09-12): a real kernel rewrite, and its instruments do not exist
+  yet.**  `idx_mma_m16n8k32` (`indexer_mxfp4.cu:104`) ALREADY takes e2m1xe2m1
+  through `mxf8f6f4` with a nibble SPREAD (`idx_spread4`, `:147`) because the
+  measured contract puts the e2m1 nibble at bits [5:2].  The C6 form is
+  `kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64` (timed and correct in
+  `tests/idx_mma_issue_bench.cu`: 251 vs 125 TMAC/s), which means packed nibbles
+  verbatim, a 2X scale-factor lane layout, and k64 blocking -- the Q pre-stage
+  (`idx_expand_q_kernel`) and the K staging move with it.  The operands stay
+  VALUE-identical (same e2m1 codes and scales), but the K-blocking changes the
+  f32 accumulation order, so scores move at the ulp level and the top-512
+  selection can shift at boundaries -- exactly why the review demands the ramp
+  overlap harness BEFORE the kernel.  Neither required instrument exists: the
+  top-k overlap harness, and the calibrated speed bench whose pattern is
+  `tests/attn_indexed_bench.cu` (deleted in `a71e346`; it `#include`s the
+  shipped `.cu` so the file-static kernel under test is the real one, with a
+  gate that brackets the engine's own per-launch cost).  Prize: the whole
+  indexer complex is ~1.5% of a 4000-ctx prefill on the fresh census, so the
+  end-to-end win is ~1%.  Plan: (1) ramp overlap harness, (2) speed bench with
+  the calibration gate, (3) the kernel swap, (4) the four gates + a GB10
+  measurement.
 - **D2 (indexer selection fidelity) -- CLOSED, measured: no drift.**  Ran the
   owed reference grade at `867e06f` with the blobs staged from
   `pulsar-notes/reference-capture/` (`cuda-reference-gate`,
