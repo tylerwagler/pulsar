@@ -1301,6 +1301,12 @@ struct server {
      * eval pins behavior WITHOUT changing production defaults. */
     uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
     uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
+    /** Context-scaled KV one bank holds at the configured context — the
+     *  compressed rows plus their index. Demand-paged under overcommit, so it is
+     *  reserved as VA and resident only on touch; published because dividing the
+     *  budget by it is the only way to answer "how many tokens of KV does this
+     *  box actually hold", which the configured slot count does not answer. */
+    uint64_t     kv_bank_bytes;
     uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir

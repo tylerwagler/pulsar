@@ -950,6 +950,9 @@ int main(int argc, char **argv) {
      * like every other bank. */
     s.slots[0].ctx_size = cfg.ctx_size;
     s.pool_ctx_size = cfg.ctx_size;
+    /* Unconditional: the context-scaled KV one bank holds is a property of the
+     * shape and the ctx, not of how admission happens to be gated. */
+    s.kv_bank_bytes = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
     if (s.pool_banks == 0) {
         s.slots[0].provisioned = true;
         s.slots[0].state = SLOT_IDLE;

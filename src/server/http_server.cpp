@@ -626,6 +626,9 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_ledger_committed_bytes Session cost committed by the admission ledger.\n");
     buf_puts(&b, "# TYPE pulsar:kv_ledger_committed_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_committed_bytes %llu\n", ledger_committed);
+    buf_puts(&b, "# HELP pulsar:kv_bank_bytes KV bytes one bank holds at the configured context, compressed rows plus index. Demand-paged under overcommit: reserved as VA, resident on touch.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_bank_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_bank_bytes %llu\n", (unsigned long long)s->kv_bank_bytes);
     buf_puts(&b, "# HELP pulsar:kv_ledger_budget_bytes Admission ceiling computed at startup.\n");
     buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
