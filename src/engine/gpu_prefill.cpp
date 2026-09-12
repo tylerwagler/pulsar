@@ -218,6 +218,50 @@ bool gpu_graph_upload_prompt_embeddings_hc(
 
 
 
+/* Scatter a MERGED image span into the HC carrier.
+ *
+ * vision_merge_span() produces one bf16 embedding per span position on the HOST
+ * (the sentinel's learned vector, or an aligner row for an IMAGE slot).  The
+ * reference writes that block into h BEFORE expanding to hc_mult copies --
+ * `merge_image_embeddings` runs, then `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`
+ * -- so every HC stream carries the SAME merged row.  That is what this
+ * replicates: n_hc copies of one n_embd row, not a broadcast the downstream
+ * kernels would have to know about.
+ *
+ * The rows are raw bf16 bits (pulsar_hc_t is __nv_bfloat16, 2 bytes), so the
+ * copies are memcpys and no numerics live here.  The carrier layout is
+ * [token][hc][embd], contiguous per token, so one tensor_write covers the span.
+ *
+ * Returns false, without writing, if the span does not fit the carrier. */
+bool gpu_graph_write_vision_span(
+        pulsar_gpu_tensor *out_hc,
+        const uint16_t    *rows,      /* n_rows * PULSAR_N_EMBD bf16 bits */
+        uint32_t           n_rows,
+        uint32_t           row0,      /* the span's first row within the chunk */
+        uint32_t           n_tokens) {
+    if (!out_hc || !rows || n_rows == 0) return false;
+    if (row0 > n_tokens || n_rows > n_tokens - row0) return false;
+    const uint64_t row_elt = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+    const size_t per_row = (size_t)row_elt * PULSAR_HC_ELT_SIZE;
+    if (pulsar_gpu_tensor_bytes(out_hc) < (uint64_t)n_tokens * per_row) return false;
+
+    uint16_t *stage = (uint16_t *)malloc((size_t)n_rows * per_row);
+    if (!stage) return false;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const uint16_t *src = rows + (size_t)r * PULSAR_N_EMBD;
+        uint16_t *dst = (uint16_t *)(void *)((char *)stage + (size_t)r * per_row);
+        for (uint32_t h = 0; h < PULSAR_N_HC; h++)
+            memcpy(dst + (size_t)h * PULSAR_N_EMBD, src,
+                   (size_t)PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE);
+    }
+    const bool ok = pulsar_gpu_tensor_write(out_hc, (uint64_t)row0 * per_row, stage,
+                                            (uint64_t)n_rows * per_row) != 0;
+    free(stage);
+    return ok;
+}
+
+
+
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,

@@ -2834,6 +2834,13 @@ bool gpu_graph_upload_prompt_embeddings_hc(
         const token_vec    *prompt,
         uint32_t            pos0,
         uint32_t            n_tokens);
+/** Scatter a merged image span (vision_merge_span's n_rows * PULSAR_N_EMBD bf16
+ * rows) into the HC carrier at `row0`, replicating each row across all
+ * PULSAR_N_HC streams the way the reference's post-merge HC expansion does.
+ * Returns false, without writing, if the span does not fit the carrier. */
+bool gpu_graph_write_vision_span(pulsar_gpu_tensor *out_hc, const uint16_t *rows,
+                                 uint32_t n_rows, uint32_t row0, uint32_t n_tokens);
+
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,
