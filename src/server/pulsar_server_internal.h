@@ -993,14 +993,21 @@ typedef struct {
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
 #define PULSAR_SESSION_POOL_CAP 16
-/* Auto-sizing cap: measured 2026-08-10, when the dense-step lanes capped
- * their fast paths at 8 rows -- N=12 aggregate decode held 29.2 tok/s at 8
- * banks vs 21.9 at 12 -- so the DEFAULT config never auto-sizes past 8 (the
- * lanes are 16-row neutral now; the cap awaits a re-measure).  POOL_CAP above is the hard
- * array bound = PULSAR_MSEQ_MAX, so an operator PULSAR_MSEQ_BANKS pin up to
- * 16 is safe (it was an out-of-bounds walk when the pin exceeded the array,
- * a latent bug up to and including the 5-slot era). */
-#define PULSAR_SESSION_POOL_AUTO_MAX 8
+/* Auto-sizing cap: raised 8 -> 16 on 2026-09-11 after the re-measure the old
+ * comment asked for (L219).  The 2026-08-10 measurement (N=12 aggregate held
+ * 29.2 tok/s at 8 banks vs 21.9 at 12) predated the row-neutral lanes; the
+ * dense, spec and attention lanes are 16-row neutral now, and the cliff is
+ * gone.  Locked-clock one-shot chat, thinking off, 200 tokens, ctx 8192:
+ *
+ *   banks  N=8          N=12                  N=16
+ *     8    54.2 t/s     50.7 (5x 25-31 s TTFT stalls)   --
+ *    12    53.9         56.2 (no stalls)      54.6 (4x 34-38 s stalls)
+ *    16    --           56.5                   56.5 (no stalls)
+ *
+ * 16 is the row-neutral maximum (PULSAR_MSEQ_MAX), so the cap moves there;
+ * auto-sizing still fits N to the KV budget below the cap (huge ctx yields
+ * fewer banks), and POOL_CAP above remains the hard array bound. */
+#define PULSAR_SESSION_POOL_AUTO_MAX 16
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
