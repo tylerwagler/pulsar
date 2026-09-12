@@ -1023,10 +1023,14 @@ unit-test-gate: pulsar_test seam-check
 # The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
 # tests/gates_runner.cpp) -- one 86 GB model load per engine configuration
 # instead of one per gate.  Their individual targets below remain for
-# iterating on one gate; the battery is the runner.
+# iterating on one gate; the battery is the runner, with one exception:
+# cuda-session-payload-gate is not a runner function yet (it opens its own
+# engine and returns from every failure site), and its v10 digest corruption
+# case must be IN the battery -- a gate nothing runs is the L219 finding this
+# target closed.  Fold it into tests/gates_runner.cpp to drop the extra load.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates \
+	cuda-attn-gates cuda-session-payload-gate \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A

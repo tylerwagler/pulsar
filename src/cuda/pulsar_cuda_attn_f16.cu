@@ -96,7 +96,7 @@ static_assert(AF16_HPB * AF16_ROWS == AF16_THREADS,
 static_assert(AF16_ROWS == 16u,
               "the phase-2 xor tree reduces 16 rows, one aligned half-warp per head");
 static_assert(AF16_HEADS == 16u,
-              "each head's 16 rows must stay inside one aligned half-warp");
+              "the MMA's M tile is 16 heads; every phase indexes sPart by mt = h/16, hh = h%16");
 /* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
 #define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */

@@ -103,11 +103,13 @@ static void peek_all(pulsar_spec_round **r, int n, draft_result *out) {
 
 /* One server-shaped tick up to (and including) the deferred round_end. Returns
  * the number of banks still live, or -1.  audit != 0 also checks the readback
- * invariant the round-end walk stands on: after the step, exactly the arm the
- * step's temperatures armed is live (all-greedy -> argmax rows, no compact
- * rows; any sampled round -> compact rows, no argmax rows).  A mixed step
- * followed by a greedy step used to leave the compact rows live and the greedy
- * walk read the previous step's candidates (review of 4fa5e0b6). */
+ * invariant the round-end walk stands on: after the step, the live rows are
+ * exactly those of the arm the ENGINE armed for it (captured from the graph
+ * before arm_capture retires it) -- argmax rows and no compact rows when it
+ * armed the greedy readback, compact rows and no argmax rows when it armed the
+ * compact one, neither when it armed nothing.  A greedy step that follows an
+ * all-sampled one used to leave the compact rows live and the greedy walk read
+ * the previous step's candidates (review of 4fa5e0b6). */
 static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const float *temps,
                              uint64_t *rngs, int *first_tok, uint32_t *row0, float *logits,
                              int vocab, int audit) {
@@ -130,6 +132,14 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         pulsar_session_bank_state_save(s, (uint32_t)b);
     }
     pulsar_session_spec_arm_capture(s, rows);
+    /* The engine's OWN arm decision for this step, read before arm_capture(0)
+     * retires it.  The audit below checks the counters the round-end walk
+     * consumes against the arm the ENGINE says it armed: re-deriving the arm
+     * from the temperatures would be a second copy of the min-p contract
+     * (top_k/top_p/min_p are part of it, not just temperature) and would go
+     * stale the moment a shape used different knobs. */
+    const bool expect_compact = s->graph.spec_compact_armed;
+    const bool expect_argmax  = s->graph.spec_argmax_armed;
     uint32_t got = 0;
     const int rc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)vocab),
                                                &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
@@ -137,6 +147,26 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
     if (rc != 0 || got != rows) {
         fprintf(stderr, "decode_mixed failed (rc=%d got=%u rows=%u): %s\n", rc, got, rows, err);
         return -1;
+    }
+    if (audit) {
+        pulsar_gpu_graph *g = &s->graph;
+        if (expect_argmax) {
+            CHECK(g->spec_argmax_rows >= rows && g->spec_compact_rows == 0,
+                  "STALE COMPACT ROWS: the engine armed the argmax readback for %u rows, but "
+                  "spec_compact_rows=%u is still live (argmax_rows=%u) -- spec_round_end_block "
+                  "reads the previous step's candidates first", rows, g->spec_compact_rows,
+                  g->spec_argmax_rows);
+        } else if (expect_compact) {
+            CHECK(g->spec_compact_rows >= rows && g->spec_argmax_rows == 0,
+                  "STALE ARGMAX ROWS: the engine armed the compact readback for %u rows, but "
+                  "spec_argmax_rows=%u is still live (compact_rows=%u)", rows,
+                  g->spec_argmax_rows, g->spec_compact_rows);
+        } else {
+            CHECK(g->spec_compact_rows == 0 && g->spec_argmax_rows == 0,
+                  "MIXED STEP TOOK AN ARM: the engine armed neither readback for %u rows, but "
+                  "compact_rows=%u argmax_rows=%u", rows, g->spec_compact_rows,
+                  g->spec_argmax_rows);
+        }
     }
     int live = 0;
     for (int b = 0; b < g_nb; b++) {
@@ -148,32 +178,6 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         if (na < 0) { fprintf(stderr, "round_end bank %d: %s\n", b, err); return -1; }
         live++;
         pulsar_session_bank_state_save(s, (uint32_t)b);
-    }
-    if (audit) {
-        pulsar_gpu_graph *g = &s->graph;
-        /* Faithful to arm_capture: ALL rounds greedy -> argmax; ALL rounds in
-         * the sparse min-p contract -> compact; a mixed step arms neither and
-         * takes the full-read branch. */
-        bool all_greedy = true, all_sampled = true;
-        for (int b = 0; b < g_nb; b++) {
-            if (temps[b] > 0.0f) all_greedy = false;
-            if (temps[b] <= 0.0f) all_sampled = false;
-        }
-        if (all_greedy) {
-            CHECK(g->spec_argmax_rows >= rows && g->spec_compact_rows == 0,
-                  "STALE COMPACT ROWS: an all-greedy step left spec_compact_rows=%u "
-                  "(argmax_rows=%u, rows=%u) -- spec_round_end_block reads the previous "
-                  "step's candidates", g->spec_compact_rows, g->spec_argmax_rows, rows);
-        } else if (all_sampled) {
-            CHECK(g->spec_compact_rows >= rows && g->spec_argmax_rows == 0,
-                  "STALE ARGMAX ROWS: an all-sampled step left spec_argmax_rows=%u "
-                  "(compact_rows=%u, rows=%u)", g->spec_argmax_rows,
-                  g->spec_compact_rows, rows);
-        } else {
-            CHECK(g->spec_compact_rows == 0 && g->spec_argmax_rows == 0,
-                  "MIXED STEP TOOK AN ARM: compact_rows=%u argmax_rows=%u "
-                  "(rows=%u)", g->spec_compact_rows, g->spec_argmax_rows, rows);
-        }
     }
     return live;
 }
@@ -199,8 +203,9 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
     for (int t = 0; t < ticks; t++) {
         int first_tok[NB];
         uint32_t row0[NB];
-        /* temps_alt, when given, is the odd-tick shape: alternating mixed and
-         * greedy ticks is the readback-arm switch the audit exists for. */
+        /* temps_alt, when given, is the odd-tick shape: alternating an
+         * all-sampled tick with an all-greedy one is the readback-arm switch
+         * the audit exists for. */
         const float *tp = (temps_alt && (t & 1)) ? temps_alt : temps;
         if (tick_to_round_end(s, r, tp, rngs, first_tok, row0, logits, vocab, 1) < 0) {
             CHECK(0, "%s: tick %d failed", name, t);

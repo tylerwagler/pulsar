@@ -1217,6 +1217,16 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
+    /* Every knob must be finite.  A NaN fails every comparison-based clamp
+     * below (and the greedy `<= 0` test); +-Inf temperature or top_p produces
+     * a FINITE mass (p = expf((v-max)/+-inf) = 1, sum = n), so neither the
+     * clamps nor the mass guard would catch it -- each would silently become a
+     * uniform or unfiltered draw.  The server parser refuses these at the
+     * surface; this is the engine's own refusal, so the API/CLI path cannot
+     * reach the sampler with one either (review B2).  Fail closed, loudly,
+     * once, for all three. */
+    if (!isfinite(temperature) || !isfinite(top_p) || !isfinite(min_p))
+        return sample_dist_refuse(out, n_vocab, "a sampling knob is not finite");
     if (temperature <= 0.0f) {
         const int best = sample_argmax(logits, n_vocab);
         if (best < 0) return sample_dist_refuse(out, n_vocab, "no finite logit");
@@ -1318,14 +1328,9 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         if (finite > 0) {
             uint64_t *keys = scratch->keys;
             const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
-            /* isfinite(temperature): the fast arm's floor_logit is NaN for a
-             * non-finite temperature and its +inf/inert sum defeats the guard
-             * below, so it would emit NaN probs.  Keep such input on the
-             * general arm, whose sum check refuses it (review B2). */
             const bool full_nucleus = (top_p == 1.0f &&
                                        min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN &&
-                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX &&
-                                       isfinite(temperature));
+                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX);
             const float floor_logit = full_nucleus
                 ? max_logit + temperature * (logf(min_p) - 1e-3f)
                 : -INFINITY;
@@ -1388,10 +1393,12 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     /* prob(0) == expf(0) == 1 exactly, so the mass is >= 1 for any finite
-     * temperature: only a NaN temperature reaches this.  The full-nucleus arm
-     * replaces `sum` with +inf on purpose (see its comment), so the guard
-     * does not apply there: the emitted probs are renormalised by filtered_sum
-     * and every kept prob is a finite positive number. */
+     * temperature and finite knobs: the entry guard above refuses anything
+     * else, so this is now an arithmetic-fault catch, not the NaN-temperature
+     * door it was.  The full-nucleus arm replaces `sum` with +inf on purpose
+     * (see its comment), so the guard does not apply there: the emitted probs
+     * are renormalised by filtered_sum and every kept prob is a finite
+     * positive number. */
     if (!sum_inert && (sum <= 0.0f || !isfinite(sum)))
         return sample_dist_refuse(out, n_vocab, "candidate mass is not a positive finite number");
     sample_nucleus_emit(n, sum, top_p, min_p,
