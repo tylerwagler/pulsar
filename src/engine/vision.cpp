@@ -485,20 +485,34 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
     memset(&image, 0, sizeof image);
     image.version = PNG_IMAGE_VERSION;
     if (!png_image_begin_read_from_memory(&image, bytes, len)) return 0;
-    image.format = PNG_FORMAT_RGB;
+    /* Decode to RGBA and drop the alpha HERE rather than asking libpng for
+     * PNG_FORMAT_RGB: given an alpha source and a background of NULL, libpng
+     * composites (measured: an alpha=200 pixel came back as 69 where the source
+     * was 0), while Pillow's .convert("RGB") discards the alpha outright.  The
+     * gate caught exactly that on an RGBA PNG. */
+    image.format = PNG_FORMAT_RGBA;
     if (image.width == 0 || image.height == 0 ||
         image.width > (png_uint_32)INT32_MAX || image.height > (png_uint_32)INT32_MAX) {
         png_image_free(&image);
         return 0;
     }
     const size_t sz = PNG_IMAGE_SIZE(image);
-    uint8_t *buf = (uint8_t *)malloc(sz);
-    if (!buf) { png_image_free(&image); return 0; }
-    if (!png_image_finish_read(&image, NULL, buf, 0, NULL)) {
-        free(buf);
+    uint8_t *rgba = (uint8_t *)malloc(sz);
+    if (!rgba) { png_image_free(&image); return 0; }
+    if (!png_image_finish_read(&image, NULL, rgba, 0, NULL)) {
+        free(rgba);
         png_image_free(&image);
         return 0;
     }
+    const size_t npix = (size_t)image.width * (size_t)image.height;
+    uint8_t *buf = (uint8_t *)malloc(npix * 3u);
+    if (!buf) { free(rgba); png_image_free(&image); return 0; }
+    for (size_t i = 0; i < npix; i++) {
+        buf[i * 3 + 0] = rgba[i * 4 + 0];
+        buf[i * 3 + 1] = rgba[i * 4 + 1];
+        buf[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    free(rgba);
     *w_out = (int)image.width;
     *h_out = (int)image.height;
     png_image_free(&image);
