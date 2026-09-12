@@ -772,15 +772,39 @@ bool gpu_graph_dspark_draft_forward_banks(
     return ok;
 }
 
+/* The fused RMSNorm + HC-mix GEMV, for the head that computes its own
+ * coefficients (0731).  Byte-identical to the rms_norm_plain -> matmul pair it
+ * replaces; it exists because that pair ran a 1-block kernel then a 24-block
+ * kernel with a 64 KB f32 scratch round trip between them.  Anything that is
+ * not a storage the fused kernel reads REFUSES rather than being read at the
+ * wrong width.  plans/96-two-profiles-one-engine.md s17. */
+static bool gpu_graph_norm_mix_plain(
+        const pulsar_model      *model,
+        const pulsar_tensor     *w,
+        uint64_t              hc_dim,
+        uint64_t              out_dim,
+        const pulsar_gpu_tensor *src_hc,
+        pulsar_gpu_tensor       *out) {
+    if (w->type != PULSAR_TENSOR_BF16 && w->type != PULSAR_TENSOR_F32) {
+        fprintf(stderr, "pulsar: hc mix weight type %d has no fused norm+mix kernel -- refusing\n",
+                (int)w->type);
+        return false;
+    }
+    return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
+                                          w->abs_offset, hc_dim, out_dim,
+                                          src_hc, PULSAR_RMS_EPS,
+                                          w->type) != 0;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on GPU for
  * ONE row of the sweep-final stream: the last row of a whole/chunked prefill.
  * The collapse weights are the pre the last FFN handed on (batch_hc_pre, the
- * reference's `layer.hc_pre(h, pre_mix)` after the layer loop) -- there is no
- * head-side mix.  Its logits are the first decode output -- the same
- * distribution the classic decode step produces with the one-row GEMV -- so
- * the row is declared a DECODE row and the vocab GEMM takes the M-independent
- * arm (as it did before L167, by row count).  The callers are the prefill
- * lane, which declares nothing itself. */
+ * reference's `layer.hc_pre(h, pre_mix)` after the layer loop) for V4.1, and
+ * the head's own mix (output_hc_*) for 0731.  Its logits are the first decode
+ * output -- the same distribution the classic decode step produces with the
+ * one-row GEMV -- so the row is declared a DECODE row and the vocab GEMM takes
+ * the M-independent arm (as it did before L167, by row count).  The callers are
+ * the prefill lane, which declares nothing itself. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -795,23 +819,37 @@ bool gpu_graph_encode_output_head(
                                                         (uint64_t)row * PULSAR_N_HC * sizeof(float),
                                                         (uint64_t)PULSAR_N_HC * sizeof(float));
     bool ok = row_hc && row_pre;
-    /* 0731 ships an HC head mix (output_hc_*), V4.1 ships none and collapses
-     * with the pre its last FFN handed on -- which is the arithmetic below.
-     * The mix is a separate port (PLAN 96 S1) and is not restored, so refuse by
-     * name rather than feed a 0731 artifact through V4.1's collapse. */
+    /* The collapse is SHARED; only the coefficient source differs.  0731 binds
+     * output_hc_* and computes its own; V4.1 binds none and collapses with the
+     * pre its last FFN handed on.  The bind is the fact -- a 0731 artifact
+     * missing the group dies at load (weights_bind_output). */
     if (weights->output_hc_fn) {
-        fprintf(stderr, "pulsar: this model computes its own HC head mix (0731) -- "
-                        "that path is not restored yet, refusing\n");
-        ok = false;
+        if (!weights->output_hc_scale || !weights->output_hc_base) {
+            fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = gpu_graph_norm_mix_plain(model, weights->output_hc_fn, hc_dim, PULSAR_N_HC,
+                                              row_hc, g->output_pre);
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(g->output_weights, g->output_pre,
+                                                        model->map, model->size,
+                                                        weights->output_hc_scale->abs_offset,
+                                                        weights->output_hc_base->abs_offset,
+                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+        if (ok) {
+            gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+        }
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd, row_hc, g->output_weights,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+    } else {
+        if (ok) {
+            gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+        }
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd,
+                                                      row_hc,
+                                                      row_pre,
+                                                      PULSAR_N_EMBD,
+                                                      PULSAR_N_HC) != 0;
     }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
-    }
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  row_hc,
-                                                  row_pre,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
     pulsar_gpu_tensor_free(row_pre);
     pulsar_gpu_tensor_free(row_hc);
     if (ok) {
@@ -1039,8 +1077,11 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = rows_pre && output_embd && output_norm && logits;
-    /* The DRAFTER's own head mix (dspark.2.hc_head_*, L216).  Refused for the
-     * same reason as the main head above. */
+    /* The DRAFTER's own head mix (dspark.2.hc_head_*).  The TARGET head now
+     * computes its mix (see gpu_graph_encode_output_head); this one is the
+     * remaining half -- it uses the UNFUSED norm + matmul pair over
+     * batch_flat_hc rather than the fused kernel, so it is its own port.  Still
+     * refused by name. */
     if (dw->hc_head_fn) {
         fprintf(stderr, "pulsar: the drafter computes its own HC head mix (0731) -- "
                         "that path is not restored yet, refusing\n");

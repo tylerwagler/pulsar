@@ -1042,6 +1042,12 @@ typedef struct {
      * split with its own pre, read by the output head after the last FFN.
      * Row-indexed like batch_cur_hc: whatever moves an hc row moves its pre. */
     pulsar_gpu_tensor *batch_hc_pre;
+    /** 0731's HC head-mix scratch, one row's worth: the norm+mix projection and
+     * the sigmoid'd coefficients the shared collapse consumes.  V4.1 allocates
+     * them and never reads them -- its collapse reads batch_hc_pre.
+     * plans/96-two-profiles-one-engine.md s17. */
+    pulsar_gpu_tensor *output_pre;                  ///< [n_hc] norm+mix output
+    pulsar_gpu_tensor *output_weights;              ///< [n_hc] sigmoid'd coefficients
     pulsar_gpu_tensor *batch_attn_cur;              ///< batched twin: attention sublayer input
     pulsar_gpu_tensor *batch_attn_norm;             ///< batched twin: RMSNorm output feeding the projections
     pulsar_gpu_tensor *batch_qr;                    ///< batched twin: low-rank query latent

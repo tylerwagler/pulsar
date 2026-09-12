@@ -1526,6 +1526,11 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_hc_mix = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_pre = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HC * sizeof(float));
+    /* 0731's HC head-mix scratch: one row's coefficients, produced by the fused
+     * norm+mix and then by the sigmoid.  V4.1 allocates them too -- 16 B each --
+     * because its collapse reads batch_hc_pre instead and never touches these. */
+    g->output_pre = pulsar_gpu_tensor_alloc(PULSAR_N_HC * sizeof(float));
+    g->output_weights = pulsar_gpu_tensor_alloc(PULSAR_N_HC * sizeof(float));
     /* Dump-only carrier (L090.1): its WRITE has been dump-gated NULL since the
      * dead-store pass, but the 64 MiB allocation never followed.  Confirmed by
      * the D2 hand census: zero non-debug readers.  Allocate it only when a
@@ -1606,6 +1611,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->prefill_tokens && g->spec_logits &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split && g->batch_hc_pre &&
+                    g->output_pre && g->output_weights &&
                     (g->batch_attn_cur || !gpu_graph_f32_store_observed_any()) &&
                     g->batch_attn_norm &&
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&

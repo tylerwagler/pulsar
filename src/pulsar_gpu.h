@@ -1739,6 +1739,30 @@ int pulsar_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/** The HC HEAD MIX (0731): the two steps that produce the coefficients the
+ * collapse above consumes.  V4.1 has neither -- it collapses with the pre its
+ * last FFN handed on -- and no profile but 0731's binds the weights, so these
+ * are unreachable for V4.1.  plans/96-two-profiles-one-engine.md s17. */
+int pulsar_gpu_hc_norm_mix_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const pulsar_gpu_tensor *x,
+        float                   eps,
+        uint32_t                w_type);
+int pulsar_gpu_output_hc_weights_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *pre,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint32_t                n_hc,
+        float                   eps);
+
 
 /** Same, but also emits norm_out's E4M3 + swizzled E8M0 encoding (norm_out_q,
  * norm_out_sf, pitch norm_out_kbp) from the same registers that produce the f32
