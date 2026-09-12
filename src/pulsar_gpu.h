@@ -324,6 +324,7 @@ enum {
 #define PULSAR_GPU_HD __host__ __device__   /* the helper is called from kernels too */
 #else
 #define PULSAR_GPU_HD
+
 #endif
 static inline PULSAR_GPU_HD uint32_t pulsar_compress_coff(uint32_t ratio) { return ratio == 4u ? 2u : 1u; }
 
@@ -2048,5 +2049,49 @@ __attribute__((constructor)) void pulsar_tu_archs_register_(void) {
 }
 }
 #endif
+
+/* ---------------------------------------------------------------------------
+ * L216: the Vision-Exp tower's shape and its CUDA-facing weight contract.
+ *
+ * These live HERE, not in the engine's internal header, because the CUDA TUs
+ * cannot see engine-internal types (pulsar_cuda_internal.h pulls in only
+ * cuda/cub headers) and every kernel in the tree takes (map, size, offset) for
+ * the same reason.  The engine builds the offsets from pulsar_vision_weights;
+ * the kernels read them against the mapped model base.
+ *
+ * The artifact carries the vision TENSORS but no vision metadata (the template
+ * writes only the text-side config keys), so these compiled values are the
+ * authority.  They match the checkpoint's config.json (vision_n_layers 32,
+ * vision_dim 1024, vision_n_heads 16, vision_inter_dim 2816,
+ * vision_patch_size 14, vision_downsample_ratio 3, vision_rope_theta 10000) and
+ * predict every `vision.*` tensor's dims. */
+#define PULSAR_VISION_LAYERS      32u
+#define PULSAR_VISION_DIM         1024u
+#define PULSAR_VISION_HEADS       16u
+#define PULSAR_VISION_INTER       2816u
+#define PULSAR_VISION_PATCH       14u
+#define PULSAR_VISION_DOWNSAMPLE  3u
+#define PULSAR_VISION_ROPE_THETA  10000.0f
+
+/** One vision-tower tensor as a file offset into the model mapping.  The CUDA
+ * forward reads every weight through these; the engine fills them from the
+ * bound pulsar_vision_weights. */
+typedef struct {
+    uint64_t patch_proj, patch_bias, norm;
+    uint64_t aligner_w1, aligner_b1, aligner_w2, aligner_b2;
+    struct {
+        uint64_t norm1, wqkv, wqkv_bias, wo, wo_bias, norm2, w1, w2;
+    } block[PULSAR_VISION_LAYERS];
+    uint32_t n_layers;              ///< must be PULSAR_VISION_LAYERS
+    uint32_t text_dim;              ///< the aligner's output width (the text model's n_embd)
+} pulsar_vision_offsets;
+
+/** ViT + aligner over ONE image's patches: `patches` is
+ * (n_h*n_w, 3, PATCH, PATCH) bf16, the result is (out_rows, text_dim) bf16
+ * written to `out`.  Returns 0 on any refusal. */
+int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
+                               const void *map, uint64_t map_size,
+                               const uint16_t *patches, int n_h, int n_w,
+                               uint16_t *out, int out_cap, int *out_rows);
 
 #endif

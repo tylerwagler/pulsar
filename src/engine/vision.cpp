@@ -593,3 +593,35 @@ int vision_decode_rgb(const uint8_t *bytes, size_t len,
     if (bytes[0] == 0xFF && bytes[1] == 0xD8) return vision_decode_jpeg(bytes, len, rgb_out, w_out, h_out);
     return 0;
 }
+
+/* Flatten the engine's bound tower into the CUDA-facing offset contract and run
+ * the forward.  This is the ONLY place the two sides meet: the kernels cannot
+ * see pulsar_vision_weights (see pulsar_gpu.h). */
+int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
+                   const uint16_t *patches, int n_h, int n_w,
+                   uint16_t *out, int out_cap, int *out_rows) {
+    if (!w || !m || w->n_layers != PULSAR_VISION_LAYERS) return 0;
+    pulsar_vision_offsets o;
+    memset(&o, 0, sizeof o);
+    o.n_layers = w->n_layers;
+    o.text_dim = (uint32_t)PULSAR_N_EMBD;
+    o.patch_proj = w->patch_proj->abs_offset;
+    o.patch_bias = w->patch_bias->abs_offset;
+    o.norm = w->norm->abs_offset;
+    o.aligner_w1 = w->aligner_w1->abs_offset;
+    o.aligner_b1 = w->aligner_b1->abs_offset;
+    o.aligner_w2 = w->aligner_w2->abs_offset;
+    o.aligner_b2 = w->aligner_b2->abs_offset;
+    for (uint32_t i = 0; i < w->n_layers; i++) {
+        o.block[i].norm1     = w->block[i].norm1->abs_offset;
+        o.block[i].wqkv      = w->block[i].wqkv->abs_offset;
+        o.block[i].wqkv_bias = w->block[i].wqkv_bias->abs_offset;
+        o.block[i].wo        = w->block[i].wo->abs_offset;
+        o.block[i].wo_bias   = w->block[i].wo_bias->abs_offset;
+        o.block[i].norm2     = w->block[i].norm2->abs_offset;
+        o.block[i].w1        = w->block[i].w1->abs_offset;
+        o.block[i].w2        = w->block[i].w2->abs_offset;
+    }
+    return pulsar_cuda_vision_forward(&o, m->map, m->size, patches, n_h, n_w,
+                                      out, out_cap, out_rows);
+}

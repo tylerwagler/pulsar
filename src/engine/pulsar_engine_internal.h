@@ -621,24 +621,11 @@ typedef struct {
     uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
 } pulsar_dspark_weights;
 
-/** DeepSeek Vision-Exp tower shape.  The artifact carries the vision TENSORS but
- * no vision metadata (the template writes only the text-side config keys), so
- * these compiled values are the authority.  They match the checkpoint's
- * config.json (vision_n_layers 32, vision_dim 1024, vision_n_heads 16,
- * vision_inter_dim 2816, vision_patch_size 14, vision_downsample_ratio 3,
- * vision_rope_theta 10000) and predict every `vision.*` tensor's dims. */
-#define PULSAR_VISION_LAYERS      32u
-#define PULSAR_VISION_DIM         1024u
-#define PULSAR_VISION_HEADS       16u
-#define PULSAR_VISION_INTER       2816u
-#define PULSAR_VISION_PATCH       14u
-#define PULSAR_VISION_DOWNSAMPLE  3u
-#define PULSAR_VISION_ROPE_THETA  10000.0f
-
-/** Vision-Exp tower weights: the ViT patch encoder, its 32 blocks, the final
- * norm, the 3x3-merge aligner, and the four image-span embeddings the text
- * sequence substitutes for image tokens.  Present or absent per artifact
- * (`vision.*` / `aligner.*` / `image_*`), exactly like the drafter.
+/** DeepSeek Vision-Exp tower weights.  The tower's SHAPE constants
+ * (PULSAR_VISION_*) and the CUDA-facing offset contract live in pulsar_gpu.h:
+ * the CUDA TUs cannot see this header, and every kernel takes (map, size,
+ * offset) rather than engine types.  This struct is the engine-side binding;
+ * vision_offsets_from_weights() flattens it for the kernels.
  *
  * The reference is the checkpoint's own inference/vision.py: RMSNorm(1e-6),
  * fused QKV, 2D RoPE with 16 frequencies per axis over the 64-wide head,
@@ -2307,6 +2294,12 @@ int vision_safe_resize(int height, int width, int best_height, int best_width,
 int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
                              int *types_out, int types_cap,
                              int *perm_out, int perm_cap);
+/** Run the bound tower over one image's patches (n_h*n_w*3*PATCH*PATCH bf16
+ * values) and write (out_rows, PULSAR_N_EMBD) bf16 embeddings.  Returns 0 on
+ * refusal.  Needs a GPU and a bound tower. */
+int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
+                   const uint16_t *patches, int n_h, int n_w,
+                   uint16_t *out, int out_cap, int *out_rows);
 
 /** The vision config the preprocessing reads (mirrors the reference's args). */
 typedef struct {
