@@ -160,18 +160,10 @@
 
 
 
-/** MXKV FP4 row bytes for the indexer compressed cache: the shared
- * definition at this model's indexer head_dim (68 B at 128). */
-#define PULSAR_ENGINE_IDXFP4_ROWBYTES \
-    ((uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM))
-
-/** The two KV rows (src/pulsar_gpu.h, L218) at this model's head_dim: WINDOW
- * rows (528 B) fill every sliding-window ring -- raw, drafter, the current
- * chunk's pack buffer; MAIN rows (288 B) fill a kv source's compressed pool.
- * Neither has a conversion path from 0731's 384 B row -- stale payloads and
- * bank snapshots refuse by version and stride. */
-#define PULSAR_ENGINE_WINKV_ROWBYTES  PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
-#define PULSAR_ENGINE_MAINKV_ROWBYTES PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
+/* KV row geometry is asked for by KIND through pulsar_kv_row_bytes(), which
+ * reads the loaded profile's kv_row_style.  There is deliberately no
+ * per-format macro left: a caller must not be able to name WINDOW/MAIN when the
+ * loaded model stores one unified row.  See pulsar_kv_row_style. */
 
 
 /** =========================================================================
@@ -253,6 +245,22 @@ typedef enum {
     PULSAR_VARIANT_V41 = 1,  /**< DeepSeek-V4.1-Flash (L218): 40 layers, CSA2 sharing, no hash layers */
 } pulsar_variant;
 
+/** The KV row family a model stores.  A "row" is one token's (or one pooled
+ * group's) KV block; the family is the quantiser and layout, not the size.
+ *
+ * CSA2:    V4.1.  WINDOW rows (E4M3 x E8M0/32) in every sliding-window ring,
+ *          MAIN rows (E2M1 x E4M3/16) in a kv source's compressed pool, and an
+ *          FP4 index-K row -- three formats, three strides.
+ * UNIFIED: 0731.  One NVFP4 row for every non-index buffer (the L111
+ *          unification), plus the same FP4 index row.
+ *
+ * pulsar_kv_row_bytes() is the one reader.  plans/96-two-profiles-one-engine.md
+ * s2 axis 2 / plans/96-SPIKE0-results.md S3. */
+typedef enum {
+    PULSAR_KV_ROWS_CSA2    = 0,  /**< V4.1: two formats + the index row */
+    PULSAR_KV_ROWS_UNIFIED = 1,  /**< 0731: one NVFP4 row + the index row */
+} pulsar_kv_row_style;
+
 /** The model's architectural constants, resolved once at load and then treated
  * as compile-time-ish truth by the graph and kernels.
  *
@@ -308,6 +316,10 @@ typedef struct {
      *   source's latent (V4.1, indexer_k / indexer_k_norm). */
     bool compressor_ape;
     bool indexer_own_compressor;
+    /** The KV row family (see pulsar_kv_row_style).  Every row-geometry
+     * question goes through pulsar_kv_row_bytes(), which reads this -- so no
+     * caller names a format and the geometry cannot disagree with the packer. */
+    pulsar_kv_row_style kv_row_style;
     float rms_eps;             ///< epsilon for the transformer RMSNorms
     float hc_eps;              ///< epsilon for the HC normalisation
     float expert_weight_scale; ///< scale applied to routed-expert gate weights
@@ -2130,6 +2142,35 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
  * index; a layer that is its own source (mode FULL) writes them.  Every
  * per-layer cache array in pulsar_gpu_graph / pulsar_bank_slabs is indexed by
  * the source, so a consumer resolves through these and never through `il`. */
+/** Which KV buffer a row-geometry question is about. */
+typedef enum {
+    PULSAR_KV_ROW_RING = 0,   /**< a sliding-window ring row */
+    PULSAR_KV_ROW_COMP,       /**< a compressed-pool row */
+    PULSAR_KV_ROW_INDEX,      /**< an index-K pool row */
+} pulsar_kv_row_kind;
+
+/** The row geometry of the LOADED model, in bytes, asked by KIND.
+ *
+ * CSA2 (V4.1): RING 528 (WINDOW), COMP 288 (MAIN), INDEX 68.
+ * UNIFIED (0731): one 384 B NVFP4 row in every non-index buffer; INDEX 68.
+ *
+ * The 0731 case REFUSES here until its packer is restored: returning 384 now
+ * would size every pool correctly and fill it with a format nothing writes.
+ * plans/96-two-profiles-one-engine.md s10. */
+static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
+    /* The index-K row is the same FP4 row in both families. */
+    if (kind == PULSAR_KV_ROW_INDEX) {
+        return (uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM);
+    }
+    if (g_pulsar_shape.kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
+        pulsar_die("the 0731 unified 384 B KV row has no packer yet");
+        return 0;   /* unreachable: pulsar_die does not return */
+    }
+    return kind == PULSAR_KV_ROW_RING
+               ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
+               : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
+}
+
 static inline uint32_t gpu_graph_kv_source(uint32_t il) {
     return pulsar_layer_attn_layout(il)->kv_source;
 }

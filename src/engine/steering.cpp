@@ -58,8 +58,8 @@ bool gpu_graph_apply_directional_steering_ffn(
  * split (gpu_graph_demand_paged_bytes_per_bank) and the boot-line estimate
  * (pulsar_context_memory_estimate). */
 uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
-    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
-    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
     /* CSA2 (L218): one comp pool + one index-K pool per kv SOURCE; the
      * member layers read them and own nothing. */
@@ -76,7 +76,7 @@ uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
      * and trips the managed-KV (demand-paged) policy at the 512k+ contexts
      * where performance matters most.  The raw ring is WINDOW rows,
      * as gpu_graph_bank_slabs_alloc sizes it (raw_bank_bytes). */
-    return (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_ENGINE_WINKV_ROWBYTES;
+    return (uint64_t)PULSAR_N_LAYER * raw_cap * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
 }
 
 uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {

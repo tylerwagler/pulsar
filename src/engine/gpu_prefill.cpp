@@ -496,8 +496,8 @@ static bool gpu_graph_indexed_attention_span(
      * n_head packed rows, in BYTES -- the element-size trap the sq_view
      * comment below warns about, avoided by construction. */
     pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_qp,
-            (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
-            (uint64_t)sn * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
+            (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX),
+            (uint64_t)sn * PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
     pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
             (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
             (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
@@ -569,8 +569,8 @@ static bool gpu_graph_indexed_attention_span(
             const uint32_t bank  = (uint32_t)g->ms_seq_id[s0 + r0];
             const uint32_t rpos0 = (uint32_t)g->ms_positions[s0 + r0];
             pulsar_gpu_tensor *rq = pulsar_gpu_tensor_view(g->batch_indexer_qp,
-                    (uint64_t)(s0 + r0) * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
-                    (uint64_t)rn * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
+                    (uint64_t)(s0 + r0) * PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX),
+                    (uint64_t)rn * PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
             pulsar_gpu_tensor *rw = pulsar_gpu_tensor_view(g->batch_indexer_weights,
                     (uint64_t)(s0 + r0) * PULSAR_N_INDEXER_HEAD * sizeof(float),
                     (uint64_t)rn * PULSAR_N_INDEXER_HEAD * sizeof(float));
@@ -1554,8 +1554,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                     pulsar_gpu_tensor *indexer_q_view = pulsar_gpu_tensor_view(
                             g->batch_indexer_qp,
-                            (uint64_t)t * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
-                            (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
+                            (uint64_t)t * PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX),
+                            (uint64_t)PULSAR_N_INDEXER_HEAD * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
                     pulsar_gpu_tensor *indexer_w_view = gpu_graph_tensor_row_view(
                             g->batch_indexer_weights, t, PULSAR_N_INDEXER_HEAD);
                     ok = indexer_q_view && indexer_w_view &&
@@ -1607,8 +1607,8 @@ bool gpu_graph_encode_layer_attention_batch(
                  * what attention read by construction. */
                 pulsar_gpu_tensor *kv_pack_view = pulsar_gpu_tensor_view(
                         g->batch_kv_pack,
-                        (uint64_t)t * PULSAR_ENGINE_WINKV_ROWBYTES,
-                        PULSAR_ENGINE_WINKV_ROWBYTES);
+                        (uint64_t)t * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING),
+                        pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
                 pulsar_gpu_tensor *heads_view = gpu_graph_heads_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_pack_view && heads_view;
                 if (ok && !zero_prefix) {

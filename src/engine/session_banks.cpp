@@ -347,8 +347,8 @@ int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
         payload_set_err(err, errlen, "bank kv save: no pool / bad bank"); return 1;
     }
     gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
-    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
-    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint32_t hdr[5] = { PULSAR_BANK_KV_MAGIC, PULSAR_BANK_KV_VERSION, bank,
                         (uint32_t)PULSAR_N_LAYER, (uint32_t)attn_row };
     if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
@@ -393,7 +393,7 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
         hdr[1] != PULSAR_BANK_KV_VERSION || hdr[3] != (uint32_t)PULSAR_N_LAYER) {
         payload_set_err(err, errlen, "bank kv load: bad header"); return 1;
     }
-    if (hdr[4] != (uint32_t)PULSAR_ENGINE_MAINKV_ROWBYTES) {
+    if (hdr[4] != (uint32_t)pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP)) {
         payload_set_err(err, errlen,
                         "bank kv load: snapshot comp row stride differs from this "
                         "build's MAIN row; refusing (re-prefill)");
@@ -420,8 +420,8 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * directly — no repoint) BEFORE touching the live frontier. On any read/H2D
      * failure the bank's ms counters stay 0 (from free_physical) so it advertises
      * an EMPTY frontier — no OOB — and the caller fails the request. */
-    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
-    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = comp_cnt[il];
