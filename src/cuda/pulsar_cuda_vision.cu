@@ -191,7 +191,8 @@ __global__ static void vk_gelu(bf16 *__restrict__ y, size_t n) {
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const void *map, uint64_t map_size,
                                const uint16_t *patches_host, int n_h, int n_w,
-                               uint16_t *out_host, int out_cap, int *out_rows) {
+                               uint16_t *out_host, int out_cap, int *out_rows,
+                               uint16_t *dbg, uint32_t dbg_blocks) {
     (void)map_size;
     if (!o || !map || o->n_layers != PULSAR_VISION_LAYERS) return 0;
     const int P = (int)PULSAR_VISION_PATCH;
@@ -218,6 +219,12 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
 #define WT(off) ((const bf16 *)(const void *)((const char *)map + (off)))
 #define CUDA_ALLOC(p, bytes) do { if (cudaMalloc(&(p), (bytes)) != cudaSuccess) goto done; } while (0)
 #define CUDA_LAUNCH(what) do { if (!cuda_ok(cudaGetLastError(), what)) goto done; } while (0)
+/* The optional stage dump: `row` indexes a (2 + dbg_blocks) x n_tok*D block. */
+#define DUMP_STAGE(row, src) do { \
+        if (dbg && cudaMemcpy((uint16_t *)dbg + (size_t)(row) * x_elems, (src), \
+                              x_elems * sizeof(bf16), cudaMemcpyDeviceToHost) != cudaSuccess) \
+            goto done; \
+    } while (0)
 
     CUDA_ALLOC(d_patches, (size_t)n_tok * 3 * P * P * sizeof(bf16));
     CUDA_ALLOC(d_x, x_elems * sizeof(bf16));
@@ -238,6 +245,7 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     vk_linear<<<dim3((unsigned)((D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
         (const bf16 *)d_patches, WT(o->patch_proj), WT(o->patch_bias), (bf16 *)d_x, 3 * P * P, D);
     CUDA_LAUNCH("vision patch_embed");
+    DUMP_STAGE(0, d_x);
 
     for (uint32_t li = 0; li < o->n_layers; li++) {
         vk_rmsnorm<<<(unsigned)n_tok, VK_THREADS, smem_norm>>>(
@@ -287,11 +295,13 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
         vk_add<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
             (bf16 *)d_x, (const bf16 *)d_attn, x_elems);
         CUDA_LAUNCH("vision mlp residual");
+        if (li < dbg_blocks) DUMP_STAGE(1 + li, d_x);
     }
 
     vk_rmsnorm<<<(unsigned)n_tok, VK_THREADS, smem_norm>>>(
         (const bf16 *)d_x, WT(o->norm), (bf16 *)d_normed, D, eps);
     CUDA_LAUNCH("vision final norm");
+    DUMP_STAGE(1 + (int)dbg_blocks, d_normed);
 
     vk_aligner_gather<<<(unsigned)((alg_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
         (const bf16 *)d_normed, (bf16 *)d_alg, n_h, n_w, D, R);
@@ -320,6 +330,7 @@ done:
     cudaFree(d_normed);
     cudaFree(d_qkv); cudaFree(d_mlp); cudaFree(d_alg); cudaFree(d_alg2); cudaFree(d_out);
     return ok;
+#undef DUMP_STAGE
 #undef CUDA_LAUNCH
 #undef CUDA_ALLOC
 #undef WT

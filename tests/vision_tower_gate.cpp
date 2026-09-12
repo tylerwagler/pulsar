@@ -86,20 +86,48 @@ int main(int argc, char **argv) {
         const size_t n_tok = (size_t)n_h * n_w;
         const size_t n_llm = (size_t)((n_h + ratio - 1) / ratio) * ((n_w + ratio - 1) / ratio);
 
+        const size_t stage_elems = n_tok * (size_t)dim;
         uint16_t *patches = (uint16_t *)malloc(n_tok * 3 * patch * patch * sizeof(uint16_t));
-        uint16_t *scratch = (uint16_t *)malloc((n_tok * dim + n_llm * text_dim) * sizeof(uint16_t));
+        uint16_t *want_stage = (uint16_t *)malloc((size_t)(2 + n_stage) * stage_elems * sizeof(uint16_t));
+        uint16_t *got_stage = (uint16_t *)malloc((size_t)(2 + n_stage) * stage_elems * sizeof(uint16_t));
         uint16_t *want = (uint16_t *)malloc(n_llm * text_dim * sizeof(uint16_t));
         uint16_t *got = (uint16_t *)malloc(n_llm * text_dim * sizeof(uint16_t));
-        if (!patches || !scratch || !want || !got) { fprintf(stderr, "tower gate: oom\n"); return 2; }
+        if (!patches || !want_stage || !got_stage || !want || !got) {
+            fprintf(stderr, "tower gate: oom\n");
+            return 2;
+        }
         rd(patches, n_tok * 3 * patch * patch * sizeof(uint16_t), f);
-        rd(scratch, n_tok * dim * sizeof(uint16_t), f);                    /* patch_embed */
-        for (uint32_t s = 0; s < n_stage; s++) rd(scratch, n_tok * dim * sizeof(uint16_t), f);
-        rd(scratch, n_tok * dim * sizeof(uint16_t), f);                    /* final norm */
+        rd(want_stage, (size_t)(2 + n_stage) * stage_elems * sizeof(uint16_t), f);
         rd(want, n_llm * text_dim * sizeof(uint16_t), f);
 
         int rows = 0;
         const int ok = vision_forward(&e->vision_weights, &e->model, patches, n_h, n_w,
-                                      got, (int)(n_llm * text_dim), &rows);
+                                      got, (int)(n_llm * text_dim), &rows,
+                                      got_stage, n_stage);
+        if (ok) {
+            /* Stage-by-stage FIRST: a bad patch_embed means the weight plumbing
+             * is wrong, which is a different bug from a wrong rope/norm, and
+             * without this split the aligner number says only "something". */
+            static const char *names[] = { "patch_embed", "block0", "block1", "block2",
+                                           "block3", "block4", "block5" };
+            printf("  case %u (%dx%d):\n", c, n_h, n_w);
+            for (uint32_t st = 0; st < 2 + n_stage; st++) {
+                const uint16_t *g = got_stage + (size_t)st * stage_elems;
+                const uint16_t *w = want_stage + (size_t)st * stage_elems;
+                double sq = 0.0, rq = 0.0, ma = 0.0;
+                for (size_t i = 0; i < stage_elems; i++) {
+                    const double a = bf16_to_f32(g[i]), b = bf16_to_f32(w[i]);
+                    const double d = a - b;
+                    sq += d * d; rq += b * b;
+                    if (fabs(d) > ma) ma = fabs(d);
+                }
+                const char *nm = st == 0 ? "patch_embed"
+                                        : (st == 1 + n_stage ? "final_norm"
+                                                             : (st - 1 < 7 ? names[st] : "block?"));
+                printf("    %-12s rel-RMS %.3e  max-abs %.3e\n",
+                       nm, rq > 0.0 ? sqrt(sq / rq) : sqrt(sq), ma);
+            }
+        }
         if (!ok || rows != (int)n_llm) {
             fprintf(stderr, "  FAIL case %u (%dx%d): forward refused or returned %d rows (want %zu)\n",
                     c, n_h, n_w, rows, n_llm);
@@ -126,7 +154,7 @@ int main(int argc, char **argv) {
             printf("\n");
             if (!pass) failures++;
         }
-        free(patches); free(scratch); free(want); free(got);
+        free(patches); free(want_stage); free(got_stage); free(want); free(got);
     }
     fclose(f);
     printf("VISION-TOWER GATE: %s (%u cases, %d failures; rel-RMS limit %.1e)\n",

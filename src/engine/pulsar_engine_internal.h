@@ -2299,7 +2299,8 @@ int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
  * refusal.  Needs a GPU and a bound tower. */
 int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
                    const uint16_t *patches, int n_h, int n_w,
-                   uint16_t *out, int out_cap, int *out_rows);
+                   uint16_t *out, int out_cap, int *out_rows,
+                   uint16_t *dbg, uint32_t dbg_blocks);
 
 /** The vision config the preprocessing reads (mirrors the reference's args). */
 typedef struct {

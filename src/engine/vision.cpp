@@ -599,7 +599,8 @@ int vision_decode_rgb(const uint8_t *bytes, size_t len,
  * see pulsar_vision_weights (see pulsar_gpu.h). */
 int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
                    const uint16_t *patches, int n_h, int n_w,
-                   uint16_t *out, int out_cap, int *out_rows) {
+                   uint16_t *out, int out_cap, int *out_rows,
+                   uint16_t *dbg, uint32_t dbg_blocks) {
     if (!w || !m || w->n_layers != PULSAR_VISION_LAYERS) return 0;
     pulsar_vision_offsets o;
     memset(&o, 0, sizeof o);
@@ -623,5 +624,5 @@ int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
         o.block[i].w2        = w->block[i].w2->abs_offset;
     }
     return pulsar_cuda_vision_forward(&o, m->map, m->size, patches, n_h, n_w,
-                                      out, out_cap, out_rows);
+                                      out, out_cap, out_rows, dbg, dbg_blocks);
 }

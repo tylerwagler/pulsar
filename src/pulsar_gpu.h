@@ -2088,10 +2088,16 @@ typedef struct {
 
 /** ViT + aligner over ONE image's patches: `patches` is
  * (n_h*n_w, 3, PATCH, PATCH) bf16, the result is (out_rows, text_dim) bf16
- * written to `out`.  Returns 0 on any refusal. */
+ * written to `out`.  Returns 0 on any refusal.
+ *
+ * `dbg` is an OPTIONAL instrument (NULL in production): when set it receives
+ * (2 + dbg_blocks) rows of n_h*n_w*PULSAR_VISION_DIM bf16 -- patch_embed,
+ * blocks 0..dbg_blocks-1, then the final norm -- which is how
+ * tests/vision_tower_gate.cpp localises a mismatch instead of guessing. */
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const void *map, uint64_t map_size,
                                const uint16_t *patches, int n_h, int n_w,
-                               uint16_t *out, int out_cap, int *out_rows);
+                               uint16_t *out, int out_cap, int *out_rows,
+                               uint16_t *dbg, uint32_t dbg_blocks);
 
 #endif
