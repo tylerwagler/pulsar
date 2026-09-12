@@ -171,3 +171,281 @@ int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
     free(raw_idx);
     return written;
 }
+
+/* ---------------------------------------------------------------------------
+ * The PIXEL half: image_processor.load_image() after the decode.
+ *
+ * The resampler is a faithful port of Pillow's src/libImaging/Resample.c
+ * (BICUBIC, 8bpc, Q22 fixed-point coefficients) plus ImageOps.contain/pad --
+ * `ImageOps.pad` scales to fit and centres on a (127,127,127) canvas, and
+ * `Image.resize` in the max_wh_ratio branch stretches.  Matching Pillow HERE is
+ * the point: the reference (and the vLLM capture) both preprocess with Pillow,
+ * so a "close enough" resampler would put every image feature on a slightly
+ * different input and there would be nothing to compare against.
+ *
+ * Everything below is integer or IEEE-deterministic, so this TU is built
+ * without -ffast-math (see the Makefile) for the same reason the layout math is.
+ * ------------------------------------------------------------------------- */
+
+#define PIL_PRECISION_BITS 22   /* (32 - 8 - 2): 8 bits of result, 2 of overflow */
+
+static double pil_bicubic_filter(double x) {
+    const double a = -0.5;
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
+/* Pillow's clip8(): the lookup table maps (v >> 22) in [-640, 639] to [0,255],
+ * negative to 0 and >255 to 255.  Clamping the index keeps the same answers
+ * without relying on the filter never overshooting the table. */
+static inline uint8_t pil_clip8(int32_t in) {
+    int32_t v = in >> PIL_PRECISION_BITS;
+    if (v < -640) v = -640;
+    if (v > 639) v = 639;
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+/* Pillow's precompute_coeffs() for BICUBIC (support 2.0), double coefficients. */
+static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size,
+                                 int **bounds_out, double **kk_out) {
+    double scale = (double)(in1 - in0) / (double)out_size;
+    double filterscale = scale < 1.0 ? 1.0 : scale;
+    const double support = 2.0 * filterscale;
+    const int ksize = (int)ceil(support) * 2 + 1;
+    double *kk = (double *)calloc((size_t)out_size * (size_t)ksize, sizeof(double));
+    int *bounds = (int *)malloc((size_t)out_size * 2u * sizeof(int));
+    if (!kk || !bounds) { free(kk); free(bounds); return 0; }
+    const double inv_filterscale = 1.0 / filterscale;
+    for (int xx = 0; xx < out_size; xx++) {
+        const double center = (double)in0 + ((double)xx + 0.5) * scale;
+        double ww = 0.0;
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int xmax = (int)(center + support + 0.5);
+        if (xmax > in_size) xmax = in_size;
+        xmax -= xmin;
+        double *k = &kk[(size_t)xx * (size_t)ksize];
+        for (int x = 0; x < xmax; x++) {
+            const double w = pil_bicubic_filter(((double)x + xmin - center + 0.5) * inv_filterscale);
+            k[x] = w;
+            ww += w;
+        }
+        if (ww != 0.0)
+            for (int x = 0; x < xmax; x++) k[x] /= ww;
+        bounds[xx * 2 + 0] = xmin;
+        bounds[xx * 2 + 1] = xmax;
+    }
+    *bounds_out = bounds;
+    *kk_out = kk;
+    return ksize;
+}
+
+/* Pillow's normalize_coeffs_8bpc(): double -> Q22, round-half-away-from-zero
+ * (add +/-0.5 then truncate toward zero). */
+static void pil_normalize_coeffs(int n, const double *pre, int32_t *kk) {
+    const double one = (double)(1 << PIL_PRECISION_BITS);
+    for (int i = 0; i < n; i++)
+        kk[i] = pre[i] < 0.0 ? (int32_t)(-0.5 + pre[i] * one)
+                             : (int32_t)(0.5 + pre[i] * one);
+}
+
+/* One axis of Pillow's two-pass 8bpc resample for 3 bands.  `vert` selects
+ * whether the filter runs down the source rows or across the source columns;
+ * the arithmetic (and the 1<<21 rounding seed) is identical either way. */
+static void pil_resample_axis(uint8_t *dst, int dst_w, int dst_h,
+                              const uint8_t *src, int src_w, int src_h,
+                              int ksize, const int *bounds, const int32_t *kk,
+                              int vert) {
+    (void)src_h;
+    for (int y = 0; y < dst_h; y++) {
+        uint8_t *line_out = dst + (size_t)y * (size_t)dst_w * 3u;
+        const int ymin = vert ? bounds[y * 2 + 0] : 0;
+        const int ymax = vert ? bounds[y * 2 + 1] : 0;
+        const int32_t *krow = vert ? &kk[(size_t)y * (size_t)ksize] : NULL;
+        for (int xx = 0; xx < dst_w; xx++) {
+            const int xmin = vert ? 0 : bounds[xx * 2 + 0];
+            const int xmax = vert ? 0 : bounds[xx * 2 + 1];
+            const int32_t *k = vert ? krow : &kk[(size_t)xx * (size_t)ksize];
+            int32_t s0 = 1 << (PIL_PRECISION_BITS - 1);
+            int32_t s1 = s0, s2 = s0;
+            if (vert) {
+                for (int y2 = 0; y2 < ymax; y2++) {
+                    const uint8_t *p = src + ((size_t)(y2 + ymin) * (size_t)src_w + (size_t)xx) * 3u;
+                    s0 += p[0] * k[y2];
+                    s1 += p[1] * k[y2];
+                    s2 += p[2] * k[y2];
+                }
+            } else {
+                const uint8_t *row = src + (size_t)y * (size_t)src_w * 3u;
+                for (int x2 = 0; x2 < xmax; x2++) {
+                    const uint8_t *p = row + ((size_t)(x2 + xmin)) * 3u;
+                    s0 += p[0] * k[x2];
+                    s1 += p[1] * k[x2];
+                    s2 += p[2] * k[x2];
+                }
+            }
+            line_out[(size_t)xx * 3u + 0] = pil_clip8(s0);
+            line_out[(size_t)xx * 3u + 1] = pil_clip8(s1);
+            line_out[(size_t)xx * 3u + 2] = pil_clip8(s2);
+        }
+    }
+}
+
+/* ImagingResample() for one dimension pair: horizontal first, then vertical,
+ * skipping a pass whose size is unchanged (Pillow's need_horizontal/vertical).
+ * `box` is always the whole source, which is what Image.resize uses. */
+static uint8_t *pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
+                               int dst_w, int dst_h) {
+    uint8_t *cur = (uint8_t *)src;
+    uint8_t *alloc1 = NULL, *alloc2 = NULL;
+    int cur_w = src_w, cur_h = src_h;
+
+    if (dst_w != src_w) {
+        int *bounds = NULL; double *pre = NULL;
+        int ksize = pil_precompute_coeffs(src_w, 0.0f, (float)src_w, dst_w, &bounds, &pre);
+        if (!ksize) return NULL;
+        int32_t *kk = (int32_t *)malloc((size_t)dst_w * (size_t)ksize * sizeof(int32_t));
+        alloc1 = (uint8_t *)malloc((size_t)dst_w * (size_t)cur_h * 3u);
+        if (!kk || !alloc1) { free(kk); free(bounds); free(pre); free(alloc1); return NULL; }
+        pil_normalize_coeffs(dst_w * ksize, pre, kk);
+        pil_resample_axis(alloc1, dst_w, cur_h, cur, cur_w, cur_h, ksize, bounds, kk, 0);
+        free(kk); free(bounds); free(pre);
+        cur = alloc1; cur_w = dst_w;
+    }
+    if (dst_h != src_h) {
+        int *bounds = NULL; double *pre = NULL;
+        int ksize = pil_precompute_coeffs(src_h, 0.0f, (float)src_h, dst_h, &bounds, &pre);
+        if (!ksize) { free(alloc1); return NULL; }
+        int32_t *kk = (int32_t *)malloc((size_t)dst_h * (size_t)ksize * sizeof(int32_t));
+        alloc2 = (uint8_t *)malloc((size_t)cur_w * (size_t)dst_h * 3u);
+        if (!kk || !alloc2) { free(kk); free(bounds); free(pre); free(alloc1); free(alloc2); return NULL; }
+        pil_normalize_coeffs(dst_h * ksize, pre, kk);
+        pil_resample_axis(alloc2, cur_w, dst_h, cur, cur_w, cur_h, ksize, bounds, kk, 1);
+        free(kk); free(bounds); free(pre);
+        free(alloc1);   /* the horizontal pass's temp, when there was one */
+        cur = alloc2;
+    }
+    if (cur == src) {   /* nothing changed: Pillow copies */
+        size_t n = (size_t)src_w * (size_t)src_h * 3u;
+        uint8_t *copy = (uint8_t *)malloc(n);
+        if (copy) memcpy(copy, src, n);
+        return copy;
+    }
+    return cur;
+}
+
+/* Python's round(): ties-to-even, which is what ImageOps.pad uses for the paste
+ * offset and ImageOps.contain for the contained size. */
+static int py_round(double v) {
+    double r = nearbyint(v);   /* default FE_TONEAREST == half to even */
+    return (int)r;
+}
+
+/* float32 -> bfloat16, round-to-nearest-even, as torch's .to(bfloat16) does. */
+static uint16_t f32_to_bf16_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    const uint32_t lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    return (uint16_t)(u >> 16);
+}
+
+int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
+                          const pulsar_vision_args *args,
+                          uint16_t *patch_out, size_t patch_cap,
+                          pulsar_vision_image *out) {
+    const int p = args->patch_size;
+    const int dr = args->downsample_ratio;
+    const float max_wh = args->max_wh_ratio;
+
+    /* load_image(): the max_wh_ratio clamp and the min_pixels upscale act on the
+     * VARIABLES only; the decoded image is untouched. */
+    int vw = width, vh = height;
+    if (max_wh > 0.0f && (float)vw > (float)vh * max_wh)
+        vw = (int)((float)vh * max_wh);
+    if (vw * vh > 0 && vw * vh < args->min_pixels) {
+        const double ratio = sqrt((double)args->min_pixels / ((double)vw * (double)vh));
+        vw = (int)((double)vw * ratio);
+        vh = (int)((double)vh * ratio);
+    }
+    int best_w = (int)(((vw + p - 1) / p) * p);
+    int best_h = (int)(((vh + p - 1) / p) * p);
+    pulsar_vision_resize sr;
+    if (!vision_safe_resize(vh, vw, best_h, best_w, p, dr, args->max_n_token, &sr))
+        return 0;
+    best_h = sr.best_height;
+    best_w = sr.best_width;
+    const int n_vit_h = best_h / p;
+    const int n_vit_w = best_w / p;
+
+    /* The resize/pad branch, then ImageOps.pad's contain + centred paste. */
+    uint8_t *canvas = NULL;
+    if (max_wh > 0.0f && (float)width >= max_wh * (float)height) {
+        canvas = pil_resize_rgb(rgb, width, height, best_w, best_h);
+    } else {
+        const double im_ratio = (double)width / (double)height;
+        const double dest_ratio = (double)best_w / (double)best_h;
+        int cw = best_w, ch = best_h;
+        if (im_ratio != dest_ratio) {
+            if (im_ratio > dest_ratio) {
+                const int nh = py_round((double)height / (double)width * (double)best_w);
+                if (nh != best_h) ch = nh;
+            } else {
+                const int nw = py_round((double)width / (double)height * (double)best_h);
+                if (nw != best_w) cw = nw;
+            }
+        }
+        uint8_t *resized = pil_resize_rgb(rgb, width, height, cw, ch);
+        if (!resized) return 0;
+        if (cw == best_w && ch == best_h) {
+            canvas = resized;
+        } else {
+            canvas = (uint8_t *)malloc((size_t)best_w * (size_t)best_h * 3u);
+            if (!canvas) { free(resized); return 0; }
+            memset(canvas, 127, (size_t)best_w * (size_t)best_h * 3u);
+            int ox = 0, oy = 0;
+            if (cw != best_w) ox = py_round((double)(best_w - cw) * 0.5);
+            else              oy = py_round((double)(best_h - ch) * 0.5);
+            for (int y = 0; y < ch; y++)
+                memcpy(canvas + ((size_t)(y + oy) * (size_t)best_w + (size_t)ox) * 3u,
+                       resized + (size_t)y * (size_t)cw * 3u, (size_t)cw * 3u);
+            free(resized);
+        }
+    }
+    if (!canvas) return 0;
+
+    /* x = float32(rgb)/255; x = (x-0.5)/0.5; to bf16; then patchify:
+     * reshape(3, n_vit_h, p, n_vit_w, p).permute(1,3,0,2,4). */
+    const size_t n_patch = (size_t)n_vit_h * (size_t)n_vit_w;
+    const size_t per_patch = (size_t)3 * (size_t)p * (size_t)p;
+    if (n_patch * per_patch > patch_cap) { free(canvas); return 0; }
+    for (int i = 0; i < n_vit_h; i++) {
+        for (int j = 0; j < n_vit_w; j++) {
+            uint16_t *dst = patch_out + ((size_t)i * (size_t)n_vit_w + (size_t)j) * per_patch;
+            for (int c = 0; c < 3; c++) {
+                for (int py = 0; py < p; py++) {
+                    for (int px = 0; px < p; px++) {
+                        const uint8_t byte = canvas[((size_t)(i * p + py) * (size_t)best_w +
+                                                     (size_t)(j * p + px)) * 3u + (size_t)c];
+                        const float x = (float)byte / 255.0f;
+                        const float n = (x - 0.5f) / 0.5f;
+                        dst[((size_t)c * (size_t)p + (size_t)py) * (size_t)p + (size_t)px] =
+                            f32_to_bf16_bits(n);
+                    }
+                }
+            }
+        }
+    }
+    free(canvas);
+    out->n_vit_h = n_vit_h;
+    out->n_vit_w = n_vit_w;
+    out->n_llm_h = sr.n_llm_h;
+    out->n_llm_w = sr.n_llm_w;
+    out->best_width = best_w;
+    out->best_height = best_h;
+    return 1;
+}

@@ -490,6 +490,12 @@ cuda-session-payload-gate: tests/session_payload_gate
 vision-layout-gate: tests/vision_layout_gate
 	./tests/vision_layout_gate tests/test-vectors/vision-layout-goldens.txt
 
+# L216: the pixel half -- Pillow-faithful resample/contain/pad, normalisation,
+# bf16 rounding and patchify -- graded against patches the reference produced
+# from the same decoded RGB.  Host-only; the codec is deliberately out of scope.
+vision-pixel-gate: tests/vision_pixel_gate
+	./tests/vision_pixel_gate tests/test-vectors/vision-pixel-goldens.bin
+
 # plan-34 phase-2 inc 2: cuBLASLt algo-stability. A decode bank's step logits must
 # be byte-identical across batched-step widths M (incl. the M=4->5 custom->cuBLASLt
 # boundary) so a co-scheduled big prefill (inc 4) cannot perturb it. MODEL-DEPENDENT,
@@ -1039,7 +1045,7 @@ unit-test-gate: pulsar_test seam-check
 # target closed.  Fold it into tests/gates_runner.cpp to drop the extra load.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-session-payload-gate vision-layout-gate \
+	cuda-attn-gates cuda-session-payload-gate vision-layout-gate vision-pixel-gate \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
@@ -1204,6 +1210,9 @@ tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_e
 tests/vision_layout_gate.o: tests/vision_layout_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_layout_gate.cpp
 
+tests/vision_pixel_gate.o: tests/vision_pixel_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_pixel_gate.cpp
+
 tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
@@ -1312,6 +1321,9 @@ tests/session_payload_gate: tests/session_payload_gate.o src/lib/pulsar_help.o $
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_layout_gate: tests/vision_layout_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_pixel_gate: tests/vision_pixel_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/pulsar_help.o $(CORE_OBJS)

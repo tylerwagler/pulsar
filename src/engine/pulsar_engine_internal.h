@@ -2307,6 +2307,31 @@ int vision_safe_resize(int height, int width, int best_height, int best_width,
 int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
                              int *types_out, int types_cap,
                              int *perm_out, int perm_cap);
+
+/** The vision config the preprocessing reads (mirrors the reference's args). */
+typedef struct {
+    int   patch_size;
+    int   downsample_ratio;
+    int   max_n_token;
+    int   min_pixels;
+    float max_wh_ratio;   ///< <= 0 means the reference's None (no clamp, no stretch)
+} pulsar_vision_args;
+/** What one preprocessed image produced. */
+typedef struct {
+    int n_vit_h, n_vit_w;         ///< ViT patch grid
+    int n_llm_h, n_llm_w;         ///< text grid after the aligner merge
+    int best_width, best_height;  ///< the resized/padded canvas the patches came from
+} pulsar_vision_image;
+/** Pixel half of image_processor.load_image(): decode-free.  Runs Pillow's
+ * bicubic resample, ImageOps.contain/pad (127-grey), the (x/255-0.5)/0.5
+ * normalisation and the patchify, all bit-exact with the reference.  `rgb` is
+ * width*height*3 bytes; `patch_out` receives n_vit_h*n_vit_w*3*patch^2 bf16
+ * values (as bit patterns).  Returns 0 on refusal (grid that the reference's
+ * assert would reject, or a cap too small). */
+int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
+                          const pulsar_vision_args *args,
+                          uint16_t *patch_out, size_t patch_cap,
+                          pulsar_vision_image *out);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
