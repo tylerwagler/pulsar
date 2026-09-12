@@ -100,10 +100,10 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   removing 44.5 ms of fallback, a -0.3% wash at 4096 tokens that worsens with
   depth.  Kernel census and reasoning in the revert message.
 
-Still open, in value order: B5 (lane grouping), B10 (sampled redraft), C4
-(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10b/c and the
-`attn_pack_store` retile.  B9's row-budget half, B4, C1, D1 and D2 need
-dedicated campaigns.
+Still open, in value order: B10 (sampled redraft), C4 (indexer f16 scores), C5
+(`low` fusion), C6 (`mxf4nvf4`), C10b/c and the `attn_pack_store` retile.  B9's
+row-budget half, B4, C1, D1 and D2 need dedicated campaigns.  B5 is a measured
+NO-GO (below).
 
 ### Tail review — the five commits after the external review (2026-09-11)
 
@@ -162,6 +162,47 @@ Not run: the full `make gates` battery at this tip (the branch still owes one);
 and no served A/B for the sampler entry guard -- a non-finite knob is
 unreachable through the server parser, so every served path is unchanged by
 construction.
+
+### B5 measured NO-GO — the lane split costs a weight sweep (2026-09-11)
+
+The per-member lane plan was built, gate-verified, and REFUTED by measurement.
+It replaces the group verdict with two subsets (spec-eligible and plain) and
+runs one quantum per subset in the same worker iteration.  That fixes the
+demotion -- and loses badly:
+
+| mix (192 tok each, 3 reps, greedy) | pre-B5, one shared sweep | B5 split, two sweeps |
+| --- | --- | --- |
+| 1 spec + 1 logprobs | 29.02 tok/s aggregate | 22.77 (**-22%**) |
+| 3 spec + 1 logprobs | 42.40 tok/s aggregate | 32.27 (**-24%**) |
+
+Decode is memory-bound: one M=4 sweep streams the weights once for every
+client, while the split streams them twice.  Even the SPECULATING clients lose
+(8.1 vs 11.7 tok/s at 3+1) -- the spec gain does not come close to a second
+sweep.  **The demotion was buying co-batching, not broken.**  Reverted on
+`l219-review-fixes`; the experiment is kept on branch `b5-lane-split` (`4e12f472`)
+with the probe in `pulsar-notes/probes/b5-mix-probe.py` (1+1: 22.77 vs 29.02;
+3+1: 32.27 vs 42.40).
+
+The gate is real and discriminating, which is what makes the NO-GO trustworthy:
+`tests/spec_batched_gate.py` case 5 drives a CHAT `/logprobs` partner against a
+spec decoder and fails on the pre-B5 engine
+(`A+logprobs={'spec-batched': 2, 'idle': 5, 'batched': 38}`, no drafts counted)
+while passing on the split.  Getting it to be discriminating cost two
+corrections: lane 2's metric name is `batched`, and `/v1/completions` does NOT
+honor `logprobs`, so only the chat surface can create a non-spec decoder.
+
+**If B5 is pursued, the design to try is the review's actual hint** -- base-only
+members riding the SPEC quantum in ONE sweep (`worker_spec_batched_quantum`
+tolerates them), not a second quantum.  That keeps the sweep count at one and
+is the only version that can beat the measured baseline; it is a deeper change
+(the spec rounds, the B3 readback arm, and full rows for the logprobs member
+all have to agree).
+
+**Filed separately (2026-09-11):** `/v1/completions` accepts `logprobs: true`,
+returns HTTP 200 with no logprobs payload, and keeps speculation enabled (solo
+probe: `draft_delta=61` with or without the flag).  `/v1/chat/completions` is
+correct (`draft_delta=0`, payload present).  A client on the legacy surface
+cannot tell the option was dropped -- fail-open, rules 1 and 9.
 
 ---
 
