@@ -104,3 +104,4 @@ tests/runner/
 tests/dspark_batch_gate
 /tests/engram_hash_test
 /tests/attn_layout_test
+/tests/compressor_pool_test
