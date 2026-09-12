@@ -102,18 +102,14 @@ int main(int argc, char **argv) {
         rd(want.data(), want.size() * 2, f);
 
         /* The prompt carries the block at start_pos as `vocab + role`, exactly how
-         * a renderer emits it, with ordinary text ids on either side.
-         *
-         * NOTE which position the image NAMES.  build_image_block's types are in
-         * final order and the block does not begin with IMAGE_START -- the
-         * reference prepends a compressor pad, so the START sentinel lands
-         * `start_off` slots in.  pulsar_image_ref names the SENTINEL (that is what
-         * vision_span_extent looks for), while the golden's start_pos names the
-         * BLOCK (that is what merge_image_embeddings writes at). */
-        int start_off = -1;
-        for (int i = 0; i < span_len; i++) if (types[i] == 0) { start_off = i; break; }
-        if (start_off < 0) {
-            printf("  FAIL case %u: the fixture block carries no IMAGE_START\n", c);
+         * a renderer emits it, with ordinary text ids on either side.  The
+         * golden's start_pos IS the block start -- the same thing the reference's
+         * ImageInput.start names and the same thing pulsar_image_ref.start_pos
+         * names -- so it goes in unchanged.  (The block does not begin with
+         * IMAGE_START; build_image_block prepends a compressor pad, which is why
+         * vision_span_extent scans for the sentinel rather than testing slot 0.) */
+        if (span_len <= 0) {
+            printf("  FAIL case %u: fixture block is empty\n", c);
             failures++;
             continue;
         }
@@ -133,7 +129,7 @@ int main(int argc, char **argv) {
          * left alone" is answerable. */
         std::vector<uint16_t> fill((size_t)n_tokens * n_hc * n_embd, 0xA5A5u);
         std::vector<uint16_t> back(fill.size(), 0);
-        pulsar_image_ref img = { enc.data(), enc.size(), start_pos + start_off };
+        pulsar_image_ref img = { enc.data(), enc.size(), start_pos };
         pulsar_vision_request vreq = { &img, 1, &e->vision_weights };
 
         int bad = 0;
@@ -172,6 +168,20 @@ int main(int argc, char **argv) {
                                c, start_pos + r, h);
                         bad++;
                     }
+                }
+            }
+        }
+        /* every row INSIDE the span was written.  Without this a block placed a
+         * few rows late hides behind the tolerance: the rows it fails to cover
+         * are compressor pads, whose share of the block's RMS is tiny.  A fill
+         * word in a span row means the block did not land where it claims. */
+        for (int t = start_pos; t < start_pos + span_len && !bad; t++) {
+            for (size_t i = 0; i < per_row / 2; i++) {
+                if (back[(size_t)t * per_row / 2 + i] == 0xA5A5u) {
+                    printf("  FAIL case %u: row %d inside the span was never written (word %zu)\n",
+                           c, t, i);
+                    bad++;
+                    break;
                 }
             }
         }

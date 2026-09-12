@@ -39,10 +39,13 @@ typedef enum {
 } pulsar_log_type;
 
 /** One image to place in a prompt.  `start_pos` is the token index of the
- * span's IMAGE_START sentinel: the renderer writes the span's ids as
- * `vocab_size + role` (out-of-vocab sentinels, per the reference), so they are
- * ids the tokenizer never produces and the embedder zero-masks.  `bytes`/`len`
- * are the encoded image file (PNG or JPEG). */
+ * image BLOCK's first slot -- the reference's `ImageInput.start`, i.e. the
+ * length of the prompt at the moment the block was appended.  The renderer
+ * writes the block's ids as `vocab_size + role` (out-of-vocab sentinels, per the
+ * reference), so they are ids the tokenizer never produces and the embedder
+ * zero-masks; the block begins with a compressor pad, and its IMAGE_START
+ * sentinel therefore sits a few slots in.  `bytes`/`len` are the encoded image
+ * file (PNG or JPEG). */
 typedef struct {
     const uint8_t *bytes;
     size_t         len;

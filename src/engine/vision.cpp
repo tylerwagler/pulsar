@@ -240,20 +240,37 @@ void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_
     }
 }
 
-/* The sentinel span that BEGINS at `start_pos`, or 0 when the ids there are not
- * an IMAGE_START..IMAGE_END span.  This is the one place the sentinel ROLES are
- * turned into token ids for a scan, so the chunk planner (which must not split a
- * span) and the merge (which must place it) read the same rule; the ids
- * themselves are written by whoever builds the prompt. */
+/* The image sentinel BLOCK beginning at `start_pos`, or 0 when the ids there are
+ * not such a block.  `*len_out` is the BLOCK length -- what
+ * merge_image_embeddings writes and what the chunk planner must not split.
+ *
+ * The block does NOT begin with IMAGE_START: build_image_block prepends a
+ * compressor pad whose count depends on the position, so `start_pos` is the
+ * block's first slot and the START sentinel lands `compress_pad` slots in.  That
+ * is also the reference's own convention -- `ImageInput.start` is `len(tokens)`
+ * at the moment the block is appended, and `h[i, img.start:img.start+len]` is
+ * where the merged block goes.  Naming the START sentinel here instead would
+ * place the block `compress_pad` rows late, which is a real bug: the leading pad
+ * rows are a small part of the block, so a tolerance-based grade can miss it.
+ *
+ * This is the one place the sentinel ROLES are turned into token ids for a scan,
+ * so the chunk planner and the merge cannot disagree about where a block ends. */
 int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out) {
     if (!ids || !len_out || start_pos < 0 || start_pos >= n) return 0;
+    const int32_t pad_id   = (int32_t)n_vocab + VISION_T_IMAGE_PAD;
     const int32_t start_id = (int32_t)n_vocab + VISION_T_IMAGE_START;
     const int32_t end_id   = (int32_t)n_vocab + VISION_T_IMAGE_END;
-    if (ids[start_pos] != start_id) return 0;
-    for (int i = start_pos + 1; i < n; i++) {
+    int seen_start = 0;
+    for (int i = start_pos; i < n; i++) {
+        if (!seen_start) {
+            if (ids[i] == start_id) { seen_start = 1; continue; }
+            /* only compressor pads may precede the START inside the block */
+            if (ids[i] != pad_id) return 0;
+            continue;
+        }
         if (ids[i] == end_id) { *len_out = i - start_pos + 1; return 1; }
     }
-    return 0;   /* a START with no END is not a span the engine will merge */
+    return 0;   /* no START, or a START with no END: not a block we will merge */
 }
 
 /* The reference's `width = min(seqlen, window_size + max_image_tokens)`: the

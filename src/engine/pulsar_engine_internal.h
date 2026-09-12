@@ -2374,10 +2374,12 @@ typedef struct {
 int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
                          int start_pos, int vocab_size, pulsar_vision_prepared *out);
 void vision_prepared_free(pulsar_vision_prepared *p);
-/** The sentinel span beginning at `start_pos` (IMAGE_START..IMAGE_END), or 0 if
- * the ids there are not such a span.  `*len_out` receives its length.  The ONE
- * place the sentinel roles are resolved for a scan, so the chunk planner and the
- * merge cannot disagree about where a span ends. */
+/** The image sentinel BLOCK beginning at `start_pos` (the reference's
+ * ImageInput.start: the block's first slot, which is a compressor pad, with the
+ * IMAGE_START sentinel a few slots in).  `*len_out` receives the BLOCK length --
+ * what merge_image_embeddings writes and what the chunk planner must not split.
+ * Returns 0 if the ids there are not such a block.  The ONE place the sentinel
+ * roles are resolved for a scan. */
 int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
 
 /** The reference's get_image_visible(): per-token visible counts to the
