@@ -306,6 +306,17 @@ dropped with the reason.
   (`mxfp8_quant_act_kernel`) is 29.1 ms / **0.9%** of a 4000-ctx prefill, plus
   the GEMM's f32 store of `low` -- so the honest ceiling is ~1-1.5%, not the
   0.1% a byte-count gives.
+  **Recon (2026-09-12): there is no byte-identical version, so C5 is a graded
+  fidelity move, not a moved emit.**  The "a" projection is a cuBLASLt
+  block-scaled MXFP8 GEMM (`cuda_attention_output_a_mx_gemm`,
+  `matmul.cu:1595`) whose algorithm is PINNED per (group_dim, rank, n_groups)
+  for determinism (L195).  cuBLASLt cannot emit E4M3, so fusing the encoding
+  means REPLACING that GEMM with a CUTLASS block-scaled arm -- a different
+  accumulation order, so `low` and every downstream logit move.  The cheaper
+  `f16 low` partial is no better: f16 rounds before the E4M3 crush and the
+  32-wide block max (hence the E8M0 scale) moves with it.  Both need the
+  reference grade and may not stay within budget, for ~0.5-1%.  Scoped as its
+  own item with the grade FIRST; not an unattended landing.
 - **C1 (expert recipe tier imbalance) -- census RE-RUN; do not re-solve on it.**
   Fresh `nsys cuda_gpu_kern_sum`, 4000 ctx, `--gen-tokens 0`, story prompt
   (total ~3.28 s; raw in
