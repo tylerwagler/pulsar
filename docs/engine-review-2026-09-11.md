@@ -52,6 +52,13 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 - **Locked-clock deltas vs `d6d3feb`** (pulsar-bench, teacher_forced_corpus,
   two stable rounds): prefill **+5.2% @4096** and **+5.4% @8192**; decode
   **+1.8% @2048** and **+2.0% @8192**.
+- **Plain decode census on the current tree** (nsys, 8k and 28k decode
+  windows): dense A8 GEMVs 39.6%, bf16 GEMVs 15.2% (the 1 GB BF16 output head
+  alone is 4.15 ms/token at 94% of roofline), grouped A8 12.3%, IQ2 GEMV
+  10.7%, MXFP4 experts 10.0%, attention 3.3%, indexer scorer <0.5% even at
+  28k.  Plain decode is at the memory roofline; the actionable items were the
+  top-k dispatch and the serving pool, both landed above (C10d: CUB top-k
+  +0.8% @8k; pool cap 8 -> 16: +10.8% 12-way aggregate, no stalls at 16-way).
 
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
 - A2 payload digest, format v10 (`117541f7`; fmemopen terminator fix `1cd0f145`)
@@ -72,14 +79,20 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 - C7 block-parallel softmax (bit-exact; runtime-bound fix `09228ff9`)
 - C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
 - C9 refuted — already covered at block granularity (`8c67aeb0`)
+- C10d indexer top-k uses CUB for 1025..4095 too (measured +0.8% @8k decode)
+  (`3af5220b`)
+- B9 (pool-cap half): bank-pool auto-cap raised 8 -> 16 after the requested
+  re-measure (+10.8% 12-way aggregate, no TTFT stalls; 16-way 56.5 t/s)
+  (`a8faa620`)
 - C10a (indexed prefill gact/rope fusion) — **MEASURED NO-GO 2026-09-11** and
   reverted (`bedc2744`): the in-kernel epilogue costs attention +31.4 ms while
   removing 44.5 ms of fallback, a -0.3% wash at 4096 tokens that worsens with
   depth.  Kernel census and reasoning in the revert message.
 
 Still open, in value order: B5 (lane grouping), B10 (sampled redraft), C4
-(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10b/c/d and the
-`attn_pack_store` retile.  B4, B9, C1, D1 and D2 need dedicated campaigns.
+(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10b/c and the
+`attn_pack_store` retile.  B9's row-budget half, B4, C1, D1 and D2 need
+dedicated campaigns.
 
 ---
 
