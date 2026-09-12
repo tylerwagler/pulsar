@@ -237,6 +237,7 @@ void server::close_resources() {
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_mutex_destroy(&s->capture_mu);
+    pthread_cond_destroy(&s->stream_cv);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
@@ -1003,6 +1004,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
+    pthread_cond_init(&s.stream_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     pthread_mutex_init(&s.capture_mu, NULL);
@@ -1103,6 +1105,11 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&s.mu);
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
+    /* /metrics/stream subscribers are parked on their own condition and are
+     * not woken by `cv`. Without this they would sleep out a full keepalive
+     * interval each before noticing, and the client drain below would wait on
+     * them — a shutdown that hangs for as long as the slowest keepalive. */
+    pthread_cond_broadcast(&s.stream_cv);
     pthread_mutex_unlock(&s.mu);
     pthread_join(worker, NULL);
     {

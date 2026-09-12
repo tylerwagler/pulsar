@@ -270,7 +270,8 @@ bool server::send_root(int fd) {
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
-        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\"]}\n",
+        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\","
+        "\"/metrics/stream\"]}\n",
         PULSAR_VERSION_STR);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -666,6 +667,123 @@ bool server::send_metrics(int fd) {
 
 
 
+/* ── /metrics/stream ───────────────────────────────────────────────────────
+ *
+ * Polling, inverted: instead of a client asking /metrics twenty times a second
+ * whether anything changed, it opens one connection and is told.
+ *
+ * Polling is unusually expensive here. Every response closes its connection
+ * (http_response hard-codes `Connection: close`) and the accept loop spawns a
+ * thread per connection against a client cap shared with real requests, so a
+ * 20 Hz scraper costs twenty handshakes and twenty thread creations per second
+ * on the machine it is measuring. One stream subscriber costs one thread for
+ * the life of the subscription and nothing at all in between.
+ *
+ * The event carries the generation and nothing else. Shipping the exposition
+ * body on every publish would be ~12 KiB per event, worse than the polling it
+ * replaces, so the client fetches /metrics itself when the generation moves —
+ * once per publish instead of twenty times per publish. */
+
+bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
+                         const unsigned long long *generation, const bool *stop,
+                         int keepalive_ms) {
+    unsigned long long last = 0;
+    bool sent = false;
+
+    for (;;) {
+        bool keepalive = false;
+        unsigned long long gen;
+
+        pthread_mutex_lock(mu);
+        if (*stop) {
+            pthread_mutex_unlock(mu);
+            return true;
+        }
+        gen = *generation;
+
+        if (sent && gen == last) {
+            /* Nothing published since the last frame. Wait for the worker to
+             * publish, or for long enough that the connection has to be
+             * proved still alive — whichever comes first. */
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += keepalive_ms / 1000;
+            deadline.tv_nsec += (long)(keepalive_ms % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec += 1;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(cv, mu, &deadline);
+
+            if (*stop) {
+                pthread_mutex_unlock(mu);
+                return true;
+            }
+            gen = *generation;
+            keepalive = (gen == last);
+        }
+        pthread_mutex_unlock(mu);
+
+        /* The write happens with mu released, and that is the whole of the
+         * no-backpressure argument: send_all bounds itself with its own
+         * deadline and returns false for a wedged reader, and while it is
+         * waiting no lock is held, so the worker publishing the next snapshot
+         * never queues behind a slow client. */
+        buf b = {0};
+        if (keepalive) {
+            /* An SSE comment: every parser skips it, and it keeps the socket
+             * warm through proxy idle timeouts. */
+            buf_puts(&b, ": keepalive\n\n");
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            buf_puts(&b, "event: metrics\ndata: {\"generation\":");
+            buf_printf(&b, "%llu", gen);
+            buf_puts(&b, ",\"t\":");
+            buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
+            buf_puts(&b, "}\n\n");
+            last = gen;
+            sent = true;
+        }
+        bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) return false;   /* client gone, or shutdown: send_all checks */
+    }
+}
+
+
+
+bool server::send_metrics_stream(int fd) {
+    auto *s = this;
+
+    pthread_mutex_lock(&s->mu);
+    const bool at_cap = s->stream_clients >= PULSAR_SERVER_MAX_STREAMS;
+    if (!at_cap) s->stream_clients++;
+    pthread_mutex_unlock(&s->mu);
+
+    if (at_cap) {
+        /* Refused rather than queued: a scraper that cannot stream should fall
+         * back to polling, which this server still serves. Blocking here would
+         * just move the queueing somewhere less visible. */
+        http_error(fd, 503, "too many metric streams");
+        return false;
+    }
+
+    bool ok = sse_headers(fd);
+    if (ok) {
+        ok = metrics_stream_pump(fd, &s->mu, &s->stream_cv,
+                                 &s->metrics_generation, &s->stopping,
+                                 PULSAR_METRICS_STREAM_KEEPALIVE_MS);
+    }
+
+    pthread_mutex_lock(&s->mu);
+    if (s->stream_clients > 0) s->stream_clients--;
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
+
+
 void server::client_done() {
     auto *s = this;
     pthread_mutex_lock(&s->mu);
@@ -725,6 +843,13 @@ void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
         s->send_metrics(fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    /* Blocks for the life of the subscription, which is why it gets its own
+     * cap and its own thread rather than sharing the request path. */
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics/stream")) {
+        s->send_metrics_stream(fd);
         http_request_free(&hr);
         goto done;
     }

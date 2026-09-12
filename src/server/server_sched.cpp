@@ -1383,6 +1383,13 @@ void server::publish_metrics_snapshot() {
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
     s->m_decode_lane = s->w_decode_lane;
+    /* Bump and wake the /metrics/stream subscribers. A generation counter
+     * rather than a payload comparison on purpose: "did anything move" over a
+     * dozen fields is exactly the check pulsar-gui got wrong, because the
+     * derived rates are window-relative and differ on every sample even when
+     * nothing happened. The worker already knows when it published. */
+    s->metrics_generation++;
+    pthread_cond_broadcast(&s->stream_cv);
     pthread_mutex_unlock(&s->mu);
 }
 

@@ -76,6 +76,17 @@
 #define PULSAR_SERVER_MAX_CLIENTS 64
 #define PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
+/* Long-lived /metrics/stream subscribers, capped separately from
+ * PULSAR_SERVER_MAX_CLIENTS. A stream holds its connection (and its thread)
+ * until the client goes away, so sharing the request budget would let a couple
+ * of idle dashboards lock real requests out of the server. */
+#define PULSAR_SERVER_MAX_STREAMS 8
+
+/* Silence on the stream for this long means the connection is unverified, so
+ * the pump sends an SSE comment. Comfortably inside the idle timeouts of the
+ * proxies and NATs this is expected to run behind. */
+#define PULSAR_METRICS_STREAM_KEEPALIVE_MS 15000
+
 /* Multi-session serving increment 2: the worker steps each job as a resumable
  * state machine in bounded quanta instead of running it to completion. A
  * decode quantum yields back to the worker loop once it has emitted at least
@@ -1316,11 +1327,22 @@ struct server {
     pthread_mutex_t mu;          ///< guards the queue, client count, and every published metric
     pthread_cond_t cv;           ///< wakes the worker when a job is enqueued or state changes
     pthread_cond_t clients_cv;   ///< signals shutdown waiters as clients drain
+    /** Broadcast on every metrics publish and once at shutdown, waking
+     * /metrics/stream waiters. Separate from `cv` on purpose: `cv` wakes the
+     * single worker thread, and waking it on every metrics publish would spin
+     * it against an empty queue for no reason. */
+    pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
     bool stopping;               ///< shutdown in progress; stop accepting and drain
     time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;                 ///< connected clients, for the shutdown drain
+    int stream_clients;          ///< live /metrics/stream subscribers (under mu)
+    /** Bumped by publish_metrics_snapshot on every publish. A stream client
+     * waits for this to change rather than for anything in the payload: the
+     * snapshot is a dozen fields, and comparing it to decide "did anything
+     * move" is exactly the mistake pulsar-gui made and had to undo. */
+    unsigned long long metrics_generation;
     /** /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots
      * (0..n_slots, time-sliced by the single worker). m_* are cumulative
@@ -1464,6 +1486,10 @@ struct server {
      * vLLM-oriented scraper ignores them.
      */
     bool send_metrics(int fd);
+    /** GET /metrics/stream: hold the connection open and emit one SSE frame
+     * per metrics publish. Returns false if the client went away or the
+     * stream cap was already reached. */
+    bool send_metrics_stream(int fd);
     /** Drop the connected-client count and signal anyone waiting on the
      * shutdown drain. Called from client threads. */
     void client_done();
@@ -2532,6 +2558,19 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen);
 bool send_all(int fd, const void *p, size_t n);
+
+/* Emit one `event: metrics` frame per change of *generation, plus a `: keepalive`
+ * comment whenever nothing has changed for keepalive_ms, until the client goes
+ * away or *stop becomes true. Return false only when a write failed (the
+ * client is gone); a shutdown-driven exit returns true.
+ *
+ * Deliberately a free function taking no server and no engine: it is the part
+ * with the interesting failure modes — a missed wakeup, a keepalive that never
+ * fires, a shutdown that hangs the drain — and this signature is what lets all
+ * three be tested over a socketpair without a GPU. */
+bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
+                         const unsigned long long *generation, const bool *stop,
+                         int keepalive_ms);
 void json_escape(buf *b, const char *s);
 void json_escape_n(buf *b, const char *s, size_t n);
 void json_escape_fragment_n(buf *b, const char *s, size_t n);
