@@ -18,10 +18,12 @@ requires before the lane lands on dev:
                  lane tail, which is a different arithmetic and would fail
                  this check spuriously -- L043).
   4. HEALTH      no degenerate repetition in any stream; finishes are sane.
-  5. B5          a /logprobs partner overlapping a spec decoder leaves that
-                 decoder on lane 3 with the spec counters advancing; the
-                 partner itself goes plain (it cannot speculate) and still
-                 returns its logprobs payload.
+  5. B5          a /logprobs partner (CHAT endpoint -- the legacy completions
+                 surface accepts logprobs and ignores it, so it cannot make a
+                 decoder non-spec) overlapping a spec decoder leaves that
+                 decoder on lane 3 with the spec counters advancing and lane
+                 "batched" never observed; the partner itself goes plain and
+                 still returns its logprobs payload.
 
 Cross-LANE byte equality is deliberately NOT asserted (L043): the solo run
 is captured and printed as information only.
@@ -63,23 +65,30 @@ def active_lane(txt):
     return "?"
 
 
-def complete(base, prompt, max_tokens, slot, logprobs=False):
-    body = {"prompt": prompt, "max_tokens": max_tokens,
-            "temperature": 0.0, "stream": False}
+def complete(base, prompt, max_tokens, slot, logprobs=False, chat=False):
+    if chat:
+        body = {"messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens, "temperature": 0.0, "stream": False}
+    else:
+        body = {"prompt": prompt, "max_tokens": max_tokens,
+                "temperature": 0.0, "stream": False}
     if logprobs:
         body["logprobs"] = True
         body["top_logprobs"] = 3
-    req = urllib.request.Request(base + "/v1/completions", data=json.dumps(body).encode(),
+    path = "/v1/chat/completions" if chat else "/v1/completions"
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         j = json.loads(r.read().decode())
-    slot["text"] = j["choices"][0]["text"]
+    ch = j["choices"][0]
+    slot["text"] = ((ch.get("message") or {}).get("content", "") if chat else ch["text"])
     slot["n"] = j.get("usage", {}).get("completion_tokens", -1)
-    slot["finish"] = j["choices"][0].get("finish_reason")
-    slot["logprobs"] = j["choices"][0].get("logprobs")
+    slot["finish"] = ch.get("finish_reason")
+    slot["logprobs"] = ch.get("logprobs")
 
 
-def run_pair(base, prompt_partner, partner_logprobs=False):
+def run_pair(base, prompt_partner, partner_logprobs=False, partner_chat=False,
+             a_tokens=A_TOKENS, p_tokens=PARTNER_TOKENS):
     a, p = {}, {}
     lanes, stop = {}, [False]
 
@@ -95,9 +104,10 @@ def run_pair(base, prompt_partner, partner_logprobs=False):
     c0 = counters(metrics(base))
     poller = threading.Thread(target=poll)
     poller.start()
-    ta = threading.Thread(target=complete, args=(base, PROMPT_A, A_TOKENS, a))
+    ta = threading.Thread(target=complete, args=(base, PROMPT_A, a_tokens, a))
     tp = threading.Thread(target=complete,
-                          args=(base, prompt_partner, PARTNER_TOKENS, p, partner_logprobs))
+                          args=(base, prompt_partner, p_tokens, p,
+                                partner_logprobs, partner_chat))
     ta.start(); tp.start(); ta.join(); tp.join()
     stop[0] = True; poller.join()
     c1 = counters(metrics(base))
@@ -154,26 +164,29 @@ def main():
             if not (0 < accepted <= drafted):
                 failures.append("%s: accepted/drafted contract violated (%d/%d)" % (tag, accepted, drafted))
 
-        # B5: a /logprobs partner must NOT demote the spec-capable decoder.  The
-        # logprobs request itself genuinely cannot speculate -- the fused step
-        # keeps each draft's target row only inside its batch, so there is no
-        # correct distribution to report for an accepted draft -- but that is a
-        # property of THE REQUEST.  Lane select used to be a GROUP verdict
-        # ("every gathered decoder spec-enabled"), so this pair ran both members
-        # on the plain lane and the spec counters never advanced; post-fix the
-        # partner goes plain and A keeps speculating.  A3 is deliberately NOT
-        # compared to A1: with a logprobs partner A is the whole spec subset
-        # (M=1) instead of one of two banks (M=2), and cross-M equality is not
-        # an invariant (L043).
-        a3, l3, lanes3, d3 = run_pair(base, PROMPT_B, partner_logprobs=True)
+        # B5: a /logprobs decoder must NOT demote the spec-capable decoder.  The
+        # logprobs surface is the CHAT endpoint: /v1/completions accepts
+        # `logprobs: true`, silently ignores it and stays spec-capable (its
+        # response carries no payload either), so a completions partner cannot
+        # create the condition at all.  A outlasts the partner, so post-fix
+        # lane 3 holds for the whole pair; pre-fix both members are
+        # plain-batched ("batched") and A latches there for the rest of its
+        # request -- lane 3 is never observed and no drafts are counted.
+        # A3 is deliberately NOT compared to A1 (cross-M equality is not an
+        # invariant, L043).
+        a3, l3, lanes3, d3 = run_pair(base, PROMPT_B, partner_logprobs=True,
+                                      partner_chat=True, a_tokens=200, p_tokens=120)
         if lanes3.get("spec-batched", 0) < 3:
             failures.append("B5 /logprobs partner: lane spec-batched barely/never engaged (%s) "
                             "-- a logprobs decoder demoted its group" % lanes3)
+        if lanes3.get("batched", 0) > 0:
+            failures.append("B5 /logprobs partner: lane batched observed (%s) -- the spec "
+                            "decoder was demoted while the logprobs request decoded" % lanes3)
         if d3.get("spec_decode_num_draft_tokens_total", 0) <= 0:
             failures.append("B5 /logprobs partner: no draft tokens counted while a "
                             "/logprobs request was decoding")
         if not l3.get("logprobs"):
-            failures.append("B5 /logprobs partner: response carried no logprobs payload")
+            failures.append("B5 /logprobs partner: chat response carried no logprobs payload")
 
         emitted1 = a1.get("n", 0) + p1.get("n", 0)
         gen1 = d1.get("spec_decode_gen_tokens_total", 0)
