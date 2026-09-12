@@ -101,8 +101,8 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   depth.  Kernel census and reasoning in the revert message.
 
 Every item that was still open now has a recorded verdict; see the autonomous
-pass section at the end of this block.  Short form: B5 measured NO-GO (lane
-split costs a sweep); B10 deferred (no bounded win); C4 deferred (indexer
+pass section at the end of this block.  Short form: B5 measured NO-GO twice (the
+two-quantum split -22%/-24%, the single-sweep -4.8%/-14.1%; the demotion stands); B10 deferred (no bounded win); C4 deferred (indexer
 complex ~2%); C5 scoped (measured 0.9% kernel, needs a CUTLASS E4M3 epilogue);
 C6 scoped (instrument-first campaign, selection now graded); C10b/c deferred
 (L209 refuted launch-count items); B4 premise corrected (MAX stays 5, only
@@ -205,6 +205,31 @@ tolerates them), not a second quantum.  That keeps the sweep count at one and
 is the only version that can beat the measured baseline; it is a deeper change
 (the spec rounds, the B3 readback arm, and full rows for the logprobs member
 all have to agree).
+
+**Follow-up (2026-09-12): the single-sweep design was BUILT and MEASURED --
+also a NO-GO.**  `server_plan_decode_lanes` admits a spec-disabled member into
+the spec subset; it runs K=0 there (`round_begin` gets `accepted_cap = 1` and
+the batched redraft list skips it, so it never grows pendings), and its base
+token is captured with `logprob_capture_session` at the base-sample point the
+plain lane uses, which the shared emit path (`gen_emit_token` ->
+`logprob_commit`) already commits.  It WORKS: solo `chat logprobs=true` is
+non-spec (`draft_delta=0`) with its payload present and zero missing-capture
+warnings, and `spec_batched_gate` case 5 PASSES -- lane 3 observed, lane
+`batched` never, drafts advancing, payload present.  But it LOSES:
+
+| mix (192 tok each, 3 reps) | pre-B5 (demote, one plain sweep) | single-sweep | delta |
+| --- | --- | --- | --- |
+| 1 spec + 1 logprobs | 28.93 tok/s aggregate | 27.54 | **-4.8%** |
+| 3 spec + 1 logprobs | 42.80 tok/s aggregate | 36.75 | **-14.1%** |
+
+The spec member speeds up (21 vs 14 tok/s at 1+1) but the base-only member
+slows more (13.8 vs 14.2; 9.2 vs 10.6 at 3+1), and the pair is bottlenecked by
+it.  An earlier run appeared to WIN (+30%) only because the logprobs member was
+being DRAFTED -- invalid, and the new missing-capture guard caught it.  Reverted
+with the numbers; both redesigns are kept on branches (`b5-lane-split`,
+`b5-single-sweep`).  **The demotion stands as the measured optimum**: on this
+memory-bound engine, co-batching the logprobs member beats speculating its
+neighbours when it is the slower half of the pair.
 
 **Fixed (2026-09-11, `867e06fc`):** `/v1/completions` used to accept
 `logprobs: true`, return HTTP 200 with no logprobs payload, and keep

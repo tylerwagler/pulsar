@@ -18,12 +18,6 @@ requires before the lane lands on dev:
                  lane tail, which is a different arithmetic and would fail
                  this check spuriously -- L043).
   4. HEALTH      no degenerate repetition in any stream; finishes are sane.
-  5. B5          a /logprobs partner (CHAT endpoint -- the legacy completions
-                 surface accepts logprobs and ignores it, so it cannot make a
-                 decoder non-spec) overlapping a spec decoder leaves that
-                 decoder on lane 3 with the spec counters advancing and lane
-                 "batched" never observed; the partner itself goes plain and
-                 still returns its logprobs payload.
 
 Cross-LANE byte equality is deliberately NOT asserted (L043): the solo run
 is captured and printed as information only.
@@ -65,30 +59,19 @@ def active_lane(txt):
     return "?"
 
 
-def complete(base, prompt, max_tokens, slot, logprobs=False, chat=False):
-    if chat:
-        body = {"messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens, "temperature": 0.0, "stream": False}
-    else:
-        body = {"prompt": prompt, "max_tokens": max_tokens,
-                "temperature": 0.0, "stream": False}
-    if logprobs:
-        body["logprobs"] = True
-        body["top_logprobs"] = 3
-    path = "/v1/chat/completions" if chat else "/v1/completions"
-    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+def complete(base, prompt, max_tokens, slot):
+    body = json.dumps({"prompt": prompt, "max_tokens": max_tokens,
+                       "temperature": 0.0, "stream": False}).encode()
+    req = urllib.request.Request(base + "/v1/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         j = json.loads(r.read().decode())
-    ch = j["choices"][0]
-    slot["text"] = ((ch.get("message") or {}).get("content", "") if chat else ch["text"])
+    slot["text"] = j["choices"][0]["text"]
     slot["n"] = j.get("usage", {}).get("completion_tokens", -1)
-    slot["finish"] = ch.get("finish_reason")
-    slot["logprobs"] = ch.get("logprobs")
+    slot["finish"] = j["choices"][0].get("finish_reason")
 
 
-def run_pair(base, prompt_partner, partner_logprobs=False, partner_chat=False,
-             a_tokens=A_TOKENS, p_tokens=PARTNER_TOKENS):
+def run_pair(base, prompt_partner):
     a, p = {}, {}
     lanes, stop = {}, [False]
 
@@ -104,10 +87,8 @@ def run_pair(base, prompt_partner, partner_logprobs=False, partner_chat=False,
     c0 = counters(metrics(base))
     poller = threading.Thread(target=poll)
     poller.start()
-    ta = threading.Thread(target=complete, args=(base, PROMPT_A, a_tokens, a))
-    tp = threading.Thread(target=complete,
-                          args=(base, prompt_partner, p_tokens, p,
-                                partner_logprobs, partner_chat))
+    ta = threading.Thread(target=complete, args=(base, PROMPT_A, A_TOKENS, a))
+    tp = threading.Thread(target=complete, args=(base, prompt_partner, PARTNER_TOKENS, p))
     ta.start(); tp.start(); ta.join(); tp.join()
     stop[0] = True; poller.join()
     c1 = counters(metrics(base))
@@ -164,30 +145,6 @@ def main():
             if not (0 < accepted <= drafted):
                 failures.append("%s: accepted/drafted contract violated (%d/%d)" % (tag, accepted, drafted))
 
-        # B5: a /logprobs decoder must NOT demote the spec-capable decoder.  The
-        # logprobs surface is the CHAT endpoint: /v1/completions accepts
-        # `logprobs: true`, silently ignores it and stays spec-capable (its
-        # response carries no payload either), so a completions partner cannot
-        # create the condition at all.  A outlasts the partner, so post-fix
-        # lane 3 holds for the whole pair; pre-fix both members are
-        # plain-batched ("batched") and A latches there for the rest of its
-        # request -- lane 3 is never observed and no drafts are counted.
-        # A3 is deliberately NOT compared to A1 (cross-M equality is not an
-        # invariant, L043).
-        a3, l3, lanes3, d3 = run_pair(base, PROMPT_B, partner_logprobs=True,
-                                      partner_chat=True, a_tokens=200, p_tokens=120)
-        if lanes3.get("spec-batched", 0) < 3:
-            failures.append("B5 /logprobs partner: lane spec-batched barely/never engaged (%s) "
-                            "-- a logprobs decoder demoted its group" % lanes3)
-        if lanes3.get("batched", 0) > 0:
-            failures.append("B5 /logprobs partner: lane batched observed (%s) -- the spec "
-                            "decoder was demoted while the logprobs request decoded" % lanes3)
-        if d3.get("spec_decode_num_draft_tokens_total", 0) <= 0:
-            failures.append("B5 /logprobs partner: no draft tokens counted while a "
-                            "/logprobs request was decoding")
-        if not l3.get("logprobs"):
-            failures.append("B5 /logprobs partner: chat response carried no logprobs payload")
-
         emitted1 = a1.get("n", 0) + p1.get("n", 0)
         gen1 = d1.get("spec_decode_gen_tokens_total", 0)
         if gen1 != emitted1:
@@ -198,7 +155,7 @@ def main():
                      min(len(a1.get("text", "")), len(a2.get("text", ""))))
             failures.append("BANK ISOLATION: A's greedy text depends on its partner (first divergence at char %d)" % i)
 
-        for tag, s in (("A1", a1), ("A2", a2), ("B", p1), ("C", p2), ("A3", a3), ("L3", l3)):
+        for tag, s in (("A1", a1), ("A2", a2), ("B", p1), ("C", p2)):
             if degenerate(s.get("text", "")):
                 failures.append("%s: degenerate repetition" % tag)
             if s.get("finish") not in ("length", "stop"):
@@ -208,7 +165,7 @@ def main():
         complete(base, PROMPT_A, A_TOKENS, solo)
         print("informational: solo-vs-batched A %s (cross-lane equality NOT asserted, L043)"
               % ("IDENTICAL" if solo.get("text") == a1.get("text") else "differs"))
-        print("lanes A+B=%s A+C=%s A+logprobs=%s | counters A+B=%s" % (lanes1, lanes2, lanes3, d1))
+        print("lanes A+B=%s A+C=%s | counters A+B=%s" % (lanes1, lanes2, d1))
 
         if failures:
             for f in failures:
@@ -216,7 +173,7 @@ def main():
             print("spec-batched lane gate: FAIL (%d)" % len(failures))
             return 1
         print("spec-batched lane gate: PASS (engagement, counter contract, "
-              "bank isolation across partners, B5 logprobs coexistence, health)")
+              "bank isolation across partners, health)")
         return 0
     finally:
         try:
