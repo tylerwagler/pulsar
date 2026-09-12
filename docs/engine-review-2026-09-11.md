@@ -99,14 +99,25 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   reverted (`bedc2744`): the in-kernel epilogue costs attention +31.4 ms while
   removing 44.5 ms of fallback, a -0.3% wash at 4096 tokens that worsens with
   depth.  Kernel census and reasoning in the revert message.
+- B4 overflow row price: **LANDED 2026-09-12** (`366472a3`).  The spec lane's
+  overflow K-allocator read a private 6.0 ms row price while L214's refit
+  measured 7.17 ms/row and landed it as the quench's row term.  L136's
+  "dormant" verdict was at the retired 2-session spec cap; L118 + the L219 pool
+  cap wake it.  Overflow A/B (sparky, N concurrent sampled prose clients): the
+  cut prices more rows (conc 8: 41 -> 145 mean/run) with aggregate t/s flat
+  (means 54.22 vs 54.30 across 6/8/12/16) and a conc-8 ladder plateau within
+  0.85% over [3, 9] ms, while a 30 ms positive control costs 12-19%.  The price
+  is now one fact, `PULSAR_SPEC_ROW_MS` (`pulsar.h`), read by both consumers;
+  raw data in `pulsar-notes/gate-baseline/l219-b4-rowprice/RESULTS.md`.
 
 Every item that was still open now has a recorded verdict; see the autonomous
 pass section at the end of this block.  Short form: B5 measured NO-GO twice (the
 two-quantum split -22%/-24%, the single-sweep -4.8%/-14.1%; the demotion stands); B10 deferred (no bounded win); C4 deferred (indexer
 complex ~2%); C5 scoped (measured 0.9% kernel, needs a CUTLASS E4M3 epilogue);
 C6 scoped (instrument-first campaign, selection now graded); C10b/c deferred
-(L209 refuted launch-count items); B4 premise corrected (MAX stays 5, only
-`marginal_ms` is stale); B9 correctness-bound (row-kind neutrality above 16);
+(L209 refuted launch-count items); B4 premise corrected (MAX stays 5) and its
+stale `marginal_ms` LANDED as one fact (`366472a3`, overflow A/B flat); B9
+correctness-bound (row-kind neutrality above 16);
 C1 census re-run (old ~984 ms estimate refuted); D1 recommended (v41 template,
 quality decision); D2 CLOSED (owed KL run, no drift); `attn_pack_store` retile
 measured negligible.  Two real fixes fell out of the pass and LANDED:
@@ -290,6 +301,19 @@ dropped with the reason.
   disagreement about the same quantity.  It binds only under row-budget
   overflow, so the change needs an overflow A/B (demand > the 16-row budget)
   before it lands, not an assertion.
+  **A/B done and LANDED 2026-09-12 (`366472a3`).**  L136's dormant verdict was
+  measured at the retired 2-session spec cap; L118 deleted that cap and L219
+  raised the pool auto-cap to 16, and the counters now fire (conc 6: 74-105
+  overflow rounds, 63-183 rows cut at 6.0).  At sparky with N concurrent
+  sampled prose clients: raising the price to 7.17 prices more rows (conc 8,
+  mean/run 41 -> 145) while aggregate t/s is flat -- means 54.22 vs 54.30
+  across 6/8/12/16 banks -- and a conc-8 ladder (3.0/6.0/7.17/9.0, 5 reps
+  each) lands on one plateau within 0.85% (52.09/52.53/52.14/52.29 t/s).  A
+  30 ms positive control costs 12-19%, so the mechanism is live and 7.17 sits
+  well inside the safe region.  The constant is now ONE fact,
+  `PULSAR_SPEC_ROW_MS` (`pulsar.h`), read by both the allocator and the
+  quench; the private 6.0f copy and the stale ROWCOST comment are gone.  Raw
+  data: `pulsar-notes/gate-baseline/l219-b4-rowprice/RESULTS.md`.
 - **C5 (attn-out `low` re-quantized) -- SCOPED, and the best prefill item left.**
   `emit_low_e4m3` (`matmul.cu:2782`) is a deliberate separate pass: "the warp
   that reduces a row does not hold that row's block neighbours", so the fused
