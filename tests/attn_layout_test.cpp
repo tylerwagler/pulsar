@@ -41,17 +41,6 @@
 
 static unsigned g_checks, g_failures;
 
-static const char *mode_name(pulsar_attn_mode m) {
-    switch (m) {
-    case PULSAR_ATTN_WINDOW:         return "WINDOW";
-    case PULSAR_ATTN_FULL:           return "FULL";
-    case PULSAR_ATTN_REINDEX:        return "REINDEX";
-    case PULSAR_ATTN_REUSE:          return "REUSE";
-    case PULSAR_ATTN_FULL_UNINDEXED: return "FULL_UNINDEXED";
-    }
-    return "?";
-}
-
 static void check(int ok, const char *what, unsigned il, const char *detail) {
     g_checks++;
     if (ok) return;
@@ -134,7 +123,7 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
         else if (il < 40)                        want_mode = V41_WANT[il];
 
         char detail[160];
-        snprintf(detail, sizeof detail, "got %s, want %s -- %s", mode_name(a->mode), mode_name(want_mode), why);
+        snprintf(detail, sizeof detail, "got %s, want %s -- %s", pulsar_attn_mode_name(a->mode), pulsar_attn_mode_name(want_mode), why);
         check(a->mode == want_mode, "wrong attention mode", il, detail);
 
         /* The compressor's STATE geometry must follow coff (pulsar_compress_coff),
@@ -142,7 +131,7 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
          * numbers rather than by re-deriving the formula, so a change to the
          * formula that keeps the two sites agreeing still has to face this. */
         {
-            const uint32_t w    = pulsar_comp_state_width(a->ratio, (uint32_t)shape->n_head_dim);
+            const uint32_t w    = pulsar_comp_row_width(a->ratio, (uint32_t)shape->n_head_dim);
             const uint32_t rows = a->ratio > 1u ? pulsar_comp_state_rows(a->ratio) : 0u;
             const uint32_t hd   = (uint32_t)shape->n_head_dim;
             uint32_t want_w = hd, want_rows = a->ratio > 1u ? a->ratio : 0u;
@@ -195,12 +184,12 @@ int main(void) {
     const pulsar_layer_attn *hca = pulsar_layer_attn_layout(3);
     check(hca->ratio == 128, "layer 3 should be 0731's first ratio-128 HCA layer", 3, "ratio");
     check(hca->index_source == 2, "layer 3's index source is the last even layer", 3, "index_source");
-    check(hca->mode == PULSAR_ATTN_FULL_UNINDEXED, "layer 3 compresses without an indexer", 3, mode_name(hca->mode));
-    check(pulsar_attn_owns_kv(hca->mode), "FULL_UNINDEXED still owns its compressor", 3, mode_name(hca->mode));
-    check(!pulsar_attn_runs_indexer(hca->mode), "FULL_UNINDEXED runs no indexer", 3, mode_name(hca->mode));
+    check(hca->mode == PULSAR_ATTN_FULL_UNINDEXED, "layer 3 compresses without an indexer", 3, pulsar_attn_mode_name(hca->mode));
+    check(pulsar_attn_owns_kv(hca->mode), "FULL_UNINDEXED still owns its compressor", 3, pulsar_attn_mode_name(hca->mode));
+    check(!pulsar_attn_runs_indexer(hca->mode), "FULL_UNINDEXED runs no indexer", 3, pulsar_attn_mode_name(hca->mode));
     check(pulsar_attn_reads_index(hca->mode) == false,
           "FULL_UNINDEXED must NOT read an index source -- this is what makes the ratio check skippable for it",
-          3, mode_name(hca->mode));
+          3, pulsar_attn_mode_name(hca->mode));
     check(pulsar_attn_reads_index(PULSAR_ATTN_REUSE) == true,
           "REUSE consumes a top-k it did not compute, so it does read an index source",
           3, "predicate");

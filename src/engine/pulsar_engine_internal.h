@@ -332,7 +332,11 @@ typedef struct {
     uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
-/** The compressor's STATE geometry: `coff*ratio` rows of `coff*head_dim` floats.
+/** The compressor ROW width: `coff*head_dim`.  One quantity, three users --
+ * the kv/gate projection rows (batch_comp_kv/sc), the indexer-visible latent's
+ * source, and the state lane, which is `coff*ratio` such rows.  Naming it once
+ * is what stops a layer's buffer and the kernels that fill it from disagreeing
+ * about whether the projection is split.
  *
  * `coff` is the SAME one that sets the compressor projection width
  * (pulsar_compress_coff), so the state and the weights cannot disagree about it
@@ -341,13 +345,13 @@ typedef struct {
  * current group's second, so the state's two halves hold different things.
  *
  * V4.1 never overlaps (coff is 1 for every ratio it uses: 0, 1 and 2), so its
- * state is `ratio` rows of head_dim exactly as before.  V4's ratio-4 layers are
- * the ones that need the doubled form.  See the transcription in
- * tests/compressor_pool_test.cpp for what the halves mean.
+ * row is head_dim and its state `ratio` such rows, exactly as before.  V4's
+ * ratio-4 layers are the ones that need the doubled form; see the transcription
+ * in tests/compressor_pool_test.cpp for what the halves mean.
  *
  * head_dim is a parameter rather than read from the shape global so this can be
  * used before that global is declared (and from a host test). */
-static inline uint32_t pulsar_comp_state_width(uint32_t ratio, uint32_t head_dim) {
+static inline uint32_t pulsar_comp_row_width(uint32_t ratio, uint32_t head_dim) {
     return pulsar_compress_coff(ratio) * head_dim;
 }
 static inline uint32_t pulsar_comp_state_rows(uint32_t ratio) {
@@ -2209,6 +2213,19 @@ static inline bool pulsar_attn_runs_indexer(pulsar_attn_mode m) {
  * runs, and REUSE -- the mode that reads a top-k it never computed -- answers no
  * to it.  Anything asking "does this layer's behaviour depend on its index
  * source?" wants this one. */
+/** The mode's name, for instruments and refusals.  One authority: a test that
+ * spells the modes out again is a second list that can drift from this one. */
+static inline const char *pulsar_attn_mode_name(pulsar_attn_mode m) {
+    switch (m) {
+    case PULSAR_ATTN_WINDOW:         return "WINDOW";
+    case PULSAR_ATTN_FULL:           return "FULL";
+    case PULSAR_ATTN_REINDEX:        return "REINDEX";
+    case PULSAR_ATTN_REUSE:          return "REUSE";
+    case PULSAR_ATTN_FULL_UNINDEXED: return "FULL_UNINDEXED";
+    }
+    return "?";
+}
+
 static inline bool pulsar_attn_reads_index(pulsar_attn_mode m) {
     return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_REINDEX || m == PULSAR_ATTN_REUSE;
 }

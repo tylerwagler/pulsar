@@ -273,9 +273,15 @@ static void gpu_graph_compute_dims(
     d->shared_dim = layer->ffn_gate_shexp->dim[1];
     d->routed_mid_dim = layer->ffn_gate_exps->dim[1];
     d->vocab_dim = weights->output ? weights->output->dim[1] : PULSAR_N_VOCAB;
-    /* CSA2: every compressor row is one head_dim latent (no two-group overlap,
-     * no separate indexer compressor). */
-    d->comp_width_max = PULSAR_N_HEAD_DIM;
+    /* The widest compressor row any layer needs.  Derived from the layout table
+     * rather than written as head_dim: V4's ratio-4 layers project to
+     * 2*head_dim (they overlap), so a head_dim literal would under-size the
+     * shared staging the moment a V4 layer ran through it. */
+    d->comp_width_max = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint64_t w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
+        if (w > d->comp_width_max) d->comp_width_max = w;
+    }
     d->indexer_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
 }
 
@@ -396,7 +402,7 @@ static bool gpu_graph_bank_slabs_alloc(
         /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
          * state is twice as wide and twice as tall as V4.1's.  coff is 1 for
          * every ratio V4.1 uses, so this is inert there. */
-        const uint64_t attn_width = pulsar_comp_state_width(attn->ratio, PULSAR_N_HEAD_DIM);
+        const uint64_t attn_width = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM);
         const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
         const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
         b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
@@ -745,8 +751,9 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         bool ok = st_kv && st_sc;
         for (uint32_t p = first; ok && p < pos; p++) {
             const uint32_t row = g->ms_spec_save_row0[bank] + (p - s0);
-            pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], row, PULSAR_N_HEAD_DIM);
-            pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], row, PULSAR_N_HEAD_DIM);
+            const uint32_t save_w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
+            pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], row, save_w);
+            pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], row, save_w);
             ok = kv && sc && pulsar_gpu_csa2_compressor_store_tensor(kv, sc, st_kv, st_sc, PULSAR_N_HEAD_DIM, ratio, p) != 0;
             pulsar_gpu_tensor_free(sc);
             pulsar_gpu_tensor_free(kv);
@@ -1419,7 +1426,7 @@ bool gpu_graph_alloc_raw_cap(
          * does -- 0731's ratio-128 layers publish none. */
         const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
         if (pulsar_attn_owns_kv(attn->mode)) {
-            const uint64_t attn_width = pulsar_comp_state_width(attn->ratio, PULSAR_N_HEAD_DIM);
+            const uint64_t attn_width = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM);
             const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
             const uint64_t state_bytes = attn_width * attn_rows * sizeof(float);
             const uint64_t comp_row_bytes = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
@@ -1723,11 +1730,13 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
      * row) + one emit-sink scratch row.  The index-K row derives from the
      * emitted latent, so no separate indexer save exists. */
     {
-        const uint64_t attn_w = PULSAR_N_HEAD_DIM;
         for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
             g->spec_comp_kv_save[il] = NULL;
             g->spec_comp_sc_save[il] = NULL;
             if (!gpu_graph_layer_has_comp_state(il)) continue;
+            /* saved rows are the compressor PROJECTIONS, so their width is the
+             * layer's coff width, not head_dim */
+            const uint64_t attn_w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
             g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
