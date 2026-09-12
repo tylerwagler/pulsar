@@ -389,7 +389,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_kernel_test 1 16 32 x 12 1 5 20     # ONE-row indexed launch (L166: n_tokens==1 is the same kernel)
 	./tests/attn_f16_banked_test
-	./tests/vision_router_gate
+	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips
@@ -528,8 +528,9 @@ vision-merge-gate: tests/vision_merge_gate
 # L216: the MoE router's image-slot bias (bias_vl) vs a line-for-line
 # transcription of the reference's Gate.forward.  Needs a GPU, NO model: the
 # bias / bias_vl / tid2eid tensors are synthetic and laid out in one model_map.
+VISION_ROUTER_GOLDENS ?= tests/test-vectors/vision-router-goldens.bin
 cuda-vision-router-gate: tests/vision_router_gate
-	./tests/vision_router_gate
+	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
