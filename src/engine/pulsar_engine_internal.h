@@ -576,6 +576,7 @@ typedef struct {
     pulsar_tensor *ffn_gate_tid2eid; ///< token-id to expert-id routing table (when the artifact ships one)
     pulsar_tensor *ffn_gate_inp;     ///< router projection producing per-expert logits
     pulsar_tensor *ffn_exp_probs_b;  ///< router bias added to the expert probabilities
+    pulsar_tensor *ffn_exp_probs_b_vl; ///< image-token router bias (Vision-Exp only): the router adds THIS instead of ffn_exp_probs_b for tokens whose id is >= vocab_size
     pulsar_tensor *ffn_gate_exps;    ///< ROUTED experts, gate projection (expert-major)
     pulsar_tensor *ffn_up_exps;      ///< routed experts, up projection
     pulsar_tensor *ffn_down_exps;    ///< routed experts, down projection
@@ -619,6 +620,55 @@ typedef struct {
     uint32_t vocab_size;             ///< drafter output width; must match the target's logits width
     uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
 } pulsar_dspark_weights;
+
+/** DeepSeek Vision-Exp tower shape.  The artifact carries the vision TENSORS but
+ * no vision metadata (the template writes only the text-side config keys), so
+ * these compiled values are the authority.  They match the checkpoint's
+ * config.json (vision_n_layers 32, vision_dim 1024, vision_n_heads 16,
+ * vision_inter_dim 2816, vision_patch_size 14, vision_downsample_ratio 3,
+ * vision_rope_theta 10000) and predict every `vision.*` tensor's dims. */
+#define PULSAR_VISION_LAYERS      32u
+#define PULSAR_VISION_DIM         1024u
+#define PULSAR_VISION_HEADS       16u
+#define PULSAR_VISION_INTER       2816u
+#define PULSAR_VISION_PATCH       14u
+#define PULSAR_VISION_DOWNSAMPLE  3u
+#define PULSAR_VISION_ROPE_THETA  10000.0f
+
+/** Vision-Exp tower weights: the ViT patch encoder, its 32 blocks, the final
+ * norm, the 3x3-merge aligner, and the four image-span embeddings the text
+ * sequence substitutes for image tokens.  Present or absent per artifact
+ * (`vision.*` / `aligner.*` / `image_*`), exactly like the drafter.
+ *
+ * The reference is the checkpoint's own inference/vision.py: RMSNorm(1e-6),
+ * fused QKV, 2D RoPE with 16 frequencies per axis over the 64-wide head,
+ * bias-free SwiGLU, bidirectional attention; and inference/model.py's
+ * merge_image_embeddings, which permutes the aligner output into the text span
+ * with image_start/pad/newline/end filling the non-IMAGE slots. */
+typedef struct {
+    pulsar_tensor *patch_proj;   ///< patch embedding (3*patch^2 -> dim), with bias
+    pulsar_tensor *patch_bias;
+    pulsar_tensor *norm;         ///< final RMSNorm over the tower output
+    pulsar_tensor *aligner_w1;   ///< aligner 1st projection (dim*ratio^2 -> text dim)
+    pulsar_tensor *aligner_b1;
+    pulsar_tensor *aligner_w2;   ///< aligner 2nd projection (text dim -> text dim)
+    pulsar_tensor *aligner_b2;
+    pulsar_tensor *image_start;  ///< text-space embedding for an IMAGE_START slot
+    pulsar_tensor *image_end;
+    pulsar_tensor *image_newline;
+    pulsar_tensor *image_pad;
+    struct {
+        pulsar_tensor *norm1;    ///< pre-attention RMSNorm
+        pulsar_tensor *wqkv;     ///< fused QKV (dim -> 3*dim), with bias
+        pulsar_tensor *wqkv_bias;
+        pulsar_tensor *wo;       ///< attention output projection (dim -> dim), with bias
+        pulsar_tensor *wo_bias;
+        pulsar_tensor *norm2;    ///< pre-MLP RMSNorm
+        pulsar_tensor *w1;       ///< SwiGLU gate+up (dim -> 2*inter), NO bias
+        pulsar_tensor *w2;       ///< SwiGLU down (inter -> dim), NO bias
+    } block[PULSAR_VISION_LAYERS];
+    uint32_t n_layers;           ///< bound layers; equals PULSAR_VISION_LAYERS or the tower is absent
+} pulsar_vision_weights;
 
 /* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
  *
@@ -1411,6 +1461,8 @@ struct pulsar_engine {
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
+    pulsar_vision_weights vision_weights;  ///< resolved ViT tower/aligner tensors (Vision-Exp artifacts)
+    bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
     pulsar_model overlay_model; ///< donor GGUF for --expert-overlay, if any
     bool overlay_ready;         ///< overlay tensors resolved and swapped in
     /** Prometheus /metrics spec-decode counters (server /metrics endpoint via
@@ -2218,6 +2270,11 @@ void config_validate_model(const pulsar_model *m);
  */
 void weights_bind(pulsar_weights *w, const pulsar_model *m);
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
+/** Bind + layout-validate the Vision-Exp tower.  Returns false (and leaves the
+ * struct zeroed) when the artifact carries no `vision.patch_embed.proj.weight`,
+ * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
+ * type or missing tensor refuses loudly. */
+bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);

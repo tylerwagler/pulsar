@@ -548,6 +548,7 @@ static void weights_validate_layout(
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b_vl, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
@@ -1160,6 +1161,10 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
     l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
+    /* Vision-Exp only: the router adds THIS bias instead of ffn_exp_probs_b for
+     * tokens whose id is >= vocab_size (image slots).  Optional for the same
+     * reason as the drafter's: text-only artifacts do not ship it. */
+    l->ffn_exp_probs_b_vl = tensor_by_namef(m, "blk.%u.exp_probs_b_vl.bias", il);
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -1369,6 +1374,77 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     }
 
     dspark_weights_validate_layout(w);
+}
+
+
+/* Vision-Exp tower bind + layout validation.  The artifact carries the vision
+ * tensors but no vision metadata, so every dim is checked against the compiled
+ * PULSAR_VISION_* shape here -- a wrong or half-present tower refuses loudly
+ * rather than producing garbage image features.  Absent tower (no
+ * vision.patch_embed.proj.weight) is not an error: text-only artifacts stay
+ * loadable.  Reference: the checkpoint's inference/vision.py. */
+bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
+    memset(w, 0, sizeof(*w));
+    if (!model_find_tensor(m, "vision.patch_embed.proj.weight")) return false;
+
+    const uint64_t D  = PULSAR_VISION_DIM;
+    const uint64_t N  = PULSAR_VISION_HEADS;
+    const uint64_t I  = PULSAR_VISION_INTER;
+    const uint64_t P  = 3ull * PULSAR_VISION_PATCH * PULSAR_VISION_PATCH;
+    const uint64_t A1 = D * PULSAR_VISION_DOWNSAMPLE * PULSAR_VISION_DOWNSAMPLE;
+    const uint64_t T  = PULSAR_N_EMBD;
+
+    w->patch_proj    = required_tensor(m, "vision.patch_embed.proj.weight");
+    w->patch_bias    = required_tensor(m, "vision.patch_embed.proj.bias");
+    w->norm          = required_tensor(m, "vision.norm.weight");
+    w->aligner_w1    = required_tensor(m, "aligner.w1.weight");
+    w->aligner_b1    = required_tensor(m, "aligner.w1.bias");
+    w->aligner_w2    = required_tensor(m, "aligner.w2.weight");
+    w->aligner_b2    = required_tensor(m, "aligner.w2.bias");
+    w->image_start   = required_tensor(m, "image_start");
+    w->image_end     = required_tensor(m, "image_end");
+    w->image_newline = required_tensor(m, "image_newline");
+    w->image_pad     = required_tensor(m, "image_pad");
+
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li);
+        w->block[li].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li);
+        w->block[li].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li);
+        w->block[li].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li);
+        w->block[li].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li);
+        w->block[li].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li);
+        w->block[li].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li);
+        w->block[li].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li);
+    }
+    w->n_layers = PULSAR_VISION_LAYERS;
+
+    tensor_expect_f32_or_bf16(w->patch_proj, 2, P, D, 0);
+    tensor_expect_f32_or_bf16(w->patch_bias, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->norm, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w1, 2, A1, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b1, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w2, 2, T, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b2, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_start, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_end, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_newline, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
+
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv, 2, D, 3u * D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv_bias, 1, 3u * D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo, 2, D, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo_bias, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].norm2, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w1, 2, D, 2u * I, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w2, 2, I, D, 0);
+    }
+    /* The head count must divide the width; the tower asserts it here so the
+     * forward can assume a whole head_dim. */
+    if (D % N != 0)
+        pulsar_die("vision: dim is not a multiple of n_heads");
+    return true;
 }
 
 

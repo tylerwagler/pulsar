@@ -414,6 +414,20 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
                 e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
     }
+    /* Vision-Exp tower: bound and layout-validated here so a wrong or
+     * half-present vision stack refuses at load rather than at first image.
+     * Absent tower is normal for text-only artifacts and simply leaves
+     * vision_ready false; the image path is refused until it is true. */
+    if (vision_weights_bind(&e->vision_weights, &e->model)) {
+        e->vision_ready = true;
+        fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
+                "patch %u, aligner %ux%d -> %u)\n",
+                e->vision_weights.n_layers, (unsigned)PULSAR_VISION_DIM,
+                (unsigned)PULSAR_VISION_HEADS, (unsigned)PULSAR_VISION_INTER,
+                (unsigned)PULSAR_VISION_PATCH,
+                (unsigned)PULSAR_VISION_DOWNSAMPLE, (unsigned)PULSAR_VISION_DOWNSAMPLE,
+                (unsigned)PULSAR_N_EMBD);
+    }
 
     if (graph_backend) {
         e->gpu_ready = pulsar_gpu_init() != 0;
