@@ -85,13 +85,14 @@ enum {
     BIAS_OFF = 0,
     VL_OFF = 4096,
     HASH_OFF = 8192,
-    /* Score step between consecutive experts by rank. */
-    SCORE_STEP = 5e-3f,
-    /* Bias magnitudes.  Each must exceed the whole score span (1.5 - 0.225)
-     * plus the other's span, so the intended set wins outright. */
-    TEXT_BIAS = 2.0f,
-    IMAGE_BIAS = 4.0f,
 };
+
+/* Score step between consecutive experts by rank. */
+static const float SCORE_STEP = 5e-3f;
+/* Bias magnitudes.  Each must exceed the whole score span (1.5 - 0.225) plus
+ * the other's span, so the intended set wins outright. */
+static const float TEXT_BIAS = 2.0f;
+static const float IMAGE_BIAS = 4.0f;
 
 static const int32_t TEXT_SET[N_SET] = {17, 88, 133, 200, 211, 250};
 static const int32_t IMAGE_SET[N_SET] = {3, 61, 99, 150, 175, 240};
@@ -295,7 +296,6 @@ int main(void) {
         int idx_bad = 0;
         for (int r = 0; launched && r < c.n_rows; r++) {
             const int32_t *ei = &exp_idx[(size_t)r * TOPK];
-            const int32_t *di = &idx[(size_t)r * TOPK];
             if (margins[r] < min_gap) min_gap = (double)margins[r];
 
             /* ---- GUARD 1: the case must be able to see what it claims ------
