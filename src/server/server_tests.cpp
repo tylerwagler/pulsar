@@ -3448,6 +3448,26 @@ static void test_parse_sampling_key_contract(void) {
     request_free(&r);
 }
 
+/* The legacy /v1/completions surface has NO logprobs path: the ledger append and
+ * the response field are chat/Responses only.  Its catch-all used to SKIP the
+ * key, so a client that asked for distributions got HTTP 200, no payload, and
+ * speculation still enabled -- a silent fail-open (found while building the B5
+ * lane gate).  It refuses loudly now.  The refusal returns before tokenization,
+ * so a NULL engine is a valid probe of it; the "explicit null stays accepted"
+ * half reaches tokenization and is served-probed instead. */
+static void test_parse_completion_request_refuses_logprobs(void) {
+    request r;
+    char err[256];
+    const char *yes = "{\"prompt\": \"hi\", \"logprobs\": true}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_completion_request(NULL, yes, 16, 4096, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "not supported on /v1/completions") != NULL);
+    const char *top = "{\"prompt\": \"hi\", \"top_logprobs\": 3}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_completion_request(NULL, top, 16, 4096, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "not supported on /v1/completions") != NULL);
+}
+
 /* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
  * duplicate-key idiom `free(x); if (!helper(&p, &x)) goto fail;` cannot
  * double-free x (the fail label frees it again).  A malformed second value on
@@ -6880,6 +6900,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
     test_parse_sampling_key_contract();
+    test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

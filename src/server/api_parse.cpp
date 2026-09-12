@@ -1589,6 +1589,25 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "logprobs") || !strcmp(key, "top_logprobs")) {
+            /* This surface has NO logprobs path: the ledger append and the
+             * response field are chat/Responses only (parse_chat_request owns
+             * the key there).  The catch-all below used to SKIP it, so a client
+             * that asked for distributions got HTTP 200, no payload, and
+             * speculation still enabled -- a silent fail-open.  Refuse loudly;
+             * an explicit null is "not set" (the OpenAI SDKs send it on both
+             * logprobs fields) and stays accepted, as it is on the chat
+             * surface. */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                snprintf(err, errlen,
+                         "%s is not supported on /v1/completions; use "
+                         "/v1/chat/completions with logprobs:true", key);
+                free(key);
+                free(prompt);
+                request_free(r);
+                return false;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
