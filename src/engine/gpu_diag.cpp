@@ -739,6 +739,20 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         const uint32_t phase = pos % ratio;
         if (phase == 0u) continue;   /* a group boundary: the empty group IS the state */
+        /* The overlap (coff 2) lane holds TWO groups, and this rebuild only has
+         * the PENDING one in the verify saves.  The carry half would be left at
+         * the reset value -- kv 0 / score -inf -- so the next group to complete
+         * would pool its first-half positions from -inf and emit a latent built
+         * from the wrong tokens.  Still a number, still plausible.  Refuse by
+         * name until the carry is stashed; the caller invalidates the checkpoint,
+         * which is the honest outcome.  See s29 for the design. */
+        if (pulsar_compress_coff(ratio) != 1u) {
+            fprintf(stderr,
+                    "pulsar: kv source %u: rewind to %u would rebuild only the pending group, and the "
+                    "overlap lane's carry half is not recoverable from the verify saves -- refusing\n",
+                    il, pos);
+            return false;
+        }
         /* the group's committed positions [pos - phase, pos) must be saved */
         const uint32_t first = pos - phase;
         const uint32_t s0 = g->ms_spec_save_pos0[bank], sn = g->ms_spec_save_rows[bank];
@@ -1557,8 +1571,6 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_kv_pack = pulsar_gpu_tensor_alloc(pc * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
     g->batch_comp_kv = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_comp_sc = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->comp_tail_kv = pulsar_gpu_tensor_alloc(8ull * comp_width_max * sizeof(float));
-    g->comp_tail_sc = pulsar_gpu_tensor_alloc(8ull * comp_width_max * sizeof(float));
     g->batch_indexer_q = pulsar_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_qp = pulsar_gpu_tensor_alloc(pc * (uint64_t)PULSAR_N_INDEXER_HEAD *
                                                   pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
@@ -1627,7 +1639,6 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
-                    g->comp_tail_kv && g->comp_tail_sc &&
                     g->batch_indexer_q && g->batch_indexer_qp && g->batch_indexer_weights &&
                     g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
                     g->batch_after_attn_hc &&
