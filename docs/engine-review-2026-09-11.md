@@ -135,12 +135,33 @@ mid-payload field; and the `AF16_HEADS` `static_assert` message now names the
 M-tile invariant it guards rather than the half-warp property that follows from
 `AF16_ROWS`.
 
-Host-only verification run at `a9ea5210`: all four changed TUs compile with
-zero warnings (`g++ -Wall -Wextra`; `nvcc -arch=sm_120f` for `attn_f16.cu`);
-`./pulsar_test --sampler`, `--server` and `--sampler-prefilter` PASS; `make
-seam-check` PASS (83 host files).  The two GPU gates this touches
-(`cuda-session-payload-gate`, `cuda-dspark-batch-gate`) were NOT run -- no GPU
-on the authoring box.  The branch still owes a battery run at its tip.
+Host-only verification run at `a9ea5210` (authoring box, no GPU): all four
+changed TUs compile with zero warnings (`g++ -Wall -Wextra`; `nvcc
+-arch=sm_120f` for `attn_f16.cu`); `./pulsar_test --sampler`, `--server` and
+`--sampler-prefilter` PASS; `make seam-check` PASS (83 host files).
+
+GB10 verification at `d847440` (sparky; the bank tree fast-forwarded from
+`2e51f069` by git bundle -- GitHub is unreachable from the authoring box -- and
+the two gate binaries rebuilt, 0 warning/error lines):
+
+- `cuda-session-payload-gate` **PASS** -- v10, 22,453,536 B payload, comp fnv
+  and all 129,280 logits identical across the round trip.  The corruption case
+  fired: `corruption at byte 22453531 refused (rc=1): KV checkpoint digest
+  mismatch (corrupt payload)`.  First run of that assertion as a battery gate.
+- `cuda-dspark-batch-gate` **PASS** at depth 0 (8 ticks), depth 1 (6) and depth
+  4 (6); all three shapes `IDENTICAL`, including `sampled/greedy alternating`,
+  the readback-arm switch the B3 audit exists for (24 / 18 / 18 bank-ticks).
+- **The rewritten audit is mutation-validated.**  With the argmax branch's
+  `spec_compact_rows = 0` removed, the alternating shape fails with
+  `STALE COMPACT ROWS: the engine armed the argmax readback for 3 rows, but
+  spec_compact_rows=3 is still live (argmax_rows=3)` on all four greedy ticks
+  (gate FAIL, rc=1); it passes again after the restore.  The audit reaches the
+  path it claims to reach.
+
+Not run: the full `make gates` battery at this tip (the branch still owes one);
+and no served A/B for the sampler entry guard -- a non-finite knob is
+unreachable through the server parser, so every served path is unchanged by
+construction.
 
 ---
 
