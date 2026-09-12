@@ -198,11 +198,84 @@ is the only version that can beat the measured baseline; it is a deeper change
 (the spec rounds, the B3 readback arm, and full rows for the logprobs member
 all have to agree).
 
-**Filed separately (2026-09-11):** `/v1/completions` accepts `logprobs: true`,
-returns HTTP 200 with no logprobs payload, and keeps speculation enabled (solo
-probe: `draft_delta=61` with or without the flag).  `/v1/chat/completions` is
-correct (`draft_delta=0`, payload present).  A client on the legacy surface
-cannot tell the option was dropped -- fail-open, rules 1 and 9.
+**Fixed (2026-09-11, `867e06fc`):** `/v1/completions` used to accept
+`logprobs: true`, return HTTP 200 with no logprobs payload, and keep
+speculation enabled (solo probe: `draft_delta=61` with or without the flag).
+The legacy parser's catch-all skipped the key; the surface has no logprobs path
+at all (the ledger append is chat/Responses only), so it now refuses loudly
+while still tolerating the explicit `null` the OpenAI SDKs send for "not set".
+Served-verified on the GB10: `logprobs:true` -> HTTP 400 naming the working
+surface, `logprobs:null` -> 200 with speculation on, `/v1/chat/completions`
+unchanged (`draft_delta=0`, payload present).  `/v1/chat/completions` was
+always correct.
+
+### Autonomous pass — open-item verdicts (2026-09-12)
+
+Each remaining item is taken to a recorded verdict: landed and measured, or
+dropped with the reason.
+
+- **B10 (sampled redraft round trips) — DEFERRED, no bounded win.**  The chain
+  is genuinely positional (each position's draw feeds the next markov step), so
+  the per-position H2D write of `prev` is required; the per-position D2H read of
+  the prefilter block is what the HOST draw needs, and async-ing the write saves
+  only its few microseconds because the read blocks on the kernels a moment
+  later.  The one real lever is a device-side draw that must reproduce
+  `pulsar_sample_dist_build`/`_draw` exactly (RNG, tie order, min-p/top-p
+  cutoff, q/residual store) -- medium-high effort against a T>0-only prize the
+  review estimates at 0.3-1 ms per redraft group (~1-2%).  Re-open with a
+  device-sampler design if T>0 spec latency becomes the target.
+- **C4 (indexer scores f32 -> f16) -- DEFERRED, premise smaller than stated.**
+  `docs/engine-perf-map.md:489` measures the WHOLE indexer complex at ~2% of
+  prefill; C4 changes only the score buffer's dtype inside it, so the ceiling is
+  a fraction of 2%, and only at depth (the review's own "~= 0 at 4k").  Against
+  that: ~10 kernels (producers `idx_scores_mxfp4_kernel` /
+  `indexer_scores_wmma128_kernel`, consumers `indexer_topk_*`), the
+  `indexer_scores` allocation and every view, plus a top-k selection change that
+  needs the oracle D2 does not yet exist.  Re-open after D2 grades selection and
+  a depth census shows the indexer complex larger than 2% at 128k.
+- **C10b/c (compressor emit launches; decode indexer scorer grid) -- DEFERRED,
+  refuted by an existing measurement.**  L209 captured the whole decode sweep
+  into a CUDA graph and replayed it (announce on every pass): +0.2% avg, +0.6%
+  best -- launch issue is NOT the limiter at one row, which is exactly what
+  fusion of the 5-6 small launches per compressed row would have to beat.
+  C10c's
+  scorer is <0.5% of decode on the current census.  C10a was already a measured
+  NO-GO and reverted; C10d landed.  Re-open only with a per-kernel timing that
+  shows the fused chain's intermediate traffic, not its launch count.
+- **B4 (draft-depth controller / cost model) -- premise partly refuted, one
+  stale constant.**  `SPEC_DEPTH_MAX = 5` must NOT move: the addendum in
+  `pulsar-notes/draft-depth-sweep-2026-08-25.md` ties the depth-6 cliff to the
+  drafter's TRAINED `block=5` (position 6 is out of distribution -- structured
+  accepted/step FALLS 3.31 -> 3.20 while drafted/step jumps 4.76 -> 5.55).  That
+  is a model property, not a verify-row-cost one, so L214's 2.6x cheaper row
+  does not reopen depth 6; the review's "structured regimes should move up" is
+  wrong.  The climb/veto thresholds (`SPEC_DEPTH_CONF_UP = 0.70`, calibrated to
+  >=0.82 realized accept) are cost-independent too.
+  The one genuinely stale number is the K allocator's `marginal_ms = 6.0`
+  (`server_sched.cpp:2178`), whose comment cites the 08-31 ROWCOST (6.4 ms/row
+  @2048, 5.9 @24576) while L214's quench re-fit measured 7.17 ms/row -- a ~20%
+  disagreement about the same quantity.  It binds only under row-budget
+  overflow, so the change needs an overflow A/B (demand > the 16-row budget)
+  before it lands, not an assertion.
+- **C5 (attn-out `low` re-quantized) -- SCOPED, and the best prefill item left.**
+  `emit_low_e4m3` (`matmul.cu:2782`) is a deliberate separate pass: "the warp
+  that reduces a row does not hold that row's block neighbours", so the fused
+  form needs a CUTLASS block-scaled "a" GEMM with an E4M3 epilogue (weights
+  already ship MXFP8_LT) -- medium-high, its own item.  The cheaper "f16 `low`"
+  partial is NOT a dtype switch: `pulsar_gpu_attention_output_batch_tensor`
+  hard-requires f32 for both `low` and `out` (`matmul.cu:2501`),
+  `mxfp8_quant_act_kernel` is f32-input only, and the E4M3 slot machinery plus
+  the `attn_low` dump have to agree.  The prize is real, not the ~0.1% a
+  back-of-envelope gives: the measured prefill map's CONVERSION kernels are
+  ~9.5% of prefill (`f32_to_f16` 3.8 + `pack_act_e4m3_rowmajor_warp` 3.1 +
+  `mxfp8_quant_act_grouped` 2.6).  Rule 3 ("producers emit") is the theme here.
+- **C6 (indexer scorer `mxf4nvf4`) -- BLOCKED on D2; scoped.**  The
+  instruction-ceiling measurement is real (`mxf4nvf4` 251 vs `mxf8f6f4` 125
+  TMAC/s against a kernel running ~6.5), so the 2-4x scorer multiple is
+  credible -- but the WHOLE indexer complex is ~2% of prefill (perf map) and
+  <0.5% of decode (L219 census), so the end-to-end prize is ~1-2%, and the
+  change alters top-k selection.  Grade selection (D2) first; then build it with
+  the selection oracle as the gate.
 
 ---
 
