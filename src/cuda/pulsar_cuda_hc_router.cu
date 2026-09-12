@@ -378,11 +378,27 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        const float *vl_bias,
+        uint32_t n_vocab,
+        int has_vl_bias) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
     if (t >= n_tokens || lane >= 32u) return;
+
+    /* Vision-Exp: an image slot carries a token id at or above the vocabulary
+     * -- the reference emits out-of-vocab sentinels for every image position
+     * (model.py: image ids are vocab_size + type).  Such a position routes
+     * with bias_vl INSTEAD of the text bias, and on a hash layer it must NOT
+     * take the tid2eid path, because that table only has a row per real token
+     * (model.py: topk(scores + bias_vl) where the image mask holds).  Only the
+     * SELECTION is biased: the routing weights come from the unbiased scores,
+     * matching the reference's softmax over the selected logits. */
+    const int32_t tok_id = tokens ? tokens[t] : token_scalar;
+    const int is_image = has_vl_bias && tok_id >= (int32_t)n_vocab;
+    const int use_bias = is_image ? 1 : has_bias;
+    const float *use_bias_row = is_image ? vl_bias : bias;
 
     const float *log = logits + (uint64_t)t * 256u;
     float *prob = probs ? probs + (uint64_t)t * 256u : NULL;
@@ -397,15 +413,15 @@ __global__ static void router_select_warp_topk_kernel(
         const uint32_t e = lane + j * 32u;
         const float p = sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
+        local_score[j] = p + (use_bias ? use_bias_row[e] : 0.0f);
         sprob[row_in_block][e] = p;
         if (prob) prob[e] = p;
     }
     __syncwarp();
 
-    if (hash_mode) {
+    if (hash_mode && !is_image) {
         if (lane == 0) {
-            int32_t tok = tokens ? tokens[t] : token_scalar;
+            int32_t tok = tok_id;
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
             const int32_t *row = hash + (uint64_t)tok * 6u;
             float sum = 0.0f;
@@ -676,7 +692,7 @@ int pulsar_gpu_directional_steering_project_tensor(
 
 
 
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens, uint64_t vl_bias_offset, uint32_t n_vocab, bool has_vl_bias) {
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
@@ -692,6 +708,15 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
         bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
         if (!bias) return 0;
+    }
+    /* Vision-Exp: the image-token bias, one 256-wide row per layer.  A
+     * text-only artifact has no such tensor and this stays NULL, which leaves
+     * the kernel's behaviour bit-identical to before. */
+    const float *vl_bias = NULL;
+    if (has_vl_bias) {
+        if (vl_bias_offset > model_size || model_size - vl_bias_offset < 256u * sizeof(float)) return 0;
+        vl_bias = (const float *)cuda_model_range_ptr(model_map, vl_bias_offset, 256u * sizeof(float), "router_bias_vl");
+        if (!vl_bias) return 0;
     }
     if (hash_mode) {
         const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
@@ -711,7 +736,10 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
                                                                     hash_rows,
                                                                     n_tokens,
                                                                     has_bias && !hash_mode,
-                                                                    hash_mode);
+                                                                    hash_mode,
+                                                                    vl_bias,
+                                                                    n_vocab,
+                                                                    has_vl_bias ? 1 : 0);
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
 

@@ -1583,7 +1583,10 @@ int pulsar_gpu_router_select_batch_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint64_t                vl_bias_offset,
+        uint32_t                n_vocab,
+        bool                    has_vl_bias);
 
 
 int pulsar_gpu_routed_moe_batch_tensor(

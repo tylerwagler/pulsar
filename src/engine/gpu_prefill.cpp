@@ -2501,7 +2501,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       PULSAR_N_EXPERT,
                                                       PULSAR_N_EXPERT_USED,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,
-                                                      n_tokens) != 0;
+                                                      n_tokens,
+                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : 0,
+                                                      PULSAR_N_VOCAB,
+                                                      layer->ffn_exp_probs_b_vl != NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * PULSAR_N_EXPERT, il, pos0);
