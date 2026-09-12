@@ -18,6 +18,13 @@
  *                      SAME latents (bit-identical to the prefill path -- same
  *                      kernel, same rows, same order) and leaves the state
  *                      empty after each emit.
+ *   ratio 4 (OVERLAP): the coff-2 mode.  Batched prefill against the reference's
+ *                      PER-TOKEN state machine -- latents bf16-identical AND the
+ *                      post-prefill lane (carry half + canonicalised current half)
+ *                      element-for-element -- then the update path over the same
+ *                      tokens, which must reach the same latents and the same state
+ *                      and emit only on group boundaries.  Also covers the ape fold
+ *                      on the score rows, which is what the overlap weights need.
  *   ratio 1:           latent = norm(bf16(kv)), no state touched.
  *   store:             a slot store lands at pos %% ratio and nothing else.
  *
@@ -235,6 +242,125 @@ int main(void) {
         }
         CHECK(mism == 0, "ratio-1 update vs prefill: %d elements differ", mism);
         printf("ratio-1: %u latents, worst %d bf16 ulp vs the oracle, update == prefill: %s\n", n_tok, worst, mism ? "NO" : "yes");
+    }
+    /* ---- ratio 4: the OVERLAP mode (coff 2).  11 tokens = 2 groups + 3 pending,
+     * from position 0 so the sequence start exercises the padding branch. ---- */
+    {
+        const uint32_t ratio = 4u, coff = 2u, W = coff * D;
+        const uint32_t n_tok = 11u, pos0 = 0u, n_groups = n_tok / ratio;
+        const uint32_t lane_rows = coff * ratio;
+        std::vector<float> kv(n_tok * W), sc(n_tok * W), ape(ratio * W);
+        for (auto &v : kv) v = 3.0f * frand(&seed);
+        for (auto &v : sc) v = 4.0f * frand(&seed);
+        for (auto &v : ape) v = 0.5f * frand(&seed);
+        pulsar_gpu_tensor *kv_d = dev_tensor(kv.size() * 4), *sc_d = dev_tensor(sc.size() * 4);
+        pulsar_gpu_tensor *ape_d = dev_tensor(ape.size() * 4);
+        dev_write(kv_d, kv.data(), kv.size() * 4);
+        dev_write(sc_d, sc.data(), sc.size() * 4);
+        dev_write(ape_d, ape.data(), ape.size() * 4);
+        /* the host folds the ape into the score rows; the oracle does the same */
+        CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(sc_d, ape_d, W, ratio, pos0, n_tok), "ratio-4 ape add launch");
+        for (uint32_t t = 0; t < n_tok; t++)
+            for (uint32_t d = 0; d < W; d++) sc[t * W + d] += ape[((pos0 + t) % ratio) * W + d];
+
+        pulsar_gpu_tensor *lat_d = dev_tensor(n_groups * D * 4);
+        pulsar_gpu_tensor *st_kv = dev_tensor((size_t)lane_rows * W * 4);
+        pulsar_gpu_tensor *st_sc = dev_tensor((size_t)lane_rows * W * 4);
+        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+                                                        D, ratio, pos0, n_tok, eps), "ratio-4 prefill launch");
+        cudaDeviceSynchronize();
+        std::vector<float> lat(n_groups * D), ref(D), gkv(lane_rows * W), gsc(lane_rows * W);
+        dev_read(lat.data(), lat_d, lat.size() * 4);
+        dev_read(gkv.data(), st_kv, gkv.size() * 4);
+        dev_read(gsc.data(), st_sc, gsc.size() * 4);
+
+        /* The oracle is the reference's per-token state machine -- store the row
+         * into the current half, and on completion pool [carry first halves |
+         * current second halves], then shift and re-empty the current half.  The
+         * batched prefill must agree with it including on the state. */
+        std::vector<float> okv(lane_rows * W, 0.0f), osc(lane_rows * W, -INFINITY);
+        std::vector<float> ov_kv((size_t)2 * ratio * D), ov_sc((size_t)2 * ratio * D);
+        int worst = 0, mism = 0, state_bad = 0, emitted_seen = 0;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const uint32_t pos = pos0 + t;
+            const uint32_t slot = ratio + pos % ratio;
+            for (uint32_t c = 0; c < W; c++) { okv[(size_t)slot * W + c] = kv[t * W + c]; osc[(size_t)slot * W + c] = sc[t * W + c]; }
+            if ((pos + 1u) % ratio != 0u) continue;
+            for (uint32_t p = 0; p < 2u * ratio; p++) {
+                const uint32_t off = p < ratio ? 0u : D;
+                for (uint32_t d = 0; d < D; d++) {
+                    ov_kv[(size_t)p * D + d] = okv[(size_t)p * W + off + d];
+                    ov_sc[(size_t)p * D + d] = osc[(size_t)p * W + off + d];
+                }
+            }
+            oracle_latent(ov_kv.data(), ov_sc.data(), 2u * ratio, D, w_f.data(), eps, ref.data());
+            const uint32_t gi = pos / ratio - pos0 / ratio;
+            for (uint32_t d = 0; d < D; d++) {
+                const int u = bf16_ulps(lat[(size_t)gi * D + d], ref[d]);
+                if (u > worst) worst = u;
+                if (lat[(size_t)gi * D + d] != ref[d]) mism++;
+            }
+            emitted_seen++;
+            for (uint32_t r = 0; r < ratio; r++)
+                for (uint32_t c = 0; c < W; c++) {
+                    okv[(size_t)r * W + c] = okv[(size_t)(ratio + r) * W + c];
+                    osc[(size_t)r * W + c] = osc[(size_t)(ratio + r) * W + c];
+                }
+            for (uint32_t r = 0; r < ratio; r++)
+                for (uint32_t c = 0; c < W; c++) { okv[(size_t)(ratio + r) * W + c] = 0.0f; osc[(size_t)(ratio + r) * W + c] = -INFINITY; }
+        }
+        CHECK(emitted_seen == (int)n_groups, "ratio-4 oracle emitted %d groups, want %u", emitted_seen, n_groups);
+        CHECK(worst <= 2, "ratio-4 prefill latent vs oracle: %d bf16 ulps", worst);
+        CHECK(mism == 0, "ratio-4 prefill latent vs oracle: %d elements not bf16-identical", mism);
+        for (uint32_t i = 0; i < lane_rows * W; i++) {
+            const bool kv_empty = okv[i] == 0.0f;
+            if (kv_empty ? (gkv[i] != 0.0f) : (gkv[i] != okv[i])) state_bad++;
+            const bool sc_empty = osc[i] == -INFINITY;
+            if (sc_empty ? (gsc[i] != -INFINITY) : (gsc[i] != osc[i])) state_bad++;
+        }
+        CHECK(state_bad == 0, "ratio-4 prefill state: %d elements differ from the per-token oracle", state_bad);
+        printf("ratio-4 overlap: %u latents, worst %d bf16 ulp, state vs the per-token oracle: %s\n",
+               n_groups, worst, state_bad ? "NO" : "yes");
+
+        /* the per-token UPDATE path over the same tokens must reach the same
+         * latents and the same state, and must emit only on boundaries */
+        /* The per-token path starts where the reference does: a FRESH lane (kv 0,
+         * score -inf), which is what makes the first group's missing first half
+         * padding rather than a carry.  (A zero-token prefill does NOT reset it --
+         * that entry refuses n_tokens == 0 -- so reset it here, explicitly.) */
+        std::vector<float> empty_kv((size_t)lane_rows * W, 0.0f), empty_sc((size_t)lane_rows * W, -INFINITY);
+        if (cudaMemcpy(st_kv->ptr, empty_kv.data(), empty_kv.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(st_sc->ptr, empty_sc.data(), empty_sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            CHECK(0, "ratio-4 update: could not reset the lane");
+        pulsar_gpu_tensor *row_d = dev_tensor(D * 4);
+        std::vector<float> row(D), ustate_kv(lane_rows * W), ustate_sc(lane_rows * W);
+        int u_emits = 0, u_mism = 0;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            pulsar_gpu_tensor kvv = *kv_d; kvv.ptr = (char *)kv_d->ptr + (size_t)t * W * 4; kvv.bytes = W * 4;
+            pulsar_gpu_tensor scv = *sc_d; scv.ptr = (char *)sc_d->ptr + (size_t)t * W * 4; scv.bytes = W * 4;
+            int emitted = 0;
+            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, &kvv, &scv, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+                                                           D, ratio, pos0 + t, eps, &emitted), "ratio-4 update launch");
+            cudaDeviceSynchronize();
+            const int want = ((pos0 + t + 1u) % ratio == 0u) ? 1 : 0;
+            CHECK(emitted == want, "ratio-4 update t=%u emitted %d want %d", t, emitted, want);
+            if (emitted) {
+                dev_read(row.data(), row_d, D * 4);
+                for (uint32_t d = 0; d < D; d++) if (row[d] != lat[(size_t)u_emits * D + d]) u_mism++;
+                u_emits++;
+            }
+        }
+        CHECK(u_emits == (int)n_groups, "ratio-4 update emitted %d groups, want %u", u_emits, n_groups);
+        CHECK(u_mism == 0, "ratio-4 update vs prefill latents: %d elements differ (must be bit-identical)", u_mism);
+        dev_read(ustate_kv.data(), st_kv, ustate_kv.size() * 4);
+        dev_read(ustate_sc.data(), st_sc, ustate_sc.size() * 4);
+        int u_state_bad = 0;
+        for (uint32_t i = 0; i < lane_rows * W; i++) {
+            if (ustate_kv[i] != gkv[i]) u_state_bad++;
+            if (ustate_sc[i] != gsc[i]) u_state_bad++;
+        }
+        CHECK(u_state_bad == 0, "ratio-4 update state: %d elements differ from the prefill state", u_state_bad);
+        printf("ratio-4 update == prefill: latents %s, state %s\n", u_mism ? "NO" : "yes", u_state_bad ? "NO" : "yes");
     }
     printf("CSA2 COMPRESSOR KERNEL TEST: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

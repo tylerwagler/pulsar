@@ -1260,6 +1260,21 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(
  * and optional indexer masks.
  */
 
+/** Add each position's within-group ape row to its score projection:
+ * `sc[t] += ape[(pos0 + t) %% ratio]`, width = pulsar_compress_coff(ratio) *
+ * head_dim.  The reference adds the ape at four different sites (both prefill
+ * stashes, the batched pool and the decode add) but always as
+ * `ape[position %% ratio]`, so folding it in once here is exactly equivalent and
+ * keeps the compressor kernels from each re-deriving it.  V4.1 has no ape
+ * (compressor_ape is false), so this is called only where the weights exist. */
+int pulsar_gpu_csa2_comp_ape_add_tensor(
+        pulsar_gpu_tensor       *sc,           /* [n_tokens][coff * head_dim] f32, in/out */
+        const pulsar_gpu_tensor *ape,          /* [ratio][coff * head_dim] f32 */
+        uint32_t                 width,
+        uint32_t                 ratio,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens);
+
 /** CSA2 (L218) compressor, the reference's Compressor.forward as two entries.
  *
  * A kv source of ratio > 1 pools the `ratio` tokens of a group into ONE latent:
