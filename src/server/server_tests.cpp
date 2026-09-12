@@ -5752,54 +5752,64 @@ static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     TEST_ASSERT(!park_live_bank_needed(3, pool, holey, 2, NULL));
 }
 
-/* L179 branch 2 -- worker_main's lane select (w_decode_lane). Invariant:
- * lane 0 with no decoders; lane 3 (spec-batched) iff the drafter is loaded,
- * no decoder has joined a plain batch (n_batched == 0) and EVERY decoder has
- * spec enabled; lane 2 (plain batched) otherwise, including the L118 batch of
- * one; a solo spec decoder is lane 3. Lane 1 is the retired classic lane,
- * reachable only in the gather loop's impossible no-pool/decoders shape --
- * asserted as what the code computes, not as a feature. */
+/* L179 branch 2 / B5 -- worker_main's lane PLAN (w_decode_lane). Invariant:
+ * lane 0 with no decoders; lane 3 when at least one member rides the spec lane
+ * (the drafter is loaded and the member has not latched into the plain lane),
+ * lane 2 when every member must go plain (no drafter, or every member latched),
+ * including the L118 batch of one; a solo spec decoder is lane 3.  B5
+ * single-sweep: a NON-spec member (/logprobs) does NOT demote the group -- it
+ * rides the spec lane base-only, so the group keeps ONE shared sweep.  Lane 1
+ * is the retired classic lane, reachable only in the gather loop's impossible
+ * no-pool/decoders shape -- asserted as what the code computes, not a feature. */
 static void test_l179_lane_select_spec_needs_every_decoder(void) {
     gen_state g[4];
     memset(g, 0, sizeof g);
     session_slot slots[4];
     memset(slots, 0, sizeof slots);
-    session_slot *dec[4];
+    session_slot *dec[4], *spec[4], *plain[4];
+    int ns = 0, np = 0;
     for (int i = 0; i < 4; i++) {
         slots[i].gen = &g[i];
         g[i].dspark_spec_enabled = true;
         dec[i] = &slots[i];
     }
     const int pool = 4;
-    /* nothing to decode: idle */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 0, 0) == 0);
-    /* four spec decoders: spec lane */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 3);
-    /* one non-spec slot among four drags the group to plain */
+    /* nothing to decode: idle, no subset */
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 0, spec, plain, &ns, &np) == 0);
+    TEST_ASSERT(ns == 0 && np == 0);
+    TEST_ASSERT(server_plan_decode_lanes(pool, false, dec, 0, spec, plain, &ns, &np) == 0);
+    /* four spec decoders: all spec, gather order kept */
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 4, spec, plain, &ns, &np) == 3);
+    TEST_ASSERT(ns == 4 && np == 0 && spec[0] == dec[0] && spec[3] == dec[3]);
+    /* B5: a /logprobs (spec-disabled) member still rides the SPEC lane as a
+     * base-only member -- the group is NOT demoted (the old verdict returned 2
+     * and the two-quantum split ran a second sweep) */
     g[2].dspark_spec_enabled = false;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 4, spec, plain, &ns, &np) == 3);
+    TEST_ASSERT(ns == 4 && np == 0);
     g[2].dspark_spec_enabled = true;
-    /* a slot with no gen state likewise */
-    slots[3].gen = NULL;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
-    slots[3].gen = &g[3];
-    /* a plain batch in flight locks the lane even when all spec */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 1) == 2);
-    /* ...and a decoder that has joined the plain lane says so itself */
+    /* a decoder that HAS latched into the plain lane is the only one that goes
+     * plain -- and it goes alone */
     g[1].batch_active = true;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 4, spec, plain, &ns, &np) == 3);
+    TEST_ASSERT(ns == 3 && np == 1 && plain[0] == dec[1]);
+    TEST_ASSERT(spec[0] == dec[0] && spec[1] == dec[2] && spec[2] == dec[3]);
     g[1].batch_active = false;
-    /* no drafter: plain */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 4, 0) == 2);
-    /* L118 batch of one: a solo spec decoder is lane 3, solo plain lane 2 */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 0) == 3);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 1, 0) == 2);
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 1) == 2);
-    /* no pool: idle with no decoders, else the retired classic code 1 */
-    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 1, 0) == 1);
-    TEST_ASSERT(server_pick_decode_lane(0, false, dec, 4, 0) == 1);
+    /* no drafter: every member plain */
+    TEST_ASSERT(server_plan_decode_lanes(pool, false, dec, 4, spec, plain, &ns, &np) == 2);
+    TEST_ASSERT(ns == 0 && np == 4);
+    /* L118 batch of one: a solo spec decoder is lane 3, a solo latched one 2 */
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 1, spec, plain, &ns, &np) == 3);
+    TEST_ASSERT(server_plan_decode_lanes(pool, false, dec, 1, spec, plain, &ns, &np) == 2);
+    g[0].batch_active = true;
+    TEST_ASSERT(server_plan_decode_lanes(pool, true, dec, 1, spec, plain, &ns, &np) == 2);
+    g[0].batch_active = false;
+    /* no pool: idle with no decoders, else the retired classic code 1 (the
+     * planner fills no subsets without a pool) */
+    TEST_ASSERT(server_plan_decode_lanes(0, true, dec, 0, spec, plain, &ns, &np) == 0);
+    TEST_ASSERT(server_plan_decode_lanes(0, true, dec, 1, spec, plain, &ns, &np) == 1);
+    TEST_ASSERT(server_plan_decode_lanes(0, false, dec, 4, spec, plain, &ns, &np) == 1);
+    TEST_ASSERT(ns == 0 && np == 0);
 }
 
 /* Geometric survival for one bank: np pendings at per-position confidence c,
