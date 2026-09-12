@@ -269,6 +269,30 @@ dropped with the reason.
   back-of-envelope gives: the measured prefill map's CONVERSION kernels are
   ~9.5% of prefill (`f32_to_f16` 3.8 + `pack_act_e4m3_rowmajor_warp` 3.1 +
   `mxfp8_quant_act_grouped` 2.6).  Rule 3 ("producers emit") is the theme here.
+  Measured on the fresh census below: the attn-out `low` emit
+  (`mxfp8_quant_act_kernel`) is 29.1 ms / **0.9%** of a 4000-ctx prefill, plus
+  the GEMM's f32 store of `low` -- so the honest ceiling is ~1-1.5%, not the
+  0.1% a byte-count gives.
+- **C1 (expert recipe tier imbalance) -- census RE-RUN; do not re-solve on it.**
+  Fresh `nsys cuda_gpu_kern_sum`, 4000 ctx, `--gen-tokens 0`, story prompt
+  (total ~3.28 s; raw in
+  `pulsar-notes/gate-baseline/l219-c1-census/kern-sum-4000ctx.csv`):
+  - MXFP4 grouped expert GEMM **400.5 ms / 12.2%** (9 layers, ~44 ms/layer)
+  - IQ2 gate/up `gateup_iq2_d2r_pair_kernel<64>` **952.4 ms / 29.0%**
+    (34 layers, ~28 ms/layer)
+  - attention f16 590.7 / 18.0%; dense block-scaled cutlass 276.6 / 8.4%;
+    hc + norm ~9.4%.
+
+  The old "the 9 MXFP4 layers cost ~984 ms against ~26 ms/layer for the ~30 IQ2
+  layers" (`7550d1da`) is NOT reproducible now: the tier gap is ~1.6x per layer,
+  not the ~40x that pair of numbers implies, and the IQ2 gate/up path is the
+  larger single bucket.  Attribution is still blurred -- the per-layer down
+  recipe differs (IQ2 gate/up pairs with an MXFP4 or IQ2 down, per the binder
+  table), and `cutlass3x` serves dense GEMMs too -- so a re-solve needs
+  PER-LAYER attribution (NVTX ranges or an engine-side timer), not this kernel
+  sum.  Demoting the MXFP4 layers is also a quality decision (ppl/KL gates plus
+  an artifact rebuild).  Recommendation: build the per-layer attribution first;
+  do not demote on this census.
 - **C6 (indexer scorer `mxf4nvf4`) -- scoped; selection now graded (D2).**  The
   instruction-ceiling measurement is real (`mxf4nvf4` 251 vs `mxf8f6f4` 125
   TMAC/s against a kernel running ~6.5), so the 2-4x scorer multiple is
@@ -296,6 +320,26 @@ dropped with the reason.
   `cuda-reference-gate` target prints REFUSING and exits nonzero.  An UNSET
   `PULSAR_REF_DIR` still SKIPs -- that is the deliberate default for boxes
   without the captures.
+- **B9 (spec row budget past 16) -- DEFERRED: correctness-bound, high effort.**
+  The pool-cap half landed (8 -> 16, +10.8% at 12-way).  The row-budget half
+  cannot be a constant bump: `pulsar_gpu.h:110-117` records L117's raise to 32
+  and its failure mode -- past 16 the step's row-kind inference found no
+  single-row runs, declared zero decode rows and ran every row on the
+  tensor-core arm, so a bank's numerics depended on batch width; Tyler took it
+  back to 16 (L177).  The work is therefore the campaign the review names:
+  extend the M-independent decode instantiations AND the row-neutrality gates to
+  24/32, then re-measure c4+ depth.  Gate first, lane second; not a tuning
+  change.
+- **D1 (two-format KV window) -- RECOMMENDED as its own item; v41 template
+  exists.**  One 384 B NVFP4 row serves ring/pool/drafter/chunk by L111's
+  authority, so the raw 128-row window -- the region every query attends and the
+  only thing a ratio-0 layer sees -- shares the pool's FP4 budget.  v41
+  `0ffef78d` stores two reference-matching rows (WINDOW E4M3xE8M0/32 528 B, MAIN
+  E2M1xE4M3/16 288 B) with a per-row selector
+  (`v41 pulsar_cuda_kvrows.cu:31-79`); +144 B per window row is
+  memory-trivial.  It needs ppl/KL gates and a payload/bank version bump, and it
+  reintroduces a second KV row format that `AGENTS.md` currently rules out --
+  a quality decision for Tyler, not an unattended landing.
 
 ---
 
