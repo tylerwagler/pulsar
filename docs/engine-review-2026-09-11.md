@@ -100,10 +100,18 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   removing 44.5 ms of fallback, a -0.3% wash at 4096 tokens that worsens with
   depth.  Kernel census and reasoning in the revert message.
 
-Still open, in value order: B10 (sampled redraft), C4 (indexer f16 scores), C5
-(`low` fusion), C6 (`mxf4nvf4`), C10b/c and the `attn_pack_store` retile.  B9's
-row-budget half, B4, C1, D1 and D2 need dedicated campaigns.  B5 is a measured
-NO-GO (below).
+Every item that was still open now has a recorded verdict; see the autonomous
+pass section at the end of this block.  Short form: B5 measured NO-GO (lane
+split costs a sweep); B10 deferred (no bounded win); C4 deferred (indexer
+complex ~2%); C5 scoped (measured 0.9% kernel, needs a CUTLASS E4M3 epilogue);
+C6 scoped (instrument-first campaign, selection now graded); C10b/c deferred
+(L209 refuted launch-count items); B4 premise corrected (MAX stays 5, only
+`marginal_ms` is stale); B9 correctness-bound (row-kind neutrality above 16);
+C1 census re-run (old ~984 ms estimate refuted); D1 recommended (v41 template,
+quality decision); D2 CLOSED (owed KL run, no drift); `attn_pack_store` retile
+measured negligible.  Two real fixes fell out of the pass and LANDED:
+`/v1/completions` no longer swallows `logprobs`, and a configured-but-missing
+`PULSAR_REF_DIR` no longer skips the reference grade silently.
 
 ### Tail review — the five commits after the external review (2026-09-11)
 
@@ -293,6 +301,12 @@ dropped with the reason.
   sum.  Demoting the MXFP4 layers is also a quality decision (ppl/KL gates plus
   an artifact rebuild).  Recommendation: build the per-layer attribution first;
   do not demote on this census.
+- **`attn_pack_store` retile -- measured negligible.**  Named in the still-open
+  list without its own section; the kernel is `attn_pack_store_kernel`
+  (`norm_kv.cu:599`, launched `<<<n_rows, 64>>>`) and the same fresh census
+  measures it at **3.7 ms / 0.1%** of a 4000-ctx prefill (448 instances).  Not
+  worth a retile; leave un-scoped unless a depth is found where it grows.
+  (The whole INDEXER complex in that census is ~1.5%, which also bounds C4/C6.)
 - **C6 (indexer scorer `mxf4nvf4`) -- scoped; selection now graded (D2).**  The
   instruction-ceiling measurement is real (`mxf4nvf4` 251 vs `mxf8f6f4` 125
   TMAC/s against a kernel running ~6.5), so the 2-4x scorer multiple is
