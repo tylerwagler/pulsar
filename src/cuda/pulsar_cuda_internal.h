@@ -229,12 +229,10 @@ __device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
     return (nib & 8u) ? -sv : sv;
 }
 
-/* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  Only
- * pulsar_cuda_norm_kv.cu's dispatchers call these -- the engine-facing surface
- * is the two dispatchers, so no caller names a row family. */
-int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src,
-                                      pulsar_gpu_tensor *packed, uint32_t out_row0,
-                                      uint32_t n_rows, uint32_t head_dim);
+/* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  The
+ * contiguous store is declared in pulsar_gpu.h because tests/attn_pack_gate.cpp
+ * grades it; the rest are reached only through pulsar_cuda_norm_kv.cu's
+ * dispatchers, so no engine caller names a row family. */
 int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                            uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,

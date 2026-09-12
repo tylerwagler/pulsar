@@ -392,12 +392,25 @@ tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
-# the device packer will write; that packer is not restored yet, so
-# pulsar_kv_row_bytes() still refuses PULSAR_KV_ROWS_UNIFIED.  This binary pins
-# the geometry and the recipe arithmetic the kernel must then reproduce, which
-# is what makes the kernel's restoration checkable instead of blind.
+# the device packer writes; this binary pins the geometry and the recipe
+# arithmetic the kernel must reproduce.
 tests/attn_pack_fixture_test: tests/attn_pack_fixture_test.cpp tests/attn_pack_fixture.h Makefile src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/attn_pack_fixture_test.cpp
+
+# The DEVICE gate for that packer: runs the real kernel and grades its bytes and
+# its f32 writeback against an INDEPENDENT CPU transcription (deliberately not
+# the fixture -- an oracle shared with the code under test can be wrong in the
+# same direction).  Host side built -fno-fast-math so the reference is exact;
+# the tolerances exist because the DEVICE is fast-math.  No model needed.
+tests/attn_pack_gate.o: tests/attn_pack_gate.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/attn_pack_gate.cpp
+
+tests/attn_pack_gate: tests/attn_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: cuda-attn-pack-gate
+cuda-attn-pack-gate: tests/attn_pack_gate
+	./tests/attn_pack_gate
 
 .PHONY: attn-pack-fixture-check
 attn-pack-fixture-check: tests/attn_pack_fixture_test
@@ -1084,7 +1097,7 @@ render-gate: pulsar_test
 # iterating on one gate; the battery is the runner.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates \
+	cuda-attn-gates cuda-attn-pack-gate \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A

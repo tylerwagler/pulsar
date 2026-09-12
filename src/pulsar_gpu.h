@@ -1085,6 +1085,16 @@ int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *
 int pulsar_gpu_mainkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim);
 
+/** 0731's unified NVFP4 row packer (src/cuda/pulsar_cuda_attnpack.cu): quantise
+ * `n_rows` f32 rows of `src` and store them at `packed` rows
+ * [out_row0, out_row0 + n_rows).  `x`, when non-NULL, receives the DECODED
+ * values -- observer-only, pass NULL unless gpu_graph_f32_store_observed_any().
+ * Public because tests/attn_pack_gate.cpp grades it; the ENGINE reaches it
+ * through the dispatchers below, never by name. */
+int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src,
+                                      pulsar_gpu_tensor *packed, uint32_t out_row0,
+                                      uint32_t n_rows, uint32_t head_dim);
+
 /** ---- the row-family DISPATCHERS: the engine-facing pack surface ----------
  *
  * Callers ask to pack a RING row or a COMP row.  WHICH format that is comes

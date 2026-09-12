@@ -52,6 +52,7 @@ __pycache__/
 /tests/token_seam_gate
 /tests/spec_sampling_gate
 /tests/attn_pack_fixture_test
+/tests/attn_pack_gate
 /gguf-tools/test_quants
 .claude/
 /data/
