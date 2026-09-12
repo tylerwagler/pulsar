@@ -354,6 +354,21 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     fflush(f);
 }
 
+/* Seed the HC carrier for one chunk: gather the token embeddings, then merge any
+ * image span this chunk owns over them.  The reference's order is exactly this --
+ * `h = self.embed(input_ids)`, then merge_image_embeddings, then the layers --
+ * and this is the ONE place the carrier is seeded from token-derived data, so
+ * every prefill arm goes through it. */
+static bool gpu_graph_seed_chunk_hc(pulsar_gpu_graph *g, const pulsar_model *model,
+                                    const pulsar_weights *weights, const token_vec *prompt,
+                                    uint32_t start, uint32_t n_tokens) {
+    if (!gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc, g->prefill_tokens,
+                                               model, weights, prompt, start, n_tokens))
+        return false;
+    return gpu_graph_merge_image_spans(g->batch_cur_hc, model, prompt->v, prompt->len,
+                                       g->vision_req, start, n_tokens);
+}
+
 static bool gpu_graph_prefill_layer_major_inner(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -437,13 +452,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     const bool split_commands = n_tokens > 2048 || imatrix != NULL;
 
     if (!split_commands) {
-        ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                     g->prefill_tokens,
-                                                     model,
-                                                     weights,
-                                                     prompt,
-                                                     start,
-                                                     n_tokens);
+        ok = gpu_graph_seed_chunk_hc(g, model, weights, prompt, start, n_tokens);
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
             ok = gpu_graph_encode_layer_batch(g,
@@ -495,13 +504,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         return ok;
     }
 
-    ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                 g->prefill_tokens,
-                                                 model,
-                                                 weights,
-                                                 prompt,
-                                                 start,
-                                                 n_tokens);
+    ok = gpu_graph_seed_chunk_hc(g, model, weights, prompt, start, n_tokens);
     if (!ok) {
         if (pulsar_gpu_synchronize() == 0) {
             fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill embed failure also failed\n");
@@ -728,6 +731,39 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
+    /* An image span is prefilled WHOLE, and only on the pass that begins at token
+     * 0: the reference merges images solely when start_pos == 0 and asserts
+     * `(input_ids < vocab_size).all()` for a continuation, i.e. no sentinel id may
+     * survive into a chunk that does not start at 0.  So every span must lie
+     * inside the FIRST chunk.  Refuse rather than degrade -- a split span would
+     * prefill sentinels whose embeddings were never merged. */
+    int32_t vision_span_end = 0;
+    if (g->vision_req && g->vision_req->n_images > 0) {
+        if (start != 0) {
+            fprintf(stderr, "pulsar: an image request cannot extend a cached prefix (start=%u); "
+                            "image spans are prefilled from token 0 in one chunk\n", start);
+            return false;
+        }
+        for (int i = 0; i < g->vision_req->n_images; i++) {
+            int len = 0;
+            if (!vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB,
+                                    g->vision_req->images[i].start_pos, &len)) {
+                fprintf(stderr, "pulsar: image %d claims a span at token %d that the prompt does not "
+                                "carry (no IMAGE_START sentinel there, or no IMAGE_END after it)\n",
+                        i, g->vision_req->images[i].start_pos);
+                return false;
+            }
+            const int32_t e = g->vision_req->images[i].start_pos + len;
+            if (e > vision_span_end) vision_span_end = e;
+        }
+        if (vision_span_end > (int32_t)chunk_cap) {
+            fprintf(stderr, "pulsar: image spans reach token %d but one prefill chunk holds only %u; "
+                            "an image span must fit in a single chunk (raise --prefill-chunk or send "
+                            "a smaller image)\n", vision_span_end, chunk_cap);
+            return false;
+        }
+    }
+
     const uint32_t end = start + n_tokens;
 
     if (progress) {
@@ -774,6 +810,12 @@ bool gpu_graph_prefill_chunked_range(
                 if (aligned_end > pos0) chunk = aligned_end - pos0;
             }
         }
+        /* The ratio alignment above may have pulled the boundary back INTO the
+         * span.  Only the first chunk can be inside one (the plan already refused
+         * a span that does not fit), so this only ever widens that chunk, at the
+         * cost of the compressor fallback for one boundary. */
+        if (pos0 < (uint32_t)vision_span_end && chunk < (uint32_t)vision_span_end - pos0)
+            chunk = (uint32_t)vision_span_end - pos0;
         const uint32_t chunk_end = pos0 + chunk;
         /* Only the final chunk's logits are consumed (the progress callback below
          * reports position only, never reads logits). Running the full output

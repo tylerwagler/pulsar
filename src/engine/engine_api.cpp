@@ -226,7 +226,13 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, cons
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
 int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) { return s ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL; }
 int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
-int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) { return s ? s->sync(prompt, err, errlen) : 1; }
+int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
+    return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
+}
+int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
+                           const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
+    return s ? s->sync(prompt, images, n_images, err, errlen) : 1;
+}
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) { return s ? s->rewrite_from_common(prompt, common, err, errlen) : PULSAR_SESSION_REWRITE_ERROR; }
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return s->common_prefix(prompt); }
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }

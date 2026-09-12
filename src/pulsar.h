@@ -38,6 +38,17 @@ typedef enum {
     PULSAR_LOG_ERROR,
 } pulsar_log_type;
 
+/** One image to place in a prompt.  `start_pos` is the token index of the
+ * span's IMAGE_START sentinel: the renderer writes the span's ids as
+ * `vocab_size + role` (out-of-vocab sentinels, per the reference), so they are
+ * ids the tokenizer never produces and the embedder zero-masks.  `bytes`/`len`
+ * are the encoded image file (PNG or JPEG). */
+typedef struct {
+    const uint8_t *bytes;
+    size_t         len;
+    int            start_pos;
+} pulsar_image_ref;
+
 /** Growable token vector. Owns `v`; free with pulsar_tokens_free().
  *
  * `len` is the token count, `cap` the allocated slots. Many APIs accept a
@@ -360,6 +371,18 @@ typedef enum {
  * counts and row offsets every kernel sees are the same); otherwise the
  * backend state is refilled from scratch. */
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen);
+/** pulsar_session_sync() with images.  `n_images == 0` is the text-only path and
+ * is exactly what pulsar_session_sync() calls.
+ *
+ * An image request is a COLD prefill from token 0: the reference merges an
+ * image only on the start_pos == 0 pass and asserts that no sentinel id
+ * survives into a continuation, so a cached prefix is never reused for one.
+ * Every span must also fit inside a single prefill chunk -- a request that would
+ * split one is refused loudly rather than prefilled with sentinels whose
+ * embeddings were never merged. */
+int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
+                           const pulsar_image_ref *images, int n_images,
+                           char *err, size_t errlen);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, -1 when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a

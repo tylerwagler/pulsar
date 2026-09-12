@@ -2075,6 +2075,17 @@ __attribute__((constructor)) void pulsar_tu_archs_register_(void) {
 #define PULSAR_VISION_PATCH       14u
 #define PULSAR_VISION_DOWNSAMPLE  3u
 #define PULSAR_VISION_ROPE_THETA  10000.0f
+/* The reference's image-preprocessing POLICY (config.json: vision_max_n_token,
+ * vision_min_pixels, vision_max_wh_ratio).  Unlike PATCH/DOWNSAMPLE these are
+ * not derivable from any tensor shape -- they bound how large an image the model
+ * will accept -- and the artifact carries no metadata for them: every scalar key
+ * in the GGUF is deepseek4.<...> or dspark.<...>, with no vision.<...> scalar (the tower
+ * arrives as tensors only).  They are therefore constants of THIS checkpoint,
+ * exactly as the tower dims above are.  A future artifact that changes them
+ * needs them in the GGUF metadata, not a second constant here. */
+#define PULSAR_VISION_MAX_N_TOKEN  384
+#define PULSAR_VISION_MIN_PIXELS   147456
+#define PULSAR_VISION_MAX_WH_RATIO 8.0f
 
 /** One vision-tower tensor as a file offset into the model mapping.  The CUDA
  * forward reads every weight through these; the engine fills them from the

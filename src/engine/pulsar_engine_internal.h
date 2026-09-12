@@ -848,6 +848,18 @@ typedef struct {
  * rather than any one bank's frontier -- see the multiseq block below, which
  * is the part to read before touching decode state.
  */
+
+/** The images a prefill must merge, bound to the tower that encodes them.  Lives
+ * on the graph (pulsar_gpu_graph::vision_req) as a BORROW for the duration of one
+ * prefill, the same way `prompt` is borrowed: the owner sets it before entering
+ * the prefill and clears it on every exit.  Declared here because the graph
+ * carries the pointer. */
+typedef struct {
+    const pulsar_image_ref      *images;
+    int                          n_images;
+    const pulsar_vision_weights *weights;
+} pulsar_vision_request;
+
 typedef struct {
     /** One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -1260,6 +1272,10 @@ typedef struct {
      * and the banked arms publish per bank instead. */
     bool batch_multiseq;
     uint32_t batch_multiseq_rows;         ///< rows in the current step
+    /** Borrowed for ONE prefill: the images to merge and the tower to encode them
+     * with, or NULL for the text-only path.  Set and cleared by the prefill's
+     * owner (pulsar_session::sync); nothing else may leave it set. */
+    const pulsar_vision_request *vision_req;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1963,7 +1979,8 @@ struct pulsar_session {
     int bank_fork_partial_feasible(uint32_t src, int n_cached);
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
-    int sync(const pulsar_tokens *prompt, char *err, size_t errlen);
+    int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
+             char *err, size_t errlen);
     /** Rewrite the session to `prompt` given an already-computed `common`
      * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
@@ -2357,6 +2374,12 @@ typedef struct {
 int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
                          int start_pos, int vocab_size, pulsar_vision_prepared *out);
 void vision_prepared_free(pulsar_vision_prepared *p);
+/** The sentinel span beginning at `start_pos` (IMAGE_START..IMAGE_END), or 0 if
+ * the ids there are not such a span.  `*len_out` receives its length.  The ONE
+ * place the sentinel roles are resolved for a scan, so the chunk planner and the
+ * merge cannot disagree about where a span ends. */
+int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
+
 /** The reference's get_image_visible(): per-token visible counts to the
  * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function
  * of the token ids, so it is graded directly against the reference by
@@ -2840,6 +2863,15 @@ bool gpu_graph_upload_prompt_embeddings_hc(
  * Returns false, without writing, if the span does not fit the carrier. */
 bool gpu_graph_write_vision_span(pulsar_gpu_tensor *out_hc, const uint16_t *rows,
                                  uint32_t n_rows, uint32_t row0, uint32_t n_tokens);
+/** Merge every image span that lies inside [pos0, pos0 + n_tokens) into the HC
+ * carrier: decode, preprocess, run the tower, and scatter the result.  `ids` is
+ * the whole prompt (the span extent comes from vision_span_extent, not from the
+ * image), so a request whose prompt does not carry the span it claims is
+ * refused.  Returns false on any refusal; true (a no-op) when `vr` is NULL. */
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
+                                 const int32_t *ids, int n_ids,
+                                 const pulsar_vision_request *vr,
+                                 uint32_t pos0, uint32_t n_tokens);
 
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,

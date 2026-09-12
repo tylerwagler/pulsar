@@ -262,6 +262,78 @@ bool gpu_graph_write_vision_span(
 
 
 
+/* The reference's image-preprocessing args.  Patch size and downsample ratio are
+ * tower dims the binder already validates against the tensors; the other three
+ * are the checkpoint's policy constants (see PULSAR_VISION_MAX_N_TOKEN).  Built
+ * here rather than at each call so there is one place that knows the mapping. */
+static void vision_default_args(pulsar_vision_args *a) {
+    a->patch_size       = (int)PULSAR_VISION_PATCH;
+    a->downsample_ratio = (int)PULSAR_VISION_DOWNSAMPLE;
+    a->max_n_token      = PULSAR_VISION_MAX_N_TOKEN;
+    a->min_pixels       = PULSAR_VISION_MIN_PIXELS;
+    a->max_wh_ratio     = PULSAR_VISION_MAX_WH_RATIO;
+}
+
+/* Decode + preprocess + encode + scatter, for every image span inside the chunk.
+ *
+ * The span EXTENT comes from the prompt's own sentinel ids (vision_span_extent),
+ * not from the image, so an image whose span is not actually in the prompt is a
+ * refusal rather than a silently misplaced block.  An image whose span lies in
+ * another chunk is skipped: the chunk planner has already refused any request
+ * that would split one, so this only ever skips images that a later chunk owns.
+ *
+ * The reference does exactly this merge between `h = self.embed(input_ids)` and
+ * the first layer, which is why the caller runs it right after the embedding
+ * gather. */
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
+                                 const int32_t *ids, int n_ids,
+                                 const pulsar_vision_request *vr,
+                                 uint32_t pos0, uint32_t n_tokens) {
+    if (!vr || vr->n_images <= 0) return true;      /* text-only: nothing to do */
+    if (!out_hc || !model || !vr->weights || !ids || n_ids <= 0) return false;
+
+    pulsar_vision_args args;
+    vision_default_args(&args);
+
+    for (int i = 0; i < vr->n_images; i++) {
+        const pulsar_image_ref *img = &vr->images[i];
+        if (!img->bytes || img->len == 0 || img->start_pos < 0) return false;
+        int span_len = 0;
+        if (!vision_span_extent(ids, n_ids, (int)PULSAR_N_VOCAB, img->start_pos, &span_len)) {
+            fprintf(stderr, "pulsar: image %d claims a span at token %d that the prompt does not "
+                            "carry (no IMAGE_START sentinel there, or no IMAGE_END after it)\n",
+                    i, img->start_pos);
+            return false;
+        }
+        const uint32_t s0 = (uint32_t)img->start_pos;
+        if (s0 < pos0 || s0 + (uint32_t)span_len > pos0 + n_tokens) continue;   /* another chunk */
+
+        pulsar_vision_prepared prep = {};
+        if (!vision_prepare_image(img->bytes, img->len, &args, (int)s0, (int)PULSAR_N_VOCAB, &prep)) {
+            fprintf(stderr, "pulsar: image %d at token %d failed to decode/preprocess\n", i, img->start_pos);
+            return false;
+        }
+        const int cap = prep.span_len * (int)PULSAR_N_EMBD;
+        uint16_t *rows = (uint16_t *)malloc((size_t)cap * sizeof(uint16_t));
+        if (!rows) { vision_prepared_free(&prep); return false; }
+        int n_rows = 0;
+        const bool merged = vision_merge_span(vr->weights, model, &prep, rows, cap, &n_rows) &&
+                            n_rows == prep.span_len &&
+                            gpu_graph_write_vision_span(out_hc, rows, (uint32_t)n_rows,
+                                                        s0 - pos0, n_tokens);
+        free(rows);
+        vision_prepared_free(&prep);
+        if (!merged) {
+            fprintf(stderr, "pulsar: image %d at token %d failed to merge (span %d rows)\n",
+                    i, img->start_pos, prep.span_len);
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,

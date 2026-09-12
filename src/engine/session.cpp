@@ -822,7 +822,8 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) {
+int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                         int n_images, char *err, size_t errlen) {
     auto *s = this;
     s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -835,6 +836,26 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
     }
     pulsar_engine *e = s->engine;
     const char *backend_name = pulsar_backend_name(e->backend);
+
+    /* The image path is refused until the artifact actually carries a bound,
+     * layout-validated tower -- which is what vision_ready has always meant.
+     * An image request is then a COLD prefill from token 0: the reference merges
+     * only on the start_pos == 0 pass and asserts that no sentinel id survives a
+     * continuation, so neither cache-reuse path may run (the extend path and the
+     * L115 seam rescue are both gated on checkpoint_valid). */
+    if (n_images > 0) {
+        if (!e->vision_ready) {
+            snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
+            return 1;
+        }
+        for (int i = 0; i < n_images; i++) {
+            if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
+                snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
+                return 1;
+            }
+        }
+        s->checkpoint_valid = false;
+    }
 
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
@@ -1017,11 +1038,25 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             memcpy(stitched.v + live_n, prompt->v + prompt_n,
                    (size_t)(prompt->len - prompt_n) * sizeof(int));
             stitched.len = stitched.cap;
-            const int rc = s->sync(&stitched, err, errlen);
+            const int rc = s->sync(&stitched, NULL, 0, err, errlen);
             free(stitched.v);
             return rc;
         }
     }
+
+    /* The images are BORROWED for exactly this prefill.  The driver reads them
+     * off the graph so that four prefill signatures do not grow a parameter that
+     * only this caller can ever fill; the scope clears the borrow on every exit,
+     * including the interrupted ones, so no later decode can see it. */
+    struct vision_scope {
+        pulsar_gpu_graph *g;
+        const pulsar_vision_request *prev;
+        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
+            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
+        ~vision_scope() { g->vision_req = prev; }
+    };
+    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
+    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
 
     bool ok;
     s->checkpoint_valid = false;
@@ -1136,7 +1171,7 @@ pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_t
     }
 
     if (common == s->checkpoint.len) {
-        return s->sync(prompt, err, errlen) == 0 ?
+        return s->sync(prompt, NULL, 0, err, errlen) == 0 ?
             PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
     }
 
