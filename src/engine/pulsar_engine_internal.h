@@ -2332,6 +2332,13 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                           const pulsar_vision_args *args,
                           uint16_t *patch_out, size_t patch_cap,
                           pulsar_vision_image *out);
+/** Decode image BYTES to 8-bit RGB.  PNG (libpng) and JPEG (libjpeg-turbo, with
+ * Pillow's settings, which are libjpeg's defaults) only -- the caller fails
+ * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
+ * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
+ * own .convert("RGB") is a different transform from libjpeg's. */
+int vision_decode_rgb(const uint8_t *bytes, size_t len,
+                      uint8_t **rgb_out, int *w_out, int *h_out);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);

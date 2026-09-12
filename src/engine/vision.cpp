@@ -21,6 +21,18 @@
 #include "pulsar_engine_internal.h"
 
 #include <math.h>
+#include <setjmp.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The DECODER: libpng and libjpeg-turbo, the two libraries Pillow itself
+ * decodes with.  Using the same pair is the whole point -- a different JPEG
+ * decoder produces different pixels for the same file, and the reference (and
+ * the vLLM capture) preprocess with Pillow, so any other choice would put every
+ * image feature on a different input with nothing to compare against. */
+#include <jpeglib.h>
+#include <png.h>
 
 /* The reference's IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END. */
 #define VISION_T_IMAGE_START    0
@@ -448,4 +460,122 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
     out->best_width = best_w;
     out->best_height = best_h;
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * The CODEC.
+ *
+ * PNG through libpng's simplified API (PNG_FORMAT_RGB: every colour type, bit
+ * depth and interlace mode reduced to 8-bit RGB, alpha dropped -- exactly what
+ * Pillow's .convert("RGB") yields).  JPEG through libjpeg-turbo with Pillow's
+ * settings, which are libjpeg's DEFAULTS: Pillow only touches dct_method and
+ * do_fancy_upsampling in draft mode (see libImaging/JpegDecode.c), so JDCT_ISLOW
+ * + fancy upsampling + block smoothing + JCS_RGB output is what it gets and what
+ * we ask for.
+ *
+ * CMYK/YCCK JPEG is REFUSED rather than converted: Pillow keeps those in CMYK
+ * and its own .convert("RGB") is a different transform from libjpeg's, so a
+ * silent agreement would be luck.  Anything that is not PNG or JPEG is refused
+ * by the dispatcher -- the caller fails loudly, it does not guess.
+ * ------------------------------------------------------------------------- */
+
+static int vision_decode_png(const uint8_t *bytes, size_t len,
+                             uint8_t **rgb_out, int *w_out, int *h_out) {
+    png_image image;
+    memset(&image, 0, sizeof image);
+    image.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_memory(&image, bytes, len)) return 0;
+    image.format = PNG_FORMAT_RGB;
+    if (image.width == 0 || image.height == 0 ||
+        image.width > (png_uint_32)INT32_MAX || image.height > (png_uint_32)INT32_MAX) {
+        png_image_free(&image);
+        return 0;
+    }
+    const size_t sz = PNG_IMAGE_SIZE(image);
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) { png_image_free(&image); return 0; }
+    if (!png_image_finish_read(&image, NULL, buf, 0, NULL)) {
+        free(buf);
+        png_image_free(&image);
+        return 0;
+    }
+    *w_out = (int)image.width;
+    *h_out = (int)image.height;
+    png_image_free(&image);
+    *rgb_out = buf;
+    return 1;
+}
+
+struct vision_jpeg_error {
+    struct jpeg_error_mgr pub;
+    jmp_buf jb;
+};
+
+static void vision_jpeg_error_exit(j_common_ptr cinfo) {
+    struct vision_jpeg_error *e = (struct vision_jpeg_error *)cinfo->err;
+    longjmp(e->jb, 1);
+}
+static void vision_jpeg_output_message(j_common_ptr cinfo) { (void)cinfo; }
+
+static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
+                              uint8_t **rgb_out, int *w_out, int *h_out) {
+    struct jpeg_decompress_struct cinfo;
+    struct vision_jpeg_error jerr;
+    memset(&cinfo, 0, sizeof cinfo);   /* so the longjmp path's destroy is a no-op */
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = vision_jpeg_error_exit;
+    jerr.pub.output_message = vision_jpeg_output_message;
+    if (setjmp(jerr.jb)) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, bytes, (unsigned long)len);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    if (cinfo.jpeg_color_space == JCS_CMYK || cinfo.jpeg_color_space == JCS_YCCK) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    cinfo.out_color_space = JCS_RGB;
+    if (!jpeg_start_decompress(&cinfo)) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    const int cw = (int)cinfo.output_width, ch = (int)cinfo.output_height;
+    if (cinfo.output_components != 3 || cw <= 0 || ch <= 0 ||
+        (size_t)cw > SIZE_MAX / 3u / (size_t)ch) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)cw * (size_t)ch * 3u);
+    if (!buf) { jpeg_destroy_decompress(&cinfo); return 0; }
+    while (cinfo.output_scanline < cinfo.output_height) {
+        uint8_t *row = buf + (size_t)cinfo.output_scanline * (size_t)cw * 3u;
+        JSAMPROW rows[1] = { row };
+        if (jpeg_read_scanlines(&cinfo, rows, 1) != 1) {
+            free(buf);
+            jpeg_destroy_decompress(&cinfo);
+            return 0;
+        }
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    *w_out = cw;
+    *h_out = ch;
+    *rgb_out = buf;
+    return 1;
+}
+
+/* Formats the server accepts today: PNG and JPEG.  A GIF/WebP/... payload is
+ * refused by name rather than mis-parsed. */
+int vision_decode_rgb(const uint8_t *bytes, size_t len,
+                      uint8_t **rgb_out, int *w_out, int *h_out) {
+    if (!bytes || len < 8) return 0;
+    static const uint8_t png_sig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    if (!memcmp(bytes, png_sig, 8)) return vision_decode_png(bytes, len, rgb_out, w_out, h_out);
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8) return vision_decode_jpeg(bytes, len, rgb_out, w_out, h_out);
+    return 0;
 }
