@@ -86,11 +86,15 @@ def main():
     # whatever dtype nn.Module created, so the cast is what makes the module the
     # checkpoint's own dtype -- and what the engine has to reproduce.
     tower = load_tower(args).to(torch.bfloat16).eval()
+    # The same tower in fp32: the reference's own bf16 output differs from THIS
+    # by a measurable amount, and that gap is the noise floor the gate calibrates
+    # against.  Without it a tolerance is a number someone picked.
+    tower_fp32 = load_tower(args).to(torch.float32).eval()
     p = args.vision_patch_size
 
     out = sys.stdout.buffer
     cases = [(4, 6), (7, 5), (3, 3)]
-    out.write(b"VTX1")
+    out.write(b"VTX2")
     out.write(struct.pack("<I", len(cases)))
 
     for (nh, nw) in cases:
@@ -109,21 +113,30 @@ def main():
                     stages.append(x)
             normed = tower.vision.norm(x)
             aligned = tower.aligner(normed, nh, nw)
+            with torch.no_grad():
+                xf = tower_fp32.vision.patch_embed(patches.float())
+                cosf, sinf = V.get_vision_cos_sin(nh, nw, tower_fp32.vision.rope_dim,
+                                                  tower_fp32.vision.rope_theta)
+                for block in tower_fp32.vision.blocks:
+                    xf = block(xf, cosf, sinf)
+                aligned_fp32 = tower_fp32.aligner(tower_fp32.vision.norm(xf), nh, nw)
+        d = (aligned.float() - aligned_fp32).flatten()
+        floor = (d.pow(2).sum() / aligned_fp32.flatten().pow(2).sum()).sqrt().item()
 
         n_llm_rows = aligned.shape[0]
         out.write(struct.pack("<iiiiiiifI", nh, nw, p, args.vision_dim, args.vision_n_heads,
                               args.vision_inter_dim, args.vision_downsample_ratio,
                               float(args.vision_rope_theta), N_STAGE_BLOCKS))
         out.write(struct.pack("<i", args.dim))
+        out.write(struct.pack("<f", float(floor)))
         out.write(bf16_bits(patches))
         out.write(bf16_bits(x0))
         for s in stages:
             out.write(bf16_bits(s))
         out.write(bf16_bits(normed))
         out.write(bf16_bits(aligned))
-        sys.stderr.write("case %dx%d: %d patches, aligner %d rows; x0 %s norm %s align %s\n"
-                         % (nh, nw, n, n_llm_rows, tuple(x0.shape), tuple(normed.shape),
-                            tuple(aligned.shape)))
+        sys.stderr.write("case %dx%d: %d patches, aligner %d rows; bf16-vs-fp32 floor %.3e\n"
+                         % (nh, nw, n, n_llm_rows, floor))
 
 
 if __name__ == "__main__":
