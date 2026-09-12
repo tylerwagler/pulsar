@@ -18,6 +18,10 @@ requires before the lane lands on dev:
                  lane tail, which is a different arithmetic and would fail
                  this check spuriously -- L043).
   4. HEALTH      no degenerate repetition in any stream; finishes are sane.
+  5. B5          a /logprobs partner overlapping a spec decoder leaves that
+                 decoder on lane 3 with the spec counters advancing; the
+                 partner itself goes plain (it cannot speculate) and still
+                 returns its logprobs payload.
 
 Cross-LANE byte equality is deliberately NOT asserted (L043): the solo run
 is captured and printed as information only.
@@ -59,19 +63,23 @@ def active_lane(txt):
     return "?"
 
 
-def complete(base, prompt, max_tokens, slot):
-    body = json.dumps({"prompt": prompt, "max_tokens": max_tokens,
-                       "temperature": 0.0, "stream": False}).encode()
-    req = urllib.request.Request(base + "/v1/completions", data=body,
+def complete(base, prompt, max_tokens, slot, logprobs=False):
+    body = {"prompt": prompt, "max_tokens": max_tokens,
+            "temperature": 0.0, "stream": False}
+    if logprobs:
+        body["logprobs"] = True
+        body["top_logprobs"] = 3
+    req = urllib.request.Request(base + "/v1/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         j = json.loads(r.read().decode())
     slot["text"] = j["choices"][0]["text"]
     slot["n"] = j.get("usage", {}).get("completion_tokens", -1)
     slot["finish"] = j["choices"][0].get("finish_reason")
+    slot["logprobs"] = j["choices"][0].get("logprobs")
 
 
-def run_pair(base, prompt_partner):
+def run_pair(base, prompt_partner, partner_logprobs=False):
     a, p = {}, {}
     lanes, stop = {}, [False]
 
@@ -88,7 +96,8 @@ def run_pair(base, prompt_partner):
     poller = threading.Thread(target=poll)
     poller.start()
     ta = threading.Thread(target=complete, args=(base, PROMPT_A, A_TOKENS, a))
-    tp = threading.Thread(target=complete, args=(base, prompt_partner, PARTNER_TOKENS, p))
+    tp = threading.Thread(target=complete,
+                          args=(base, prompt_partner, PARTNER_TOKENS, p, partner_logprobs))
     ta.start(); tp.start(); ta.join(); tp.join()
     stop[0] = True; poller.join()
     c1 = counters(metrics(base))
@@ -145,6 +154,27 @@ def main():
             if not (0 < accepted <= drafted):
                 failures.append("%s: accepted/drafted contract violated (%d/%d)" % (tag, accepted, drafted))
 
+        # B5: a /logprobs partner must NOT demote the spec-capable decoder.  The
+        # logprobs request itself genuinely cannot speculate -- the fused step
+        # keeps each draft's target row only inside its batch, so there is no
+        # correct distribution to report for an accepted draft -- but that is a
+        # property of THE REQUEST.  Lane select used to be a GROUP verdict
+        # ("every gathered decoder spec-enabled"), so this pair ran both members
+        # on the plain lane and the spec counters never advanced; post-fix the
+        # partner goes plain and A keeps speculating.  A3 is deliberately NOT
+        # compared to A1: with a logprobs partner A is the whole spec subset
+        # (M=1) instead of one of two banks (M=2), and cross-M equality is not
+        # an invariant (L043).
+        a3, l3, lanes3, d3 = run_pair(base, PROMPT_B, partner_logprobs=True)
+        if lanes3.get("spec-batched", 0) < 3:
+            failures.append("B5 /logprobs partner: lane spec-batched barely/never engaged (%s) "
+                            "-- a logprobs decoder demoted its group" % lanes3)
+        if d3.get("spec_decode_num_draft_tokens_total", 0) <= 0:
+            failures.append("B5 /logprobs partner: no draft tokens counted while a "
+                            "/logprobs request was decoding")
+        if not l3.get("logprobs"):
+            failures.append("B5 /logprobs partner: response carried no logprobs payload")
+
         emitted1 = a1.get("n", 0) + p1.get("n", 0)
         gen1 = d1.get("spec_decode_gen_tokens_total", 0)
         if gen1 != emitted1:
@@ -155,7 +185,7 @@ def main():
                      min(len(a1.get("text", "")), len(a2.get("text", ""))))
             failures.append("BANK ISOLATION: A's greedy text depends on its partner (first divergence at char %d)" % i)
 
-        for tag, s in (("A1", a1), ("A2", a2), ("B", p1), ("C", p2)):
+        for tag, s in (("A1", a1), ("A2", a2), ("B", p1), ("C", p2), ("A3", a3), ("L3", l3)):
             if degenerate(s.get("text", "")):
                 failures.append("%s: degenerate repetition" % tag)
             if s.get("finish") not in ("length", "stop"):
@@ -165,7 +195,7 @@ def main():
         complete(base, PROMPT_A, A_TOKENS, solo)
         print("informational: solo-vs-batched A %s (cross-lane equality NOT asserted, L043)"
               % ("IDENTICAL" if solo.get("text") == a1.get("text") else "differs"))
-        print("lanes A+B=%s A+C=%s | counters A+B=%s" % (lanes1, lanes2, d1))
+        print("lanes A+B=%s A+C=%s A+logprobs=%s | counters A+B=%s" % (lanes1, lanes2, lanes3, d1))
 
         if failures:
             for f in failures:
@@ -173,7 +203,7 @@ def main():
             print("spec-batched lane gate: FAIL (%d)" % len(failures))
             return 1
         print("spec-batched lane gate: PASS (engagement, counter contract, "
-              "bank isolation across partners, health)")
+              "bank isolation across partners, B5 logprobs coexistence, health)")
         return 0
     finally:
         try:
