@@ -43,7 +43,12 @@
  * could reorder is reported as inconclusive rather than as a pass.
  *
  * Needs a GPU, no model: the bias / bias_vl / tid2eid tensors are laid out in
- * one synthetic model_map.
+ * one synthetic model_map, and every case gets its OWN slot in it.  That is not
+ * tidiness: cuda_model_range_ptr caches a device copy per (model_map, offset),
+ * so two cases sharing a host address and offset hand the second case the
+ * first case's cached bytes.  With per-case offsets the cache key identifies
+ * the content, which is the invariant the engine relies on (one mmap'd GGUF,
+ * one offset per tensor, contents never changing).
  *
  * WHY INDICES ARE EXACT AND WEIGHTS ARE NOT.  The kernel is compiled with
  * --use_fast_math (approximate expf/log1pf on the device) while the reference
@@ -140,20 +145,16 @@ int main(int argc, char **argv) {
 
     size_t off = 28;
     const uint64_t hash_bytes = (uint64_t)g.n_vocab * g.topk * sizeof(int32_t);
-    const uint64_t map_size = HASH_OFF + hash_bytes;
 
-    int failures = 0, checked = 0;
-    std::vector<int32_t> dev_idx[16];
-
-    for (uint32_t ci = 0; ci < g.n_cases && ci < 16u; ci++) {
+    std::vector<Case> cases;
+    for (uint32_t ci = 0; ci < g.n_cases; ci++) {
         Case c;
         const size_t b = off + NAME_LEN + 20;
         const size_t need = b + (size_t)g.n_expert * 4 * 2 +
                             (size_t)g.hash_rows * g.topk * 4;
         if (need > g.raw.size()) {
             printf("FAIL case %u: fixture truncated\n", ci);
-            failures++;
-            break;
+            return 1;
         }
         copy_name(c.name, &g.raw[off]);
         off += NAME_LEN;
@@ -171,8 +172,7 @@ int main(int argc, char **argv) {
                             (size_t)rows * g.topk * 4 * 2;
         if (off + tail > g.raw.size()) {
             printf("FAIL %-32s: fixture truncated\n", c.name);
-            failures++;
-            break;
+            return 1;
         }
         c.bias.resize(g.n_expert);
         memcpy(c.bias.data(), &g.raw[off], (size_t)g.n_expert * 4); off += (size_t)g.n_expert * 4;
@@ -190,13 +190,26 @@ int main(int argc, char **argv) {
         memcpy(c.idx.data(), &g.raw[off], c.idx.size() * 4); off += c.idx.size() * 4;
         c.w.resize((size_t)rows * g.topk);
         memcpy(c.w.data(), &g.raw[off], c.w.size() * 4); off += c.w.size() * 4;
+        cases.push_back(std::move(c));
+    }
 
-        /* ---- the synthetic layer ------------------------------------------ */
-        std::vector<uint8_t> map((size_t)map_size, 0);
-        memcpy(map.data() + BIAS_OFF, c.bias.data(), (size_t)g.n_expert * 4);
-        memcpy(map.data() + VL_OFF, c.bias_vl.data(), (size_t)g.n_expert * 4);
-        memcpy(map.data() + HASH_OFF, c.tid2eid.data(), c.tid2eid.size() * 4);
+    /* ---- the synthetic layer: one slot per case --------------------------- */
+    const uint64_t stride = ((HASH_OFF + hash_bytes) + 4095u) & ~(uint64_t)4095u;
+    std::vector<uint8_t> map((size_t)(stride * cases.size()), 0);
+    for (size_t ci = 0; ci < cases.size(); ci++) {
+        const Case &c = cases[ci];
+        uint8_t *base = map.data() + stride * ci;
+        memcpy(base + BIAS_OFF, c.bias.data(), (size_t)g.n_expert * 4);
+        memcpy(base + VL_OFF, c.bias_vl.data(), (size_t)g.n_expert * 4);
+        memcpy(base + HASH_OFF, c.tid2eid.data(), c.tid2eid.size() * 4);
+    }
 
+    int failures = 0, checked = 0;
+    std::vector<int32_t> dev_idx[16];
+
+    for (uint32_t ci = 0; ci < cases.size() && ci < 16u; ci++) {
+        const Case &c = cases[ci];
+        const uint64_t rows = c.n_rows;
         int bad = 0;
 
         /* ---- GUARD 1: the fixture must discriminate -----------------------
@@ -242,7 +255,7 @@ int main(int argc, char **argv) {
         }
 
         /* ---- the device against the reference ------------------------------ */
-        const uint64_t logits_bytes = (uint64_t)rows * g.n_expert * sizeof(float);
+        const uint64_t logits_bytes = rows * g.n_expert * sizeof(float);
         pulsar_gpu_tensor *dlog = pulsar_gpu_tensor_alloc(logits_bytes);
         pulsar_gpu_tensor *dtok = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
         pulsar_gpu_tensor *dsel = pulsar_gpu_tensor_alloc(rows * g.topk * sizeof(int32_t));
@@ -253,12 +266,13 @@ int main(int argc, char **argv) {
             dlog && dtok && dsel && dw &&
             pulsar_gpu_tensor_write(dlog, 0, c.logits.data(), logits_bytes) &&
             pulsar_gpu_tensor_write(dtok, 0, c.tokens.data(), rows * sizeof(int32_t)) &&
-            pulsar_gpu_router_select_batch_tensor(dsel, dw, NULL, map.data(), map_size,
-                                                  BIAS_OFF, HASH_OFF, g.hash_rows, 0, 0,
+            pulsar_gpu_router_select_batch_tensor(dsel, dw, NULL, map.data(), map.size(),
+                                                  stride * ci + BIAS_OFF, stride * ci + HASH_OFF,
+                                                  g.hash_rows, 0, 0,
                                                   c.has_text_bias != 0, c.hash_mode != 0,
                                                   dlog, dtok, g.n_expert, g.topk, 1.5f,
                                                   (uint32_t)rows,
-                                                  c.has_vl_bias ? (uint64_t)VL_OFF : 0u,
+                                                  c.has_vl_bias ? stride * ci + VL_OFF : 0u,
                                                   g.n_vocab, c.has_vl_bias != 0) &&
             pulsar_gpu_end_commands() &&
             pulsar_gpu_tensor_read(dsel, 0, idx.data(), idx.size() * 4) &&
@@ -310,7 +324,7 @@ int main(int argc, char **argv) {
         {4, 3, "bias_vl present must not disturb a text-only batch (hash)"},
     };
     for (const Pair &pr : same) {
-        if (pr.a >= g.n_cases || pr.b >= g.n_cases) continue;
+        if (pr.a >= cases.size() || pr.b >= cases.size()) continue;
         if (dev_idx[pr.a].empty() || dev_idx[pr.b].empty()) continue;
         if (dev_idx[pr.a] != dev_idx[pr.b]) {
             printf("FAIL %s\n", pr.why);
