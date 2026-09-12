@@ -89,6 +89,14 @@
  * is not a 16-multiple would silently drop its tail.  One packed row at
  * head_dim 512 is 384 B, so this holds, but say it rather than derive it. */
 static_assert(AF16_ROWB % 16u == 0u, "ATTN_PACK row must be a whole number of 16-byte chunks");
+/* The phase-2 softmax (one thread per (head,row), an 8/4/2/1 xor tree per
+ * head) stands on these; only a comment said so before (review C7). */
+static_assert(AF16_HPB * AF16_ROWS == AF16_THREADS,
+              "phase-2 softmax requires exactly one thread per (head,row)");
+static_assert(AF16_ROWS == 16u,
+              "the phase-2 xor tree reduces 16 rows, one aligned half-warp per head");
+static_assert(AF16_HEADS == 16u,
+              "each head's 16 rows must stay inside one aligned half-warp");
 /* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
 #define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
