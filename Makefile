@@ -518,6 +518,18 @@ vision-span-gate: tests/vision_span_gate
 # tower), so it is NOT in GATE_TARGETS and refuses to silently pass when
 # VISION_MODEL is unset.
 VISION_MODEL ?=
+# L216: the WHOLE per-image lane, bytes in -> HC carrier out, vs the reference.
+# This is the instrument that proves the image lane ran: decode, preprocess,
+# span discovery, tower, and placement in one call.  Needs a VISION-EXP artifact.
+VISION_IMAGE_GOLDENS ?= tests/test-vectors/vision-image-goldens.bin
+vision-image-gate: tests/vision_image_gate
+	@if [ -z "$(VISION_MODEL)" ]; then \
+		echo "  SKIP  vision-image-gate: set VISION_MODEL=/path/to/a/vision-exp.gguf"; \
+	else \
+		echo "  running against $(VISION_MODEL)"; \
+		./tests/vision_image_gate $(VISION_MODEL) $(VISION_IMAGE_GOLDENS); \
+	fi
+
 vision-merge-gate: tests/vision_merge_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-merge-gate: set VISION_MODEL=/path/to/a/vision-exp.gguf"; \
@@ -1107,7 +1119,7 @@ GATE_TARGETS = unit-test-gate \
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate
+.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1266,6 +1278,9 @@ tests/bank_fork_gate.o: tests/bank_fork_gate.cpp src/engine/pulsar_engine_intern
 tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/session_payload_gate.cpp
 
+tests/vision_image_gate.o: tests/vision_image_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_image_gate.cpp
+
 tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_hc_gate.cpp
 
@@ -1398,6 +1413,9 @@ tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/session_payload_gate: tests/session_payload_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_image_gate: tests/vision_image_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -1585,7 +1603,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
