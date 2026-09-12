@@ -285,8 +285,13 @@ typedef struct {
      * the index keys derived from the same latent) to every later layer up to
      * the next source; the layers that run their own indexer and publish its
      * top-k the same way; and the one indexer whose block-max pool pre-filters
-     * every later indexer (-1: none).  Ascending, and every kv source is also
-     * an index source -- pulsar_attn_layout_install asserts both. */
+     * every later indexer (-1: none).  Ascending and inside the backbone.
+     *
+     * The two sets are NOT the same size in general: V4.1's are equal, but
+     * 0731 has 41 kv sources against 21 index sources, and the 20 layers that
+     * compress without an indexer are PULSAR_ATTN_FULL_UNINDEXED.  A kv source
+     * is therefore NOT necessarily an index source -- derive the mode and ask
+     * pulsar_attn_reads_index rather than assuming the sets coincide. */
     uint32_t n_kv_source;
     uint32_t kv_source_layer[PULSAR_MAX_ATTN_SOURCE];
     uint32_t n_index_source;
@@ -2152,7 +2157,7 @@ void spec_quench_reset(pulsar_session *s);
  *          tensor at all.  Reachable only from a profile whose index source set
  *          is narrower than its kv source set (0731: 21 index of 41 kv).
  *
- * Ask the two predicates below rather than comparing against PULSAR_ATTN_FULL:
+ * Ask the predicates below rather than comparing against PULSAR_ATTN_FULL:
  * a bare comparison silently MISSES the new mode, which skips a layer's
  * compressor without a word. */
 typedef enum {
@@ -2171,6 +2176,19 @@ static inline bool pulsar_attn_owns_kv(pulsar_attn_mode m) {
 /** Runs an indexer: query projection, scoring, and a published top-k. */
 static inline bool pulsar_attn_runs_indexer(pulsar_attn_mode m) {
     return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_REINDEX;
+}
+
+/** Depends on an index source's top-k: FULL and REINDEX publish one, REUSE
+ * consumes one it did not compute.  FULL_UNINDEXED is the single compressed mode
+ * that does not -- it has no indexer, so it has no top-k and no index source to
+ * read.
+ *
+ * This is NOT pulsar_attn_runs_indexer: that asks whether the indexer KERNEL
+ * runs, and REUSE -- the mode that reads a top-k it never computed -- answers no
+ * to it.  Anything asking "does this layer's behaviour depend on its index
+ * source?" wants this one. */
+static inline bool pulsar_attn_reads_index(pulsar_attn_mode m) {
+    return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_REINDEX || m == PULSAR_ATTN_REUSE;
 }
 
 /** One layer's row of the attention layout table.  Derived once at load from
@@ -2212,10 +2230,10 @@ uint32_t pulsar_layer_compress_ratio(uint32_t il);
 const pulsar_layer_attn *pulsar_layer_attn_layout(uint32_t il);
 /** Build the attention layout table from a per-layer ratio array and the
  * source sets, asserting the shape profile's expectation and the CSA2
- * invariants (sources ascending and inside the backbone, a member's ratio
- * equals its source's, every kv source is an index source, the candidate
- * source is an index source).  The loader calls it with the artifact's
- * metadata; a unit test with the profile's own sets.  Dies on any violation. */
+ * invariants (sources ascending and inside the backbone, a layer's ratio equals
+ * the ratio of every source it READS, the candidate source is an index source).
+ * The loader calls it with the artifact's metadata; a unit test with the
+ * profile's own sets.  Dies on any violation. */
 void pulsar_attn_layout_install(const uint32_t *ratios,
                                 const uint32_t *kv_sources, uint32_t n_kv,
                                 const uint32_t *index_sources, uint32_t n_index,

@@ -55,10 +55,12 @@ const pulsar_shape PULSAR_SHAPE_V4 = {
      * layers have a compressor and NO indexer at all -- verified in the real
      * artifact, where blk.2.* carries indexer + indexer_compressor tensors and
      * blk.3.* carries neither.  So HCA publishes compressed KV and no top-k,
-     * which the layout table cannot express yet: pulsar_attn_layout_install
-     * refuses such a layer by name rather than mis-moding it as an indexed
-     * FULL.  The mode and its consumers land together -- see
-     * plans/96-two-profiles-one-engine.md s9. */
+     * which is PULSAR_ATTN_FULL_UNINDEXED: the layout table derives it, and the
+     * attention path reads that layer's own compressed cache unindexed.  It is
+     * the only mode that does not depend on its index source, which is why the
+     * layout's ratio check asks pulsar_attn_reads_index and not
+     * pulsar_attn_runs_indexer.  See
+     * plans/96-two-profiles-one-engine.md s9 / s9.1. */
     .index_source_layer = {
         2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
         22, 24, 26, 28, 30, 32, 34, 36, 38, 40,

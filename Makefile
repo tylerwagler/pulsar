@@ -433,6 +433,20 @@ tests/engram_hash_test: tests/engram_hash_test.cpp tests/engram_hash_fixture.h \
 engram-hash-check: tests/engram_hash_test
 	./tests/engram_hash_test
 
+# The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
+# table is a pure function of the artifact's declared metadata, so both profiles'
+# mode rows are checkable with no model and no device.  The arrays in the test are
+# read out of the real artifacts, not copied from the shape profiles.
+tests/attn_layout_test: tests/attn_layout_test.cpp src/engine/model_layout.cpp \
+                        src/engine/shape_profiles.cpp src/engine/log.cpp Makefile \
+                        src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/attn_layout_test.cpp \
+	    src/engine/model_layout.cpp src/engine/shape_profiles.cpp src/engine/log.cpp
+
+.PHONY: attn-layout-check
+attn-layout-check: tests/attn_layout_test
+	./tests/attn_layout_test
+
 # Single-pass mHC hand-over (L218): the fused split collapses with the pre it
 # was handed and leaves its own behind; two chained calls vs a host oracle.
 # Built the way the engine builds the TU (--use_fast_math).

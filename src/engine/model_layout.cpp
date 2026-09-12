@@ -67,8 +67,10 @@ static uint32_t expected_layer_compress_ratio(uint32_t il) {
     if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
     switch (g_pulsar_shape.variant) {
     case PULSAR_VARIANT_V4:
-        /* 0731 CSA/HCA: ratio 4 and 128 alternate up the backbone, and every
-         * compressed layer owns its own compressor and indexer. */
+        /* 0731 CSA/HCA: ratio 4 and 128 alternate up the backbone.  Every
+         * compressed layer owns its own compressor, but only the ratio-4 layers
+         * carry an indexer -- the ratio-128 (HCA) layers compress and publish no
+         * top-k (see the index_source_layer comment in shape_profiles.cpp). */
         return (il & 1u) == 0 ? 4u : 128u;
     case PULSAR_VARIANT_V41:
         /* V4.1 CSA2: the encoder's 2-19 share ratio-2 compressed KV from
@@ -165,11 +167,6 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
             fprintf(stderr, "pulsar: layer %u compresses (ratio %u) but no kv/index source precedes it\n", il, a->ratio);
             exit(1);
         }
-        if (ratios[a->kv_source] != a->ratio || ratios[a->index_source] != a->ratio) {
-            fprintf(stderr, "pulsar: layer %u (ratio %u) reads sources %u/%u of ratio %u/%u\n",
-                    il, a->ratio, a->kv_source, a->index_source, ratios[a->kv_source], ratios[a->index_source]);
-            exit(1);
-        }
         /* A kv source that runs no indexer is 0731's ratio-128 (HCA) layer: it
          * publishes compressed KV and no top-k, so it reads its own compressed
          * cache unindexed.  V4.1 never reaches this -- every kv source there is
@@ -177,6 +174,22 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
         a->mode = is_kv ? (is_index ? PULSAR_ATTN_FULL : PULSAR_ATTN_FULL_UNINDEXED)
                         : is_index ? PULSAR_ATTN_REINDEX
                                    : PULSAR_ATTN_REUSE;
+        /* Every source a layer READS must carry the layer's own ratio: it slices
+         * the shared cache with its own ratio, and a top-k indexes that cache.
+         *
+         * The kv source is always read; the index source only when the mode
+         * depends on it.  Demanding the index ratio unconditionally refused
+         * 0731's HCA layers outright: 0731 has 41 kv sources but only 21 index
+         * sources (the ratio-4 layers), so the "latest index source" found for a
+         * ratio-128 layer is just the last even layer -- ratio 4 by
+         * construction -- and the layer was rejected for a source it never
+         * reads.  That is the whole of S2's asymmetry. */
+        if (ratios[a->kv_source] != a->ratio ||
+            (pulsar_attn_reads_index(a->mode) && ratios[a->index_source] != a->ratio)) {
+            fprintf(stderr, "pulsar: layer %u (ratio %u) reads sources %u/%u of ratio %u/%u\n",
+                    il, a->ratio, a->kv_source, a->index_source, ratios[a->kv_source], ratios[a->index_source]);
+            exit(1);
+        }
         a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il;
         a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il;
         if (a->candidate_source && !is_index) {
