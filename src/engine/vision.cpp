@@ -185,6 +185,91 @@ int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
 }
 
 /* ---------------------------------------------------------------------------
+ * The VISIBILITY half: how far a token inside an image span may look.
+ *
+ * The sentinel span is the one place the model is BIDIRECTIONAL: a patch must
+ * see its whole image, not just the causal sliding window, or the aligner rows
+ * would each be computed from a different prefix of the image.  The reference
+ * expresses that as two per-token counts -- `get_image_visible` -- which then
+ * replace the plain window index matrix for the attention call
+ * (`get_window_topk_idxs_visible`).  Both are pure integer functions of the
+ * token ids, so both are graded directly against the reference by
+ * tests/vision_visible_gate.cpp.
+ *
+ * Prefill only, by construction: the reference asserts
+ * `(input_ids < vocab_size).all()` for start_pos > 0, i.e. an image span must
+ * arrive in ONE chunk.  Neither function takes a start_pos.
+ * ------------------------------------------------------------------------- */
+
+/* get_image_visible(): per-token visible counts to the left/right within each
+ * [IMAGE_START, IMAGE_END] span.
+ *
+ *   valid  = (cumsum(is_start) > cumsum(is_end)) | is_end
+ *   starts = where(is_start, idx, 0).cummax()
+ *   left   = (idx - starts) * valid
+ *   ends   = where(is_end, idx, seqlen).flip().cummin().flip()
+ *   right  = (ends - idx) * valid
+ *
+ * `right` is filled with `ends` by the backward pass and then overwritten with
+ * the final count by the forward pass, so the reverse cummin needs no second
+ * buffer: the forward pass only ever reads right[i] at the i it is writing. */
+void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_tokens,
+                          int32_t *left, int32_t *right) {
+    if (!ids || !left || !right || n <= 0) return;
+    const int32_t start_id = (int32_t)n_vocab + VISION_T_IMAGE_START;
+    const int32_t end_id   = (int32_t)n_vocab + VISION_T_IMAGE_END;
+
+    int32_t ends = n;
+    for (int i = n - 1; i >= 0; i--) {
+        if (ids[i] == end_id) ends = i;
+        right[i] = ends;
+    }
+
+    int run = 0, starts = 0;
+    for (int i = 0; i < n; i++) {
+        const int is_start = ids[i] == start_id;
+        const int is_end   = ids[i] == end_id;
+        run += is_start - is_end;
+        if (is_start) starts = i;
+        const int valid = (run > 0) || is_end;
+        left[i] = valid ? (i - starts) : 0;
+        if (left[i] > max_image_tokens - 1) left[i] = max_image_tokens - 1;
+        int32_t r = valid ? (right[i] - i) : 0;   /* right[i] still holds `ends` */
+        if (r > max_image_tokens) r = max_image_tokens;
+        right[i] = r;
+    }
+}
+
+/* The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
+ * image span needs `max_image_tokens` columns beyond the sliding window. */
+int vision_visible_width(int n, int window_size, int max_image_tokens) {
+    const int w = window_size + max_image_tokens;
+    return n < w ? n : w;
+}
+
+/* get_window_topk_idxs_visible(): the window index matrix, widened per query so
+ * that a token inside an image span reaches the span's start (`left_add`) and
+ * no further right than the span's end.  Entries past the query's reach are -1,
+ * which is the same padding convention the plain window matrix uses. */
+void vision_window_topk_visible(int window_size, int n, const int32_t *left,
+                                const int32_t *right, int max_image_tokens,
+                                int32_t *out) {
+    if (!left || !right || !out || n <= 0) return;
+    const int width = vision_visible_width(n, window_size, max_image_tokens);
+    for (int i = 0; i < n; i++) {
+        const int32_t left_add = left[i] - (window_size - 1);
+        const int32_t back = (window_size - 1) + (left_add > 0 ? left_add : 0);
+        const int32_t start = (i - back) > 0 ? (i - back) : 0;
+        const int32_t stop = i + right[i];
+        int32_t *row = out + (size_t)i * (size_t)width;
+        for (int j = 0; j < width; j++) {
+            const int32_t v = start + j;
+            row[j] = (v > stop) ? -1 : v;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * The PIXEL half: image_processor.load_image() after the decode.
  *
  * The resampler is a faithful port of Pillow's src/libImaging/Resample.c

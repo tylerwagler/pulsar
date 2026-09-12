@@ -2357,6 +2357,22 @@ typedef struct {
 int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
                          int start_pos, int vocab_size, pulsar_vision_prepared *out);
 void vision_prepared_free(pulsar_vision_prepared *p);
+/** The reference's get_image_visible(): per-token visible counts to the
+ * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function
+ * of the token ids, so it is graded directly against the reference by
+ * tests/vision_visible_gate.cpp.  Prefill only -- an image span must arrive in
+ * one chunk. */
+void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_tokens,
+                          int32_t *left, int32_t *right);
+/** The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
+ * column count of the matrix vision_window_topk_visible() writes. */
+int vision_visible_width(int n, int window_size, int max_image_tokens);
+/** The reference's get_window_topk_idxs_visible(): the window index matrix,
+ * widened per query so a token inside an image span reaches the whole span.
+ * `out` receives n * vision_visible_width(...) int32 values. */
+void vision_window_topk_visible(int window_size, int n, const int32_t *left,
+                                const int32_t *right, int max_image_tokens,
+                                int32_t *out);
 /** The reference's merge_image_embeddings() for ONE prepared image: run the
  * tower over its patches and scatter the aligner rows (in `perm` order) into the
  * IMAGE slots, filling every other slot with its type's learned vector.  `out`
