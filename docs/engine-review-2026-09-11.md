@@ -63,7 +63,9 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
 - A2 payload digest, format v10 (`117541f7`; fmemopen terminator fix `1cd0f145`);
   the one-byte corruption refusal is now asserted in
-  `tests/session_payload_gate.cpp` (mid-payload flip -> load refused, v10 digest)
+  `tests/session_payload_gate.cpp` (a flip of the last data byte, offset len-9 --
+  the trailing 8 are the digest -- -> load refused, v10 digest); wired into the
+  battery (`cuda-session-payload-gate` target) by the tail review below
 - A3 sampler range clamps + warning (`bc9d70bb`)
 - A4 AGENTS.md truth (`d6b4e93c`)
 - A5 quantizer pre-flight shapes (`b9745c7e`)
@@ -102,6 +104,43 @@ Still open, in value order: B5 (lane grouping), B10 (sampled redraft), C4
 (indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10b/c and the
 `attn_pack_store` retile.  B9's row-budget half, B4, C1, D1 and D2 need
 dedicated campaigns.
+
+### Tail review — the five commits after the external review (2026-09-11)
+
+`docs/engine-review-2026-09-11-review.md` scoped `dev..5bdadf04` (33 files,
++1597/−285).  Five commits landed after it and were never reviewed: `6801cdf6`
+(B3), `bcaaa541` (B2), `2a32fdbf` (C7), `35a545c0` (A2), `2e51f069` (docs).  A
+static read of that range found all four fixes correct, and closed three gaps
+on `a9ea5210`:
+
+- **A2 had no instrument in the battery.**  `cuda-session-payload-gate` was
+  referenced only by its own Makefile definition -- absent from `GATE_TARGETS`
+  and from `tests/gates_runner.cpp` -- so the new one-byte-corruption case
+  could never fire on a landing.  It is in `GATE_TARGETS` now; folding it into
+  the runner (one fewer model load) is the follow-up noted at the list.
+- **The engine still accepted `+-Inf` temperature** (and a non-finite
+  `top_p`/`min_p`), turning it into a uniform or unfiltered draw instead of a
+  refusal, because those make a *finite* mass and so pass the mass guard.  All
+  three are refused at the entry of `pulsar_sample_dist_build` now; the fast
+  arm's `isfinite(temperature)` special case is gone with them.
+- **The B3 gate's audit re-derived the readback arm from the temperatures
+  alone** -- a second copy of the min-p contract, which also depends on
+  `top_k`/`top_p`/`min_p`.  It now captures the engine's own armed flags before
+  `arm_capture(0)` retires them, checks the live rows against that, and runs
+  the audit before the per-bank round ends (the state the walk consumes)
+  instead of after.  The pre-fix bug still fails it.
+
+Also corrected: the A2 case flips the last DATA byte (offset `len-9`), not a
+mid-payload field; and the `AF16_HEADS` `static_assert` message now names the
+M-tile invariant it guards rather than the half-warp property that follows from
+`AF16_ROWS`.
+
+Host-only verification run at `a9ea5210`: all four changed TUs compile with
+zero warnings (`g++ -Wall -Wextra`; `nvcc -arch=sm_120f` for `attn_f16.cu`);
+`./pulsar_test --sampler`, `--server` and `--sampler-prefilter` PASS; `make
+seam-check` PASS (83 host files).  The two GPU gates this touches
+(`cuda-session-payload-gate`, `cuda-dspark-batch-gate`) were NOT run -- no GPU
+on the authoring box.  The branch still owes a battery run at its tip.
 
 ---
 
