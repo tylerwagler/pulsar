@@ -855,6 +855,19 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             }
         }
         s->checkpoint_valid = false;
+    } else {
+        /* A prompt carrying sentinel ids with no image to fill them would prefill
+         * rows whose embeddings never arrived -- the embedder zero-masks an
+         * out-of-vocab id, and only the merge puts anything there -- so refuse it
+         * here instead of silently serving a wrong answer.  A tokenizer never
+         * emits an id at or above vocab_size, so ANY such id is a sentinel. */
+        for (int i = 0; i < prompt->len; i++) {
+            if (prompt->v[i] >= (int)PULSAR_N_VOCAB) {
+                snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request "
+                                      "carries no images", i, prompt->v[i]);
+                return 1;
+            }
+        }
     }
 
     /* a sync begins a new request: any carry left by a max-tokens/stop-string

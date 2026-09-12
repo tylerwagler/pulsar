@@ -93,8 +93,16 @@ bool gpu_graph_upload_prompt_tokens(
     int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
     for (uint32_t i = 0; i < n_tokens; i++) {
         tokens[i] = prompt->v[pos0 + i];
-        /* L188: the embed kernel clamps a negative id to 0 -- refuse it here */
-        if (tokens[i] < 0 || tokens[i] >= (int32_t)PULSAR_N_VOCAB) {
+        /* L188: the embed kernel clamps a negative id to 0 -- refuse it here.
+         *
+         * L216: an image block's slots carry `vocab_size + role` sentinel ids,
+         * so the bound is not simply n_vocab.  The roles are 0..IMAGE_END and
+         * nothing else may sit at or above vocab_size, which keeps this a real
+         * check rather than a hole.  pulsar_session::sync refuses such an id
+         * when the request carries no image, so reaching here with one means a
+         * merge will fill the row; the embedder zero-masks it until then. */
+        if (tokens[i] < 0 ||
+            tokens[i] > (int32_t)(PULSAR_N_VOCAB + PULSAR_VISION_ROLE_IMAGE_END)) {
             fprintf(stderr, "pulsar: prefill token %d at position %u is not a vocab id -- refusing\n",
                     tokens[i], pos0 + i);
             free(tokens);

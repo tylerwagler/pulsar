@@ -2387,6 +2387,17 @@ int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in
                                      const pulsar_vision_args *args, int vocab_size,
                                      pulsar_vision_prepared *preps, int *starts);
 
+/* The reference's sentinel ROLES (image_processor: IMAGE_START, IMAGE_PAD,
+ * IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)).  A prompt slot belonging to an
+ * image block carries `vocab_size + role`, so these are the ONLY ids at or above
+ * vocab_size the engine will accept -- which is what lets the prefill token
+ * upload distinguish a sentinel from a bad id. */
+#define PULSAR_VISION_ROLE_IMAGE_START 0
+#define PULSAR_VISION_ROLE_IMAGE_PAD   1
+#define PULSAR_VISION_ROLE_IMAGE       2
+#define PULSAR_VISION_ROLE_NEWLINE     3
+#define PULSAR_VISION_ROLE_IMAGE_END   4
+
 /** The image sentinel BLOCK beginning at `start_pos` (the reference's
  * ImageInput.start: the block's first slot, which is a compressor pad, with the
  * IMAGE_START sentinel a few slots in).  `*len_out` receives the BLOCK length --

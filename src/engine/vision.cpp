@@ -34,12 +34,14 @@
 #include <jpeglib.h>
 #include <png.h>
 
-/* The reference's IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END. */
-#define VISION_T_IMAGE_START    0
-#define VISION_T_IMAGE_PAD      1
-#define VISION_T_IMAGE          2
-#define VISION_T_IMAGE_NEWLINE  3
-#define VISION_T_IMAGE_END      4
+/* The reference's IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END.
+ * The values are the shared authority (PULSAR_VISION_ROLE_*) because the prefill
+ * token upload has to know which out-of-vocab ids are legal sentinels. */
+#define VISION_T_IMAGE_START    PULSAR_VISION_ROLE_IMAGE_START
+#define VISION_T_IMAGE_PAD      PULSAR_VISION_ROLE_IMAGE_PAD
+#define VISION_T_IMAGE          PULSAR_VISION_ROLE_IMAGE
+#define VISION_T_IMAGE_NEWLINE  PULSAR_VISION_ROLE_NEWLINE
+#define VISION_T_IMAGE_END      PULSAR_VISION_ROLE_IMAGE_END
 #define VISION_COMPRESS_PAD_TO  4
 
 /* image_processor.grid_tokens(): the LLM-token grid the aligner occupies,
