@@ -390,6 +390,19 @@ tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
                          src/cuda/pulsar_cuda_kvrows.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
 	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
+# The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
+# it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
+# the device packer will write; that packer is not restored yet, so
+# pulsar_kv_row_bytes() still refuses PULSAR_KV_ROWS_UNIFIED.  This binary pins
+# the geometry and the recipe arithmetic the kernel must then reproduce, which
+# is what makes the kernel's restoration checkable instead of blind.
+tests/attn_pack_fixture_test: tests/attn_pack_fixture_test.cpp tests/attn_pack_fixture.h Makefile src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/attn_pack_fixture_test.cpp
+
+.PHONY: attn-pack-fixture-check
+attn-pack-fixture-check: tests/attn_pack_fixture_test
+	./tests/attn_pack_fixture_test
+
 # Single-pass mHC hand-over (L218): the fused split collapses with the pre it
 # was handed and leaves its own behind; two chained calls vs a host oracle.
 # Built the way the engine builds the TU (--use_fast_math).

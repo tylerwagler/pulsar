@@ -997,6 +997,31 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 #define PULSAR_MAINKV_BLOCK 16u
 #define PULSAR_WINKV_ROWBYTES(HD)  ((uint64_t)(HD) + (HD) / PULSAR_WINKV_BLOCK)
 #define PULSAR_MAINKV_ROWBYTES(HD) ((uint64_t)(HD) / 2u + (HD) / PULSAR_MAINKV_BLOCK)
+
+/** 0731's unified NVFP4 attention KV row (the L111 format).  Restored for the
+ * two-profile engine: V4.1 replaced it, 0731 stores it in EVERY non-index
+ * buffer (raw ring, comp pool, drafter ring, MTP cache, current chunk).
+ *
+ *   [n_nope/2 E2M1 nibbles][n_nope/16 E4M3 scale codes][f32 row scale]
+ *   [n_rot bf16 rope]   = 384 B at head_dim 512 / n_rot 64
+ *
+ * Requires n_rot == PULSAR_ATTN_PACK_NROT and (head_dim - n_rot) a multiple of
+ * PULSAR_KV4_NV_BLOCK.  Quantise EXACTLY ONCE; every later move is a byte move.
+ *
+ * The geometry is here because the host fixture (tests/attn_pack_fixture.h)
+ * codes against it; the DEVICE packer is not restored yet, which is why
+ * pulsar_kv_row_bytes() still refuses PULSAR_KV_ROWS_UNIFIED.  The two land
+ * together, and the fixture is the oracle they land against.
+ * plans/96-two-profiles-one-engine.md s10. */
+#define PULSAR_ATTN_PACK_NROT 64u
+#define PULSAR_ATTN_PACK_NOPE_ALIGN 64u   /* the kernels walk the nope dims in 64-wide lanes */
+#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
+#define PULSAR_ATTN_PACK_NIB(HD)  (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
+#define PULSAR_KV4_NV_BLOCK      16u
+#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
+#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
+    ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
+     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 /** Microscaling compressed-KV row (the indexer's FP4 cache): one E8M0 scale
  * byte per 32 elements, [HD/2 E2M1 nibble bytes][NBLK scale bytes]
  * (HD=128 -> 68 B/row).  CUTLASS-consumable layout; the GEMM re-tiles the

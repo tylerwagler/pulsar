@@ -51,6 +51,7 @@ __pycache__/
 /tests/resume_suffix_probe
 /tests/token_seam_gate
 /tests/spec_sampling_gate
+/tests/attn_pack_fixture_test
 /gguf-tools/test_quants
 .claude/
 /data/
