@@ -117,8 +117,6 @@ int main(int argc, char **argv) {
             /* Stage-by-stage FIRST: a bad patch_embed means the weight plumbing
              * is wrong, which is a different bug from a wrong rope/norm, and
              * without this split the aligner number says only "something". */
-            static const char *names[] = { "patch_embed", "block0", "block1", "block2",
-                                           "block3", "block4", "block5" };
             printf("  case %u (%dx%d):\n", c, n_h, n_w);
             for (uint32_t st = 0; st < 2 + n_stage; st++) {
                 const uint16_t *g = got_stage + (size_t)st * stage_elems;
@@ -130,9 +128,10 @@ int main(int argc, char **argv) {
                     sq += d * d; rq += b * b;
                     if (fabs(d) > ma) ma = fabs(d);
                 }
-                const char *nm = st == 0 ? "patch_embed"
-                                        : (st == 1 + n_stage ? "final_norm"
-                                                             : (st - 1 < 7 ? names[st] : "block?"));
+                char nm[32];
+                if (st == 0) snprintf(nm, sizeof nm, "patch_embed");
+                else if (st == 1 + n_stage) snprintf(nm, sizeof nm, "final_norm");
+                else snprintf(nm, sizeof nm, "block%u", st - 1);
                 printf("    %-12s rel-RMS %.3e  max-abs %.3e\n",
                        nm, rq > 0.0 ? sqrt(sq / rq) : sqrt(sq), ma);
             }

@@ -27,7 +27,12 @@ SNAP = sys.argv[1]
 sys.path.insert(0, SNAP + "/inference")
 import vision as V  # noqa: E402
 
-N_STAGE_BLOCKS = 3          # blocks 0..2 are dumped as well as the final stack
+# Blocks dumped per case.  The small grid gets ALL of them: it is the case whose
+# error is not yet explained, and a per-block trace is what separates "the error
+# jumps at some block" (a bug) from "it drifts from block 0 onward" (the tower's
+# own amplification).  The big grids keep 3 to keep the fixture small.
+N_STAGE_FULL = 3
+STAGE_FULL_CASES = {(3, 3)}
 
 
 class Args:
@@ -99,6 +104,7 @@ def main():
 
     for (nh, nw) in cases:
         n = nh * nw
+        n_stage = args.vision_n_layers if (nh, nw) in STAGE_FULL_CASES else N_STAGE_FULL
         g = torch.Generator().manual_seed(1234 + n)
         patches = torch.randn(n, 3, p, p, generator=g).to(torch.bfloat16) * 0.5
 
@@ -109,7 +115,7 @@ def main():
             stages = []
             for i, block in enumerate(tower.vision.blocks):
                 x = block(x, cos, sin)
-                if i < N_STAGE_BLOCKS:
+                if i < n_stage:
                     stages.append(x)
             normed = tower.vision.norm(x)
             aligned = tower.aligner(normed, nh, nw)
@@ -126,7 +132,7 @@ def main():
         n_llm_rows = aligned.shape[0]
         out.write(struct.pack("<iiiiiiifI", nh, nw, p, args.vision_dim, args.vision_n_heads,
                               args.vision_inter_dim, args.vision_downsample_ratio,
-                              float(args.vision_rope_theta), N_STAGE_BLOCKS))
+                              float(args.vision_rope_theta), n_stage))
         out.write(struct.pack("<i", args.dim))
         out.write(struct.pack("<f", float(floor)))
         out.write(bf16_bits(patches))
@@ -135,8 +141,9 @@ def main():
             out.write(bf16_bits(s))
         out.write(bf16_bits(normed))
         out.write(bf16_bits(aligned))
-        sys.stderr.write("case %dx%d: %d patches, aligner %d rows; bf16-vs-fp32 floor %.3e\n"
-                         % (nh, nw, n, n_llm_rows, floor))
+        sys.stderr.write("case %dx%d: %d patches, aligner %d rows, %u block dumps; "
+                         "bf16-vs-fp32 floor %.3e\n"
+                         % (nh, nw, n, n_llm_rows, n_stage, floor))
 
 
 if __name__ == "__main__":
