@@ -5832,8 +5832,8 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     int cut = -1;
     memset(surv, 0, sizeof surv);
     memset(npend, 0, sizeof npend);
-    const float thr_fallback = 6.0f / 45.0f;   /* spec_ms_per_tok_ema unset */
-    const float thr_live = 6.0f / 30.0f;       /* a live EMA of 30 ms/tok */
+    const float thr_fallback = PULSAR_SPEC_ROW_MS / 45.0f;   /* spec_ms_per_tok_ema unset */
+    const float thr_live = PULSAR_SPEC_ROW_MS / 30.0f;       /* a live EMA of 30 ms/tok */
 
     /* (a) demand 3 + 12 = 15 < 16, one bank with hopeless confidence, a
      * fourth bank not decoding (npend 0): everything admitted, no cut. */

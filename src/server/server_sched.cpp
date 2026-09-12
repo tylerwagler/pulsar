@@ -2168,14 +2168,21 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * design upstream.
              * L111/L121 established the cost is DEPTH-FLAT (the old
              * 8.4→11 ramp was the naive score kernel's rows x depth
-             * term, not a property of the engine).  L136 refresh
-             * (ROWCOST 2026-08-31, dev 87eec09): 6.4 ms/row @2048,
-             * 5.9 @24576 — the 8.0 measured on 08-27 predated L129's
-             * MoE fusion, which moved the whole sweep ~9%.  A stage
-             * decomposition (L134) puts ~83% of this in routed-MoE
-             * expert compute, so expect the number to move with MoE
-             * kernel work, not with KV/indexer work. */
-            const float marginal_ms = 6.0f;
+             * term, not a property of the engine).  L136 set the price
+             * to 6.0 from L134's stage attribution; L214's pinned-width
+             * refit then measured 7.17 ms/row on the a309ff8 kernels,
+             * and the row price is ONE fact (PULSAR_SPEC_ROW_MS,
+             * pulsar.h) shared with the engine's yield quench -- this
+             * site's private 6.0f was the stale copy.  L219/B4 drove
+             * demand past the row budget and measured the correction's
+             * effect: the cut prices more rows (conc 8, mean/run:
+             * 41 -> 145 at 6.0 -> 7.17) while aggregate t/s is flat,
+             * and every price in [3, 9] ms sits on that plateau -- a
+             * 30 ms positive control costs 12-19%.  A stage decomposition
+             * (L134) puts ~83% of this in routed-MoE expert compute, so
+             * expect the number to move with MoE kernel work, not with
+             * KV/indexer work. */
+            const float marginal_ms = PULSAR_SPEC_ROW_MS;
             const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                               s->spec_ms_per_tok_ema : 45.0f;
             int thr_cut_rows = 0;

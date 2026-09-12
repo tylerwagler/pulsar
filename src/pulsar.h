@@ -718,6 +718,15 @@ uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
 bool pulsar_engine_has_dspark(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
+/** ONE authority for the marginal wall cost of one spec-decode verify row
+ * (ms): L214's pinned-width refit of the yield-quench step model
+ * step = FLAT + ROW*n_batch on the a309ff8 kernels (landed dev 2275ad3,
+ * rows/L214.md).  The engine's terminal yield quench and the server's
+ * overflow K-allocator both price a draft row against this number; the
+ * allocator's private copy was 6.0f -- L134's stage-attribution estimate,
+ * 20% below the refit -- and decided how many rows it admits when demand
+ * exceeds PULSAR_SPEC_ROW_BUDGET (L219 B4). */
+#define PULSAR_SPEC_ROW_MS 7.17f
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Disk KV payload helpers.  HTTP/agent code owns the outer file header and

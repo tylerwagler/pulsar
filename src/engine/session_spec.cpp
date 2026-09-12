@@ -192,7 +192,10 @@ int gpu_graph_spec_dump_active(void) {
  * below is re-measured on the same instrument; guard = step / plain, so both sides
  * carry the same ~3% profiler overhead and the ratio is clean. */
 #define PULSAR_QUENCH_FLAT_MS    45.0f
-#define PULSAR_QUENCH_ROW_MS     7.17f
+/* The row term is the engine-wide authority (PULSAR_SPEC_ROW_MS, pulsar.h):
+ * the server's overflow K-allocator prices the same row, so the number lives
+ * in exactly one place. */
+#define PULSAR_QUENCH_ROW_MS     PULSAR_SPEC_ROW_MS
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
