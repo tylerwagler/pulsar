@@ -366,16 +366,19 @@ static uint16_t f32_to_bf16_bits(float f) {
     return (uint16_t)(u >> 16);
 }
 
-int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
-                          const pulsar_vision_args *args,
-                          uint16_t *patch_out, size_t patch_cap,
-                          pulsar_vision_image *out) {
+/* The ONE place load_image's geometry is computed: the max_wh_ratio clamp and
+ * the min_pixels upscale act on local variables only (the decoded image is
+ * untouched), then safe_resize fits the grid to the token budget.  Split out of
+ * vision_preprocess_rgb so a caller can size its patch buffer BEFORE paying for
+ * the pixels -- the canvas can be LARGER than the input (min_pixels upscales),
+ * so sizing from the input under-allocates. */
+static int vision_geometry(int width, int height, const pulsar_vision_args *args,
+                           int *best_w_out, int *best_h_out,
+                           int *n_vit_h_out, int *n_vit_w_out,
+                           pulsar_vision_resize *sr_out) {
     const int p = args->patch_size;
     const int dr = args->downsample_ratio;
     const float max_wh = args->max_wh_ratio;
-
-    /* load_image(): the max_wh_ratio clamp and the min_pixels upscale act on the
-     * VARIABLES only; the decoded image is untouched. */
     int vw = width, vh = height;
     if (max_wh > 0.0f && (float)vw > (float)vh * max_wh)
         vw = (int)((float)vh * max_wh);
@@ -389,10 +392,39 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
     pulsar_vision_resize sr;
     if (!vision_safe_resize(vh, vw, best_h, best_w, p, dr, args->max_n_token, &sr))
         return 0;
-    best_h = sr.best_height;
-    best_w = sr.best_width;
-    const int n_vit_h = best_h / p;
-    const int n_vit_w = best_w / p;
+    *best_w_out = sr.best_width;
+    *best_h_out = sr.best_height;
+    *n_vit_h_out = sr.best_height / p;
+    *n_vit_w_out = sr.best_width / p;
+    *sr_out = sr;
+    return 1;
+}
+
+int vision_image_grid(int width, int height, const pulsar_vision_args *args,
+                      pulsar_vision_image *out) {
+    int bw, bh, nvh, nvw;
+    pulsar_vision_resize sr;
+    if (!vision_geometry(width, height, args, &bw, &bh, &nvh, &nvw, &sr)) return 0;
+    memset(out, 0, sizeof *out);
+    out->n_vit_h = nvh;
+    out->n_vit_w = nvw;
+    out->n_llm_h = sr.n_llm_h;
+    out->n_llm_w = sr.n_llm_w;
+    out->best_width = bw;
+    out->best_height = bh;
+    return 1;
+}
+
+int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
+                          const pulsar_vision_args *args,
+                          uint16_t *patch_out, size_t patch_cap,
+                          pulsar_vision_image *out) {
+    const int p = args->patch_size;
+    const float max_wh = args->max_wh_ratio;
+    int best_w, best_h, n_vit_h, n_vit_w;
+    pulsar_vision_resize sr;
+    if (!vision_geometry(width, height, args, &best_w, &best_h, &n_vit_h, &n_vit_w, &sr))
+        return 0;
 
     /* The resize/pad branch, then ImageOps.pad's contain + centred paste. */
     uint8_t *canvas = NULL;
@@ -641,10 +673,11 @@ int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_a
     if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) return 0;
 
     pulsar_vision_image img;
-    const size_t cap = (size_t)w * (size_t)h;   /* an upper bound on patch elements/3 */
-    uint16_t *patches = (uint16_t *)malloc(cap * 3u * sizeof(uint16_t));
+    if (!vision_image_grid(w, h, args, &img)) { free(rgb); return 0; }
+    const size_t patch_cap = (size_t)img.n_vit_h * (size_t)img.n_vit_w * 3u *
+                             (size_t)args->patch_size * (size_t)args->patch_size;
+    uint16_t *patches = (uint16_t *)malloc(patch_cap * sizeof(uint16_t));
     if (!patches) { free(rgb); return 0; }
-    const size_t patch_cap = cap * 3u;
     if (!vision_preprocess_rgb(rgb, w, h, args, patches, patch_cap, &img)) {
         free(patches);
         free(rgb);
@@ -673,7 +706,9 @@ int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_a
             ids[i] = vocab_size + raw_types[i];
         }
         out->span_len = n_types;
-        out->n_perm = n_patches;
+        /* perm indexes ALIGNER rows, so it is n_llm_h*n_llm_w long -- not the
+         * patch count (the aligner folds r x r patches into one row). */
+        out->n_perm = img.n_llm_h * img.n_llm_w;
     }
     free(raw_types);
     out->patches = patches;

@@ -53,13 +53,13 @@ int main(int argc, char **argv) {
         uint8_t *enc = (uint8_t *)malloc((size_t)enc_len);
         int32_t *want_ids = (int32_t *)malloc((size_t)want_span * sizeof(int32_t));
         int32_t *want_types = (int32_t *)malloc((size_t)want_span * sizeof(int32_t));
-        int32_t *want_perm = (int32_t *)malloc((size_t)want_vh * (size_t)want_vw * sizeof(int32_t));
+        const int want_perm_n = want_lh * want_lw;   /* perm indexes aligner rows */
+        int32_t *want_perm = (int32_t *)malloc((size_t)want_perm_n * sizeof(int32_t));
         if (!enc || !want_ids || !want_types || !want_perm) { fprintf(stderr, "span gate: oom\n"); return 2; }
         if (fread(enc, 1, (size_t)enc_len, f) != (size_t)enc_len ||
             fread(want_ids, sizeof(int32_t), (size_t)want_span, f) != (size_t)want_span ||
             fread(want_types, sizeof(int32_t), (size_t)want_span, f) != (size_t)want_span ||
-            fread(want_perm, sizeof(int32_t), (size_t)want_vh * (size_t)want_vw, f)
-                != (size_t)want_vh * (size_t)want_vw) {
+            fread(want_perm, sizeof(int32_t), (size_t)want_perm_n, f) != (size_t)want_perm_n) {
             fprintf(stderr, "span gate: short read\n");
             return 2;
         }
@@ -91,7 +91,6 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            const int want_perm_n = want_vh * want_vw;
             if (!bad && got.n_perm != want_perm_n) {
                 fprintf(stderr, "  FAIL case %u: perm len got %d want %d\n", c, got.n_perm, want_perm_n);
                 bad = 1;

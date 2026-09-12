@@ -2326,6 +2326,11 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                           const pulsar_vision_args *args,
                           uint16_t *patch_out, size_t patch_cap,
                           pulsar_vision_image *out);
+/** The grid a decoded image WILL produce, without touching its pixels: the one
+ * place the geometry lives, so a caller can size its patch buffer first (the
+ * canvas can be larger than the input, because min_pixels upscales). */
+int vision_image_grid(int width, int height, const pulsar_vision_args *args,
+                      pulsar_vision_image *out);
 /** Decode image BYTES to 8-bit RGB.  PNG (libpng) and JPEG (libjpeg-turbo, with
  * Pillow's settings, which are libjpeg's defaults) only -- the caller fails
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
