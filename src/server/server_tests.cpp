@@ -7262,6 +7262,64 @@ static void test_metrics_stream_handler_refuses_past_its_own_cap(void) {
 }
 
 
+/* /health must report the pool the run was sized for separately from how many
+ * banks have actually been provisioned.
+ *
+ * Banks 1..pool_banks-1 are provisioned lazily, so `total` ramps from one over
+ * the first minutes of a session while `capacity` never moves. A client that
+ * reserves layout space for the pool — pulsar-gui draws a row per slot — needs
+ * the number that does not move, or its panel grows under it as the pool warms
+ * up. Reporting only `total` made that growth invisible to the client. */
+static void test_health_reports_pool_capacity_apart_from_provisioned(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.n_slots = 1;      /* one bank provisioned so far */
+    s.pool_banks = 8;   /* sized for eight this run */
+    s.n_generating = 1;
+    s.started = time(NULL);
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(s.send_health(fds[0]) == true);
+
+    char buf[2048];
+    const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "\"status\":\"ok\"") != NULL);
+    TEST_ASSERT(strstr(buf, "\"total\":1") != NULL);
+    TEST_ASSERT(strstr(buf, "\"capacity\":8") != NULL);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Classic mode is a pool of one, not a pool of zero: pool_banks == 0 there
+ * means "no pool", and a client asking for capacity must still get a sane
+ * row count. */
+static void test_health_capacity_is_one_in_classic_mode(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.n_slots = 1;
+    s.pool_banks = 0;
+    s.started = time(NULL);
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(s.send_health(fds[0]) == true);
+
+    char buf[2048];
+    const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "\"capacity\":1") != NULL);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_mutex_destroy(&s.mu);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_logprob_token_json_sanitizes_ill_formed_utf8();
     test_random_prefixed_id_format();
@@ -7428,6 +7486,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_send_all_gives_up_on_a_wedged_socket();
     test_metrics_stream_handler_speaks_sse();
     test_metrics_stream_handler_refuses_past_its_own_cap();
+    test_health_reports_pool_capacity_apart_from_provisioned();
+    test_health_capacity_is_one_in_classic_mode();
 }
 
 

@@ -211,12 +211,19 @@ bool server::send_health(int fd) {
     auto *s = this;
     const char *model = server_served_model_id(s);
     bool draining;
-    int n_slots, running, waiting;
+    int n_slots, running, waiting, capacity;
     time_t started;
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
     n_slots  = s->n_slots;
+    /* The pool the run was sized for, not the number of banks provisioned so
+     * far. Banks 1..pool_banks-1 are provisioned lazily as conversations
+     * arrive, so `total` ramps from 1 while this does not move — and a reader
+     * that wants to reserve space for the pool (pulsar-gui draws one row per
+     * slot) needs the number that will not change under it. Classic mode is a
+     * pool of one. */
+    capacity = s->pool_banks > 0 ? s->pool_banks : 1;
     running  = s->n_generating;
     waiting  = s->n_queued;
     started  = s->started;
@@ -235,10 +242,11 @@ bool server::send_health(int fd) {
     buf b = {0};
     buf_printf(&b,
         "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
-        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d},"
+        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d,"
+        "\"capacity\":%d},"
         "\"kv_cache_usage\":%.6f}\n",
         draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
-        uptime, n_slots, running, waiting, kv);
+        uptime, n_slots, running, waiting, capacity, kv);
     bool ok = http_response(fd, draining ? 503 : 200,
                             "application/json", b.ptr);
     buf_free(&b);
@@ -503,6 +511,14 @@ bool server::send_metrics(int fd) {
         const int idx = slot_phase_index(slot_phase[i]);
         if (idx == 1 || idx == 2) prefilling++;
     }
+    /* The pool this run was sized for. Publishes the same number /health
+     * reports as slots.capacity, so a scraper can compute "how much of the pool
+     * is in use" without polling /health — which matters because banks are
+     * provisioned lazily, so the set of pulsar:slot_* series grows from one
+     * slot to the full pool over the first minutes of a session. */
+    buf_puts(&b, "# HELP pulsar:slot_pool_capacity Decode banks this run was sized for.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_pool_capacity gauge\n");
+    buf_printf(&b, "pulsar:slot_pool_capacity %d\n", s->pool_banks > 0 ? s->pool_banks : 1);
     buf_puts(&b, "# HELP pulsar:spec_draft_depth Adaptive draft depth per slot (0 = no drafter/idle).\n");
     buf_puts(&b, "# TYPE pulsar:spec_draft_depth gauge\n");
     for (int i = 0; i < n_slots; i++)
