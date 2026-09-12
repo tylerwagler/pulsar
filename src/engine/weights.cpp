@@ -311,14 +311,25 @@ static void tensor_expect_routed_expert_combo(
     if (gate_up_pair && gate_ok && down_ok) return;
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
-            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq (43); "
-            "combos may differ per layer\n",
+            "gate=%s up=%s down=%s\n"
+            "  gate/up must match, and each of gate/up and down must be one of:",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),
             tensor_type_name(up->type),
             tensor_type_name(down->type));
+    /* DERIVED from tensor_is_routed_expert_type(), for the reason spelled out on
+     * weights_reject_unsupported_types().  This message used to name
+     * "iq2_xxs_mmq (43)" by hand; that reader was deleted (L202) and 43 is
+     * refused, so the engine was telling users to repack their artifact into a
+     * type it then rejects -- L207's failure mode, in the one message L207
+     * missed. */
+    for (uint32_t t = 0; t < 256u; ++t) {
+        if (tensor_is_routed_expert_type(t)) {
+            fprintf(stderr, " %s (%u)", tensor_type_name(t), t);
+        }
+    }
+    fprintf(stderr, "\n  the combo may differ per layer\n");
     exit(1);
 }
 
