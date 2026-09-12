@@ -1077,18 +1077,45 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = rows_pre && output_embd && output_norm && logits;
-    /* The DRAFTER's own head mix (dspark.2.hc_head_*).  The TARGET head now
-     * computes its mix (see gpu_graph_encode_output_head); this one is the
-     * remaining half -- it uses the UNFUSED norm + matmul pair over
-     * batch_flat_hc rather than the fused kernel, so it is its own port.  Still
-     * refused by name. */
-    if (dw->hc_head_fn) {
-        fprintf(stderr, "pulsar: the drafter computes its own HC head mix (0731) -- "
-                        "that path is not restored yet, refusing\n");
-        ok = false;
+    /* The DRAFTER's own head mix (dspark.2.hc_head_*).  Unlike the TARGET head,
+     * which uses the fused norm+mix kernel, this one uses the UNFUSED
+     * rms_norm_plain -> plain-matmul pair over batch_flat_hc -- dev's code,
+     * kept as it is rather than folded into the fused path.  The collapse at the
+     * end is the same shared one either way; only the coefficient source
+     * differs.  plans/96-two-profiles-one-engine.md s17. */
+    if (ok && dw->hc_head_fn) {
+        const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+        pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *mix_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        void *dsp_flat_b = NULL;
+        if (!dw->hc_head_scale || !dw->hc_head_base || !output_pre || !mix_weights) {
+            fprintf(stderr, "pulsar: drafter head mix: weights or scratch missing -- refusing\n");
+            ok = false;
+        }
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens, hc_dim, &dsp_flat_b)) {
+            fprintf(stderr, "pulsar: dspark head flat_hc: no bf16 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
+                                                          (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
+        if (ok && dsp_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
+        if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
+                                                   hc_dim, PULSAR_N_HC, g->batch_flat_hc, n_tokens) != 0;
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(mix_weights, output_pre,
+                                                        dspark_model->map, dspark_model->size,
+                                                        dw->hc_head_scale->abs_offset,
+                                                        dw->hc_head_base->abs_offset,
+                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, mix_weights,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+        pulsar_gpu_tensor_free(output_pre);
+        pulsar_gpu_tensor_free(mix_weights);
+    } else if (ok) {
+        ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
+                                              PULSAR_N_EMBD, PULSAR_N_HC) != 0;
     }
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
-                                                PULSAR_N_EMBD, PULSAR_N_HC) != 0;
     void *dn_b = NULL;
     if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&
         !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &dn_b)) {
