@@ -115,6 +115,28 @@ static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64
     return *norm_w != NULL;
 }
 
+/* ---- the overlap (coff 2) boundary -------------------------------------
+ *
+ * `coff` (= pulsar_compress_coff(ratio)) is 1 for every ratio V4.1 uses and 2
+ * for V4's ratio-4 layers, where the compressor's 2*head_dim projection is split
+ * and the state becomes a two-group carry of coff*ratio rows of coff*head_dim.
+ *
+ * The state LANE is already sized by coff on the host (gpu_diag.cpp asks
+ * pulsar_comp_state_width/rows), so a ratio-4 lane arrives twice as wide and
+ * twice as tall as these kernels assume.  The guards below used to compare
+ * against `ratio * head_dim`, which a 2x lane SATISFIES -- so without this the
+ * overlap case would be accepted and then pool only the first `ratio` positions
+ * of a row whose halves mean different things, which is silently wrong rather
+ * than loud.  Until the overlap kernels land, coff 2 is refused BY NAME. */
+static bool csa2_coff_is_one(uint32_t ratio, const char *who) {
+    if (pulsar_compress_coff(ratio) == 1u) return true;
+    fprintf(stderr,
+            "pulsar: %s: ratio %u overlaps (coff %u) -- the V4 two-group compressor "
+            "is not implemented yet, refusing rather than pooling half a state\n",
+            who, ratio, pulsar_compress_coff(ratio));
+    return false;
+}
+
 static int csa2_pool_norm_launch(float *latent, const float *kv, const float *sc,
                                  const float *state_kv, const float *state_sc, const void *norm_w,
                                  int norm_bf16, uint32_t head_dim, uint32_t ratio, uint32_t n_groups,
@@ -151,6 +173,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
                 ratio, n_tokens, norm_type);
         return 0;
     }
+    if (!csa2_coff_is_one(ratio, "csa2 compressor prefill")) return 0;
     if (pos0 % ratio != 0u) {
         fprintf(stderr, "pulsar: csa2 compressor prefill: position %u is not a group boundary (ratio %u) -- refusing\n",
                 pos0, ratio);
@@ -213,6 +236,7 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         fprintf(stderr, "pulsar: csa2 compressor update: bad arguments (ratio %u, norm type %u) -- refusing\n", ratio, norm_type);
         return 0;
     }
+    if (!csa2_coff_is_one(ratio, "csa2 compressor update")) return 0;
     const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
     if (kv_cur->bytes < row_bytes || latent->bytes < row_bytes) return 0;
     if (ratio == 1u) {
@@ -246,9 +270,15 @@ int pulsar_gpu_csa2_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos) {
     const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    /* the lane must hold coff*ratio rows of coff*head_dim -- ask the coff
+     * geometry, not `ratio * row_bytes`, or a 2x overlap lane passes this and
+     * then gets half-pooled */
+    const uint64_t lane_rows = pulsar_compress_coff(ratio) * (uint64_t)ratio;
+    const uint64_t lane_bytes = lane_rows * pulsar_compress_coff(ratio) * row_bytes;
+    if (!csa2_coff_is_one(ratio, "csa2 compressor store")) return 0;
     if (!kv_row || !sc_row || !state_kv || !state_score || head_dim == 0 || ratio < 2u ||
         kv_row->bytes < row_bytes || sc_row->bytes < row_bytes ||
-        state_kv->bytes < (uint64_t)ratio * row_bytes || state_score->bytes < (uint64_t)ratio * row_bytes) {
+        state_kv->bytes < lane_bytes || state_score->bytes < lane_bytes) {
         fprintf(stderr, "pulsar: csa2 compressor store: bad operands (ratio %u, head_dim %u) -- refusing\n", ratio, head_dim);
         return 0;
     }
