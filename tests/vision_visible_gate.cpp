@@ -108,7 +108,8 @@ int main(int argc, char **argv) {
         c.n = rd_u32(&raw[off]);
         c.width = rd_u32(&raw[off + 4]);
         off += 8;
-        const size_t words = (size_t)c.n * 2 + (size_t)c.n * c.width * 2;
+        /* ids + left + right are 3n words; matrix + plain are n*width each. */
+        const size_t words = (size_t)c.n * 3 + (size_t)c.n * c.width * 2;
         if (off + words * 4 > raw.size()) { fprintf(stderr, "truncated at %s\n", c.name); return 2; }
         const int32_t *p = (const int32_t *)(const void *)&raw[off];
         c.ids.assign(p, p + c.n); p += c.n;
