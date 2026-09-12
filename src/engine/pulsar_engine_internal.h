@@ -304,6 +304,13 @@ typedef struct {
      *   source's latent (V4.1, indexer_k / indexer_k_norm). */
     bool compressor_ape;
     bool indexer_own_compressor;
+    /** The head computes its OWN HC coefficients (0731: the output_hc_* and
+     * dspark.2.hc_head_* mixes) instead of collapsing with the pre its last FFN
+     * handed on (V4.1).  A profile fact rather than "are the tensors there",
+     * because the requiredness has to be known when they are ABSENT: a 0731
+     * artifact missing its mix would otherwise collapse with V4.1's arithmetic
+     * and produce a wrong head without failing.  plans/96-... s9/S1. */
+    bool hc_head_mix;
     /** The KV row family (see pulsar_kv_row_style).  Every row-geometry
      * question goes through pulsar_kv_row_bytes(), which reads this -- so no
      * caller names a format and the geometry cannot disagree with the packer. */
@@ -629,6 +636,14 @@ typedef struct {
     pulsar_tensor *token_embd;       ///< token embedding table
     pulsar_tensor *output_norm;      ///< final RMSNorm before the vocab projection
     pulsar_tensor *output;           ///< vocab projection (the output head)
+    /** The HC HEAD MIX: the coefficients the final collapse uses.  0731 ships
+     * these and its head computes its own coefficients; V4.1 ships none and
+     * collapses with the pre its last FFN handed on (pulsar_shape::hc_head_mix
+     * says which).  BOUND ONCE, not per layer -- the head is one tensor set.
+     * plans/96-two-profiles-one-engine.md s9/S1. */
+    pulsar_tensor *output_hc_fn;     ///< head mix weight [n_hc * n_embd -> n_hc]
+    pulsar_tensor *output_hc_scale;  ///< head mix row scale
+    pulsar_tensor *output_hc_base;   ///< head mix per-stream bias
     pulsar_layer_weights layer[PULSAR_MAX_LAYER];  ///< per-layer weight stacks
 } pulsar_weights;
 
@@ -650,6 +665,12 @@ typedef struct {
     uint32_t embed_dim;              ///< drafter hidden width
     uint32_t vocab_size;             ///< drafter output width; must match the target's logits width
     uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
+    /** The DRAFTER's HC head mix (dspark.2.hc_head_*): 0731 ships it and the
+     * drafter computes its own head coefficients; V4.1 ships none.  Bound once
+     * from block 2 -- the block whose hidden feeds the head (L216). */
+    pulsar_tensor *hc_head_fn;       ///< drafter head mix weight
+    pulsar_tensor *hc_head_scale;    ///< drafter head mix row scale
+    pulsar_tensor *hc_head_base;     ///< drafter head mix per-stream bias
 } pulsar_dspark_weights;
 
 /* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).

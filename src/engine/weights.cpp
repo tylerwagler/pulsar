@@ -1056,6 +1056,15 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
 
 
 static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
+    /* 0731's HC head mix.  REQUIRED where the profile says the head computes its
+     * own coefficients: a 0731 artifact missing the group would otherwise
+     * collapse with V4.1's carried pre -- the wrong arithmetic for the model,
+     * and it would not fail.  V4.1 has no such tensors. */
+    if (g_pulsar_shape.hc_head_mix) {
+        w->output_hc_fn    = required_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale = required_tensor(m, "output_hc_scale.weight");
+        w->output_hc_base  = required_tensor(m, "output_hc_base.weight");
+    }
     if (required) {
         w->output_norm      = required_tensor(m, "output_norm.weight");
         w->output           = required_tensor(m, "output.weight");
@@ -1354,6 +1363,16 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         if (w->target_layer_ids[i] >= PULSAR_N_LAYER || (i && w->target_layer_ids[i] <= w->target_layer_ids[i - 1])) {
             pulsar_die("dspark.target_layer_ids must be ascending target layer indices");
         }
+    }
+
+    /* The DRAFTER's own HC head mix, from block 2 -- the block whose hidden
+     * feeds the head.  Required for the same reason as the main model's above:
+     * a 0731 drafter missing it would otherwise collapse with the carried pre
+     * and draft from a wrong head without failing. */
+    if (g_pulsar_shape.hc_head_mix) {
+        w->hc_head_fn    = required_tensor(m, "dspark.2.hc_head_fn.weight");
+        w->hc_head_scale = required_tensor(m, "dspark.2.hc_head_scale.weight");
+        w->hc_head_base  = required_tensor(m, "dspark.2.hc_head_base.weight");
     }
 
     dspark_weights_validate_layout(w);

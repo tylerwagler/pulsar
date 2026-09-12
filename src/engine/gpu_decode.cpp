@@ -795,6 +795,15 @@ bool gpu_graph_encode_output_head(
                                                         (uint64_t)row * PULSAR_N_HC * sizeof(float),
                                                         (uint64_t)PULSAR_N_HC * sizeof(float));
     bool ok = row_hc && row_pre;
+    /* 0731 ships an HC head mix (output_hc_*), V4.1 ships none and collapses
+     * with the pre its last FFN handed on -- which is the arithmetic below.
+     * The mix is a separate port (PLAN 96 S1) and is not restored, so refuse by
+     * name rather than feed a 0731 artifact through V4.1's collapse. */
+    if (weights->output_hc_fn) {
+        fprintf(stderr, "pulsar: this model computes its own HC head mix (0731) -- "
+                        "that path is not restored yet, refusing\n");
+        ok = false;
+    }
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
     }
@@ -1030,6 +1039,13 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = rows_pre && output_embd && output_norm && logits;
+    /* The DRAFTER's own head mix (dspark.2.hc_head_*, L216).  Refused for the
+     * same reason as the main head above. */
+    if (dw->hc_head_fn) {
+        fprintf(stderr, "pulsar: the drafter computes its own HC head mix (0731) -- "
+                        "that path is not restored yet, refusing\n");
+        ok = false;
+    }
     if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
                                                 PULSAR_N_EMBD, PULSAR_N_HC) != 0;
     void *dn_b = NULL;
