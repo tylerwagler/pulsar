@@ -93,6 +93,22 @@ __global__ static void vk_add(bf16 *__restrict__ a, const bf16 *__restrict__ b, 
     if (i < n) a[i] = f2b(b2f(a[i]) + b2f(b[i]));
 }
 
+/* wqkv's output is (n_tok, 3D) with q|k|v ADJACENT per token -- the reference
+ * does self.wqkv(x).chunk(3, dim=-1), so token t's keys are at t*3D + D and its
+ * values at t*3D + 2D.  Rope and attention want three planes, and reading the
+ * buffer as planes is what made block0 grossly wrong (patch_embed was exact, so
+ * the weights were fine; the very first thing after them was not). */
+__global__ static void vk_split_qkv(const bf16 *__restrict__ qkv,
+                                    bf16 *__restrict__ q, bf16 *__restrict__ k,
+                                    bf16 *__restrict__ v, int D, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t t = i / (size_t)D, d = i % (size_t)D;
+    q[i] = qkv[t * 3 * (size_t)D + d];
+    k[i] = qkv[t * 3 * (size_t)D + D + d];
+    v[i] = qkv[t * 3 * (size_t)D + 2 * (size_t)D + d];
+}
+
 /* 2D RoPE over q and k in place: (n_tok, n_heads, head_dim).  One block per
  * (token, head), one thread per frequency pair. */
 __global__ static void vk_rope2d(bf16 *__restrict__ q, bf16 *__restrict__ k,
@@ -212,8 +228,8 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     const float eps = 1e-6f;
 
     void *d_patches = NULL, *d_x = NULL, *d_tmp = NULL, *d_mid = NULL, *d_qkv = NULL,
-         *d_attn = NULL, *d_mlp = NULL, *d_normed = NULL, *d_alg = NULL, *d_alg2 = NULL,
-         *d_out = NULL;
+         *d_q = NULL, *d_k = NULL, *d_v = NULL, *d_attn = NULL, *d_mlp = NULL,
+         *d_normed = NULL, *d_alg = NULL, *d_alg2 = NULL, *d_out = NULL;
     int ok = 0;
 
 #define WT(off) ((const bf16 *)(const void *)((const char *)map + (off)))
@@ -235,6 +251,9 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     CUDA_ALLOC(d_attn, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_normed, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_qkv, (size_t)n_tok * 3 * D * sizeof(bf16));
+    CUDA_ALLOC(d_q, x_elems * sizeof(bf16));
+    CUDA_ALLOC(d_k, x_elems * sizeof(bf16));
+    CUDA_ALLOC(d_v, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_mlp, (size_t)n_tok * 2 * I * sizeof(bf16));
     CUDA_ALLOC(d_alg, alg_elems * sizeof(bf16));
     CUDA_ALLOC(d_alg2, out_elems * sizeof(bf16));
@@ -257,15 +276,17 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
             (bf16 *)d_qkv, D, 3 * D);
         CUDA_LAUNCH("vision wqkv");
 
+        vk_split_qkv<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
+            (const bf16 *)d_qkv, (bf16 *)d_q, (bf16 *)d_k, (bf16 *)d_v, D, x_elems);
+        CUDA_LAUNCH("vision split_qkv");
         {
-            bf16 *q = (bf16 *)d_qkv;
-            bf16 *kk = q + (size_t)n_tok * D;
-            bf16 *vv = kk + (size_t)n_tok * D;
             vk_rope2d<<<dim3((unsigned)n_tok, H), (unsigned)rope_dim>>>(
-                q, kk, H, head_dim, n_w, rope_dim, (float)PULSAR_VISION_ROPE_THETA);
+                (bf16 *)d_q, (bf16 *)d_k, H, head_dim, n_w, rope_dim,
+                (float)PULSAR_VISION_ROPE_THETA);
             CUDA_LAUNCH("vision rope2d");
             vk_attention<<<dim3(H, (unsigned)n_tok), (unsigned)head_dim, (size_t)head_dim * sizeof(float)>>>(
-                q, kk, vv, (bf16 *)d_attn, n_tok, H, head_dim);
+                (const bf16 *)d_q, (const bf16 *)d_k, (const bf16 *)d_v, (bf16 *)d_attn,
+                n_tok, H, head_dim);
             CUDA_LAUNCH("vision attention");
         }
 
@@ -328,7 +349,8 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
 done:
     cudaFree(d_patches); cudaFree(d_x); cudaFree(d_tmp); cudaFree(d_mid); cudaFree(d_attn);
     cudaFree(d_normed);
-    cudaFree(d_qkv); cudaFree(d_mlp); cudaFree(d_alg); cudaFree(d_alg2); cudaFree(d_out);
+    cudaFree(d_qkv); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_mlp);
+    cudaFree(d_alg); cudaFree(d_alg2); cudaFree(d_out);
     return ok;
 #undef DUMP_STAGE
 #undef CUDA_LAUNCH
