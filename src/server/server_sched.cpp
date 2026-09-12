@@ -1502,25 +1502,38 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
     return sl->active_job && g && g->phase == GEN_DECODE;
 }
 
-/* worker_main's lane select over the gathered decode set (L179 branch 2).
- * 0 = idle, 3 = spec-batched (inc 6): every decoder can speculate, none has
- * joined a plain batch (n_batched == 0 -- no lane switch mid-conversation)
- * and the drafter is loaded; 2 = plain batched otherwise (L118: every n_dec
- * >= 1 is a batch, a solo session is a batch of one). 1 is the retired
- * classic lane: reachable only with n_dec >= 1 and no pool, which the
- * gather loop never produces. Lane 3 keeps the spec_decode counters
- * advancing; lane 2 does not. */
-static int server_pick_decode_lane(int pool_banks, bool has_dspark, session_slot *const *dec,
-                                   int n_dec, int n_batched) {
-    bool all_spec = has_dspark && n_dec >= 1 && n_batched == 0;
-    for (int i = 0; all_spec && i < n_dec; i++) {
-        const gen_state *dg = dec[i]->gen;
-        if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
-            all_spec = false;
+/* worker_main's lane PLAN over the gathered decode set (L179 branch 2; B5):
+ * fills spec_out/plain_out with the members each may ride, in gather order,
+ * and returns the lane code the metric reports -- 0 idle (no decoders), 3
+ * spec-batched present, 2 plain-batched only, 1 the retired classic lane
+ * (reachable only with n_dec >= 1 and no pool, which the gather loop never
+ * produces; asserted as what the code computes, not as a feature).
+ *
+ * B5: eligibility is PER MEMBER, not a group verdict.  A member may speculate
+ * when the drafter is loaded, its request can (`!logprobs` -- the fused step
+ * keeps each draft's target row only inside its batch, so a logprobs request
+ * has no correct distribution to report) and it has not already joined the
+ * shared plain lane (`batch_active` is a per-session one-way latch; a
+ * mid-conversation batched->spec switch would need stale-logits
+ * reconciliation).  One /logprobs decoder used to demote every spec-capable
+ * neighbour for the rest of its request; it now only sends ITSELF plain. */
+static int server_plan_decode_lanes(int pool_banks, bool has_dspark,
+                                    session_slot *const *dec, int n_dec,
+                                    session_slot **spec_out, session_slot **plain_out,
+                                    int *n_spec_out, int *n_plain_out) {
+    int n_spec = 0, n_plain = 0;
+    if (pool_banks > 0) {
+        for (int i = 0; i < n_dec; i++) {
+            const gen_state *g = dec[i]->gen;
+            if (has_dspark && g && g->dspark_spec_enabled && !g->batch_active)
+                spec_out[n_spec++] = dec[i];
+            else
+                plain_out[n_plain++] = dec[i];
+        }
     }
-    const bool use_spec_batched = pool_banks > 0 && all_spec;
-    const bool use_batched = use_spec_batched || (pool_banks > 0 && n_dec >= 1);
-    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (use_batched ? 2 : 1));
+    *n_spec_out = n_spec;
+    *n_plain_out = n_plain;
+    return pool_banks <= 0 ? (n_dec <= 0 ? 0 : 1) : (n_dec <= 0 ? 0 : (n_spec > 0 ? 3 : 2));
 }
 
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
@@ -2829,43 +2842,36 @@ void *worker_main(void *arg) {
             continue;
         }
 
-        /* Gather steady-state batchable decode slots. n_batched > 0 means a
-         * plain batch is already in flight — those slots stay on the plain
-         * lane until they finish (no mid-conversation lane switch, which
-         * would need stale-logits reconciliation). L118: every decode slot is
-         * batchable and every n >= 1 arms a batched quantum; the Tier-2
-         * three-way lane that lived here is deleted. */
+        /* Gather steady-state batchable decode slots and plan their lanes.
+         * L118: every decode slot is batchable and every n >= 1 arms a
+         * batched quantum; the Tier-2 three-way lane that lived here is
+         * deleted. */
         session_slot *dec[PULSAR_SESSION_POOL_CAP];
-        int n_dec = 0, n_batched = 0;
+        session_slot *spec_dec[PULSAR_SESSION_POOL_CAP];
+        session_slot *plain_dec[PULSAR_SESSION_POOL_CAP];
+        int n_dec = 0, n_spec = 0, n_plain = 0;
         if (s->pool_banks > 0) {
-            for (int i = 0; i < s->n_slots; i++) {
-                if (slot_is_batchable_decode(&s->slots[i])) {
-                    dec[n_dec++] = &s->slots[i];
-                    if (s->slots[i].gen->batch_active) n_batched++;
-                }
-            }
+            for (int i = 0; i < s->n_slots; i++)
+                if (slot_is_batchable_decode(&s->slots[i])) dec[n_dec++] = &s->slots[i];
         }
-        /* inc 6: the SPEC batched lane -- rounds, not tokens -- when every
-         * batchable decode slot can speculate and no plain batch is mid-
-         * flight (no lane switch mid-conversation; same reconciliation rule
-         * as classic->batched). Slots with spec off (logprobs requests) keep
-         * the whole group on the plain lane this quantum rather than
-         * splitting the sweep. A bank whose yield-quench has latched stays in
-         * this lane but degrades naturally to 1-row rounds: round_end's
-         * redraft respects the latch, so its pendings stay empty -- correct
-         * output, base-token rounds, only the per-row capture as overhead. */
-        /* L118 (everything is a batch): the batched quanta run at EVERY
-         * n_dec >= 1 — a solo session is a batch of one. The classic per-slot
-         * decode lane, its A/B hatch, and the spec_max_live crossover are
-         * DELETED (P4; parity evidence in rows/L118.md). Spec-batched when
-         * every decoder can speculate, plain-batched otherwise. */
+        /* B5: eligibility is per member (server_plan_decode_lanes), so a
+         * /logprobs decoder advances in the SAME worker iteration as its
+         * spec-capable neighbours instead of demoting them to the plain lane
+         * for the rest of their requests.  The spec quantum runs first -- it
+         * is the higher-value work and the metric reports it -- then the plain
+         * subset; each quantum is self-contained (park -> run -> restore), so
+         * back-to-back is safe.  A bank whose yield-quench has latched stays
+         * in the spec subset but degrades naturally to 1-row rounds:
+         * round_end's redraft respects the latch, so its pendings stay empty
+         * -- correct output, base-token rounds, only the per-row capture as
+         * overhead. */
         /* Record the lane for /metrics. Only the spec lane runs the fused verify
          * loop, so this is what tells a scraper whether the spec_decode_*
          * counters describe the present or some earlier single-request stretch. */
-        s->w_decode_lane = server_pick_decode_lane(s->pool_banks,
-                                                   pulsar_engine_has_dspark(s->engine),
-                                                   dec, n_dec, n_batched);
-        const bool use_spec_batched = s->w_decode_lane == 3;
+        s->w_decode_lane = server_plan_decode_lanes(s->pool_banks,
+                                                    pulsar_engine_has_dspark(s->engine),
+                                                    dec, n_dec, spec_dec, plain_dec,
+                                                    &n_spec, &n_plain);
         const bool use_batched = s->w_decode_lane >= 2;
 
         if (use_batched) {
@@ -2875,12 +2881,13 @@ void *worker_main(void *arg) {
              * admissible) => pf_fuse==NULL => today's exact decode-quantum +
              * separate-prefill time-slice, byte-identical. */
             session_slot *pf_fuse = NULL;
-            if (use_spec_batched) {
-                s->worker_spec_batched_quantum(dec, n_dec);
-            } else {
+            if (n_spec > 0) {
+                s->worker_spec_batched_quantum(spec_dec, n_spec);
+            }
+            if (n_plain > 0) {
                 pf_fuse = s->worker_find_fuse_prefill();
-                if (pf_fuse) s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse);
-                else         s->worker_batched_decode_quantum(dec, n_dec);
+                if (pf_fuse) s->worker_mixed_batch_quantum(plain_dec, n_plain, pf_fuse);
+                else         s->worker_batched_decode_quantum(plain_dec, n_plain);
             }
             /* Finish any slot the batched quantum stopped (per-slot path
              * reconciles its checkpoint). Then also advance ONE non-decode
