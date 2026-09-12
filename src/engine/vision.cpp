@@ -240,6 +240,66 @@ void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_
     }
 }
 
+/* The reference's prepare_vl_inputs(): expand every image placeholder in the
+ * prompt into that image's sentinel block.
+ *
+ *     for tok in prompt_tokens:
+ *         if tok != image_token_id: tokens.append(tok); continue
+ *         patches, ... = load_image(next(image_iter), args)
+ *         types, perm = build_image_block(n_llm_h, n_llm_w, len(tokens))
+ *         image_inputs.append(ImageInput(len(tokens), ...))
+ *         tokens += (args.vocab_size + types).tolist()
+ *
+ * `out` is written fresh (the caller owns it and should have freed any previous
+ * contents).  Each block's ids are `vocab_size + role`, in build_image_block's
+ * final N-layout order, and each block's START POSITION is the length of the
+ * prompt at that moment -- the reference's ImageInput.start, which is what
+ * pulsar_image_ref::start_pos must carry and where merge_image_embeddings writes.
+ *
+ * `preps` and `starts` receive one entry per image, in order, for the later
+ * merge.  Refuses when the placeholder count and the image count disagree (the
+ * reference raises the same error), or when any image cannot be prepared. */
+int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in,
+                                     int placeholder_id,
+                                     const pulsar_image_ref *images, int n_images,
+                                     const pulsar_vision_args *args, int vocab_size,
+                                     pulsar_vision_prepared *preps, int *starts) {
+    if (!out || !in || !in->v || !args || vocab_size <= 0) return 0;
+    if (n_images < 0 || (n_images > 0 && (!images || !preps || !starts))) return 0;
+
+    int seen = 0, next = 0;
+    for (int i = 0; i < in->len; i++) {
+        if (in->v[i] != placeholder_id) {
+            pulsar_tokens_push(out, in->v[i]);
+            continue;
+        }
+        if (next >= n_images) {
+            fprintf(stderr, "pulsar: prompt carries more image placeholders than the request has "
+                            "images (%d images, placeholder at %d)\n", n_images, i);
+            return 0;
+        }
+        const int block_at = out->len;      /* the block start, before any of it is appended */
+        const pulsar_image_ref *img = &images[next];
+        if (!img->bytes || img->len == 0) return 0;
+        if (!vision_prepare_image(img->bytes, img->len, args, block_at, vocab_size, &preps[next]))
+            return 0;
+        for (int k = 0; k < preps[next].span_len; k++) {
+            const int role = preps[next].span_types[k];
+            if (role < 0 || role > VISION_T_IMAGE_END) return 0;
+            pulsar_tokens_push(out, vocab_size + role);
+        }
+        starts[next] = block_at;
+        next++;
+        seen++;
+    }
+    if (seen != n_images) {
+        fprintf(stderr, "pulsar: prompt carries %d image placeholder(s) but the request has %d "
+                        "image(s)\n", seen, n_images);
+        return 0;
+    }
+    return 1;
+}
+
 /* The image sentinel BLOCK beginning at `start_pos`, or 0 when the ids there are
  * not such a block.  `*len_out` is the BLOCK length -- what
  * merge_image_embeddings writes and what the chunk planner must not split.

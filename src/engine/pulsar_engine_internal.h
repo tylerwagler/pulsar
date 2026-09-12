@@ -2374,6 +2374,19 @@ typedef struct {
 int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
                          int start_pos, int vocab_size, pulsar_vision_prepared *out);
 void vision_prepared_free(pulsar_vision_prepared *p);
+/** The reference's prepare_vl_inputs(): expand every image placeholder in `in`
+ * into that image's sentinel block in `out` (which the caller owns and must have
+ * emptied).  `out`'s ids become `vocab_size + role` in build_image_block's order,
+ * and `starts[k]` receives image k's BLOCK start -- the value
+ * pulsar_image_ref::start_pos must carry.  `preps[k]` receives the prepared image
+ * for the later merge.  Refuses when the placeholder count and the image count
+ * disagree, or when an image cannot be prepared. */
+int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in,
+                                     int placeholder_id,
+                                     const pulsar_image_ref *images, int n_images,
+                                     const pulsar_vision_args *args, int vocab_size,
+                                     pulsar_vision_prepared *preps, int *starts);
+
 /** The image sentinel BLOCK beginning at `start_pos` (the reference's
  * ImageInput.start: the block's first slot, which is a compressor pad, with the
  * IMAGE_START sentinel a few slots in).  `*len_out` receives the BLOCK length --
