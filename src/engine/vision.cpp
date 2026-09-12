@@ -626,3 +626,82 @@ int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
     return pulsar_cuda_vision_forward(&o, m->map, m->size, patches, n_h, n_w,
                                       out, out_cap, out_rows, dbg, dbg_blocks);
 }
+
+
+/* The per-image input path end to end: decode -> preprocess -> sentinel span.
+ * This is the reference's prepare_vl_inputs minus the prompt tokenisation (which
+ * the renderer owns): load_image -> build_image_block(len(tokens)) -> ids are
+ * vocab_size + type.  The pieces were each gated separately; this composes them,
+ * which is what the server will actually call. */
+int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
+                         int start_pos, int vocab_size, pulsar_vision_prepared *out) {
+    memset(out, 0, sizeof *out);
+    uint8_t *rgb = NULL;
+    int w = 0, h = 0;
+    if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) return 0;
+
+    pulsar_vision_image img;
+    const size_t cap = (size_t)w * (size_t)h;   /* an upper bound on patch elements/3 */
+    uint16_t *patches = (uint16_t *)malloc(cap * 3u * sizeof(uint16_t));
+    if (!patches) { free(rgb); return 0; }
+    const size_t patch_cap = cap * 3u;
+    if (!vision_preprocess_rgb(rgb, w, h, args, patches, patch_cap, &img)) {
+        free(patches);
+        free(rgb);
+        return 0;
+    }
+    free(rgb);
+
+    const int p = args->patch_size;
+    const int n_patches = img.n_vit_h * img.n_vit_w;
+    const size_t used = (size_t)n_patches * 3u * (size_t)p * (size_t)p;
+
+    int32_t *ids = (int32_t *)malloc((size_t)img.n_llm_h * (size_t)(img.n_llm_w + 1) * 4u * sizeof(int32_t) + 64u);
+    int32_t *types = (int32_t *)malloc((size_t)img.n_llm_h * (size_t)(img.n_llm_w + 1) * 4u * sizeof(int32_t) + 64u);
+    int32_t *perm = (int32_t *)malloc((size_t)n_patches * sizeof(int32_t) + 1u);
+    int *raw_types = NULL;
+    if (!ids || !types || !perm) goto fail_tmp;
+    {
+        const int cap_ids = (int)((size_t)img.n_llm_h * (size_t)(img.n_llm_w + 1) * 4u + 64u);
+        raw_types = (int *)malloc((size_t)cap_ids * sizeof(int));
+        if (!raw_types) goto fail_tmp;
+        const int n_types = vision_build_image_block(img.n_llm_h, img.n_llm_w, start_pos,
+                                                     raw_types, cap_ids, perm, n_patches);
+        if (n_types <= 0) goto fail_tmp;
+        for (int i = 0; i < n_types; i++) {
+            types[i] = raw_types[i];
+            ids[i] = vocab_size + raw_types[i];
+        }
+        out->span_len = n_types;
+        out->n_perm = n_patches;
+    }
+    free(raw_types);
+    out->patches = patches;
+    out->span_ids = ids;
+    out->span_types = types;
+    out->perm = perm;
+    out->n_patches = n_patches;
+    out->n_vit_h = img.n_vit_h;
+    out->n_vit_w = img.n_vit_w;
+    out->n_llm_h = img.n_llm_h;
+    out->n_llm_w = img.n_llm_w;
+    (void)used;
+    return 1;
+
+fail_tmp:
+    free(raw_types);
+    free(ids);
+    free(types);
+    free(perm);
+    free(patches);
+    return 0;
+}
+
+void vision_prepared_free(pulsar_vision_prepared *p) {
+    if (!p) return;
+    free(p->patches);
+    free(p->span_ids);
+    free(p->span_types);
+    free(p->perm);
+    memset(p, 0, sizeof *p);
+}

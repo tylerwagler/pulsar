@@ -2333,6 +2333,25 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
  * own .convert("RGB") is a different transform from libjpeg's. */
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
+
+/** One image READY for the model: the reference's per-image half of
+ * prepare_vl_inputs.  `span_ids` are the sentinel token ids (vocab_size + type),
+ * `span_types` the roles, `perm` the aligner-row order for the IMAGE slots, and
+ * `patches` the ViT input.  All buffers are malloc'd; free with
+ * vision_prepared_free(). */
+typedef struct {
+    uint16_t *patches;      ///< n_patches * 3 * PATCH * PATCH bf16
+    int32_t  *span_ids;     ///< span_len ids: vocab_size + type
+    int32_t  *span_types;   ///< span_len roles (IMAGE_START..IMAGE_END)
+    int32_t  *perm;         ///< n_perm aligner-row indices for the IMAGE slots
+    int n_patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w, span_len, n_perm;
+} pulsar_vision_prepared;
+/** Decode + preprocess + build the sentinel span for ONE image at `start_pos`
+ * (its token index in the prompt).  `vocab_size` is the text model's n_vocab,
+ * which the sentinel ids are offset by.  Returns 0 on refusal. */
+int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
+                         int start_pos, int vocab_size, pulsar_vision_prepared *out);
+void vision_prepared_free(pulsar_vision_prepared *p);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);

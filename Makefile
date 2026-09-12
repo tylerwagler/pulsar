@@ -505,6 +505,12 @@ vision-pixel-gate: tests/vision_pixel_gate
 vision-codec-gate: tests/vision_codec_gate
 	./tests/vision_codec_gate tests/test-vectors/vision-codec-goldens.bin
 
+# L216: the composed per-image path (decode + preprocess + sentinel span) vs the
+# reference's load_image + build_image_block.  EXACT -- no tolerance.
+VISION_SPAN_GOLDENS ?= tests/test-vectors/vision-span-goldens.bin
+vision-span-gate: tests/vision_span_gate
+	./tests/vision_span_gate $(VISION_SPAN_GOLDENS)
+
 # L216: the ViT + aligner forward vs the checkpoint's own vision.py.  This one
 # needs a VISION-EXP artifact (the battery's FRONTIER_MODEL is 0731, which has no
 # tower), so it is NOT in GATE_TARGETS and refuses to silently pass when
@@ -1067,13 +1073,13 @@ unit-test-gate: pulsar_test seam-check
 # target closed.  Fold it into tests/gates_runner.cpp to drop the extra load.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-session-payload-gate vision-layout-gate vision-pixel-gate vision-codec-gate \
+	cuda-attn-gates cuda-session-payload-gate vision-layout-gate vision-pixel-gate vision-codec-gate vision-span-gate \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate
+.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1238,6 +1244,9 @@ tests/vision_pixel_gate.o: tests/vision_pixel_gate.cpp src/engine/pulsar_engine_
 tests/vision_codec_gate.o: tests/vision_codec_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_codec_gate.cpp
 
+tests/vision_span_gate.o: tests/vision_span_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_span_gate.cpp
+
 tests/vision_tower_gate.o: tests/vision_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_tower_gate.cpp
 
@@ -1355,6 +1364,9 @@ tests/vision_pixel_gate: tests/vision_pixel_gate.o src/lib/pulsar_help.o $(CORE_
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_codec_gate: tests/vision_codec_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_span_gate: tests/vision_span_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
