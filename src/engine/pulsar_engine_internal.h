@@ -332,6 +332,28 @@ typedef struct {
     uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
+/** The compressor's STATE geometry: `coff*ratio` rows of `coff*head_dim` floats.
+ *
+ * `coff` is the SAME one that sets the compressor projection width
+ * (pulsar_compress_coff), so the state and the weights cannot disagree about it
+ * -- and they must not, because with overlap the projection is split: pooled
+ * column c comes from the previous group's first half and column c+d from the
+ * current group's second, so the state's two halves hold different things.
+ *
+ * V4.1 never overlaps (coff is 1 for every ratio it uses: 0, 1 and 2), so its
+ * state is `ratio` rows of head_dim exactly as before.  V4's ratio-4 layers are
+ * the ones that need the doubled form.  See the transcription in
+ * tests/compressor_pool_test.cpp for what the halves mean.
+ *
+ * head_dim is a parameter rather than read from the shape global so this can be
+ * used before that global is declared (and from a host test). */
+static inline uint32_t pulsar_comp_state_width(uint32_t ratio, uint32_t head_dim) {
+    return pulsar_compress_coff(ratio) * head_dim;
+}
+static inline uint32_t pulsar_comp_state_rows(uint32_t ratio) {
+    return pulsar_compress_coff(ratio) * ratio;
+}
+
 /** ---- Engram n-gram hashing (L218 phase 0c / V4.1 phase 4) ------------------
  *
  * Engram is NEW IN V4.1 -- 0731 has no such layers (PLAN 95's delta table lists

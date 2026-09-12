@@ -393,8 +393,11 @@ static bool gpu_graph_bank_slabs_alloc(
          * pool and (at ratio > 1) a compressor state lane. */
         if (!ok || attn->mode != PULSAR_ATTN_FULL) continue;
 
-        const uint64_t attn_width = PULSAR_N_HEAD_DIM;
-        const uint64_t attn_rows = attn->ratio > 1u ? attn->ratio : 0u;
+        /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
+         * state is twice as wide and twice as tall as V4.1's.  coff is 1 for
+         * every ratio V4.1 uses, so this is inert there. */
+        const uint64_t attn_width = pulsar_comp_state_width(attn->ratio, PULSAR_N_HEAD_DIM);
+        const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
         const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
         b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
                                  pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
@@ -1416,8 +1419,8 @@ bool gpu_graph_alloc_raw_cap(
          * does -- 0731's ratio-128 layers publish none. */
         const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
         if (pulsar_attn_owns_kv(attn->mode)) {
-            const uint64_t attn_width = PULSAR_N_HEAD_DIM;
-            const uint64_t attn_rows = attn->ratio > 1u ? attn->ratio : 0u;
+            const uint64_t attn_width = pulsar_comp_state_width(attn->ratio, PULSAR_N_HEAD_DIM);
+            const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
             const uint64_t state_bytes = attn_width * attn_rows * sizeof(float);
             const uint64_t comp_row_bytes = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
             const uint64_t index_row_bytes = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);

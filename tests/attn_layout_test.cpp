@@ -137,6 +137,29 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
         snprintf(detail, sizeof detail, "got %s, want %s -- %s", mode_name(a->mode), mode_name(want_mode), why);
         check(a->mode == want_mode, "wrong attention mode", il, detail);
 
+        /* The compressor's STATE geometry must follow coff (pulsar_compress_coff),
+         * not be hardcoded to V4.1's no-overlap width.  Pinned as concrete
+         * numbers rather than by re-deriving the formula, so a change to the
+         * formula that keeps the two sites agreeing still has to face this. */
+        {
+            const uint32_t w    = pulsar_comp_state_width(a->ratio, (uint32_t)shape->n_head_dim);
+            const uint32_t rows = a->ratio > 1u ? pulsar_comp_state_rows(a->ratio) : 0u;
+            const uint32_t hd   = (uint32_t)shape->n_head_dim;
+            uint32_t want_w = hd, want_rows = a->ratio > 1u ? a->ratio : 0u;
+            if (a->ratio == 4u) { want_w = 2u * hd; want_rows = 8u; }   /* overlap: two-group */
+            snprintf(detail, sizeof detail, "ratio %u: got %ux%u, want %ux%u",
+                     a->ratio, w, rows, want_w, want_rows);
+            check(w == want_w && rows == want_rows, "compressor state geometry is wrong", il, detail);
+            if (shape->variant == PULSAR_VARIANT_V41) {
+                /* The inertness proof for the coff-aware geometry: V4.1 uses no
+                 * ratio that overlaps, so coff is 1 everywhere and its state is
+                 * bit-for-bit what it was before. */
+                snprintf(detail, sizeof detail, "ratio %u has coff %u", a->ratio, pulsar_compress_coff(a->ratio));
+                check(pulsar_compress_coff(a->ratio) == 1u,
+                      "V4.1 must never overlap -- the state geometry change is only inert if it does not", il, detail);
+            }
+        }
+
         /* A layer's own ratio must equal the ratio of every source it reads.
          * The install enforces this, so reaching here with a mismatch would mean
          * the check was relaxed; assert the postcondition independently. */
