@@ -1212,13 +1212,27 @@ bool gpu_graph_encode_layer_attention_batch(
         }
         if (ok) batch_attention_done = true;
     } else if (ok && compressed) {
-        /* CSA2 (L218): KV production is the kv SOURCE's alone -- it runs its
-         * compressor over this batch and emits the comp + index-K rows every
-         * later layer up to the next source attends over; a member layer
-         * (REINDEX / REUSE) produces nothing and reads its source's pools.
-         * The indexer QUERY side belongs to every index source (FULL +
-         * REINDEX); a REUSE layer attends with its index source's top-k. */
-        if (attn->mode == PULSAR_ATTN_FULL) {
+        /* CSA2 (L218): KV production belongs to the kv SOURCE alone (FULL /
+         * FULL_UNINDEXED) -- it runs its compressor over this batch and emits
+         * the comp rows every later layer up to the next source attends over,
+         * plus the index-K rows when it is also an index source (V4.1 always,
+         * 0731 only on its ratio-4 layers).  A member layer (REINDEX / REUSE)
+         * produces nothing and reads its source's pools.  The indexer QUERY
+         * side belongs to every indexed layer; a REUSE layer attends with its
+         * index source's top-k. */
+        if (pulsar_attn_owns_kv(attn->mode) && g_pulsar_shape.indexer_own_compressor) {
+            /* 0731's production is its own machinery -- the ratio-4 two-group
+             * pool, the ratio-128 undo-lane ring, and the indexer's OWN
+             * compressor -- and none of it is restored yet.  Refuse by NAME: the
+             * member branch below would read a pool no source ever wrote, and
+             * the V4.1 body would look for an index-key tensor 0731 does not
+             * have and report the wrong reason.
+             * plans/96-two-profiles-one-engine.md s9.1. */
+            fprintf(stderr,
+                    "pulsar: layer %u: the 0731 CSA/HCA attention production path is "
+                    "not restored yet -- refusing\n", il);
+            ok = false;
+        } else if (pulsar_attn_owns_kv(attn->mode)) {
             const bool have_comp = layer->attn_compressor_kv && layer->attn_compressor_norm &&
                                    layer->indexer_k && layer->indexer_k_norm &&
                                    (ratio == 1u || layer->attn_compressor_gate);

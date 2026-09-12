@@ -622,17 +622,20 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
                 ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
                                          b->raw[il], (uint64_t)src * b->raw_bank_bytes,
                                          raw_bytes) != 0;
-            if (ok && attn->mode == PULSAR_ATTN_FULL) {
+            if (ok && pulsar_attn_owns_kv(attn->mode)) {
                 const uint64_t crows = (uint64_t)R / attn->ratio;
                 if (crows) {
                     ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0,
                                              crows * attn_row) != 0;
-                    if (ok) ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
-                                                     crows * idx_row) != 0;
+                    /* The index-K pool exists only where an indexer does. */
+                    if (ok && pulsar_attn_runs_indexer(attn->mode)) {
+                        ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
+                                                 crows * idx_row) != 0;
+                    }
                 }
             }
         }
-        if (ok && attn->mode == PULSAR_ATTN_FULL) g->ms_n_comp[dst][il] = R / attn->ratio;
+        if (ok && pulsar_attn_owns_kv(attn->mode)) g->ms_n_comp[dst][il] = R / attn->ratio;
     }
     if (ok) ok = gpu_graph_compressor_state_reset(g, dst);
     return ok;
@@ -1408,29 +1411,36 @@ bool gpu_graph_alloc_raw_cap(
             : gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     (uint64_t)raw_cap * raw_row_bytes_pack);
-        /* CSA2 (L218): the compressed pool, the index-K pool and (ratio > 1)
-         * the compressor state exist at kv sources only. */
+        /* CSA2 (L218): the compressed pool and (ratio > 1) the compressor state
+         * exist at every kv source; the index-K pool only where an indexer
+         * does -- 0731's ratio-128 layers publish none. */
         const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
-        if (attn->mode == PULSAR_ATTN_FULL) {
+        if (pulsar_attn_owns_kv(attn->mode)) {
             const uint64_t attn_width = PULSAR_N_HEAD_DIM;
             const uint64_t attn_rows = attn->ratio > 1u ? attn->ratio : 0u;
             const uint64_t state_bytes = attn_width * attn_rows * sizeof(float);
             const uint64_t comp_row_bytes = PULSAR_ENGINE_MAINKV_ROWBYTES;
             const uint64_t index_row_bytes = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+            const bool indexed = pulsar_attn_runs_indexer(attn->mode);
             if (banked) {
                 g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
                         g->banks.comp[il][0], 0, g->banks.comp_bank_bytes[il]);
-                g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
-                        g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
+                if (indexed) {
+                    g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
+                            g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
+                }
             } else {
                 g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
-                g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
-                        managed_kv_cache,
-                        (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
+                if (indexed) {
+                    g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                            managed_kv_cache,
+                            (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
+                }
             }
-            state_init_ok = state_init_ok && g->layer_attn_comp_cache[il] && g->layer_index_comp_cache[il];
+            state_init_ok = state_init_ok && g->layer_attn_comp_cache[il] &&
+                            (!indexed || g->layer_index_comp_cache[il]);
             if (state_bytes) {
                 if (banked) {
                     g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(

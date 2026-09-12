@@ -1005,6 +1005,13 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 #define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
 #define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
 
+/** The compressor's width multiplier at a given compress ratio: 0731's ratio-4
+ * (CSA) compressor pools two OVERLAPPING groups and emits 2 * head_dim, while
+ * its ratio-128 (HCA) compressor emits head_dim; V4.1's CSA2 ratios (1 and 2)
+ * are both 1.  One authority for that width -- the binder's shape expectations
+ * and the kernels read this rather than keeping their own copy. */
+static inline PULSAR_GPU_HD uint32_t pulsar_compress_coff(uint32_t ratio) { return ratio == 4u ? 2u : 1u; }
+
 /** The window-row packer: quantise `n_rows` f32 rows of `src` to WINDOW rows
  * (see the format block) and store them.  raw_cap == 0: consecutive rows of
  * `packed` from out_row0 (the batch pack buffer).  raw_cap != 0: a ring

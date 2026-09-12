@@ -300,6 +300,14 @@ typedef struct {
     uint32_t candidate_block_size;   ///< compressed positions per candidate block
     uint32_t n_hc;                ///< hyper-connection streams
     uint32_t n_hc_sinkhorn_iter;  ///< Sinkhorn normalisation iterations in the HC mix
+    /** Attention weight families, read at bind only.
+     * compressor_ape: the compressors carry an absolute-position embedding
+     *   (0731 does; V4.1's are plain projections).
+     * indexer_own_compressor: the indexer compresses its own index key
+     *   (0731, indexer_compressor_*) instead of projecting it from the kv
+     *   source's latent (V4.1, indexer_k / indexer_k_norm). */
+    bool compressor_ape;
+    bool indexer_own_compressor;
     float rms_eps;             ///< epsilon for the transformer RMSNorms
     float hc_eps;              ///< epsilon for the HC normalisation
     float expert_weight_scale; ///< scale applied to routed-expert gate weights
@@ -576,13 +584,22 @@ typedef struct {
     pulsar_tensor *attn_sinks;       ///< per-head attention sink logits (always-attendable slots)
     pulsar_tensor *attn_output_a;    ///< attention output down-projection (A factor)
     pulsar_tensor *attn_output_b;    ///< attention output up-projection (B factor) back to embedding
-    pulsar_tensor *attn_compressor_kv;    ///< compressor KV projection [n_embd -> head_dim]; FULL layers
-    pulsar_tensor *attn_compressor_gate;  ///< compressor softmax gate over the group's rows; FULL layers of ratio > 1
-    pulsar_tensor *attn_compressor_norm;  ///< RMSNorm on the pooled latent; FULL layers
-    pulsar_tensor *indexer_attn_q_b;      ///< indexer query up-projection (its own head space); FULL + REINDEX layers
-    pulsar_tensor *indexer_proj;          ///< indexer per-head score weights; FULL + REINDEX layers
-    pulsar_tensor *indexer_k;             ///< index key from the compressor latent [head_dim -> indexer_head_dim]; FULL layers
-    pulsar_tensor *indexer_k_norm;        ///< RMSNorm on the index key; FULL layers
+    pulsar_tensor *attn_compressor_ape;   ///< compressor absolute-position embedding; 0731 compressed layers only
+    pulsar_tensor *attn_compressor_kv;    ///< compressor KV projection [n_embd -> head_dim]; every kv source
+    pulsar_tensor *attn_compressor_gate;  ///< compressor softmax gate over the group's rows; kv sources of ratio > 1
+    pulsar_tensor *attn_compressor_norm;  ///< RMSNorm on the pooled latent; every kv source
+    pulsar_tensor *indexer_attn_q_b;      ///< indexer query up-projection (its own head space); indexed layers
+    pulsar_tensor *indexer_proj;          ///< indexer per-head score weights; indexed layers
+    pulsar_tensor *indexer_k;             ///< index key from the kv source's latent; V4.1 indexed layers
+    pulsar_tensor *indexer_k_norm;        ///< RMSNorm on that index key; V4.1 indexed layers
+    /** The indexer's OWN compressor (0731 indexed layers).  0731 does not
+     * derive the index key from the kv source's latent -- it compresses the
+     * index key itself, so these replace indexer_k / indexer_k_norm.  Which
+     * family a profile uses is pulsar_shape::indexer_own_compressor. */
+    pulsar_tensor *indexer_compressor_ape;
+    pulsar_tensor *indexer_compressor_kv;
+    pulsar_tensor *indexer_compressor_gate;
+    pulsar_tensor *indexer_compressor_norm;
     pulsar_tensor *hc_ffn_fn;        ///< HC mix weight feeding the FFN sublayer
     pulsar_tensor *hc_ffn_scale;     ///< HC per-channel scale, FFN side
     pulsar_tensor *hc_ffn_base;      ///< HC per-channel base/offset, FFN side
@@ -2031,19 +2048,34 @@ void spec_quench_reset(pulsar_session *s);
  *          (inside the candidate pool when one is published), publishes top-k.
  * REUSE:   neither.  Reads the kv source's rows and the index source's top-k
  *          unchanged; owns nothing beyond its window ring and its q path.
+ * FULL_UNINDEXED: a kv source that runs NO indexer -- 0731's ratio-128 (HCA)
+ *          layers.  It runs the compressor over its own input and publishes the
+ *          compressed-KV rows, but publishes no index K and no top-k, so its
+ *          attention reads its own compressed cache unindexed.  The artifact
+ *          agrees: such a layer carries attn_compressor_* and no indexer.*
+ *          tensor at all.  Reachable only from a profile whose index source set
+ *          is narrower than its kv source set (0731: 21 index of 41 kv).
  *
- * NOT YET EXPRESSIBLE: a kv source that runs no indexer -- 0731's ratio-128
- * (HCA) layers, which carry attn_compressor_* and no indexer.* tensor at all and
- * therefore publish no top-k.  The installer refuses such a layer today rather
- * than mis-moding it as an indexed FULL; the mode and every consumer that tests
- * `mode == PULSAR_ATTN_FULL` (weights.cpp:392/491/1073, gpu_prefill.cpp:1221)
- * must land together.  plans/96-two-profiles-one-engine.md s9. */
+ * Ask the two predicates below rather than comparing against PULSAR_ATTN_FULL:
+ * a bare comparison silently MISSES the new mode, which skips a layer's
+ * compressor without a word. */
 typedef enum {
     PULSAR_ATTN_WINDOW = 0,
     PULSAR_ATTN_FULL,
     PULSAR_ATTN_REINDEX,
     PULSAR_ATTN_REUSE,
+    PULSAR_ATTN_FULL_UNINDEXED,
 } pulsar_attn_mode;
+
+/** Runs the compressor and publishes compressed KV for its group. */
+static inline bool pulsar_attn_owns_kv(pulsar_attn_mode m) {
+    return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_FULL_UNINDEXED;
+}
+
+/** Runs an indexer: query projection, scoring, and a published top-k. */
+static inline bool pulsar_attn_runs_indexer(pulsar_attn_mode m) {
+    return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_REINDEX;
+}
 
 /** One layer's row of the attention layout table.  Derived once at load from
  * the artifact's compress_ratios / kv_source_layers / index_source_layers /
@@ -2102,13 +2134,13 @@ static inline uint32_t gpu_graph_kv_source(uint32_t il) {
     return pulsar_layer_attn_layout(il)->kv_source;
 }
 static inline bool gpu_graph_layer_is_kv_source(uint32_t il) {
-    return pulsar_layer_attn_layout(il)->mode == PULSAR_ATTN_FULL;
+    return pulsar_attn_owns_kv(pulsar_layer_attn_layout(il)->mode);
 }
 /** A kv source of ratio > 1 keeps a pending group in the state lane; ratio 1
  * emits a row per token and keeps none. */
 static inline bool gpu_graph_layer_has_comp_state(uint32_t il) {
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
-    return a->mode == PULSAR_ATTN_FULL && a->ratio > 1u;
+    return pulsar_attn_owns_kv(a->mode) && a->ratio > 1u;
 }
 /** Physically-present routed-expert count for a layer. For an un-pruned model
  * (or any layer whose keep_count was not set) this is the full n_expert; for a

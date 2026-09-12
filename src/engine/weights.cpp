@@ -389,17 +389,20 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
     }
 
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
-    if (a->mode == PULSAR_ATTN_FULL &&
+    if (pulsar_attn_owns_kv(a->mode) &&
         (!l->attn_compressor_kv ||
          !l->attn_compressor_norm ||
          (a->ratio > 1 && !l->attn_compressor_gate) ||
-         !l->indexer_k ||
-         !l->indexer_k_norm))
+         (g_pulsar_shape.compressor_ape && !l->attn_compressor_ape) ||
+         (!g_pulsar_shape.indexer_own_compressor && (!l->indexer_k || !l->indexer_k_norm))))
     {
         return false;
     }
-    if ((a->mode == PULSAR_ATTN_FULL || a->mode == PULSAR_ATTN_REINDEX) &&
-        (!l->indexer_attn_q_b || !l->indexer_proj))
+    if (pulsar_attn_runs_indexer(a->mode) &&
+        (!l->indexer_attn_q_b || !l->indexer_proj ||
+         (g_pulsar_shape.indexer_own_compressor &&
+          (!l->indexer_compressor_ape || !l->indexer_compressor_kv ||
+           !l->indexer_compressor_gate || !l->indexer_compressor_norm))))
     {
         return false;
     }
@@ -484,21 +487,37 @@ static void weights_validate_layout(
         tensor_expect_mxfp8(l->attn_output_a,   2, PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, PULSAR_N_EMBD, 0);
 
-        /* CSA2 (L218): the compressor and the index-key projection live on the
-         * kv sources only, the indexer's q/score weights on every index source.
-         * A ratio-1 compressor is a plain projection + norm (no gate). */
+        /* The compressor lives on the kv sources only, the indexer's q/score
+         * weights on every index source.  A ratio-1 compressor is a plain
+         * projection + norm (no gate).  On 0731 the compressor width is
+         * coff * head_dim (coff 2 at ratio 4, 1 at ratio 128 -- pulsar_compress_coff)
+         * and both compressors carry an ape; the index KEY comes from the
+         * indexer's own compressor instead of the kv source's latent. */
         const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
-        if (a->mode == PULSAR_ATTN_FULL) {
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
-            if (a->ratio > 1) tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
+        if (pulsar_attn_owns_kv(a->mode)) {
+            const uint64_t comp_width = (uint64_t)pulsar_compress_coff(a->ratio) * PULSAR_N_HEAD_DIM;
+            if (g_pulsar_shape.compressor_ape) {
+                tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, a->ratio, 0);
+            }
+            tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, comp_width, 0);
+            if (a->ratio > 1) tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, comp_width, 0);
             tensor_expect_f32_or_bf16(l->attn_compressor_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_k, 2, PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, 0);
-            tensor_expect_f32_or_bf16(l->indexer_k_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            if (!g_pulsar_shape.indexer_own_compressor) {
+                tensor_expect_plain_or_mxfp8(l->indexer_k, 2, PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, 0);
+                tensor_expect_f32_or_bf16(l->indexer_k_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            }
         }
-        if (a->mode == PULSAR_ATTN_FULL || a->mode == PULSAR_ATTN_REINDEX) {
+        if (pulsar_attn_runs_indexer(a->mode)) {
             const uint64_t index_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
+            const uint64_t index_width = 2ull * PULSAR_N_INDEXER_HEAD_DIM;
             tensor_expect_plain_or_mxfp8(l->indexer_attn_q_b, 2, PULSAR_N_LORA_Q, index_q_dim, 0);
             tensor_expect_plain_or_mxfp8(l->indexer_proj, 2, PULSAR_N_EMBD, PULSAR_N_INDEXER_HEAD, 0);
+            if (g_pulsar_shape.indexer_own_compressor) {
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_ape, 2, index_width, a->ratio, 0);
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_kv, 2, PULSAR_N_EMBD, index_width, 0);
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_gate, 2, PULSAR_N_EMBD, index_width, 0);
+                tensor_expect_f32_or_bf16(l->indexer_compressor_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            }
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
@@ -1067,27 +1086,47 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-    /* CSA2 (L218): compressor + index key on the kv sources, indexer q/score
-     * weights on every index source, nothing on a REUSE layer.  Any of these
-     * tensors on a layer whose mode does not own it is a wrong artifact. */
-    if (attn->mode == PULSAR_ATTN_FULL) {
+    /* The compressor lives on every kv source; the indexer's q/score weights on
+     * every index source; a REUSE layer owns neither.  Which index-KEY family a
+     * model uses is the profile's: V4.1 projects it from the kv source's latent
+     * (indexer.attn_k / k_norm), 0731 compresses its own
+     * (indexer_compressor_*).  Any of these tensors on a layer whose mode does
+     * not own it is a wrong artifact. */
+    if (pulsar_attn_owns_kv(attn->mode)) {
+        if (g_pulsar_shape.compressor_ape) {
+            l->attn_compressor_ape = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+        }
         l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
         if (attn->ratio > 1) l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
         l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
-        l->indexer_k            = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
-        l->indexer_k_norm       = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+        if (!g_pulsar_shape.indexer_own_compressor) {
+            l->indexer_k        = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
+            l->indexer_k_norm   = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+        }
     }
-    if (attn->mode == PULSAR_ATTN_FULL || attn->mode == PULSAR_ATTN_REINDEX) {
+    if (pulsar_attn_runs_indexer(attn->mode)) {
         l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
         l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
+        if (g_pulsar_shape.indexer_own_compressor) {
+            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
+            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
+            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
+            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+        }
     }
     static const char *const attn_owned[] = {
+        "attn_compressor_ape.weight",
         "attn_compressor_kv.weight", "attn_compressor_gate.weight", "attn_compressor_norm.weight",
         "indexer.attn_k.weight", "indexer.k_norm.weight", "indexer.attn_q_b.weight", "indexer.proj.weight",
+        "indexer_compressor_ape.weight", "indexer_compressor_kv.weight",
+        "indexer_compressor_gate.weight", "indexer_compressor_norm.weight",
     };
     const pulsar_tensor *const attn_bound[] = {
+        l->attn_compressor_ape,
         l->attn_compressor_kv, l->attn_compressor_gate, l->attn_compressor_norm,
         l->indexer_k, l->indexer_k_norm, l->indexer_attn_q_b, l->indexer_proj,
+        l->indexer_compressor_ape, l->indexer_compressor_kv,
+        l->indexer_compressor_gate, l->indexer_compressor_norm,
     };
     for (size_t i = 0; i < sizeof(attn_owned) / sizeof(attn_owned[0]); i++) {
         char name[128];

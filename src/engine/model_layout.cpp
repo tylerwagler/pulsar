@@ -170,21 +170,13 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
                     il, a->ratio, a->kv_source, a->index_source, ratios[a->kv_source], ratios[a->index_source]);
             exit(1);
         }
-        if (is_kv && !is_index) {
-            /* 0731's ratio-128 (HCA) layer: it owns a compressor and runs NO
-             * indexer, so it publishes compressed KV and no top-k.  The table
-             * has no mode for that yet -- refuse loudly rather than mis-mode it
-             * as an indexed FULL, which would silently select rows with a top-k
-             * over a cache that never published one.  The mode lands with the
-             * binder and the prefill paths that test mode == FULL.
-             * plans/96-two-profiles-one-engine.md s9. */
-            fprintf(stderr,
-                    "pulsar: layer %u compresses (ratio %u) but runs no indexer; "
-                    "that mode (0731 HCA) is not implemented yet\n",
-                    il, a->ratio);
-            exit(1);
-        }
-        a->mode = is_kv ? PULSAR_ATTN_FULL : is_index ? PULSAR_ATTN_REINDEX : PULSAR_ATTN_REUSE;
+        /* A kv source that runs no indexer is 0731's ratio-128 (HCA) layer: it
+         * publishes compressed KV and no top-k, so it reads its own compressed
+         * cache unindexed.  V4.1 never reaches this -- every kv source there is
+         * also an index source.  plans/96-two-profiles-one-engine.md s9.1. */
+        a->mode = is_kv ? (is_index ? PULSAR_ATTN_FULL : PULSAR_ATTN_FULL_UNINDEXED)
+                        : is_index ? PULSAR_ATTN_REINDEX
+                                   : PULSAR_ATTN_REUSE;
         a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il;
         a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il;
         if (a->candidate_source && !is_index) {
