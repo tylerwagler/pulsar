@@ -644,7 +644,81 @@ int pulsar_gpu_directional_steering_project_tensor(
 
 
 
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, const pulsar_gpu_tensor *logits, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+/* The HASH-ROUTED arm -- 0731's leading layers (pulsar_shape::n_hash_layer),
+ * which name their experts by TOKEN ID instead of selecting them from the
+ * logits.  Restored for the two-profile engine (PLAN 96 s16); V4.1 has no such
+ * layer.
+ *
+ * The logits are still needed: the table names the experts, but the WEIGHT is
+ * the expert's sqrt(softplus(logit)) -- the bias-free probability, the same
+ * value the top-k arm stores in `probs`, NOT the bias-corrected score.  So this
+ * kernel takes no bias at all.
+ *
+ * A separate kernel rather than an arm inside router_select_warp_topk_kernel:
+ * this one needs an NE-wide shared tile of probabilities, and paying 4-6 KB of
+ * shared in the V4.1 instantiations would cost occupancy on a path that never
+ * hash-routes.  Being separate, V4.1's router is bit-for-bit untouched.
+ *
+ * dev's constants are kept exactly: the sum floor 2^-14 (not the top-k arm's
+ * 1e-20) and the route scale. */
+template <uint32_t NE, uint32_t TOPK>
+__global__ static void router_select_hash_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const int32_t *hash,
+        const float *logits,
+        const int32_t *tokens,
+        int32_t token_scalar,
+        uint32_t hash_rows,
+        uint32_t n_tokens,
+        float route_scale) {
+    static_assert(NE % 32u == 0u, "experts per lane must be whole");
+    constexpr uint32_t PER = NE / 32u;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row_in_block = threadIdx.y;
+    const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
+    if (t >= n_tokens || lane >= 32u) return;
+
+    const float *log = logits + (uint64_t)t * NE;
+    __shared__ float sprob[4][NE];   /* 4 = the block's y dim */
+
+    #pragma unroll
+    for (uint32_t j = 0; j < PER; j++) {
+        const uint32_t e = lane + j * 32u;
+        const float p = sqrtf(softplus_dev(log[e]));
+        sprob[row_in_block][e] = p;
+        if (probs) probs[(uint64_t)t * NE + e] = p;
+    }
+    __syncwarp();
+
+    /* One lane does the table walk and the normalisation -- there is one row of
+     * table per token, so spreading it over the warp would need a broadcast for
+     * no gain. */
+    if (lane == 0) {
+        int32_t *sel = selected + (uint64_t)t * TOPK;
+        float *w = weights + (uint64_t)t * TOPK;
+        int32_t tok = tokens ? tokens[t] : token_scalar;
+        if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;   /* fail closed on a bad id */
+        const int32_t *row = hash + (uint64_t)tok * TOPK;
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint32_t j = 0; j < TOPK; j++) {
+            const int32_t e = row[j];
+            sel[j] = e;
+            const float v = (e >= 0 && (uint32_t)e < NE) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
+            w[j] = v;
+            sum += v;
+        }
+        /* dev's floor, not the top-k arm's 1e-20 */
+        sum = fmaxf(sum, 6.103515625e-5f);
+        #pragma unroll
+        for (uint32_t j = 0; j < TOPK; j++) w[j] = w[j] / sum * route_scale;
+    }
+}
+
+
+int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t tid2eid_offset, uint32_t tid2eid_rows, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
@@ -664,9 +738,45 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
     float *w = (float *)weights->ptr;
     float *pr = probs ? (float *)probs->ptr : NULL;
     const float *lg = (const float *)logits->ptr;
-    /* the two routers this engine serves: the V4.1 target and its DSpark drafter */
+
+    /* The HASH-routed arm takes precedence when the artifact carries a token-id
+     * table: the ids come from the table, not from a top-k over the logits.
+     * tid2eid_rows is the table's row count (the vocab size); 0 means the model
+     * has no such table, so no separate presence flag is needed. */
+    if (tid2eid_rows != 0) {
+        if (n_expert != 256u || n_expert_used != 6u) {
+            fprintf(stderr, "pulsar: a hash-routed layer with %u experts / top-%u has no "
+                            "arm -- refusing\n", n_expert, n_expert_used);
+            return 0;
+        }
+        if (!tokens) {
+            /* The lookup is per TOKEN.  dev's kernel fell back to a scalar id
+             * here; guessing one would route every row of a decode batch to the
+             * same experts, silently.  The engine's only caller passes the
+             * prompt tokens, so a NULL here means a lane we have not met --
+             * refuse and name it rather than mis-route. */
+            fprintf(stderr, "pulsar: hash routing needs the token ids and none were "
+                            "passed -- refusing\n");
+            return 0;
+        }
+        const uint64_t table_bytes = (uint64_t)tid2eid_rows * n_expert_used * sizeof(int32_t);
+        if (tid2eid_offset > model_size || model_size - tid2eid_offset < table_bytes ||
+            tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+        const int32_t *hash = (const int32_t *)cuda_model_range_ptr(model_map, tid2eid_offset,
+                                                                   table_bytes, "router_tid2eid");
+        if (!hash) return 0;
+        router_select_hash_kernel<256u, 6u><<<grid, block>>>(
+                sel, w, pr, hash, lg, (const int32_t *)tokens->ptr, 0,
+                tid2eid_rows, n_tokens, expert_weight_scale);
+        return cuda_ok(cudaGetLastError(), "router_select hash launch");
+    }
+
+    /* the routers this engine serves: the V4.1 target, 0731's target and its
+     * DSpark drafter (0731 routes with 256/top-6 on both) */
     if (n_expert == 384u && n_expert_used == 6u) {
         router_select_warp_topk_kernel<384u, 6u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
+    } else if (n_expert == 256u && n_expert_used == 6u) {
+        router_select_warp_topk_kernel<256u, 6u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
     } else if (n_expert == 128u && n_expert_used == 3u) {
         router_select_warp_topk_kernel<128u, 3u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
     } else {

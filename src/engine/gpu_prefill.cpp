@@ -1963,7 +1963,12 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       model->map,
                                                       model->size,
                                                       layer->ffn_exp_probs_b->abs_offset,
+                                                      layer->ffn_gate_tid2eid
+                                                          ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                      layer->ffn_gate_tid2eid
+                                                          ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                       g->batch_router_logits,
+                                                      g->prefill_tokens,
                                                       layer->n_expert,
                                                       layer->n_expert_used,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,

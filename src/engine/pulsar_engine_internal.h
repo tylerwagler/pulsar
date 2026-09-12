@@ -613,6 +613,11 @@ typedef struct {
     pulsar_tensor *ffn_norm;         ///< RMSNorm weight before the FFN
     pulsar_tensor *ffn_gate_inp;     ///< router projection producing per-expert logits
     pulsar_tensor *ffn_exp_probs_b;  ///< router bias added to the expert probabilities
+    /** 0731's token-id -> expert-id table (I32 [n_expert_used, n_vocab]) for the
+     * leading pulsar_shape::n_hash_layer layers, which route by token id instead
+     * of by a top-k over the gate logits.  V4.1 ships none: NULL here means the
+     * layer routes by the gate. */
+    pulsar_tensor *ffn_gate_tid2eid;
     /** This layer's router width, the experts a token activates, and the experts
      * physically present in its stacks (REAP keep count on the target; the
      * full width on the drafter).  Set at bind; the FFN encoder reads THESE, so

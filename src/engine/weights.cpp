@@ -387,6 +387,8 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
     {
         return false;
     }
+    /* 0731: a hash-routed layer without its table cannot route at all. */
+    if (il < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
 
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     if (pulsar_attn_owns_kv(a->mode) &&
@@ -530,6 +532,11 @@ static void weights_validate_layout(
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
         tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        if (l->ffn_gate_tid2eid) {
+            /* [n_expert_used, n_vocab]: one row of expert ids per token id. */
+            tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2,
+                                 PULSAR_N_EXPERT_USED, PULSAR_N_VOCAB, 0);
+        }
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
@@ -1156,6 +1163,22 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
     l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    /* 0731's leading layers route by token id.  Required exactly on the hash
+     * layers and REFUSED on any other, so an artifact cannot carry a table that
+     * would silently replace the gate's routing. */
+    if (il < PULSAR_N_HASH_LAYER) {
+        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+    } else {
+        char tid_name[128];
+        const int n = snprintf(tid_name, sizeof(tid_name), "blk.%u.ffn_gate_tid2eid.weight", il);
+        if (n < 0 || (size_t)n >= sizeof(tid_name)) pulsar_die("tensor name is too long");
+        if (model_find_tensor(m, tid_name)) {
+            fprintf(stderr, "pulsar: layer %u carries ffn_gate_tid2eid but only the first %u "
+                            "layers are hash-routed -- refusing\n",
+                    il, (unsigned)PULSAR_N_HASH_LAYER);
+            exit(1);
+        }
+    }
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
