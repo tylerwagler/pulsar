@@ -370,6 +370,24 @@ dropped with the reason.
   end-to-end win is ~1%.  Plan: (1) ramp overlap harness, (2) speed bench with
   the calibration gate, (3) the kernel swap, (4) the four gates + a GB10
   measurement.
+  **Verdict (2026-09-12): the instruments are built and the prize is measured;
+  C6 is refuted on value, not attempted.**  The ramp-overlap instrument now
+  exists in `tests/idx_mxfp4_kernel_test.cu`: per-token top-k SELECTION vs the
+  f64 oracle over the SAME packed bytes at any `n_comp`, with the engine-shaped
+  timing in the same run.  Baseline at `n_tokens=512, pos0=4096, causal` on the
+  current `mxf8f6f4`+spread path: selection **100.0000%** identical to the
+  oracle across `n_comp` 32..4096 (Jaccard 100%, no top-1 flips), max relative
+  value error 3.3e-07, ratio spread [1.0, 1.0]; the scorer costs 0.0353 ms per
+  launch at `n_comp=32`, 0.1384 at 1024, 0.1622 at 4096.  At ~168 launches per
+  4096-token prefill that is ~23 ms of a 3.28 s prefill: **the SCORER is ~0.7%,
+  so a 2-4x scorer buys ~0.3-0.5%** -- not the 1-2% the review quoted, which was
+  the whole indexer complex.  The swap is also not mechanical: the probe proved
+  the `m16n8k64` 2X INSTRUCTION issues at 251 TMAC/s, not its fragment or
+  scale-factor lane layouts, and the kernel's `idx_spread4` staging exists
+  precisely because the k32 form's layout had to be MEASURED.  Deriving the 2X
+  layouts is research-scale for ~0.4%.  Recommend leaving C6 closed; the
+  instrument is committed, so a future attempt (or a real layout reference)
+  starts from a gated baseline.
 - **D2 (indexer selection fidelity) -- CLOSED, measured: no drift.**  Ran the
   owed reference grade at `867e06f` with the blobs staged from
   `pulsar-notes/reference-capture/` (`cuda-reference-gate`,
