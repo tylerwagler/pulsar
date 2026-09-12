@@ -15,11 +15,13 @@
  * the same rings and anchors; each bank draws from its own rng, and the two
  * passes start from equal rng copies, so the sampled path must match too.
  *
- * Runs two shapes: all banks greedy, and bank 0 greedy with banks 1-2 sampled
+ * Runs three shapes: all banks greedy; bank 0 greedy with banks 1-2 sampled
  * at temperature 1.0 / min_p 0.05 (the production shape; the mixed set
- * exercises the greedy-first / sampled-second grouping). argv[3] = draft depth
- * (0 = engine default) so the Makefile can also pin depth 1, whose attention
- * takes a distinct single-row fast path.
+ * exercises the greedy-first / sampled-second grouping); and all-sampled
+ * alternating with all-greedy per tick, which switches the verify readback
+ * arm (compact -> argmax) and audits that the round-end walk consumes the
+ * fresh one.  argv[3] = draft depth (0 = engine default) so the Makefile can
+ * also pin depth 1, whose attention takes a distinct single-row fast path.
  *
  * WHY THIS AND NOT THE MULTISEQ FINGERPRINTS: with exact verification the
  * emitted tokens never depend on the drafts, so a token-stream gate cannot see
@@ -100,10 +102,15 @@ static void peek_all(pulsar_spec_round **r, int n, draft_result *out) {
 }
 
 /* One server-shaped tick up to (and including) the deferred round_end. Returns
- * the number of banks still live, or -1. */
+ * the number of banks still live, or -1.  audit != 0 also checks the readback
+ * invariant the round-end walk stands on: after the step, exactly the arm the
+ * step's temperatures armed is live (all-greedy -> argmax rows, no compact
+ * rows; any sampled round -> compact rows, no argmax rows).  A mixed step
+ * followed by a greedy step used to leave the compact rows live and the greedy
+ * walk read the previous step's candidates (review of 4fa5e0b6). */
 static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const float *temps,
                              uint64_t *rngs, int *first_tok, uint32_t *row0, float *logits,
-                             int vocab) {
+                             int vocab, int audit) {
     char err[256];
     pulsar_multiseq_req reqs[ROWS];
     uint32_t rows = 0;
@@ -142,10 +149,36 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         live++;
         pulsar_session_bank_state_save(s, (uint32_t)b);
     }
+    if (audit) {
+        pulsar_gpu_graph *g = &s->graph;
+        /* Faithful to arm_capture: ALL rounds greedy -> argmax; ALL rounds in
+         * the sparse min-p contract -> compact; a mixed step arms neither and
+         * takes the full-read branch. */
+        bool all_greedy = true, all_sampled = true;
+        for (int b = 0; b < g_nb; b++) {
+            if (temps[b] > 0.0f) all_greedy = false;
+            if (temps[b] <= 0.0f) all_sampled = false;
+        }
+        if (all_greedy) {
+            CHECK(g->spec_argmax_rows >= rows && g->spec_compact_rows == 0,
+                  "STALE COMPACT ROWS: an all-greedy step left spec_compact_rows=%u "
+                  "(argmax_rows=%u, rows=%u) -- spec_round_end_block reads the previous "
+                  "step's candidates", g->spec_compact_rows, g->spec_argmax_rows, rows);
+        } else if (all_sampled) {
+            CHECK(g->spec_compact_rows >= rows && g->spec_argmax_rows == 0,
+                  "STALE ARGMAX ROWS: an all-sampled step left spec_argmax_rows=%u "
+                  "(compact_rows=%u, rows=%u)", g->spec_argmax_rows,
+                  g->spec_compact_rows, rows);
+        } else {
+            CHECK(g->spec_compact_rows == 0 && g->spec_argmax_rows == 0,
+                  "MIXED STEP TOOK AN ARM: compact_rows=%u argmax_rows=%u "
+                  "(rows=%u)", g->spec_compact_rows, g->spec_argmax_rows, rows);
+        }
+    }
     return live;
 }
 
-static int run_shape(const char *name, const float *temps, int ticks) {
+static int run_shape(const char *name, const float *temps, const float *temps_alt, int ticks) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "%s: session create", name); return 0; }
     if ((int)gpu_graph_bank_pool_count(&s->graph) < g_nb) {
@@ -166,7 +199,10 @@ static int run_shape(const char *name, const float *temps, int ticks) {
     for (int t = 0; t < ticks; t++) {
         int first_tok[NB];
         uint32_t row0[NB];
-        if (tick_to_round_end(s, r, temps, rngs, first_tok, row0, logits, vocab) < 0) {
+        /* temps_alt, when given, is the odd-tick shape: alternating mixed and
+         * greedy ticks is the readback-arm switch the audit exists for. */
+        const float *tp = (temps_alt && (t & 1)) ? temps_alt : temps;
+        if (tick_to_round_end(s, r, tp, rngs, first_tok, row0, logits, vocab, 1) < 0) {
             CHECK(0, "%s: tick %d failed", name, t);
             break;
         }
@@ -238,7 +274,7 @@ static int run_shape(const char *name, const float *temps, int ticks) {
             uint32_t off = 0;
             for (int pass = 0; pass < 2; pass++)
                 for (int b = 0; b < g_nb; b++) {
-                    if ((pass == 0) != (temps[b] <= 0.0f)) continue;
+                    if ((pass == 0) != (tp[b] <= 0.0f)) continue;
                     if (!ser_logits[b]) continue;
                     for (uint32_t k = 0; k < ser_nd[b]; k++) {
                         const float *sl = ser_logits[b] + (size_t)k * vocab;
@@ -324,9 +360,15 @@ int GATE_ENTRY(int argc, char **argv) {
 
     const float greedy[NB] = {0.0f, 0.0f, 0.0f};
     const float mixed[NB] = {0.0f, 1.0f, 1.0f};
-    const int c1 = run_shape("greedy x3", greedy, ticks);
-    const int c2 = run_shape("greedy + sampled x2", mixed, ticks);
-    CHECK(c1 >= ticks && c2 >= ticks, "too few bank-ticks compared (%d, %d)", c1, c2);
+    const float sampled[NB] = {1.0f, 1.0f, 1.0f};
+    const int c1 = run_shape("greedy x3", greedy, NULL, ticks);
+    const int c2 = run_shape("greedy + sampled x2", mixed, NULL, ticks);
+    /* The readback-arm alternation: tick 0 all-sampled (compact arm), tick 1
+     * all-greedy (argmax arm).  The B3 bug made tick 1 read tick 0's compact
+     * candidates.  All-sampled is required: a mixed step arms neither arm. */
+    const int c3 = run_shape("sampled/greedy alternating", sampled, greedy, ticks);
+    CHECK(c1 >= ticks && c2 >= ticks && c3 >= ticks,
+          "too few bank-ticks compared (%d, %d, %d)", c1, c2, c3);
     printf("DSPARK BATCH GATE (depth %s, %d banks): %s\n", depth ? "pinned" : "default", g_nb, g_fail ? "FAIL" : "PASS");
     pulsar_tokens_free(&g_toks);
     gate_engine_close(g_e);

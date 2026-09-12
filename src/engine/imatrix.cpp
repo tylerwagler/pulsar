@@ -1171,7 +1171,13 @@ int gpu_graph_decode_multiseq_batch(
          * readback the fused lane and the classic verify use) and read ints
          * instead of head_runs x 517 KB.  Greedy and compact are mutually
          * exclusive by temperature; a device failure refuses rather than
-         * falling back to the full read (L174). */
+         * falling back to the full read (L174).
+         * The compact rows from an EARLIER compact step must be retired here:
+         * spec_round_end_block tests spec_compact_rows first, so a stale value
+         * would make the greedy walk read the previous step's candidates
+         * (review of 4fa5e0b6).  Mirror of the compact branch retiring
+         * spec_argmax_rows. */
+        g->spec_compact_rows = 0;
         ok = gpu_graph_spec_argmax_read(g, 0u, head_runs);
         if (!ok)
             fprintf(stderr, "pulsar: spec argmax readback failed for %u rows -- refusing "
