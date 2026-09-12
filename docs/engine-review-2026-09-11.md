@@ -61,14 +61,22 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   +0.8% @8k; pool cap 8 -> 16: +10.8% 12-way aggregate, no stalls at 16-way).
 
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
-- A2 payload digest, format v10 (`117541f7`; fmemopen terminator fix `1cd0f145`)
+- A2 payload digest, format v10 (`117541f7`; fmemopen terminator fix `1cd0f145`);
+  the one-byte corruption refusal is now asserted in
+  `tests/session_payload_gate.cpp` (mid-payload flip -> load refused, v10 digest)
 - A3 sampler range clamps + warning (`bc9d70bb`)
 - A4 AGENTS.md truth (`d6b4e93c`)
 - A5 quantizer pre-flight shapes (`b9745c7e`)
 - B1 IQ2 down decode GEMV, re-anchored and measured (`cf30211f`, anchor
   `01c1b9ca`)
-- B2 full-nucleus sampler skips the below-floor expf (`13501b89`)
-- B3 greedy spec argmax readback (`4fa5e0b6`)
+- B2 full-nucleus sampler skips the below-floor expf (`13501b89`); the review's
+  NaN-temperature hole is closed twice: `parse_sampling_key` refuses non-finite
+  knobs (`api_parse.cpp`) and the full-nucleus fast arm requires
+  `isfinite(temperature)` so the general arm's mass guard refuses it
+- B3 greedy spec argmax readback (`4fa5e0b6`); the review's stale-compact bug
+  (argmax branch did not reset `spec_compact_rows`) is fixed in `imatrix.cpp`
+  and gated by the new `sampled/greedy alternating` shape in
+  `tests/dspark_batch_gate.cpp` (verified FAIL on the bug, PASS after)
 - B6 persistent plain/mixed lane logits (`e5b2979f`)
 - B7 bulk `pulsar_tokens_copy` (`f59043f7`)
 - B8 async drafter seed copies (`eb9b5a8b`)
@@ -76,7 +84,8 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   (`8a6986ea`); case A (type-40 gate/up) emits too, via the scatter kernel and
   the GEMV epilogue (`8dd124f8`)
 - C3 `hc_expand` destination dedupe (bit-exact) (`ef576858`)
-- C7 block-parallel softmax (bit-exact; runtime-bound fix `09228ff9`)
+- C7 block-parallel softmax (bit-exact; runtime-bound fix `09228ff9`); the
+  phase-2 tile invariants the review asked for are now `static_assert`s
 - C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
 - C9 refuted — already covered at block granularity (`8c67aeb0`)
 - C10d indexer top-k uses CUB for 1025..4095 too (measured +0.8% @8k decode)
