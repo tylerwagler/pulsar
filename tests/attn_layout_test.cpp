@@ -113,6 +113,13 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
     printf("--- %s: %u layers\n", what, (unsigned)PULSAR_N_LAYER);
 
     unsigned counts[5] = {0};
+    /* Counted rather than checked per layer: "an indexer-running layer is ratio
+     * 4" is VACUOUSLY true of today's data (it follows from the artifact's own
+     * source sets), so a per-layer guard there can be deleted without any gate
+     * noticing.  The biconditional below is the live statement -- every ratio-4
+     * layer runs an indexer AND every indexer-running layer is ratio 4 -- and it
+     * fails the moment a profile or artifact breaks the coupling. */
+    unsigned n_idx_own = 0, n_ratio4 = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
         counts[a->mode]++;
@@ -147,6 +154,27 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
                 check(pulsar_compress_coff(a->ratio) == 1u,
                       "V4.1 must never overlap -- the state geometry change is only inert if it does not", il, detail);
             }
+            /* The INDEXER's OWN compressor is a SECOND Compressor: V4 builds
+             * `Compressor(args, ratio, head_dim=n_indexer_head_dim, rotate=True)`
+             * inside the Indexer, so at ratio 4 it is the overlap variant at
+             * head_dim 128 and its lane is coff*ratio rows of
+             * coff*index_head_dim.  Pinned as concrete numbers before the kernel
+             * exists, for the same reason the main compressor's is -- and it also
+             * pins the COUPLING the reference creates: an indexer that owns its
+             * compressor only exists where that compressor overlaps. */
+            if (shape->indexer_own_compressor) {
+                const uint32_t ihd = (uint32_t)shape->n_indexer_head_dim;
+                const uint32_t iw  = pulsar_comp_row_width(a->ratio, ihd);
+                const uint32_t ir  = a->ratio > 1u ? pulsar_comp_state_rows(a->ratio) : 0u;
+                if (pulsar_attn_runs_indexer(a->mode)) {
+                    n_idx_own++;
+                    snprintf(detail, sizeof detail, "indexer lane %ux%u, want %ux%u (head_dim %u)",
+                             iw, ir, 2u * ihd, 8u, ihd);
+                    check(a->ratio != 4u || (iw == 2u * ihd && ir == 8u),
+                          "the indexer's own compressor state geometry is wrong", il, detail);
+                }
+                if (a->ratio == 4u) n_ratio4++;
+            }
         }
 
         /* A layer's own ratio must equal the ratio of every source it reads.
@@ -162,6 +190,13 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
         }
     }
 
+    if (shape->indexer_own_compressor) {
+        char idetail[96];
+        snprintf(idetail, sizeof idetail, "%u indexer-running vs %u ratio-4 layers", n_idx_own, n_ratio4);
+        check(n_idx_own > 0u && n_idx_own == n_ratio4,
+              "an indexer that owns its compressor exists exactly on the overlapping layers", 0, idetail);
+        printf("    indexer's own compressor: %u layers (ratio-4 layers %u)\n", n_idx_own, n_ratio4);
+    }
     unsigned total = 0;
     for (unsigned m = 0; m < 5; m++) total += counts[m];
     printf("    WINDOW %u  FULL %u  REINDEX %u  REUSE %u  FULL_UNINDEXED %u  (total %u)\n",
