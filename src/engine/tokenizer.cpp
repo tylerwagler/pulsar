@@ -1318,9 +1318,14 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         if (finite > 0) {
             uint64_t *keys = scratch->keys;
             const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
+            /* isfinite(temperature): the fast arm's floor_logit is NaN for a
+             * non-finite temperature and its +inf/inert sum defeats the guard
+             * below, so it would emit NaN probs.  Keep such input on the
+             * general arm, whose sum check refuses it (review B2). */
             const bool full_nucleus = (top_p == 1.0f &&
                                        min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN &&
-                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX);
+                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX &&
+                                       isfinite(temperature));
             const float floor_logit = full_nucleus
                 ? max_logit + temperature * (logf(min_p) - 1e-3f)
                 : -INFINITY;

@@ -12,12 +12,16 @@
 int parse_sampling_key(const char *key, const char **p, request *r) {
     if (!strcmp(key, "temperature")) {
         double v = 0.0;
-        if (!json_number(p, &v)) return -1;
+        /* strtod also accepts nan/inf lexemes.  A NaN fails every range test
+         * below (and the engine's `temperature <= 0` greedy test), so it would
+         * reach the sampler as a non-finite distribution (review B2).  Refuse
+         * non-finite knobs at the surface. */
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
         r->temperature = (float)v;
         r->has_temperature = true;
     } else if (!strcmp(key, "top_p")) {
         double v = 0.0;
-        if (!json_number(p, &v)) return -1;
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
         /* The engine maps anything outside (0,1] to 1.0 (pulsar_sample_dist_build).
          * Clamp here too so the stored request matches what will run, and say so
          * once: top_p=0 is a common near-greedy idiom that clients expect to
@@ -35,7 +39,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
         r->has_top_p = true;
     } else if (!strcmp(key, "min_p")) {
         double v = 0.0;
-        if (!json_number(p, &v)) return -1;
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
         /* out-of-range disables the filter, matching the engine sampler
          * (sample_top_p_min_p); an unvalidated min_p>1 collapses to greedy. */
         if (v < 0.0 || v > 1.0) {

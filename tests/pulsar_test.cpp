@@ -1826,6 +1826,23 @@ static void test_sampler_dist_equivalence(void) {
         pulsar_sample_scratch_free(&fresh);
     }
 
+    /* (review B2) a NaN temperature is non-finite, fails the `<= 0` greedy
+     * test, and used to take the full-nucleus fast arm, whose inert +inf sum
+     * defeated the mass guard and emitted NaN probs.  The engine must refuse
+     * it (and the plain sampler propagate -1 with the rng untouched). */
+    {
+        float nan_row[256];
+        for (int i = 0; i < 256; i++) nan_row[i] = (float)(i % 7);
+        pulsar_sample_dist nd;
+        memset(&nd, 0, sizeof(nd));
+        TEST_ASSERT(pulsar_sample_dist_build(nan_row, 256, NAN, 0, 1.0f, 0.05f,
+                                             &scratch, &nd) == 0);
+        TEST_ASSERT(nd.n == 0 && nd.ids == NULL && nd.probs == NULL);
+        uint64_t r = 0xABCD0000u;
+        TEST_ASSERT(sample_top_p_min_p(nan_row, 256, NAN, 0, 1.0f, 0.05f, &r, NULL) == -1);
+        TEST_ASSERT(r == 0xABCD0000u);
+    }
+
     pulsar_sample_scratch_free(&scratch);
     pulsar_sample_scratch_free(&plain_scratch);
     free(logits);

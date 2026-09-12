@@ -3426,6 +3426,15 @@ static void test_parse_sampling_key_contract(void) {
     p = "0.7,";
     TEST_ASSERT(parse_sampling_key("temperature", &p, &r) == 1);
     TEST_ASSERT(r.temperature > 0.69f && r.temperature < 0.71f);
+    /* strtod accepts nan/inf lexemes; a non-finite knob bypasses every clamp
+     * below (NaN fails each comparison) and would reach the sampler, so the
+     * parser refuses it (review B2). */
+    p = "nan,";
+    TEST_ASSERT(parse_sampling_key("temperature", &p, &r) == -1);
+    p = "-Infinity,";
+    TEST_ASSERT(parse_sampling_key("min_p", &p, &r) == -1);
+    p = "inf,";
+    TEST_ASSERT(parse_sampling_key("top_p", &p, &r) == -1);
     p = "1.5,"; /* out-of-range min_p disables the filter, never greedy-collapses */
     TEST_ASSERT(parse_sampling_key("min_p", &p, &r) == 1);
     TEST_ASSERT(r.min_p == 0.0f && r.has_min_p);
