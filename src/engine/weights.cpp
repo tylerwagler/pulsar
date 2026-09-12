@@ -923,7 +923,18 @@ void config_validate_model(const pulsar_model *m) {
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, PULSAR_EXPERT_WEIGHT_SCALE);
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
-    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, PULSAR_RMS_EPS);
+    /* rms_norm_eps is the ONE text-config field the shipped Flash checkpoints
+     * disagree on: 0731 declares 1e-6, Vision-Exp declares 1e-20.  It is a
+     * kernel parameter (PULSAR_RMS_EPS -> g_pulsar_shape.rms_eps), not a shape,
+     * so the artifact is the authority here rather than the compiled default.
+     * Only the known pair is accepted: anything else exits instead of silently
+     * retuning the norm of all 43 layers (L216). */
+    if (rms_eps != 1.0e-6f && rms_eps != 1.0e-20f) {
+        fprintf(stderr, "pulsar: attention.layer_norm_rms_epsilon=%.9g is neither "
+                "Flash 0731's 1e-06 nor Vision-Exp's 1e-20\n", (double)rms_eps);
+        exit(1);
+    }
+    g_pulsar_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, PULSAR_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
@@ -1235,6 +1246,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_EXPERT, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_EXPERT);
@@ -1308,6 +1320,17 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
         l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
         l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
+        /* The drafter's expert routing carries the same trained correction bias
+         * as the target's layers (mtp.N.ffn.gate.bias -> dspark.N.exp_probs_b.bias,
+         * F32 [n_expert]).  OPTIONAL, like the target's blk.N.exp_probs_b.bias:
+         * the Vision-Exp artifact ships it on every drafter layer, while the
+         * shipped 0731 drafter predates the template fix and has no such tensor
+         * -- refusing it here would refuse the artifact in production today.
+         * When present the shared layer encoder threads it into the router
+         * (gpu_prefill.cpp, has_bias = ffn_exp_probs_b != NULL), which the
+         * drafter now reaches through the same gpu_graph_encode_layer_ffn_batch.
+         * 0731's drafter rebuild with the bias is a separate follow-up. */
+        l->ffn_exp_probs_b = tensor_by_namef(m, "dspark.%d.exp_probs_b.bias", li);
         l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
         l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
         l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);
