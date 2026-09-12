@@ -2273,10 +2273,18 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
              * upper bound, never a promise. */
+            /* A /logprobs member rides this lane BASE-ONLY: it must not draft,
+             * because the fused step keeps each accepted draft's target row
+             * only inside its batch, so no correct distribution exists for an
+             * accepted draft -- the whole reason logprobs disables speculation.
+             * accepted_cap = 1 trims K to 0 at round_begin, and the redraft
+             * list below skips the member, so it never grows pendings. */
+            const bool spec_ok = g->dspark_spec_enabled;
             if (pulsar_session_spec_round_begin(pool, rounds[i], first,
                                              g->max_tokens - g->completion,
-                                             k_overflow ? k_alloc[i] + 1
-                                                        : (int)(sizeof(accepted) / sizeof(accepted[0])),
+                                             !spec_ok ? 1
+                                             : k_overflow ? k_alloc[i] + 1
+                                                          : (int)(sizeof(accepted) / sizeof(accepted[0])),
                                              temp, top_k, top_p, min_p,
                                              err, sizeof err) != 0) {
                 snprintf(g->err, sizeof g->err, "spec round begin failed: %s", err);
@@ -2431,6 +2439,10 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             for (int q = 0; q < m && nl < (int)PULSAR_SPEC_LOGITS_ROWS; q++) {
                 session_slot *sl = dec[live_idx[q]];
                 if (!rounds[live_idx[q]] || !sl->gen || sl->gen->phase != GEN_DECODE) continue;
+                /* Base-only members (a /logprobs request riding this lane) never
+                 * draft -- see round_begin above -- so they are never redrafted
+                 * and never grow pendings. */
+                if (!sl->gen->dspark_spec_enabled) continue;
                 live_rounds[nl] = rounds[live_idx[q]];
                 live_banks[nl] = (uint32_t)sl->bank;
                 live_rngs[nl] = &sl->gen->rng;
