@@ -210,8 +210,9 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     const size_t smem_norm = (size_t)((D + VK_THREADS - 1) / VK_THREADS * VK_THREADS) * sizeof(float);
     const float eps = 1e-6f;
 
-    void *d_patches = NULL, *d_x = NULL, *d_tmp = NULL, *d_qkv = NULL, *d_attn = NULL,
-         *d_mlp = NULL, *d_normed = NULL, *d_alg = NULL, *d_alg2 = NULL, *d_out = NULL;
+    void *d_patches = NULL, *d_x = NULL, *d_tmp = NULL, *d_mid = NULL, *d_qkv = NULL,
+         *d_attn = NULL, *d_mlp = NULL, *d_normed = NULL, *d_alg = NULL, *d_alg2 = NULL,
+         *d_out = NULL;
     int ok = 0;
 
 #define WT(off) ((const bf16 *)(const void *)((const char *)map + (off)))
@@ -221,6 +222,9 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     CUDA_ALLOC(d_patches, (size_t)n_tok * 3 * P * P * sizeof(bf16));
     CUDA_ALLOC(d_x, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_tmp, x_elems * sizeof(bf16));
+    /* the SwiGLU result is inter-wide (2816), NOT dim-wide: writing it into
+     * d_tmp overran that buffer by 2.75x and corrupted the residual stream. */
+    CUDA_ALLOC(d_mid, (size_t)n_tok * I * sizeof(bf16));
     CUDA_ALLOC(d_attn, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_normed, x_elems * sizeof(bf16));
     CUDA_ALLOC(d_qkv, (size_t)n_tok * 3 * D * sizeof(bf16));
@@ -274,11 +278,11 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
         CUDA_LAUNCH("vision mlp w1");
 
         vk_silu_mul<<<dim3((unsigned)((I + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_mlp, (bf16 *)d_tmp, I);
+            (const bf16 *)d_mlp, (bf16 *)d_mid, I);
         CUDA_LAUNCH("vision silu_mul");
 
         vk_linear<<<dim3((unsigned)((D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_tmp, WT(o->block[li].w2), NULL, (bf16 *)d_attn, I, D);
+            (const bf16 *)d_mid, WT(o->block[li].w2), NULL, (bf16 *)d_attn, I, D);
         CUDA_LAUNCH("vision mlp w2");
         vk_add<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
             (bf16 *)d_x, (const bf16 *)d_attn, x_elems);
@@ -312,7 +316,8 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     ok = 1;
 
 done:
-    cudaFree(d_patches); cudaFree(d_x); cudaFree(d_tmp); cudaFree(d_attn); cudaFree(d_normed);
+    cudaFree(d_patches); cudaFree(d_x); cudaFree(d_tmp); cudaFree(d_mid); cudaFree(d_attn);
+    cudaFree(d_normed);
     cudaFree(d_qkv); cudaFree(d_mlp); cudaFree(d_alg); cudaFree(d_alg2); cudaFree(d_out);
     return ok;
 #undef CUDA_LAUNCH
