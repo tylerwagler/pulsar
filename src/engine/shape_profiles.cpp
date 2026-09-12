@@ -40,7 +40,7 @@ const pulsar_shape PULSAR_SHAPE_V4 = {
     .n_indexer_head = 64,
     .n_indexer_head_dim = 128,
     .n_indexer_top_k = 512,
-    /* Every compressed layer (2..42) is its own kv and index source. */
+    /* Every compressed layer (2..42) owns its own compressor. */
     .n_kv_source = 41,
     .kv_source_layer = {
         2, 3, 4, 5, 6, 7, 8, 9,
@@ -50,13 +50,18 @@ const pulsar_shape PULSAR_SHAPE_V4 = {
         34, 35, 36, 37, 38, 39, 40, 41,
         42,
     },
-    .n_index_source = 41,
+    .n_index_source = 21,
+    /* Only the ratio-4 (CSA) layers carry an indexer.  The ratio-128 (HCA)
+     * layers have a compressor and NO indexer at all -- verified in the real
+     * artifact, where blk.2.* carries indexer + indexer_compressor tensors and
+     * blk.3.* carries neither.  So HCA publishes compressed KV and no top-k,
+     * which the layout table cannot express yet: pulsar_attn_layout_install
+     * refuses such a layer by name rather than mis-moding it as an indexed
+     * FULL.  The mode and its consumers land together -- see
+     * plans/96-two-profiles-one-engine.md s9. */
     .index_source_layer = {
-        2, 3, 4, 5, 6, 7, 8, 9,
-        10, 11, 12, 13, 14, 15, 16, 17,
-        18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32, 33,
-        34, 35, 36, 37, 38, 39, 40, 41,
+        2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
+        22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
         42,
     },
     .candidate_source_layer = -1,   /* no hierarchical candidate pool */

@@ -2030,7 +2030,14 @@ void spec_quench_reset(pulsar_session *s);
  *          compressed KV and index K, scores them with its own indexer weights
  *          (inside the candidate pool when one is published), publishes top-k.
  * REUSE:   neither.  Reads the kv source's rows and the index source's top-k
- *          unchanged; owns nothing beyond its window ring and its q path. */
+ *          unchanged; owns nothing beyond its window ring and its q path.
+ *
+ * NOT YET EXPRESSIBLE: a kv source that runs no indexer -- 0731's ratio-128
+ * (HCA) layers, which carry attn_compressor_* and no indexer.* tensor at all and
+ * therefore publish no top-k.  The installer refuses such a layer today rather
+ * than mis-moding it as an indexed FULL; the mode and every consumer that tests
+ * `mode == PULSAR_ATTN_FULL` (weights.cpp:392/491/1073, gpu_prefill.cpp:1221)
+ * must land together.  plans/96-two-profiles-one-engine.md s9. */
 typedef enum {
     PULSAR_ATTN_WINDOW = 0,
     PULSAR_ATTN_FULL,
