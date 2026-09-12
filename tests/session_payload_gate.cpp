@@ -188,6 +188,42 @@ int main(int argc, char **argv) {
           "The comp caches matched, so this is the RAW RING or the compressor state",
           ndiff, width, (double)worst);
 
+    /* ---- corruption case: the v10 digest must refuse a one-byte flip ----
+     * The digest is the only thing between a damaged disk cache and silent
+     * wrong attention, so assert it fires on a payload that differs in exactly
+     * one byte.  Offset pbytes-9 is the last DATA byte (the trailing 8 are the
+     * digest itself): a structural field would trip the reader's length check
+     * first, so this offset is what reaches, and must exercise, the digest
+     * comparison. */
+    {
+        FILE *fc = tmpfile();
+        CHECK(fc != NULL, "tmpfile for corruption case failed");
+        CHECK(pulsar_session_save_payload(a, fc, err, sizeof err) == 0, "save 2: %s", err);
+        /* This file's length, not the first save's: the eval above advanced the
+         * session, so the payload grew. */
+        const long len2 = ftell(fc);
+        CHECK(len2 > 16, "corruption payload too small (%ld B)", len2);
+        const long at = len2 - 9;
+        CHECK(fseek(fc, at, SEEK_SET) == 0, "corruption seek failed");
+        const int byte = fgetc(fc);
+        CHECK(byte != EOF, "corruption read failed");
+        CHECK(fseek(fc, at, SEEK_SET) == 0, "corruption seek-back failed");
+        CHECK(fputc(byte ^ 0xFF, fc) != EOF, "corruption write failed");
+        fflush(fc);
+        rewind(fc);
+        pulsar_session *c = NULL;
+        CHECK(pulsar_session_create(&c, e, ctx) == 0, "session C create failed");
+        err[0] = '\0';
+        const int crc = pulsar_session_load_payload(c, fc, (uint64_t)len2, err, sizeof err);
+        CHECK(crc != 0 && strstr(err, "digest mismatch") != NULL,
+              "CORRUPTED PAYLOAD ACCEPTED: one flipped byte at offset %ld loaded "
+              "clean or failed without the digest (rc=%d, err='%s') -- the v10 "
+              "digest did not fire", at, crc, err);
+        printf("corruption at byte %ld refused (rc=%d): %s\n", at, crc, err);
+        pulsar_session_free(c);
+        fclose(fc);
+    }
+
     free(ref); free(got); free(base.v);
     printf("SESSION-PAYLOAD GATE: PASS (v%u, %llu B, comp fnv %016llx, logits identical)\n",
            (unsigned)PULSAR_SESSION_PAYLOAD_VERSION, (unsigned long long)pbytes,
