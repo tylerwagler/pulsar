@@ -78,6 +78,7 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <random>
 
 static const double kE2M1[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
@@ -264,6 +265,50 @@ int main(int argc, char **argv) {
         cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
         printf("timing: %.4f ms/launch  (n_comp=%u n_tokens=%u)\n", ms / iters, n_comp, n_tokens);
+    }
+
+    /* ---- top-k SELECTION overlap (C6 instrument, L219) --------------------
+     * These scores feed only a top-512 ranking, and a uniform positive scale
+     * cannot reorder one (see the note above).  So the property a scorer rewrite
+     * must preserve is the SELECTED SET, not the raw values -- and a change that
+     * alters the K-blocking moves the accumulation order, hence the values at
+     * the ulp level, hence potentially a boundary tie in the ranking.  Compare
+     * the kernel's top-k against the f64 oracle's at whatever n_comp this run
+     * was given; drive the ramp from the caller (32 -> 512+) to get the curve.
+     * The host top-k here is the engine's total order: descending score,
+     * ascending id (the same rule topk_pack_key encodes). */
+    {
+        const uint32_t k = 512u < n_comp ? 512u : n_comp;
+        size_t inter = 0, unionn = 0, flipped = 0;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            std::vector<uint32_t> ig(n_comp), ir(n_comp);
+            for (uint32_t c = 0; c < n_comp; c++) { ig[c] = c; ir[c] = c; }
+            const float *grow = &got[(size_t)t * n_comp];
+            const double *rrow = &ref[(size_t)t * n_comp];
+            std::partial_sort(ig.begin(), ig.begin() + k, ig.end(),
+                              [&](uint32_t a, uint32_t b) {
+                                  return grow[a] != grow[b] ? grow[a] > grow[b] : a < b;
+                              });
+            std::partial_sort(ir.begin(), ir.begin() + k, ir.end(),
+                              [&](uint32_t a, uint32_t b) {
+                                  return rrow[a] != rrow[b] ? rrow[a] > rrow[b] : a < b;
+                              });
+            if (ig[0] != ir[0]) flipped++;          /* top-1 disagreement */
+            ig.resize(k); ir.resize(k);
+            std::sort(ig.begin(), ig.end());
+            std::sort(ir.begin(), ir.end());
+            std::vector<uint32_t> uni;
+            std::set_intersection(ig.begin(), ig.end(), ir.begin(), ir.end(),
+                                  std::back_inserter(uni));
+            inter += uni.size();
+            unionn += (size_t)k * 2u - uni.size();
+        }
+        const double denom = (double)n_tokens * (double)k;
+        printf("TOP-%u selection vs oracle: %zu/%zu = %.4f%%",
+               k, inter, (size_t)denom, denom > 0 ? 100.0 * (double)inter / denom : 0.0);
+        if (unionn) printf("  (Jaccard %.4f%%)", 100.0 * (double)inter / (double)unionn);
+        if (flipped) printf("  TOP-1 DIFFERS on %zu/%u tokens", flipped, n_tokens);
+        printf("\n");
     }
 
     /* Uniformity is the layout alarm: a fragment or lane-map bug cannot leave
