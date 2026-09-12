@@ -346,6 +346,17 @@ int main(int argc, char **argv) {
         if (kl_code_ok) { c.args[n++] = "--kl-baseline"; c.args[n++] = kl_code; }
         c.args[n] = NULL;
         RUN(c);
+    } else if (ref_dir) {
+        /* The caller ASKED for the reference grade (--ref-dir was passed) and the
+         * blob is not readable: that is a misconfiguration, not "not
+         * configured", and it must not leave the battery green.  This is how
+         * the landing script's PULSAR_REF_DIR pointed at a directory that did
+         * not exist while every run still printed ALL GATES PASS -- the grade
+         * was silently absent.  Fail. */
+        printf("\n  FAIL  cuda-reference-gate: --ref-dir '%s' has no readable %s\n"
+               "        (blobs live outside the repo; stage them or unset PULSAR_REF_DIR)\n",
+               ref_dir, story_ref);
+        rc_all = 1;
     } else {
         printf("\n  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir\n"
                "        (blobs live outside the repo; without them this gate grades nothing)\n");

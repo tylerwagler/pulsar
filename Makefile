@@ -865,9 +865,12 @@ KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # PULSAR_REF_DIR was unset (i.e. by default).  The guard and the work must sit
 # in the same shell for the skip to be a skip.
 cuda-reference-gate:
-	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
+	@if [ -z "$(PULSAR_REF_DIR)" ]; then \
 		echo "  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir"; \
 		echo "        (blobs live outside the repo; without them this gate grades nothing)"; \
+	elif [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
+		echo "REFUSING: PULSAR_REF_DIR=$(PULSAR_REF_DIR) has no readable story.ref.bin"; \
+		echo "          (a configured-but-missing dir must not pass silently)"; exit 1; \
 	else \
 		set -e; \
 		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \

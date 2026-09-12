@@ -269,13 +269,33 @@ dropped with the reason.
   back-of-envelope gives: the measured prefill map's CONVERSION kernels are
   ~9.5% of prefill (`f32_to_f16` 3.8 + `pack_act_e4m3_rowmajor_warp` 3.1 +
   `mxfp8_quant_act_grouped` 2.6).  Rule 3 ("producers emit") is the theme here.
-- **C6 (indexer scorer `mxf4nvf4`) -- BLOCKED on D2; scoped.**  The
+- **C6 (indexer scorer `mxf4nvf4`) -- scoped; selection now graded (D2).**  The
   instruction-ceiling measurement is real (`mxf4nvf4` 251 vs `mxf8f6f4` 125
   TMAC/s against a kernel running ~6.5), so the 2-4x scorer multiple is
   credible -- but the WHOLE indexer complex is ~2% of prefill (perf map) and
   <0.5% of decode (L219 census), so the end-to-end prize is ~1-2%, and the
-  change alters top-k selection.  Grade selection (D2) first; then build it with
-  the selection oracle as the gate.
+  change alters top-k selection.  Selection is now graded (D2 below), so the
+  selection oracle is the gate to build it against.
+- **D2 (indexer selection fidelity) -- CLOSED, measured: no drift.**  Ran the
+  owed reference grade at `867e06f` with the blobs staged from
+  `pulsar-notes/reference-capture/` (`cuda-reference-gate`,
+  `PULSAR_REF_DIR=/home/claude/refcap`).  Every depth grades `same` against the
+  recorded budget, and top-1 MATCHES at the selection-engaged depths:
+  story 30464 (KL 2.681e-01) and code 3840 (KL 1.790e-01).  Confident depths are
+  story 2048 `9.592e-06`, 4096 `5.400e-06`, 4102 `1.975e-07`, 6144 `9.621e-08`
+  and code 512 `3.732e-06`, 2048 `2.340e-06` -- all `+0.0%`.  The two deep
+  depths are FLAT (high entropy, so their KL is informational) but their top-1
+  holds.  No drift appeared, so the review's per-128 E8M0 / top-1024 f32
+  rescore is NOT needed, and C4/C6 have their selection-engaged gate.
+  **Process finding: the reference grade was absent, not passed.**  The landing
+  script exports `PULSAR_REF_DIR=/home/claude/refcap`, which did not exist, so
+  the reference gate SKIPped silently inside every battery that printed
+  "8/8 ALL PASS".  The blobs are staged there now (from the notes repo, which
+  protects them), and both entry points refuse a configured-but-missing dir
+  instead of skipping: `gates_runner.cpp` marks the run FAIL, and the
+  `cuda-reference-gate` target prints REFUSING and exits nonzero.  An UNSET
+  `PULSAR_REF_DIR` still SKIPs -- that is the deliberate default for boxes
+  without the captures.
 
 ---
 
