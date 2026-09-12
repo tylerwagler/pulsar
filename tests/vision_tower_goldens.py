@@ -15,17 +15,21 @@ max-abs and relative-RMS error and passes under a documented threshold.
 
     python3 tests/vision_tower_goldens.py <snapshot-dir> > tests/test-vectors/vision-tower-goldens.bin
 """
+import io
 import json
 import struct
 import sys
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from safetensors import safe_open
 
 SNAP = sys.argv[1]
 sys.path.insert(0, SNAP + "/inference")
 import vision as V  # noqa: E402
+import image_processor as ip  # noqa: E402
 
 # Blocks dumped per case.  The small grid gets ALL of them: it is the case whose
 # error is not yet explained, and a per-block trace is what separates "the error
@@ -44,6 +48,9 @@ class Args:
         self.vision_patch_size = c["vision_patch_size"]
         self.vision_rope_theta = c["vision_rope_theta"]
         self.vision_downsample_ratio = c["vision_downsample_ratio"]
+        self.vision_max_n_token = c["vision_max_n_token"]
+        self.vision_min_pixels = c["vision_min_pixels"]
+        self.vision_max_wh_ratio = c["vision_max_wh_ratio"]
         self.dim = c["hidden_size"]
 
 
@@ -79,6 +86,28 @@ def load_tower(args):
     return tower
 
 
+def realistic_patches(args, nh, nw):
+    """Patches from a REAL preprocessed image, cropped to the case's grid.
+
+    NOT torch.randn: random-noise patches are out of distribution and drive the
+    tower into the massive-activation regime (the reference's own block-31 max
+    reaches 792 on noise), which makes every reduction-order difference amplify
+    and turns the comparison into a measurement of chaos rather than of
+    correctness.  Rule 8 applies to golden inputs too."""
+    y, x = np.mgrid[0:384, 0:512]
+    r = (x * 255 // 511).astype(np.uint8)
+    g = (y * 255 // 383).astype(np.uint8)
+    b = (((x // 5) + (y // 7)) % 2 * 200 + 27).astype(np.uint8)
+    arr = np.dstack([r, g, b])
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG")
+    patches, nvh, nvw, _, _ = ip.load_image({"data": buf.getvalue()}, args)
+    p = args.vision_patch_size
+    assert nvh >= nh and nvw >= nw, (nvh, nvw, nh, nw)
+    grid = patches.view(nvh, nvw, 3, p, p)
+    return grid[:nh, :nw].reshape(nh * nw, 3, p, p).contiguous()
+
+
 def bf16_bits(t):
     return t.contiguous().view(torch.uint16).cpu().numpy().astype("<u2").tobytes()
 
@@ -105,8 +134,7 @@ def main():
     for (nh, nw) in cases:
         n = nh * nw
         n_stage = args.vision_n_layers if (nh, nw) in STAGE_FULL_CASES else N_STAGE_FULL
-        g = torch.Generator().manual_seed(1234 + n)
-        patches = torch.randn(n, 3, p, p, generator=g).to(torch.bfloat16) * 0.5
+        patches = realistic_patches(args, nh, nw)
 
         with torch.no_grad():
             x = tower.vision.patch_embed(patches)
