@@ -595,16 +595,26 @@ static void pulsar_select_shape_from_metadata(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
-    if (pulsar_shape_matches_metadata(&PULSAR_SHAPE_FLASH,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_pulsar_shape = PULSAR_SHAPE_FLASH;
-        return;
+    /* The ONE model-identity dispatch in the engine, and it runs once at load.
+     * The geometry alone identifies the profile: 0731 and V4.1 differ in six of
+     * these fields (layers 43/40, embd 4096/5120, experts 256/384, ff_exp
+     * 2048/2304, q_lora 1024/1280, indexer heads 64/32), so nothing downstream
+     * needs to test which model is loaded.
+     * plans/96-two-profiles-one-engine.md s4. */
+    static const pulsar_shape *const profiles[] = { &PULSAR_SHAPE_V4, &PULSAR_SHAPE_V41 };
+
+    for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+        if (pulsar_shape_matches_metadata(profiles[i],
+                                       n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                       n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                       n_lora_o, n_out_group, n_expert,
+                                       n_expert_used, n_ff_exp, n_expert_shared,
+                                       n_swa, n_indexer_head,
+                                       n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                       n_hc_sinkhorn_iter)) {
+            g_pulsar_shape = *profiles[i];
+            return;
+        }
     }
 
     fprintf(stderr,
@@ -654,32 +664,61 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
 
 
 
-/* CSA2 (L218): the per-layer ratios and the kv / index / candidate source
- * layers are the artifact's; pulsar_attn_layout_install checks them against
- * the shape profile and derives every layer's mode and sources from them. */
+/* The per-layer ratios and the source sets that shape the attention layout.
+ *
+ * compress_ratios is the artifact's on BOTH models and is required.  The source
+ * sets and the candidate pool are the PROFILE's: 0731 compresses every layer
+ * >= 2 on its own and has no candidate pool, so its artifact carries none of
+ * those keys, while V4.1's artifact carries all four and carries no
+ * hash_layer_count.  When a key IS present it must agree with the profile --
+ * pulsar_attn_layout_install enforces that against g_pulsar_shape.
+ * plans/96-SPIKE0-results.md S2. */
 static void validate_attention_layout_metadata(const pulsar_model *m) {
     uint32_t ratios[PULSAR_MAX_LAYER];
     const uint32_t n_ratio = model_read_u32_array(m, "deepseek4.attention.compress_ratios", ratios, PULSAR_MAX_LAYER);
     if (n_ratio < PULSAR_N_LAYER) pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
 
-    uint32_t kv_sources[PULSAR_MAX_ATTN_SOURCE], index_sources[PULSAR_MAX_ATTN_SOURCE];
-    const uint32_t n_kv = model_read_u32_array(m, "deepseek4.attention.kv_source_layers", kv_sources, PULSAR_MAX_ATTN_SOURCE);
-    const uint32_t n_index = model_read_u32_array(m, "deepseek4.attention.index_source_layers", index_sources, PULSAR_MAX_ATTN_SOURCE);
+    const pulsar_shape *sh = &g_pulsar_shape;
+    pulsar_array_ref probe;
 
-    uint32_t candidate = 0, topk_blocks = 0, block_size = 0;
-    if (!model_get_u32(m, "deepseek4.attention.candidate_source_layer", &candidate) ||
-        !model_get_u32(m, "deepseek4.attention.candidate_topk_blocks", &topk_blocks) ||
-        !model_get_u32(m, "deepseek4.attention.candidate_block_size", &block_size)) {
-        pulsar_die("deepseek4.attention.candidate_{source_layer,topk_blocks,block_size} are required");
+    /* Undeclared -> the profile's set (the degenerate 0731 case: every
+     * compressed layer is its own source).  Declared -> the artifact's, which
+     * the installer then checks against the profile. */
+    uint32_t kv_sources[PULSAR_MAX_ATTN_SOURCE], index_sources[PULSAR_MAX_ATTN_SOURCE];
+    uint32_t n_kv, n_index;
+    if (model_get_array(m, "deepseek4.attention.kv_source_layers", &probe)) {
+        n_kv = model_read_u32_array(m, "deepseek4.attention.kv_source_layers", kv_sources, PULSAR_MAX_ATTN_SOURCE);
+    } else {
+        n_kv = sh->n_kv_source;
+        memcpy(kv_sources, sh->kv_source_layer, sizeof(kv_sources));
     }
-    if (candidate > (uint32_t)INT32_MAX) pulsar_die("deepseek4.attention.candidate_source_layer is out of range");
-    if (topk_blocks != g_pulsar_shape.candidate_topk_blocks || block_size != g_pulsar_shape.candidate_block_size) {
+    if (model_get_array(m, "deepseek4.attention.index_source_layers", &probe)) {
+        n_index = model_read_u32_array(m, "deepseek4.attention.index_source_layers", index_sources, PULSAR_MAX_ATTN_SOURCE);
+    } else {
+        n_index = sh->n_index_source;
+        memcpy(index_sources, sh->index_source_layer, sizeof(index_sources));
+    }
+
+    /* Same rule for the candidate pool: absent means "this model has none",
+     * which is only consistent with a profile that has none (-1). */
+    int32_t candidate = sh->candidate_source_layer;
+    uint32_t declared_candidate = 0;
+    if (model_get_u32(m, "deepseek4.attention.candidate_source_layer", &declared_candidate)) {
+        if (declared_candidate > (uint32_t)INT32_MAX) {
+            pulsar_die("deepseek4.attention.candidate_source_layer is out of range");
+        }
+        candidate = (int32_t)declared_candidate;
+    }
+    uint32_t topk_blocks = sh->candidate_topk_blocks, block_size = sh->candidate_block_size;
+    (void)model_get_u32(m, "deepseek4.attention.candidate_topk_blocks", &topk_blocks);
+    (void)model_get_u32(m, "deepseek4.attention.candidate_block_size", &block_size);
+    if (topk_blocks != sh->candidate_topk_blocks || block_size != sh->candidate_block_size) {
         fprintf(stderr, "pulsar: candidate pool is %u blocks of %u, %s expects %u of %u\n",
                 topk_blocks, block_size, PULSAR_MODEL_SHAPE_NAME,
-                g_pulsar_shape.candidate_topk_blocks, g_pulsar_shape.candidate_block_size);
+                sh->candidate_topk_blocks, sh->candidate_block_size);
         exit(1);
     }
-    pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, (int32_t)candidate);
+    pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);
 }
 
 
@@ -908,6 +947,19 @@ void config_validate_model(const pulsar_model *m) {
     config_expect_f32("hyper_connection.epsilon", hc_eps, PULSAR_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+
+    /* The hash-routed layer count follows the same rule as the source sets: it
+     * is the PROFILE's.  The 0731 artifact declares it (3); V4.1's does not and
+     * has none.  Declared -> it must agree.  The restored hash-routing arm reads
+     * PULSAR_N_HASH_LAYER, so a wrong value here would route by id in a model
+     * that has no id table. */
+    uint32_t declared_hash = 0;
+    if (model_get_u32(m, "deepseek4.hash_layer_count", &declared_hash) &&
+        declared_hash != (uint32_t)PULSAR_N_HASH_LAYER) {
+        fprintf(stderr, "pulsar: hash_layer_count is %u, %s expects %u\n",
+                declared_hash, PULSAR_MODEL_SHAPE_NAME, (unsigned)PULSAR_N_HASH_LAYER);
+        exit(1);
+    }
 }
 
 

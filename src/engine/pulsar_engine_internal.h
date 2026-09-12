@@ -55,7 +55,13 @@
 #endif
 
 #define PULSAR_NEG_INF (-1.0e30f)
-#define PULSAR_DEFAULT_RMS_EPS ( 1.0e-20f)   /* V4.1 (L218); 0731 was 1e-6 */
+/* RMSNorm epsilon is PER MODEL and must not be a shared "default": it is 1e-6
+ * for 0731 and 1e-20 for V4.1.  The L218 work redefined this macro in place
+ * (leaving "0731 was 1e-6" in a comment) rather than naming the second value,
+ * which is how a per-model constant hides inside a shared one.  Each profile
+ * names its own. */
+#define PULSAR_V4_RMS_EPS      ( 1.0e-6f)
+#define PULSAR_V41_RMS_EPS     ( 1.0e-20f)
 #define PULSAR_DEFAULT_HC_EPS  ( 1.0e-6f)
 #define PULSAR_DEFAULT_SWIGLU_CLAMP_EXP    (10.0f)
 #define PULSAR_DEFAULT_ROPE_FREQ_BASE      (10000.0f)
@@ -102,6 +108,7 @@
 #define PULSAR_N_DSPARK_EXPERT           (g_pulsar_shape.n_dspark_expert)
 #define PULSAR_N_DSPARK_EXPERT_USED      (g_pulsar_shape.n_dspark_expert_used)
 #define PULSAR_N_EXPERT_SHARED           (g_pulsar_shape.n_expert_shared)
+#define PULSAR_N_HASH_LAYER              (g_pulsar_shape.n_hash_layer)
 #define PULSAR_N_FF_EXP                  (g_pulsar_shape.n_ff_exp)
 #define PULSAR_N_SWA                     (g_pulsar_shape.n_swa)
 #define PULSAR_N_INDEXER_HEAD            (g_pulsar_shape.n_indexer_head)
@@ -205,7 +212,10 @@
 
 enum {
     PULSAR_MAX_LAYER            = 61,
-    PULSAR_MAX_ATTN_SOURCE      = 8,   ///< CSA2 source layers of one kind (V4.1: 4 kv, 8 index)
+    /* A source set can name any layer.  V4.1 shares (4 kv / 8 index sources),
+     * but 0731 compresses every layer >= 2 on its own, so its set is the whole
+     * backbone.  plans/96-SPIKE0-results.md S2. */
+    PULSAR_MAX_ATTN_SOURCE      = PULSAR_MAX_LAYER,
     PULSAR_NO_LAYER             = 0xFFFFFFFFu,  ///< "no such layer" in the attention layout table
     PULSAR_MAX_EMBD             = 7168,
     PULSAR_MAX_VOCAB            = 129280,
@@ -231,8 +241,16 @@ enum {
 /* L188: the routed-MoE non-finite flag packs layer_index + 1 into 8 bits (pulsar_cuda_moe.cu) */
 static_assert(PULSAR_MAX_LAYER < 255, "the non-finite flag's layer field is 8 bits");
 
+/** The two architectures this engine serves.  They are adjacent revisions of
+ * one family -- same attention lineage, same MoE, byte-identical tokenizer --
+ * and everything that differs between them is selected from the profile.  This
+ * enum is the ONE model-identity dispatch, and it is read at load time only
+ * (pulsar_select_shape_from_metadata, expected_layer_compress_ratio); nothing
+ * in the per-layer hot path may consult it.  See
+ * plans/96-two-profiles-one-engine.md and plans/96-SPIKE0-results.md. */
 typedef enum {
-    PULSAR_VARIANT_FLASH = 0,
+    PULSAR_VARIANT_V4  = 0,  /**< DeepSeek-V4-Flash (0731): 43 layers, 4/128 CSA/HCA, 3 hash layers */
+    PULSAR_VARIANT_V41 = 1,  /**< DeepSeek-V4.1-Flash (L218): 40 layers, CSA2 sharing, no hash layers */
 } pulsar_variant;
 
 /** The model's architectural constants, resolved once at load and then treated
@@ -259,6 +277,7 @@ typedef struct {
     uint32_t n_expert;         ///< routed experts per MoE layer
     uint32_t n_expert_used;    ///< experts activated per token (top-k routing)
     uint32_t n_expert_shared;  ///< always-on shared experts
+    uint32_t n_hash_layer;     ///< leading layers routed by token id, not by the gate (0731: 3; V4.1: 0)
     uint32_t n_dspark_expert;      ///< routed experts per DSpark drafter layer (V4.1: 128)
     uint32_t n_dspark_expert_used; ///< experts a drafter token activates (V4.1: 3)
     uint32_t n_ff_exp;         ///< per-expert FFN hidden width
@@ -2034,7 +2053,10 @@ typedef struct {
 
 /** ---- shared globals ---- */
 
-extern const pulsar_shape PULSAR_SHAPE_FLASH;
+/** The shape profiles this engine serves: the two are selected at load from the
+ * artifact's own metadata.  plans/96-two-profiles-one-engine.md. */
+extern const pulsar_shape PULSAR_SHAPE_V4;
+extern const pulsar_shape PULSAR_SHAPE_V41;
 extern pulsar_shape g_pulsar_shape;
 /** REAP ds4-compact-v1: per-layer count of physically-present routed experts.
  * 0 means "not set" -> falls back to n_expert (the un-pruned default). The

@@ -56,13 +56,28 @@ bool pulsar_engine::is_pruned() const {
 
 
 
-/* V4.1 CSA2 (L218): layers 0-1 sliding window only; the encoder's 2-19 share
- * ratio-2 compressed KV from sources 2/8/14; the decoder's 20-39 read one
- * ratio-1 (one latent per token) cache from layer 20.  The 0731 4/128 pattern
- * (CSA/HCA alternating) is gone with that checkpoint. */
+/* The compression ratio a profile expects the artifact to declare for `il`.
+ *
+ * This is the second and last site that reads the model identity, and like
+ * pulsar_select_shape_from_metadata it runs ONCE at load (from
+ * pulsar_attn_layout_install).  Nothing in the per-layer hot path may branch on
+ * the variant -- downstream reads the derived layout table instead.
+ * plans/96-SPIKE0-results.md S2. */
 static uint32_t expected_layer_compress_ratio(uint32_t il) {
-    if (il < 2) return 0;
-    return il < 20 ? 2u : 1u;
+    if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
+    switch (g_pulsar_shape.variant) {
+    case PULSAR_VARIANT_V4:
+        /* 0731 CSA/HCA: ratio 4 and 128 alternate up the backbone, and every
+         * compressed layer owns its own compressor and indexer. */
+        return (il & 1u) == 0 ? 4u : 128u;
+    case PULSAR_VARIANT_V41:
+        /* V4.1 CSA2: the encoder's 2-19 share ratio-2 compressed KV from
+         * sources 2/8/14; the decoder's 20-39 read one ratio-1 (one latent per
+         * token) cache from layer 20. */
+        return il < 20 ? 2u : 1u;
+    }
+    pulsar_die("no compression-ratio expectation for the loaded shape variant");
+    return 0;   /* unreachable: pulsar_die does not return */
 }
 
 
