@@ -168,7 +168,7 @@ static bool gpu_graph_csa2_emit_rows(
                                                      pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
                                                      freq_base, freq_scale, ext_factor, attn_factor,
                                                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) ok = pulsar_gpu_mainkv_pack_tensor(gpu_graph_f32_store_observed_any() ? latent : NULL, latent,
+    if (ok) ok = pulsar_gpu_kv_comp_pack_tensor(gpu_graph_f32_store_observed_any() ? latent : NULL, latent,
                                                comp_dst, cache_row0, n_rows, PULSAR_N_HEAD_DIM) != 0;
     if (ok) gpu_graph_debug_dump_tensor("KVcompress", latent,
                                         (uint64_t)n_rows * PULSAR_N_HEAD_DIM, il, pos_first);
@@ -1124,7 +1124,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * the ring; that now scatters the packed bytes instead, so after this pack
      * the only thing that ever looks at batch_kv is a dump or the range sweep
      * (L094 item 4).  ~8 MiB x 43 layers of stores per chunk. */
-    if (ok) ok = pulsar_gpu_winkv_pack_tensor(gpu_graph_f32_store_observed_any() ? g->batch_kv : NULL,
+    if (ok) ok = pulsar_gpu_kv_ring_pack_tensor(gpu_graph_f32_store_observed_any() ? g->batch_kv : NULL,
                                               g->batch_kv, g->batch_kv_pack, 0u, n_tokens, PULSAR_N_HEAD_DIM,
                                               NULL, NULL, 1u, 0u) != 0;
     if (ok) {

@@ -217,6 +217,35 @@ __device__ __forceinline__ static uint64_t pulsar_kv_ring_slot(
     return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
 }
 
+/* The 0731 unified row's E2M1 decoder: one nibble and its block scale.  Codes
+ * 0..7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6; codes >= 2 are normals (exponent
+ * 126 + c>>1, mantissa bit c&1) and 0 / 0.5 are the format's zero and
+ * subnormal.  Nibble bit 3 is the sign. */
+__device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
+    const uint32_t c = nib & 7u;
+    const float v = (c >= 2u) ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22))
+                              : (float)c * 0.5f;
+    const float sv = v * scale;
+    return (nib & 8u) ? -sv : sv;
+}
+
+/* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  Only
+ * pulsar_cuda_norm_kv.cu's dispatchers call these -- the engine-facing surface
+ * is the two dispatchers, so no caller names a row family. */
+int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src,
+                                      pulsar_gpu_tensor *packed, uint32_t out_row0,
+                                      uint32_t n_rows, uint32_t head_dim);
+int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
+                                           uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
+                                                 uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+                                                 uint32_t head_dim, const pulsar_gpu_tensor *positions,
+                                                 const pulsar_gpu_tensor *seq_id, uint32_t n_banks);
+int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
+                                        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+                                        uint32_t head_dim, const pulsar_gpu_tensor *positions,
+                                        const pulsar_gpu_tensor *seq_id, uint32_t n_banks);
+
 /* The sanctioned element reads of the two KV rows (every KV buffer -- see
  * pulsar_gpu.h).  The opaque carriers pulsar_winkv_row_t / pulsar_mainkv_row_t
  * are declared there. */

@@ -245,21 +245,9 @@ typedef enum {
     PULSAR_VARIANT_V41 = 1,  /**< DeepSeek-V4.1-Flash (L218): 40 layers, CSA2 sharing, no hash layers */
 } pulsar_variant;
 
-/** The KV row family a model stores.  A "row" is one token's (or one pooled
- * group's) KV block; the family is the quantiser and layout, not the size.
- *
- * CSA2:    V4.1.  WINDOW rows (E4M3 x E8M0/32) in every sliding-window ring,
- *          MAIN rows (E2M1 x E4M3/16) in a kv source's compressed pool, and an
- *          FP4 index-K row -- three formats, three strides.
- * UNIFIED: 0731.  One NVFP4 row for every non-index buffer (the L111
- *          unification), plus the same FP4 index row.
- *
- * pulsar_kv_row_bytes() is the one reader.  plans/96-two-profiles-one-engine.md
- * s2 axis 2 / plans/96-SPIKE0-results.md S3. */
-typedef enum {
-    PULSAR_KV_ROWS_CSA2    = 0,  /**< V4.1: two formats + the index row */
-    PULSAR_KV_ROWS_UNIFIED = 1,  /**< 0731: one NVFP4 row + the index row */
-} pulsar_kv_row_style;
+/* pulsar_kv_row_style and pulsar_kv_row_kind are declared in src/pulsar_gpu.h:
+ * both sides of the seam need them (the engine sizes, the CUDA module packs),
+ * so the definition lives on the shared header and neither side owns a copy. */
 
 /** The model's architectural constants, resolved once at load and then treated
  * as compile-time-ish truth by the graph and kernels.
@@ -2142,20 +2130,13 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
  * index; a layer that is its own source (mode FULL) writes them.  Every
  * per-layer cache array in pulsar_gpu_graph / pulsar_bank_slabs is indexed by
  * the source, so a consumer resolves through these and never through `il`. */
-/** Which KV buffer a row-geometry question is about. */
-typedef enum {
-    PULSAR_KV_ROW_RING = 0,   /**< a sliding-window ring row */
-    PULSAR_KV_ROW_COMP,       /**< a compressed-pool row */
-    PULSAR_KV_ROW_INDEX,      /**< an index-K pool row */
-} pulsar_kv_row_kind;
+/* pulsar_kv_row_kind is declared in src/pulsar_gpu.h (see above). */
 
 /** The row geometry of the LOADED model, in bytes, asked by KIND.
  *
  * CSA2 (V4.1): RING 528 (WINDOW), COMP 288 (MAIN), INDEX 68.
  * UNIFIED (0731): one 384 B NVFP4 row in every non-index buffer; INDEX 68.
  *
- * The 0731 case REFUSES here until its packer is restored: returning 384 now
- * would size every pool correctly and fill it with a format nothing writes.
  * plans/96-two-profiles-one-engine.md s10. */
 static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
     /* The index-K row is the same FP4 row in both families. */
@@ -2163,8 +2144,7 @@ static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
         return (uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM);
     }
     if (g_pulsar_shape.kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
-        pulsar_die("the 0731 unified 384 B KV row has no packer yet");
-        return 0;   /* unreachable: pulsar_die does not return */
+        return (uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
     }
     return kind == PULSAR_KV_ROW_RING
                ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)

@@ -763,16 +763,84 @@ int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, u
 }
 
 
-/* The raw-ring writers.  Every ring row is a WINDOW row (pulsar_gpu.h); the
- * quantise happens in pulsar_gpu_winkv_pack_tensor exactly once, and rows
- * already packed are moved as bytes.  Destination slot = the shared
- * pulsar_kv_ring_slot rule. */
+/* ---- the loaded model's KV row family, mirrored across the seam -----------
+ *
+ * The profile is the authority (pulsar_kv_row_style, src/pulsar_gpu.h); the
+ * engine pushes it here once at load (pulsar_select_shape_from_metadata) and the
+ * packers below read it.  A CUDA TU does not include the engine header, so this
+ * is the seam's copy -- the same shape as the model map and the geometry macros
+ * both sides already share.  Default CSA2 keeps a synthetic/test graph that
+ * never selects a profile on V4.1's formats, which is what it had before. */
+static pulsar_kv_row_style g_kv_row_style = PULSAR_KV_ROWS_CSA2;
+
+void pulsar_gpu_set_kv_row_style(pulsar_kv_row_style style) { g_kv_row_style = style; }
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_kv_row_style; }
+
+uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim) {
+    if (kind == PULSAR_KV_ROW_INDEX) {
+        fprintf(stderr, "pulsar: the index-K row is not packed by this module -- refusing\n");
+        return 0;
+    }
+    if (g_kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
+        return (uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)head_dim);
+    }
+    return kind == PULSAR_KV_ROW_RING ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)head_dim)
+                                      : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)head_dim);
+}
+
+/* The raw-ring writers.  The ring row's FORMAT is the loaded profile's, so the
+ * size check asks by KIND and the pack goes through the dispatcher below --
+ * neither this function nor its caller names a family.  Destination slot = the
+ * shared pulsar_kv_ring_slot rule. */
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap ||
-        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_WINKV_ROWBYTES(head_dim) ||
+        raw_cache->bytes < (uint64_t)raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
     /* x = NULL: kv is const here; the ring slot is pos % raw_cap with pos = row */
-    return pulsar_gpu_winkv_pack_tensor(NULL, kv, raw_cache, row, 1u, head_dim, NULL, NULL, 1u, raw_cap);
+    return pulsar_gpu_kv_ring_pack_tensor(NULL, kv, raw_cache, row, 1u, head_dim, NULL, NULL, 1u, raw_cap);
+}
+
+
+/* ---- the ONE place a KV row family is chosen -------------------------------
+ *
+ * Callers ask to pack a RING row or a COMP row; which FORMAT that is comes from
+ * the loaded profile (pulsar_kv_row_style).  V4.1 stores two distinct formats
+ * (src/cuda/pulsar_cuda_kvrows.cu); 0731 stores one unified NVFP4 row
+ * (src/cuda/pulsar_cuda_attnpack.cu).  The families live in separate TUs and
+ * meet only here, so no engine site can pack the wrong format for the loaded
+ * model -- a site left on a family packer is how a new family silently
+ * mis-sizes a buffer instead of failing loudly.
+ *
+ * plans/96-two-profiles-one-engine.md s12. */
+int pulsar_gpu_kv_comp_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim) {
+    if (g_kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
+        return pulsar_gpu_attn_pack_store_tensor(x, src, packed, out_row0, n_rows, head_dim);
+    }
+    return pulsar_gpu_mainkv_pack_tensor(x, src, packed, out_row0, n_rows, head_dim);
+}
+
+int pulsar_gpu_kv_ring_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
+                                   const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
+                                   uint32_t n_banks, uint32_t raw_cap) {
+    if (g_kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
+        if (raw_cap == 0) {   /* a contiguous pack buffer, not a ring */
+            return pulsar_gpu_attn_pack_store_tensor(x, src, packed, out_row0, n_rows, head_dim);
+        }
+        if (x) {
+            /* The 0731 ring store has no f32 writeback; no caller asks for one,
+             * and silently dropping it would leave the observer holding values
+             * the cache no longer matches. */
+            fprintf(stderr, "pulsar: a ring KV pack with an f32 writeback is not "
+                            "supported for the 0731 row -- refusing\n");
+            return 0;
+        }
+        return pulsar_gpu_attn_pack_ring_store_batch_tensor(packed, src, raw_cap, out_row0, n_rows,
+                                                           head_dim, positions, seq_id, n_banks);
+    }
+    return pulsar_gpu_winkv_pack_tensor(x, src, packed, out_row0, n_rows, head_dim,
+                                        positions, seq_id, n_banks, raw_cap);
 }
 
 
@@ -840,12 +908,12 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
     if (!raw_store_descr_ok(positions, seq_id, n_tokens, n_banks, raw_cap, "banked raw store")) return 0;
     const bool descr = positions != NULL;
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * PULSAR_WINKV_ROWBYTES(head_dim) ||
+        raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     if (n_tokens == 0) return 1;
     /* x = NULL: kv is const on this entry */
-    return pulsar_gpu_winkv_pack_tensor(NULL, kv, raw_cache, pos0, n_tokens, head_dim,
-                                        positions, seq_id, descr ? n_banks : 1u, raw_cap);
+    return pulsar_gpu_kv_ring_pack_tensor(NULL, kv, raw_cache, pos0, n_tokens, head_dim,
+                                          positions, seq_id, descr ? n_banks : 1u, raw_cap);
 }
 
 

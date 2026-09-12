@@ -998,6 +998,38 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 #define PULSAR_WINKV_ROWBYTES(HD)  ((uint64_t)(HD) + (HD) / PULSAR_WINKV_BLOCK)
 #define PULSAR_MAINKV_ROWBYTES(HD) ((uint64_t)(HD) / 2u + (HD) / PULSAR_MAINKV_BLOCK)
 
+/** The KV row family a model stores, and the buffer a geometry question is
+ * about.  These live HERE because both sides of the seam need them: the engine
+ * sizes caches and payload spans from the profile, and the CUDA module packs
+ * the rows.  One definition, two readers.
+ *
+ * CSA2:    V4.1.  WINDOW rows in every sliding-window ring, MAIN rows in a kv
+ *          source's compressed pool, plus an FP4 index-K row.
+ * UNIFIED: 0731.  One NVFP4 row for every non-index buffer, plus the same index
+ *          row.  plans/96-two-profiles-one-engine.md s2 axis 2. */
+typedef enum {
+    PULSAR_KV_ROWS_CSA2    = 0,
+    PULSAR_KV_ROWS_UNIFIED = 1,
+} pulsar_kv_row_style;
+
+typedef enum {
+    PULSAR_KV_ROW_RING = 0,   /**< a sliding-window ring row */
+    PULSAR_KV_ROW_COMP,       /**< a compressed-pool row */
+    PULSAR_KV_ROW_INDEX,      /**< an index-K pool row */
+} pulsar_kv_row_kind;
+
+/** Push the loaded profile's row family into the CUDA module, once at load.
+ * The profile stays the authority; this is the seam's copy of it, and it is how
+ * the packers below learn which family to write without every call site
+ * carrying it. */
+void pulsar_gpu_set_kv_row_style(pulsar_kv_row_style style);
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void);
+
+/** The row geometry, in bytes, asked by KIND -- the CUDA side's reader.  head_dim
+ * is a parameter, as everywhere else in this module.  The index-K row is not
+ * packed here (the engine carries its stride), so asking for it refuses. */
+uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim);
+
 /** 0731's unified NVFP4 attention KV row (the L111 format).  Restored for the
  * two-profile engine: V4.1 replaced it, 0731 stores it in EVERY non-index
  * buffer (raw ring, comp pool, drafter ring, MTP cache, current chunk).
@@ -1008,11 +1040,10 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * Requires n_rot == PULSAR_ATTN_PACK_NROT and (head_dim - n_rot) a multiple of
  * PULSAR_KV4_NV_BLOCK.  Quantise EXACTLY ONCE; every later move is a byte move.
  *
- * The geometry is here because the host fixture (tests/attn_pack_fixture.h)
- * codes against it; the DEVICE packer is not restored yet, which is why
- * pulsar_kv_row_bytes() still refuses PULSAR_KV_ROWS_UNIFIED.  The two land
- * together, and the fixture is the oracle they land against.
- * plans/96-two-profiles-one-engine.md s10. */
+ * The packer is src/cuda/pulsar_cuda_attnpack.cu; the oracle is
+ * tests/attn_pack_fixture.h (host, run by `make attn-pack-fixture-check`) and
+ * tests/kv4_pack_gate.cpp (device vs host).  plans/96-two-profiles-one-engine.md
+ * s11/s12. */
 #define PULSAR_ATTN_PACK_NROT 64u
 #define PULSAR_ATTN_PACK_NOPE_ALIGN 64u   /* the kernels walk the nope dims in 64-wide lanes */
 #define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
@@ -1053,6 +1084,24 @@ int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *
  * store them at `packed` rows [out_row0, out_row0 + n_rows).  `x` as above. */
 int pulsar_gpu_mainkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim);
+
+/** ---- the row-family DISPATCHERS: the engine-facing pack surface ----------
+ *
+ * Callers ask to pack a RING row or a COMP row.  WHICH format that is comes
+ * from the loaded profile (pulsar_kv_row_style): V4.1 has two distinct formats
+ * (the two packers above), 0731 has one unified NVFP4 row.  The engine must
+ * call these rather than a family's packer, so that no site can be left packing
+ * the wrong format for the loaded model -- which is how a new family silently
+ * mis-sizes a buffer instead of failing.  The family packers stay public for
+ * the gates that test a format on purpose.
+ *
+ * Signatures mirror the two they dispatch to. */
+int pulsar_gpu_kv_ring_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
+                                   const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
+                                   uint32_t n_banks, uint32_t raw_cap);
+int pulsar_gpu_kv_comp_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim);
 
 /** Fused rope + FP4 pack for the indexer q projection (L218: the reference's
  * fp4_act_quant with E8M0 scales per 32 on the bf16-rounded row; 0731's

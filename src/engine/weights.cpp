@@ -632,6 +632,10 @@ static void pulsar_select_shape_from_metadata(
                                        n_indexer_head_dim, n_indexer_top_k, n_hc,
                                        n_hc_sinkhorn_iter)) {
             g_pulsar_shape = *profiles[i];
+            /* The CUDA module packs the rows, so it needs the family too.  The
+             * profile stays the authority; this is the seam's copy of one fact,
+             * pushed once, here. */
+            pulsar_gpu_set_kv_row_style(g_pulsar_shape.kv_row_style);
             return;
         }
     }
