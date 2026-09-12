@@ -2357,6 +2357,13 @@ typedef struct {
 int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
                          int start_pos, int vocab_size, pulsar_vision_prepared *out);
 void vision_prepared_free(pulsar_vision_prepared *p);
+/** The reference's merge_image_embeddings() for ONE prepared image: run the
+ * tower over its patches and scatter the aligner rows (in `perm` order) into the
+ * IMAGE slots, filling every other slot with its type's learned vector.  `out`
+ * receives span_len * PULSAR_N_EMBD bf16 values. */
+int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
+                      const pulsar_vision_prepared *prep,
+                      uint16_t *out, int out_cap, int *out_len);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);

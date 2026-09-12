@@ -740,3 +740,55 @@ void vision_prepared_free(pulsar_vision_prepared *p) {
     free(p->perm);
     memset(p, 0, sizeof *p);
 }
+
+/* The reference's merge_image_embeddings(), for ONE image: run the tower over the
+ * prepared patches and scatter the result into the span the image occupies.
+ * IMAGE slots take the aligner rows in `perm` order; every other slot takes the
+ * learned vector for its type (image_start / image_pad / image_newline /
+ * image_end), which is exactly model.py's
+ *     params = stack([image_start, image_pad, image_pad, image_newline, image_end])
+ *     block = params[types]; block[types == IMAGE] = encode_image(...)[perm]
+ */
+int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
+                      const pulsar_vision_prepared *prep,
+                      uint16_t *out, int out_cap, int *out_len) {
+    const int T = (int)PULSAR_N_EMBD;
+    if (!w || !m || !prep || !prep->span_types || !prep->perm) return 0;
+    if (prep->span_len <= 0 || prep->span_len > out_cap / T) return 0;
+
+    uint16_t *aligner = (uint16_t *)malloc((size_t)prep->n_llm_h * (size_t)prep->n_llm_w *
+                                           (size_t)T * sizeof(uint16_t));
+    if (!aligner) return 0;
+    int rows = 0;
+    if (!vision_forward(w, m, prep->patches, prep->n_vit_h, prep->n_vit_w,
+                        aligner, prep->n_llm_h * prep->n_llm_w * T, &rows,
+                        NULL, 0) ||
+        rows != prep->n_llm_h * prep->n_llm_w) {
+        free(aligner);
+        return 0;
+    }
+
+    /* types are IMAGE_START=0, IMAGE_PAD=1, IMAGE=2, IMAGE_NEWLINE=3, IMAGE_END=4;
+     * `param` mirrors the reference's stack, with slot 2 filled from the aligner. */
+    const pulsar_tensor *param[5] = { w->image_start, w->image_pad, NULL,
+                                      w->image_newline, w->image_end };
+    int j = 0;
+    for (int p = 0; p < prep->span_len; p++) {
+        const int ty = prep->span_types[p];
+        uint16_t *dst = out + (size_t)p * T;
+        if (ty == 2) {
+            if (j >= prep->n_perm) { free(aligner); return 0; }
+            const int row = prep->perm[j++];
+            if (row < 0 || row >= rows) { free(aligner); return 0; }
+            memcpy(dst, aligner + (size_t)row * T, (size_t)T * sizeof(uint16_t));
+        } else {
+            if (ty < 0 || ty > 4 || !param[ty]) { free(aligner); return 0; }
+            const uint16_t *src = (const uint16_t *)(const void *)
+                ((const char *)tensor_map_base(m, param[ty]) + param[ty]->abs_offset);
+            memcpy(dst, src, (size_t)T * sizeof(uint16_t));
+        }
+    }
+    free(aligner);
+    *out_len = prep->span_len;
+    return 1;
+}

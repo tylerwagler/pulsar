@@ -516,6 +516,14 @@ vision-span-gate: tests/vision_span_gate
 # tower), so it is NOT in GATE_TARGETS and refuses to silently pass when
 # VISION_MODEL is unset.
 VISION_MODEL ?=
+vision-merge-gate: tests/vision_merge_gate
+	@if [ -z "$(VISION_MODEL)" ]; then \
+		echo "  SKIP  vision-merge-gate: set VISION_MODEL=/path/to/a/vision-exp.gguf"; \
+	else \
+		echo "  running against $(VISION_MODEL)"; \
+		./tests/vision_merge_gate $(VISION_MODEL) tests/test-vectors/vision-merge-goldens.bin; \
+	fi
+
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-tower-gate: set VISION_MODEL=/path/to/a/vision-exp.gguf"; \
@@ -1079,7 +1087,7 @@ GATE_TARGETS = unit-test-gate \
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate
+.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1250,6 +1258,9 @@ tests/vision_span_gate.o: tests/vision_span_gate.cpp src/engine/pulsar_engine_in
 tests/vision_tower_gate.o: tests/vision_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_tower_gate.cpp
 
+tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_merge_gate.cpp
+
 tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
@@ -1370,6 +1381,9 @@ tests/vision_span_gate: tests/vision_span_gate.o src/lib/pulsar_help.o $(CORE_OB
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_merge_gate: tests/vision_merge_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
