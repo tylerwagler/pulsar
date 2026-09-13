@@ -1354,30 +1354,21 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     weights_reject_unsupported_types(m);
 
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
-    /* The drafter's own shape keys, checked against what this engine was built
-     * to draft: block_size is the depth it was trained to draft (the depth
-     * controller's ceiling must not exceed it), the noise token fills the
-     * draft slots past the first (forward_embed), the markov rank is the
-     * width the k-major markov kernels are written for. */
-    {
-        const uint32_t n_expert = required_u32(m, "deepseek_v4_dspark.expert_count");
-        const uint32_t n_used = required_u32(m, "deepseek_v4_dspark.expert_used_count");
-        const uint32_t block_size = required_u32(m, "deepseek_v4_dspark.block_size");
-        const uint32_t noise_id = required_u32(m, "deepseek_v4_dspark.noise_token_id");
-        const uint32_t markov_rank = required_u32(m, "deepseek_v4_dspark.markov_rank");
-        if (n_expert != (uint32_t)PULSAR_N_DSPARK_EXPERT || n_used != (uint32_t)PULSAR_N_DSPARK_EXPERT_USED ||
-            block_size < (uint32_t)PULSAR_SPEC_DEPTH_MAX || noise_id != (uint32_t)PULSAR_DSPARK_NOISE_TOKEN_ID ||
-            markov_rank != 256u) {
-            char msg[320];
-            snprintf(msg, sizeof(msg),
-                     "dspark: artifact experts %u/%u, block_size %u, noise_token_id %u, markov_rank %u vs this "
-                     "engine's %u/%u, depth ceiling %d, noise token %d, markov rank 256 -- refusing",
-                     n_expert, n_used, block_size, noise_id, markov_rank,
-                     (unsigned)PULSAR_N_DSPARK_EXPERT, (unsigned)PULSAR_N_DSPARK_EXPERT_USED,
-                     (int)PULSAR_SPEC_DEPTH_MAX, (int)PULSAR_DSPARK_NOISE_TOKEN_ID);
-            pulsar_die(msg);
-        }
-    }
+    /* The drafter's SHAPE is not in the artifact's metadata beyond embedding_length:
+     * the shipped file carries NO expert_count, expert_used_count, block_size,
+     * noise_token_id or markov_rank key (checked directly in the GGUF, on both
+     * the serving and the -k variant).  This block used to require all five and
+     * compare them against compiled constants -- so it made the artifact
+     * unloadable while checking nothing the tensor validation does not already
+     * check.  The facts are asserted where they actually live:
+     * dspark_weights_validate_layout pins every tensor against this engine's
+     * compiled constants -- the expert count from ffn_gate_inp and the routed
+     * expert tensors, the markov rank from markov_w1's 256 -- and the noise
+     * token needs no check at all because the runtime uses
+     * PULSAR_DSPARK_NOISE_TOKEN_ID directly rather than reading it from a file.
+     * The one fact that is no longer checked anywhere is the depth the drafter
+     * was TRAINED for; the artifact never carried it either, and the depth
+     * controller's ceiling stays the compiled PULSAR_SPEC_DEPTH_MAX. */
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 
