@@ -983,7 +983,23 @@ void config_validate_model(const pulsar_model *m) {
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, PULSAR_EXPERT_WEIGHT_SCALE);
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
-    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, PULSAR_RMS_EPS);
+    /* THE ARTIFACT IS THE AUTHORITY, not the profile.  This is the one text
+     * config field the shipped checkpoints disagree on, and they disagree
+     * ACROSS the profile split rather than along it: 0731 declares 1e-6 while
+     * BOTH Vision-Exp and V4.1 declare 1e-20.  It is a kernel parameter
+     * (PULSAR_RMS_EPS == g_pulsar_shape.rms_eps), not a shape, so pinning it per
+     * profile made the compiled default refuse a real artifact -- Vision-Exp
+     * (v5-vexp-full256) failed to load with "expected 1e-06, got 1e-20" until
+     * this was read off the artifact instead.  Only the known pair is accepted:
+     * anything else exits rather than silently retuning the norm of every
+     * layer. */
+    if (rms_eps != PULSAR_V4_RMS_EPS && rms_eps != PULSAR_V41_RMS_EPS) {
+        fprintf(stderr, "pulsar: attention.layer_norm_rms_epsilon=%.9g is neither 0731's %.9g "
+                        "nor Vision-Exp's/V4.1's %.9g\n",
+                (double)rms_eps, (double)PULSAR_V4_RMS_EPS, (double)PULSAR_V41_RMS_EPS);
+        exit(1);
+    }
+    g_pulsar_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, PULSAR_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
