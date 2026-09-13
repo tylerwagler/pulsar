@@ -48,9 +48,19 @@ enum {
     PULSAR_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
-/* The indexer scorer tier is tiled for exactly this many heads (V4.1: 32,
- * L218; V4 was 64).  Both entry gates and the MXFP4 kernel read THIS. */
-#define PULSAR_IDX_MXFP4_HEADS 32u
+/* The indexer scorer tier is TILED PER HEAD COUNT rather than pinned to one
+ * model: V4.1 runs 32 indexer heads (L218) and V4 ran 64.  L218 de-generalised
+ * the kernel to 32 and refused every other count, which is what left V4's
+ * indexer with no scorer at all.  The MXFP4 kernel is a template instantiated
+ * for each count and both entry gates ask THIS predicate, so a third count
+ * refuses by name instead of quietly tiling a different M. */
+#define PULSAR_IDX_MXFP4_HEADS_V41 32u
+#define PULSAR_IDX_MXFP4_HEADS_V4  64u
+/* constexpr so the kernel templates and the probes can assert it at compile
+ * time, which is where "a third head count" should be caught. */
+constexpr bool pulsar_idx_mxfp4_heads_supported(uint32_t n_head) {
+    return n_head == PULSAR_IDX_MXFP4_HEADS_V41 || n_head == PULSAR_IDX_MXFP4_HEADS_V4;
+}
 
 /*
  * Microscaling (MX / OCP) compressed-KV storage.  One E8M0 (power-of-two)

@@ -25,6 +25,17 @@
  */
 #include "../src/cuda/pulsar_cuda_indexer_mxfp4.cu"
 
+/* The shipped scorer is TEMPLATED on the head count (V4.1 tiles 32, V4 tiled
+ * 64), so this test is built once per count rather than assuming one; the body
+ * only ever asks "does the kernel compute the function it claims to" at the
+ * count it was handed.  Default 32 so the plain `nvcc` line above still works. */
+#ifndef IDX_TEST_HEADS
+#define IDX_TEST_HEADS PULSAR_IDX_MXFP4_HEADS_V41
+#endif
+#define IDX_HEADS IDX_TEST_HEADS
+static_assert(pulsar_idx_mxfp4_heads_supported(IDX_HEADS),
+              "the tier supports exactly the counts it instantiates");
+
 /* cuda_ok lives in pulsar_cuda_runtime.cu; this TU links neither the engine nor
  * the rest of the backend, so provide the one symbol the launcher needs. */
 /* cuda_tmp_alloc is the backend's scratch arena (pulsar_cuda_runtime.cu).  This

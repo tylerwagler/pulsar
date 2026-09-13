@@ -61,8 +61,6 @@
 #define PULSAR_IDX_MXFP4_MMA 0
 #endif
 
-#define IDX_HEADS     PULSAR_IDX_MXFP4_HEADS
-#define IDX_MTILES    (IDX_HEADS / 16u)      /* m-tiles of 16 heads: 2 at 32 heads */
 #define IDX_HEAD_DIM  128u
 #define IDX_NTILE     128u         /* compressed rows per block */
 #define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
@@ -96,11 +94,11 @@
 #define IDX_TOKGROUP  8u
 #define IDX_THREADS   256u         /* 8 warps per token group */
 #define IDX_WARPS     (IDX_THREADS / 32u)
-#define IDX_NSPLITS   (IDX_WARPS / IDX_MTILES)              /* N splits across the warps: 4 at 32 heads */
-#define IDX_NT_PER_SPLIT ((IDX_NTILE / 8u) / IDX_NSPLITS)   /* 8-column n-tiles per split: 4 at 32 heads */
-static_assert(IDX_HEADS % 16u == 0u, "the scorer tiles heads by 16");
-static_assert(IDX_WARPS % IDX_MTILES == 0u, "warps must split evenly over the head tiles");
-static_assert((IDX_NTILE / 8u) % IDX_NSPLITS == 0u, "n-tiles must split evenly over the warps");
+/* The M/N split is DERIVED PER INSTANTIATION, not fixed here: the scorer is
+ * templated on the head count, so MTILES/NSPLITS/NT_PER_SPLIT live inside
+ * idx_scores_mxfp4_kernel and each of 32 (2 m-tiles x 4 n-splits of 32 columns,
+ * V4.1) and 64 (4 x 2, V4) gets its own constants and its own static_asserts.
+ * A fixed pair of macros here could only describe one of the two. */
 
 /* (The E4M3 encode helpers idx_f32_to_e4m3 / idx_amax_shift lived here until
  * the e2m1 operand switch: Q staging is a nibble spread now and this TU
@@ -220,6 +218,11 @@ static void idx_expand_q_kernel(
 #ifndef IDX_MINBLK
 #define IDX_MINBLK 3
 #endif
+/* HEADS is the only free parameter: the M is HEADS/16 m-tiles of 16 and the
+ * eight warps divide as (n-split, m-tile), so NSPLITS and the per-split n-tile
+ * count follow from it.  32 heads -> 2 m-tiles x 4 splits of 32 columns (V4.1);
+ * 64 -> 4 x 2 (V4, which L218 dropped). */
+template <uint32_t HEADS>
 __global__ __launch_bounds__(IDX_THREADS, IDX_MINBLK)
 static void idx_scores_mxfp4_kernel(
         float *__restrict__ scores,          /* [n_tokens][n_comp] */
@@ -229,6 +232,12 @@ static void idx_scores_mxfp4_kernel(
         const uint8_t *__restrict__ comp,    /* [n_comp][68] MXKV-FP4 rows */
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t ratio, float scale, int causal) {
+    static_assert(HEADS % 16u == 0u, "the scorer tiles heads by 16");
+    constexpr uint32_t MTILES       = HEADS / 16u;             /* 2 at 32 heads, 4 at 64 */
+    constexpr uint32_t NSPLITS      = IDX_WARPS / MTILES;      /* 4 at 32 heads, 2 at 64 */
+    constexpr uint32_t NT_PER_SPLIT = (IDX_NTILE / 8u) / NSPLITS;  /* 4 at 32 heads, 8 at 64 */
+    static_assert(IDX_WARPS % MTILES == 0u, "warps must split evenly over the head tiles");
+    static_assert((IDX_NTILE / 8u) % NSPLITS == 0u, "n-tiles must split evenly over the warps");
     const uint32_t tile_c = blockIdx.x * IDX_NTILE;
     const uint32_t tok_base = blockIdx.y * IDX_TOKGROUP;
     if (tok_base >= n_tokens) return;
@@ -258,11 +267,11 @@ static void idx_scores_mxfp4_kernel(
      * also capped N at 64, because [64 x 128] f32 would have been 64 KB.
      * Reducing in-register over the warp's own rows and combining warps through
      * a 2 KB partial buffer removes both problems, which is what lets N double. */
-    __shared__ uint8_t sA[IDX_TOKTILE * IDX_HEADS * IDX_ASTRIDE];    /* ~17 KB e4m3 */
+    __shared__ uint8_t sA[IDX_TOKTILE * HEADS * IDX_ASTRIDE];        /* 32 heads: 4.2 KB, 64: 8.4 KB */
     __shared__ __align__(16) uint8_t sB[IDX_NTILE * IDX_BPSTRIDE];   /* 8 KB packed nibbles */
-    __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
+    __shared__ uint8_t sSFA[IDX_TOKTILE * HEADS * IDX_KSLABS];       /* 32: 128 B, 64: 256 B */
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
-    __shared__ float   sPart[IDX_MTILES][IDX_NTILE];       /* one partial row per m-tile */
+    __shared__ float   sPart[MTILES][IDX_NTILE];           /* one partial row per m-tile */
 
     /* ---- stage K ONCE for the whole token group -------------------------- */
     /* ---- stage K: raw copy; the nibble spread moves to the MMA load --------
@@ -317,11 +326,11 @@ static void idx_scores_mxfp4_kernel(
 
     /* ---- stage Q: straight copy of the pre-packed bytes ------------------ */
     {
-        const uint32_t sbytes = ntok * IDX_HEADS * IDX_KSLABS;
-        const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
-        const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
+        const uint32_t sbytes = ntok * HEADS * IDX_KSLABS;
+        const uint8_t *qsrc = qa  + (uint64_t)tok0 * HEADS * IDX_HEAD_DIM;
+        const uint8_t *ssrc = qsf + (uint64_t)tok0 * HEADS * IDX_KSLABS;
         /* row-wise, because the shared stride is padded and the global one is not */
-        for (uint32_t slot = tid; slot < IDX_HEADS * 32u; slot += IDX_THREADS) {
+        for (uint32_t slot = tid; slot < HEADS * 32u; slot += IDX_THREADS) {
             const uint32_t r = slot / 32u;              /* head */
             const uint32_t j = slot % 32u;              /* 32 x uint32 = 128 B */
             uint32_t *dst = (uint32_t *)(sA + r * IDX_ASTRIDE);
@@ -334,13 +343,13 @@ static void idx_scores_mxfp4_kernel(
     __syncthreads();
 
     /* ---- GEMM + fused head reduction ------------------------------------ */
-    /* 8 warps over an IDX_HEADS-row M (IDX_MTILES m-tiles of 16 heads) x 128-col
+    /* 8 warps over a HEADS-row M (MTILES m-tiles of 16 heads) x 128-col
      * N: warp = (n-split, m-tile).  At 32 heads that is 2 m-tiles x 4 n-splits
-     * of 32 columns (V4's 64 heads were 4 x 2). */
-    const uint32_t warp_m = warp % IDX_MTILES;          /* m-tile */
-    const uint32_t warp_n = warp / IDX_MTILES;          /* which N split */
+     * of 32 columns; at 64 (V4) it is 4 x 2. */
+    const uint32_t warp_m = warp % MTILES;              /* m-tile */
+    const uint32_t warp_n = warp / MTILES;              /* which N split */
     const uint32_t m_base = warp_m * 16u;
-    const float *wrow = weights + (uint64_t)tok0 * IDX_HEADS;
+    const float *wrow = weights + (uint64_t)tok0 * HEADS;
     const float wg0 = wrow[m_base + g];
     const float wg1 = wrow[m_base + g + 8u];
 
@@ -357,9 +366,9 @@ static void idx_scores_mxfp4_kernel(
     #ifndef IDX_NB
     #define IDX_NB 4u
     #endif
-    static_assert(IDX_NT_PER_SPLIT % IDX_NB == 0u, "the register block must tile the split");
-    const uint32_t nt_lo = warp_n * IDX_NT_PER_SPLIT;
-    for (uint32_t nt0 = nt_lo; nt0 < nt_lo + IDX_NT_PER_SPLIT; nt0 += IDX_NB) {
+    static_assert(NT_PER_SPLIT % IDX_NB == 0u, "the register block must tile the split");
+    const uint32_t nt_lo = warp_n * NT_PER_SPLIT;
+    for (uint32_t nt0 = nt_lo; nt0 < nt_lo + NT_PER_SPLIT; nt0 += IDX_NB) {
         float d[IDX_NB][4];
         #pragma unroll
         for (uint32_t j = 0; j < IDX_NB; j++) { d[j][0] = d[j][1] = d[j][2] = d[j][3] = 0.f; }
@@ -446,7 +455,7 @@ static void idx_scores_mxfp4_kernel(
         if (comp_i >= n_comp) continue;
         float acc = 0.f;
         #pragma unroll
-        for (uint32_t w = 0; w < IDX_MTILES; w++) acc += sPart[w][c];
+        for (uint32_t w = 0; w < MTILES; w++) acc += sPart[w][c];
         float out = acc * scale;
         if (causal && comp_i >= ((pos0 + tok0 + 1u) / ratio)) out = -INFINITY;
         scores[(uint64_t)tok0 * n_comp + comp_i] = out;
@@ -466,12 +475,14 @@ int pulsar_gpu_indexer_scores_mxfp4(
         float scale, int causal) {
     /* Shape gate, evaluated once per launch -- never per token or per layer. */
     if (!scores || !q || !weights || !comp) return 0;
-    if (n_head != IDX_HEADS || head_dim != IDX_HEAD_DIM) return 0;
+    if (!pulsar_idx_mxfp4_heads_supported(n_head) || head_dim != IDX_HEAD_DIM) return 0;
     if (n_comp == 0u || n_tokens == 0u) return 0;
 
-    /* Pre-pack Q once per token; the scorer then only copies bytes. */
-    const uint64_t qa_bytes  = (uint64_t)n_tokens * IDX_HEADS * IDX_HEAD_DIM;
-    const uint64_t qsf_bytes = (uint64_t)n_tokens * IDX_HEADS * IDX_KSLABS;
+    /* Pre-pack Q once per token; the scorer then only copies bytes.  Every size
+     * below is the RUNTIME head count -- the two instantiations differ in their
+     * internal M/N split, not in the row layout they read. */
+    const uint64_t qa_bytes  = (uint64_t)n_tokens * n_head * IDX_HEAD_DIM;
+    const uint64_t qsf_bytes = (uint64_t)n_tokens * n_head * IDX_KSLABS;
     cuda_arena ar;
     if (!cuda_arena_begin(&ar, ((qa_bytes + 255u) & ~255ull) + qsf_bytes,
                           "indexer mxfp4 Q pack")) return 0;
@@ -482,14 +493,20 @@ int pulsar_gpu_indexer_scores_mxfp4(
     if (!qsf) return 0;   /* take() latches: one check covers both */
 
     /* One warp per (token, head) row, 8 warps per block. */
-    const uint32_t pack_rows = n_tokens * IDX_HEADS;
+    const uint32_t pack_rows = n_tokens * n_head;
     idx_expand_q_kernel<<<(pack_rows + 7u) / 8u, 256>>>(qa, qsf, q, pack_rows);
     if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q expand launch")) return 0;
 
     dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE,
               (n_tokens + IDX_TOKGROUP - 1u) / IDX_TOKGROUP, 1);
-    idx_scores_mxfp4_kernel<<<grid, IDX_THREADS>>>(
-        scores, qa, qsf, weights, (const uint8_t *)comp,
-        n_comp, n_tokens, pos0, ratio, scale, causal);
+    if (n_head == PULSAR_IDX_MXFP4_HEADS_V41) {
+        idx_scores_mxfp4_kernel<PULSAR_IDX_MXFP4_HEADS_V41><<<grid, IDX_THREADS>>>(
+            scores, qa, qsf, weights, (const uint8_t *)comp,
+            n_comp, n_tokens, pos0, ratio, scale, causal);
+    } else {
+        idx_scores_mxfp4_kernel<PULSAR_IDX_MXFP4_HEADS_V4><<<grid, IDX_THREADS>>>(
+            scores, qa, qsf, weights, (const uint8_t *)comp,
+            n_comp, n_tokens, pos0, ratio, scale, causal);
+    }
     return cuda_ok(cudaGetLastError(), "indexer scores mxfp4 launch");
 }
