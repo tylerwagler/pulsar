@@ -66,17 +66,40 @@ __global__ static void csa2_compressor_pool_norm_kernel(
              * row p-ratio read at its SECOND half -- the 2*head_dim projection is
              * split, which is the whole point of the mode.
              *
-             * Group 0 has no previous group, and what stands in for it depends
-             * on where the batch starts: at the sequence start the reference
-             * PADS (kv 0, score -inf), mid-sequence it is the state CARRY.  That
-             * is why pos0 has to reach this kernel; inferring it from the state
-             * alone cannot tell the two apart. */
+             * WHERE those rows live depends on `src`, and the two callers differ
+             * exactly there:
+             *   SRC_ROWS  (batched prefill): a rows array indexed by group, with
+             *             the previous group at g-1.  Group 0 has no previous
+             *             group, and what stands in for it depends on where the
+             *             batch starts: at the sequence start the reference PADS
+             *             (kv 0, score -inf), mid-sequence it is the state CARRY.
+             *             That is why pos0 has to reach this kernel; inferring it
+             *             from the state alone cannot tell the two apart.
+             *   SRC_STATE (per-token update): there is no rows array at all --
+             *             kv/sc are NULL -- because THIS group is the lane's own
+             *             current half.  Position p is then simply lane row p, at
+             *             its first half (p < ratio, the carry the last shift
+             *             left) or its second half (p >= ratio, this group).
+             *             n_groups is 1 here, so g is always 0.
+             * Reading `kv` unconditionally is what a first version did; on the
+             * update path that is a NULL dereference, and it only ever ran on a
+             * device. */
             const uint32_t width = 2u * head_dim;
             const uint32_t npos = 2u * ratio;
+            const bool from_state = src == CSA2_SRC_STATE;
             float sk[8], ss[8];
             for (uint32_t p = 0; p < npos; p++) {
                 const uint32_t r = p % ratio;
-                if (p < ratio) {
+                if (from_state) {
+                    if (p < ratio && pos0 == 0u) {
+                        sk[p] = 0.0f;               /* the sequence start: pad */
+                        ss[p] = -INFINITY;
+                    } else {
+                        const uint32_t off = p < ratio ? 0u : head_dim;
+                        sk[p] = state_kv[(uint64_t)p * width + off + d];
+                        ss[p] = state_sc[(uint64_t)p * width + off + d];
+                    }
+                } else if (p < ratio) {
                     if (g > 0u) {
                         sk[p] = kv[(uint64_t)((g - 1u) * ratio + r) * width + d];
                         ss[p] = sc[(uint64_t)((g - 1u) * ratio + r) * width + d];
