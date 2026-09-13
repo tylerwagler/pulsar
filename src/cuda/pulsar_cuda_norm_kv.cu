@@ -853,6 +853,80 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
     return cuda_ok(cudaGetLastError(), "indexer rope+hadamard+fp4 pack launch");
 }
 
+/* V4's indexer key: the Indexer's OWN compressor end to end --
+ * `Compressor(args, ratio, head_dim = PULSAR_N_INDEXER_HEAD_DIM, rotate=True)`
+ * in the reference.  Each step is an existing, separately gated kernel; the only
+ * thing the reference's forward() adds is their ORDER, which is what this
+ * composes:
+ *
+ *   score += ape[pos % ratio]            (BEFORE the softmax, per group)
+ *   pooled = sum_r kv_r * softmax(score)_r, RMSNorm, bf16-round
+ *   rope the pooled row at its GROUP's position (start_pos + 1 - ratio, or the
+ *        group positions of a whole prompt)
+ *   rotate_activation, then fp4_act_quant
+ *
+ * It lives here rather than beside the CSA2 kernels because the csa2 TU is
+ * compiled standalone by tests/csa2_compressor_kernel_test, which links nothing
+ * else; this entry point needs the rotation, which is a norm_kv symbol.
+ *
+ * Unreachable for a V4.1 artifact: V4.1's index key is a projection of the kv
+ * source's latent, with no rotation and no second compressor. */
+int pulsar_gpu_indexer_compressor_prefill_tensor(
+        pulsar_gpu_tensor       *packed,       /* the layer's index-K pool, MXKV FP4 rows */
+        pulsar_gpu_tensor       *latent,       /* scratch: [n_groups][index_head_dim] f32 */
+        pulsar_gpu_tensor       *state_kv,     /* the indexer's OWN state lane */
+        pulsar_gpu_tensor       *state_score,
+        pulsar_gpu_tensor       *sc,           /* [n_tokens][coff*index_head_dim] f32, ape folded IN PLACE */
+        const pulsar_gpu_tensor *kv,           /* [n_tokens][coff*index_head_dim] f32 */
+        const pulsar_gpu_tensor *ape,          /* [ratio][coff*index_head_dim] f32 */
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                out_row0,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps) {
+    const uint32_t coff = pulsar_compress_coff(ratio);
+    const uint32_t width = coff * head_dim;
+    const uint32_t n_groups = ratio ? n_tokens / ratio : 0u;
+    const uint64_t lane_bytes = (uint64_t)coff * ratio * width * sizeof(float);
+    if (ratio == 0u || width == 0u ||
+        !packed || !latent || !state_kv || !state_score || !sc || !kv || !ape ||
+        state_kv->bytes < lane_bytes || state_score->bytes < lane_bytes ||
+        latent->bytes < (uint64_t)n_groups * head_dim * sizeof(float) ||
+        packed->bytes < ((uint64_t)out_row0 + n_groups) * PULSAR_MXKV_FP4_ROWBYTES(head_dim)) {
+        fprintf(stderr, "pulsar: indexer compressor prefill: bad operands (ratio %u, tokens %u, head_dim %u) -- refusing\n",
+                ratio, n_tokens, head_dim);
+        return 0;
+    }
+    if (n_groups == 0u) return 1;   /* a remainder-only batch produces no row */
+    if (!pulsar_gpu_csa2_comp_ape_add_tensor(sc, ape, width, ratio, pos0, n_tokens)) return 0;
+    if (!pulsar_gpu_csa2_compressor_prefill_tensor(latent, kv, sc, state_kv, state_score,
+                                                   model_map, model_size, norm_offset, norm_type,
+                                                   head_dim, ratio, pos0, n_tokens, rms_eps)) return 0;
+    /* The pooled row for group g was built from positions [pos0+g*ratio,
+     * pos0+(g+1)*ratio), and the reference ropes it at that group's LAST
+     * position (`freqs_cis[start_pos + 1 - ratio]` in the decode branch,
+     * `[:cutoff:ratio]` in the prefill branch) -- hence pos0 + ratio - 1 with a
+     * stride of ratio. */
+    if (!pulsar_gpu_rope_tail_strided_tensor(latent, n_groups, head_dim, n_rot,
+                                             pos0 + ratio - 1u, ratio, n_ctx_orig,
+                                             freq_base, freq_scale, ext_factor, attn_factor,
+                                             beta_fast, beta_slow)) return 0;
+    return pulsar_gpu_dsv4_indexer_qat_pack_tensor(latent, packed, out_row0, n_groups, head_dim, false);
+}
+
 
 int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {

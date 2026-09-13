@@ -1494,6 +1494,35 @@ bool gpu_graph_alloc_raw_cap(
                                     gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows);
                 }
             }
+            /* V4 ONLY: the indexer's OWN compressor lane (see the struct note).
+             * Same two authorities, the indexer's head dim -- so a geometry
+             * change cannot leave the two lanes disagreeing.  Absent on a V4.1
+             * artifact (indexer_own_compressor is false): nothing would write it,
+             * and an unwritten lane that a payload still serializes is a file
+             * full of whatever the allocator handed back. */
+            if (g_pulsar_shape.indexer_own_compressor && indexed && attn_rows != 0u) {
+                if (banked) {
+                    /* The bank slab carries askv/assc but no index twin yet, and
+                     * handing a per-bank caller ONE lane would have every bank
+                     * share the indexer's carry -- a wrong answer, not a crash.
+                     * Refuse by name until the twin lands. */
+                    fprintf(stderr, "pulsar: layer %u: banked mode has no indexer-compressor state lane yet "
+                                    "(%u banks) -- refusing\n", il, g->banks.n_banks);
+                    state_init_ok = false;
+                } else {
+                    const uint64_t index_state_bytes =
+                            pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
+                            pulsar_comp_state_rows(attn->ratio) * sizeof(float);
+                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                    g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                    state_init_ok = state_init_ok && g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+                    if (state_init_ok) {
+                        const uint64_t n = index_state_bytes / sizeof(float);
+                        state_init_ok = gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) &&
+                                        gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, n);
+                    }
+                }
+            }
         }
     }
     /* f32 staging: the compressor writes real f32 rows here, then the commit

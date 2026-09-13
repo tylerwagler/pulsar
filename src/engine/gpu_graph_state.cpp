@@ -122,6 +122,10 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
+        pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
+    }
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
     }

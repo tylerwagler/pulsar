@@ -970,6 +970,16 @@ typedef struct {
     pulsar_gpu_tensor *layer_attn_state_kv[PULSAR_MAX_LAYER];    ///< per ratio>1 kv source, compressor accumulator KV half: the group being built (ratio rows x head_dim f32)
     pulsar_gpu_tensor *layer_attn_state_score[PULSAR_MAX_LAYER]; ///< compressor accumulator, score half
     pulsar_gpu_tensor *layer_index_comp_cache[PULSAR_MAX_LAYER]; ///< per kv source, index-K rows derived from the emitted latent
+    /** V4 ONLY: the indexer's OWN compressor accumulator (`indexer_own_compressor`),
+     * one lane per indexed ratio>1 source.  V4 builds `Compressor(..., head_dim=
+     * PULSAR_N_INDEXER_HEAD_DIM, rotate=True)` INSIDE the Indexer, so the index
+     * key is pooled from its own weights and is not the kv source's latent the
+     * way V4.1's is; the lane is therefore a SECOND lane, sized by the same two
+     * authorities at the indexer's head dim (`pulsar_comp_row_width(ratio, 128)`
+     * x `pulsar_comp_state_rows(ratio)` = 8x256 floats at ratio 4).  NULL on a
+     * V4.1 artifact: nothing would ever write it. */
+    pulsar_gpu_tensor *layer_index_state_kv[PULSAR_MAX_LAYER];    ///< indexer compressor accumulator, KV half
+    pulsar_gpu_tensor *layer_index_state_score[PULSAR_MAX_LAYER]; ///< indexer compressor accumulator, score half
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the

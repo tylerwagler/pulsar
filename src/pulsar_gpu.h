@@ -1187,6 +1187,44 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
         float             beta_slow,
         const pulsar_gpu_tensor *positions);
 
+/** V4's indexer key, end to end: the ape fold, the gated pooling + RMSNorm, the
+ * rope at each group's position, then the rotation and fp4 pack above.  This is
+ * `Compressor(args, ratio, head_dim = PULSAR_N_INDEXER_HEAD_DIM, rotate=True)`
+ * as the Indexer uses it -- a SECOND compressor with its own weights, its own
+ * state lane and its own output pool, not the kv source's latent (which is what
+ * V4.1's index key is).
+ *
+ * Every step is an existing kernel; the ORDER is the whole content.  `sc` is
+ * modified in place (the ape fold is the reference's `score += self.ape`).
+ *
+ * @return nonzero on success, 0 on bad operands or a failed launch. */
+int pulsar_gpu_indexer_compressor_prefill_tensor(
+        pulsar_gpu_tensor       *packed,
+        pulsar_gpu_tensor       *latent,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        pulsar_gpu_tensor       *sc,
+        const pulsar_gpu_tensor *kv,
+        const pulsar_gpu_tensor *ape,
+        const void              *model_map,
+        uint64_t                 model_size,
+        uint64_t                 norm_offset,
+        uint32_t                 norm_type,
+        uint32_t                 out_row0,
+        uint32_t                 head_dim,
+        uint32_t                 ratio,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens,
+        uint32_t                 n_rot,
+        uint32_t                 n_ctx_orig,
+        float                    freq_base,
+        float                    freq_scale,
+        float                    ext_factor,
+        float                    attn_factor,
+        float                    beta_fast,
+        float                    beta_slow,
+        float                    rms_eps);
+
 /** As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
  * half of the attn-output "a" activation: the fp16 attention epilogue emits
