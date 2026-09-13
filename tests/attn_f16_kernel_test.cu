@@ -79,13 +79,31 @@ int main(int argc, char **argv) {
      * subtly wrong and it is invisible in the output magnitude. */
     const uint32_t top_k    = (argc > 7) ? (uint32_t)atoi(argv[7]) : 0u;
     const uint32_t raw_cap  = (argc > 8) ? (uint32_t)atoi(argv[8]) : 0u;
+    /* argv[9] == "vis": arm the L216 image-span VISIBILITY.  A synthetic span
+     * [n/4, 3n/4] gives every in-span query a FORWARD reach past the causal
+     * window, so an oracle/plan that ignored vis_right, or one that kept the
+     * window-sized raw span and only clamped its ends, is caught here -- this is
+     * the lane the prefill attention now takes for an image request. */
+    const int vis_mode = (argc > 9 && argv[9][0] == 'v');
     const uint32_t D = AF16_DIM;
 
     printf("attn f16 kernel test: n_tokens=%u window=%u n_head=%u head_dim=%u"
-           " n_comp=%u ratio=%u\n\n", n_tokens, window, n_head, D, n_comp, ratio);
+           " n_comp=%u ratio=%u vis=%d\n\n", n_tokens, window, n_head, D, n_comp, ratio, vis_mode);
 
     std::mt19937_64 rng(20260808);
     std::normal_distribution<double> nd(0.0, 1.0);
+
+    /* The synthetic image span: left = distance back to the span's first slot,
+     * right = distance forward to its last -- the reference's get_image_visible
+     * counts, which are 0 outside a span. */
+    std::vector<int32_t> vleft((size_t)n_tokens, 0), vright((size_t)n_tokens, 0);
+    if (vis_mode) {
+        const uint32_t a = n_tokens / 4u, b = (3u * n_tokens) / 4u;
+        for (uint32_t i = a; i <= b; i++) {
+            vleft[i] = (int32_t)(i - a);
+            vright[i] = (int32_t)(b - i);
+        }
+    }
 
     std::vector<float> q((size_t)n_tokens * n_head * D), kv((size_t)n_tokens * D),
                        ckv((size_t)(n_comp ? n_comp : 1u) * D),
@@ -155,22 +173,57 @@ int main(int argc, char **argv) {
             if (n_raw != 0u) {
                 const uint32_t last = first_raw_pos + n_raw - 1u;
                 if (qpos >= first_raw_pos) {
-                    uint32_t lo = first_raw_pos;
-                    if (window != 0u && qpos + 1u > window) {
-                        const uint32_t wlo = qpos + 1u - window;
-                        if (wlo > lo) lo = wlo;
+                    if (vis_mode) {
+                        /* Kernel's scalar-ring visibility plan: widen around the
+                         * query, clamp to the ring the launcher stored, and fold
+                         * exactly [lo, hi] (rfirst is 0 by construction). */
+                        uint32_t lo = (window != 0u && qpos + 1u > window) ? qpos + 1u - window : 0u;
+                        if (vleft[t] > 0) {
+                            const uint32_t v = (uint32_t)vleft[t];
+                            const uint32_t vlo = v <= qpos ? qpos - v : 0u;
+                            if (vlo < lo) lo = vlo;
+                        }
+                        uint32_t hi = qpos + (vright[t] > 0 ? (uint32_t)vright[t] : 0u);
+                        if (lo < first_raw_pos) lo = first_raw_pos;
+                        if (hi > last) hi = last;
+                        /* The kernel keeps first_raw_pos = lo for the visibility
+                         * plan, so its row base is lo's ring slot and rfirst is
+                         * 0.  The ring is position-indexed (slot = pos % cap). */
+                        rfirst = lo % rcap;
+                        rc = hi >= lo ? hi - lo + 1u : 0u;
+                    } else {
+                        uint32_t lo = first_raw_pos;
+                        if (window != 0u && qpos + 1u > window) {
+                            const uint32_t wlo = qpos + 1u - window;
+                            if (wlo > lo) lo = wlo;
+                        }
+                        const uint32_t hi = qpos < last ? qpos : last;
+                        if (hi >= lo) { rfirst = lo - first_raw_pos; rc = hi - lo + 1u; }
                     }
-                    const uint32_t hi = qpos < last ? qpos : last;
-                    if (hi >= lo) { rfirst = lo - first_raw_pos; rc = hi - lo + 1u; }
-                    if (rc > 256u) rc = 256u;
+                    if (rc > AF16_RAWROWS) rc = AF16_RAWROWS;
                 }
             }
             cnt = rc;
             if (ratio) { vis = (qpos + 1u) / ratio; if (vis > n_comp) vis = n_comp; }
             ccnt = use_topk ? (top_k < vis ? top_k : vis) : vis;
         } else {
-            cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
-            start = t + 1u - cnt;
+            if (vis_mode) {
+                /* Kernel's dense visibility plan: the chunk's own rows, so the
+                 * helper's absolute bounds ARE row indices. */
+                uint32_t lo = (window != 0u && t + 1u > window) ? t + 1u - window : 0u;
+                if (vleft[t] > 0) {
+                    const uint32_t v = (uint32_t)vleft[t];
+                    const uint32_t vlo = v <= t ? t - v : 0u;
+                    if (vlo < lo) lo = vlo;
+                }
+                uint32_t hi = t + (vright[t] > 0 ? (uint32_t)vright[t] : 0u);
+                if (hi >= n_tokens) hi = n_tokens - 1u;
+                cnt = hi >= lo ? hi - lo + 1u : 0u;
+                start = lo;
+            } else {
+                cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
+                start = t + 1u - cnt;
+            }
             if (n_comp && ratio) { ccnt = (t + 1u) / ratio; if (ccnt > n_comp) ccnt = n_comp; }
         }
         const uint32_t tot = cnt + ccnt;
@@ -255,13 +308,24 @@ int main(int argc, char **argv) {
         cudaMalloc(&dtk, tk.size() * 4);
         cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
     }
+    int32_t *dvl = NULL, *dvr = NULL;
+    if (vis_mode) {
+        cudaMalloc(&dvl, (size_t)n_tokens * sizeof(int32_t));
+        cudaMalloc(&dvr, (size_t)n_tokens * sizeof(int32_t));
+        cudaMemcpy(dvl, vleft.data(), (size_t)n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(dvr, vright.data(), (size_t)n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    }
     /* L210: an indexed case runs twice -- the classic whole-window walk (no
      * decode rows) and the split-K path (every row a decode row: 4 logical
      * splits, partials, combine) -- against the same oracle and bar.  The two
      * reach the bf16 rounding boundary from different f32 fold orders, so they
-     * are not byte-identical to each other; both must be within the bar. */
+     * are not byte-identical to each other; both must be within the bar.  The
+     * visibility plan is a PREFILL plan and the split-K walk has no visibility
+     * arithmetic, so a vis case runs the classic walk only (the launcher refuses
+     * the combination, which the launch check below would surface). */
     int overall = 1;
-    for (int split_mode = 0; split_mode < (indexed ? 2 : 1); split_mode++) {
+    const int n_modes = (indexed && !vis_mode) ? 2 : 1;
+    for (int split_mode = 0; split_mode < n_modes; split_mode++) {
     g_decode_rows = split_mode ? (int)n_tokens : 0;
     const char *mode_label = split_mode ? "split-K (decode rows)" : "classic walk";
     std::fill(out.begin(), out.end(), -12345.f);
@@ -272,11 +336,13 @@ int main(int argc, char **argv) {
                                            (const pulsar_attn_pack_t *)dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
-                                           NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL)
+                                           NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL,
+                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
                                            n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,
-                                           n_head, D, NULL);
+                                           n_head, D, NULL,
+                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
@@ -290,12 +356,12 @@ int main(int argc, char **argv) {
         const int iters = 20;
         for (int i = 0; i < 3; i++)
             pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, NULL);
+                                             n_tokens, n_comp, window, ratio, n_head, D, NULL, NULL, NULL);
         cudaDeviceSynchronize();
         cudaEventRecord(e0);
         for (int i = 0; i < iters; i++)
             pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, NULL);
+                                             n_tokens, n_comp, window, ratio, n_head, D, NULL, NULL, NULL);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
         printf("timing: %.4f ms/launch  (n_tokens=%u window=%u n_head=%u)\n",

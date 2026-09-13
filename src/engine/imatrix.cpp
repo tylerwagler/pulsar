@@ -365,6 +365,11 @@ static bool gpu_graph_seed_chunk_hc(pulsar_gpu_graph *g, const pulsar_model *mod
     if (!gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc, g->prefill_tokens,
                                                model, weights, prompt, start, n_tokens))
         return false;
+    /* L216: the chunk's image-span visibility, once, before any layer's
+     * attention runs.  No image request -> no-op; a text chunk -> token count 0,
+     * so every attention launch below takes its NULL path unchanged. */
+    if (!gpu_graph_upload_vision_visible(g, prompt->v, prompt->len, start, n_tokens))
+        return false;
     return gpu_graph_merge_image_spans(g->batch_cur_hc, model, prompt->v, prompt->len,
                                        g->vision_req, start, n_tokens);
 }

@@ -388,6 +388,8 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 5 20    # indexed + ring raw rows
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_kernel_test 1 16 32 x 12 1 5 20     # ONE-row indexed launch (L166: n_tokens==1 is the same kernel)
+	./tests/attn_f16_kernel_test 48 16 32 x 0 0 0 0 vis   # L216 image-span visibility, dense prefill plan
+	./tests/attn_f16_kernel_test 48 16 32 x 0 0 0 48 vis  # L216 image-span visibility, scalar-ring plan
 	./tests/attn_f16_banked_test
 	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 	./tests/vision_hc_gate

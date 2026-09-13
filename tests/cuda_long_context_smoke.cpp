@@ -872,7 +872,7 @@ static int mb_run_case(const char *label,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, top_k, window, ratio, n_head, head_dim,
                     positions, seq_id, NULL, comp_cap, n_banks,
-                                          NULL /* q pre-normed */);
+                                          NULL /* q pre-normed */, NULL, NULL /* no visibility */);
         } else {
             ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                     heads, sinks, (uint64_t)n_head * sizeof(float), 0,
@@ -953,7 +953,7 @@ static int mb_run_case(const char *label,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, top_k, window, ratio, n_head, head_dim,
                         NULL, NULL, NULL, 0, 1,
-                                          NULL /* q pre-normed */);
+                                          NULL /* q pre-normed */, NULL, NULL /* no visibility */);
             } else {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                         h_ref, sinks, (uint64_t)n_head * sizeof(float), 0,

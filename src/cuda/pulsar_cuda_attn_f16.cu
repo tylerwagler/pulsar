@@ -102,6 +102,18 @@ static_assert(AF16_HEADS == 16u,
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
 
+/* Capacity of the per-query raw-row scratch (sRawRows).  A sliding-window plan
+ * never asks for more than PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP rows (the
+ * dispatcher caps `window` there), but the image-span visibility widens one
+ * query's reach to [q - left, q + right] with left <= max_image_tokens-1 and
+ * right <= max_image_tokens (vision_image_visible's clamps), i.e. at most
+ * 2*max_image_tokens + 1 rows.  The scratch must hold whichever is larger; a
+ * plan that asked for more would be clipped here, and clipping an image span is
+ * exactly the wrong answer this bound exists to make impossible. */
+#define AF16_RAWROWS  (2u * PULSAR_VISION_MAX_N_TOKEN + 1u)
+static_assert(AF16_RAWROWS >= PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP,
+              "sRawRows must also cover the dispatcher's raw-window cap");
+
 /* WHY 2 M-TILES.  ncu on the 1-M-tile version: pipe_tensor 6-8%, pipe_lsu 33%,
  * 7.15 GB of L2 traffic in 11.9 ms -- the MMAs idle while the kernel moves KV.
  * Each block stages the whole window (up to 640 rows x 2 KB) and there were 4
@@ -239,6 +251,31 @@ __device__ static inline uint32_t af16_pack_qraw(
     return af16_pack(x0, x1);
 }
 
+/* The raw range ONE query sees, in ABSOLUTE positions, with the image-span
+ * visibility folded in.  vis_l/vis_r are the reference's per-query `left`/
+ * `right` counts (0 outside a sentinel span); a query inside a span reaches
+ * `vis_l` back to the span's first slot and `vis_r` forward to its IMAGE_END,
+ * on top of the ordinary sliding window.  With both 0 the bounds degenerate to
+ *   lo = qpos + 1 - window   (window == 0 = unbounded -> 0)
+ *   hi = qpos
+ * which is exactly the pre-L216 window.  This is the ONE place that min/max
+ * lives: the ring plan and the dense plan both call it, so the forward reach
+ * cannot be forgotten in one of them. */
+__device__ __forceinline__ static void af16_vis_bounds(
+        uint32_t qpos, uint32_t window, int32_t vis_l, int32_t vis_r,
+        uint32_t *lo_out, uint32_t *hi_out) {
+    uint32_t lo = (window != 0u && qpos + 1u > window) ? qpos + 1u - window : 0u;
+    if (vis_l > 0) {
+        const uint32_t vl = (uint32_t)vis_l;
+        const uint32_t vlo = vl <= qpos ? qpos - vl : 0u;
+        if (vlo < lo) lo = vlo;
+    }
+    uint32_t hi = qpos;
+    if (vis_r > 0) hi = qpos + (uint32_t)vis_r;
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
 template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
@@ -268,6 +305,14 @@ static void attn_f16_kernel(
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks,
+        /* Image-span visibility: per-query counts to the left and right of the
+         * query (the reference's get_image_visible), indexed by this launch's
+         * OWN token axis, or NULL for every text-only launch.  Non-NULL widens
+         * one query's raw reach on BOTH sides -- the ring plan enlarges its
+         * span, the dense plan replaces its window -- because an image span is
+         * the one bidirectional region.  See af16_vis_bounds.  Both are NULL or
+         * both are set (the wrappers refuse a half pair). */
+        const int32_t *__restrict__ vis_left, const int32_t *__restrict__ vis_right,
         int ring,                         /* ring/descriptor row plan; topk may
                                            * be NULL -> visible comp prefix */
         int non_causal,                   /* ring mode only: a query sees every
@@ -307,6 +352,7 @@ static void attn_f16_kernel(
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
+    (void)vis_left; (void)vis_right;
     (void)ring; (void)non_causal;
     (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
     (void)n_groups; (void)n_nope;
@@ -382,7 +428,7 @@ static void attn_f16_kernel(
      * draft position, window = raw_cap) derives the same window either way;
      * the scalar launch (pos0 = the first query's position, n_raw = the
      * visible rows) is where the two rules differ. */
-    __shared__ uint32_t sRawRows[256];
+    __shared__ uint32_t sRawRows[AF16_RAWROWS];
     __shared__ uint32_t sRawCount, sRawFirst;
     __shared__ uint32_t sVisComp;
     uint32_t raw_count, raw_start = 0u, comp_count = 0u;
@@ -392,12 +438,46 @@ static void attn_f16_kernel(
         /* Descriptor (banked) preamble; NULL descriptors collapse to the
          * scalar pos0+t path. */
         const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+        /* Image-span visibility for THIS row, or 0/0 for a text launch.  The
+         * two arrays are a pair (the wrappers refuse a half pair), and the
+         * launch's token axis is this kernel's own t. */
+        const uint32_t vis_l = vis_left ? (vis_left[t] > 0 ? (uint32_t)vis_left[t] : 0u) : 0u;
+        const uint32_t vis_r = vis_right ? (vis_right[t] > 0 ? (uint32_t)vis_right[t] : 0u) : 0u;
         uint32_t eff_n_raw = n_raw, eff_raw_start = raw_start_in, first_raw_pos;
+        uint32_t vis_hi = 0u;   /* visibility path: the last raw position this query reaches */
         if (positions) {
-            eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-            if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-            eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
-            first_raw_pos = qpos + 1u - eff_n_raw;
+            if (vis_left) {
+                /* An image query replaces the window-derived span with the
+                 * span's own reach [qpos - left, qpos + right].  Enlarging
+                 * eff_n_raw HERE is what makes the forward rows addressable:
+                 * the plan below folds exactly [first_raw_pos, vis_hi], and a
+                 * rows table sized for the plain window would not hold them. */
+                af16_vis_bounds(qpos, window, (int32_t)vis_l, (int32_t)vis_r,
+                                &first_raw_pos, &vis_hi);
+                eff_n_raw = vis_hi - first_raw_pos + 1u;
+                eff_raw_start = first_raw_pos % raw_cap;
+            } else {
+                eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+                if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+                eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+                first_raw_pos = qpos + 1u - eff_n_raw;
+            }
+        } else if (vis_left) {
+            /* Scalar ring: n_raw says how much of the ring the launcher stored.
+             * Widen around the query but never past either end of that live
+             * range -- the HOST refuses a span needing more than the ring
+             * holds, so this clamp can only be reached by a caller that
+             * bypassed the host, and it must not address a foreign row. */
+            uint32_t lo, hi;
+            af16_vis_bounds(qpos, window, (int32_t)vis_l, (int32_t)vis_r, &lo, &hi);
+            const uint32_t first = pos0 + n_tokens - n_raw;
+            const uint32_t last = pos0 + n_tokens - 1u;
+            if (lo < first) lo = first;
+            if (hi > last) hi = last;
+            eff_n_raw = hi >= lo ? hi - lo + 1u : 0u;
+            eff_raw_start = eff_n_raw ? lo % raw_cap : 0u;
+            first_raw_pos = lo;
+            vis_hi = hi;
         } else {
             first_raw_pos = pos0 + n_tokens - n_raw;
         }
@@ -410,15 +490,30 @@ static void attn_f16_kernel(
             if (eff_n_raw != 0u) {
                 const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
                 if (qpos >= first_raw_pos) {
-                    uint32_t lo = first_raw_pos;
-                    if (window != 0u && qpos + 1u > window) {
-                        const uint32_t wlo = qpos + 1u - window;
-                        if (wlo > lo) lo = wlo;
+                    uint32_t lo, hi;
+                    if (vis_left) {
+                        /* first_raw_pos IS the lower bound the helper chose;
+                         * re-raising it to the plain window would drop the
+                         * backward reach the span needs. */
+                        lo = first_raw_pos;
+                        hi = non_causal ? raw_last_pos
+                                        : (vis_hi < raw_last_pos ? vis_hi : raw_last_pos);
+                    } else {
+                        lo = first_raw_pos;
+                        if (window != 0u && qpos + 1u > window) {
+                            const uint32_t wlo = qpos + 1u - window;
+                            if (wlo > lo) lo = wlo;
+                        }
+                        hi = non_causal ? raw_last_pos
+                                        : (qpos < raw_last_pos ? qpos : raw_last_pos);
                     }
-                    const uint32_t hi = non_causal ? raw_last_pos
-                                      : (qpos < raw_last_pos ? qpos : raw_last_pos);
                     if (hi >= lo) { rf = lo - first_raw_pos; rc = hi - lo + 1u; }
-                    if (rc > 256u) rc = 256u;
+                    /* A text row's window is capped at RAW_SCORE_CAP by the
+                     * dispatcher, so this is the pre-L216 cap unchanged; the
+                     * image-span plan may use the whole scratch. */
+                    const uint32_t rows_cap = vis_left ? AF16_RAWROWS
+                                                       : PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP;
+                    if (rc > rows_cap) rc = rows_cap;
                 }
             }
             sRawCount = rc; sRawFirst = rf;
@@ -438,8 +533,23 @@ static void attn_f16_kernel(
         sVisComp = visible_comp;
         __syncthreads();
     } else {
-        raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
-        raw_start = t + 1u - raw_count;
+        if (vis_left) {
+            /* Dense prefill: the raw rows are the chunk's own tokens, so the
+             * helper's absolute bounds ARE row indices -- the forward reach is
+             * the whole point, since a query mid-span must see the rest of it.
+             * Clamp the top to the chunk: the host refuses a span that would
+             * reach past it. */
+            const uint32_t vis_l = vis_left[t] > 0 ? (uint32_t)vis_left[t] : 0u;
+            const uint32_t vis_r = vis_right[t] > 0 ? (uint32_t)vis_right[t] : 0u;
+            uint32_t lo, hi;
+            af16_vis_bounds((uint32_t)t, window, (int32_t)vis_l, (int32_t)vis_r, &lo, &hi);
+            if (hi >= n_tokens) hi = n_tokens - 1u;
+            raw_start = lo;
+            raw_count = hi >= lo ? hi - lo + 1u : 0u;
+        } else {
+            raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+            raw_start = t + 1u - raw_count;
+        }
         if (n_comp != 0u && ratio != 0u) {
             comp_count = (t + 1u) / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
@@ -459,8 +569,9 @@ static void attn_f16_kernel(
 
     /* __align__(16) is REQUIRED by the ldmatrix in phase 3: it loads 8 x 16 bits
      * per lane and the address must be 16-byte aligned.  A __half array is only
-     * 2-byte aligned by default, and this one follows sRawRows[256] plus three
-     * uint32_t, so its natural offset is 1036 -- misaligned by 12. */
+     * 2-byte aligned by default, and this one follows sRawRows[AF16_RAWROWS]
+     * plus three uint32_t -- 4*(AF16_RAWROWS + 3) bytes in, not a multiple of
+     * 16 -- so the explicit alignment is load-bearing. */
     __shared__ __align__(16) __half sKV[AF16_ROWS * AF16_KVSTRIDE];
     __shared__ float  sPart[4][AF16_MT][AF16_HEADS][AF16_ROWS];  /* k-split partials */
     __shared__ float  sS[AF16_HPB][AF16_ROWS];
@@ -1168,10 +1279,16 @@ int pulsar_gpu_attention_f16_prefill_mx(
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok,
-        const int *positions, const pulsar_gpu_q_prep *q_prep) {
+        const int *positions, const pulsar_gpu_q_prep *q_prep,
+        /* vis_left/vis_right: int32 [n_tokens] DEVICE arrays of the image-span
+         * counts (the reference's get_image_visible), or NULL/NULL for a text
+         * launch.  A half pair is refused rather than guessed at. */
+        const int *vis_left, const int *vis_right) {
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     AF16_REQUIRE("prefill", heads && sinks && q && raw_kv, "heads=%d sinks=%d q=%d raw_kv=%d",
                  heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL);
+    AF16_REQUIRE("prefill", (vis_left != NULL) == (vis_right != NULL),
+                 "vis_left=%d vis_right=%d", vis_left != NULL, vis_right != NULL);
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {
@@ -1219,7 +1336,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
-                                            (const int32_t *)positions, NULL, NULL, 0u, 1u, 0, 0,
+                                            (const int32_t *)positions, NULL, NULL, 0u, 1u,
+                                            (const int32_t *)vis_left, (const int32_t *)vis_right, 0, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
                                             gact_kbp, gact_slab, n_groups, n_nope,
@@ -1255,7 +1373,7 @@ static_assert(std::is_same<
         int(void *, const float *, const void *,
             const pulsar_attn_pack_t *, const pulsar_attn_pack_t *,
             uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-            const pulsar_gpu_q_prep *)>::value,
+            const pulsar_gpu_q_prep *, const int *, const int *)>::value,
     "pulsar_gpu.h's pulsar_gpu_attention_f16_prefill has drifted from the "
     "definition below; update the header -- do not add an overload");
 
@@ -1264,12 +1382,13 @@ int pulsar_gpu_attention_f16_prefill(
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
-        const pulsar_gpu_q_prep *q_prep) {
+        const pulsar_gpu_q_prep *q_prep,
+        const int *vis_left, const int *vis_right) {
     return pulsar_gpu_attention_f16_prefill_mx(heads_v, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
                                                n_head, head_dim,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
-                                               NULL, q_prep);
+                                               NULL, q_prep, vis_left, vis_right);
 }
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
@@ -1291,13 +1410,22 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks, uint32_t non_causal,
-        const pulsar_gpu_q_prep *q_prep) {
+        const pulsar_gpu_q_prep *q_prep,
+        /* vis_left/vis_right: see the prefill_mx entry.  Indexed by this
+         * launch's own token axis, exactly like positions. */
+        const int *vis_left, const int *vis_right) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     AF16_REQUIRE("indexed", heads && sinks && q && raw_kv && comp_kv,
                  "heads=%d sinks=%d q=%d raw_kv=%d comp_kv=%d",
                  heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL, comp_kv != NULL);
+    AF16_REQUIRE("indexed", (vis_left != NULL) == (vis_right != NULL),
+                 "vis_left=%d vis_right=%d", vis_left != NULL, vis_right != NULL);
+    /* Vision is a PREFILL feature (the reference's window matrix) and its plan
+     * ignores non_causal; the two rules together are not a shape this kernel
+     * serves, so refuse rather than silently pick one. */
+    AF16_REQUIRE("indexed", !vis_left || non_causal == 0u, "vis with non_causal=%u", non_causal);
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {
@@ -1331,9 +1459,10 @@ int pulsar_gpu_attention_f16_indexed(
     /* a table with no budget is a bug */
     AF16_REQUIRE("indexed", !topk || top_k != 0u, "topk=%d top_k=%u", topk != NULL, top_k);
     /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
-     * is what sRawRows[256] must hold; the kernel caps it at 256
-     * (PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP, which the dispatcher's descriptor
-     * check enforces on `window`). */
+     * is what sRawRows[AF16_RAWROWS] must hold; the kernel caps it there.  The
+     * sliding-window plans stay under the smaller dispatcher window cap
+     * (PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP); the image-span reach is what needs
+     * the rest -- see the AF16_RAWROWS note. */
     AF16_REQUIRE("indexed", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
     AF16_REQUIRE("indexed", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
     /* L210: the leading DECODE rows of this batch split their key walk
@@ -1344,6 +1473,10 @@ int pulsar_gpu_attention_f16_indexed(
      * launch keep the classic walk on z == 0, byte for byte. */
     const int dec_rows = pulsar_gpu_matmul_batch_decode_rows();
     const uint32_t n_dec = dec_rows > 0 ? min((uint32_t)dec_rows, n_tokens) : 0u;
+    /* The split-K walk folds a row's raw window without the visibility plan
+     * (decode rows never carry one); a launch asking for both is a shape this
+     * kernel does not serve. */
+    AF16_REQUIRE("indexed", !vis_left || n_dec == 0u, "vis with %u split-K decode rows", n_dec);
     uint32_t n_phys = 1u;
     float *partials = NULL;
     if (n_dec != 0u) {
@@ -1371,7 +1504,8 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u, 1,
+                                            positions ? n_banks : 1u,
+                                            (const int32_t *)vis_left, (const int32_t *)vis_right, 1,
                                             non_causal != 0u,
                                             NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                             qp, q_prep != NULL,

@@ -470,7 +470,15 @@ int pulsar_gpu_attention_f16_prefill_mx(
          * for the fused Q rope only (positions[t] instead of t); the row plan is
          * the batch's own causal window either way. */
         const int *positions,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility: int32 [n_tokens] DEVICE arrays of the
+         * reference's get_image_visible() counts, or NULL/NULL (the text-only
+         * path, bit-identical to the pre-L216 kernel).  Non-NULL makes an image
+         * query see [q - vis_left[q], q + vis_right[q]] -- a FORWARD reach the
+         * plain causal window cannot express.  A half pair or a visibility
+         * launch mixed with non_causal is refused. */
+        const int *vis_left,
+        const int *vis_right);
 
 int pulsar_gpu_attention_f16_prefill(
         /* heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes per
@@ -497,7 +505,9 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const int               *vis_left,
+        const int               *vis_right);
 
 /** fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
@@ -542,7 +552,12 @@ int pulsar_gpu_attention_f16_indexed(
          * (the drafter's raw-window forward).  Only WHICH rows are visible
          * changes; compressed-row visibility and the fold are the same. */
         uint32_t                non_causal,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility: see pulsar_gpu_attention_f16_prefill_mx.  The
+         * arrays are indexed by this launch's own token axis (like positions),
+         * so a caller launching a sub-span offsets them by its first row. */
+        const int               *vis_left,
+        const int               *vis_right);
 
 /** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
@@ -1356,7 +1371,12 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope, int *mx_out,
-        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility (L216): int32 [n_tokens] DEVICE tensor slices of
+         * get_image_visible()'s left/right counts, or NULL/NULL for a text
+         * chunk.  Non-NULL gives an image query a FORWARD reach the causal
+         * window cannot express; see the f16 entry for the exact range. */
+        const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right);
 
 int pulsar_gpu_attention_prefill_raw_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1369,7 +1389,8 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right);
 
 /** Batched decode attention.  The trailing descriptor quad enables multi-
  * session banked mode: positions/seq_id are int32 [n_tokens] DEVICE arrays
@@ -1473,7 +1494,9 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right);
 
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1501,7 +1524,9 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right);
 
 
 int pulsar_gpu_attention_output_batch_tensor(

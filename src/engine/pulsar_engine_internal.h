@@ -1117,6 +1117,14 @@ typedef struct {
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
     pulsar_gpu_tensor *prefill_tokens;
+    /** L216 image-span visibility for the CURRENT prefill chunk: `prefill_cap`
+     * int32 left counts followed by `prefill_cap` int32 right counts (the
+     * reference's get_image_visible).  Uploaded once per chunk by
+     * gpu_graph_upload_vision_visible; vision_visible_tokens is 0 unless THIS
+     * chunk carries sentinel ids, which is what keeps every text prefill on the
+     * NULL path it took before. */
+    pulsar_gpu_tensor *vision_visible;
+    uint32_t           vision_visible_tokens;
     pulsar_gpu_tensor *batch_cur_hc;                ///< batched twin: HC residual carrier
     pulsar_gpu_tensor *batch_next_hc;               ///< batched twin: HC residual for the next layer (swapped with batch_cur_hc each layer)
     pulsar_gpu_tensor *batch_flat_hc;               ///< batched twin: HC streams flattened for the mix GEMV
@@ -2898,6 +2906,16 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *
                                  const int32_t *ids, int n_ids,
                                  const pulsar_vision_request *vr,
                                  uint32_t pos0, uint32_t n_tokens);
+/** Compute THIS chunk's image-span visibility and upload it to
+ * g->vision_visible, once per chunk, before any layer's attention runs.  A
+ * chunk with no sentinel id (every text chunk, and every chunk of an image
+ * request that is not the first) leaves g->vision_visible_tokens == 0, which is
+ * what keeps the text path bit-identical: the attention entries then receive
+ * NULL pointers.  Refuses (returns false) a visibility span that cannot be
+ * addressed in one pass rather than clipping it.  A no-op when the graph has no
+ * borrowed image request. */
+bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
+                                     int n_ids, uint32_t start, uint32_t n_tokens);
 
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
