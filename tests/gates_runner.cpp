@@ -27,11 +27,14 @@
  *
  * usage: tests/gates_runner MODEL --prefill-baseline BLOB --prefill-ref SHORT
  *          [--ref-dir DIR] [--ref-tol TOL] [--kl-story FILE] [--kl-code FILE]
- *          [--only name,name,...] [--shape]
+ *          [--only=a,b | --only a,b] [--except=a,b] [--shape]
  * Exit 0 only when every gate passed.  Prints a per-gate time table (all of
  * them, slowest first) and the number of engine opens.  --shape adds the work
  * shape each gate actually ran (prefill chunks, step calls/rows, deepest
- * position), read from the graph funnels; it changes nothing else.
+ * position), read from the graph funnels; it changes nothing else.  --only /
+ * --except select sub-gates by name for the iteration tier (`make gates-dev`):
+ * an unknown name is refused, the selection is announced, and a selection that
+ * leaves nothing to run FAILS.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -233,6 +236,51 @@ static bool only_wants(const char *only, const char *name) {
     return false;
 }
 
+/* ---- selection (--only / --except) --------------------------------------
+ * The iteration tier (make gates-dev) drives these.  Three rules, all of them
+ * fail-closed:
+ *   - an UNKNOWN name is refused (exit 2), never ignored: a typo must not look
+ *     like a tier that ran and passed;
+ *   - the remaining sub-gates are announced (selected and skipped) so the log
+ *     says what the run covered;
+ *   - a selection that leaves NO sub-gate to run FAILS the runner, because a
+ *     tier that ran nothing is not a green tier.
+ * --only also keeps its historical space form (`--only a,b`); `=` is accepted
+ * for both. */
+static const char *g_only, *g_except;
+
+static bool name_in_list(const char *list, const char *name) {
+    return list && only_wants(list, name);
+}
+
+static bool gate_selected(const char *name) {
+    if (g_only && !name_in_list(g_only, name)) return false;
+    if (g_except && name_in_list(g_except, name)) return false;
+    return true;
+}
+
+/* Refuse any name in `list` that is not a sub-gate the runner knows. */
+static int validate_names(const char *list, const char *what,
+                          const char *const *known, int n_known) {
+    if (!list) return 0;
+    for (const char *p = list; *p;) {
+        const char *q = strchr(p, ',');
+        const size_t len = q ? (size_t)(q - p) : strlen(p);
+        bool found = false;
+        for (int i = 0; i < n_known && !found; i++)
+            found = strlen(known[i]) == len && strncmp(known[i], p, len) == 0;
+        if (!found) {
+            fprintf(stderr, "gates_runner: %s names '%.*s', which is not a sub-gate; known names:\n", what,
+                    (int)len, p);
+            for (int i = 0; i < n_known; i++) fprintf(stderr, "    %s\n", known[i]);
+            return 1;
+        }
+        if (!q) break;
+        p = q + 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* The engine resolves prefill_chunk 0 through this variable; the runner's
      * engine-sharing rule (same_config) assumes the default grid.  Refuse
@@ -244,15 +292,19 @@ int main(int argc, char **argv) {
     }
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL --prefill-baseline BLOB --prefill-ref SHORT [--ref-dir DIR] "
-                        "[--ref-tol TOL] [--kl-story FILE] [--kl-code FILE] [--only a,b] [--shape]\n", argv[0]);
+                        "[--ref-tol TOL] [--kl-story FILE] [--kl-code FILE] [--only=a,b] [--except=a,b] [--shape]\n", argv[0]);
         return 2;
     }
     const char *model = argv[1];
     const char *prefill_baseline = NULL, *prefill_ref = NULL, *ref_dir = NULL, *ref_tol = "1e-4";
     const char *decode_baseline = NULL, *decode_ref = NULL;
-    const char *kl_story = NULL, *kl_code = NULL, *only = NULL;
+    const char *kl_story = NULL, *kl_code = NULL;
     for (int i = 2; i < argc; ) {
         if (!strcmp(argv[i], "--shape")) { g_shape_report = true; i += 1; continue; }
+        /* `--only=X` / `--except=X` take their value inline; the historical
+         * `--only X` / `--except X` forms take the next argv. */
+        if (!strncmp(argv[i], "--only=", 7)) { g_only = argv[i] + 7; i += 1; continue; }
+        if (!strncmp(argv[i], "--except=", 9)) { g_except = argv[i] + 9; i += 1; continue; }
         if (i + 1 >= argc) { fprintf(stderr, "gates_runner: option %s needs a value\n", argv[i]); return 2; }
         if (!strcmp(argv[i], "--prefill-baseline")) prefill_baseline = argv[i + 1];
         else if (!strcmp(argv[i], "--prefill-ref")) prefill_ref = argv[i + 1];
@@ -262,7 +314,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ref-tol")) ref_tol = argv[i + 1];
         else if (!strcmp(argv[i], "--kl-story")) kl_story = argv[i + 1];
         else if (!strcmp(argv[i], "--kl-code")) kl_code = argv[i + 1];
-        else if (!strcmp(argv[i], "--only")) only = argv[i + 1];
+        else if (!strcmp(argv[i], "--only")) g_only = argv[i + 1];
+        else if (!strcmp(argv[i], "--except")) g_except = argv[i + 1];
         else { fprintf(stderr, "gates_runner: unknown option %s\n", argv[i]); return 2; }
         i += 2;
     }
@@ -365,10 +418,40 @@ int main(int argc, char **argv) {
     const gate_spec ref_code = {"cuda-reference-gate-code", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                 {"--check-reference", code_ref, code_tok, ref_tol, "--known-high", "3840", NULL}};
 
+    /* The known sub-gate set, in run order.  The validator and the selection
+     * report both read it, so --only/--except can never name a gate that does
+     * not exist here.  A name that is expected but missing is a bug in the
+     * caller's list, and it is refused rather than silently skipped. */
+    const char *known[64];
+    int n_known = 0;
+#define KNOWN(spec) do { if (n_known < (int)(sizeof known / sizeof known[0])) known[n_known++] = (spec).name; } while (0)
+    for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) KNOWN(group_default[i]);
+    for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) KNOWN(group_depth1[i]);
+    for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) KNOWN(group_nodspark[i]);
+    KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality);
+    KNOWN(ref_story); KNOWN(ref_code);
+#undef KNOWN
+    if (validate_names(g_only, "--only", known, n_known) ||
+        validate_names(g_except, "--except", known, n_known)) return 2;
+    if (g_only || g_except) {
+        printf("gates_runner: selection");
+        if (g_only) printf(" --only=%s", g_only);
+        if (g_except) printf(" --except=%s", g_except);
+        printf("\n  selected (%d):", n_known);
+        int n_sel = 0;
+        for (int i = 0; i < n_known; i++) if (gate_selected(known[i])) { printf(" %s", known[i]); n_sel++; }
+        printf("\n  skipped (%d):", n_known - n_sel);
+        for (int i = 0; i < n_known; i++) if (!gate_selected(known[i])) printf(" %s", known[i]);
+        printf("\n");
+        if (!have_ref && (gate_selected(ref_story.name) || gate_selected(ref_code.name)))
+            printf("  note: cuda-reference-gate-* selected but PULSAR_REF_DIR is unset -- they will SKIP\n");
+        fflush(stdout);
+    }
+
     gate_result results[64];
     int n_results = 0, rc_all = 0;
     const double suite0 = now_s();
-#define RUN(spec) do { if (only_wants(only, (spec).name)) { \
+#define RUN(spec) do { if (gate_selected((spec).name)) { \
         if (run_gate(&(spec), model, &results[n_results++]) != 0) rc_all = 1; } } while (0)
 
     for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) RUN(group_default[i]);
@@ -390,7 +473,7 @@ int main(int argc, char **argv) {
         if (kl_code_ok) { c.args[n++] = "--kl-baseline"; c.args[n++] = kl_code; }
         c.args[n] = NULL;
         RUN(c);
-    } else if (ref_dir) {
+    } else if (ref_dir && (gate_selected(ref_story.name) || gate_selected(ref_code.name))) {
         /* The caller ASKED for the reference grade (--ref-dir was passed) and the
          * blob is not readable: that is a misconfiguration, not "not
          * configured", and it must not leave the battery green.  This is how
@@ -407,6 +490,11 @@ int main(int argc, char **argv) {
     }
 #undef RUN
 
+    if (n_results == 0) {
+        printf("\n  FAIL  the selection ran no sub-gate -- a tier that runs nothing "
+               "is not a pass\n");
+        rc_all = 1;
+    }
     if (g_live) { pulsar_engine_close(g_live); g_live = NULL; }
 
     printf("\n===================== RUNNER SUMMARY =====================\n");

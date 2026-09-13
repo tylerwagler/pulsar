@@ -1244,6 +1244,129 @@ gates: tests/gates_runner
 	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
 	exit $$rc
 
+# ---- gates-dev: the ITERATION tier (L220 phase 4) --------------------------
+#
+# `make gates` is the PRE-MERGE instrument: every release-blocking gate, ~18
+# minutes, one engine open per configuration.  `make gates-dev` is the ITERATION
+# tier: a fast subset chosen from what the working tree actually touches, so the
+# loop between an edit and a numeric answer is one-to-two minutes.
+#
+# IT IS NOT A SUBSTITUTE FOR `make gates`, and it is not a release gate.  A
+# green gates-dev says the lanes this diff touches still agree with themselves;
+# it does not say the suite is green.  Run `make gates` before merging.
+#
+# Selection.  PATHS="p1 p2" is the explicit path set; by default it is the
+# working tree's tracked edits plus untracked SOURCES from git.  Each path is
+# classified by the lane it belongs to and mapped to a sub-gate list below; the
+# runner runs them in ONE process (--only=), so the tier pays a single engine
+# open.  The mapping is deliberately NARROW: the expensive general gates
+# (chunk-neutrality, prefill, spec-sampling, fork, accounting, rewind) stay in
+# `make gates` only, and the always-on block -- seam-check, the reap-router
+# audit, and the host-only pulsar_test switches -- is cheap and lane-independent.
+# GATES_DEV_ONLY="a b" overrides the selection outright (the runner refuses an
+# unknown name and FAILS on an empty selection).
+#
+# ⚠ Pass CUDA_ARCH exactly as the battery does -- `make gates-dev
+# CUDA_ARCH=sm_120f FRONTIER_MODEL=...`.  CUDA_ARCH is part of the CUDA flag
+# stamp (`.build/cuda-flags.stamp`), so an invocation that leaves it empty
+# rewrites the stamp for the empty arch and the next `make gates` rebuilds
+# every .cu.  Every sub-make below carries it for the same reason.
+GATES_DEV_UNIT ?= --ctxmem --sampler --sampler-prefilter --spec-math --lib-utf8 --lib-think
+GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
+# attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
+# which is where an attention/compressor row change shows up as a logits delta.
+GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+# kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
+GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+# engine lanes: the batched driver, the spec lane, the bank pool.
+GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
+GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
+# vision: the host gates below do the real work (they need no model); the two
+# sub-gates pin the prefill lane an image span rides.
+GATES_DEV_VISION = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+# Nothing recognizable changed (or a clean tree): the conservative core -- the
+# dispatch/neutrality gates that fail on the widest class of numerics breaks.
+GATES_DEV_DEFAULT= cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-row-neutrality-gate-deep cuda-multiseq-gate
+
+.PHONY: gates-dev
+gates-dev:
+	@t0=$$(date +%s); rc=0; \
+	if [ -z "$(CUDA_ARCH)" ]; then \
+	  printf 'gates-dev: CUDA_ARCH is empty -- pass the served arch (CUDA_ARCH=sm_120f)\n'; \
+	  printf '  or the CUDA flag stamp flips and the next `make gates` rebuilds every .cu\n'; \
+	fi; \
+	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; \
+	if [ -z "$$paths" ]; then \
+	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
+	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
+	fi; \
+	sel='$(GATES_DEV_ONLY)'; \
+	if [ -z "$$sel" ]; then \
+	  add() { case " $$sel " in *" $$1 "*) ;; *) sel="$$sel $$1";; esac; }; \
+	  if [ -z "$$paths" ]; then \
+	    why=" (no changed sources)"; \
+	    for g in $(GATES_DEV_DEFAULT); do add $$g; done; \
+	  else \
+	    for p in $$paths; do \
+	      case "$$p" in \
+	        *vision*) cls=vision; vision=1 ;; \
+	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
+	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
+	        src/cuda/*) cls=cuda ;; \
+	        src/server/*) cls=server; server=1 ;; \
+	        src/engine/*) cls=engine ;; \
+	        *) cls=default ;; \
+	      esac; \
+	      why="$$why $$p($$cls)"; \
+	      case $$cls in \
+	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
+	        cuda) for g in $(GATES_DEV_CUDA); do add $$g; done ;; \
+	        server) for g in $(GATES_DEV_SERVER); do add $$g; done ;; \
+	        engine) for g in $(GATES_DEV_ENGINE); do add $$g; done ;; \
+	        vision) for g in $(GATES_DEV_VISION); do add $$g; done ;; \
+	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
+	      esac; \
+	    done; \
+	  fi; \
+	  sel=$$(echo $$sel); \
+	fi; \
+	printf '\033[1m=== gates-dev: the ITERATION tier (NOT a substitute for `make gates`) ===\033[0m\n'; \
+	printf '  selection driven by:%s\n' "$$why"; \
+	if [ -z "$$sel" ]; then printf '  runner sub-gates: (none -- all coverage for this path set is in the targets below)\n'; \
+	else printf '  runner sub-gates: %s\n' "$$(echo $$sel | tr ' ' ',')"; fi; \
+	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
+	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
+	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
+	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
+	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
+	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
+	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test $(GATES_DEV_UNIT) || rc=1; \
+	if [ $$server -eq 1 ]; then \
+	  PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
+	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-chat-smoke-gate CUDA_ARCH=sm_120f \
+	        FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
+	fi; \
+	if [ $$attn -eq 1 ]; then \
+	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-attn-gates CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$vision -eq 1 ]; then \
+	  for h in vision-layout-gate vision-pixel-gate vision-codec-gate vision-span-gate \
+	           vision-visible-gate vision-placeholder-gate; do \
+	    $(MAKE) --no-print-directory $$h CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
+	  done; \
+	fi; \
+	if [ -n "$$sel" ]; then \
+	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
+	      --prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
+	      --decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
+	      --only=$$(echo $$sel | tr ' ' ',') || rc=1; \
+	fi; \
+	printf '\n  gates-dev total: %s s\n' "$$(( $$(date +%s) - t0 ))"; \
+	if [ $$rc -eq 0 ]; then printf '\nDEV TIER PASS -- run `make gates` before merging\n'; \
+	else printf '\nDEV TIER FAILED\n'; fi; \
+	exit $$rc
+
 # Ported C++ TUs (pulsar). One rule per source dir, mirroring the .c rules.
 src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h src/lib/pulsar_utf8.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
