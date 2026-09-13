@@ -1783,7 +1783,7 @@ static void test_inline_system_message_placement(void) {
         "{\"role\":\"system\",\"content\":\"Prefer bullet lists.\"}]";
     const char *p = messages;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 3);
     TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
     TEST_ASSERT(!strcmp(msgs.v[2].role, "system"));
@@ -2762,7 +2762,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
         "]";
     const char *p = json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 2);
     TEST_ASSERT(msgs.v[1].tool_call_id && !strcmp(msgs.v[1].tool_call_id, "toolu_exact"));
 
@@ -2937,7 +2937,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
         "]";
     const char *p = json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 3);
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(msgs.v[0].calls.v[0].id &&
@@ -3571,6 +3571,82 @@ static void test_chat_image_url_content_blocks(void) {
     TEST_ASSERT(base64_decode("ab=c", 4, &n) == NULL);      /* data after padding */
     TEST_ASSERT(base64_decode("aaaa====", 8, &n) == NULL);  /* padding mid-stream */
     TEST_ASSERT(base64_decode("a!b=", 4, &n) == NULL);      /* bad alphabet */
+}
+
+
+
+/* The Anthropic image surface: an image block's inline base64 is decoded from
+ * source.data, attached to the message, and its placeholder is written into
+ * the content at the block's position.  A remote-URL source, a malformed
+ * payload, an unsupported media_type and an unknown block type all refuse with
+ * a message; the silent drop was the bug this reader exists to remove. */
+static void test_anthropic_image_content_blocks(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"look\"},");
+    buf_puts(&json, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",");
+    buf_puts(&json, "\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_anthropic_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (!parsed) {
+        fprintf(stderr, "anthropic image parse refused: %s\n", err);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+        return;
+    }
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(msgs.v[0].images[0].len > 8);
+        TEST_ASSERT(msgs.v[0].images[0].bytes[0] == 0x89 && msgs.v[0].images[0].bytes[1] == 'P');
+        TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) != NULL);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* image/jpeg is the other media type the engine decodes. */
+    const char *jpeg =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+        "{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"aGVsbG8=\"}}]}]";
+    chat_msgs jmsgs = {0};
+    p = jpeg; err[0] = 0;
+    TEST_ASSERT(parse_anthropic_messages(&p, &jmsgs, err, sizeof err));
+    TEST_ASSERT(jmsgs.len == 1 && jmsgs.v[0].images_len == 1 &&
+                jmsgs.v[0].images[0].len == 5);
+    chat_msgs_free(&jmsgs);
+
+    struct { const char *json; const char *needle; } bad[] = {
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]",
+         "remote"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"!!!!\"}}]}]",
+         "base64"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/webp\",\"data\":\"aGVsbG8=\"}}]}]",
+         "media_type"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/png\"}}]}]",
+         "data"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"data\":\"x\"}]}]",
+         "content block type"},
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        chat_msgs bad_msgs = {0};
+        p = bad[i].json; err[0] = 0;
+        TEST_ASSERT(!parse_anthropic_messages(&p, &bad_msgs, err, sizeof err));
+        TEST_ASSERT(strstr(err, bad[i].needle) != NULL);
+        TEST_ASSERT(bad_msgs.len == 0);
+        chat_msgs_free(&bad_msgs);
+    }
 }
 
 
@@ -7499,6 +7575,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
     test_chat_image_url_content_blocks();
+    test_anthropic_image_content_blocks();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();

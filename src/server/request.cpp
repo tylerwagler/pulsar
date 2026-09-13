@@ -1703,9 +1703,16 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
 
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
- * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
- * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+ * assistant tool_use blocks to tool_calls, keeps tool_result blocks as escaped
+ * text because DS4 sees tool results in its chat template, and decodes an
+ * image block's inline base64 into an attached encoded image file with
+ * PULSAR_IMAGE_PLACEHOLDER written into the content at the block's position --
+ * the same contract, and the same refusal wording, as the OpenAI image_url
+ * reader.  A block type this parser does not know is refused: silently
+ * dropping one is how an image request used to answer as if no image were
+ * sent. */
+static bool parse_anthropic_content_block(const char **p, const char *role,
+                                          chat_msg *msg, char *err, size_t errlen) {
     (void)role;
     if (**p != '{') return false;
     (*p)++;
@@ -1716,6 +1723,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *content_raw = NULL;
+    char *source_type = NULL;
+    char *media_type = NULL;
+    char *data = NULL;
+    char *url = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1772,6 +1783,74 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "source")) {
+            /* An image block's payload: {"type":"base64","media_type":...,
+             * "data":...} (or {"type":"url","url":...}).  Captured into locals
+             * and classified after the whole block is read, because "type"
+             * (the block's) may not have been seen yet. */
+            json_ws(p);
+            if (**p != '{') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *sk = NULL;
+                if (!json_string(p, &sk)) {
+                    free(key);
+                    goto bad;
+                }
+                json_ws(p);
+                if (**p != ':') {
+                    free(sk);
+                    free(key);
+                    goto bad;
+                }
+                (*p)++;
+                if (!strcmp(sk, "type")) {
+                    free(source_type);
+                    if (!json_string(p, &source_type)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "media_type")) {
+                    free(media_type);
+                    if (!json_string(p, &media_type)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "data")) {
+                    free(data);
+                    if (!json_string(p, &data)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "url")) {
+                    free(url);
+                    if (!json_string(p, &url)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(sk);
+                    free(key);
+                    goto bad;
+                }
+                free(sk);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
@@ -1811,7 +1890,51 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         free(msg->content);
         msg->content = buf_take(&b);
         free(tool_result);
-    } else {
+    } else if (type && !strcmp(type, "image")) {
+        if (!source_type) {
+            snprintf(err, errlen, "image block has no source.type");
+            goto bad;
+        }
+        if (!strcmp(source_type, "url")) {
+            snprintf(err, errlen,
+                     "image source is a remote URL, but this server does not fetch remote content; "
+                     "send the image inline as base64");
+            goto bad;
+        }
+        if (strcmp(source_type, "base64")) {
+            snprintf(err, errlen,
+                     "unsupported image source.type \"%s\"; this server accepts base64",
+                     source_type);
+            goto bad;
+        }
+        /* The engine decodes PNG and JPEG only (pulsar_decode_image), so a
+         * media_type it cannot decode is refused here rather than handed over
+         * to fail deeper. */
+        if (!media_type ||
+            (strcmp(media_type, "image/png") && strcmp(media_type, "image/jpeg"))) {
+            snprintf(err, errlen,
+                     "unsupported image media_type \"%s\"; this server decodes image/png and image/jpeg",
+                     media_type ? media_type : "(missing)");
+            goto bad;
+        }
+        if (!data || !data[0]) {
+            snprintf(err, errlen, "image source has no base64 data");
+            goto bad;
+        }
+        size_t n = 0;
+        uint8_t *bytes = base64_decode(data, strlen(data), &n);
+        if (!bytes || n == 0) {
+            free(bytes);
+            snprintf(err, errlen, "malformed base64 in the image source data");
+            goto bad;
+        }
+        chat_msg_add_image(msg, bytes, n);
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        buf_puts(&b, PULSAR_IMAGE_PLACEHOLDER);
+        free(msg->content);
+        msg->content = buf_take(&b);
+    } else if (type && (!strcmp(type, "text") || !strcmp(type, "thinking"))) {
         if (text) {
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
@@ -1826,6 +1949,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
             free(msg->reasoning);
             msg->reasoning = buf_take(&b);
         }
+    } else {
+        snprintf(err, errlen,
+                 "unsupported content block type \"%s\"; this server accepts text, thinking, "
+                 "tool_use, tool_result and image blocks",
+                 type ? type : "(missing)");
+        goto bad;
     }
 
     free(type);
@@ -1835,6 +1964,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(content_raw);
+    free(source_type);
+    free(media_type);
+    free(data);
+    free(url);
     return true;
 bad:
     free(type);
@@ -1844,12 +1977,16 @@ bad:
     free(name);
     free(input);
     free(content_raw);
+    free(source_type);
+    free(media_type);
+    free(data);
+    free(url);
     return false;
 }
 
 
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content(const char **p, chat_msg *msg, char *err, size_t errlen) {
     json_ws(p);
     if (**p == '"') return json_string(p, &msg->content);
     if (json_lit(p, "null")) {
@@ -1870,7 +2007,8 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg, err, errlen))
+                return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -1886,7 +2024,8 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
 
 
 
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -1915,7 +2054,7 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
+                if (!parse_anthropic_content(p, &msg, err, errlen)) {
                     free(key);
                     goto fail;
                 }

@@ -360,6 +360,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
+    if (err && errlen) err[0] = '\0';
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -387,7 +388,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_anthropic_messages(&p, &msgs)) {
+            if (!parse_anthropic_messages(&p, &msgs, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -564,6 +565,18 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         request_apply_forced_tool_prefill(r);
     }
     pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* Images, if any, are resolved here -- on the renderer's side, just before
+     * the model -- into the sentinel BLOCK ids pulsar_session_sync_mm() takes.
+     * The Anthropic block reader writes the same PULSAR_IMAGE_PLACEHOLDER the
+     * OpenAI reader does, so this shared authority produces the blocks for
+     * both surfaces. */
+    if (!request_prepare_images(e, &msgs, r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -572,7 +585,10 @@ bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    /* An image-surface refusal (remote URL, bad base64, unsupported media
+     * type, unknown block) sets a specific message; only a plain shape error
+     * falls back to the generic. */
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }

@@ -2511,7 +2511,7 @@ bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs);
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_system(const char **p, char **out);
 void append_tool_result_text(buf *b, const char *s);
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order);
