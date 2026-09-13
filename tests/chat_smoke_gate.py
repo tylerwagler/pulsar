@@ -151,12 +151,18 @@ reader_done.wait(timeout=5.0)
 errfile.close()
 
 tail = out.decode("utf-8", "replace")[-4000:]
+# The BOS token as it appears in DETOKENIZED output.  `tail` is already decoded
+# from UTF-8, so this must be compared literally: the check used to round-trip
+# `bos` through .encode().decode("unicode_escape"), which reinterprets its UTF-8
+# bytes as latin-1 and yields mojibake that cannot occur in `tail` -- so the
+# check could not fire whether the token was present or not.  Proved dead by
+# evaluating both directions (present -> False, absent -> False) and live after
+# the fix (present -> True, absent -> False).
 bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-bos_lit = bos.encode().decode("unicode_escape")
 fails = []
 if "12" not in tail:
     fails.append("expected answer '12' not found")
-if bos_lit in tail:
+if bos in tail:
     fails.append("BOS token present in continuation (degenerate decode)")
 words = re.findall(r"\S+", tail)
 if words and len(set(words)) < max(2, len(words) // 8):
