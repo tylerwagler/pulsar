@@ -368,6 +368,7 @@ __global__ static void router_select_warp_topk_kernel(
         float *weights,
         float *probs,
         const float *bias,
+        int has_bias,
         const float *logits,
         uint32_t n_tokens,
         float route_scale) {
@@ -390,7 +391,7 @@ __global__ static void router_select_warp_topk_kernel(
         const uint32_t e = lane + j * 32u;
         const float p = sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
-        local_score[j] = p + bias[e];
+        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
         if (prob) prob[e] = p;
     }
 
@@ -718,7 +719,7 @@ __global__ static void router_select_hash_kernel(
 }
 
 
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t tid2eid_offset, uint32_t tid2eid_rows, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, bool has_bias, uint64_t tid2eid_offset, uint32_t tid2eid_rows, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
@@ -726,12 +727,21 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
-    /* the correction bias (exp_probs_b) is part of every V4.1 router, target
-     * and drafter alike -- there is no bias-less arm */
-    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
-    if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
-    const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
-    if (!bias) return 0;
+    /* The correction bias is OPTIONAL.  Both the target's blk.N.exp_probs_b.bias
+     * and the drafter's dspark.N.exp_probs_b.bias are absent from shipped
+     * artifacts -- Vision-Exp's serving file among them -- and `has_bias` is the
+     * only thing that can distinguish "absent" from "offset 0", which is a real
+     * tensor offset.  A routed layer without it scores sqrt(softplus(logit))
+     * alone.  (dev had the same arm; this file used to insist the bias was part
+     * of every router, which made those artifacts unloadable.) */
+    const float *bias = NULL;
+    if (has_bias) {
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
+        if (!bias) return 0;
+    }
+    const int hb = has_bias ? 1 : 0;
     dim3 block(32, 4, 1);
     const dim3 grid((n_tokens + 3u) / 4u);
     int32_t *sel = (int32_t *)selected->ptr;
@@ -774,11 +784,11 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
     /* the routers this engine serves: the V4.1 target, 0731's target and its
      * DSpark drafter (0731 routes with 256/top-6 on both) */
     if (n_expert == 384u && n_expert_used == 6u) {
-        router_select_warp_topk_kernel<384u, 6u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<384u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
     } else if (n_expert == 256u && n_expert_used == 6u) {
-        router_select_warp_topk_kernel<256u, 6u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<256u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
     } else if (n_expert == 128u && n_expert_used == 3u) {
-        router_select_warp_topk_kernel<128u, 3u><<<grid, block>>>(sel, w, pr, bias, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<128u, 3u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
     } else {
         fprintf(stderr, "pulsar: router_select has no arm for %u experts / top-%u -- refusing\n", n_expert, n_expert_used);
         return 0;

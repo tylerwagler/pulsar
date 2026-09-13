@@ -44,6 +44,20 @@ static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, u
 
 
 
+/* Formatted OPTIONAL lookup: NULL when the artifact does not carry it.  Used for
+ * the tensors a shipped checkpoint may legitimately omit -- the router's
+ * correction bias is the one that bit (see the binding site).  The caller is
+ * responsible for the "absent" arm; a silent NULL reaching a deref is the
+ * failure this naming is meant to make visible. */
+static pulsar_tensor *optional_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
+    char name[128];
+    int n = snprintf(name, sizeof(name), fmt, layer);
+    if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
+    return model_find_tensor(m, name);
+}
+
+
+
 /* Shape half of the layout validators. Both callers check the TYPE their own
  * way and then need exactly this; keeping one copy stops the two drifting, which
  * is a live failure mode in this file (two banked emit blocks had silently
@@ -542,7 +556,10 @@ static void weights_validate_layout(
          * (== n_expert for un-pruned models). */
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
-        tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        /* OPTIONAL: absent from Vision-Exp's serving artifact; the router has a
+         * bias-less arm and the bind below is optional_tensorf. */
+        if (l->ffn_exp_probs_b)
+            tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
         if (l->ffn_gate_tid2eid) {
             /* [n_expert_used, n_vocab]: one row of expert ids per token id. */
             tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2,
@@ -1189,7 +1206,8 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    /* OPTIONAL, like the drafter's: text-only artifacts do not ship it. */
+    l->ffn_exp_probs_b = optional_tensorf(m, "blk.%u.exp_probs_b.bias", il);
     /* 0731's leading layers route by token id.  Required exactly on the hash
      * layers and REFUSED on any other, so an artifact cannot carry a table that
      * would silently replace the gate's routing. */
@@ -1287,7 +1305,8 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
-        tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
+        if (l->ffn_exp_probs_b)
+            tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
@@ -1386,7 +1405,7 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
         /* the drafter's trained router bias (L216: every shipped 0731 artifact
          * routed its drafter without it; V4.1 ships one per drafter layer) */
-        l->ffn_exp_probs_b = required_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
+        l->ffn_exp_probs_b = optional_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
         l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
         l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
         l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);

@@ -1983,7 +1983,9 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           ? g->batch_router_probs : NULL,
                                                       model->map,
                                                       model->size,
-                                                      layer->ffn_exp_probs_b->abs_offset,
+                                                      layer->ffn_exp_probs_b
+                                                          ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                      layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid
                                                           ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                       layer->ffn_gate_tid2eid
