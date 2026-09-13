@@ -1227,9 +1227,18 @@ int pulsar_gpu_attention_f16_indexed(
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
-    AF16_REQUIRE("indexed", heads && sinks && q && raw_kv && comp_kv,
-                 "heads=%d sinks=%d q=%d raw_kv=%d comp_kv=%d",
-                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL, comp_kv != NULL);
+    /* comp_kv is UNUSED when n_comp == 0 (see the kernel's own note on the
+     * parameter), and this is the same rule the prefill entry above already
+     * states.  It has to be spelled out here rather than satisfied with a
+     * placeholder: the two KV row families are now DIFFERENT types (WINDOW
+     * 528 B vs MAIN 288 B, L218 2c-ii), so there is no type-correct stand-in
+     * to hand a caller that legitimately has no compressed prefix -- passing
+     * raw_kv, which is what this dispatch did while both were one 384 B
+     * PULSAR_ATTN_PACK row, would be a lie about the row being addressed.
+     * A raw-only banked batch (n_comp == 0) is normal, not a refusal. */
+    AF16_REQUIRE("indexed", heads && sinks && q && raw_kv && (n_comp == 0u || comp_kv),
+                 "heads=%d sinks=%d q=%d raw_kv=%d comp_kv=%d n_comp=%u",
+                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL, comp_kv != NULL, n_comp);
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {
