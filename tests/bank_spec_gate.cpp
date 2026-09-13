@@ -26,6 +26,15 @@
  *    re-prefill) and classic/spec work resumes on that bank.
  *
  * usage: PULSAR_MSEQ_BANKS=2 ./tests/bank_spec_gate MODEL [STEPS]
+ *
+ * STEPS (default 128, 32 since L220).  The assertions are per-token identities
+ * (banked == solo streams, and a_ts == a_solo through the warm-ring accept
+ * counter), and every one of them is already exercised by the first spec
+ * quantum: the ring is warmed by the 130/258-token prefills, the time-slice
+ * alternation happens ~20 times in 32 steps, and STEPS only repeats the same
+ * quanta.  Measured at 32: 30/28 drafted tokens, accept 46.7%/57.1%, and
+ * a_ts == a_solo exactly (so the 5.0-point margin is not a sampling-noise
+ * budget); a cross-cooled ring (accept collapse) is still caught.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -253,6 +262,14 @@ int GATE_ENTRY(int argc, char **argv) {
                          d >= 0 ? ts[k][d] : -1, d >= 0 ? solo[k][d] : -1);
             const double a_ts = drf[k] ? 100.0*(double)acc[k]/(double)drf[k] : 0.0;
             const double a_solo = solo_drf[k] ? 100.0*(double)solo_acc[k]/(double)solo_drf[k] : 0.0;
+            /* VACUITY GUARD (L220): an accept RATE needs drafts on both sides
+             * or the margin below is satisfied by 0/0.  Measured at the default
+             * STEPS=32: 30 and 28 drafted tokens; require 8 so the rate is a
+             * rate with headroom, not a rounding of one or two draws. */
+            CHECK(drf[k] >= 8 && solo_drf[k] >= 8,
+                  "TEST2: bank %d accept rate is measured over %llu/%llu drafts -- too few "
+                  "to be a rate; the warm-ring assertion below would be vacuous",
+                  k, (unsigned long long)drf[k], (unsigned long long)solo_drf[k]);
             /* Warm-ring proof: time-sliced accept must track solo (a cross-cooled
              * ring would collapse it by >10x).  Allow a small slack. */
             CHECK(a_ts >= a_solo - 5.0,

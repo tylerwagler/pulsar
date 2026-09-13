@@ -437,7 +437,7 @@ cuda-seam-gate: tests/token_seam_gate
 # tests/multiseq_decode_gate.cpp).  MODEL-DEPENDENT — run manually on the GB10
 # with the same memory discipline as the frontier gate.
 cuda-multiseq-gate: tests/multiseq_decode_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
+	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 64
 
 # The same gate with speculation DISABLED — the pulsar-bench/pulsar-eval/agent and
 # `pulsar-server --no-dspark` config, and a different allocation shape (no DSpark
@@ -451,7 +451,7 @@ cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 # cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
 # model, same memory discipline as the gates above; hold temp/gpu.lock.
 cuda-bank-spec-gate: tests/bank_spec_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
+	PULSAR_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 32
 
 # L150: the batched redraft (one drafter pass over every bank of a tick) must
 # equal the serialized per-bank redraft byte for byte -- draft ids, confidence

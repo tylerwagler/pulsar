@@ -23,6 +23,15 @@
  * temp/gpu.lock, drop_caches, no foreign ds4 process). NOT part of `make test`.
  *
  * usage: PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate MODEL [L]
+ *
+ * L (default 8192, was 24576 until L220).  The invariant under test is
+ * format/pointer identity -- the saved row bytes come back bit-identical and
+ * the rebuilt base table points at the fresh allocation -- so the length buys
+ * coverage of the cache KINDS, not strength: 8192 is the shortest L that still
+ * populates every class the save/load loops handle (ratio-4 comp rows and the
+ * MXFP4 index rows at L/4 = 2048, ratio-128 comp rows at L/128 = 64, so
+ * several ratio-128 boundaries are crossed).  That coverage is asserted below
+ * (frontier_coverage), not assumed.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -98,10 +107,40 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     return h;
 }
 
+/* NON-VACUITY: the frontier the gate captures and folds must hold rows in
+ * EVERY cache class pulsar_session::bank_kv_save/load handle -- ratio-4 comp
+ * rows, ratio-128 comp rows, and the MXFP4 index rows (ratio-4 layers only).
+ * A length that left a class empty would make the bit-identity assertion
+ * vacuous for it while still printing PASS, which is the failure mode this
+ * gate exists to prevent (L220 cut L 24576 -> 8192 and had to prove the
+ * classes survived).  Counts are read from the captured per-bank frontier the
+ * checksum itself folds. */
+static void frontier_coverage(const pulsar_gpu_graph *g, uint32_t bank, int L) {
+    uint32_t l4 = 0, l128 = 0, lidx = 0;
+    uint64_t r4 = 0, r128 = 0, ridx = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t nc = g->ms_n_comp[bank][il];
+        if (ratio == 4) {
+            if (nc) { l4++; r4 += nc; }
+            const uint32_t ni = g->ms_n_index_comp[bank][il];
+            if (ni) { lidx++; ridx += ni; }
+        } else if (nc) { l128++; r128 += nc; }
+    }
+    CHECK(l4 > 0, "frontier coverage: no ratio-4 comp rows at L=%d (vacuous)", L);
+    CHECK(l128 > 0, "frontier coverage: no ratio-128 comp rows at L=%d (vacuous)", L);
+    CHECK(lidx > 0, "frontier coverage: no MXFP4 index rows at L=%d (vacuous)", L);
+    fprintf(stderr, "evict_restore_gate: frontier coverage L=%d bank=%u: ratio-4 %u layers/%llu rows, "
+                    "ratio-128 %u layers/%llu rows, index %u layers/%llu rows\n",
+            L, bank, l4, (unsigned long long)r4, l128, (unsigned long long)r128,
+            lidx, (unsigned long long)ridx);
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [L]\n", argv[0]); return 2; }
-    const int L = argc > 2 ? atoi(argv[2]) : 24576;
+    const int L = argc > 2 ? atoi(argv[2]) : 8192;
     const int ctx = L + 4096;
 
     pulsar_engine *e = NULL;
@@ -131,6 +170,7 @@ int GATE_ENTRY(int argc, char **argv) {
     if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); goto done; }
     gpu_graph_bank_counters_capture(&s->graph, 0);
     (void)pulsar_gpu_synchronize();
+    frontier_coverage(&s->graph, 0, L);
     const uint64_t sum_before = checksum_bank_kv(s, 0);
     const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0);
     CHECK(sum_before != 0, "checksum_before failed");
