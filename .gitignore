@@ -100,6 +100,7 @@ gguf-tools/libds4q_reflow.so
 docs/api/
 /tests/idx_mxfp4_kernel_test
 /tests/idx_mxfp4_kernel_test_64
+/tests/indexer_hadamard_kernel_test
 tests/gates_runner
 tests/runner/
 tests/dspark_batch_gate

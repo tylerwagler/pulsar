@@ -1147,6 +1147,46 @@ int pulsar_gpu_indexer_fp4_pack_tensor(
         uint32_t          head_dim,
         bool              keep_f32);
 
+/** V4's indexer key: the reference's `rotate=True` compressor runs
+ * `rotate_activation(x) = hadamard_transform(x, d**-0.5)` -- the natural-order
+ * 128-point Walsh-Hadamard transform scaled by 1/sqrt(128) -- before the same
+ * fp4 quant the entry above applies.  L218 deleted the rotation with the 0731
+ * checkpoint; this is its restore, and its ORDER and NORMALISATION are pinned
+ * by tests/indexer_hadamard_kernel_test rather than argued.
+ *
+ * Unreachable for a V4.1 artifact: `g_pulsar_shape.indexer_own_compressor` is
+ * false there and V4.1's index key carries no rotation.
+ *
+ * @return nonzero on success, 0 on a bad shape or a failed launch. */
+int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
+        pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
+        uint32_t          out_row0,
+        uint32_t          n_rows,
+        uint32_t          head_dim,
+        bool              keep_f32);
+
+/** V4's indexer q: rope the tail, then the rotation+pack above, one launch.
+ * Indexer.forward does `apply_rotary_emb(q[..., -rd:]); q = rotate_activation(q)`
+ * and every consumer reads the PACKED row, so there is no f32 q to observe. */
+int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
+        pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        const pulsar_gpu_tensor *positions);
+
 /** As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
  * half of the attn-output "a" activation: the fp16 attention epilogue emits

@@ -324,6 +324,7 @@ PROBES = tests/attn_mma_probe tests/fp16_fold_probe tests/mxfp8_mma_probe \
          tests/idx_mxfp4_probe tests/idx_mma_issue_bench \
          tests/idx_mxfp4_kernel_test tests/idx_mxfp4_kernel_test_64 \
          tests/csa2_compressor_kernel_test \
+         tests/indexer_hadamard_kernel_test \
          tests/candidate_kernel_test
 
 .PHONY: probes
@@ -376,6 +377,20 @@ tests/csa2_compressor_kernel_test: tests/csa2_compressor_kernel_test.cu Makefile
 tests/candidate_kernel_test: tests/candidate_kernel_test.cu Makefile \
                             src/cuda/pulsar_cuda_candidates.cu src/cuda/pulsar_cuda_internal.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# V4's indexer rotation (the 128-point Hadamard, L218's deletion, restored): the
+# ORDER and NORMALISATION are pinned against a from-scratch host oracle, byte for
+# byte, including every E8M0 scale byte.  Host side built -fno-fast-math so the
+# oracle's arithmetic is IEEE and the comparison can be exact.
+tests/indexer_hadamard_kernel_test.o: tests/indexer_hadamard_kernel_test.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/indexer_hadamard_kernel_test.cpp
+
+tests/indexer_hadamard_kernel_test: tests/indexer_hadamard_kernel_test.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: indexer-hadamard-kernel-check
+indexer-hadamard-kernel-check: tests/indexer_hadamard_kernel_test
+	./tests/indexer_hadamard_kernel_test
 
 # DELIBERATELY NOT in PROBES: tests/flashinfer_sparse_mla_bench.cu needs
 # FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
@@ -1162,7 +1177,7 @@ render-gate: pulsar_test
 # iterating on one gate; the battery is the runner.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-attn-pack-gate \
+	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A

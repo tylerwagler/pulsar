@@ -451,6 +451,116 @@ __global__ static void indexer_fp4_pack_kernel(float *x, uint8_t *out,
                              keep_f32 ? &xr[tid] : NULL);
 }
 
+/* ---- V4's indexer rotation (restored; L218 deleted it) --------------------
+ *
+ * The reference's `rotate=True` compressors run
+ *     rotate_activation(x) = hadamard_transform(x, scale = d**-0.5)
+ * before the same fp4 quant, i.e. the NATURAL-ORDER (Hadamard, not sequency)
+ * 128-point Walsh-Hadamard transform scaled by 1/sqrt(128).  V4's indexer is the
+ * one that needs it -- both for its own compressor's index key and for its q
+ * (`q = rotate_activation(q)` in Indexer.forward) -- and L218 deleted it with
+ * the 0731 checkpoint ("0731's 128-point Hadamard rotation before the quant is
+ * gone with that checkpoint"), which is why V4's indexer had no key path at all.
+ *
+ * The ORDER and the NORMALISATION are the entire content of this function: a
+ * wrong convention is not garbage, it is a rotation by a different orthogonal
+ * matrix, so it yields plausible scores and plausible text.  That is why
+ * tests/indexer_hadamard_kernel_test pins both against a host oracle, with two
+ * inputs whose transform is known in closed form.
+ *
+ * The per-32-block absmax that follows is the SAME reduction, in the same order,
+ * as indexer_block_absmax_dev -- only the value being reduced differs (the
+ * butterfly result rather than the raw row), so the pack below is the shared
+ * one and there is no second E8M0/E2M1 authority.
+ *
+ * Unreachable for a V4.1 artifact by construction: `indexer_own_compressor` is
+ * false there, and V4.1's index key is a projection of the kv source's latent
+ * (indexer_fp4_pack_kernel), with no rotation. */
+__device__ static inline indexer_fp4_t indexer_hadamard_block_absmax_dev(
+        const float *xr, uint32_t tid, float *vals, float *absbuf) {
+    vals[tid] = xr[tid];
+    __syncthreads();
+
+    for (uint32_t stride = 1u; stride < 128u; stride <<= 1u) {
+        if ((tid & stride) == 0u) {
+            const uint32_t base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
+            const float a = vals[base];
+            const float b = vals[base + stride];
+            vals[base] = a + b;
+            vals[base + stride] = a - b;
+        }
+        __syncthreads();
+    }
+
+    const float v = vals[tid] * 0.08838834764831845f;   /* 1/sqrt(128) */
+    const uint32_t fp4_block = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t block_base = fp4_block * 32u;
+    absbuf[tid] = fabsf(v);
+    __syncthreads();
+
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            absbuf[block_base + lane] = fmaxf(absbuf[block_base + lane],
+                                              absbuf[block_base + lane + stride]);
+        }
+        __syncthreads();
+    }
+    return { v, fp4_block, lane, block_base };
+}
+
+/* Hadamard + fp4 pack, one 128-thread block per row: the indexer compressor's
+ * index key.  `keep_f32` writes the DEQUANTISED value back for observers only
+ * (every consumer reads the packed row). */
+__global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
+                                                        uint32_t n_rows, uint32_t head_dim,
+                                                        int keep_f32) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+    __shared__ float vals[128];
+    __shared__ float absbuf[128];
+    __shared__ uint8_t nib_sh[128];
+    float *xr = x + (uint64_t)row * head_dim;
+    const indexer_fp4_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
+    indexer_fp4_pack_row_dev(h, absbuf, nib_sh, out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid,
+                             keep_f32 ? &xr[tid] : NULL);
+}
+
+/* The same, fused behind the indexer q's rope: Indexer.forward does
+ * `apply_rotary_emb(q[..., -rd:]); q = rotate_activation(q)`, so one block per
+ * (token, head) row runs the rotation then the Hadamard in place.  One block
+ * owns the whole row, so the __syncthreads() between the phases is equivalent to
+ * the kernel boundary the two-launch sequence had. */
+__global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
+        float *x, uint8_t *out, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, int inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow,
+        const int32_t * __restrict__ positions) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+
+    float *xr = x + (uint64_t)row * head_dim;
+    if (tid < n_rot / 2u) {
+        const uint32_t t = row / n_head;
+        const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        float r0, r1;
+        rope_tail_rotate_pair_dev(xr + (head_dim - n_rot), tid * 2u, n_rot, rope_pos,
+                                  n_ctx_orig, inverse, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast, beta_slow,
+                                  &r0, &r1);
+    }
+    __syncthreads();
+
+    __shared__ float vals[128];
+    __shared__ float absbuf[128];
+    __shared__ uint8_t nib_sh[128];
+    const indexer_fp4_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
+    indexer_fp4_pack_row_dev(h, absbuf, nib_sh, out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid, NULL);
+}
+
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps,
                                           int skip_f32) {
@@ -693,6 +803,54 @@ int pulsar_gpu_indexer_fp4_pack_tensor(pulsar_gpu_tensor *x,
             (uint8_t *)packed->ptr + (uint64_t)out_row0 * rowbytes,
             n_rows, head_dim, keep_f32 ? 1 : 0);
     return cuda_ok(cudaGetLastError(), "indexer fp4 pack launch");
+}
+
+/* V4's indexer key: Hadamard-rotate then fp4-pack n_rows f32 rows of `x`,
+ * storing MXKV FP4 rows into `packed` at [out_row0, out_row0 + n_rows).  The
+ * rotate half of the reference's `rotate=True` compressor
+ * (Compressor.forward: kv = rotate_activation(kv); fp4_act_quant(kv, ...)). */
+int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
+                                            pulsar_gpu_tensor *packed,
+                                            uint32_t out_row0,
+                                            uint32_t n_rows,
+                                            uint32_t head_dim,
+                                            bool keep_f32) {
+    const uint64_t rowbytes = PULSAR_MXKV_FP4_ROWBYTES(128u);
+    if (!x || !packed || n_rows == 0 || head_dim != 128u ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        packed->bytes < ((uint64_t)out_row0 + n_rows) * rowbytes) {
+        return 0;
+    }
+    indexer_hadamard_fp4_pack_kernel<<<n_rows, 128>>>(
+            (float *)x->ptr,
+            (uint8_t *)packed->ptr + (uint64_t)out_row0 * rowbytes,
+            n_rows, head_dim, keep_f32 ? 1 : 0);
+    return cuda_ok(cudaGetLastError(), "indexer hadamard fp4 pack launch");
+}
+
+/* V4's indexer q: rope the tail, Hadamard-rotate, fp4-pack -- in one launch,
+ * because `rotate=True`'s q is not a consumer-visible f32 tensor. */
+int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
+        pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
+        uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
+    const uint32_t n_rows = n_tok * n_head;
+    if (!x || !packed || n_rows == 0 || head_dim != 128u || n_rot > head_dim || (n_rot & 1u) ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        packed->bytes < (uint64_t)n_rows * PULSAR_MXKV_FP4_ROWBYTES(128u)) {
+        return 0;
+    }
+    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;   /* staging is f32 by contract */
+    if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+    indexer_rope_hadamard_fp4_pack_q_kernel<<<n_rows, 128>>>((float *)x->ptr,
+            (uint8_t *)packed->ptr,
+            n_rows, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+            positions ? (const int32_t *)positions->ptr : NULL);
+    return cuda_ok(cudaGetLastError(), "indexer rope+hadamard+fp4 pack launch");
 }
 
 
