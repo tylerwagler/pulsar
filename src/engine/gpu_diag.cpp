@@ -1515,11 +1515,18 @@ bool gpu_graph_alloc_raw_cap(
                             pulsar_comp_state_rows(attn->ratio) * sizeof(float);
                     g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
                     g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                    if (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il]) {
+                        fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane alloc failed (%llu B each)\n",
+                                il, (unsigned long long)index_state_bytes);
+                    }
                     state_init_ok = state_init_ok && g->layer_index_state_kv[il] && g->layer_index_state_score[il];
                     if (state_init_ok) {
                         const uint64_t n = index_state_bytes / sizeof(float);
-                        state_init_ok = gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) &&
-                                        gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, n);
+                        if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) ||
+                            !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, n)) {
+                            fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane prime failed\n", il);
+                            state_init_ok = false;
+                        }
                     }
                 }
             }
@@ -1634,23 +1641,43 @@ bool gpu_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < PULSAR_N_LAYER; il++) {
-        layer_cache_ok = g->layer_raw_cache[il] != NULL;
-        if (layer_cache_ok && gpu_graph_layer_is_kv_source(il)) {
-            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
-                             g->layer_index_comp_cache[il] != NULL &&
-                             g->idx_comp_stage != NULL;
+        if (!g->layer_raw_cache[il]) {
+            fprintf(stderr, "pulsar: layer %u: the raw ring cache is missing -- refusing\n", il);
+            layer_cache_ok = false;
+            break;
         }
-        if (layer_cache_ok && gpu_graph_layer_has_comp_state(il)) {
-            layer_cache_ok = g->layer_attn_state_kv[il] != NULL &&
-                             g->layer_attn_state_score[il] != NULL &&
-                             (!enable_spec ||
-                              (g->spec_attn_state_kv[il] != NULL &&
-                               g->spec_attn_state_score[il] != NULL));
+        /* The index pool exists only where an indexer RUNS, which is the same
+         * predicate the allocation above used.  Demanding it of every kv source
+         * is a second authority: 0731's ratio-128 HCA layers are kv sources that
+         * run no indexer, so they legitimately have none -- and requiring it
+         * made every V4 session fail to allocate, reported three layers up as
+         * "sampled CLI generation requires a session backend". */
+        const bool indexed = pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode);
+        if (gpu_graph_layer_is_kv_source(il) &&
+            (!g->layer_attn_comp_cache[il] || !g->idx_comp_stage ||
+             (indexed && !g->layer_index_comp_cache[il]))) {
+            fprintf(stderr, "pulsar: layer %u: kv-source cache missing (comp pool %s, index pool %s, "
+                            "index stage %s) -- refusing\n",
+                    il, g->layer_attn_comp_cache[il] ? "ok" : "MISSING",
+                    !indexed ? "n/a (no indexer)" : (g->layer_index_comp_cache[il] ? "ok" : "MISSING"),
+                    g->idx_comp_stage ? "ok" : "MISSING");
+            layer_cache_ok = false;
+            break;
+        }
+        if (gpu_graph_layer_has_comp_state(il) &&
+            (!g->layer_attn_state_kv[il] || !g->layer_attn_state_score[il] ||
+             (enable_spec && (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il])))) {
+            fprintf(stderr, "pulsar: layer %u: compressor state missing (attn %s/%s, spec %s/%s) -- refusing\n",
+                    il, g->layer_attn_state_kv[il] ? "ok" : "MISSING",
+                    g->layer_attn_state_score[il] ? "ok" : "MISSING",
+                    !enable_spec ? "off" : (g->spec_attn_state_kv[il] ? "ok" : "MISSING"),
+                    !enable_spec ? "off" : (g->spec_attn_state_score[il] ? "ok" : "MISSING"));
+            layer_cache_ok = false;
+            break;
         }
     }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
-                    g->cur_hc && g->hc_split &&
+    const bool ok = state_init_ok && layer_cache_ok &&                    g->cur_hc && g->hc_split &&
                     g->hc_post && g->hc_comb &&
                     g->attn_norm && g->kv &&
                     g->attn_comp_stage &&
@@ -1679,7 +1706,16 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
-    if (!ok) gpu_graph_release(g);
+    /* Name the failing GROUP before releasing: this returned false with no
+     * message at all, so a session-create failure reached the caller as
+     * "sampled CLI generation requires a session backend" -- three layers away
+     * from the actual cause, and against rule 9 (fail closed, LOUDLY).  The two
+     * named flags are the aggregates the per-tensor checks fold into. */
+    if (!ok) {
+        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s -- refusing\n",
+                state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED");
+        gpu_graph_release(g);
+    }
     return ok;
 }
 
