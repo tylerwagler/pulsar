@@ -2738,6 +2738,29 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs,
         bool                   capture_cur);
+
+/** Work shape of everything the process has run through the two graph funnels:
+ * gpu_graph_prefill_layer_major (one call per prefill chunk, plus the L195
+ * state-only warm-up passes) and gpu_graph_decode_multiseq_batch (one call per
+ * classic decode step, per mixed-entry K-row run, and per speculative verify
+ * batch).  tests/gates_runner.cpp --shape snapshots this around each gate to
+ * say whether a gate's cost is DEPTH (max_pos), REPETITION (step_calls) or
+ * SETUP (prefill_calls/prefill_tokens) instead of guessing from its name.
+ *
+ * Process-global, not per-graph: the graph carries no back-pointer to the
+ * engine, and one process runs one battery.  The reader resets them per gate
+ * (pulsar_gate_shape_reset) so a reused engine's earlier work is not charged
+ * to a later gate.  Counters only -- no branch, no allocation. */
+typedef struct {
+    uint64_t prefill_calls;   /**< gpu_graph_prefill_layer_major calls */
+    uint64_t prefill_tokens;  /**< tokens covered by those calls (n_tokens summed) */
+    uint64_t step_calls;      /**< gpu_graph_decode_multiseq_batch calls */
+    uint64_t step_rows;       /**< rows across those calls (n_active summed) */
+    uint64_t max_pos;         /**< deepest position reached, +1 (a token count) */
+} pulsar_gate_shape;
+void pulsar_gate_shape_read(pulsar_gate_shape *out);
+void pulsar_gate_shape_reset(void);
+
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]);
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,

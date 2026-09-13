@@ -32,18 +32,37 @@
  * MODEL-DEPENDENT, GPU-resident.  Run under the usual memory discipline.
  *
  * usage: ./tests/session_payload_gate MODEL [L]
+ *
+ * L220: a runner function like the other model gates (tests/gate_entry.h), so
+ * the battery reuses the broker's engine instead of paying a 92 GB cold load
+ * for this gate alone.  Every session it creates is registered with
+ * g_sessions so a CHECK failure frees it before returning -- in the runner the
+ * next gate has to fit beside whatever this one leaked.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Slots are cleared as each session is freed, so release is idempotent. */
+static pulsar_session *g_sessions[3];
+
+static int payload_gate_release(pulsar_engine *e) {
+    for (int i = 0; i < 3; i++) {
+        if (g_sessions[i]) pulsar_session_free(g_sessions[i]);
+        g_sessions[i] = NULL;
+    }
+    gate_engine_close(e);
+    return 1;
+}
+
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr, "SESSION-PAYLOAD GATE FAIL: " __VA_ARGS__); \
-    fprintf(stderr, "\n"); return 1; } } while (0)
+    fprintf(stderr, "\n"); return payload_gate_release(e); } } while (0)
 
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
@@ -99,14 +118,14 @@ static uint64_t checksum_comp_caches(pulsar_session *s, const char *tag) {
     return h;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [L]\n", argv[0]); return 2; }
     const int L = argc > 2 ? atoi(argv[2]) : 2048;
     const int ctx = L + 4096;
 
     pulsar_engine *e = NULL; pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
     CHECK(text != NULL, "prompt read failed");
@@ -125,6 +144,7 @@ int main(int argc, char **argv) {
     /* ---- session A: prefill, checksum, save ---- */
     pulsar_session *a = NULL;
     CHECK(pulsar_session_create(&a, e, ctx) == 0, "session A create failed");
+    g_sessions[0] = a;
     pulsar_tokens p; memset(&p, 0, sizeof p);
     p.v = base.v; p.len = p.cap = L;
     CHECK(pulsar_session_sync(a, &p, err, sizeof err) == 0, "A sync: %s", err);
@@ -157,6 +177,7 @@ int main(int argc, char **argv) {
     rewind(fp);
     pulsar_session *b = NULL;
     CHECK(pulsar_session_create(&b, e, ctx) == 0, "session B create failed");
+    g_sessions[1] = b;
     CHECK(pulsar_session_load_payload(b, fp, pbytes, err, sizeof err) == 0, "load: %s", err);
     fclose(fp);
 
@@ -213,6 +234,7 @@ int main(int argc, char **argv) {
         rewind(fc);
         pulsar_session *c = NULL;
         CHECK(pulsar_session_create(&c, e, ctx) == 0, "session C create failed");
+        g_sessions[2] = c;
         err[0] = '\0';
         const int crc = pulsar_session_load_payload(c, fc, (uint64_t)len2, err, sizeof err);
         CHECK(crc != 0 && strstr(err, "digest mismatch") != NULL,
@@ -221,6 +243,7 @@ int main(int argc, char **argv) {
               "digest did not fire", at, crc, err);
         printf("corruption at byte %ld refused (rc=%d): %s\n", at, crc, err);
         pulsar_session_free(c);
+        g_sessions[2] = NULL;
         fclose(fc);
     }
 
@@ -228,5 +251,6 @@ int main(int argc, char **argv) {
     printf("SESSION-PAYLOAD GATE: PASS (v%u, %llu B, comp fnv %016llx, logits identical)\n",
            (unsigned)PULSAR_SESSION_PAYLOAD_VERSION, (unsigned long long)pbytes,
            (unsigned long long)fnv_a);
+    payload_gate_release(e);
     return 0;
 }

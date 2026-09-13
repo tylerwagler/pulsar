@@ -27,11 +27,14 @@
  *
  * usage: tests/gates_runner MODEL --prefill-baseline BLOB --prefill-ref SHORT
  *          [--ref-dir DIR] [--ref-tol TOL] [--kl-story FILE] [--kl-code FILE]
- *          [--only name,name,...]
+ *          [--only name,name,...] [--shape]
  * Exit 0 only when every gate passed.  Prints a per-gate time table (all of
- * them, slowest first) and the number of engine opens.
+ * them, slowest first) and the number of engine opens.  --shape adds the work
+ * shape each gate actually ran (prefill chunks, step calls/rows, deepest
+ * position), read from the graph funnels; it changes nothing else.
  */
 #include "pulsar.h"
+#include "pulsar_engine_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +65,7 @@ int gate_mseq_short_ctx_probe_main(int, char **);
 int gate_comp_state_gate_main(int, char **);
 int gate_chunk_neutrality_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
+int gate_session_payload_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -149,7 +153,9 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-typedef struct { const char *name; int rc; double secs; } gate_result;
+typedef struct { const char *name; int rc; double secs; pulsar_gate_shape shape; uint64_t drafts; } gate_result;
+
+static bool g_shape_report;
 
 static int run_gate(const gate_spec *g, const char *model, gate_result *out) {
     char *argv[20];
@@ -168,15 +174,44 @@ static int run_gate(const gate_spec *g, const char *model, gate_result *out) {
     if (g->env_name) setenv(g->env_name, g->env_val, 1);
     pulsar_engine_set_bank_pool(g->banks);
     const int opens_before = g_engine_opens;
+    pulsar_gate_shape_reset();   /* only this gate's work is counted, even on a reused engine */
+    /* Spec rounds are a fact the engine already carries (the /metrics counters),
+     * not a second copy: the spec lane's draft/verify forwards do not ride the
+     * decode funnel, so a gate like bank-spec shows few step_calls and its real
+     * repetition would be invisible without this. */
+    pulsar_spec_metrics m0;
+    const bool have_m0 = g_live != NULL;
+    if (have_m0) pulsar_engine_spec_metrics(g_live, &m0);
     const double t0 = now_s();
     const int rc = g->entry(argc, argv);
     const double secs = now_s() - t0;
+    pulsar_gate_shape shape1;
+    pulsar_gate_shape_read(&shape1);
+    uint64_t drafts = 0;
+    if (g_live) {
+        pulsar_spec_metrics m1;
+        pulsar_engine_spec_metrics(g_live, &m1);
+        /* A gate that opened its own engine starts those counters at 0. */
+        drafts = (g_engine_opens > opens_before || !have_m0) ? m1.num_drafts
+                                                             : m1.num_drafts - m0.num_drafts;
+    }
     if (g->env_name) unsetenv(g->env_name);
     fflush(stdout); fflush(stderr);
-    printf("--- %s: %s (rc=%d, %.1f s, engine %s)\n", g->name, rc == 0 ? "PASS" : "FAIL", rc, secs,
+    printf("--- %s: %s (rc=%d, %.1f s, engine %s)", g->name, rc == 0 ? "PASS" : "FAIL", rc, secs,
            g_engine_opens > opens_before ? "opened" : "reused");
+    if (g_shape_report)
+        printf("  [prefill %llu/%llutok, steps %llu/%llurows, draftrounds %llu, maxpos %llu]",
+               (unsigned long long)shape1.prefill_calls,
+               (unsigned long long)shape1.prefill_tokens,
+               (unsigned long long)shape1.step_calls,
+               (unsigned long long)shape1.step_rows,
+               (unsigned long long)drafts,
+               (unsigned long long)shape1.max_pos);
+    printf("\n");
     fflush(stdout);
     out->name = g->name; out->rc = rc; out->secs = secs;
+    out->shape = shape1;
+    out->drafts = drafts;
     return rc;
 }
 
@@ -209,14 +244,16 @@ int main(int argc, char **argv) {
     }
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL --prefill-baseline BLOB --prefill-ref SHORT [--ref-dir DIR] "
-                        "[--ref-tol TOL] [--kl-story FILE] [--kl-code FILE] [--only a,b]\n", argv[0]);
+                        "[--ref-tol TOL] [--kl-story FILE] [--kl-code FILE] [--only a,b] [--shape]\n", argv[0]);
         return 2;
     }
     const char *model = argv[1];
     const char *prefill_baseline = NULL, *prefill_ref = NULL, *ref_dir = NULL, *ref_tol = "1e-4";
     const char *decode_baseline = NULL, *decode_ref = NULL;
     const char *kl_story = NULL, *kl_code = NULL, *only = NULL;
-    for (int i = 2; i + 1 < argc; i += 2) {
+    for (int i = 2; i < argc; ) {
+        if (!strcmp(argv[i], "--shape")) { g_shape_report = true; i += 1; continue; }
+        if (i + 1 >= argc) { fprintf(stderr, "gates_runner: option %s needs a value\n", argv[i]); return 2; }
         if (!strcmp(argv[i], "--prefill-baseline")) prefill_baseline = argv[i + 1];
         else if (!strcmp(argv[i], "--prefill-ref")) prefill_ref = argv[i + 1];
         else if (!strcmp(argv[i], "--decode-baseline")) decode_baseline = argv[i + 1];
@@ -227,6 +264,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--kl-code")) kl_code = argv[i + 1];
         else if (!strcmp(argv[i], "--only")) only = argv[i + 1];
         else { fprintf(stderr, "gates_runner: unknown option %s\n", argv[i]); return 2; }
+        i += 2;
     }
     if (!prefill_baseline || !prefill_ref || !decode_baseline || !decode_ref) {
         fprintf(stderr, "gates_runner: --prefill-baseline/--prefill-ref and --decode-baseline/--decode-ref "
@@ -289,6 +327,12 @@ int main(int argc, char **argv) {
         /* L175: the same assertions on the banked layout (per-layer caches are
          * bank views with a pool, owning allocations without one). */
         {"cuda-comp-state-gate-banked", gate_comp_state_gate_main,      2, NULL, NULL, {NULL}},
+        /* L220: the SAVE -> LOAD round trip (comp-cache bytes + same-token
+         * logits, then the v10 digest on a one-byte flip).  Same default
+         * configuration as this group, so it reuses the broker's engine
+         * instead of paying its own 92 GB load (the Makefile's last
+         * not-yet-folded target).  1 bank: the classic payload layout. */
+        {"cuda-session-payload-gate", gate_session_payload_gate_main,    1, NULL, NULL, {NULL}},
     };
     /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
     const gate_spec group_depth1[] = {
@@ -373,6 +417,27 @@ int main(int argc, char **argv) {
     qsort(results, (size_t)n_results, sizeof results[0], cmp_secs_desc);
     printf("\n  seconds per gate (slowest first):\n");
     for (int i = 0; i < n_results; i++) printf("    %6.0f  %s\n", results[i].secs, results[i].name);
+    if (g_shape_report) {
+        /* PHASE-0 work shape: what each gate actually ran, so the cut list is
+         * argued from prefill chunks / step rows / depth instead of its name.
+         * prefill = gpu_graph_prefill_layer_major calls and tokens (chunks and
+         * L195 state-only warm-ups); steps = gpu_graph_decode_multiseq_batch
+         * calls and rows (decode tokens, mixed K-row runs, verify batches);
+         * maxpos = the deepest position the gate reached. */
+        printf("\n  work shape per gate (slowest first):\n");
+        printf("    %6s  %8s %9s  %8s %9s  %6s  %7s  %s\n",
+               "secs", "prefill", "tok", "steps", "rows", "drafts", "maxpos", "gate");
+        for (int i = 0; i < n_results; i++)
+            printf("    %6.0f  %8llu %9llu  %8llu %9llu  %6llu  %7llu  %s\n",
+                   results[i].secs,
+                   (unsigned long long)results[i].shape.prefill_calls,
+                   (unsigned long long)results[i].shape.prefill_tokens,
+                   (unsigned long long)results[i].shape.step_calls,
+                   (unsigned long long)results[i].shape.step_rows,
+                   (unsigned long long)results[i].drafts,
+                   (unsigned long long)results[i].shape.max_pos,
+                   results[i].name);
+    }
     printf("\n  %d gates in %.0f s, %d engine open(s)\n", n_results, now_s() - suite0, g_engine_opens);
     printf(rc_all == 0 ? "RUNNER GATES: PASS\n" : "RUNNER GATES: FAIL\n");
     return rc_all;

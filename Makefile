@@ -227,6 +227,8 @@ help:
 	@echo "                           pass/fail summary (needs the GB10 + model:"
 	@echo "                           make gates FRONTIER_MODEL=/srv/models/x.gguf)"
 	@echo "                           = $(GATE_TARGETS)"
+	@echo "                           + host-only, run alongside cuda-runner-gate:"
+	@echo "                             $(HOST_GATE_TARGETS)"
 	@echo "                           (cuda-runner-gate runs the model gates in one process)"
 	@echo "  make clean               Remove build outputs"
 
@@ -1081,25 +1083,29 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
                bank_evict_restore_gate bank_fork_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
-               comp_state_gate chunk_neutrality_gate
+               comp_state_gate chunk_neutrality_gate session_payload_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h
 	@mkdir -p tests/runner
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
-tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h src/pulsar.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/gates_runner.cpp
+tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
 tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # The runner receives exactly what the individual targets passed: the prefill
 # baseline blob and its ref, the reference-capture dir (skips loudly when
 # unset), the tolerance and the KL budgets (passed only when present).
+# GATE_RUNNER_FLAGS carries the battery-invisible diagnostics (--shape prints
+# each gate's prefill/step work shape); it is empty for `make gates`.
+GATE_RUNNER_FLAGS ?=
 cuda-runner-gate: tests/gates_runner
 	./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
 		--ref-dir "$(PULSAR_REF_DIR)" \
-		--ref-tol $(PULSAR_REF_TOL) --kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE)
+		--ref-tol $(PULSAR_REF_TOL) --kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
+		$(GATE_RUNNER_FLAGS)
 
 # Every release-blocking gate, in one command.
 #
@@ -1119,26 +1125,37 @@ cuda-runner-gate: tests/gates_runner
 # the one test set a landing could skip, and L156 found a golden in it that had
 # been failing since May because nobody ran it.  Same model as the frontier
 # gates so one FRONTIER_MODEL= names the artifact for everything.
-unit-test-gate: pulsar_test seam-check
+# seam-check used to be a prerequisite here (host-only, ~instant).  L220 moved
+# it to HOST_GATE_TARGETS: it still runs in the battery, just alongside the GPU
+# tail instead of in front of pulsar_test.  A seam-check failure still fails the
+# battery (it lands in the same pass/fail fold).
+unit-test-gate: pulsar_test
 	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test
 
 # The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
-# tests/gates_runner.cpp) -- one 86 GB model load per engine configuration
+# tests/gates_runner.cpp) -- one 92 GB model load per engine configuration
 # instead of one per gate.  Their individual targets below remain for
-# iterating on one gate; the battery is the runner, with one exception:
-# cuda-session-payload-gate is not a runner function yet (it opens its own
-# engine and returns from every failure site), and its v10 digest corruption
-# case must be IN the battery -- a gate nothing runs is the L219 finding this
-# target closed.  Fold it into tests/gates_runner.cpp to drop the extra load.
+# iterating on one gate; the battery is the runner.  L220 folded the last
+# exception in: cuda-session-payload-gate is now a runner function too (its
+# v10 digest corruption case included), so the battery no longer pays a
+# separate engine load for it.
 GATE_TARGETS = unit-test-gate \
-	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-session-payload-gate vision-layout-gate vision-pixel-gate vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate \
+	cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
+	cuda-attn-gates \
 	cuda-runner-gate
+# L220: gates that need no GPU and no model.  They are launched in the
+# background immediately before cuda-runner-gate and collected after it, so
+# they overlap the long GPU tail instead of adding their seconds in front of
+# it.  The runner is the only target after them, and every gate binary and
+# CORE_OBJS is built by the targets above, so the background sub-makes only
+# RUN -- they do not race the runner's build (which reads the same objects).
+HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
+	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
+.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1176,9 +1193,25 @@ gates-quick:
 # triggers is SERIAL.
 GATE_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-gates:
+# tests/gates_runner is a PREREQUISITE, not just an in-loop target: L220 starts
+# the host-only gates as background sub-makes at cuda-runner-gate, and building
+# the runner here (before any recipe line runs) means the whole CORE_OBJS set
+# is fresh before those sub-makes start -- they then only compile their own
+# test TU and link, so concurrent make processes cannot race shared objects.
+gates: tests/gates_runner
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
+	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
 	for g in $(GATE_TARGETS); do \
+	  if [ "$$g" = "cuda-runner-gate" ]; then \
+	    for h in $(HOST_GATE_TARGETS); do \
+	      ( h0=$$(date +%s); \
+	        $(MAKE) -j$(GATE_JOBS) --no-print-directory "$$h" CUDA_ARCH=sm_120f \
+	              FRONTIER_MODEL="$(FRONTIER_MODEL)" SPEC_GATE_MODEL="$(SPEC_GATE_MODEL)" \
+	              CUTLASS_DIR="$(CUTLASS_DIR)" > "$$hostdir/$$h.log" 2>&1; \
+	        echo "$$? $$(( $$(date +%s) - h0 ))" > "$$hostdir/$$h.result" ) & \
+	      host_pids="$$host_pids $$!"; \
+	    done; \
+	  fi; \
 	  printf '\n\033[1m=== %s ===\033[0m\n' "$$g"; \
 	  t0=$$(date +%s); \
 	  if $(MAKE) -j$(GATE_JOBS) --no-print-directory "$$g" CUDA_ARCH=sm_120f \
@@ -1190,10 +1223,20 @@ gates:
 	  fi; \
 	  times="$$times $$g:$$(( $$(date +%s) - t0 ))"; \
 	done; \
+	for p in $$host_pids; do wait $$p; done; \
+	for h in $(HOST_GATE_TARGETS); do \
+	  printf '\n\033[1m=== %s (host-only, ran alongside the GPU tail) ===\033[0m\n' "$$h"; \
+	  cat "$$hostdir/$$h.log"; \
+	  read hrc hsecs < "$$hostdir/$$h.result"; \
+	  times="$$times $$h:$$hsecs"; \
+	  if [ "$$hrc" = "0" ]; then passed="$$passed $$h"; \
+	  else failed="$$failed $$h"; rc=1; fi; \
+	done; \
+	rm -rf "$$hostdir"; \
 	printf '\n===================== GATE SUMMARY =====================\n'; \
 	for g in $$passed; do printf '  PASS  %s\n' "$$g"; done; \
 	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
-	printf '\n  seconds per gate (slowest first):\n'; \
+	printf '\n  seconds per gate (slowest first; host gates overlap the runner):\n'; \
 	for e in $$times; do printf '    %6s  %s\n' "$${e##*:}" "$${e%%:*}"; done \
 	  | sort -rn; \
 	printf '\n  suite total: %s s\n' "$$(( $$(date +%s) - suite0 ))"; \

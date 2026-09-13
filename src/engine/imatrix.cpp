@@ -1,6 +1,18 @@
 #include "pulsar_engine_internal.h"
 
+/* The one place the two graph funnels' work is counted (see pulsar_gate_shape
+ * in pulsar_engine_internal.h).  imatrix.cpp holds both funnels -- prefill via
+ * gpu_graph_prefill_layer_major, stepping via gpu_graph_decode_multiseq_batch --
+ * so the counters and the accessor stay in one TU with them. */
+static pulsar_gate_shape g_gate_shape;
 
+void pulsar_gate_shape_read(pulsar_gate_shape *out) {
+    *out = g_gate_shape;
+}
+
+void pulsar_gate_shape_reset(void) {
+    memset(&g_gate_shape, 0, sizeof g_gate_shape);
+}
 
 bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
@@ -399,6 +411,12 @@ bool gpu_graph_prefill_layer_major(
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    /* Every prefill chunk and every L195 state-only warm-up pass joins the
+     * battery's shape report exactly once, here. */
+    g_gate_shape.prefill_calls++;
+    g_gate_shape.prefill_tokens += n_tokens;
+    if ((uint64_t)start + n_tokens > g_gate_shape.max_pos)
+        g_gate_shape.max_pos = (uint64_t)start + n_tokens;
     /* The collector reads each layer's f32 ffn_norm rows on the host; the
      * norm stores them only while this is set. */
     g->imatrix_f32_rows = imatrix != NULL;
@@ -1091,6 +1109,15 @@ int gpu_graph_decode_multiseq_batch(
                 (g && g->spec_logits) ? "ok" : "MISSING");
         return 0;
     }
+
+    /* Every accepted step joins the battery's shape report once, here: one
+     * call per classic decode token, per mixed-entry K-row run, per
+     * speculative verify batch; n_active is its row count. */
+    g_gate_shape.step_calls++;
+    g_gate_shape.step_rows += n_active;
+    for (uint32_t i = 0; i < n_active; i++)
+        if ((uint64_t)pos[i] + 1 > g_gate_shape.max_pos)
+            g_gate_shape.max_pos = (uint64_t)pos[i] + 1;
 
     /* Gather each session's current token into the batch input rows.  The
      * token embedding is position/bank-independent, so the existing prompt
