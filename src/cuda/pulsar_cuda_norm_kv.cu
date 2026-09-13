@@ -1083,6 +1083,7 @@ int pulsar_gpu_kv_ring_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor
  * boundaries; the ring must hold exactly what attention read). */
 __global__ static void winkv_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
                                             uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
+                                            uint64_t rowbytes,
                                             const int32_t *__restrict__ positions,
                                             const int32_t *__restrict__ seq_id,
                                             uint32_t n_banks, uint32_t raw_cap) {
@@ -1090,7 +1091,11 @@ __global__ static void winkv_scatter_kernel(const uint8_t *__restrict__ src, uin
     if (row >= n_rows) return;
     const uint64_t dst_row = pulsar_kv_ring_slot(row, out_row0, raw_cap, n_banks, positions, seq_id);
     if (dst_row == PULSAR_KV_RING_DEAD_ROW) return;   /* dead row stores nothing */
-    const uint64_t rowbytes = PULSAR_WINKV_ROWBYTES(head_dim);
+    /* rowbytes comes from the CALLER's style-aware authority, not from a formula
+     * here: this is a byte move of rows the loaded profile already packed, and
+     * hard-coding the WINDOW formula made it agree with the V4.1 ring (528 B)
+     * while the V4 ring is 384 B -- so the batch store walked the wrong stride
+     * and every V4 session died in layer 0 (see the host guard below). */
     const uint8_t *sr = src + (uint64_t)row * rowbytes;
     uint8_t *dr = out + dst_row * rowbytes;
     for (uint32_t b = threadIdx.x; b < (uint32_t)rowbytes; b += blockDim.x) dr[b] = sr[b];
@@ -1122,13 +1127,21 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, co
     if (!raw_store_descr_ok(positions, seq_id, n_tokens, n_banks, raw_cap, "banked packed raw store")) return 0;
     const bool descr = positions != NULL;
     const uint64_t kv_banks = descr ? n_banks : 1u;
-    const uint64_t rowbytes = PULSAR_WINKV_ROWBYTES(head_dim);
+    /* ASK BY KIND, like every other ring path in this file (see
+     * pulsar_gpu_store_raw_kv_tensor).  This was PULSAR_WINKV_ROWBYTES(head_dim)
+     * -- the V4.1 WINDOW formula -- while the ring it guards was allocated at
+     * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING), which for the V4 (UNIFIED) family
+     * is the 384 B NVFP4 row.  So the bound asked for 528 B/row against a 384 B
+     * allocation, and the function returned 0 SILENTLY: every V4 session failed
+     * in layer 0's attention encode with no message anywhere. */
+    const uint64_t rowbytes = pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim);
+    if (rowbytes == 0) return 0;
     if (!raw_cache || !packed || raw_cap == 0 || (head_dim % PULSAR_WINKV_BLOCK) != 0u ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
         packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
     if (n_tokens == 0) return 1;
     winkv_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr, (uint8_t *)raw_cache->ptr,
-                                           pos0, n_tokens, head_dim,
+                                           pos0, n_tokens, head_dim, rowbytes,
                                            descr ? (const int32_t *)positions->ptr : NULL,
                                            descr ? (const int32_t *)seq_id->ptr : NULL,
                                            descr ? n_banks : 1u, raw_cap);
