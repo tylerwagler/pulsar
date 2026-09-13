@@ -525,3 +525,59 @@ fail:
     return false;
 }
 
+
+
+/* RFC 4648 standard-alphabet value, or -1. */
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+
+
+uint8_t *base64_decode(const char *in, size_t in_len, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!in || in_len == 0 || (in_len % 4) != 0) return NULL;
+    uint8_t *out = (uint8_t *)server_xmalloc(in_len / 4 * 3 + 1);
+    size_t n = 0;
+    for (size_t i = 0; i < in_len; i += 4) {
+        int v[4];
+        int pad = 0;
+        for (int k = 0; k < 4; k++) {
+            const unsigned char c = (unsigned char)in[i + k];
+            if (c == '=') {
+                /* Padding closes the stream: only the final one or two slots
+                 * of the final quad may be '=', and nothing may follow it. */
+                if (k < 2 || i + 4 != in_len) {
+                    free(out);
+                    return NULL;
+                }
+                pad++;
+                v[k] = 0;
+                continue;
+            }
+            if (pad) {
+                free(out);
+                return NULL;
+            }
+            const int d = base64_value(c);
+            if (d < 0) {
+                free(out);
+                return NULL;
+            }
+            v[k] = d;
+        }
+        const uint32_t x = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+                           ((uint32_t)v[2] << 6) | (uint32_t)v[3];
+        out[n++] = (uint8_t)(x >> 16);
+        if (pad < 2) out[n++] = (uint8_t)(x >> 8);
+        if (pad < 1) out[n++] = (uint8_t)x;
+    }
+    if (out_len) *out_len = n;
+    return out;
+}
+

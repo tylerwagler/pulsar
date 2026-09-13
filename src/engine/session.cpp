@@ -860,9 +860,12 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * rows whose embeddings never arrived -- the embedder zero-masks an
          * out-of-vocab id, and only the merge puts anything there -- so refuse it
          * here instead of silently serving a wrong answer.  A tokenizer never
-         * emits an id at or above vocab_size, so ANY such id is a sentinel. */
+         * emits an id at or above vocab_size, so ANY such id is a sentinel.  The
+         * PLACEHOLDER id is in-vocab and would embed as ordinary text, so it is
+         * refused too: it is a renderer artifact that
+         * pulsar_expand_image_placeholders() must have replaced. */
         for (int i = 0; i < prompt->len; i++) {
-            if (prompt->v[i] >= (int)PULSAR_N_VOCAB) {
+            if (prompt->v[i] >= (int)PULSAR_N_VOCAB || prompt->v[i] == e->vocab.image_id) {
                 snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request "
                                       "carries no images", i, prompt->v[i]);
                 return 1;

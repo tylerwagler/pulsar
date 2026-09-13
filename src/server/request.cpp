@@ -130,6 +130,30 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 
 
 
+static void chat_msg_clear_images(chat_msg *m) {
+    for (int i = 0; i < m->images_len; i++) free(m->images[i].bytes);
+    free(m->images);
+    m->images = NULL;
+    m->images_len = 0;
+    m->images_cap = 0;
+}
+
+
+
+/* Take ownership of one decoded image. */
+static void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len) {
+    if (m->images_len == m->images_cap) {
+        m->images_cap = m->images_cap ? m->images_cap * 2 : 4;
+        m->images = (chat_image *)server_xrealloc(m->images,
+                                                  (size_t)m->images_cap * sizeof(m->images[0]));
+    }
+    m->images[m->images_len].bytes = bytes;
+    m->images[m->images_len].len = len;
+    m->images_len++;
+}
+
+
+
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
@@ -137,6 +161,7 @@ static void chat_msg_free(chat_msg *m) {
     free(m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
+    chat_msg_clear_images(m);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -240,6 +265,8 @@ void request_init(request *r, req_kind kind, int max_tokens) {
 
 void request_free(request *r) {
     pulsar_tokens_free(&r->prompt);
+    for (int i = 0; i < r->n_images; i++) free((void *)r->images[i].bytes);
+    free(r->images);
     free(r->model);
     free(r->forced_tool_name);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -1354,7 +1381,232 @@ bad:
 
 
 
-bool parse_messages(const char **p, chat_msgs *msgs) {
+/* Decode the `url` of an OpenAI image_url block.  Only an inline base64 data:
+ * URL is accepted.  A remote http(s) URL is refused with a clear message: this
+ * server does not fetch remote content, and quietly dropping the image is
+ * exactly the silent-context loss this path exists to prevent.  Returns
+ * malloc'd encoded-file bytes (PNG or JPEG) and sets `*len_out`, or NULL with
+ * `err` set. */
+static uint8_t *decode_image_data_url(const char *url, size_t *len_out,
+                                      char *err, size_t errlen) {
+    *len_out = 0;
+    if (!url || !url[0]) {
+        snprintf(err, errlen, "image_url.url is missing");
+        return NULL;
+    }
+    if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
+        snprintf(err, errlen,
+                 "image_url uses a remote http(s) URL, but this server does not fetch remote "
+                 "content; send the image inline as a base64 data: URL");
+        return NULL;
+    }
+    static const char prefix[] = "data:";
+    if (strncmp(url, prefix, sizeof(prefix) - 1)) {
+        snprintf(err, errlen, "image_url must be an inline base64 data: URL");
+        return NULL;
+    }
+    const char *comma = strchr(url, ',');
+    if (!comma) {
+        snprintf(err, errlen, "malformed image data: URL (no ',' before the payload)");
+        return NULL;
+    }
+    /* `data:[<mediatype>][;base64],<payload>`.  Only base64 images are
+     * supported: a percent-encoded payload would need a second decoder, and the
+     * engine only decodes PNG/JPEG. */
+    const char *semi = NULL;
+    for (const char *q = url + sizeof(prefix) - 1; q < comma; q++) {
+        if (*q == ';') { semi = q; break; }
+    }
+    const char *media_end = semi ? semi : comma;
+    if (media_end != url + sizeof(prefix) - 1 &&
+        strncmp(url + sizeof(prefix) - 1, "image/", 6) != 0) {
+        snprintf(err, errlen, "image data: URL must carry an image/* media type");
+        return NULL;
+    }
+    if (!semi || strncmp(semi, ";base64", 7) != 0) {
+        snprintf(err, errlen, "image data: URL must be base64-encoded");
+        return NULL;
+    }
+    uint8_t *bytes = base64_decode(comma + 1, strlen(comma + 1), len_out);
+    if (!bytes || *len_out == 0) {
+        free(bytes);
+        snprintf(err, errlen, "malformed base64 in the image data: URL");
+        return NULL;
+    }
+    return bytes;
+}
+
+
+
+/* Message content: a plain string, null, or an array of typed blocks.  Unlike
+ * json_content (which extracts any "text" field and drops the rest), this is
+ * the FAIL-CLOSED reader for a chat message's content: a text-like block
+ * contributes its text, an OpenAI image_url block is decoded to raw encoded
+ * bytes attached to `msg` with PULSAR_IMAGE_PLACEHOLDER written into the
+ * content at the block's position, and any other block is refused so the client
+ * gets a 400 instead of an answer built on context the server discarded. */
+static bool parse_chat_content(const char **p, chat_msg *msg, char *err, size_t errlen) {
+    json_ws(p);
+    if (**p == '"') {
+        free(msg->content);
+        return json_string(p, &msg->content);
+    }
+    if (json_lit(p, "null")) {
+        free(msg->content);
+        msg->content = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        snprintf(err, errlen, "message content must be a string or an array of content blocks");
+        return false;
+    }
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            char *type = NULL;
+            char *text = NULL;
+            char *url = NULL;
+            bool image = false;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto block_fail;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto block_fail;
+                }
+                (*p)++;
+                if (!strcmp(key, "type")) {
+                    free(type);
+                    if (!json_string(p, &type)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                    image = !strcmp(type, "image_url");
+                } else if (!strcmp(key, "text")) {
+                    free(text);
+                    json_ws(p);
+                    if (json_lit(p, "null")) {
+                        text = xstrdup("");
+                    } else if (!json_string(p, &text)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    /* OpenAI wraps the URL in {"url": ...}; a bare string is
+                     * tolerated so a slightly-off client still lands here. */
+                    free(url);
+                    json_ws(p);
+                    if (**p == '{') {
+                        (*p)++;
+                        json_ws(p);
+                        while (**p && **p != '}') {
+                            char *ik = NULL;
+                            if (!json_string(p, &ik)) {
+                                free(key);
+                                goto block_fail;
+                            }
+                            json_ws(p);
+                            if (**p != ':') {
+                                free(ik);
+                                free(key);
+                                goto block_fail;
+                            }
+                            (*p)++;
+                            if (!strcmp(ik, "url")) {
+                                free(url);
+                                if (!json_string(p, &url)) {
+                                    free(ik);
+                                    free(key);
+                                    goto block_fail;
+                                }
+                            } else if (!json_skip_value(p)) {
+                                free(ik);
+                                free(key);
+                                goto block_fail;
+                            }
+                            free(ik);
+                            json_ws(p);
+                            if (**p == ',') (*p)++;
+                            json_ws(p);
+                        }
+                        if (**p != '}') {
+                            free(key);
+                            goto block_fail;
+                        }
+                        (*p)++;
+                    } else if (!json_string(p, &url)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    goto block_fail;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') goto block_fail;
+            (*p)++;
+            if (image) {
+                size_t n = 0;
+                uint8_t *bytes = decode_image_data_url(url, &n, err, errlen);
+                if (!bytes) goto block_fail;
+                chat_msg_add_image(msg, bytes, n);
+                buf_puts(&b, PULSAR_IMAGE_PLACEHOLDER);
+            } else if (text) {
+                buf_puts(&b, text);
+            } else {
+                snprintf(err, errlen,
+                         "unsupported content block type \"%s\"; this server accepts text and image_url blocks",
+                         type ? type : "(missing)");
+                goto block_fail;
+            }
+            free(type);
+            free(text);
+            free(url);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+            continue;
+block_fail:
+            free(type);
+            free(text);
+            free(url);
+            goto fail;
+        } else {
+            snprintf(err, errlen, "content array elements must be strings or typed blocks");
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    free(msg->content);
+    msg->content = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+
+
+bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -1381,8 +1633,10 @@ bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
+                chat_msg_clear_images(&msg);
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                msg.content = NULL;
+                if (!parse_chat_content(p, &msg, err, errlen)) {
                     free(key);
                     goto fail;
                 }

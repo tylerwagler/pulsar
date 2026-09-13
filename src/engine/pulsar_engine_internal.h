@@ -1418,6 +1418,7 @@ struct pulsar_vocab {
     int think_start_id;    ///< opens a reasoning span
     int think_end_id;      ///< closes a reasoning span
     int dsml_id;           ///< DSML tool-call marker
+    int image_id;          ///< PULSAR_IMAGE_PLACEHOLDER's id, or -1 when the artifact has no such token
     str_i32_table token_to_id;  ///< token bytes -> id, for the BPE merge loop
     str_i32_table merge_rank;   ///< BPE merge priority; lower rank merges first
 
@@ -1431,8 +1432,13 @@ struct pulsar_vocab {
     void bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const;
     /** Tokenize plain text: pre-tokenize, then BPE-merge each piece. */
     void bpe_tokenize_text(const char *text, token_vec *out) const;
-    /** Exact-match lookup of a token's id. @return the id, or -1 if absent. */
+    /** Exact-match lookup of a REQUIRED token's id.  A missing token is a fatal
+     * load error (exits), so only callers whose token every served artifact
+     * carries may use it. @return the id. */
     int vocab_lookup(const char *text) const;
+    /** Exact-match lookup that returns -1 when the token is absent -- the
+     * OPTIONAL counterpart of vocab_lookup, which exits on a missing token. */
+    int vocab_find(const char *text) const;
     /** Populate the vocabulary from the model's GGUF metadata. */
     void vocab_load(const pulsar_model *model);
     /** Release the vocabulary's owned tables. */

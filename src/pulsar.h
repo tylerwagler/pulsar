@@ -38,6 +38,13 @@ typedef enum {
     PULSAR_LOG_ERROR,
 } pulsar_log_type;
 
+/** The tokenizer's image placeholder: the ONE text a renderer writes where an
+ * image belongs.  `pulsar_expand_image_placeholders()` replaces every
+ * occurrence with that image's sentinel block; its id is resolved from the
+ * vocab by string (never hard-coded), so an artifact without the token simply
+ * cannot serve images. */
+#define PULSAR_IMAGE_PLACEHOLDER "<｜deepseek_image｜>"
+
 /** One image to place in a prompt.  `start_pos` is the token index of the
  * image BLOCK's first slot -- the reference's `ImageInput.start`, i.e. the
  * length of the prompt at the moment the block was appended.  The renderer
@@ -386,6 +393,25 @@ int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *er
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images,
                            char *err, size_t errlen);
+/** The renderer's half of prepare_vl_inputs(), and the ONLY producer of the
+ * out-of-vocab sentinel ids the engine's mm prefill consumes: walk `prompt` and
+ * replace every PULSAR_IMAGE_PLACEHOLDER token with that image's sentinel block,
+ * in request order, setting `images[i].start_pos` to the block's first slot
+ * (the token count at that moment; see pulsar_image_ref).
+ *
+ * `out` must be zero-initialized and is owned by the caller afterwards (it
+ * receives the expanded prompt); `images[i].bytes/len` are read for the decode.
+ * Refuses, with `err` set, when the placeholder and image counts disagree, when
+ * an image cannot be decoded or is not one the tower accepts, when the artifact
+ * carries no vision tower, or when the vocab has no placeholder token.  Text
+ * with no image passes through unchanged, but callers must NOT route a
+ * text-only request through here: pulsar_session_sync() is its path.
+ *
+ * The engine's sync API is BLOCK-based, so this call must happen before it: a
+ * placeholder id reaching pulsar_session_sync_mm() is a caller bug. */
+int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
+                                     pulsar_image_ref *images, int n_images,
+                                     pulsar_tokens *out, char *err, size_t errlen);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, -1 when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a

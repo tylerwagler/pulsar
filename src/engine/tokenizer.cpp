@@ -494,6 +494,17 @@ int pulsar_vocab::vocab_lookup(const char *text) const {
 
 
 
+/* The optional counterpart: an artifact legitimately lacks the image
+ * placeholder, so its absence is a fact (no image path), not a refusal. */
+int pulsar_vocab::vocab_find(const char *text) const {
+    const auto *vocab = this;
+    int token = -1;
+    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
+    return token;
+}
+
+
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 void pulsar_vocab::vocab_load(const pulsar_model *model) {
     auto *vocab = this;
@@ -536,6 +547,11 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     vocab->think_start_id = vocab->vocab_lookup("<think>");
     vocab->think_end_id = vocab->vocab_lookup("</think>");
     vocab->dsml_id = vocab->vocab_lookup("｜DSML｜");
+    /* The image placeholder is resolved BY STRING, never a literal id: an
+     * artifact without the token leaves image_id < 0 and cannot serve images,
+     * and one that has it gets whichever id its own table assigned.  This is
+     * the optional lookup -- a text-only artifact must still load. */
+    vocab->image_id = vocab->vocab_find(PULSAR_IMAGE_PLACEHOLDER);
 }
 
 
@@ -598,9 +614,11 @@ bool pulsar_vocab::special_token_at(const char *p, int *token, size_t *len) cons
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"｜DSML｜",                vocab->dsml_id},
+        {PULSAR_IMAGE_PLACEHOLDER, vocab->image_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (specials[i].token < 0) continue;   /* absent in this artifact's vocab */
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;

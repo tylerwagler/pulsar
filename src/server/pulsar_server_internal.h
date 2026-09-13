@@ -292,10 +292,25 @@ typedef struct {
     int cap;               ///< tools allocated
 } tool_schema_orders;
 
+/** One inline image attached to a chat message: the ENCODED image FILE
+ * (PNG or JPEG) exactly as the client's base64 data: URL carried it.  The
+ * engine decodes; the server never converts pixels. */
+typedef struct {
+    uint8_t *bytes;  ///< the encoded image file, owned
+    size_t   len;    ///< its length in bytes
+} chat_image;
+
 /** One message in a chat request, after parsing and before rendering. */
 typedef struct {
     char *role;           ///< "system", "user", "assistant", or "tool", owned
     char *content;        ///< message text, owned
+    /** Inline images in content order.  Each contributes one
+     * PULSAR_IMAGE_PLACEHOLDER to `content` at the position its block occupied,
+     * so the rendered prompt places the sentinel block where the client asked;
+     * the two lists must stay the same length. */
+    chat_image *images;   ///< owned, `images_len` entries
+    int   images_len;     ///< images present
+    int   images_cap;     ///< images allocated
     char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
     char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
     char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
@@ -459,6 +474,12 @@ typedef struct {
     req_kind kind;             ///< what the request asks for (completion, chat, embedding, ...)
     api_style api;             ///< which wire protocol it arrived on; the response must match
     pulsar_tokens prompt;      ///< the rendered prompt as tokens
+    /** Images for pulsar_session_sync_mm(), in message/content order, with
+     * `start_pos` already resolved by pulsar_expand_image_placeholders() at
+     * parse time.  Empty (n_images == 0) for every text-only request, which
+     * keeps pulsar_session_sync() as its exact path.  `bytes` are owned. */
+    pulsar_image_ref *images;  ///< owned, `n_images` entries
+    int n_images;              ///< images in the request
     char *model;               ///< model name to serve, owned
     bool model_from_request;   ///< the client named the model (vs the server default)
     stop_list stops;           ///< client-supplied stop sequences
@@ -2194,6 +2215,9 @@ typedef struct server_prefill_progress {
     const char *phase;   ///< current phase name, for log lines
     bool has_tools;      ///< the request declared tools
     bool responses_protocol;  ///< the request is on /responses
+    /** An image request is a COLD prefill whose sentinel blocks must not be
+     * checkpointed: the progress callback skips the continued KV store. */
+    bool image_request;  ///< the request carries images
     double t0;           ///< wall-clock at prefill start
     double last_t;       ///< wall-clock of the last progress event, for interval rates
     int last_current;    ///< `current` at that event
@@ -2443,6 +2467,11 @@ bool json_skip_value(const char **p);
 bool json_raw_value(const char **p, char **out);
 char *json_minify_raw_value(const char *json);
 bool json_content(const char **p, char **out);
+/** Decode a standard base64 payload (RFC 4648 alphabet, '=' padding, no
+ * whitespace).  Returns a malloc'd buffer and sets `*out_len`, or NULL on
+ * malformed input.  The server's ONE base64 decoder; used for inline data:
+ * image URLs. */
+uint8_t *base64_decode(const char *in, size_t in_len, size_t *out_len);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
  * available (ids must never be predictable).  The ONE id generator: tool-call,
@@ -2481,7 +2510,7 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
 bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
-bool parse_messages(const char **p, chat_msgs *msgs);
+bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs);
 bool parse_anthropic_system(const char **p, char **out);
 void append_tool_result_text(buf *b, const char *s);

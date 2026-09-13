@@ -3499,6 +3499,82 @@ static void test_json_value_helpers_null_out_on_failure(void) {
 
 
 
+/* The chat image surface: an OpenAI image_url block is decoded from its base64
+ * data: URL, attached to the message, and its placeholder is written into the
+ * content at the block's position.  A remote URL and a malformed data URL are
+ * refused with a message, never dropped, and an unknown non-text block fails
+ * closed instead of vanishing from the prompt. */
+static void test_chat_image_url_content_blocks(void) {
+    /* The 1x1 PNG, so the bytes are a real encoded FILE, not a re-encode. */
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"look\"},");
+    buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (!parsed) {
+        fprintf(stderr, "chat image parse refused: %s\n", err);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+        return;
+    }
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(msgs.v[0].images[0].len > 8);
+        TEST_ASSERT(msgs.v[0].images[0].bytes[0] == 0x89 && msgs.v[0].images[0].bytes[1] == 'P');
+        TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) != NULL);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    const char *remote =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]";
+    chat_msgs remote_msgs = {0};
+    p = remote; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &remote_msgs, err, sizeof err));
+    TEST_ASSERT(strstr(err, "http") != NULL);
+    chat_msgs_free(&remote_msgs);
+
+    const char *badb64 =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,!!!!\"}}]}]";
+    chat_msgs bad_msgs = {0};
+    p = badb64; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &bad_msgs, err, sizeof err));
+    TEST_ASSERT(strstr(err, "base64") != NULL);
+    chat_msgs_free(&bad_msgs);
+
+    const char *audio =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"data\":\"x\"}]}]";
+    chat_msgs audio_msgs = {0};
+    p = audio; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &audio_msgs, err, sizeof err));
+    chat_msgs_free(&audio_msgs);
+
+    /* The decoder itself: round trip, then the malformed shapes. */
+    static const char hello[] = "aGVsbG8=";   /* "hello" */
+    size_t n = 0;
+    uint8_t *bytes = base64_decode(hello, strlen(hello), &n);
+    TEST_ASSERT(bytes && n == 5 && !memcmp(bytes, "hello", 5));
+    free(bytes);
+    TEST_ASSERT(base64_decode("abc", 3, &n) == NULL);       /* impossible length */
+    TEST_ASSERT(base64_decode("ab=c", 4, &n) == NULL);      /* data after padding */
+    TEST_ASSERT(base64_decode("aaaa====", 8, &n) == NULL);  /* padding mid-stream */
+    TEST_ASSERT(base64_decode("a!b=", 4, &n) == NULL);      /* bad alphabet */
+}
+
+
+
 static void append_tool_heavy_schema(buf *b, int idx) {
     if (idx) buf_putc(b, ',');
     buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
@@ -3607,7 +3683,8 @@ static void test_json_parser_handles_tool_heavy_requests(void) {
 
         const char *mp = messages.ptr;
         chat_msgs msgs = {0};
-        TEST_ASSERT(parse_messages(&mp, &msgs));
+        char perr[160] = {0};
+        TEST_ASSERT(parse_messages(&mp, &msgs, perr, sizeof perr));
         json_ws(&mp);
         TEST_ASSERT(*mp == '\0');
         TEST_ASSERT(msgs.len == 98);
@@ -7421,6 +7498,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
+    test_chat_image_url_content_blocks();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();

@@ -81,6 +81,51 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
 }
 
 
+/* The renderer's half of prepare_vl_inputs(): the parsed messages carry their
+ * inline images; this gathers them in message/content order, copies the encoded
+ * bytes into the request (the messages are freed when parsing returns), and
+ * lets the engine replace each rendered PULSAR_IMAGE_PLACEHOLDER with that
+ * image's sentinel block, filling each start_pos.  A text-only request is left
+ * untouched -- its sync path is pulsar_session_sync(). */
+static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
+                                   request *r, char *err, size_t errlen) {
+    int n = 0;
+    for (int i = 0; i < msgs->len; i++) n += msgs->v[i].images_len;
+    /* A request with no images and no placeholder text is the plain text path:
+     * leave r->prompt exactly as tokenized.  A placeholder with no image is a
+     * malformed image request, not text, and must be refused -- it is checked
+     * by the expander below (and by the engine's own text-path scan). */
+    const bool placeholder = r->prompt_text &&
+                             strstr(r->prompt_text, PULSAR_IMAGE_PLACEHOLDER) != NULL;
+    if (n == 0 && !placeholder) return true;
+    if (n > 0) {
+        r->images = (pulsar_image_ref *)server_xmalloc((size_t)n * sizeof(r->images[0]));
+        memset(r->images, 0, (size_t)n * sizeof(r->images[0]));
+        r->n_images = n;
+        int k = 0;
+        for (int i = 0; i < msgs->len; i++) {
+            for (int j = 0; j < msgs->v[i].images_len; j++, k++) {
+                const size_t len = msgs->v[i].images[j].len;
+                uint8_t *bytes = (uint8_t *)server_xmalloc(len);
+                memcpy(bytes, msgs->v[i].images[j].bytes, len);
+                r->images[k].bytes = bytes;
+                r->images[k].len = len;
+                r->images[k].start_pos = -1;
+            }
+        }
+    }
+    pulsar_tokens expanded = {0};
+    if (!pulsar_expand_image_placeholders(e, &r->prompt, r->images, r->n_images,
+                                          &expanded, err, errlen)) {
+        return false;
+    }
+    pulsar_tokens_free(&r->prompt);
+    r->prompt = expanded;
+    return true;
+}
+
+
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -88,6 +133,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (err && errlen) err[0] = '\0';
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -115,7 +161,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_messages(&p, &msgs)) {
+            if (!parse_messages(&p, &msgs, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -285,13 +331,25 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         request_apply_forced_tool_prefill(r);
     }
     pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* Images, if any, are resolved here -- on the renderer's side, just before
+     * the model -- into the sentinel BLOCK ids pulsar_session_sync_mm() takes.
+     * A placeholder reaching sync would be a caller bug; this is the one
+     * authority that produces the blocks. */
+    if (!request_prepare_images(e, &msgs, r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    /* An image-surface refusal (bad data: URL, remote URL, no tower, ...) sets
+     * a specific message; only a plain shape error falls back to the generic. */
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
