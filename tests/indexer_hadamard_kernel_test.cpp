@@ -305,7 +305,7 @@ int main(void) {
         CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
                                                   width, ratio, pos0, n_tok), "ape add B");
         CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
-                                                        model_map, map_bytes, 0ull, 0u,
+                                                        model_map, map_bytes, norm_offset, 0u,
                                                         head_dim, ratio, pos0, n_tok, eps), "pool B");
         CHECK(pulsar_gpu_rope_tail_strided_tensor(latB, n_groups, head_dim, n_rot,
                                                   pos0 + ratio - 1u, ratio, n_ctx,
@@ -363,7 +363,7 @@ int main(void) {
             CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
                                                       width, ratio, pos0, r_tok), "remainder-only ape add B");
             CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
-                                                            model_map, map_bytes, 0ull, 0u,
+                                                            model_map, map_bytes, norm_offset, 0u,
                                                             head_dim, ratio, pos0, r_tok, eps),
                   "remainder-only pool B");
             pulsar_gpu_synchronize();
