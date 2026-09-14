@@ -390,6 +390,18 @@ static bool gpu_graph_csa2_produce(
         if (pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) == 0 ||
             pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) == 0)
             return false;
+        /* V4's indexer owns a second lane over the same rows and needs its own
+         * save for the same reason (see the rollforward).  Both are RAW
+         * projections: the ape each compressor folds before its store is
+         * applied by the rollforward, exactly as the live path applies it. */
+        if (own_index) {
+            const uint32_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+            const uint64_t ib = (uint64_t)sn * iw * sizeof(float);
+            if (!g->spec_icomp_kv_save[il] || !g->spec_icomp_sc_save[il] ||
+                pulsar_gpu_tensor_copy_async(g->spec_icomp_kv_save[il], 0, g->batch_index_comp_kv, 0, ib) == 0 ||
+                pulsar_gpu_tensor_copy_async(g->spec_icomp_sc_save[il], 0, g->batch_index_comp_sc, 0, ib) == 0)
+                return false;
+        }
     }
     const uint32_t run_bank = mseq ? (uint32_t)g->ms_seq_id[0] : gpu_graph_cur_bank(g);
     const bool one_bank = !mseq || (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank;
@@ -2591,17 +2603,55 @@ bool gpu_graph_dspark_compressor_rollforward(
         if (ratio > 1u) {
             if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il])
                 return rollforward_fail(il, pos0, "no saved compressor projections for this kv source");
+            /* The saved rows are the compressor PROJECTIONS, so their width is
+             * the layer's coff width (2*head_dim at ratio 4), NOT head_dim.  The
+             * view said head_dim, so every ratio-4 source stored a 2048-byte row
+             * into a kernel that requires 4096 -- `bad operands`, loudly, on the
+             * first verify batch.  V4.1's ratio-2 sources have coff 1 and agreed
+             * by accident, which is why this survived until a V4 model ran. */
+            const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
             for (uint32_t t = 0; t < n_positions; t++) {
                 const uint32_t pos = pos0 + t;
-                pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, PULSAR_N_HEAD_DIM);
-                pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, PULSAR_N_HEAD_DIM);
+                pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
+                pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, comp_width);
+                /* The reference adds the ape to a row BEFORE it stores it, so
+                 * the saved (raw) score row is not what the lane holds.  Fold it
+                 * here or the rolled-forward pending group is a different
+                 * function of its own inputs than the live path's. */
                 const bool ok = kv_view && sc_view &&
+                    gpu_graph_comp_ape_fold(model, &weights->layer[il], sc_view, comp_width, ratio, pos, 1u) &&
                     pulsar_gpu_csa2_compressor_store_tensor(kv_view, sc_view,
                             g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
                             PULSAR_N_HEAD_DIM, ratio, pos) != 0;
                 pulsar_gpu_tensor_free(sc_view);
                 pulsar_gpu_tensor_free(kv_view);
                 if (!ok) return rollforward_fail(il, pos, "pending-slot store (row view or kernel)");
+            }
+            /* V4's indexer lane is a second recurrent state over the same rows:
+             * roll it from ITS saved projections, or the next group pools
+             * positions the rejected draft put there.  Store only -- the emitted
+             * rows are in the pool already and the frontier is set by formula. */
+            if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
+                if (!g->spec_icomp_kv_save[il] || !g->spec_icomp_sc_save[il])
+                    return rollforward_fail(il, pos0, "no saved indexer-compressor projections for this kv source");
+                const pulsar_layer_weights *lw = &weights->layer[il];
+                const uint32_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+                for (uint32_t t = 0; t < n_positions; t++) {
+                    const uint32_t pos = pos0 + t;
+                    pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, iw);
+                    pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, iw);
+                    const bool ok = kv_view && sc_view &&
+                        pulsar_gpu_csa2_comp_ape_add_tensor(sc_view, model->map, model->size,
+                                                            lw->indexer_compressor_ape->abs_offset,
+                                                            lw->indexer_compressor_ape->type,
+                                                            iw, ratio, pos, 1u) &&
+                        pulsar_gpu_csa2_compressor_store_tensor(kv_view, sc_view,
+                                g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                                PULSAR_N_INDEXER_HEAD_DIM, ratio, pos) != 0;
+                    pulsar_gpu_tensor_free(sc_view);
+                    pulsar_gpu_tensor_free(kv_view);
+                    if (!ok) return rollforward_fail(il, pos, "indexer pending-slot store");
+                }
             }
         }
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = (pos0 + n_positions) / ratio;

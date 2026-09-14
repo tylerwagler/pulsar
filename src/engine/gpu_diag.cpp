@@ -1820,13 +1820,26 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
             g->spec_comp_kv_save[il] = NULL;
             g->spec_comp_sc_save[il] = NULL;
+            g->spec_icomp_kv_save[il] = NULL;
+            g->spec_icomp_sc_save[il] = NULL;
             if (!gpu_graph_layer_has_comp_state(il)) continue;
             /* saved rows are the compressor PROJECTIONS, so their width is the
              * layer's coff width, not head_dim */
-            const uint64_t attn_w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
+            const uint32_t il_ratio = pulsar_layer_compress_ratio(il);
+            const uint64_t attn_w = pulsar_comp_row_width(il_ratio, PULSAR_N_HEAD_DIM);
             g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
+            /* V4's indexer owns a SECOND recurrent lane over the same rows, so a
+             * rejected draft has to roll it back from its own projections -- the
+             * attention pair says nothing about it.  V4.1 has no such lane and
+             * must not pay for one. */
+            if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
+                const uint64_t idx_w = pulsar_comp_row_width(il_ratio, PULSAR_N_INDEXER_HEAD_DIM);
+                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
+                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
+                ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
+            }
         }
         g->spec_comp_scratch_row = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         ok = ok && g->spec_comp_scratch_row;

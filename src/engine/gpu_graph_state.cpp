@@ -83,6 +83,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_comp_kv_save[il]);
         pulsar_gpu_tensor_free(g->spec_comp_sc_save[il]);
+        pulsar_gpu_tensor_free(g->spec_icomp_kv_save[il]);
+        pulsar_gpu_tensor_free(g->spec_icomp_sc_save[il]);
     }
     pulsar_gpu_tensor_free(g->spec_comp_scratch_row);
     pulsar_gpu_tensor_free(g->dspark_concat);

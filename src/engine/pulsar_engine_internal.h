@@ -1095,6 +1095,15 @@ typedef struct {
      * cover them too. spec_comp_save_n arms the save (0 = off). */
     pulsar_gpu_tensor *spec_comp_kv_save[PULSAR_MAX_LAYER];   ///< saved compressor KV projections a rejected draft must not keep
     pulsar_gpu_tensor *spec_comp_sc_save[PULSAR_MAX_LAYER];   ///< saved compressor score projections
+    /** V4 ONLY: the INDEXER compressor's own projections, saved beside the
+     * attention compressor's.  Its lane is a second recurrent state (see
+     * layer_index_state_kv) and a rejected draft has to roll it back too --
+     * for V4.1 there is no such lane, so these stay NULL.  Same row indexing
+     * and the same `spec_comp_save_n` arming as the pair above; the ape fold
+     * the reference does before the store happens in the rollforward, exactly
+     * as it does on the live path. */
+    pulsar_gpu_tensor *spec_icomp_kv_save[PULSAR_MAX_LAYER];  ///< indexer-compressor KV projections (V4)
+    pulsar_gpu_tensor *spec_icomp_sc_save[PULSAR_MAX_LAYER];  ///< indexer-compressor score projections (V4)
     pulsar_gpu_tensor *spec_comp_scratch_row;   ///< emit sink during roll-forward: absorbs writes that must not land in the real cache
     uint32_t spec_comp_save_n;                  ///< arms the save; 0 = off
     /** Persistent drafter scratch (was per-call cudaMalloc/cudaFree churn --
