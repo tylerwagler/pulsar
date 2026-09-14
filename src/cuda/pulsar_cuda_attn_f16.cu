@@ -274,16 +274,8 @@ __device__ static inline uint32_t af16_pack_qraw(
         rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
                                   qp.freq_base, qp.freq_scale, qp.ext_factor,
                                   qp.attn_factor, corr0, corr1, &r0, &r1);
-        /* NO bf16 round here.  The rotation stays f32 and narrows ONCE, in
-         * af16_pack below -- which is exactly what the standalone arm does
-         * (head_rms_norm_rope_tail_kernel / rope_tail_kernel store the same f32
-         * straight into the f16 buffer), and what makes the two arms bit-exact
-         * as this file's comment claims.  Rounding to bf16 first narrowed
-         * twice and put the fused arm 1-2 bf16 ULP off the standalone one and
-         * off dev: measured at layer 0, every row of the attention output
-         * differed by 0.0156-0.0312 with nothing else left in the layer. */
-        x0 = r0;
-        x1 = r1;
+        x0 = __bfloat162float(__float2bfloat16(r0));
+        x1 = __bfloat162float(__float2bfloat16(r1));
     }
     return af16_pack(x0, x1);
 }
