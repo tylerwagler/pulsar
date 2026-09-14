@@ -931,12 +931,19 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
                                                    head_dim, ratio, pos0, n_tokens, rms_eps)) return 0;
     if (n_groups == 0u) return 1;   /* a remainder-only batch produces no row */
     /* The pooled row for group g was built from positions [pos0+g*ratio,
-     * pos0+(g+1)*ratio), and the reference ropes it at that group's LAST
-     * position (`freqs_cis[start_pos + 1 - ratio]` in the decode branch,
-     * `[:cutoff:ratio]` in the prefill branch) -- hence pos0 + ratio - 1 with a
-     * stride of ratio. */
+     * pos0+(g+1)*ratio), and the reference ropes it at that group's FIRST
+     * position -- both branches say so: the prefill branch takes
+     * `freqs_cis[:cutoff:ratio]` (indices 0, ratio, 2*ratio, ...) and the decode
+     * branch `freqs_cis[start_pos + 1 - ratio]`, which is the first position of
+     * the group that ENDS at start_pos.  Hence pos0 with a stride of ratio.
+     *
+     * This said `pos0 + ratio - 1` -- the group's LAST position -- and justified
+     * it with the decode branch's index read backwards.  Every pooled comp row
+     * was therefore rotated at the wrong position, which is what separated this
+     * from dev at the first COMPRESSED layer (L218 s53).  The per-row twin below
+     * had it right (`pos + 1 - ratio`), which is how the two disagreed. */
     if (!pulsar_gpu_rope_tail_strided_tensor(latent, n_groups, head_dim, n_rot,
-                                             pos0 + ratio - 1u, ratio, n_ctx_orig,
+                                             pos0, ratio, n_ctx_orig,
                                              freq_base, freq_scale, ext_factor, attn_factor,
                                              beta_fast, beta_slow)) return 0;
     return pulsar_gpu_dsv4_indexer_qat_pack_tensor(latent, packed, out_row0, n_groups, head_dim, false);
