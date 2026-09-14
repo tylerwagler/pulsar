@@ -140,6 +140,16 @@ static bool gpu_graph_csa2_emit_rows(
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
                                                        (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float));
     pulsar_gpu_tensor *comp_dst = banked ? gpu_graph_bank_attn_comp_view(g, il, bank) : g->layer_attn_comp_cache[il];
+    /* The POOL's output, before the rotation -- dev's `KVprelatent`.  This is
+     * the only point at which it can be observed: everything below mutates
+     * `latent` in place, first the tail rope and then the pack's f32 writeback
+     * (the pack is handed `latent` as BOTH its read source and its
+     * f32-observation output whenever any f32 dump is armed, so it writes the
+     * quantised round-trip back over the row it just read).  A dump taken
+     * after them is the quantised row, and comparing a quantised row against
+     * an unquantised model is what made this compressor look 1.4% wrong. */
+    gpu_graph_debug_dump_tensor("KVprelatent", latent,
+                                (uint64_t)n_rows * PULSAR_N_HEAD_DIM, il, pos_first);
     /* The projection staging and the index pool are V4.1's alone: under
      * indexer_own_compressor both are the indexer compressor's, and a view
      * opened here would only shadow the buffer it stages through. */
