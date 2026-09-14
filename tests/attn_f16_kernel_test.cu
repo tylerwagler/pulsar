@@ -38,6 +38,16 @@
  * drives every indexed case through BOTH paths against the same oracle. */
 static int g_decode_rows = 0;
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
+/* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
+ * pulsar_cuda_norm_kv.cu, not linked here).  This test owns the value and drives
+ * BOTH families, because a gate built from one family's fixture cannot fail for
+ * the other: this file built only V4.1's WINDOW/MAIN pair, and the fp16 kernel
+ * meanwhile had no arm at all for V4's single 384-byte row -- so every V4
+ * attention staged 384-byte rows at a 528-byte stride and produced NaN, at
+ * every shape this gate declares PASS (L218 s45/s46). */
+static pulsar_kv_row_style g_row_style = PULSAR_KV_ROWS_CSA2;
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_row_style; }
+static const char *g_family = "csa2";
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -57,7 +67,8 @@ int cuda_ok(cudaError_t err, const char *what) {
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
 
 
-#include "kv_row_fixture.h"   /* host replicas of the two row packers: see the note
+#include "attn_pack_fixture.h" /* the UNIFIED row's host replica (V4) */
+#include "kv_row_fixture.h"   /* host replicas of the two CSA2 row packers (V4.1): see the note
  * there on why the fixture ENCODES a draw instead of drawing random bytes */
 
 int main(int argc, char **argv) {
@@ -68,6 +79,10 @@ int main(int argc, char **argv) {
      * uses and the raw-window one does not.  Wiring the kernel in against only
      * the n_comp=0 path would have shipped that half untested. */
     const uint32_t n_comp   = (argc > 5) ? (uint32_t)atoi(argv[5]) : 0u;
+    if (argc > 9 && strcmp(argv[9], "unified") == 0) {
+        g_row_style = PULSAR_KV_ROWS_UNIFIED;
+        g_family = "unified";
+    }
     const uint32_t ratio    = (argc > 6) ? (uint32_t)atoi(argv[6]) : 4u;
     /* top_k > 0 switches to INDEXED mode: compressed rows become a top-k
      * selection and raw rows come from a ring buffer.  Exercised against the
@@ -78,7 +93,7 @@ int main(int argc, char **argv) {
     const uint32_t D = AF16_DIM;
 
     printf("attn f16 kernel test: n_tokens=%u window=%u n_head=%u head_dim=%u"
-           " n_comp=%u ratio=%u\n\n", n_tokens, window, n_head, D, n_comp, ratio);
+           " n_comp=%u ratio=%u rows=%s\n\n", n_tokens, window, n_head, D, n_comp, ratio, g_family);
 
     std::mt19937_64 rng(20260808);
     std::normal_distribution<double> nd(0.0, 1.0);
@@ -87,27 +102,37 @@ int main(int argc, char **argv) {
                        ckv((size_t)(n_comp ? n_comp : 1u) * D),
                        sinks(n_head), out((size_t)n_tokens * n_head * D, -12345.f);
     for (auto &v : q) v = (float)(nd(rng) * 0.5);
-    /* Raw KV: build WINDOW rows first, then DECODE them into kv[] so the f64
-     * oracle below and the kernel are looking at the same numbers.  Draws with
-     * a per-16-block magnitude band (2^-1..2^1) so scale addressing is
-     * exercised without degenerating the softmax. */
-    const size_t win_row_h = (size_t)PULSAR_WINKV_ROWBYTES(D);
+    /* Raw KV rows first, then DECODE them into kv[] so the f64 oracle below and
+     * the kernel are looking at the same numbers.  Draws with a per-16-block
+     * magnitude band (2^-1..2^1) so scale addressing is exercised without
+     * degenerating the softmax.
+     *
+     * WHICH family's packer builds these rows is the gate's own switch, and it
+     * must match what the kernel will read: V4.1's WINDOW/MAIN pair, or V4's
+     * single UNIFIED row for both. */
+    const int unified = g_row_style == PULSAR_KV_ROWS_UNIFIED;
+    const size_t win_row_h = unified ? (size_t)PULSAR_ATTN_PACK_ROWBYTES(D)
+                                     : (size_t)PULSAR_WINKV_ROWBYTES(D);
     std::vector<uint8_t> rawp((size_t)n_tokens * win_row_h);
     for (uint32_t r = 0; r < n_tokens; r++) {
         std::vector<float> vals(D);
         for (uint32_t d = 0; d < D; d++)
             vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
-        host_winkv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
+        if (unified) host_nv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
+        else         host_winkv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
     }
-    /* Comp rows are MAIN rows (the other format); same encode-a-draw discipline. */
-    const size_t main_row_h = (size_t)PULSAR_MAINKV_ROWBYTES(D);
+    /* Comp rows: MAIN for V4.1, the same UNIFIED row for V4; same
+     * encode-a-draw discipline. */
+    const size_t main_row_h = unified ? (size_t)PULSAR_ATTN_PACK_ROWBYTES(D)
+                                      : (size_t)PULSAR_MAINKV_ROWBYTES(D);
     const size_t n_ckv = (size_t)(n_comp ? n_comp : 1u);
     std::vector<uint8_t> ckvp(n_ckv * main_row_h);
     for (size_t r = 0; r < n_ckv; r++) {
         std::vector<float> vals(D);
         for (uint32_t d = 0; d < D; d++)
             vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
-        host_mainkv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
+        if (unified) host_nv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
+        else         host_mainkv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
     }
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 

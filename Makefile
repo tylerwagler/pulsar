@@ -396,7 +396,8 @@ indexer-hadamard-kernel-check: tests/indexer_hadamard_kernel_test
 # FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
 
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h \
+                            tests/kv_row_fixture.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
@@ -522,6 +523,13 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 5 20    # indexed + ring raw rows
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_kernel_test 1 16 32 x 12 1 5 20     # ONE-row indexed launch (L166: n_tokens==1 is the same kernel)
+	# The SAME kernel on V4's row family.  Every line above builds V4.1 WINDOW/MAIN
+	# rows, and the kernel carried no UNIFIED arm at all until L218 s46 -- so the
+	# whole gate passed while every V4 attention decoded garbage.  A gate built
+	# from one family's fixture cannot fail for the other; these two lines are the
+	# other family, and the second is the shape V4 production actually runs.
+	./tests/attn_f16_kernel_test 40 24 32 x 8 4 0 0 unified   # compressed tail, UNIFIED rows
+	./tests/attn_f16_kernel_test 36 128 64 x 0 0 0 0 unified  # the V4 production shape
 	./tests/attn_f16_banked_test
 	./tests/hc_carry_kernel_test
 

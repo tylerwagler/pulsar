@@ -88,13 +88,48 @@
  * the chunk's own pack buffer) and MAIN rows from a kv source's pool -- and
  * the tile stage is sized for the wider one; each staged row copies its own
  * byte count and decodes with its own accessor. */
+/* THREE row families reach this kernel, and which one is a property of the
+ * LOADED PROFILE (pulsar_gpu_kv_row_style), not of the call site:
+ *
+ *   WINDOW  528 B  raw E4M3 x E8M0/32          V4.1's raw ring / chunk pack
+ *   MAIN    288 B  E2M1 nibbles x E4M3/16      V4.1's compressed pools
+ *   UNIFIED 384 B  E2M1 nibbles + E4M3/16 codes + f32 row scale + bf16 rope
+ *                                              V4's ONE row: raw ring, chunk
+ *                                              pack AND every pool
+ *
+ * The stage's pitch is the widest of the three (a row is copied at its own
+ * byte count inside it), and each staged row carries its own format id so the
+ * decode picks the matching accessor.  Before L218 s46 this file carried only
+ * the two V4.1 families, so a V4 attention staged 384-byte rows at WINDOW's
+ * 528-byte stride -- silent, because the launcher's own byte bound was computed
+ * from the same wrong constant. */
+#define AF16_FMT_WINDOW  0u
+#define AF16_FMT_MAIN    1u
+#define AF16_FMT_UNIFIED 2u
+__device__ __forceinline__ static uint32_t af16_fmt_rowb(uint32_t fmt) {
+    switch (fmt) {
+    case AF16_FMT_MAIN:    return (uint32_t)PULSAR_MAINKV_ROWBYTES(AF16_DIM);   /* 288 */
+    case AF16_FMT_UNIFIED: return (uint32_t)PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);/* 384 */
+    default:               return (uint32_t)PULSAR_WINKV_ROWBYTES(AF16_DIM);    /* 528 */
+    }
+}
 #define AF16_WIN_ROWB  (PULSAR_WINKV_ROWBYTES(AF16_DIM))    /* 528 */
 #define AF16_MAIN_ROWB (PULSAR_MAINKV_ROWBYTES(AF16_DIM))   /* 288 */
+#define AF16_UNI_ROWB  (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))/* 384 */
 #define AF16_ROWB      AF16_WIN_ROWB                        /* the stage's row pitch */
-static_assert(AF16_WIN_ROWB >= AF16_MAIN_ROWB && (AF16_WIN_ROWB % 8u) == 0u && (AF16_MAIN_ROWB % 8u) == 0u,
+static_assert(AF16_WIN_ROWB >= AF16_MAIN_ROWB && AF16_WIN_ROWB >= AF16_UNI_ROWB &&
+              (AF16_WIN_ROWB % 8u) == 0u && (AF16_MAIN_ROWB % 8u) == 0u && (AF16_UNI_ROWB % 8u) == 0u,
               "the tile stage copies 8-byte chunks of the wider row");
 /* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
 #define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
+
+/* The loaded profile's row family, as the kernel wants it.  The engine pushes
+ * the style into this module once at load (pulsar_gpu_set_kv_row_style), which
+ * is the same authority the packers and the engine's cache sizing read -- so a
+ * profile cannot be UNIFIED for its packs and CSA2 for its attention. */
+static int af16_unified_rows(void) {
+    return pulsar_gpu_kv_row_style() == PULSAR_KV_ROWS_UNIFIED ? 1 : 0;
+}
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
 
@@ -302,6 +337,11 @@ static void attn_f16_kernel(
          * this kernel applies the tail rope itself at Q-fragment build
          * (shared rope core -- see af16_pack_qraw). */
         pulsar_gpu_q_prep qp, int q_raw,
+        /* The loaded profile's KV row family: nonzero means BOTH `raw_kv` and
+         * `comp_kv` are the 384-byte UNIFIED row (V4); zero means the V4.1
+         * WINDOW/MAIN pair.  A launch-invariant profile fact, passed in rather
+         * than read per row. */
+        int unified_rows,
         /* L210 split-K (see the file header).  Rows t < n_dec split their key
          * walk across gridDim.z blocks and write partials; rows t >= n_dec run
          * the classic whole-window walk on blockIdx.z == 0 and store heads
@@ -596,7 +636,7 @@ static void attn_f16_kernel(
         (uint8_t (*)[AF16_ROWS][AF16_ROWB])af16_dynsmem;
     __shared__ const uint8_t *sSrc[2][AF16_ROWS];
     __shared__ uint8_t sBadStage[2][AF16_ROWS];
-    __shared__ uint8_t sMainStage[2][AF16_ROWS];   /* 1 = a MAIN row, 0 = a WINDOW row */
+    __shared__ uint8_t sFmtStage[2][AF16_ROWS];    /* AF16_FMT_* of the staged row */
     #define AF16_STAGE_TILE(BUF, ROW0)                                        \
     do {                                                                      \
         const uint32_t _nr = (ROW0) < row_hi                                  \
@@ -605,12 +645,14 @@ static void attn_f16_kernel(
             const uint32_t _r = tid;                                          \
             const uint32_t _sr = (ROW0) + _r;                                 \
             const uint8_t *_p = NULL;                                         \
-            bool _bad = false, _main = false;                                 \
+            bool _bad = false;                                                \
+            uint32_t _fmt = unified_rows ? AF16_FMT_UNIFIED : AF16_FMT_WINDOW; \
             if (_r < _nr) {                                                   \
                 if (_sr < raw_count) {                                        \
                     const uint32_t _rr = ring ? sRawRows[_sr]                 \
                                               : (raw_start + _sr);            \
-                    _p = (const uint8_t *)raw_kv + (uint64_t)_rr * AF16_WIN_ROWB; \
+                    _p = (const uint8_t *)raw_kv                              \
+                       + (uint64_t)_rr * af16_fmt_rowb(_fmt);                 \
                 } else {                                                      \
                     uint32_t _ci = _sr - raw_count;                           \
                     if (topk) {                                               \
@@ -618,22 +660,21 @@ static void attn_f16_kernel(
                         _bad = !(_c >= 0 && (uint32_t)_c < sVisComp);         \
                         _ci = _bad ? 0u : (uint32_t)_c;                       \
                     }                                                         \
+                    _fmt = unified_rows ? AF16_FMT_UNIFIED : AF16_FMT_MAIN;\
                     _p = (const uint8_t *)comp_src +                          \
-                         ((uint64_t)comp_base + _ci) * AF16_MAIN_ROWB;        \
-                    _main = true;                                             \
+                         ((uint64_t)comp_base + _ci) * af16_fmt_rowb(_fmt);   \
                 }                                                             \
             }                                                                 \
             sSrc[BUF][_r] = _p;                                               \
             sBadStage[BUF][_r] = _bad ? 1u : 0u;                              \
-            sMainStage[BUF][_r] = _main ? 1u : 0u;                            \
+            sFmtStage[BUF][_r] = (uint8_t)_fmt;                               \
         }                                                                     \
         __syncthreads();                                                      \
         for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 8u);            \
              _c += AF16_THREADS) {                                            \
             const uint32_t _r = _c / (AF16_ROWB / 8u);                        \
             const uint32_t _off = (_c % (AF16_ROWB / 8u)) * 8u;               \
-            const uint32_t _rowb = sMainStage[BUF][_r] ? AF16_MAIN_ROWB       \
-                                                       : AF16_WIN_ROWB;       \
+            const uint32_t _rowb = af16_fmt_rowb(sFmtStage[BUF][_r]);         \
             if (sSrc[BUF][_r] && _off < _rowb)                                \
                 __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
                                         sSrc[BUF][_r] + _off, 8);             \
@@ -681,18 +722,21 @@ static void attn_f16_kernel(
 
         /* ---- decode the staged tile to fp16 -----------------------------
          * Four dims per thread from the smem copy the cp.async stage filled,
-         * by the row's own format: WINDOW rows (E4M3 x E8M0/32) or MAIN rows
-         * (E2M1 x E4M3/16).  Both decode to the bf16 values the reference
-         * stores; the f16 tile holds them exactly (8 significant bits inside
-         * f16's 11, magnitudes inside its range for normalised KV). */
+         * by the row's own format: WINDOW rows (E4M3 x E8M0/32), MAIN rows
+         * (E2M1 x E4M3/16) or UNIFIED rows (E2M1 x E4M3/16 x a row scale).
+         * All three decode to the bf16 values the reference stores; the f16
+         * tile holds them exactly (8 significant bits inside f16's 11,
+         * magnitudes inside its range for normalised KV). */
         for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 4u; i += AF16_THREADS) {
             const uint32_t r = i / (AF16_DIM / 4u);
             const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
             if (r < nr && sSrc[buf][r]) {
                 const uint8_t *pr = sRawB[buf][r];
-                const float4 v = sMainStage[buf][r] ? mainkv_row_ld4(pr, d4 >> 2, AF16_DIM)
-                                                    : winkv_row_ld4(pr, d4 >> 2, AF16_DIM);
+                const uint32_t fmt = sFmtStage[buf][r];
+                const float4 v = fmt == AF16_FMT_MAIN    ? mainkv_row_ld4(pr, d4 >> 2, AF16_DIM)
+                               : fmt == AF16_FMT_UNIFIED ? attnkv_row_ld4(pr, d4 >> 2, AF16_DIM)
+                                                         : winkv_row_ld4(pr, d4 >> 2, AF16_DIM);
                 f0 = v.x; f1 = v.y; f2 = v.z; f3 = v.w;
             }
             if (d4 == 0u) sRowBad[r] = (r < nr) ? sBadStage[buf][r] : 0u;
@@ -1180,11 +1224,13 @@ int pulsar_gpu_attention_f16_prefill_mx(
     AF16_REQUIRE("prefill", n_tokens != 0u, "n_tokens=%u", n_tokens);
     AF16_REQUIRE("prefill", n_comp == 0u || comp_kv, "n_comp=%u comp_kv=%d", n_comp, comp_kv != NULL);
     AF16_REQUIRE("prefill", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
-    /* Both row formats tile head_dim by their scale blocks; the kernel is
+    /* Every row family tiles head_dim by its scale blocks; the kernel is
      * specialised for AF16_DIM anyway (checked above). */
-    AF16_REQUIRE("prefill", (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
-                 "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
-                 (unsigned)PULSAR_MAINKV_BLOCK);
+    AF16_REQUIRE("prefill", (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u &&
+                            (head_dim % PULSAR_KV4_NV_BLOCK) == 0u,
+                 "head_dim=%u win_block=%u main_block=%u kv4_block=%u", head_dim,
+                 (unsigned)PULSAR_WINKV_BLOCK, (unsigned)PULSAR_MAINKV_BLOCK,
+                 (unsigned)PULSAR_KV4_NV_BLOCK);
     /* The epilogue's grouped index math assumes whole heads per group and that
      * the nope/rope split falls on an MX block boundary (so rope_tail can own
      * the tail blocks without either side touching the other's).  Refuse the
@@ -1213,6 +1259,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             gact_kbp, gact_slab, n_groups, n_nope,
                                             gact_tok0, gact_ntok,
                                             qp, q_prep != NULL,
+                                            af16_unified_rows(),
                                             NULL, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
@@ -1372,6 +1419,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             non_causal != 0u,
                                             NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                             qp, q_prep != NULL,
+                                            af16_unified_rows(),
                                             partials, n_dec);
     if (!cuda_ok(cudaGetLastError(), "attention f16 indexed launch")) return 0;
     if (n_dec != 0u) {

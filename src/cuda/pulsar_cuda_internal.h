@@ -294,6 +294,45 @@ __device__ static inline float4 mainkv_row_ld4(const uint8_t *pr, uint32_t c4, u
     return v;
 }
 
+/* The 0731 UNIFIED NVFP4 row's four-dim read -- the THIRD family, packed by
+ * src/cuda/pulsar_cuda_attnpack.cu and graded by tests/attn_pack_gate.cpp.
+ *
+ * Layout, in this order (PULSAR_ATTN_PACK_ROWBYTES is their sum):
+ *   [n_nope/2 E2M1 nibble bytes][n_nope/16 E4M3 block codes][4 B f32 row
+ *   scale][n_rot bf16 rope values]
+ * so a dim's value is its e4m3 code times the row scale.  The per-ROW scale is
+ * what stops this from borrowing mainkv_row_ld4 with a different stride: the
+ * two families' recipes are not the same shape at different widths.  Four dims
+ * share one block code, exactly as in the siblings above.
+ *
+ * This is what a V4 attention reads, and it had no caller at all before L218
+ * s46: the fp16 kernel carried only the two V4.1 families, so a V4 layer's
+ * 384-byte rows were staged at WINDOW's 528-byte stride -- reading past every
+ * row into its neighbour's bytes and decoding those. */
+__device__ static inline float4 attnkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint32_t nib_bytes = n_nope / 2u;
+    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
+    const uint32_t base = c4 << 2;
+    float4 v;
+    if (base < n_nope) {
+        const float row_scale = *(const float *)(pr + nib_bytes + nblk);
+        const float scale = pulsar_e4m3_times(pr[nib_bytes + base / PULSAR_KV4_NV_BLOCK], row_scale);
+        const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
+        v.x = pulsar_e2m1_times(b0 & 0xFu, scale);
+        v.y = pulsar_e2m1_times(b0 >> 4, scale);
+        v.z = pulsar_e2m1_times(b1 & 0xFu, scale);
+        v.w = pulsar_e2m1_times(b1 >> 4, scale);
+    } else {
+        const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + nib_bytes + nblk + 4u);
+        v.x = __bfloat162float(rope[base - n_nope + 0u]);
+        v.y = __bfloat162float(rope[base - n_nope + 1u]);
+        v.z = __bfloat162float(rope[base - n_nope + 2u]);
+        v.w = __bfloat162float(rope[base - n_nope + 3u]);
+    }
+    return v;
+}
+
 /** A device buffer plus the metadata needed to interpret its bytes.
  *
  * Deliberately NOT a shaped tensor: no dimensions, no strides. Shape lives at

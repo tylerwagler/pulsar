@@ -111,9 +111,9 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim),
                      "raw_kv bytes=%llu need=%llu", (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim));
+                     (unsigned long long)n_tokens * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim));
         ATTN_REQUIRE(aw, window <= 256, "window=%u cap=256", window);
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
@@ -257,18 +257,18 @@ static int attention_decode_batch_launch(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim),
                      "raw_kv bytes=%llu need=%llu (kv_banks=%llu raw_cap=%u)",
                      (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)(kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim)),
+                     (unsigned long long)(kv_banks * raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim)),
                      (unsigned long long)kv_banks, raw_cap);
         ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
                      "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
                      (unsigned)PULSAR_MAINKV_BLOCK);
-        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= comp_rows_min * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim),
                      "comp_kv bytes=%llu need=%llu (comp_rows_min=%llu n_comp=%u)",
                      n_comp ? (unsigned long long)comp_kv->bytes : 0ull,
-                     (unsigned long long)(comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim)),
+                     (unsigned long long)(comp_rows_min * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim)),
                      (unsigned long long)comp_rows_min, n_comp);
     }
     if (n_comp != 0 && ratio == 0) {
@@ -479,18 +479,18 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim),
                      "raw_kv bytes=%llu need=%llu (kv_banks=%llu raw_cap=%u)",
                      (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)(kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim)),
+                     (unsigned long long)(kv_banks * raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim)),
                      (unsigned long long)kv_banks, raw_cap);
         ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
                      "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
                      (unsigned)PULSAR_MAINKV_BLOCK);
-        ATTN_REQUIRE(aw, comp_kv->bytes >= comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, comp_kv->bytes >= comp_rows_min * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim),
                      "comp_kv bytes=%llu need=%llu (comp_rows_min=%llu n_comp=%u)",
                      (unsigned long long)comp_kv->bytes,
-                     (unsigned long long)(comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim)),
+                     (unsigned long long)(comp_rows_min * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim)),
                      (unsigned long long)comp_rows_min, n_comp);
         ATTN_REQUIRE(aw, topk->bytes >= (uint64_t)n_tokens * top_k * sizeof(int32_t),
                      "topk bytes=%llu need=%llu (n_tokens=%u top_k=%u)", (unsigned long long)topk->bytes,
@@ -620,9 +620,9 @@ static int attention_prefill_mixed_launch(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim),
                      "raw_kv bytes=%llu need=%llu", (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim));
+                     (unsigned long long)n_tokens * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim));
         /* Row-format-aware, like the three sibling launches.  A guard that
          * hard-codes a wrong stride demands the wrong byte count, fails, and
          * returns 0 -- which is "did not encode", not an error, so the graph
@@ -631,10 +631,10 @@ static int attention_prefill_mixed_launch(
         ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
                      "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
                      (unsigned)PULSAR_MAINKV_BLOCK);
-        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= (uint64_t)n_comp * PULSAR_MAINKV_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= (uint64_t)n_comp * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim),
                      "comp_kv bytes=%llu need=%llu (n_comp=%u)",
                      n_comp ? (unsigned long long)comp_kv->bytes : 0ull,
-                     (unsigned long long)n_comp * PULSAR_MAINKV_ROWBYTES(head_dim), n_comp);
+                     (unsigned long long)n_comp * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_COMP, head_dim), n_comp);
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
