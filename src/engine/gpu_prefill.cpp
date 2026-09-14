@@ -270,7 +270,8 @@ static bool gpu_graph_index_comp_update(
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
         uint32_t                    il,
-        uint32_t                    row,
+        uint32_t                    row,       /* which BATCH ROW to read */
+        uint32_t                    pos,       /* that row's absolute POSITION */
         uint32_t                    out_row,
         uint32_t                    ratio,
         float                       freq_base,
@@ -292,7 +293,7 @@ static bool gpu_graph_index_comp_update(
                       layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
                       layer->indexer_compressor_norm->abs_offset,
                       layer->indexer_compressor_norm->type,
-                      out_row, PULSAR_N_INDEXER_HEAD_DIM, ratio, row,
+                      out_row, PULSAR_N_INDEXER_HEAD_DIM, ratio, pos,
                       PULSAR_N_ROT, (uint32_t)PULSAR_ROPE_ORIG_CTX,
                       freq_base, freq_scale, ext_factor, attn_factor,
                       PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
@@ -496,7 +497,7 @@ static bool gpu_graph_csa2_produce(
          * would mean the second pool's row indices had drifted off the first's,
          * which no later check would notice. */
         int idx_emitted = 0;
-        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, t, *n_comp_slot, ratio,
+        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, t, pos, *n_comp_slot, ratio,
                                                               freq_base, freq_scale, ext_factor, attn_factor,
                                                               &idx_emitted);
         if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
