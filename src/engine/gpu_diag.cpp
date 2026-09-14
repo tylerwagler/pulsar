@@ -37,6 +37,31 @@ bool gpu_graph_f32_store_observed_any(void) {
 }
 
 
+/* How many times this (name, layer, pos) dump has already been written.  A
+ * single run can call the layer encoder more than once for the same
+ * (il, pos) -- measured: THREE times at layer 0 for a one-token prompt -- and
+ * every call overwrote `<prefix>_<name>-<il>_pos<pos>.bin`.  The file therefore
+ * held whichever pass ran last, which is how a layer-by-layer comparison
+ * between two engines can end up comparing different passes and calling the
+ * result a numerical divergence (L218 s49: it very nearly did).  Each write now
+ * gets its own file, so the lossy part is gone and the pass index is visible. */
+struct dump_hist_entry { const char *name; uint32_t il; uint32_t pos; uint32_t n; };
+static dump_hist_entry g_dump_hist[1024];
+static uint32_t g_dump_hist_n = 0;
+
+static uint32_t dump_hist_next(const char *name, uint32_t il, uint32_t pos) {
+    for (uint32_t i = 0; i < g_dump_hist_n; i++) {
+        dump_hist_entry *e = &g_dump_hist[i];
+        if (e->il == il && e->pos == pos && strcmp(e->name, name) == 0) return ++e->n;
+    }
+    if (g_dump_hist_n < sizeof(g_dump_hist) / sizeof(g_dump_hist[0])) {
+        dump_hist_entry *e = &g_dump_hist[g_dump_hist_n++];
+        e->name = name; e->il = il; e->pos = pos; e->n = 1;
+        return 1;
+    }
+    return 0;   /* table full: fall back to the old lossy name */
+}
+
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -58,9 +83,13 @@ void gpu_graph_debug_dump_tensor(
      * garbage rather than an error. */
     if (pulsar_gpu_tensor_read_f32(t, 0, buf, n_f32) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_f32)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
         }
     }
     free(buf);
