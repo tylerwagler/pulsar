@@ -307,8 +307,20 @@ int main(void) {
         CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
                                                         model_map, map_bytes, norm_offset, 0u,
                                                         head_dim, ratio, pos0, n_tok, eps), "pool B");
+        /* The rope position is the reference's rule and this line STATES it, so
+         * that the composite and the parts cannot agree on a shared mistake --
+         * which they did: both used `pos0 + ratio - 1` (the group's LAST
+         * position) until L218 s53, and this gate passed the whole time.
+         *
+         * The reference ropes a pooled row at the FIRST position of the group
+         * it was pooled from.  Both branches say so:
+         *   prefill  freqs_cis[:cutoff:ratio]           -> 0, ratio, 2*ratio, ...
+         *   decode   freqs_cis[start_pos + 1 - ratio]   -> the first position of
+         *                                                   the group ending at
+         *                                                   start_pos
+         * so a chunk starting at pos0 ropes group g at pos0 + g*ratio. */
         CHECK(pulsar_gpu_rope_tail_strided_tensor(latB, n_groups, head_dim, n_rot,
-                                                  pos0 + ratio - 1u, ratio, n_ctx,
+                                                  pos0, ratio, n_ctx,
                                                   fb, fs, ef, af, bf, bs), "rope B");
         CHECK(pulsar_gpu_dsv4_indexer_qat_pack_tensor(latB, pkB, 0, n_groups, head_dim, false), "pack B");
         pulsar_gpu_synchronize();
