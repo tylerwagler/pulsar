@@ -367,12 +367,19 @@ static bool gpu_graph_csa2_produce(
     const float ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    if (own_index && mseq) {
-        /* The indexer's lane is single-session: the bank slab carries the
-         * attention state lanes but no index twin, so a V4 banked graph is
-         * refused at allocation (gpu_diag.c) and must never reach this
-         * producer.  Writing the shared lane from every bank would be a wrong
-         * answer rather than a crash, hence the check. */
+    if (own_index && g->banks.n_banks != 0) {
+        /* The indexer's lane is single-lane: with no banks the classic graph's
+         * lane IS it, but the bank slab carries the attention state lanes and
+         * no index twin, so a V4 banked graph is refused at allocation
+         * (gpu_diag.c) and must never reach this producer.  Writing the one
+         * lane from every bank would be a wrong answer rather than a crash,
+         * which is why the check is here as well as there.
+         *
+         * The condition is BANKS, not `mseq`: the multiseq step driver runs
+         * with no banks at all (Tier-2 is opt-in via PULSAR_MSEQ_BANKS), and
+         * refusing on `mseq` refused every plain single-session decode after
+         * the first spec round -- measured, with the model generating text
+         * until it hit this. */
         fprintf(stderr, "pulsar: index source %u: banked mode has no indexer-compressor state lane -- refusing\n", il);
         return false;
     }
