@@ -110,6 +110,7 @@
 #define PULSAR_N_EXPERT_SHARED           (g_pulsar_shape.n_expert_shared)
 #define PULSAR_N_HASH_LAYER              (g_pulsar_shape.n_hash_layer)
 #define PULSAR_Q_HEAD_NORM               (g_pulsar_shape.q_head_norm)
+#define PULSAR_CHAT_SYSTEM_MARKER        (g_pulsar_shape.chat_system_marker)
 #define PULSAR_N_FF_EXP                  (g_pulsar_shape.n_ff_exp)
 #define PULSAR_N_SWA                     (g_pulsar_shape.n_swa)
 #define PULSAR_N_INDEXER_HEAD            (g_pulsar_shape.n_indexer_head)
@@ -319,6 +320,15 @@ typedef struct {
      * too small (dev's Qcur max 15.1 vs the branch's 0.51 for one prompt) and
      * drove layer 0's attention to NaN.  Restored from dev per PLAN 96 s5. */
     bool q_head_norm;
+    /** The chat template writes a <｜System｜> MARKER before the lead-in system
+     * region (V4.1's format).  0731's does not: dev -- the engine that served
+     * 0731 -- writes the system text straight after BOS.  A profile fact
+     * because the template is the model family's, and because the difference is
+     * exactly one token in the prompt: with it, a 5-token prompt rendered to 15
+     * tokens where dev renders 14, and the V4 model then answered a different
+     * question ("In the world of" where dev says "The capital of France is
+     * Paris.").  plans/96-... s9. */
+    bool chat_system_marker;
     /** The head computes its OWN HC coefficients (0731: the output_hc_* and
      * dspark.2.hc_head_* mixes) instead of collapsing with the pre its last FFN
      * handed on (V4.1).  A profile fact rather than "are the tensors there",

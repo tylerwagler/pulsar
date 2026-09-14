@@ -548,7 +548,11 @@ void pulsar_vocab::vocab_free() {
 static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
                                 pulsar_think_mode think_mode, token_vec *out) {
     const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
-    if (effort_prefix[0] || has_system) token_vec_push(out, vocab->system_id);
+    /* The MARKER is the template's, and the template is the model family's:
+     * V4.1 marks its lead-in system region, 0731 does not.  Writing it for both
+     * cost V4 exactly one prompt token -- enough to change the answer. */
+    if (PULSAR_CHAT_SYSTEM_MARKER && (effort_prefix[0] || has_system))
+        token_vec_push(out, vocab->system_id);
     if (effort_prefix[0]) vocab->bpe_tokenize_text(effort_prefix, out);
 }
 
