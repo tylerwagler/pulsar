@@ -724,7 +724,9 @@ static bool gpu_graph_indexed_attention_span(
     pulsar_gpu_tensor *sel_view = pulsar_gpu_tensor_view(g->comp_selected,
             (uint64_t)s0 * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t),
             (uint64_t)sn * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t));
-    const bool selects = attn->mode != PULSAR_ATTN_REUSE;
+    /* FULL / REINDEX score and select here; REUSE reads the selection its index
+     * source wrote.  The unindexed and window modes never reach this span. */
+    const bool selects = pulsar_attn_runs_indexer(attn->mode);
     bool ok = iq_view && iw_view && sq_view && sh_view && sel_view &&
               (!op->mseq || (sp_view && ss_view));
 
@@ -1417,36 +1419,33 @@ bool gpu_graph_encode_layer_attention_batch(
          * produces nothing and reads its source's pools.  The indexer QUERY
          * side belongs to every indexed layer; a REUSE layer attends with its
          * index source's top-k. */
-        if (pulsar_attn_owns_kv(attn->mode) && g_pulsar_shape.indexer_own_compressor &&
-            attn->mode == PULSAR_ATTN_FULL_UNINDEXED) {
-            /* 0731's ratio-128 (HCA) layer: an own compressor and no indexer at
-             * all.  Production would suffice -- a plain compressor is a plain
-             * compressor -- but the CONSUMER does not exist: the attention has to
-             * read its own compressed cache with no top-k, and the branches below
-             * would ask for indexer query weights this artifact does not carry.
-             * Refuse rather than half-run, so the missing piece is named once.
-             * plans/96-two-profiles-one-engine.md s9.1 / s28. */
-            fprintf(stderr,
-                    "pulsar: layer %u (%s, ratio %u): the compressor is implemented but the "
-                    "unindexed compressed-cache attention (its whole consumer) is not -- refusing\n",
-                    il, pulsar_attn_mode_name(attn->mode), attn->ratio);
-            ok = false;
-        } else if (pulsar_attn_owns_kv(attn->mode)) {
-            /* ONE production body for both profiles.  They differ in which
-             * weights project the rows and in whether the indexer compresses its
-             * own index key, and neither difference is visible here: the
-             * projections are named by `own`, and gpu_graph_csa2_produce branches
-             * on the profile for the second compression.  Control flow is
-             * identical, which is what makes the two artifacts share a path. */
-            const bool own = g_pulsar_shape.indexer_own_compressor;
+        if (pulsar_attn_owns_kv(attn->mode)) {
+            /* ONE production body for both profiles, and for BOTH kinds of kv
+             * source.  They differ in which weights project the rows and in
+             * whether the indexer compresses its own index key; neither
+             * difference is visible here, because the projections are named by
+             * `own` and gpu_graph_csa2_produce branches on the profile for the
+             * second compression.  Control flow is identical.
+             *
+             * A FULL_UNINDEXED source (0731's ratio-128 HCA layers) has no
+             * indexer at all, so it needs no index-key weights and produces no
+             * top-k: `indexed` is false for it.  It is its own kv source and
+             * attends over that pool with no selection, which is the mixed
+             * branch below -- the reference's `get_compress_topk_idxs` hands the
+             * unindexed layers every visible compressed position, in order, with
+             * no top-k at all. */
+            const bool indexed = pulsar_attn_runs_indexer(attn->mode);
+            const bool own = g_pulsar_shape.indexer_own_compressor && indexed;
             const bool have_comp = layer->attn_compressor_kv && layer->attn_compressor_norm &&
                                    (ratio == 1u || layer->attn_compressor_gate) &&
-                                   (own ? (layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
-                                           layer->indexer_compressor_norm && layer->indexer_compressor_ape)
-                                        : (layer->indexer_k && layer->indexer_k_norm));
+                                   (!indexed ||
+                                    (own ? (layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
+                                            layer->indexer_compressor_norm && layer->indexer_compressor_ape)
+                                         : (layer->indexer_k && layer->indexer_k_norm)));
             if (!have_comp) {
                 fprintf(stderr, "pulsar: kv source %u is missing its %s weights -- refusing\n", il,
-                        own ? "compressor / indexer-compressor" : "compressor / index-key");
+                        !indexed ? "compressor"
+                                 : own ? "compressor / indexer-compressor" : "compressor / index-key");
                 ok = false;
             }
             const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
@@ -1480,7 +1479,13 @@ bool gpu_graph_encode_layer_attention_batch(
          * once in step_begin (L178); classic, the source's frontier. */
         uint32_t n_comp = mseq ? g->batch_comp_sup[src] : gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src);
 
-        if (ok && attn->mode != PULSAR_ATTN_REUSE) {
+        /* The QUERY side belongs to the layers that run an indexer: FULL and
+         * REINDEX publish a top-k, REUSE reads one it did not compute, and
+         * FULL_UNINDEXED has no indexer and no top-k at all.  Spelled with the
+         * named authority rather than `mode != REUSE`, which quietly included the
+         * unindexed layer and then asked it for query weights its artifact does
+         * not carry. */
+        if (ok && pulsar_attn_runs_indexer(attn->mode)) {
             if (!layer->indexer_attn_q_b || !layer->indexer_proj) {
                 fprintf(stderr, "pulsar: index source %u is missing indexer query weights -- refusing\n", il);
                 ok = false;
@@ -1544,7 +1549,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      mseq ? g->batch_positions : NULL,
                                                      mseq ? g->batch_seq_id : NULL,
                                                      mseq ? nb : 1) != 0;
-            if (ok && n_comp > PULSAR_N_INDEXER_TOP_K) {
+            /* The top-k path needs a top-k.  A FULL_UNINDEXED source never has
+             * one however deep the pool grows, so it takes the mixed branch at
+             * every depth -- which is exactly what the reference's unindexed
+             * layers do (`get_compress_topk_idxs`, every visible compressed
+             * position, in order). */
+            if (ok && pulsar_attn_reads_index(attn->mode) && n_comp > PULSAR_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                 /* PULSAR_PREFILL_SLICE: run [score -> top-k -> indexed attention]
                  * over <=slice-token spans so indexer_scores only ever holds
@@ -1622,7 +1632,8 @@ bool gpu_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
 
-        const bool topk_prefill_needed = compressed && n_comp > PULSAR_N_INDEXER_TOP_K;
+        const bool topk_prefill_needed = pulsar_attn_reads_index(attn->mode) &&
+                                         compressed && n_comp > PULSAR_N_INDEXER_TOP_K;
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
             const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
             /* PULSAR_PREFILL_SLICE: same span loop as the chunked branch.  The
@@ -1774,7 +1785,11 @@ bool gpu_graph_encode_layer_attention_batch(
                         (uint64_t)t * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t),
                         (uint64_t)PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t)) : NULL;
                 if (compressed && !sel_t) { ok = false; break; }
-                if (compressed && cur_comp > PULSAR_N_INDEXER_TOP_K && attn->mode != PULSAR_ATTN_REUSE) {
+                /* Selection belongs to the layers that run an indexer (FULL,
+                 * REINDEX); a REUSE layer reads the shared one and a
+                 * FULL_UNINDEXED layer has none to make. */
+                if (compressed && pulsar_attn_runs_indexer(attn->mode) &&
+                    cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                     pulsar_gpu_tensor *indexer_q_view = pulsar_gpu_tensor_view(
                             g->batch_indexer_qp,
@@ -1800,7 +1815,11 @@ bool gpu_graph_encode_layer_attention_batch(
                     pulsar_gpu_tensor_free(indexer_w_view);
                     pulsar_gpu_tensor_free(indexer_q_view);
                 }
-                if (compressed && cur_comp > PULSAR_N_INDEXER_TOP_K) {
+                /* As above, the top-k path is the top-k layers' alone: past 512
+                 * compressed rows an unindexed source still attends over every
+                 * one of them. */
+                if (compressed && pulsar_attn_reads_index(attn->mode) &&
+                    cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     if (ok) {
                         have_topk = true;
                         n_selected = PULSAR_N_INDEXER_TOP_K < cur_comp
