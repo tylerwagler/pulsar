@@ -67,7 +67,29 @@ int cuda_ok(cudaError_t err, const char *what) {
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
 
 
-#include "attn_pack_fixture.h" /* the UNIFIED row's host replica (V4) */
+/* The UNIFIED row's host replica (V4), included UNDER A RENAME.
+ *
+ * attn_pack_fixture.h and kv_row_fixture.h both define host_e4m3_mag,
+ * host_e4m3_encode_pos, host_e2m1_value, host_e2m1_encode, fixture_q_set and
+ * fixture_upload_q -- and they are NOT the same functions (the two row families
+ * have their own encoders; unifying them silently broke the MAIN leg of
+ * tests/kv_rows_pack_gate when this was first tried).  So the colliding names
+ * are macro-renamed for the duration of this include instead of being merged:
+ * this gate needs exactly one thing from the unified replica, host_nv_pack_row,
+ * and must not reach into the CSA2 gate's arithmetic to get it. */
+#define host_e4m3_mag         attnfix_host_e4m3_mag
+#define host_e4m3_encode_pos  attnfix_host_e4m3_encode_pos
+#define host_e2m1_value       attnfix_host_e2m1_value
+#define host_e2m1_encode      attnfix_host_e2m1_encode
+#define fixture_q_set         attnfix_fixture_q_set
+#define fixture_upload_q      attnfix_fixture_upload_q
+#include "attn_pack_fixture.h"
+#undef host_e4m3_mag
+#undef host_e4m3_encode_pos
+#undef host_e2m1_value
+#undef host_e2m1_encode
+#undef fixture_q_set
+#undef fixture_upload_q
 #include "kv_row_fixture.h"   /* host replicas of the two CSA2 row packers (V4.1): see the note
  * there on why the fixture ENCODES a draw instead of drawing random bytes */
 

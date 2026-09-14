@@ -51,6 +51,12 @@
  * drives every indexed case through BOTH paths against the same oracle. */
 static int g_decode_rows = 0;
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
+/* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
+ * pulsar_cuda_norm_kv.cu, not linked here).  This gate drives V4.1's CSA2 pair;
+ * the UNIFIED family V4 uses is driven by attn_f16_kernel_test's `unified`
+ * argument. */
+static pulsar_kv_row_style g_row_style = PULSAR_KV_ROWS_CSA2;
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_row_style; }
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;

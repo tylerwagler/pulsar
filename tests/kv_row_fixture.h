@@ -41,21 +41,25 @@
 #include <cstring>
 #include <vector>
 
-/* ---- element codecs ------------------------------------------------------
- *
- * The primitive codecs (host_e4m3_mag, host_e4m3_encode_pos, host_e2m1_value,
- * host_e2m1_encode) and the Q upload helpers come from attn_pack_fixture.h --
- * the ONE host replica of the NVFP4 row's arithmetic.  This file carried
- * identical copies of four of them, and a duplicated fixture is how a gate ends
- * up looking like it covers a format it does not (L218 s46: the attention gate
- * built only this file's rows, so it could not fail for the UNIFIED family the
- * kernel had no arm for).  What stays below is what is genuinely THIS family's:
- * the signed E4M3 helper the WINDOW recipe uses, the scale codecs, and the two
- * packers.
- */
-#include "attn_pack_fixture.h"
+/* ---- element codecs (inverse searches of the value tables, so encode and
+ * decode cannot drift; fixture code -- clarity over speed) ---------------- */
+static inline float host_e4m3_mag(uint8_t code) {
+    const uint32_t e = (code >> 3) & 15u, m = code & 7u;
+    if (e == 15u && m == 7u) return NAN;
+    if (e == 0u) return (float)m * 0.001953125f;
+    return std::ldexp(1.0f + (float)m / 8.0f, (int)e - 7);
+}
 /* RNE, saturating at 448 -- what __nv_fp8_e4m3(float) does on finite input.
  * Ties go to the even CODE, which is the even mantissa (code LSB == mantissa LSB). */
+static inline uint8_t host_e4m3_encode_pos(float x) {
+    if (x >= 448.0f) return 126u;
+    uint32_t best = 0u; float bd = std::fabs(x - host_e4m3_mag(0));
+    for (uint32_t c = 1u; c <= 126u; c++) {
+        const float d = std::fabs(x - host_e4m3_mag((uint8_t)c));
+        if (d < bd || (d == bd && (c & 1u) == 0u && (best & 1u) != 0u)) { best = c; bd = d; }
+    }
+    return (uint8_t)best;
+}
 static inline uint8_t host_e4m3_encode(float x) {
     return (uint8_t)(host_e4m3_encode_pos(std::fabs(x)) | (std::signbit(x) ? 0x80u : 0u));
 }
@@ -64,7 +68,20 @@ static inline float host_e4m3_times(uint8_t code, float scale) {
     const float sv = host_e4m3_mag((uint8_t)(code & 0x7Fu)) * scale;
     return (code & 0x80u) ? -sv : sv;
 }
+static inline float host_e2m1_value(uint32_t c) {
+    static const float t[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    return t[c & 7u];
+}
 /* the device's dsv4_e2m1fn_encode_dev: nearest code, ties to even, sign from x < 0 */
+static inline uint8_t host_e2m1_encode(float x) {
+    const float ax = std::fmin(std::fabs(x), 6.0f);
+    uint32_t best = 0u; float bd = std::fabs(ax - host_e2m1_value(0));
+    for (uint32_t i = 1u; i < 8u; i++) {
+        const float d = std::fabs(ax - host_e2m1_value(i));
+        if (d < bd || (d == bd && (i & 1u) == 0u && (best & 1u) != 0u)) { best = i; bd = d; }
+    }
+    return (uint8_t)(best | (x < 0.0f ? 0x8u : 0u));
+}
 static inline float host_e2m1_times(uint8_t nib, float scale) {
     const float sv = host_e2m1_value(nib & 7u) * scale;
     return (nib & 8u) ? -sv : sv;
@@ -130,7 +147,21 @@ static inline void host_mainkv_pack_row(const float *vals, uint8_t *row, float *
  * green, and measuring nothing.
  *
  * Going through here ties the fixture to pulsar_q_t by construction. */
+static inline void fixture_q_set(float &d, float v)  { d = v; }
+static inline void fixture_q_set(__half &d, float v) { d = __float2half(v); }
 
+static inline pulsar_q_t *fixture_upload_q(const std::vector<float> &q) {
+    pulsar_q_t *d = NULL;
+    if (cudaMalloc(&d, q.size() * sizeof(pulsar_q_t)) != cudaSuccess) return NULL;
+    std::vector<pulsar_q_t> h(q.size());
+    for (size_t i = 0; i < q.size(); i++) fixture_q_set(h[i], q[i]);
+    if (cudaMemcpy(d, h.data(), h.size() * sizeof(pulsar_q_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d);
+        return NULL;
+    }
+    return d;
+}
 
 #endif /* __CUDACC__ */
 
