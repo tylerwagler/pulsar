@@ -1059,21 +1059,27 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
             (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
 #define PULSAR_HCFUSED_BLK 256u
-#define PULSAR_HCFUSED_VEC 20u   /* 256 x 20 = 5120 = V4.1 n_embd (L218); the body bounds-checks col < n_embd */
-    /* Flash is n_embd == 4096 == BLK*VEC exactly, so the templated kernel always
-     * applies.  There WAS a generic fallback for wider models; it is deleted.
-     * It could not emit E4M3 at all -- its parameter list had no norm_out_q --
-     * while the caller still marked the activation slot valid, so every MXFP8
-     * consumer downstream read the previous layer's data against zeroed scales.
-     * Fail loud rather than ever silently skip the emit again. */
-    if (n_embd > PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC) {
+/* The unroll must land EXACTLY on n_embd where it can.  A group past the end is
+ * not free: every unrolled step calls pulsar_mx_emit_block, and a dead group
+ * still runs through its shuffles, so a width that does not divide n_embd
+ * perturbs the emitted E4M3 plane.  That is the s51 bug, and dev's V4 build is
+ * exactly 256*16 == 4096 == n_embd with no dead group at all.  V4.1's 5120
+ * needs 20.  Both are selected here, on the tensor's own shape. */
+#define PULSAR_HCFUSED_VEC_4096 16u
+#define PULSAR_HCFUSED_VEC_5120 20u
+    /* Fail loud rather than ever silently skip the emit again.  There WAS a
+     * generic fallback for wider models; it is deleted -- it could not emit
+     * E4M3 at all (its parameter list had no norm_out_q) while the caller still
+     * marked the activation slot valid, so every MXFP8 consumer downstream read
+     * the previous layer's data against zeroed scales. */
+    if (n_embd > PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120) {
         fprintf(stderr, "pulsar: hc fused norm cannot handle n_embd=%u (max %u)\n",
-                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC);
+                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120);
         return 0;
     }
     {
-#define PULSAR_HCFUSED_LAUNCH(NW)                                                    \
-        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC, NW> \
+#define PULSAR_HCFUSED_LAUNCH(VEC, NW)                                               \
+        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, VEC, NW>          \
                 <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(                           \
                 out ? (float *)out->ptr : NULL,                                       \
                 (float *)norm_out->ptr,                                              \
@@ -1091,8 +1097,14 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 norm_w,                                                              \
                 n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,     \
                 g_hc_head_mix ? 1 : 0)
-        if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(true);
-        else             PULSAR_HCFUSED_LAUNCH(false);
+#define PULSAR_HCFUSED_LAUNCH_NW(VEC)                                                \
+        do { if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(VEC, true);                       \
+             else             PULSAR_HCFUSED_LAUNCH(VEC, false); } while (0)
+        if (n_embd <= PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096)
+            PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_4096);
+        else
+            PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_5120);
+#undef PULSAR_HCFUSED_LAUNCH_NW
 #undef PULSAR_HCFUSED_LAUNCH
         return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
     }
