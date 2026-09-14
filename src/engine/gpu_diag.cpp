@@ -120,9 +120,18 @@ void gpu_graph_debug_dump_hc_tensor(
     float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
     if (pulsar_read_hc_carrier_f32(t, 0, buf, n_elems) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        /* Same per-(name, layer, pos) call index as the plain f32 dump above:
+         * this helper writes a DIFFERENT buffer but collides on the same
+         * filename rule, and it was missed when the counter landed -- which
+         * showed up as an apparent carrier mismatch between two engines whose
+         * only difference was which pass each file held. */
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_elems)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
         }
     }
     free(buf);
@@ -157,9 +166,13 @@ void gpu_graph_debug_dump_q_tensor(
     float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
     if (pulsar_read_q_f32(t, 0, buf, n_elems) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_elems)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
         }
     }
     free(buf);
