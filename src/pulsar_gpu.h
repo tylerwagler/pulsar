@@ -1029,6 +1029,22 @@ typedef enum {
  * the packers below learn which family to write without every call site
  * carrying it. */
 void pulsar_gpu_set_kv_row_style(pulsar_kv_row_style style);
+
+/** Where the HC collapse takes its coefficients, pushed once at load from the
+ * profile (`pulsar_shape::hc_head_mix`).
+ *
+ * 0731's head COMPUTES its own coefficients, so a sublayer collapses with the
+ * split it just derived (`sp`); V4.1's collapses with the `pre` its previous
+ * sublayer handed on.  The two are different functions of the same inputs, and
+ * the branch applied V4.1's to both: on V4 every layer's attention collapsed
+ * with the wrong coefficients, which showed up as one bf16 ULP in
+ * `attn_norm` at layer 0 and grew to a 0.48 logit correlation by the head.
+ * The same flag also decides the two bf16 round trips the reference's
+ * `hc_pre`/norm narrowing implies for V4.1's arithmetic and 0731's does not:
+ * that profile's kernel, which served 0731, has neither.
+ *
+ * @param on true = the head computes them (0731); false = carry the pre (V4.1). */
+void pulsar_gpu_set_hc_head_mix(bool on);
 pulsar_kv_row_style pulsar_gpu_kv_row_style(void);
 
 /** The row geometry, in bytes, asked by KIND -- the CUDA side's reader.  head_dim

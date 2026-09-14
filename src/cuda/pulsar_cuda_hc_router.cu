@@ -230,6 +230,14 @@ static void hc_expand_launch(uint32_t blocks, uint32_t threads,
  * threads before the write, and no other block touches the row, so one buffer
  * carries the value through the whole sweep.  `post` and `comb` (split[4..])
  * stay with THIS sublayer's expand, as in the reference's hc_post. */
+/* Where the collapse takes its coefficients -- see pulsar_gpu.h's setter.  A
+ * host-side fact pushed once at load, beside the KV row style and for the same
+ * reason: it is a property of the loaded profile, not of the call.  It reaches
+ * the kernel as a LAUNCH ARGUMENT rather than a __device__ symbol because the
+ * setter runs during weight binding, before the graph's first command batch. */
+static bool g_hc_head_mix = false;
+void pulsar_gpu_set_hc_head_mix(bool on) { g_hc_head_mix = on; }
+
 template <uint32_t BLK, uint32_t VEC, bool NWBF16>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
@@ -251,7 +259,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
         float epsv,
-        float norm_eps) {
+        float norm_eps,
+        int head_mix) {
     const uint32_t t = blockIdx.x;
     const uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
@@ -276,11 +285,17 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
             float acc = 0.0f;
             #pragma unroll
             for (uint32_t h = 0; h < 4; h++) {
-                acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * pre_in[h];
+                /* 0731 collapses with the split this sublayer just derived;
+                 * V4.1 with the pre its predecessor handed on. */
+                acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) *
+                       (head_mix ? sp[h] : pre_in[h]);
             }
             /* hc_pre returns y.to(x.dtype): the collapsed row is bf16 before
-             * the norm sees it (RMSNorm then does its math in fp32 on it) */
-            acc = __bfloat162float(__float2bfloat16(acc));
+             * the norm sees it (RMSNorm then does its math in fp32 on it).
+             * That narrowing is V4.1's reference; 0731's kernel -- the one that
+             * served this artifact -- does not narrow, and narrowing here cost
+             * V4 a bf16 ULP in attn_norm that grew into a different answer. */
+            if (!head_mix) acc = __bfloat162float(__float2bfloat16(acc));
             if (out) out[obase + col] = acc;
             accs[u] = acc;
             sum += acc * acc;
@@ -303,7 +318,9 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         /* (weight * x).to(bf16): the normed row is bf16 -- the value every
          * consumer sees, f32 plane, bf16 plane and the E4M3 quant alike */
         const float v = (col < n_embd)
-                ? __bfloat162float(__float2bfloat16(accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col)))
+                ? (head_mix
+                       ? (accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))
+                       : __bfloat162float(__float2bfloat16(accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))))
                 : 0.0f;
         if (col < n_embd) {
             /* Row-conditional f32: below keep_from every consumer reads an
@@ -1072,7 +1089,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 scale,                                                               \
                 base,                                                                \
                 norm_w,                                                              \
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps)
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,     \
+                g_hc_head_mix ? 1 : 0)
         if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(true);
         else             PULSAR_HCFUSED_LAUNCH(false);
 #undef PULSAR_HCFUSED_LAUNCH

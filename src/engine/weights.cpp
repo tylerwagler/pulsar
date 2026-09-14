@@ -671,6 +671,7 @@ static void pulsar_select_shape_from_metadata(
              * profile stays the authority; this is the seam's copy of one fact,
              * pushed once, here. */
             pulsar_gpu_set_kv_row_style(g_pulsar_shape.kv_row_style);
+            pulsar_gpu_set_hc_head_mix(g_pulsar_shape.hc_head_mix);
             return;
         }
     }
