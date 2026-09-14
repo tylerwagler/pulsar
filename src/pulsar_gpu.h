@@ -413,6 +413,12 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * prologue is rope only.  Carries only the launch-invariant shape;
  * pos0/positions stay the wrapper params they already are. */
 typedef struct {
+    /** Per-head RMS epsilon for the fused prologue, or 0 for a profile whose
+     * reference has no per-head Q norm.  0731's Attention.forward normalises Q
+     * per head before the tail rope (`q *= rsqrt(q.square().mean(-1) + eps)`);
+     * V4.1's does not.  Nonzero both arms the scale and selects the reference's
+     * Q path (fp32 rotation, no extra narrowing of the rotated pair). */
+    float eps;
     uint32_t n_rot;        ///< rotary dimensions at the head's tail
     uint32_t n_ctx_orig;   ///< context length the RoPE settings were trained at
     float freq_base;       ///< RoPE base frequency
@@ -1295,6 +1301,33 @@ int pulsar_gpu_rope_tail_mx_tensor(
         int               gact_kbp,
         uint32_t          gact_slab,
         uint32_t          n_groups);
+
+/** The reference's per-head Q norm and tail rope, fused: RMS-normalise each
+ * head of `x` in f32 (`x *= rsqrt(mean(x^2) + eps)`, no learned weight) and
+ * rotate its tail in place, rounding back into `x`'s element type -- 0731's
+ * Attention.forward, and bit-exact with the fp16 attention kernel's fused
+ * prologue (attn_f16.cu replicates this reduction operation for operation).
+ *
+ * `x` is [n_tok][n_head][head_dim] and may be f32 or f16; the element type is
+ * derived from the buffer, never passed.  Unreachable for a V4.1 artifact:
+ * `g_pulsar_shape.q_head_norm` is false there. */
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(
+        pulsar_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps,
+        const pulsar_gpu_tensor *positions);
 
 int pulsar_gpu_rope_tail_tensor(
         pulsar_gpu_tensor *x,

@@ -211,23 +211,29 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
 #ifndef AF16_MINBLK
 #define AF16_MINBLK 1
 #endif
-/* Build one packed f16 pair from RAW q: rope-rotate when the pair sits in the
- * tail, then round to bf16 -- the reference rotates in fp32 and copies back
- * into the bf16 tensor (apply_rotary_emb), so the attention sees bf16 values;
- * the nope dims are bf16 already (Q is stored bf16).  c0 is even and n_nope
- * is even, so a pair never straddles the nope/rope boundary and one
- * c0 >= n_nope test covers both elements.  The rotation is the shared core
- * every tail-rope consumer uses (pulsar_cuda_rope.cuh) -- a transcribed copy
- * here is how bit-exactness would die.  L218: V4.1 has no per-head RMS on Q
- * (its q_norm is on the low-rank latent, applied before wq_b); 0731's
- * per-head scale that stood here is gone. */
+/* Build one packed f16 pair from RAW q: apply this head's RMS scale when the
+ * profile has one, rope-rotate when the pair sits in the tail, and round to
+ * bf16 -- the reference rotates in fp32 and copies back into the bf16 tensor
+ * (apply_rotary_emb), so the attention sees bf16 values; the nope dims are bf16
+ * already (Q is stored bf16).  c0 is even and n_nope is even, so a pair never
+ * straddles the nope/rope boundary and one c0 >= n_nope test covers both
+ * elements.  The rotation is the shared core every tail-rope consumer uses
+ * (pulsar_cuda_rope.cuh) -- a transcribed copy here is how bit-exactness would
+ * die.
+ *
+ * `scale` is 1.0f for a profile whose reference has no per-head Q norm (V4.1:
+ * its q_norm is on the low-rank latent, applied before wq_b) and the head's
+ * rsqrt(mean(x^2)+eps) for one that does (0731).  The scale applies to the WHOLE
+ * head -- nope and rope dims alike, before the rotation -- because that is where
+ * the reference's `q *= ...` sits; scaling only the rotated pair would be a
+ * different function. */
 template <typename QT>
 __device__ static inline uint32_t af16_pack_qraw(
-        const QT *qrow, uint32_t c0, uint32_t q_nope,
+        const QT *qrow, uint32_t c0, float scale, uint32_t q_nope,
         const pulsar_gpu_q_prep qp, uint32_t rope_pos,
         float corr0, float corr1) {
-    float x0 = q_load<QT>(qrow, c0);
-    float x1 = q_load<QT>(qrow, c0 + 1u);
+    float x0 = q_load<QT>(qrow, c0) * scale;
+    float x1 = q_load<QT>(qrow, c0 + 1u) * scale;
     if (c0 >= q_nope) {
         float r0, r1;
         rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
@@ -483,12 +489,58 @@ static void attn_f16_kernel(
     const uint32_t job = warp & 3u;
     const uint32_t mtile = job >> 1u, ntile = job & 1u;
     const uint32_t kgrp = warp >> 2u;                   /* 0..3 */
-    /* L037 lever 3 prologue: the rope's YaRN correction dims, once per block.
-     * (0731's per-head RMS scale was computed here too; V4.1 has none.) */
+    /* L037 lever 3 prologue: per-head RMS scales for the block's rows when the
+     * profile has them, plus the rope's YaRN correction dims, once per block.
+     *
+     * The scale reduction replays the standalone head_rms_norm_rope_tail_kernel
+     * (blockDim 256: thread i sums x[i]^2 then x[i+256]^2, then a power-of-two
+     * tree partial[i] += partial[i + s] for s = 128, 64, ..., 1) operation for
+     * operation.  Two rows per WARP, lane L standing in for threads L + 32k,
+     * k = 0..7: the strides >= 32 pair the lane's own registers, the strides
+     * < 32 pair lanes through shuffles -- the same pairs in the same
+     * association order, so the same bits, and no block barrier.  Bit-exactness
+     * of the fusion still hangs on this matching that kernel; change either,
+     * change both. */
+    __shared__ float sQscale[AF16_HPB];
     float q_corr0 = 0.0f, q_corr1 = 0.0f;
-    if (q_raw && qp.ext_factor != 0.0f)
-        rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base,
-                           qp.beta_fast, qp.beta_slow, &q_corr0, &q_corr1);
+    if (q_raw) {
+        #pragma unroll
+        for (uint32_t hh = 0; hh < 2u; hh++) {
+            const uint32_t r = warp * 2u + hh;
+            const QT *xr = q + ((uint64_t)t * n_head + hbase + r) * AF16_DIM;
+            float part[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                float sum = 0.0f;
+                for (uint32_t i = lane + 32u * k; i < AF16_DIM; i += 256u) {   /* thread (lane + 32k)'s loop */
+                    float v = q_load<QT>(xr, i);
+                    sum += v * v;
+                }
+                part[k] = sum;
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) part[k] += part[k + 4u];   /* stride 128 */
+            part[0] += part[2];                                          /* stride 64 */
+            part[1] += part[3];
+            part[0] += part[1];                                          /* stride 32 */
+            float v = part[0];
+            v += __shfl_down_sync(0xffffffffu, v, 16);                   /* stride 16: lane L takes L + 16 */
+            v += __shfl_down_sync(0xffffffffu, v, 8);
+            v += __shfl_down_sync(0xffffffffu, v, 4);
+            v += __shfl_down_sync(0xffffffffu, v, 2);
+            v += __shfl_down_sync(0xffffffffu, v, 1);
+            /* qp.eps is 0 for a profile with no per-head norm, and
+             * rsqrt(v/dim + 0) is NOT 1 -- so the profile selects the scale
+             * rather than the arithmetic, and the 1.0f below is the identity
+             * both for the no-norm case and for the store below it. */
+            if (lane == 0u)
+                sQscale[r] = qp.eps != 0.0f ? rsqrtf(v / (float)AF16_DIM + qp.eps) : 1.0f;
+        }
+        __syncthreads();
+        if (qp.ext_factor != 0.0f)
+            rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base,
+                               qp.beta_fast, qp.beta_slow, &q_corr0, &q_corr1);
+    }
 
     uint32_t qf[AF16_KPW][4];
     {
@@ -504,10 +556,14 @@ static void attn_f16_kernel(
             const QT *qa = q + qbase + (uint64_t)hA * AF16_DIM;
             const QT *qb = q + qbase + (uint64_t)hB * AF16_DIM;
             if (q_raw) {
-                qf[s][0] = af16_pack_qraw<QT>(qa, c0, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][1] = af16_pack_qraw<QT>(qb, c0, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][2] = af16_pack_qraw<QT>(qa, c1, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][3] = af16_pack_qraw<QT>(qb, c1, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                /* sQscale is indexed by the M-tile's head rows: hA = g and
+                 * hB = g + 8 within the tile (see the fragment's two rows). */
+                const float sa = sQscale[mtile * AF16_HEADS + g];
+                const float sb = sQscale[mtile * AF16_HEADS + g + 8u];
+                qf[s][0] = af16_pack_qraw<QT>(qa, c0, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][1] = af16_pack_qraw<QT>(qb, c0, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][2] = af16_pack_qraw<QT>(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][3] = af16_pack_qraw<QT>(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
             } else {
                 qf[s][0] = af16_load_pair<QT>(qa, c0);
                 qf[s][1] = af16_load_pair<QT>(qb, c0);

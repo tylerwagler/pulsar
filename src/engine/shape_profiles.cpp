@@ -73,6 +73,7 @@ const pulsar_shape PULSAR_SHAPE_V4 = {
     .n_hc_sinkhorn_iter = 20,
     .compressor_ape = true,           /* both compressors carry an ape */
     .indexer_own_compressor = true,   /* the indexer compresses its own index key */
+    .q_head_norm = true,              /* Attention.forward: q *= rsqrt(mean(q^2)+eps) per head */
     .hc_head_mix = true,              /* the head computes its own HC coefficients */
     .kv_row_style = PULSAR_KV_ROWS_UNIFIED,
     .rms_eps = PULSAR_V4_RMS_EPS,
@@ -129,6 +130,7 @@ const pulsar_shape PULSAR_SHAPE_V41 = {
     .n_hc_sinkhorn_iter = 20,
     .compressor_ape = false,          /* plain projections */
     .indexer_own_compressor = false,  /* the index key projects from the kv source's latent */
+    .q_head_norm = false,             /* q_norm sits on the low-rank latent, before wq_b */
     .hc_head_mix = false,             /* collapses with the carried pre */
     .kv_row_style = PULSAR_KV_ROWS_CSA2,
     .rms_eps = PULSAR_V41_RMS_EPS,

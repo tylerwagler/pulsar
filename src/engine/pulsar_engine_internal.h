@@ -109,6 +109,7 @@
 #define PULSAR_N_DSPARK_EXPERT_USED      (g_pulsar_shape.n_dspark_expert_used)
 #define PULSAR_N_EXPERT_SHARED           (g_pulsar_shape.n_expert_shared)
 #define PULSAR_N_HASH_LAYER              (g_pulsar_shape.n_hash_layer)
+#define PULSAR_Q_HEAD_NORM               (g_pulsar_shape.q_head_norm)
 #define PULSAR_N_FF_EXP                  (g_pulsar_shape.n_ff_exp)
 #define PULSAR_N_SWA                     (g_pulsar_shape.n_swa)
 #define PULSAR_N_INDEXER_HEAD            (g_pulsar_shape.n_indexer_head)
@@ -309,6 +310,15 @@ typedef struct {
      *   source's latent (V4.1, indexer_k / indexer_k_norm). */
     bool compressor_ape;
     bool indexer_own_compressor;
+    /** The reference's Attention.forward normalises Q PER HEAD before the tail
+     * rope (`q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`), on the
+     * wq_b output.  0731 does; V4.1 does not -- its q_norm is an RMSNorm on the
+     * low-rank latent, applied before wq_b, with no per-head pass.  Both are
+     * "the reference", so this is a profile fact, not a choice.  The branch
+     * carried only V4.1's arm and deleted 0731's, which left V4's Q roughly 30x
+     * too small (dev's Qcur max 15.1 vs the branch's 0.51 for one prompt) and
+     * drove layer 0's attention to NaN.  Restored from dev per PLAN 96 s5. */
+    bool q_head_norm;
     /** The head computes its OWN HC coefficients (0731: the output_hc_* and
      * dspark.2.hc_head_* mixes) instead of collapsing with the pre its last FFN
      * handed on (V4.1).  A profile fact rather than "are the tensors there",

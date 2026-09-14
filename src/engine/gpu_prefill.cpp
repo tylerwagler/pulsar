@@ -1214,21 +1214,22 @@ bool gpu_graph_encode_layer_attention_batch(
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
-        /* WHERE the Q tail rope runs, never WHICH attention kernel.  Shipped:
-         * deferred into the fp16 attention kernel's Q-fragment build (q_prep),
-         * so batch_q stays RAW and the roped Q exists only in the kernel's
-         * registers.  A "Qcur" dump needs that intermediate in memory, so it
-         * runs the standalone rope kernel first and hands attention roped Q
-         * (q_prep NULL).  The two are bit-exact (shared rope core, and the
-         * bf16 store rounds where the prologue rounds), and the attention
-         * launch is the same fp16 kernel either way (L166).  L218: V4.1's
-         * q_norm is on the low-rank latent (qkv_rms_norm above, before wq_b);
-         * there is no per-head RMS, so this is rope only. */
+        /* WHERE the Q head-norm + tail rope runs, never WHICH attention kernel.
+         * Shipped: deferred into the fp16 attention kernel's Q-fragment build
+         * (q_prep), so batch_q stays RAW and the normed+roped Q exists only in
+         * the kernel's registers.  A "Qcur" dump needs that intermediate in
+         * memory, so it runs the standalone kernel first and hands attention
+         * pre-normed Q (q_prep NULL).  The two are bit-exact (shared rope core,
+         * replicated reduction -- attn_f16.cu), and the attention launch is the
+         * same fp16 kernel either way (L166).  The per-head RMS half is
+         * `PULSAR_Q_HEAD_NORM`'s: 0731 normalises Q per head there, V4.1 has no
+         * per-head pass (its q_norm is on the low-rank latent, before wq_b). */
         const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0);
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
         if (ok && prefill_q_defer) {
             memset(&g->q_prep, 0, sizeof g->q_prep);
+            g->q_prep.eps = PULSAR_Q_HEAD_NORM ? PULSAR_RMS_EPS : 0.0f;
             g->q_prep.n_rot = PULSAR_N_ROT;
             g->q_prep.n_ctx_orig = compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0;
             g->q_prep.freq_base = freq_base;
@@ -1240,8 +1241,10 @@ bool gpu_graph_encode_layer_attention_batch(
             g->q_prep_active = 1;
             prefill_q_norm_rope_fused = true;  ///< deferred into attention
         } else if (ok) {
-            prefill_q_norm_rope_fused =
-                pulsar_gpu_rope_tail_tensor(g->batch_q,
+            /* One call either way; the profile picks the kernel, exactly as it
+             * picks the fused prologue's scale. */
+            prefill_q_norm_rope_fused = (PULSAR_Q_HEAD_NORM
+                ? pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
                                             n_tokens,
                                             PULSAR_N_HEAD,
                                             PULSAR_N_HEAD_DIM,
@@ -1255,7 +1258,23 @@ bool gpu_graph_encode_layer_attention_batch(
                                             attn_factor,
                                             PULSAR_ROPE_YARN_BETA_FAST,
                                             PULSAR_ROPE_YARN_BETA_SLOW,
-                                            mseq ? g->batch_positions : NULL) != 0;
+                                            PULSAR_RMS_EPS,
+                                            mseq ? g->batch_positions : NULL)
+                : pulsar_gpu_rope_tail_tensor(g->batch_q,
+                                            n_tokens,
+                                            PULSAR_N_HEAD,
+                                            PULSAR_N_HEAD_DIM,
+                                            PULSAR_N_ROT,
+                                            pos0,
+                                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
+                                            false,
+                                            freq_base,
+                                            freq_scale,
+                                            ext_factor,
+                                            attn_factor,
+                                            PULSAR_ROPE_YARN_BETA_FAST,
+                                            PULSAR_ROPE_YARN_BETA_SLOW,
+                                            mseq ? g->batch_positions : NULL)) != 0;
         }
         /* The separate head-norm + rope-tail pair that used to live here was
          * reachable ONLY by asking for a "Qnorm" dump: the fused kernel never
@@ -1264,9 +1283,9 @@ bool gpu_graph_encode_layer_attention_batch(
          * own warning, not the numbers production computes.  A debug
          * affordance that changes what it observes cannot diagnose what it
          * observes, so it is gone along with the "Qnorm" dump.  Prefill Q now
-         * has exactly two places to be roped: inside attention (shipped) or
-         * by the standalone kernel above (the "Qcur" dump); same numbers,
-         * same attention kernel after it.  L045 stage 2.
+         * has exactly two places to be normed and roped: inside attention
+         * (shipped) or by the standalone kernel above (the "Qcur" dump); same
+         * numbers, same attention kernel after it.  L045 stage 2.
          *
          * If the post-norm/pre-rope intermediate is ever genuinely needed, the
          * honest way to get it is an optional store from the SHIPPED kernel,

@@ -1051,6 +1051,106 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 
+
+
+/* ---------------------------------------------------------------------------
+ * 0731's per-head Q RMS norm, fused with the tail rope.
+ *
+ * Moved back from dev by PLAN 96 s5: the two-profile branch kept only V4.1's
+ * arm of the reference's Q path and deleted this one, so V4's Q reached
+ * attention unnormalised -- roughly 30x too small (dev's Qcur max 15.1 against
+ * the branch's 0.51 on one prompt) -- and layer 0's attention came out NaN.
+ * The fp16 attention kernel's fused prologue replays this reduction operation
+ * for operation (attn_f16.cu); change either, change both.
+ */
+/* positions (both RoPE kernels): per-row absolute query positions for banked
+ * multi-session batches; NULL degenerates to the classic consecutive pos0+t
+ * rule bit-exactly (same arithmetic on the same value). */
+template <typename QT>
+__global__ static void head_rms_norm_rope_tail_kernel(
+        QT *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps,
+        const int32_t * __restrict__ positions) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_tok * n_head) return;
+    uint32_t t = row / n_head;
+    const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+    QT *xr = x + (uint64_t)row * head_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = q_load<QT>(xr, i);
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+        q_store<QT>(xr, i, q_load<QT>(xr, i) * scale);
+    }
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f)
+        rope_corr_dims_dev(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr0, &corr1);
+    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
+        uint32_t i = pair * 2u;
+        /* The rotation itself stays in f32 for both instantiations; only the
+         * two stores narrow.  Rotating in f16 would compound the rounding
+         * across the pair and is not what the fp16-storage change is. */
+        QT *tail = xr + n_nope;
+        float x0 = q_load<QT>(tail, i) * scale;
+        float x1 = q_load<QT>(tail, i + 1) * scale;
+        float r0, r1;
+        rope_pair_rotate_core_dev(x0, x1, i, n_rot, rope_pos, inverse,
+                                  freq_base, freq_scale, ext_factor, attn_factor,
+                                  corr0, corr1, &r0, &r1);
+        q_store<QT>(tail, i,     r0);
+        q_store<QT>(tail, i + 1, r1);
+    }
+}
+
+
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
+    /* Derived from the buffer, never passed in.  Passing it was how decode
+     * came to hand an f16 Q to the f32 kernel. */
+    const size_t esz = x ? pulsar_tensor_esz(x) : 0u;
+    const int q_f16 = (esz == sizeof(__half));
+    if (!x || (esz != sizeof(float) && esz != sizeof(__half)) ||
+        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) ||
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * esz ||
+        (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t))) {
+        fprintf(stderr, "pulsar: head rms norm + rope tail: bad operands (tok %u, head %u, "
+                        "head_dim %u, n_rot %u) -- refusing\n", n_tok, n_head, head_dim, n_rot);
+        return 0;
+    }
+    const int32_t *pos = positions ? (const int32_t *)positions->ptr : NULL;
+    if (q_f16)
+        head_rms_norm_rope_tail_kernel<__half><<<n_tok * n_head, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
+    else
+        head_rms_norm_rope_tail_kernel<float><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
+    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
+
+}
+
+
 int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
     return pulsar_gpu_rope_tail_mx_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
                                           freq_base, freq_scale, ext_factor, attn_factor,
