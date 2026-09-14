@@ -95,6 +95,23 @@ __device__ __forceinline__ static void pulsar_mx_emit_block(
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
     const int se = pulsar_mx_shared_exp(a);
+    /* A lane past the row must JOIN the reduction -- the shuffle is warp-wide --
+     * and then STORE NOTHING.  That half of the contract above was written down
+     * and not implemented: this stored unconditionally, so a producer whose
+     * BLK*VEC exceeds in_dim wrote its dead lanes past the row's end and into
+     * the NEXT row's leading bytes.  With v = 0 for those lanes that is a ZERO
+     * CODE, so it silently erased them.
+     *
+     * Measured (L218 s50): the hc fused norm launches 256 x VEC columns, VEC was
+     * raised 16 -> 20 for V4.1's 5120-wide embedding, and at V4's n_embd = 4096
+     * the four dead column groups zeroed cols 0..1023 of every row but the
+     * first -- a quarter of the activation, which is precisely the 0.759x
+     * magnitude and 0.935 correlation every MXFP8 projection then showed.
+     *
+     * `stride` is the row pitch, so `col >= stride` is exactly "past this row".
+     * Dead lanes are whole warps here (columns are consecutive within a warp),
+     * so a partial-warp store cannot occur. */
+    if (col >= stride) return;
     data[(size_t)row * stride + col] = pulsar_mx_encode(v, se);
     if ((threadIdx.x & 31u) == 0u) {
         scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
