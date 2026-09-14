@@ -224,6 +224,7 @@ typedef struct {
     uint64_t routed_mid_dim;  ///< routed-expert intermediate width
     uint64_t vocab_dim;       ///< output head width
     uint64_t comp_width_max;  ///< widest compressed row across layers; sizes the shared staging
+    uint64_t index_comp_width_max; ///< widest INDEXER-compressor row across layers; same rule at the indexer's head dim
     uint64_t indexer_q_dim;   ///< indexer query width
 } gpu_graph_dims;
 
@@ -278,9 +279,16 @@ static void gpu_graph_compute_dims(
      * 2*head_dim (they overlap), so a head_dim literal would under-size the
      * shared staging the moment a V4 layer ran through it. */
     d->comp_width_max = 0;
+    d->index_comp_width_max = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint64_t w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        const uint64_t w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
         if (w > d->comp_width_max) d->comp_width_max = w;
+        /* V4's indexer compresses its own index key at the indexer's head dim
+         * (pulsar_shape::indexer_own_compressor); the same derivation keeps the
+         * two stagings from disagreeing about what a row is. */
+        const uint64_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+        if (iw > d->index_comp_width_max) d->index_comp_width_max = iw;
     }
     d->indexer_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
 }
@@ -1607,6 +1615,8 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_kv_pack = pulsar_gpu_tensor_alloc(pc * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
     g->batch_comp_kv = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_comp_sc = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
+    g->batch_index_comp_kv = pulsar_gpu_tensor_alloc(pc * dz.index_comp_width_max * sizeof(float));
+    g->batch_index_comp_sc = pulsar_gpu_tensor_alloc(pc * dz.index_comp_width_max * sizeof(float));
     g->batch_indexer_q = pulsar_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_qp = pulsar_gpu_tensor_alloc(pc * (uint64_t)PULSAR_N_INDEXER_HEAD *
                                                   pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
@@ -1695,6 +1705,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
+                    g->batch_index_comp_kv && g->batch_index_comp_sc &&
                     g->batch_indexer_q && g->batch_indexer_qp && g->batch_indexer_weights &&
                     g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
                     g->batch_after_attn_hc &&

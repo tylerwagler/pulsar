@@ -139,29 +139,41 @@ static bool gpu_graph_csa2_emit_rows(
 
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
                                                        (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float));
-    pulsar_gpu_tensor *idx = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
-                                                    (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     pulsar_gpu_tensor *comp_dst = banked ? gpu_graph_bank_attn_comp_view(g, il, bank) : g->layer_attn_comp_cache[il];
-    pulsar_gpu_tensor *idx_dst = banked ? gpu_graph_bank_index_comp_view(g, il, bank) : g->layer_index_comp_cache[il];
-    bool ok = latent && idx && comp_dst && idx_dst;
+    /* The projection staging and the index pool are V4.1's alone: under
+     * indexer_own_compressor both are the indexer compressor's, and a view
+     * opened here would only shadow the buffer it stages through. */
+    pulsar_gpu_tensor *idx = g_pulsar_shape.indexer_own_compressor ? NULL
+                         : pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
+                                                  (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
+    pulsar_gpu_tensor *idx_dst = g_pulsar_shape.indexer_own_compressor ? NULL
+                              : (banked ? gpu_graph_bank_index_comp_view(g, il, bank) : g->layer_index_comp_cache[il]);
+    bool ok = latent && comp_dst && (g_pulsar_shape.indexer_own_compressor || (idx && idx_dst));
 
     /* index K: wk on the unrotated latent, k_norm, RoPE at the group position,
-     * FP4 pack into the source's index-K pool */
-    if (ok) ok = gpu_graph_matmul_plain_tensor(idx, model, layer->indexer_k,
-                                               PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, latent, n_rows) != 0;
-    if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(idx, idx, model->map, model->size,
-                                                        layer->indexer_k_norm->abs_offset,
-                                                        PULSAR_N_INDEXER_HEAD_DIM, n_rows, PULSAR_RMS_EPS, NULL,
-                                                        layer->indexer_k_norm->type == PULSAR_TENSOR_BF16) != 0;
-    if (ok) ok = pulsar_gpu_rope_tail_strided_tensor(idx, n_rows, PULSAR_N_INDEXER_HEAD_DIM, PULSAR_N_ROT,
-                                                     pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
-                                                     freq_base, freq_scale, ext_factor, attn_factor,
-                                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) ok = pulsar_gpu_indexer_fp4_pack_tensor(idx, idx_dst, cache_row0, n_rows,
-                                                         PULSAR_N_INDEXER_HEAD_DIM,
-                                                         gpu_graph_f32_store_observed_any()) != 0;
-    if (ok) gpu_graph_debug_dump_tensor("indexer_KVcompress", idx,
-                                        (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM, il, pos_first);
+     * FP4 pack into the source's index-K pool.
+     *
+     * V4.1 ONLY.  When the indexer owns its compressor (0731) the index-K row is
+     * pooled by the indexer's OWN weights over the batch norm -- it is not a
+     * projection of the kv source's latent at all -- and gpu_graph_index_comp_*
+     * has already written it into the same pool by the time this runs. */
+    if (ok && !g_pulsar_shape.indexer_own_compressor) {
+        if (ok) ok = gpu_graph_matmul_plain_tensor(idx, model, layer->indexer_k,
+                                                   PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, latent, n_rows) != 0;
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(idx, idx, model->map, model->size,
+                                                            layer->indexer_k_norm->abs_offset,
+                                                            PULSAR_N_INDEXER_HEAD_DIM, n_rows, PULSAR_RMS_EPS, NULL,
+                                                            layer->indexer_k_norm->type == PULSAR_TENSOR_BF16) != 0;
+        if (ok) ok = pulsar_gpu_rope_tail_strided_tensor(idx, n_rows, PULSAR_N_INDEXER_HEAD_DIM, PULSAR_N_ROT,
+                                                         pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
+                                                         freq_base, freq_scale, ext_factor, attn_factor,
+                                                         PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = pulsar_gpu_indexer_fp4_pack_tensor(idx, idx_dst, cache_row0, n_rows,
+                                                             PULSAR_N_INDEXER_HEAD_DIM,
+                                                             gpu_graph_f32_store_observed_any()) != 0;
+        if (ok) gpu_graph_debug_dump_tensor("indexer_KVcompress", idx,
+                                            (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM, il, pos_first);
+    }
 
     /* comp KV: the same latent rotated in place, packed into the comp pool */
     if (ok) ok = pulsar_gpu_rope_tail_strided_tensor(latent, n_rows, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
@@ -181,6 +193,142 @@ static bool gpu_graph_csa2_emit_rows(
     return ok;
 }
 
+
+
+/* ---------------------------------------------------------------------------
+ * V4's indexer-OWN compressor (0731).
+ *
+ * V4.1's index key is a projection of the kv source's latent -- wk + k_norm,
+ * fp4-packed in gpu_graph_csa2_emit_rows.  0731 is different at the root: the
+ * reference's Indexer builds `Compressor(args, compress_ratio, head_dim = 128,
+ * rotate = True)` and `self.compressor(x, start_pos)` pools the index key from
+ * its OWN wkv/wgate over the batch norm, with its own ape, its own state lane
+ * and its own rope + Hadamard tail.  So one source compresses the same tokens
+ * TWICE, and this is the second one.
+ *
+ * A pooled row lands in the source's index pool at the SAME row index the
+ * attention comp row lands at -- one emit, one frontier -- because the scorer
+ * reads the index pool with the comp frontier as its row count and stride
+ * (the `n_comp` gpu_graph_indexed_attention_span is handed).
+ *
+ * Both arms below therefore run BESIDE the attention compressor's, on the same
+ * rows, and the same helper folds the attention compressor's ape.  The two
+ * compressors are the same kernels at a different head dim and with different
+ * weights -- that is the whole difference, and it is why the pair can share a
+ * frontier without either being derived from the other.
+ * ------------------------------------------------------------------------ */
+static bool gpu_graph_index_comp_prefill(
+        pulsar_gpu_graph           *g,
+        const pulsar_model         *model,
+        const pulsar_layer_weights *layer,
+        uint32_t                    il,
+        uint32_t                    n_tokens,
+        uint32_t                    out_row0,
+        uint32_t                    pos0,
+        uint32_t                    ratio,
+        float                       freq_base,
+        float                       freq_scale,
+        float                       ext_factor,
+        float                       attn_factor) {
+    const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+    const uint32_t n_groups = n_tokens / ratio;
+    pulsar_gpu_tensor *kv = pulsar_gpu_tensor_view(g->batch_index_comp_kv, 0,
+                                                   (uint64_t)n_tokens * width * sizeof(float));
+    pulsar_gpu_tensor *sc = pulsar_gpu_tensor_view(g->batch_index_comp_sc, 0,
+                                                   (uint64_t)n_tokens * width * sizeof(float));
+    pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
+                                                       (uint64_t)n_groups * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
+    const bool ok = kv && sc && latent &&
+              pulsar_gpu_indexer_compressor_prefill_tensor(
+                      g->layer_index_comp_cache[il], latent,
+                      g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                      sc, kv,
+                      model->map, model->size,
+                      layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
+                      layer->indexer_compressor_norm->abs_offset,
+                      layer->indexer_compressor_norm->type,
+                      out_row0, PULSAR_N_INDEXER_HEAD_DIM, ratio, pos0, n_tokens,
+                      PULSAR_N_ROT, (uint32_t)PULSAR_ROPE_ORIG_CTX,
+                      freq_base, freq_scale, ext_factor, attn_factor,
+                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                      PULSAR_RMS_EPS) != 0;
+    if (ok) gpu_graph_debug_dump_tensor("indexer_KVcompress", latent,
+                                        (uint64_t)n_groups * PULSAR_N_INDEXER_HEAD_DIM, il, pos0);
+    pulsar_gpu_tensor_free(latent);
+    pulsar_gpu_tensor_free(sc);
+    pulsar_gpu_tensor_free(kv);
+    return ok;
+}
+
+
+/* The per-row twin: one token, through the indexer's own compressor.  `emitted`
+ * is 1 exactly when this token closed a group and the row was packed at
+ * `out_row`; the caller advances the shared frontier on that, not on the return
+ * value. */
+static bool gpu_graph_index_comp_update(
+        pulsar_gpu_graph           *g,
+        const pulsar_model         *model,
+        const pulsar_layer_weights *layer,
+        uint32_t                    il,
+        uint32_t                    row,
+        uint32_t                    out_row,
+        uint32_t                    ratio,
+        float                       freq_base,
+        float                       freq_scale,
+        float                       ext_factor,
+        float                       attn_factor,
+        int                        *emitted) {
+    const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+    pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->batch_index_comp_kv, row, width);
+    pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_index_comp_sc, row, width);
+    pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
+                                                       (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
+    const bool ok = kv && sc && latent &&
+              pulsar_gpu_indexer_compressor_update_tensor(
+                      g->layer_index_comp_cache[il], latent,
+                      g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                      sc, kv,
+                      model->map, model->size,
+                      layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
+                      layer->indexer_compressor_norm->abs_offset,
+                      layer->indexer_compressor_norm->type,
+                      out_row, PULSAR_N_INDEXER_HEAD_DIM, ratio, row,
+                      PULSAR_N_ROT, (uint32_t)PULSAR_ROPE_ORIG_CTX,
+                      freq_base, freq_scale, ext_factor, attn_factor,
+                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                      PULSAR_RMS_EPS, emitted) != 0;
+    pulsar_gpu_tensor_free(latent);
+    pulsar_gpu_tensor_free(sc);
+    pulsar_gpu_tensor_free(kv);
+    return ok;
+}
+
+
+/* The 0731 compressor folds an absolute-position embedding into its score
+ * before pooling -- the reference's prefill branch does `score = score + self.ape`
+ * and its decode branch `score += self.ape[start_pos % ratio]` -- while V4.1's
+ * plain projections carry none, which is what `compressor_ape` records.  Both
+ * arms go through here so the batch path and the per-row path fold the same ape
+ * the same way; the reference's two branches agree and so must ours, or a chunk
+ * boundary would change the answer. */
+static bool gpu_graph_comp_ape_fold(
+        const pulsar_model         *model,
+        const pulsar_layer_weights *layer,
+        pulsar_gpu_tensor          *sc,
+        uint32_t                    width,
+        uint32_t                    ratio,
+        uint32_t                    pos0,
+        uint32_t                    n_tokens) {
+    if (!g_pulsar_shape.compressor_ape) return true;
+    const pulsar_tensor *ape = layer->attn_compressor_ape;
+    if (!ape) {
+        fprintf(stderr, "pulsar: the 0731 compressor needs its absolute-position embedding -- refusing\n");
+        return false;
+    }
+    return pulsar_gpu_csa2_comp_ape_add_tensor(sc, model->map, model->size,
+                                               ape->abs_offset, ape->type,
+                                               width, ratio, pos0, n_tokens) != 0;
+}
 
 
 /* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
@@ -208,6 +356,25 @@ static bool gpu_graph_csa2_produce(
      * below is one or the other -- mixing them reads a neighbouring row and
      * still looks like a number. */
     const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+    /* V4's indexer compresses its OWN index key (the helpers above), so this
+     * source runs a second compression over the same rows; V4.1's index key is a
+     * projection of the latent and needs no second pass. */
+    const bool own_index = g_pulsar_shape.indexer_own_compressor &&
+                           pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode);
+    const float freq_base = layer_rope_freq_base(il);
+    const float freq_scale = layer_rope_freq_scale(il);
+    const float ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float attn_factor = 1.0f;
+    if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    if (own_index && mseq) {
+        /* The indexer's lane is single-session: the bank slab carries the
+         * attention state lanes but no index twin, so a V4 banked graph is
+         * refused at allocation (gpu_diag.c) and must never reach this
+         * producer.  Writing the shared lane from every bank would be a wrong
+         * answer rather than a crash, hence the check. */
+        fprintf(stderr, "pulsar: index source %u: banked mode has no indexer-compressor state lane -- refusing\n", il);
+        return false;
+    }
     /* Stage-B save: keep this batch's per-position compressor projections so
      * a partial spec accept can roll the pending group forward without a
      * transformer replay (gpu_graph_dspark_compressor_rollforward), and a
@@ -255,12 +422,19 @@ static bool gpu_graph_csa2_produce(
                     il, n_groups, g->attn_comp_stage_cap);
             ok = false;
         }
+        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, g->batch_comp_sc, comp_width, ratio, pos0, n_tokens);
         if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, g->batch_comp_kv, g->batch_comp_sc,
                                                                st_kv, st_sc, model->map, model->size,
                                                                layer->attn_compressor_norm->abs_offset,
                                                                layer->attn_compressor_norm->type,
                                                                PULSAR_N_HEAD_DIM, ratio, pos0, n_tokens,
                                                                PULSAR_RMS_EPS) != 0;
+        /* The indexer's own compression, before emit_rows: it needs this batch's
+         * index projections and writes the index pool emit_rows would otherwise
+         * fill from the latent -- and unlike the comp row it has no latent of its
+         * own to hand over, so it must run here rather than inside that call. */
+        if (ok && own_index) ok = gpu_graph_index_comp_prefill(g, model, layer, il, n_tokens, before, pos0,
+                                                               ratio, freq_base, freq_scale, ext_factor, attn_factor);
         if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, pos0, ratio);
         if (ok) {
             g->ms_n_comp[run_bank][il] = before + n_groups;
@@ -307,12 +481,29 @@ static bool gpu_graph_csa2_produce(
                 ok = false;
             }
         }
+        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
         ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
              pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
                                                       model->map, model->size,
                                                       layer->attn_compressor_norm->abs_offset,
                                                       layer->attn_compressor_norm->type,
                                                       PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
+        /* The indexer's own compressor walks the SAME rows on the same schedule:
+         * it stores this token whether or not the group closes, and its frontier
+         * IS the attention compressor's (one emit, one row -- the scorer reads
+         * the index pool with the comp frontier as its stride).  So it is called
+         * unconditionally and the two `emitted` flags are compared: a disagreement
+         * would mean the second pool's row indices had drifted off the first's,
+         * which no later check would notice. */
+        int idx_emitted = 0;
+        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, t, *n_comp_slot, ratio,
+                                                              freq_base, freq_scale, ext_factor, attn_factor,
+                                                              &idx_emitted);
+        if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
+            fprintf(stderr, "pulsar: index source %u: the indexer's compressor and the attention's "
+                            "disagree about the group boundary at %u (ratio %u) -- refusing\n", il, pos, ratio);
+            ok = false;
+        }
         if (ok && emitted) {
             const uint32_t row = *n_comp_slot;
             if (row != pos / ratio) {
@@ -1226,41 +1417,40 @@ bool gpu_graph_encode_layer_attention_batch(
          * produces nothing and reads its source's pools.  The indexer QUERY
          * side belongs to every indexed layer; a REUSE layer attends with its
          * index source's top-k. */
-        if (pulsar_attn_owns_kv(attn->mode) && g_pulsar_shape.indexer_own_compressor) {
-            /* The V4 production path is HALF in.  The compressor is not the
-             * blocker any more -- the coff-2 overlap pooling, the two-group state
-             * and the ape fold all landed (s26/s27) -- so the refusal now names
-             * what is actually missing, per mode, because the two gaps are
-             * different pieces of work:
-             *
-             *   FULL (ratio 4, has an indexer): the indexer's OWN compressor and
-             *     its scoring.  V4 builds `Compressor(..., head_dim=128,
-             *     rotate=True)` inside the Indexer, so the index key is not the
-             *     kv source's latent the way V4.1's is.
-             *   FULL_UNINDEXED (ratio 128, HCA): no indexer at all, so the
-             *     compressor suffices on the production side -- but the CONSUMER
-             *     does not exist: the attention has to read its own compressed
-             *     cache unindexed, and today the branch below would ask for
-             *     indexer query weights the artifact does not carry.
-             *
-             * Refuse rather than half-run: the member branch below would read a
-             * pool no source ever wrote.  plans/96-two-profiles-one-engine.md
-             * s9.1 / s28. */
+        if (pulsar_attn_owns_kv(attn->mode) && g_pulsar_shape.indexer_own_compressor &&
+            attn->mode == PULSAR_ATTN_FULL_UNINDEXED) {
+            /* 0731's ratio-128 (HCA) layer: an own compressor and no indexer at
+             * all.  Production would suffice -- a plain compressor is a plain
+             * compressor -- but the CONSUMER does not exist: the attention has to
+             * read its own compressed cache with no top-k, and the branches below
+             * would ask for indexer query weights this artifact does not carry.
+             * Refuse rather than half-run, so the missing piece is named once.
+             * plans/96-two-profiles-one-engine.md s9.1 / s28. */
             fprintf(stderr,
-                    "pulsar: layer %u (%s, ratio %u): the V4 compressor is implemented but its "
-                    "consumer is not -- no indexer's-own-compressor/scoring (ratio 4) and no "
-                    "unindexed compressed-cache attention (ratio 128) -- refusing\n",
+                    "pulsar: layer %u (%s, ratio %u): the compressor is implemented but the "
+                    "unindexed compressed-cache attention (its whole consumer) is not -- refusing\n",
                     il, pulsar_attn_mode_name(attn->mode), attn->ratio);
             ok = false;
         } else if (pulsar_attn_owns_kv(attn->mode)) {
+            /* ONE production body for both profiles.  They differ in which
+             * weights project the rows and in whether the indexer compresses its
+             * own index key, and neither difference is visible here: the
+             * projections are named by `own`, and gpu_graph_csa2_produce branches
+             * on the profile for the second compression.  Control flow is
+             * identical, which is what makes the two artifacts share a path. */
+            const bool own = g_pulsar_shape.indexer_own_compressor;
             const bool have_comp = layer->attn_compressor_kv && layer->attn_compressor_norm &&
-                                   layer->indexer_k && layer->indexer_k_norm &&
-                                   (ratio == 1u || layer->attn_compressor_gate);
+                                   (ratio == 1u || layer->attn_compressor_gate) &&
+                                   (own ? (layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
+                                           layer->indexer_compressor_norm && layer->indexer_compressor_ape)
+                                        : (layer->indexer_k && layer->indexer_k_norm));
             if (!have_comp) {
-                fprintf(stderr, "pulsar: kv source %u is missing compressor / index-key weights -- refusing\n", il);
+                fprintf(stderr, "pulsar: kv source %u is missing its %s weights -- refusing\n", il,
+                        own ? "compressor / indexer-compressor" : "compressor / index-key");
                 ok = false;
             }
             const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+            const uint32_t index_width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
             if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->attn_compressor_kv,
                                                        PULSAR_N_EMBD, comp_width, g->batch_attn_norm, n_tokens) != 0;
             if (ok && ratio > 1u) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->attn_compressor_gate,
@@ -1269,6 +1459,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                 (uint64_t)comp_width * n_tokens, il, pos0);
             if (ok && ratio > 1u) gpu_graph_debug_dump_tensor("attn_comp_score_raw", g->batch_comp_sc,
                                                               (uint64_t)comp_width * n_tokens, il, pos0);
+            /* The indexer's own projections, at its own head dim: a separate
+             * compression of the same rows, over the same normed activation. */
+            if (ok && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_kv, model, layer->indexer_compressor_kv,
+                                                              PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
+            if (ok && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_sc, model, layer->indexer_compressor_gate,
+                                                              PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
             if (ok) ok = gpu_graph_csa2_produce(g, model, layer, il, pos0, n_tokens, mseq, comp_counts);
         } else {
             /* The source ran earlier in this same layer sweep (S < il), so its
@@ -1297,8 +1493,15 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           g->batch_qr_norm,
                                                           n_tokens);
             /* Fused rope + FP4 pack: one launch over batch_indexer_q instead of
-             * a rope_tail + pack pair (bit-exact, see the kernel note). */
-            if (ok) ok = pulsar_gpu_indexer_rope_fp4_pack_tensor(g->batch_indexer_q,
+             * a rope_tail + pack pair (bit-exact, see the kernel note).  V4's
+             * Indexer is built `rotate=True`, so the reference rotates q with the
+             * same Hadamard as its key (`q = rotate_activation(q)` before the fp4
+             * quant).  The two sides of the product must be rotated together, so
+             * the profile picks the launch and the arguments are shared. */
+            const bool rotate_q = g_pulsar_shape.indexer_own_compressor;
+            if (ok) ok = (rotate_q ? pulsar_gpu_dsv4_indexer_rope_qat_tensor
+                                   : pulsar_gpu_indexer_rope_fp4_pack_tensor)(
+                                                    g->batch_indexer_q,
                                                     g->batch_indexer_qp,
                                                     n_tokens,
                                                     PULSAR_N_INDEXER_HEAD,

@@ -1181,6 +1181,15 @@ typedef struct {
     pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;               ///< batched twin: compressed KV rows produced this chunk
     pulsar_gpu_tensor *batch_comp_sc;               ///< batched twin: compressed score rows produced this chunk
+    /** V4's indexer-own compressor runs a SECOND compression over the same rows
+     * at the indexer's head dim (`indexer_compressor_kv/gate`), so it needs its
+     * own pair of projection rows.  V4.1 projects its index key from the kv
+     * source's latent and never fills these; they are still allocated, like
+     * batch_comp_kv, because a V4.1 graph must not be shaped differently from a
+     * V4 one.  Width authority: pulsar_comp_row_width(ratio,
+     * PULSAR_N_INDEXER_HEAD_DIM). */
+    pulsar_gpu_tensor *batch_index_comp_kv;         ///< batched twin: V4 indexer-compressor KV rows
+    pulsar_gpu_tensor *batch_index_comp_sc;         ///< batched twin: V4 indexer-compressor score rows
     /** Scratch for the ratio-4 compressor state rebuild's tail re-projection
      * (<= 8 rows x comp width, both halves).  Its own buffer because the
      * rebuild used to write into batch_comp_kv/_sc rows 0..n_tail-1 while the

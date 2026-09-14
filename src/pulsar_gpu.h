@@ -1205,9 +1205,10 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
         pulsar_gpu_tensor       *state_score,
         pulsar_gpu_tensor       *sc,
         const pulsar_gpu_tensor *kv,
-        const pulsar_gpu_tensor *ape,
         const void              *model_map,
         uint64_t                 model_size,
+        uint64_t                 ape_offset,
+        uint32_t                 ape_type,
         uint64_t                 norm_offset,
         uint32_t                 norm_type,
         uint32_t                 out_row0,
@@ -1224,6 +1225,48 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
         float                    beta_fast,
         float                    beta_slow,
         float                    rms_eps);
+
+/** The decode-phase twin of the composite above: one token's row, through the
+ * indexer's OWN compressor, emitting the group's index-K row when that token
+ * closes a group.  `emitted` is set exactly when a row was packed (0 on success
+ * without one, so the caller advances its frontier on `emitted`, not on the
+ * return value).
+ *
+ * `sc` is the token's score row and `ape` the compressor's absolute-position
+ * embedding ([ratio][coff*head_dim]); the ape fold happens HERE, before the
+ * store, because that is where the reference's decode branch does it
+ * (`score += self.ape[start_pos % ratio]`).  The pooled row is roped at the
+ * group's FIRST position and then rotated and fp4-packed, matching
+ * pulsar_gpu_indexer_compressor_prefill_tensor row for row.
+ *
+ * @return nonzero on success, 0 on bad operands or a failed launch. */
+int pulsar_gpu_indexer_compressor_update_tensor(
+        pulsar_gpu_tensor       *packed,
+        pulsar_gpu_tensor       *latent,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        pulsar_gpu_tensor       *sc,
+        const pulsar_gpu_tensor *kv,
+        const void              *model_map,
+        uint64_t                 model_size,
+        uint64_t                 ape_offset,
+        uint32_t                 ape_type,
+        uint64_t                 norm_offset,
+        uint32_t                 norm_type,
+        uint32_t                 out_row,
+        uint32_t                 head_dim,
+        uint32_t                 ratio,
+        uint32_t                 pos,
+        uint32_t                 n_rot,
+        uint32_t                 n_ctx_orig,
+        float                    freq_base,
+        float                    freq_scale,
+        float                    ext_factor,
+        float                    attn_factor,
+        float                    beta_fast,
+        float                    beta_slow,
+        float                    rms_eps,
+        int                     *emitted);
 
 /** As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
@@ -1347,7 +1390,10 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(
  * (compressor_ape is false), so this is called only where the weights exist. */
 int pulsar_gpu_csa2_comp_ape_add_tensor(
         pulsar_gpu_tensor       *sc,           /* [n_tokens][coff * head_dim] f32, in/out */
-        const pulsar_gpu_tensor *ape,          /* [ratio][coff * head_dim] f32 */
+        const void              *model_map,    /* the model's mapped weights */
+        uint64_t                 model_size,
+        uint64_t                 ape_offset,   /* the ape table inside that map */
+        uint32_t                 ape_type,     /* ds4 type: 0 = F32, 30 = BF16 */
         uint32_t                 width,
         uint32_t                 ratio,
         uint32_t                 pos0,

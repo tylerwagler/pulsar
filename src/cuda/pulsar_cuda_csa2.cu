@@ -165,14 +165,15 @@ __global__ static void csa2_compressor_pool_norm_kernel(
  * of a parameter they would each have to apply in the same way.
  *
  * Width is coff * head_dim: the ape is as wide as the projection it biases. */
+template <bool APE_BF16>
 __global__ static void csa2_comp_ape_add_kernel(
-        float *sc, const float *ape, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t n_tokens) {
+        float *sc, const void *ape, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t n_tokens) {
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t n = (uint64_t)n_tokens * width;
     if (gid >= n) return;
     const uint32_t t = (uint32_t)(gid / width);
     const uint32_t d = (uint32_t)(gid - (uint64_t)t * width);
-    sc[gid] += ape[(uint64_t)((pos0 + t) % ratio) * width + d];
+    sc[gid] += pulsar_w_load_f32_or_bf16<APE_BF16>(ape, (uint64_t)((pos0 + t) % ratio) * width + d);
 }
 
 /* Store `n_tokens` positions' kv / score rows into the state lane starting at
@@ -264,22 +265,42 @@ static int csa2_lane_clear_current(float *state_kv, float *state_sc, uint32_t he
 }
 
 int pulsar_gpu_csa2_comp_ape_add_tensor(
-        pulsar_gpu_tensor       *sc,
-        const pulsar_gpu_tensor *ape,
-        uint32_t                 width,
-        uint32_t                 ratio,
-        uint32_t                 pos0,
-        uint32_t                 n_tokens) {
-    if (!sc || !ape || width == 0 || ratio == 0 || n_tokens == 0 ||
-        sc->bytes < (uint64_t)n_tokens * width * sizeof(float) ||
-        ape->bytes < (uint64_t)ratio * width * sizeof(float)) {
-        fprintf(stderr, "pulsar: csa2 comp ape add: bad operands (width %u, ratio %u, n_tokens %u) -- refusing\n",
-                width, ratio, n_tokens);
+        pulsar_gpu_tensor *sc,
+        const void        *model_map,
+        uint64_t           model_size,
+        uint64_t           ape_offset,
+        uint32_t           ape_type,
+        uint32_t           width,
+        uint32_t           ratio,
+        uint32_t           pos0,
+        uint32_t           n_tokens) {
+    /* The ape is a model-mapped table, not a device tensor: every other mapped
+     * weight on this path (the norm, the matmul operands) reaches the kernels as
+     * (map, size, offset, type) through cuda_model_range_ptr, and an ape that
+     * arrived as a pulsar_gpu_tensor* would have had to be a second copy of the
+     * model.  ds4 types: 0 = F32, 30 = BF16 -- the same pair the compressor's
+     * norm accepts, and the reference stores the ape in fp32. */
+    if (!sc || !model_map || width == 0 || ratio == 0 || n_tokens == 0 ||
+        (ape_type != 0u && ape_type != 30u) ||
+        sc->bytes < (uint64_t)n_tokens * width * sizeof(float)) {
+        fprintf(stderr, "pulsar: csa2 comp ape add: bad operands (width %u, ratio %u, n_tokens %u, type %u) -- refusing\n",
+                width, ratio, n_tokens, ape_type);
         return 0;
     }
+    const uint64_t ape_bytes = (uint64_t)ratio * width * pulsar_w_elt_bytes(ape_type == 30u);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+        fprintf(stderr, "pulsar: csa2 comp ape add: ape range is outside the model map -- refusing\n");
+        return 0;
+    }
+    const void *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
+    if (!ape) return 0;
     const uint64_t n = (uint64_t)n_tokens * width;
-    csa2_comp_ape_add_kernel<<<(n + 255) / 256, 256>>>((float *)sc->ptr, (const float *)ape->ptr,
-                                                       width, ratio, pos0, n_tokens);
+    if (ape_type == 30u)
+        csa2_comp_ape_add_kernel<true><<<(n + 255) / 256, 256>>>((float *)sc->ptr, ape,
+                                                                width, ratio, pos0, n_tokens);
+    else
+        csa2_comp_ape_add_kernel<false><<<(n + 255) / 256, 256>>>((float *)sc->ptr, ape,
+                                                                 width, ratio, pos0, n_tokens);
     return cuda_ok(cudaGetLastError(), "csa2 comp ape add launch");
 }
 

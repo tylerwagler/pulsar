@@ -245,20 +245,23 @@ int main(void) {
         for (auto &v : sc)  v = frand(&s) * 4.0f;
         for (auto &v : ape) v = frand(&s) * 0.5f;
 
-        /* a fake model map holding just the compressor's RMSNorm weight.  It must
-         * be a HOST buffer: the real cuda_model_range_ptr copies OUT of the
-         * mmap'd model into a device staging copy, so handing it a device
-         * pointer makes it memcpy from device memory.  (The standalone csa2
-         * probe stubs that function to base+offset and never notices.) */
-        std::vector<float> nw(head_dim);
-        for (auto &v : nw) v = 0.5f + frand(&s) * 0.5f;
-        const uint64_t map_bytes = (uint64_t)head_dim * sizeof(float);
-        const void *model_map = nw.data();
+        /* A fake model map holding the compressor's ape followed by its RMSNorm
+         * weight -- the two model-mapped tables the composite reads.  It must be
+         * a HOST buffer: the real cuda_model_range_ptr copies OUT of the mmap'd
+         * model into a device staging copy, so handing it a device pointer makes
+         * it memcpy from device memory.  (The standalone csa2 probe stubs that
+         * function to base+offset and never notices.) */
+        std::vector<float> wmap((size_t)ratio * width + head_dim);
+        for (uint32_t i = 0; i < (uint32_t)((size_t)ratio * width); i++) wmap[i] = ape[i];
+        for (uint32_t i = 0; i < head_dim; i++) wmap[(size_t)ratio * width + i] = 0.5f + frand(&s) * 0.5f;
+        const uint64_t ape_offset = 0ull;
+        const uint64_t norm_offset = (uint64_t)ratio * width * sizeof(float);
+        const uint64_t map_bytes = (uint64_t)wmap.size() * sizeof(float);
+        const void *model_map = wmap.data();
 
         pulsar_gpu_tensor *kvA = pulsar_gpu_tensor_alloc((size_t)n_tok * width * sizeof(float));
         pulsar_gpu_tensor *scA = pulsar_gpu_tensor_alloc((size_t)n_tok * width * sizeof(float));
         pulsar_gpu_tensor *scB = pulsar_gpu_tensor_alloc((size_t)n_tok * width * sizeof(float));
-        pulsar_gpu_tensor *apeD = pulsar_gpu_tensor_alloc((size_t)ratio * width * sizeof(float));
         pulsar_gpu_tensor *latA = pulsar_gpu_tensor_alloc((size_t)n_groups * head_dim * sizeof(float));
         pulsar_gpu_tensor *latB = pulsar_gpu_tensor_alloc((size_t)n_groups * head_dim * sizeof(float));
         const uint64_t lane_bytes = (uint64_t)coff * ratio * width * sizeof(float);
@@ -266,13 +269,12 @@ int main(void) {
         pulsar_gpu_tensor *sB_kv = pulsar_gpu_tensor_alloc(lane_bytes), *sB_sc = pulsar_gpu_tensor_alloc(lane_bytes);
         pulsar_gpu_tensor *pkA = pulsar_gpu_tensor_alloc((size_t)n_groups * HAD_ROWBYTES);
         pulsar_gpu_tensor *pkB = pulsar_gpu_tensor_alloc((size_t)n_groups * HAD_ROWBYTES);
-        CHECK(kvA && scA && scB && apeD && latA && latB && sA_kv && sA_sc && sB_kv && sB_sc && pkA && pkB,
+        CHECK(kvA && scA && scB && latA && latB && sA_kv && sA_sc && sB_kv && sB_sc && pkA && pkB,
               "compressor alloc failed");
         if (g_fail) return 1;
         CHECK(pulsar_gpu_tensor_write(kvA, 0, kv.data(), kv.size() * sizeof(float)), "kv write");
         CHECK(pulsar_gpu_tensor_write(scA, 0, sc.data(), sc.size() * sizeof(float)), "sc write A");
         CHECK(pulsar_gpu_tensor_write(scB, 0, sc.data(), sc.size() * sizeof(float)), "sc write B");
-        CHECK(pulsar_gpu_tensor_write(apeD, 0, ape.data(), ape.size() * sizeof(float)), "ape write");
         
         /* pos0 != 0 means the lane is LIVE: the reference reads the incoming
          * carry for group 0 rather than padding, and the csa2 prefill
@@ -293,13 +295,15 @@ int main(void) {
         const float eps = 1e-6f;
 
         /* route A: the composite */
-        CHECK(pulsar_gpu_indexer_compressor_prefill_tensor(pkA, latA, sA_kv, sA_sc, scA, kvA, apeD,
-                                                           model_map, map_bytes, 0ull, 0u, 0u,
+        CHECK(pulsar_gpu_indexer_compressor_prefill_tensor(pkA, latA, sA_kv, sA_sc, scA, kvA,
+                                                           model_map, map_bytes, ape_offset, 0u,
+                                                           norm_offset, 0u, 0u,
                                                            head_dim, ratio, pos0, n_tok, n_rot, n_ctx,
                                                            fb, fs, ef, af, bf, bs, eps),
               "indexer compressor composite launch");
         /* route B: the parts, by hand, with the arguments written out here */
-        CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, apeD, width, ratio, pos0, n_tok), "ape add B");
+        CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
+                                                  width, ratio, pos0, n_tok), "ape add B");
         CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
                                                         model_map, map_bytes, 0ull, 0u,
                                                         head_dim, ratio, pos0, n_tok, eps), "pool B");
@@ -330,6 +334,59 @@ int main(void) {
         printf("indexer compressor: %u tokens -> %u index-K rows (%u B each), composite == its parts byte-for-byte; "
                "state lane %llu B identical\n",
                n_tok, n_groups, HAD_ROWBYTES, (unsigned long long)lane_bytes);
+
+        /* A batch that closes NO group (n_tokens < ratio) emits no row, but the
+         * lane still has to receive the trailing partial rows: the next chunk's
+         * first group pools them in, and the reference stashes them
+         * (`kv_state[...offset:offset+remainder]`, `+ self.ape[:remainder]`).
+         * The composite used to return before the pool on this shape, which left
+         * the lane at its zero/-inf prime and made the group spanning the two
+         * chunks pool the wrong tokens -- silently, since the emitted rows still
+         * looked like numbers.  There is no packed row to compare here, so the
+         * LANE is the byte-exact witness. */
+        {
+            const uint32_t r_tok = 3u;   /* < ratio: no complete group */
+            std::vector<float> z(lane_bytes / 4, 0.0f), ninf(lane_bytes / 4, -INFINITY);
+            CHECK(pulsar_gpu_tensor_write(sA_kv, 0, z.data(), lane_bytes), "reset sA_kv");
+            CHECK(pulsar_gpu_tensor_write(sB_kv, 0, z.data(), lane_bytes), "reset sB_kv");
+            CHECK(pulsar_gpu_tensor_write(sA_sc, 0, ninf.data(), lane_bytes), "reset sA_sc");
+            CHECK(pulsar_gpu_tensor_write(sB_sc, 0, ninf.data(), lane_bytes), "reset sB_sc");
+            CHECK(pulsar_gpu_tensor_write(scA, 0, sc.data(), (size_t)r_tok * width * sizeof(float)), "sc write A");
+            CHECK(pulsar_gpu_tensor_write(scB, 0, sc.data(), (size_t)r_tok * width * sizeof(float)), "sc write B");
+
+            CHECK(pulsar_gpu_indexer_compressor_prefill_tensor(pkA, latA, sA_kv, sA_sc, scA, kvA,
+                                                               model_map, map_bytes, ape_offset, 0u,
+                                                               norm_offset, 0u, 0u,
+                                                               head_dim, ratio, pos0, r_tok, n_rot, n_ctx,
+                                                               fb, fs, ef, af, bf, bs, eps),
+                  "remainder-only composite launch");
+            CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
+                                                      width, ratio, pos0, r_tok), "remainder-only ape add B");
+            CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
+                                                            model_map, map_bytes, 0ull, 0u,
+                                                            head_dim, ratio, pos0, r_tok, eps),
+                  "remainder-only pool B");
+            pulsar_gpu_synchronize();
+
+            std::vector<float> ra_kv(lane_bytes / 4), rb_kv(lane_bytes / 4), ra_sc(lane_bytes / 4), rb_sc(lane_bytes / 4);
+            CHECK(pulsar_gpu_tensor_read(sA_kv, 0, ra_kv.data(), lane_bytes), "read sA_kv");
+            CHECK(pulsar_gpu_tensor_read(sB_kv, 0, rb_kv.data(), lane_bytes), "read sB_kv");
+            CHECK(pulsar_gpu_tensor_read(sA_sc, 0, ra_sc.data(), lane_bytes), "read sA_sc");
+            CHECK(pulsar_gpu_tensor_read(sB_sc, 0, rb_sc.data(), lane_bytes), "read sB_sc");
+            uint32_t rd = 0;
+            for (size_t i = 0; i < ra_kv.size(); i++) {
+                rd += (memcmp(&ra_kv[i], &rb_kv[i], 4) != 0);
+                rd += (memcmp(&ra_sc[i], &rb_sc[i], 4) != 0);
+            }
+            CHECK(rd == 0, "remainder-only batch: the lane differs from its parts: %u elements", rd);
+            /* and the lane is NOT the untouched prime, or the comparison above
+             * would be two empty lanes agreeing with each other */
+            uint32_t nz = 0;
+            for (size_t i = 0; i < ra_kv.size(); i++) nz += (ra_kv[i] != 0.0f);
+            CHECK(nz != 0, "remainder-only batch wrote nothing into the lane");
+            printf("indexer compressor: %u tokens (< ratio %u) -> lane %u/%zu kv elements non-empty, "
+                   "composite == its parts\n", r_tok, ratio, nz, ra_kv.size());
+        }
 
         /* the lane is the size the struct note claims: coff*ratio x coff*head_dim */
         CHECK(lane_bytes == (uint64_t)coff * ratio * coff * head_dim * sizeof(float),

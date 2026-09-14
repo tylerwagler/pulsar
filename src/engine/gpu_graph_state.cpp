@@ -45,6 +45,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_indexer_weights);
     pulsar_gpu_tensor_free(g->batch_indexer_q);
     pulsar_gpu_tensor_free(g->batch_indexer_qp);
+    pulsar_gpu_tensor_free(g->batch_index_comp_sc);
+    pulsar_gpu_tensor_free(g->batch_index_comp_kv);
     pulsar_gpu_tensor_free(g->batch_comp_sc);
     pulsar_gpu_tensor_free(g->batch_comp_kv);
     pulsar_gpu_tensor_free(g->batch_kv);

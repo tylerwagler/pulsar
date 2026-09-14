@@ -259,7 +259,11 @@ int main(void) {
         dev_write(sc_d, sc.data(), sc.size() * 4);
         dev_write(ape_d, ape.data(), ape.size() * 4);
         /* the host folds the ape into the score rows; the oracle does the same */
-        CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(sc_d, ape_d, W, ratio, pos0, n_tok), "ratio-4 ape add launch");
+        /* The ape reaches the kernel as a mapped table, like every other weight on
+         * this path (see the entry point's note).  This probe stubs
+         * cuda_model_range_ptr to base+offset, so the device tensor is its map. */
+        CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(sc_d, ape_d->ptr, ape_d->bytes, 0ull, 0u,
+                                                  W, ratio, pos0, n_tok), "ratio-4 ape add launch");
         for (uint32_t t = 0; t < n_tok; t++)
             for (uint32_t d = 0; d < W; d++) sc[t * W + d] += ape[((pos0 + t) % ratio) * W + d];
 

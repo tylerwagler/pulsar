@@ -819,6 +819,11 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
     if (!x || !packed || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
         packed->bytes < ((uint64_t)out_row0 + n_rows) * rowbytes) {
+        /* Loud, like every other producer here: the V4 index-K row IS this
+         * launch, so a silent 0 would leave the index pool holding whatever the
+         * allocator handed back and the scorer reading it as a number. */
+        fprintf(stderr, "pulsar: indexer hadamard fp4 pack: bad operands (rows %u, head_dim %u, row0 %u, %llu B) -- refusing\n",
+                n_rows, head_dim, out_row0, (unsigned long long)packed->bytes);
         return 0;
     }
     indexer_hadamard_fp4_pack_kernel<<<n_rows, 128>>>(
@@ -878,9 +883,10 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
         pulsar_gpu_tensor       *state_score,
         pulsar_gpu_tensor       *sc,           /* [n_tokens][coff*index_head_dim] f32, ape folded IN PLACE */
         const pulsar_gpu_tensor *kv,           /* [n_tokens][coff*index_head_dim] f32 */
-        const pulsar_gpu_tensor *ape,          /* [ratio][coff*index_head_dim] f32 */
         const void             *model_map,
         uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
         uint64_t                norm_offset,
         uint32_t                norm_type,
         uint32_t                out_row0,
@@ -902,7 +908,7 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
     const uint32_t n_groups = ratio ? n_tokens / ratio : 0u;
     const uint64_t lane_bytes = (uint64_t)coff * ratio * width * sizeof(float);
     if (ratio == 0u || width == 0u ||
-        !packed || !latent || !state_kv || !state_score || !sc || !kv || !ape ||
+        !packed || !latent || !state_kv || !state_score || !sc || !kv ||
         state_kv->bytes < lane_bytes || state_score->bytes < lane_bytes ||
         latent->bytes < (uint64_t)n_groups * head_dim * sizeof(float) ||
         packed->bytes < ((uint64_t)out_row0 + n_groups) * PULSAR_MXKV_FP4_ROWBYTES(head_dim)) {
@@ -910,11 +916,20 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
                 ratio, n_tokens, head_dim);
         return 0;
     }
-    if (n_groups == 0u) return 1;   /* a remainder-only batch produces no row */
-    if (!pulsar_gpu_csa2_comp_ape_add_tensor(sc, ape, width, ratio, pos0, n_tokens)) return 0;
+    /* The ape fold and the pool run even when this batch closes NO group: the
+     * reference stashes the trailing partial rows into the lane
+     * (`self.kv_state[...offset:offset+remainder] = ...; score + self.ape
+     * [:remainder]`) and the next chunk's first group pools them in.  Only the
+     * EMIT is conditional on a complete group existing -- returning here before
+     * the pool, as this did, left the lane holding zero/‑inf for every chunk
+     * whose length is not a multiple of `ratio`, so the group that spanned the
+     * two chunks pooled the wrong rows. */
+    if (!pulsar_gpu_csa2_comp_ape_add_tensor(sc, model_map, model_size, ape_offset, ape_type,
+                                             width, ratio, pos0, n_tokens)) return 0;
     if (!pulsar_gpu_csa2_compressor_prefill_tensor(latent, kv, sc, state_kv, state_score,
                                                    model_map, model_size, norm_offset, norm_type,
                                                    head_dim, ratio, pos0, n_tokens, rms_eps)) return 0;
+    if (n_groups == 0u) return 1;   /* a remainder-only batch produces no row */
     /* The pooled row for group g was built from positions [pos0+g*ratio,
      * pos0+(g+1)*ratio), and the reference ropes it at that group's LAST
      * position (`freqs_cis[start_pos + 1 - ratio]` in the decode branch,
@@ -925,6 +940,76 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
                                              freq_base, freq_scale, ext_factor, attn_factor,
                                              beta_fast, beta_slow)) return 0;
     return pulsar_gpu_dsv4_indexer_qat_pack_tensor(latent, packed, out_row0, n_groups, head_dim, false);
+}
+
+
+int pulsar_gpu_indexer_compressor_update_tensor(
+        pulsar_gpu_tensor       *packed,
+        pulsar_gpu_tensor       *latent,
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        pulsar_gpu_tensor       *sc,
+        const pulsar_gpu_tensor *kv,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                out_row,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        int                    *emitted) {
+    const uint32_t coff = pulsar_compress_coff(ratio);
+    const uint32_t width = coff * head_dim;
+    if (emitted) *emitted = 0;
+    if (ratio == 0u || width == 0u || !packed || !latent || !kv || !emitted ||
+        head_dim != 128u ||
+        latent->bytes < (uint64_t)head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)width * sizeof(float) ||
+        (ratio > 1u && (!sc || sc->bytes < (uint64_t)width * sizeof(float)))) {
+        fprintf(stderr, "pulsar: indexer compressor update: bad operands (ratio %u, head_dim %u, pos %u) -- refusing\n",
+                ratio, head_dim, pos);
+        return 0;
+    }
+    /* The ape is folded into THIS row's score BEFORE the store -- the reference's
+     * decode branch does `score += self.ape[start_pos % ratio]` on the row it is
+     * about to write into the state.  Folding after the pool would weight the
+     * group with a later row's embedding, and storing before it would leave the
+     * carry without one.  The prefill composite does exactly this for the whole
+     * batch, which is what makes the two paths write the same lane. */
+    if (ratio > 1u && !pulsar_gpu_csa2_comp_ape_add_tensor(sc, model_map, model_size, ape_offset, ape_type,
+                                                          width, ratio, pos, 1u)) return 0;
+    if (!pulsar_gpu_csa2_compressor_update_tensor(latent, kv, sc, state_kv, state_score,
+                                                  model_map, model_size, norm_offset, norm_type,
+                                                  head_dim, ratio, pos, rms_eps, emitted)) return 0;
+    if (!*emitted) return 1;
+    /* The destination row is checked only now: on a token that does not close a
+     * group there is no row to write, and the caller's frontier is not a row
+     * index until there is one. */
+    if (packed->bytes < ((uint64_t)out_row + 1u) * PULSAR_MXKV_FP4_ROWBYTES(128u)) {
+        fprintf(stderr, "pulsar: indexer compressor update: row %u is past the index pool (%llu B) -- refusing\n",
+                out_row, (unsigned long long)packed->bytes);
+        return 0;
+    }
+    /* The same tail the prefill composite runs, for the one row this token
+     * closed: the group it pooled starts at pos+1-ratio, and the reference ropes
+     * the pooled row there (`freqs_cis[start_pos + 1 - ratio]`). */
+    if (!pulsar_gpu_rope_tail_strided_tensor(latent, 1u, head_dim, n_rot,
+                                             pos + 1u - ratio, ratio, n_ctx_orig,
+                                             freq_base, freq_scale, ext_factor, attn_factor,
+                                             beta_fast, beta_slow)) return 0;
+    return pulsar_gpu_dsv4_indexer_qat_pack_tensor(latent, packed, out_row, 1u, head_dim, false);
 }
 
 
