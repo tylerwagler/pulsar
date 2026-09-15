@@ -268,7 +268,15 @@ static bool gpu_graph_index_comp_prefill(
                                       : g->layer_index_state_kv[il];
     pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, bank)
                                       : g->layer_index_state_score[il];
-    const bool ok = kv && sc && latent && comp && st_kv && st_sc &&
+    const bool lanes = kv && sc && latent && comp && st_kv && st_sc;
+    if (!lanes) {
+        fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
+                        "(batch %s/%s, pool %s, state %s/%s) -- refusing\n",
+                il, banked ? "banked" : "classic", bank,
+                kv ? "ok" : "MISSING", sc ? "ok" : "MISSING",
+                comp ? "ok" : "MISSING", st_kv ? "ok" : "MISSING", st_sc ? "ok" : "MISSING");
+    }
+    const bool ok = lanes &&
               pulsar_gpu_indexer_compressor_prefill_tensor(
                       comp, latent, st_kv, st_sc, sc, kv,
                       model->map, model->size,
@@ -328,7 +336,14 @@ static bool gpu_graph_index_comp_update(
                                       : g->layer_index_state_kv[il];
     pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, bank)
                                       : g->layer_index_state_score[il];
-    const bool ok = kv && sc && latent && comp && st_kv && st_sc &&
+    const bool lanes = kv && sc && latent && comp && st_kv && st_sc;
+    if (!lanes) {
+        fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
+                        "(row %u, pool %s, state %s/%s) -- refusing\n",
+                il, banked ? "banked" : "classic", bank, row,
+                comp ? "ok" : "MISSING", st_kv ? "ok" : "MISSING", st_sc ? "ok" : "MISSING");
+    }
+    const bool ok = lanes &&
               pulsar_gpu_indexer_compressor_update_tensor(
                       comp, latent, st_kv, st_sc, sc, kv,
                       model->map, model->size,

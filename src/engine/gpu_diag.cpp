@@ -643,10 +643,13 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
      * allocated, at which point a layer-0 sample reports the bank LIVE while it
      * is really half-built — and bank_fork_copy would then read NULL/garbage
      * slabs from it (silent cross-conversation KV corruption).  A bank is only
-     * "live" when every compressed layer has physical. */
+     * "live" when every compressed layer has the physical it is entitled to --
+     * an index pool only where the layer runs an indexer, so an unindexed
+     * source's absent index slab is not eviction. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        if (g->banks.comp[il][bank] == NULL || g->banks.index[il][bank] == NULL) return true;
+        if (g->banks.comp[il][bank] == NULL) return true;
+        if (gpu_graph_layer_has_index_pool(il) && g->banks.index[il][bank] == NULL) return true;
     }
     return false;
 }
@@ -1111,15 +1114,24 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uin
 }
 
 pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
-    /* No lane at all on a profile whose indexer keeps none: hand back NULL so a
-     * caller can tell "this model has no such lane" from "the bank is wrong". */
-    if (!g || il >= PULSAR_N_LAYER || g->banks.istate_bank_bytes[il] == 0u) return NULL;
+    /* No lane at all on a profile whose indexer keeps none: bank_lane_view hands
+     * back NULL, so a caller can tell "this model has no such lane" from "the
+     * bank is wrong".
+     *
+     * The SLAB STRIDE is not the authority for that: it is 0 whenever the pool is
+     * disabled, while the classic lane is exactly the lane then.  Gating on it
+     * returned NULL for a mixed decode step's index lane on a pool-less graph,
+     * and the silent conjunction in the index compressor's caller turned that
+     * into "attention batch encode failed" at layer 2.  Ask the lane, not the
+     * stride: iskv[il] is NULL where there is no lane, and the classic tensor is
+     * NULL too. */
+    if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
                           g->layer_index_state_kv[il], il, bank);
 }
 
 pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
-    if (!g || il >= PULSAR_N_LAYER || g->banks.istate_bank_bytes[il] == 0u) return NULL;
+    if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
                           g->layer_index_state_score[il], il, bank);
 }
