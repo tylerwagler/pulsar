@@ -1006,13 +1006,61 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = rows_hc && rows_pre && output_embd && output_norm && logits;
 
-    /* layer.hc_pre(h, pre_mix): collapse with the carried pre -- no head-side
-     * mix GEMM, no sigmoid; V4.1 has no output_hc_* tensors */
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
-                                                  rows_hc,
-                                                  rows_pre,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
+    /* The collapse is SHARED; only the coefficient source differs.  A profile that
+     * binds output_hc_* (0731) computes the head's own mix here -- exactly as the
+     * single-row head does and exactly as dev's batch head does; one that binds
+     * none (V4.1) collapses with the pre its last FFN handed on,
+     * layer.hc_pre(h, pre_mix), with no head-side mix GEMM.  The bind is the fact:
+     * a 0731 artifact missing the group dies at load.  NOTE the batch path needs
+     * BATCH-SIZED scratch: dev views g->batch_hc_mix / g->batch_hc_split, not the
+     * single-row g->output_pre / g->output_weights (using those was s100's bug). */
+    if (weights->output_hc_fn) {
+        if (!weights->output_hc_scale || !weights->output_hc_base) {
+            fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
+            ok = false;
+        }
+        pulsar_gpu_tensor *hc_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *hc_w = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        if (!hc_pre || !hc_w) ok = false;
+        void *out_flat_b = NULL;
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                            (uint64_t)hc_dim, &out_flat_b)) {
+            fprintf(stderr, "pulsar: verify head flat_hc: no bf16 slot -- refusing (L159)\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, out_flat_b,
+                                                          rows_hc, (uint32_t)hc_dim,
+                                                          n_tokens, PULSAR_RMS_EPS, 0) != 0;
+        if (ok && out_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                       (uint64_t)hc_dim);
+        if (ok) ok = gpu_graph_matmul_plain_tensor(hc_pre,
+                                                   (const pulsar_model *)model,
+                                                   weights->output_hc_fn,
+                                                   hc_dim,
+                                                   PULSAR_N_HC,
+                                                   g->batch_flat_hc,
+                                                   n_tokens) != 0;
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(hc_w,
+                                                        hc_pre,
+                                                        model->map,
+                                                        model->size,
+                                                        weights->output_hc_scale->abs_offset,
+                                                        weights->output_hc_base->abs_offset,
+                                                        PULSAR_N_HC,
+                                                        PULSAR_HC_EPS) != 0;
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, rows_hc, hc_w,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+        pulsar_gpu_tensor_free(hc_w);
+        pulsar_gpu_tensor_free(hc_pre);
+    } else if (ok) {
+        ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
+                                              rows_hc,
+                                              rows_pre,
+                                              PULSAR_N_EMBD,
+                                              PULSAR_N_HC) != 0;
+    }
     void *on_b = NULL;
     if (ok && weights->output->type == PULSAR_TENSOR_BF16 &&
         !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &on_b)) {
