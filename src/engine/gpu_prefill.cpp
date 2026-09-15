@@ -240,6 +240,8 @@ static bool gpu_graph_index_comp_prefill(
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
         uint32_t                    il,
+        bool                        banked,
+        uint32_t                    bank,
         uint32_t                    n_tokens,
         uint32_t                    out_row0,
         uint32_t                    pos0,
@@ -256,11 +258,19 @@ static bool gpu_graph_index_comp_prefill(
                                                    (uint64_t)n_tokens * width * sizeof(float));
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
                                                        (uint64_t)n_groups * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-    const bool ok = kv && sc && latent &&
+    /* The index pool and the indexer's state lane are per-bank under a multiseq
+     * step and the installed views otherwise -- the same split the attention
+     * lane uses, and the reason this helper takes `bank` at all: a step that
+     * mixes banks writes each row to ITS bank's pool. */
+    pulsar_gpu_tensor *comp = banked ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                     : g->layer_index_comp_cache[il];
+    pulsar_gpu_tensor *st_kv = banked ? gpu_graph_bank_index_state_kv_view(g, il, bank)
+                                      : g->layer_index_state_kv[il];
+    pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, bank)
+                                      : g->layer_index_state_score[il];
+    const bool ok = kv && sc && latent && comp && st_kv && st_sc &&
               pulsar_gpu_indexer_compressor_prefill_tensor(
-                      g->layer_index_comp_cache[il], latent,
-                      g->layer_index_state_kv[il], g->layer_index_state_score[il],
-                      sc, kv,
+                      comp, latent, st_kv, st_sc, sc, kv,
                       model->map, model->size,
                       layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
                       layer->indexer_compressor_norm->abs_offset,
@@ -272,6 +282,11 @@ static bool gpu_graph_index_comp_prefill(
                       PULSAR_RMS_EPS) != 0;
     if (ok) gpu_graph_debug_dump_tensor("indexer_KVcompress", latent,
                                         (uint64_t)n_groups * PULSAR_N_INDEXER_HEAD_DIM, il, pos0);
+    if (banked) {
+        pulsar_gpu_tensor_free(st_sc);
+        pulsar_gpu_tensor_free(st_kv);
+        pulsar_gpu_tensor_free(comp);
+    }
     pulsar_gpu_tensor_free(latent);
     pulsar_gpu_tensor_free(sc);
     pulsar_gpu_tensor_free(kv);
@@ -288,6 +303,8 @@ static bool gpu_graph_index_comp_update(
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
         uint32_t                    il,
+        bool                        banked,
+        uint32_t                    bank,      /* which BANK this row belongs to */
         uint32_t                    row,       /* which BATCH ROW to read */
         uint32_t                    pos,       /* that row's absolute POSITION */
         uint32_t                    out_row,
@@ -302,11 +319,18 @@ static bool gpu_graph_index_comp_update(
     pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_index_comp_sc, row, width);
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
                                                        (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-    const bool ok = kv && sc && latent &&
+    /* Per-row twin of the prefill arm above: BOTH banks the row can belong to
+     * and the row's own batch slot are per-bank, and the caller's `bank` may
+     * differ from the installed one on every token of a mixed step. */
+    pulsar_gpu_tensor *comp = banked ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                     : g->layer_index_comp_cache[il];
+    pulsar_gpu_tensor *st_kv = banked ? gpu_graph_bank_index_state_kv_view(g, il, bank)
+                                      : g->layer_index_state_kv[il];
+    pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, bank)
+                                      : g->layer_index_state_score[il];
+    const bool ok = kv && sc && latent && comp && st_kv && st_sc &&
               pulsar_gpu_indexer_compressor_update_tensor(
-                      g->layer_index_comp_cache[il], latent,
-                      g->layer_index_state_kv[il], g->layer_index_state_score[il],
-                      sc, kv,
+                      comp, latent, st_kv, st_sc, sc, kv,
                       model->map, model->size,
                       layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
                       layer->indexer_compressor_norm->abs_offset,
@@ -316,6 +340,11 @@ static bool gpu_graph_index_comp_update(
                       freq_base, freq_scale, ext_factor, attn_factor,
                       PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                       PULSAR_RMS_EPS, emitted) != 0;
+    if (banked) {
+        pulsar_gpu_tensor_free(st_sc);
+        pulsar_gpu_tensor_free(st_kv);
+        pulsar_gpu_tensor_free(comp);
+    }
     pulsar_gpu_tensor_free(latent);
     pulsar_gpu_tensor_free(sc);
     pulsar_gpu_tensor_free(kv);
@@ -385,22 +414,11 @@ static bool gpu_graph_csa2_produce(
     const float ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    if (own_index && g->banks.n_banks != 0) {
-        /* The indexer's lane is single-lane: with no banks the classic graph's
-         * lane IS it, but the bank slab carries the attention state lanes and
-         * no index twin, so a V4 banked graph is refused at allocation
-         * (gpu_diag.c) and must never reach this producer.  Writing the one
-         * lane from every bank would be a wrong answer rather than a crash,
-         * which is why the check is here as well as there.
-         *
-         * The condition is BANKS, not `mseq`: the multiseq step driver runs
-         * with no banks at all (Tier-2 is opt-in via PULSAR_MSEQ_BANKS), and
-         * refusing on `mseq` refused every plain single-session decode after
-         * the first spec round -- measured, with the model generating text
-         * until it hit this. */
-        fprintf(stderr, "pulsar: index source %u: banked mode has no indexer-compressor state lane -- refusing\n", il);
-        return false;
-    }
+    /* A banked graph has the indexer's lane too (the slab carries iskv/issc,
+     * and gpu_graph_bank_index_state_*_view hands back the active bank's), so
+     * the two index helpers below take the bank and select it themselves.  The
+     * refusal that used to stand here -- "the slab carries no index twin" --
+     * was true until L218 s124 and is deleted with the premise. */
     /* Stage-B save: keep this batch's per-position compressor projections so
      * a partial spec accept can roll the pending group forward without a
      * transformer replay (gpu_graph_dspark_compressor_rollforward), and a
@@ -471,7 +489,8 @@ static bool gpu_graph_csa2_produce(
          * index projections and writes the index pool emit_rows would otherwise
          * fill from the latent -- and unlike the comp row it has no latent of its
          * own to hand over, so it must run here rather than inside that call. */
-        if (ok && own_index) ok = gpu_graph_index_comp_prefill(g, model, layer, il, n_tokens, before, pos0,
+        if (ok && own_index) ok = gpu_graph_index_comp_prefill(g, model, layer, il, mseq, run_bank,
+                                                               n_tokens, before, pos0,
                                                                ratio, freq_base, freq_scale, ext_factor, attn_factor);
         if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, pos0, ratio);
         if (ok) {
@@ -534,7 +553,8 @@ static bool gpu_graph_csa2_produce(
          * would mean the second pool's row indices had drifted off the first's,
          * which no later check would notice. */
         int idx_emitted = 0;
-        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, t, pos, *n_comp_slot, ratio,
+        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, mseq, bank, t, pos,
+                                                              *n_comp_slot, ratio,
                                                               freq_base, freq_scale, ext_factor, attn_factor,
                                                               &idx_emitted);
         if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
