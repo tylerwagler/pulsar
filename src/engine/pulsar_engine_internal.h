@@ -2350,8 +2350,20 @@ static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
                : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
 }
 
-static inline uint32_t gpu_graph_kv_source(uint32_t il) {
-    return pulsar_layer_attn_layout(il)->kv_source;
+/* The L218 row-format refactor replaced these two macros with
+ * pulsar_kv_row_bytes() above, because the row family became profile-dependent --
+ * the right shape, since UNIFIED (0731) and CSA2 (V4.1) no longer share a width.
+ * But 19 call sites across tests/ still NAME the old macros, so the test runner
+ * stopped building and took every gate that depends on it down with it.
+ *
+ * Keep the names working with the semantics the engine itself uses for the same
+ * two rows (session_banks.cpp:350): the attention row is the COMP row and the
+ * index row is the FP4 index row.  A caller that needs the raw RING row should
+ * call pulsar_kv_row_bytes(PULSAR_KV_ROW_RING) directly. */
+#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP))
+#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX))
+
+static inline uint32_t gpu_graph_kv_source(uint32_t il) {    return pulsar_layer_attn_layout(il)->kv_source;
 }
 static inline bool gpu_graph_layer_is_kv_source(uint32_t il) {
     return pulsar_attn_owns_kv(pulsar_layer_attn_layout(il)->mode);
