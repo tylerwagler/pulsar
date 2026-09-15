@@ -2483,6 +2483,15 @@ static inline bool gpu_graph_layer_has_comp_state(uint32_t il) {
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     return pulsar_attn_owns_kv(a->mode) && a->ratio > 1u;
 }
+/** A layer owns an index-K pool exactly when it is a kv source that RUNS an
+ * indexer.  0731's ratio-128 HCA layers are kv sources that run none, so they
+ * publish no index pool, own no index base table and store no index rows -- the
+ * single authority every index-pool consumer asks (the allocator, the sizing
+ * estimate, the bank snapshot, the fork's checksum). */
+static inline bool gpu_graph_layer_has_index_pool(uint32_t il) {
+    const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+    return pulsar_attn_owns_kv(a->mode) && pulsar_attn_runs_indexer(a->mode);
+}
 /** Physically-present routed-expert count for a layer. For an un-pruned model
  * (or any layer whose keep_count was not set) this is the full n_expert; for a
  * REAP ds4-compact-v1 model the pruned layers report their dense survivor

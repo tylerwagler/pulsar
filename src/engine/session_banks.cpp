@@ -360,8 +360,11 @@ int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = g->ms_n_comp[bank][il];
         if (rows == 0) continue;
-        /* comp rows, then the index-K rows the same emits wrote */
-        for (int kind = 0; kind < 2; kind++) {
+        /* comp rows, then the index-K rows the same emits wrote -- where this
+         * source HAS an index pool (an unindexed kv source publishes none, so
+         * its absence is not a snapshot failure). */
+        const int kinds = gpu_graph_layer_has_index_pool(il) ? 2 : 1;
+        for (int kind = 0; kind < kinds; kind++) {
             const uint64_t sz = rows * (kind ? idx_row : attn_row);
             uint8_t *buf = (uint8_t *)xmalloc((size_t)sz);
             pulsar_gpu_tensor *v = kind ? gpu_graph_bank_index_comp_view(g, il, bank)
@@ -426,7 +429,8 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = comp_cnt[il];
         if (rows == 0) continue;
-        for (int kind = 0; kind < 2; kind++) {
+        const int kinds = gpu_graph_layer_has_index_pool(il) ? 2 : 1;
+        for (int kind = 0; kind < kinds; kind++) {
             const uint64_t sz = rows * (kind ? idx_row : attn_row);
             uint8_t *buf = (uint8_t *)xmalloc((size_t)sz);
             int ok = fread(buf, 1, (size_t)sz, fp) == (size_t)sz;

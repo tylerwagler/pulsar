@@ -61,12 +61,16 @@ uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
-    /* CSA2 (L218): one comp pool + one index-K pool per kv SOURCE; the
-     * member layers read them and own nothing. */
+    /* CSA2 (L218): one comp pool per kv SOURCE, and one index-K pool beside it
+     * only where that source runs an indexer -- 0731's ratio-128 HCA layers
+     * publish none, so pricing one for them would overshoot the real allocation
+     * (and the accounting gate reads the allocation, not this formula).  The
+     * member layers read the pools and own nothing. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il));
-        bytes += comp_cap * (attn_row + idx_row);
+        bytes += comp_cap * attn_row;
+        if (gpu_graph_layer_has_index_pool(il)) bytes += comp_cap * idx_row;
     }
     return bytes;
 }

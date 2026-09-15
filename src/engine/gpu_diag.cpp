@@ -451,7 +451,7 @@ static bool gpu_graph_bank_slabs_alloc(
          * are kv sources that run none, so they get no index pool. */
         if (!ok || !pulsar_attn_owns_kv(attn->mode)) continue;
 
-        const bool indexed = pulsar_attn_runs_indexer(attn->mode);
+        const bool indexed = gpu_graph_layer_has_index_pool(il);
         /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
          * state is twice as wide and twice as tall as V4.1's.  coff is 1 for
          * every ratio V4.1 uses, so this is inert there. */
@@ -717,7 +717,7 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
                     ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0,
                                              crows * attn_row) != 0;
                     /* The index-K pool exists only where an indexer does. */
-                    if (ok && pulsar_attn_runs_indexer(attn->mode)) {
+                    if (ok && gpu_graph_layer_has_index_pool(il)) {
                         ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
                                                  crows * idx_row) != 0;
                     }
@@ -761,7 +761,7 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
         const uint64_t rows = g->ms_n_comp[src][il];
         if (rows) {
             ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, rows * attn_row) != 0;
-            if (ok && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode))
+            if (ok && gpu_graph_layer_has_index_pool(il))
                 ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, rows * idx_row) != 0;
         }
         if (ok && b->astate_bank_bytes[il]) {

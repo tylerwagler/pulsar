@@ -92,9 +92,10 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
             pulsar_gpu_tensor_free(v);
             for (uint64_t i = 0; i < (uint64_t)ncomp * attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
-        {   /* one emit writes the comp row AND the index-K row: one frontier */
+        {   /* one emit writes the comp row AND, where the source runs an
+             * indexer, the index-K row: one frontier */
             const uint32_t nidx = ncomp;
-            if (nidx) {
+            if (nidx && gpu_graph_layer_has_index_pool(il)) {
                 pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
                 if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
                 pulsar_gpu_tensor_free(v);
