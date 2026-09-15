@@ -2362,6 +2362,7 @@ static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
  * call pulsar_kv_row_bytes(PULSAR_KV_ROW_RING) directly. */
 #define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP))
 #define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX))
+#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING))
 
 static inline uint32_t gpu_graph_kv_source(uint32_t il) {    return pulsar_layer_attn_layout(il)->kv_source;
 }
