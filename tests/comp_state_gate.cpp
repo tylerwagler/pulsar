@@ -84,7 +84,7 @@ static int read_state(pulsar_gpu_graph *g, uint32_t il, state_rows *out) {
     const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
     const uint32_t rows = pulsar_comp_state_rows(ratio);
     const uint64_t n = (uint64_t)rows * width;
-    if (kv->bytes < n * sizeof(float) || sc->bytes < n * sizeof(float)) {
+    if (pulsar_gpu_tensor_bytes(kv) < n * sizeof(float) || pulsar_gpu_tensor_bytes(sc) < n * sizeof(float)) {
         fprintf(stderr, "comp_state_gate: kv source %u state is %llu bytes, expected >= %llu\n",
                 il, (unsigned long long)pulsar_gpu_tensor_bytes(kv), (unsigned long long)(n * sizeof(float)));
         pulsar_gpu_tensor_free(kv); pulsar_gpu_tensor_free(sc);
