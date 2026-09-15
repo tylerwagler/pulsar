@@ -71,7 +71,10 @@ int main(int argc, char **argv) {
         std::vector<int32_t> types((size_t)span_len);
         rd(enc.data(), enc.size(), f);
         rd(types.data(), types.size() * 4, f);
-        std::vector<uint16_t> skip((size_t)span_len * PULSAR_N_EMBD);
+        /* The pad is the golden's own width, NOT this binary's default profile:
+         * PULSAR_N_EMBD is 5120 in a V4.1-default build and the file was
+         * written at the reference's 4096, which desyncs the reader. */
+        std::vector<uint16_t> skip((size_t)span_len * PULSAR_VISION_GOLDEN_N_EMBD);
         rd(skip.data(), skip.size() * 2, f);
 
         pulsar_vision_args args = { patch, downsample, max_n_token, min_pixels, max_wh_ratio };

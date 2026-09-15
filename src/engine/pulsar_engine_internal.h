@@ -2677,6 +2677,15 @@ int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in
 #define PULSAR_VISION_ROLE_NEWLINE     3
 #define PULSAR_VISION_ROLE_IMAGE_END   4
 
+/** The embedding width the VISION GOLDENS were written at.  The golden blobs
+ * carry the prepared image block as bf16 rows, and those rows are the width of
+ * the REFERENCE checkpoint they came from (Vision-Exp / 0731, 4096) -- a
+ * property of the FILE, not of whatever profile the reading binary happens to
+ * compile its default in.  A gate that sizes that read with PULSAR_N_EMBD
+ * desyncs by 25% in a V4.1-default build (5120) and reads garbage from then on;
+ * that is exactly what the first merged-tree battery did. */
+#define PULSAR_VISION_GOLDEN_N_EMBD 4096u
+
 /** The image sentinel BLOCK beginning at `start_pos` (the reference's
  * ImageInput.start: the block's first slot, which is a compressor pad, with the
  * IMAGE_START sentinel a few slots in).  `*len_out` receives the BLOCK length --

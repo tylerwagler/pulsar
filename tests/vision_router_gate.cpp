@@ -266,10 +266,15 @@ int main(int argc, char **argv) {
             dlog && dtok && dsel && dw &&
             pulsar_gpu_tensor_write(dlog, 0, c.logits.data(), logits_bytes) &&
             pulsar_gpu_tensor_write(dtok, 0, c.tokens.data(), rows * sizeof(int32_t)) &&
+            /* The merged signature: the branch's tid2eid arm makes "hash mode"
+             * a ROW COUNT rather than a flag (0 = no table), and dev's image
+             * bias rides at the end.  A hash case passes its table offset and row
+             * count; a text case passes 0/0. */
             pulsar_gpu_router_select_batch_tensor(dsel, dw, NULL, map.data(), map.size(),
-                                                  stride * ci + BIAS_OFF, stride * ci + HASH_OFF,
-                                                  g.hash_rows, 0, 0,
-                                                  c.has_text_bias != 0, c.hash_mode != 0,
+                                                  stride * ci + BIAS_OFF,
+                                                  c.has_text_bias != 0,
+                                                  c.hash_mode ? stride * ci + HASH_OFF : 0,
+                                                  c.hash_mode ? g.hash_rows : 0,
                                                   dlog, dtok, g.n_expert, g.topk, 1.5f,
                                                   (uint32_t)rows,
                                                   c.has_vl_bias ? stride * ci + VL_OFF : 0u,

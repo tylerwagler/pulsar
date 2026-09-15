@@ -2726,13 +2726,31 @@ static void test_render_cases(void) {
 /* The unit process has no model, so the loader never installs the attention
  * layout; the tests that need one install the profile's own (V4.1 CSA2) through
  * the loader's one writer, which also exercises its invariant checks. */
+/* The two tests below pin the V4.1 profile for their whole body: the unit
+ * process may have LOADED a 0731 model, which selects PULSAR_SHAPE_V4 (43
+ * layers, ratios 4/128), while the ratio array installed here and the
+ * expectations asserted (40 layers, 4 kv sources, n_embd 5120) are V4.1's.
+ * Without the pin the install itself dies on the profile's own check --
+ * "unexpected DeepSeek4 compression ratio at layer 2 for DeepSeek V4 Flash:
+ * got 2, expected 4" -- which is how the merged tree's battery caught it. */
+static pulsar_shape g_v41_pin_saved;
+
 static void install_profile_attn_layout(void) {
+    g_v41_pin_saved = g_pulsar_shape;
+    g_pulsar_shape = PULSAR_SHAPE_V41;
     uint32_t ratios[PULSAR_MAX_LAYER];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) ratios[il] = il < 2 ? 0u : il < 20 ? 2u : 1u;
     pulsar_attn_layout_install(ratios,
                                g_pulsar_shape.kv_source_layer, g_pulsar_shape.n_kv_source,
                                g_pulsar_shape.index_source_layer, g_pulsar_shape.n_index_source,
                                g_pulsar_shape.candidate_source_layer);
+}
+
+/* Put the loaded profile back once a pinned test is done.  A FAILING assert
+ * returns early and leaves the pin in place, which is harmless: the suite is
+ * already failing and the remaining tests are shape-agnostic. */
+static void release_profile_attn_layout(void) {
+    g_pulsar_shape = g_v41_pin_saved;
 }
 
 /* The CSA2 layout table (L218): every layer's mode and sources follow the
@@ -2768,6 +2786,7 @@ static void test_attn_layout_table(void) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) n[pulsar_layer_attn_layout(il)->mode]++;
     TEST_ASSERT(n[PULSAR_ATTN_WINDOW] == 2 && n[PULSAR_ATTN_FULL] == 4 &&
                 n[PULSAR_ATTN_REINDEX] == 4 && n[PULSAR_ATTN_REUSE] == 30);
+    release_profile_attn_layout();
 }
 
 /* The boot-line estimate is the engine's KV sizing read back: one bank's KV
@@ -2804,6 +2823,7 @@ static void test_context_memory_shape(void) {
         gpu_graph_context_bytes_for_kv_policy((uint32_t)ctx, m.raw_cap, m.prefill_cap, &kv);
     TEST_ASSERT(kv == m.raw_bytes + m.comp_index_bytes);
     TEST_ASSERT(ctx_bytes == m.total_bytes);
+    release_profile_attn_layout();
 }
 
 typedef void (*test_fn)(void);
