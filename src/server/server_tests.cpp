@@ -6126,7 +6126,11 @@ static void test_l179_lane_abandon_needs_decode_and_hangup(void) {
  * (each used to carry its own 3-element copy; a row added to one and not
  * another would make "stream": true and the final parse disagree). */
 static void test_l184_every_consumer_loops_the_syntax_table(void) {
-    TEST_ASSERT(PULSAR_DSML_SYNTAXES == 2);  /* canonical + first-bar-omitted; plain XML retired with V4 (L218) */
+    /* Two families x (full bar, first-bar-omitted): V4.1's spaced tags and V4's
+     * unspaced ones.  Both are recognised by every consumer -- that is the
+     * point of the loop below -- because a model samples its own family's
+     * spelling and a client may replay an older transcript. */
+    TEST_ASSERT(PULSAR_DSML_SYNTAXES == 4);
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
         buf text = {0};

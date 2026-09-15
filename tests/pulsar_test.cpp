@@ -2699,8 +2699,14 @@ static void test_server_unit_group(void) {
  * parser refuses is reported as such, so the gate can count it. */
 static void test_render_cases(void) {
     const char *path = getenv("PULSAR_RENDER_CASES");
-    TEST_ASSERT(path && path[0]);
-    if (!path || !path[0]) return;
+    /* Env-gated on purpose: tests/render_gate.py sets PULSAR_RENDER_CASES and
+     * runs `pulsar_test --render-cases`.  With no cases named there is nothing
+     * to render, and --all runs this entry too -- asserting here made the whole
+     * unit battery red for a test that had no input (L218 s123). */
+    if (!path || !path[0]) {
+        fprintf(stderr, "pulsar-test: render-cases skipped (PULSAR_RENDER_CASES unset)\n");
+        return;
+    }
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
