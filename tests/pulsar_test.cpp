@@ -1104,6 +1104,12 @@ static void test_tool_call_quality_one(void) {
                                              false, &content, &reasoning, &calls);
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(parsed);
+    if (calls.len == 0) {
+        /* Print WHAT the model produced: "no tool call" alone cannot tell a
+         * rendering difference from a decode one. */
+        fprintf(stderr, "pulsar-test: tool-call-quality generated %d BYTES:\n%.*s\n",
+                text.len, text.len, text.ptr ? text.ptr : "(empty)");
+    }
     TEST_ASSERT(calls.len > 0);
     TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
 
