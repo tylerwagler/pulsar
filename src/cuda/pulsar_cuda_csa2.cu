@@ -8,18 +8,26 @@
  * CSA2 compressor (L218, DeepSeek-V4.1): the reference's Compressor.forward.
  *
  * A group of `ratio` tokens becomes one latent: softmax over the group's score
- * projections, weighted sum of its kv projections (both fp32, the reference
- * promotes the ratio-2 weights to fp32), the pooled row ROUNDED TO BF16, then
- * RMSNorm against attn_compressor_norm in fp32 with the weighted result rounded
- * to bf16 again -- `self.norm(kv.to(dtype))`.  At ratio 1 there is no pooling:
- * the projection (a bf16 Linear in the reference, so rounded to bf16 here) is
- * normed.  The latent leaves this kernel PRE-RoPE as fp32 holding bf16-exact
- * values: the index-key projection reads it unrotated and the attention row
- * pack rotates its own copy, exactly as the reference orders those two.
+ * projections and a weighted sum of its kv projections (both fp32, the
+ * reference promotes the ratio-2 weights to fp32).  At ratio 1 there is no
+ * pooling: the projection (a bf16 Linear in the reference, so rounded to bf16
+ * here) is normed.  The latent leaves this kernel PRE-RoPE as fp32: the
+ * index-key projection reads it unrotated and the attention row pack rotates
+ * its own copy, exactly as the reference orders those two.
  *
- * The softmax is written in the reference's order: normalise the weights
- * first, then sum kv * weight (torch's `(kv * score.softmax(dim)).sum(dim)`),
- * not (sum kv * e) / den -- the two differ in the last bit.
+ * POOL ARITHMETIC IS DEV'S, NOT THE REFERENCE'S, and that is deliberate.
+ * The reference (v41/inference/model.py:475-485) normalises each weight and
+ * rounds twice:
+ *     kv = (kv * score.softmax(dim=2)).sum(dim=2)   # each weight normalised
+ *     return self.norm(kv.to(dtype))                # bf16 in, bf16 out
+ * dev instead accumulates `acc += kv * exp(score - max)` and divides ONCE, and
+ * rounds neither the pooled row nor the normed row.  For the 0731 artifact dev
+ * is the parity target and this kernel is graded against it: with dev's form the
+ * next-token logits are BIT-IDENTICAL to dev on the battery prompts (L218 s115),
+ * with the reference's they are 0.943-0.985 pearson.  V4.1 has no dev to grade
+ * against and its reference is the thing being ported -- if it should keep the
+ * reference's form, this belongs in `pulsar_shape` as a per-profile fact rather
+ * than one shared kernel (s115 records the tradeoff; it is Tyler's call).
  *
  * One block per emitted latent row, 256 threads over head_dim (512 -> two
  * elements per thread); `src` selects where the group's rows come from:
@@ -29,7 +37,10 @@
 enum { CSA2_SRC_ROWS = 0, CSA2_SRC_STATE = 1 };
 
 __device__ __forceinline__ static float csa2_bf16_round(float v) {
-    return __bfloat162float(__float2bfloat16(v));   /* RNE, the reference's .to(bf16) */
+    /* RNE, the reference's `.to(bf16)`.  Used ONLY by the ratio-1 projection
+     * below, which really is a bf16 Linear in the reference; the pooled path
+     * does not round (see the header). */
+    return __bfloat162float(__float2bfloat16(v));
 }
 
 template <bool NORM_BF16>
@@ -117,24 +128,25 @@ __global__ static void csa2_compressor_pool_norm_kernel(
             }
             float m = -INFINITY;
             for (uint32_t p = 0; p < npos; p++) m = fmaxf(m, ss[p]);
-            float den = 0.0f;
-            for (uint32_t p = 0; p < npos; p++) den += expf(ss[p] - m);
-            float acc = 0.0f;
-            for (uint32_t p = 0; p < npos; p++) acc += sk[p] * (expf(ss[p] - m) / den);
-            v = csa2_bf16_round(acc);
+            float den = 0.0f, acc = 0.0f;
+            for (uint32_t p = 0; p < npos; p++) {
+                const float e = expf(ss[p] - m);
+                den += e;
+                acc += sk[p] * e;
+            }
+            v = den != 0.0f ? acc / den : 0.0f;
         } else {
             const float *gk = src == CSA2_SRC_STATE ? state_kv : kv + (uint64_t)g * ratio * head_dim;
             const float *gs = src == CSA2_SRC_STATE ? state_sc : sc + (uint64_t)g * ratio * head_dim;
             float m = -INFINITY;
             for (uint32_t r = 0; r < ratio; r++) m = fmaxf(m, gs[(uint64_t)r * head_dim + d]);
-            float den = 0.0f;
-            for (uint32_t r = 0; r < ratio; r++) den += expf(gs[(uint64_t)r * head_dim + d] - m);
-            float acc = 0.0f;
+            float den = 0.0f, acc = 0.0f;
             for (uint32_t r = 0; r < ratio; r++) {
-                const float w = expf(gs[(uint64_t)r * head_dim + d] - m) / den;
-                acc += gk[(uint64_t)r * head_dim + d] * w;
+                const float e = expf(gs[(uint64_t)r * head_dim + d] - m);
+                den += e;
+                acc += gk[(uint64_t)r * head_dim + d] * e;
             }
-            v = csa2_bf16_round(acc);
+            v = den != 0.0f ? acc / den : 0.0f;
         }
         pooled[k] = v;
         sumsq += v * v;
@@ -151,7 +163,7 @@ __global__ static void csa2_compressor_pool_norm_kernel(
     k = 0;
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x, k++) {
         const float w = pulsar_w_load_f32_or_bf16<NORM_BF16>(norm_w, d);
-        latent[(uint64_t)g * head_dim + d] = csa2_bf16_round(w * (pooled[k] * inv));
+        latent[(uint64_t)g * head_dim + d] = w * (pooled[k] * inv);
     }
 }
 
