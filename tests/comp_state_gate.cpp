@@ -1,29 +1,42 @@
-/* L168/L218 GATE: the ratio-2 compressor state after a whole-prompt prefill is
- * the state the decode store builds -- for prompts whose length is NOT a
+/* L168/L218 GATE: a kv source's compressor state after a whole-prompt prefill
+ * is the state the decode store builds -- for prompts whose length is NOT a
  * multiple of the ratio.
  *
- * CSA2 (DeepSeek-V4.1): the kv sources 2/8/14 pool two tokens into one
- * compressed row.  Their state is 2 rows, slot pos % 2 holding the pending
- * token's kv / score projection; a complete group is consumed at its emit and
- * the slots are cleared, so at any EVEN position the state is canonically
- * empty (kv 0, score -inf) and at an odd position slot 0 holds the group's
- * first token and slot 1 is empty.  The boundary-aligned prefill arm builds
- * that state from the chunk's trailing partial group; the per-position store
- * builds it token by token.  The 0731 machinery this gate used to pin -- an
- * 8-row two-group window rebuilt from a re-projected tail, an indexer
- * compressor with its own state, a rewind projection ring (L171) -- is gone.
+ * The lane is `coff * ratio` rows of `coff * head_dim` floats, and that shape is
+ * the SAME on both profiles -- only who fills which row differs:
  *
- * Asserted per kv source at r = 1 (L = 32 + 1) against prefill(L - 1) + 1
+ *   coff 1 (every V4.1 ratio; 0731's ratio 128).  The pending token's slot is
+ *     pos % ratio in the running half, which IS the whole lane.  A complete
+ *     group is consumed at its emit and the lane is cleared, so at any position
+ *     that is a multiple of the ratio the state is canonically empty (kv 0,
+ *     score -inf) and at L = ratio + p rows [0, p) hold the group's first p
+ *     tokens and rows [p, ratio) are empty.
+ *
+ *   coff 2 (0731's ratio 4; the projection is split, so a group's row is pooled
+ *     from the previous group's first halves and this group's second).  The
+ *     running token goes into the CURRENT half at row `ratio + pos % ratio`, and
+ *     the CARRY half rows [0, ratio) holds the last completed group's first
+ *     halves -- so an empty lane is not a state the overlap case has, and "empty
+ *     at a group boundary" is true of the current half only.  At L, rows
+ *     [0, ratio) are populated once L >= ratio (the first emit has happened),
+ *     rows [ratio, ratio + L % ratio) hold the pending tokens, and the rest of
+ *     the running half is empty.
+ *
+ * The boundary-aligned prefill arm builds that state from the chunk's trailing
+ * partial group; the per-position store builds it token by token.  The 0731
+ * machinery this gate used to pin -- an 8-row two-group window rebuilt from a
+ * re-projected tail, an indexer compressor with its own state, a rewind
+ * projection ring (L171) -- is gone.
+ *
+ * Asserted per kv source at L = 32 + 1 and 32 + 2 against prefill(L - 1) + 1
  * classic decode step of the same token (the state the decode path builds):
- *   PLACEMENT (bit-level): after prefill(L), slot 0 is populated (score
- *     finite, kv non-zero) and slot 1 empty -- and the decode-built state has
- *     the same shape.  After prefill(L + 1) both slots are empty on both paths.
- *   PENDING ROW (printed, not asserted): slot 0 from the prefill forward vs
- *     the decode forward of the same token differ at the compressor input
- *     (E4M3 requantization, MoE routing), which no threshold separates from a
- *     wrong token.
- * Whole prompts shorter than a group (L = 1: slot 0 populated; L = 2: empty)
- * check placement only.  The ratio-1 source (20) keeps no state.
+ *   PLACEMENT (bit-level): the rows above, on both paths.
+ *   PENDING ROW (printed, not asserted): the prefill forward vs the decode
+ *     forward of the same token differ at the compressor input (E4M3
+ *     requantization, MoE routing), which no threshold separates from a wrong
+ *     token.
+ * Whole prompts shorter than a group (L = 1, 2) check placement only.  A
+ * ratio-1 source keeps no state and is skipped.
  *
  *   ./tests/comp_state_gate MODEL
  */
@@ -46,10 +59,12 @@ static const char *PROMPT =
 static int g_fail = 0;
 
 typedef struct {
-    float *kv;     /* ratio * width */
+    float *kv;     /* coff*ratio rows of coff*head_dim */
     float *sc;
-    uint32_t width;
-    uint32_t rows;
+    uint32_t width;   /* coff * head_dim */
+    uint32_t rows;    /* coff * ratio */
+    uint32_t ratio;
+    uint32_t coff;
     int ok;
 } state_rows;
 
@@ -59,10 +74,17 @@ static int read_state(pulsar_gpu_graph *g, uint32_t il, state_rows *out) {
     pulsar_gpu_tensor *sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
     out->ok = 0;
     if (!kv || !sc) { pulsar_gpu_tensor_free(kv); pulsar_gpu_tensor_free(sc); return 0; }
-    const uint32_t width = PULSAR_N_HEAD_DIM;
-    const uint32_t rows = pulsar_layer_compress_ratio(il);
+    /* The lane's shape, from the same authorities the kernels index it with
+     * (pulsar_gpu_csa2_compressor_store_tensor): width = coff * head_dim, rows =
+     * coff * ratio.  Reading it as `ratio` rows of `head_dim` reads a quarter of
+     * a V4 ratio-4 lane at the wrong stride -- every slot looks populated, and
+     * the gate reports a placement failure that is its own. */
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    const uint32_t coff = pulsar_compress_coff(ratio);
+    const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+    const uint32_t rows = pulsar_comp_state_rows(ratio);
     const uint64_t n = (uint64_t)rows * width;
-    if (pulsar_gpu_tensor_bytes(kv) < n * sizeof(float) || pulsar_gpu_tensor_bytes(sc) < n * sizeof(float)) {
+    if (kv->bytes < n * sizeof(float) || sc->bytes < n * sizeof(float)) {
         fprintf(stderr, "comp_state_gate: kv source %u state is %llu bytes, expected >= %llu\n",
                 il, (unsigned long long)pulsar_gpu_tensor_bytes(kv), (unsigned long long)(n * sizeof(float)));
         pulsar_gpu_tensor_free(kv); pulsar_gpu_tensor_free(sc);
@@ -70,6 +92,8 @@ static int read_state(pulsar_gpu_graph *g, uint32_t il, state_rows *out) {
     }
     out->width = width;
     out->rows = rows;
+    out->ratio = ratio;
+    out->coff = coff;
     out->kv = (float *)malloc(n * sizeof(float));
     out->sc = (float *)malloc(n * sizeof(float));
     int rc = out->kv && out->sc &&
@@ -117,23 +141,32 @@ static int sync_prefix(pulsar_session *s, const pulsar_tokens *full, int len, ch
 
 static const char *kind_name(int k) { return k == 1 ? "populated" : k == 0 ? "empty" : "malformed"; }
 
-/* PLACEMENT at position L: the pending slots [0, L % ratio) populated, the
- * rest empty.  B (the decode-built state) may be NULL for a placement-only
- * pass.  Returns 1 when the layer was checked. */
+/* PLACEMENT at position L: the rows the store should have written are populated
+ * and the rest empty.  B (the decode-built state) may be NULL for a
+ * placement-only pass.  Returns 1 when the layer was checked. */
+static int want_populated(const state_rows *s, uint32_t row, int L) {
+    const uint32_t phase = (uint32_t)L % s->ratio;
+    if (s->coff == 1u) return row < phase;
+    /* Overlap: the carry half is written by the last emit (so it is populated
+     * once ANY group has completed), the running half only as far as the
+     * pending group has filled. */
+    if (row < s->ratio) return L >= (int)s->ratio;
+    return (row - s->ratio) < phase;
+}
+
 static int check_placement(const state_rows *A, const state_rows *B, uint32_t il, int L, const char *tag) {
-    const uint32_t phase = (uint32_t)L % A->rows;
     for (uint32_t row = 0; row < A->rows; row++) {
-        const int want = row < phase ? 1 : 0;
+        const int want = want_populated(A, row, L);
         const int got = row_kind(A, row);
         if (got != want) {
-            printf("  FAIL kv source %2u %s L=%d: state slot %u is %s, expected %s\n", il, tag, L, row,
+            printf("  FAIL kv source %2u %s L=%d: state row %u is %s, expected %s\n", il, tag, L, row,
                    kind_name(got), kind_name(want));
             g_fail = 1;
         }
         if (B) {
             const int gotB = row_kind(B, row);
             if (gotB != want) {
-                printf("  FAIL kv source %2u %s L=%d: DECODE-built state slot %u is %s, expected %s (fixture broken)\n",
+                printf("  FAIL kv source %2u %s L=%d: DECODE-built state row %u is %s, expected %s (fixture broken)\n",
                        il, tag, L, row, kind_name(gotB), kind_name(want));
                 g_fail = 1;
             }
@@ -190,10 +223,13 @@ int GATE_ENTRY(int argc, char **argv) {
                 state_rows b;
                 if (!read_state(&s->graph, il, &b)) { fprintf(stderr, "read decode state kv source %u\n", il); goto done; }
                 checked += check_placement(a, &b, il, L, "prefill-vs-decode");
-                if ((uint32_t)L % a->rows) {
-                    /* PENDING ROW: printed, not asserted (see header). */
-                    const double d_kv = rel_l1(b.kv, a->kv, a->width);
-                    const double d_sc = rel_l1(b.sc, a->sc, a->width);
+                if ((uint32_t)L % a->ratio) {
+                    /* PENDING ROW: printed, not asserted (see header).  The
+                     * whole lane, at its real stride -- a partial read at the
+                     * wrong stride compares the wrong pairs. */
+                    const uint64_t lane = (uint64_t)a->rows * a->width;
+                    const double d_kv = rel_l1(b.kv, a->kv, lane);
+                    const double d_sc = rel_l1(b.sc, a->sc, lane);
                     const double d = d_kv > d_sc ? d_kv : d_sc;
                     if (d > worst_pend) worst_pend = d;
                     if (min_pend == 0.0 || d < min_pend) min_pend = d;
@@ -201,14 +237,14 @@ int GATE_ENTRY(int argc, char **argv) {
                 free_state(a); free_state(&b);
             }
             if ((uint32_t)L % 2u)
-                printf("L=%d (pending token): %d compressor states checked; pending slot relL1 %.3g..%.3g "
+                printf("L=%d (pending token): %d compressor states checked; pending row relL1 %.3g..%.3g "
                        "(informational: prefill vs decode forward)%s\n", L, checked, min_pend, worst_pend, g_fail ? "" : "  OK");
             else
-                printf("L=%d (group boundary): %d compressor states checked, both slots empty on both paths%s\n",
+                printf("L=%d (group boundary): %d compressor states checked, the running half empty on both paths%s\n",
                        L, checked, g_fail ? "" : "  OK");
             total_checked += checked;
         }
-        if (total_checked == 0) { fprintf(stderr, "comp_state_gate: no ratio-2 compressor state found\n"); goto done; }
+        if (total_checked == 0) { fprintf(stderr, "comp_state_gate: no ratio>1 compressor state found\n"); goto done; }
         /* Whole prompts shorter than a group: placement only (there is no
          * shorter prefill to decode from). */
         for (int L = 1; L <= 2; L++) {
