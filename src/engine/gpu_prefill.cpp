@@ -190,16 +190,10 @@ static bool gpu_graph_csa2_emit_rows(
                                                      pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
                                                      freq_base, freq_scale, ext_factor, attn_factor,
                                                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
-    /* The PRE-PACK staging, which is what dev's `KVcompress` is.  This dump used
-     * to sit BELOW the pack, and the pack is handed `latent` as both its read
-     * source and its f32-observation output whenever any f32 dump is armed -- so
-     * it wrote the fp4 round-trip back over the row just read and the "KVcompress"
-     * comparison was mine's quantised row against dev's unquantised one (L218
-     * s54/s119).  Above the pack, the two are the same quantity. */
-    if (ok) gpu_graph_debug_dump_tensor("KVcompress", latent,
-                                        (uint64_t)n_rows * PULSAR_N_HEAD_DIM, il, pos_first);
     if (ok) ok = pulsar_gpu_kv_comp_pack_tensor(gpu_graph_f32_store_observed_any() ? latent : NULL, latent,
                                                comp_dst, cache_row0, n_rows, PULSAR_N_HEAD_DIM) != 0;
+    if (ok) gpu_graph_debug_dump_tensor("KVcompress", latent,
+                                        (uint64_t)n_rows * PULSAR_N_HEAD_DIM, il, pos_first);
     if (banked) {
         pulsar_gpu_tensor_free(idx_dst);
         pulsar_gpu_tensor_free(comp_dst);
