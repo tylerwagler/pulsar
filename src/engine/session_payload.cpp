@@ -110,11 +110,47 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
 
 
 
-/* The compressor state a kv source carries: `ratio` rows of head_dim f32 at
- * ratio > 1 (the pending group), none at ratio 1. */
+/* An index-K pool exists only where the layer runs an indexer: 0731's ratio-128
+ * (HCA) layers publish compressed KV and no indexer at all, so their
+ * layer_index_comp_cache is never allocated.  One emit writes a comp row AND an
+ * index-K row, so the row COUNT here is the source's own n_comp -- there is no
+ * second counter to drift.
+ *
+ * v10 wrote the pool for every kv source, which is sound only on V4.1 (all four
+ * of its sources run an indexer) and made EVERY 0731 checkpoint refuse to save:
+ * "session tensor is smaller than the payload (offset 0 + 2176 > 0 bytes)" is
+ * layer 3 -- ratio 128, no indexer -- at 4096 tokens, 32 rows x 68 B. */
+static bool layer_has_index_pool(uint32_t il) {
+    return pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode);
+}
+
+/* The compressor state a kv source carries, sized by the SAME two authorities
+ * gpu_diag.c allocates the lane with -- pulsar_comp_row_width() x
+ * pulsar_comp_state_rows().  A width that disagrees with the allocation does not
+ * fail: the span is merely SHORTER than the lane, so the save succeeds, the
+ * restore writes back what was saved, and the tail of a recurrent state is left
+ * at whatever the allocator primed it with.  v10 sized the lane at
+ * head_dim x ratio, a QUARTER of a V4 ratio-4 lane's 32768 B, because a V4.1
+ * artifact's ratio-2 lane is 4096 B under BOTH formulas -- so the V4.1 profile
+ * could not show it and no gate ran a 0731 payload at all. */
 static uint64_t layer_attn_state_bytes(uint32_t il) {
-    return gpu_graph_layer_has_comp_state(il)
-        ? (uint64_t)PULSAR_N_HEAD_DIM * pulsar_layer_compress_ratio(il) * sizeof(float) : 0u;
+    if (!gpu_graph_layer_has_comp_state(il)) return 0u;   /* ratio 1 emits a row per token and keeps no pending group */
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    return (uint64_t)pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM) *
+           pulsar_comp_state_rows(ratio) * sizeof(float);
+}
+
+/* V4 ONLY: 0731's indexer compresses its OWN key, so its compressor keeps a
+ * SECOND recurrent state at the indexer's head dim -- the same pair of
+ * authorities, the indexer's width.  V4.1 projects its index key from the
+ * latents above and keeps no such lane, so its payload carries none (and
+ * layer_index_state_kv is never allocated; see gpu_diag.c). */
+static uint64_t layer_index_state_bytes(uint32_t il) {
+    if (!g_pulsar_shape.indexer_own_compressor || !layer_has_index_pool(il) ||
+        !gpu_graph_layer_has_comp_state(il)) return 0u;
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    return (uint64_t)pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM) *
+           pulsar_comp_state_rows(ratio) * sizeof(float);
 }
 
 
@@ -157,8 +193,10 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
         bytes += (uint64_t)raw_live * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
-        bytes += rows * (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP) + pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
+        bytes += rows * pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+        if (layer_has_index_pool(il)) bytes += rows * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
         bytes += 2u * layer_attn_state_bytes(il);
+        bytes += 2u * layer_index_state_bytes(il);
     }
     return bytes;
 }
@@ -174,7 +212,15 @@ static int payload_write_tensor_span(FILE *fp, const pulsar_gpu_tensor *tensor,
     if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
         bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
     {
-        payload_set_err(err, errlen, "session tensor is smaller than the payload");
+        /* Name the numbers: a bare "smaller than the payload" says nothing about
+         * WHICH span overran, and this is the refusal a checkpoint hits when a
+         * payload's live-row sizing and an allocation disagree (L218 s122). */
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
+                 (unsigned long long)offset, (unsigned long long)bytes,
+                 (unsigned long long)(tensor ? pulsar_gpu_tensor_bytes(tensor) : 0));
+        payload_set_err(err, errlen, msg);
         return 1;
     }
     uint64_t done = 0;
@@ -199,7 +245,12 @@ static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
     if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
         bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
     {
-        payload_set_err(err, errlen, "session tensor is smaller than the payload");
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
+                 (unsigned long long)offset, (unsigned long long)bytes,
+                 (unsigned long long)(tensor ? pulsar_gpu_tensor_bytes(tensor) : 0));
+        payload_set_err(err, errlen, msg);
         return 1;
     }
     uint64_t done = 0;
@@ -311,7 +362,15 @@ uint64_t pulsar_session::payload_bytes() {
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
     bytes += (uint64_t)PULSAR_N_VOCAB * sizeof(float);
-    bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
+    /* ONE per-layer row-count array.  There were two while the index-K pool had
+     * its own counter; the second line outlived it, so every advertised size was
+     * PULSAR_N_LAYER * 4 (172 B on 0731) larger than what save_payload wrote.
+     * That is not a cosmetic mismatch: save_snapshot sizes the memory stream from
+     * THIS number and load_snapshot hands the same number back as the payload
+     * length, so a restore of a live session ended on "KV checkpoint has trailing
+     * payload bytes" -- the bench caught it, the disk path (which passes the real
+     * file size) did not.  The gate's written == payload_bytes() check is the
+     * guard; keep them one fact. */
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
     return bytes;
@@ -508,17 +567,25 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         }
         if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
-         * contiguous; the index-K rows the same emits wrote follow.  The two
-         * state tensors hold the pending group a ratio-2 source will fold into
-         * its next row (absent at ratio 1). */
+         * contiguous; the index-K rows the same emits wrote follow where an
+         * indexer runs.  Then the two recurrent state lanes: the attention
+         * compressor's pending group, and -- V4 only -- the indexer's own. */
         const uint32_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
         rc = payload_write_attn_comp_pack(fp, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
-        if (rc == 0) rc = payload_write_index_comp(fp, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0 && layer_has_index_pool(il))
+            rc = payload_write_index_comp(fp, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         const uint64_t state_bytes = layer_attn_state_bytes(il);
         if (rc == 0 && state_bytes) {
             rc = payload_write_tensor_span(fp, g->layer_attn_state_kv[il], 0, state_bytes,
                                            buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_attn_state_score[il], 0, state_bytes,
+                                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        }
+        const uint64_t index_state_bytes = layer_index_state_bytes(il);
+        if (rc == 0 && index_state_bytes) {
+            rc = payload_write_tensor_span(fp, g->layer_index_state_kv[il], 0, index_state_bytes,
+                                           buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_index_state_score[il], 0, index_state_bytes,
                                                         buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
     }
@@ -657,12 +724,20 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
         if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
         rc = payload_read_attn_comp_pack(fp, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
-        if (rc == 0) rc = payload_read_index_comp(fp, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        if (rc == 0 && layer_has_index_pool(il))
+            rc = payload_read_index_comp(fp, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         const uint64_t state_bytes = layer_attn_state_bytes(il);
         if (rc == 0 && state_bytes) {
             rc = payload_read_tensor_span(fp, g->layer_attn_state_kv[il], 0, state_bytes,
                                           buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_attn_state_score[il], 0, state_bytes,
+                                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
+        const uint64_t index_state_bytes = layer_index_state_bytes(il);
+        if (rc == 0 && index_state_bytes) {
+            rc = payload_read_tensor_span(fp, g->layer_index_state_kv[il], 0, index_state_bytes,
+                                          buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_index_state_score[il], 0, index_state_bytes,
                                                        buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
     }
@@ -715,21 +790,30 @@ int pulsar_session::save_snapshot(pulsar_session_snapshot *snap, char *err, size
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
         return 1;
     }
-    if (bytes > (uint64_t)SIZE_MAX) {
+    if (bytes > (uint64_t)SIZE_MAX - 1u) {
         payload_set_err(err, errlen, "session snapshot is too large for this platform");
         return 1;
     }
-    if (snap->cap < bytes) {
-        uint8_t *p = (uint8_t *)realloc(snap->ptr, (size_t)bytes);
+    /* ONE EXTRA BYTE, DELIBERATELY.  fmemopen's write mode appends a NUL at the
+     * next position on fclose, and when the buffer is filled EXACTLY to capacity
+     * that NUL lands on its last byte: the trailing payload byte is silently
+     * zeroed, which for a compressor state lane is a corrupted float and for a
+     * snapshot of a live session is a restore that is not the state it saved.
+     * Budget the terminator and keep snap->len at the real payload size.  (dev
+     * hit the same thing from the other side when the v10 digest made a single
+     * flipped byte observable; the trap predates it.) */
+    const uint64_t capacity = bytes + 1u;
+    if (snap->cap < capacity) {
+        uint8_t *p = (uint8_t *)realloc(snap->ptr, (size_t)capacity);
         if (!p) {
             payload_set_err(err, errlen, "out of memory while allocating session snapshot");
             return 1;
         }
         snap->ptr = p;
-        snap->cap = bytes;
+        snap->cap = capacity;
     }
 
-    FILE *fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+    FILE *fp = fmemopen(snap->ptr, (size_t)capacity, "wb");
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;

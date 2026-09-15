@@ -1186,6 +1186,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
+	cuda-session-payload-gate \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A

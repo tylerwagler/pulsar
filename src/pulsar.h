@@ -776,8 +776,20 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * KV rows are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the
  * raw ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
  * header carries both strides (fields 13 and 16) plus the indexer's.  Earlier
- * files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(10)
+ * files are refused.
+ * v11 (L218 s122, 2026-09-15): the per-layer byte stream is derived from the
+ * LOADED PROFILE instead of from V4.1's geometry.  v10 wrote its index-K rows
+ * for every kv source, so a 0731 artifact -- whose ratio-128 (HCA) sources have
+ * no indexer and no index pool -- refused to save at all; and it sized the
+ * compressor state at head_dim x ratio, which is a QUARTER of the 32768 B lane
+ * a V4 ratio-4 source keeps (coff 2), and omitted 0731's indexer-compressor
+ * state lane entirely.  A shorter-than-the-lane span is the dangerous shape: the
+ * save succeeds and the restore leaves the tail of a recurrent state primed.
+ * So a 0731 payload now carries each source's comp rows, its index-K rows only
+ * where an indexer runs, then the attention compressor's state, then -- V4 only
+ * -- the indexer compressor's.  v10 files are refused: the per-layer layout
+ * differs at the same strides. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(11)
 /** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 

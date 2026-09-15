@@ -14,10 +14,13 @@
  * than a thing we assume.
  *
  * WHAT IT PROVES, in the order that localises a failure:
- *   1. KV BYTES.  FNV-1a over the attn comp cache and the indexer comp cache of
- *      the restored session equals the same fold over the saved one.  These are
- *      the two caches v4 and v5 changed the storage format of, and a mismatch
- *      names which one.
+ *   1. THE LINEAR LANES, byte for byte.  FNV-1a over each kv source's attn comp
+ *      rows, its index-K rows, and both compressor state lanes, folded to the
+ *      size the ALLOCATION holds rather than the size the payload believes it
+ *      should carry.  That distinction is the point: a payload that silently
+ *      drops the tail of a lane balances its own accounting and round-trips its
+ *      own header, so only a fold at the allocation's size can see it.  (v11: a
+ *      0731 ratio-4 state lane is 32768 B and the payload carried 8192.)
  *   2. THE RAW RING, functionally.  Byte-comparing a ring is awkward (rows sit
  *      at pos % cap and the tail is legitimately stale), so instead both
  *      sessions evaluate the SAME next token and their full-vocab logits must
@@ -61,39 +64,72 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* FNV-1a over the two caches whose STORAGE FORMAT the payload changed.  Rows are
- * linear from 0 in both, unlike the raw ring, so a byte fold is well defined. */
-static uint64_t checksum_comp_caches(pulsar_session *s, const char *tag) {
+/* FNV-1a over every linear-from-row-0 lane the payload carries: each kv
+ * source's comp rows, its index-K rows where an indexer runs, and both
+ * compressor state lanes.  (The raw ring is the one lane that is NOT linear --
+ * rows sit at pos % cap -- so it is checked functionally, by the logits below.)
+ *
+ * The fold runs to pulsar_gpu_tensor_bytes(), i.e. over exactly what the
+ * ALLOCATION holds, not over what session_payload.cpp believes it should hold.
+ * That distinction is the whole point: a payload that carries fewer bytes than
+ * the lane holds still balances its own accounting and still round-trips its own
+ * header, so only a fold at the allocation's size can see the missing tail.  The
+ * v11 fix exists because a V4 ratio-4 state lane is 32768 B and the payload
+ * carried a quarter of it. */
+static bool fold_tensor(uint64_t *h, pulsar_gpu_tensor *t, uint8_t *buf, size_t cap,
+                        uint64_t *bytes_io) {
+    /* A lane the allocation never made (V4.1's indexer compressor, a ratio-1
+     * source's pending group) contributes nothing and is not an error. */
+    if (!t) return true;
+    const uint64_t n = pulsar_gpu_tensor_bytes(t);
+    if (n == 0) return true;
+    if (n > cap) return false;
+    if (pulsar_gpu_tensor_read(t, 0, buf, n) == 0) return false;
+    for (uint64_t i = 0; i < n; i++) { *h ^= buf[i]; *h *= 1099511628211ull; }
+    *bytes_io += n;
+    return true;
+}
+
+static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
     pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    const size_t cap = 64u * 1024u * 1024u;
+    bool ok = true;
     uint64_t h = 1469598103934665603ull;
-    uint64_t attn_rows = 0, idx_rows = 0;
-    uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);
+    uint64_t attn_rows = 0, idx_rows = 0, attn_state = 0, idx_state = 0;
+    uint8_t *buf = (uint8_t *)malloc(cap);
     if (!buf) return 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ncomp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
         if (ncomp) {
             const uint64_t n = (uint64_t)ncomp * attn_row;
-            if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, buf, n) == 0) { free(buf); return 0; }
+            if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, buf, n) == 0) { ok = false; break; }
             for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             attn_rows += ncomp;
         }
-        {   /* one emit writes the comp row AND the index-K row: one frontier */
-            const uint32_t nidx = ncomp;
-            if (nidx) {
-                const uint64_t n = (uint64_t)nidx * idx_row;
-                if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il], 0, buf, n) == 0) { free(buf); return 0; }
-                for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
-                idx_rows += nidx;
-            }
+        /* One emit writes the comp row AND the index-K row: one frontier, and
+         * the index pool exists only where an indexer runs -- 0731's ratio-128
+         * (HCA) sources publish none, so their lane is NULL by construction. */
+        if (ncomp && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
+            const uint64_t n = (uint64_t)ncomp * idx_row;
+            if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il], 0, buf, n) == 0) { ok = false; break; }
+            for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+            idx_rows += ncomp;
         }
+        ok = fold_tensor(&h, g->layer_attn_state_kv[il], buf, cap, &attn_state) &&
+             fold_tensor(&h, g->layer_attn_state_score[il], buf, cap, &attn_state) &&
+             fold_tensor(&h, g->layer_index_state_kv[il], buf, cap, &idx_state) &&
+             fold_tensor(&h, g->layer_index_state_score[il], buf, cap, &idx_state);
     }
     free(buf);
-    fprintf(stderr, "  %-8s attn_comp_rows=%llu (%llu B/row)  idx_comp_rows=%llu (%llu B/row)  fnv=%016llx\n",
+    if (!ok) return 0;
+    fprintf(stderr, "  %-8s attn_comp_rows=%llu (%llu B/row)  idx_comp_rows=%llu (%llu B/row)  "
+                    "attn_state=%llu B  idx_state=%llu B  fnv=%016llx\n",
             tag, (unsigned long long)attn_rows, (unsigned long long)attn_row,
             (unsigned long long)idx_rows, (unsigned long long)idx_row,
+            (unsigned long long)attn_state, (unsigned long long)idx_state,
             (unsigned long long)h);
     return h;
 }
@@ -130,7 +166,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "session_payload_gate: L=%d ctx=%d width=%d payload=%llu B\n",
             L, ctx, width, (unsigned long long)pulsar_session_payload_bytes(a));
-    const uint64_t fnv_a = checksum_comp_caches(a, "saved");
+    const uint64_t fnv_a = checksum_lanes(a, "saved");
     CHECK(fnv_a != 0, "checksum of session A failed");
 
     FILE *fp = tmpfile();
@@ -159,11 +195,11 @@ int main(int argc, char **argv) {
     CHECK(pulsar_session_load_payload(b, fp, pbytes, err, sizeof err) == 0, "load: %s", err);
     fclose(fp);
 
-    const uint64_t fnv_b = checksum_comp_caches(b, "restored");
+    const uint64_t fnv_b = checksum_lanes(b, "restored");
     CHECK(fnv_b != 0, "checksum of session B failed");
     CHECK(fnv_a == fnv_b,
-          "comp caches differ across the round trip: saved=%016llx restored=%016llx "
-          "-- the attn (v4) or indexer (v5) rows did not survive as bytes",
+          "payload lanes differ across the round trip: saved=%016llx restored=%016llx "
+          "-- a comp pool, an index-K pool or a compressor state lane did not survive as bytes",
           (unsigned long long)fnv_a, (unsigned long long)fnv_b);
 
     CHECK(pulsar_session_eval(b, probe_tok, err, sizeof err) == 0, "B eval: %s", err);
@@ -184,7 +220,7 @@ int main(int argc, char **argv) {
             probe_tok, ndiff, width, (double)worst, first);
     CHECK(ndiff == 0,
           "restored session decodes differently: %d/%d logits differ, worst %.6g. "
-          "The comp caches matched, so this is the RAW RING or the compressor state",
+          "The lanes above matched byte for byte, so this is the RAW RING",
           ndiff, width, (double)worst);
 
     free(ref); free(got); free(base.v);
