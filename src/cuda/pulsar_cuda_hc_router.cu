@@ -457,9 +457,17 @@ __global__ static void router_select_warp_topk_kernel(
             w[j] = out_prob[j];
             sum += out_prob[j];
         }
-        const float inv = route_scale / (sum + 1.0e-20f);
+        /* dev's arithmetic, exactly: floor the denominator at 2^-14, then DIVIDE
+         * and multiply per element.  Folding the scale into a reciprocal
+         * (`w * (scale/(sum+1e-20))`) rounds differently from `w/sum*scale` and
+         * produced a routing-weight vector that differed from dev on ~1/3 of
+         * entries while the logits, the probs and the top-k selection -- which
+         * depend only on the scores -- all matched.  The batched kernel and the
+         * single-token kernel must also agree with each other; :734 already has
+         * this form. */
+        sum = fmaxf(sum, 6.103515625e-5f);
         #pragma unroll
-        for (uint32_t j = 0; j < TOPK; j++) w[j] = w[j] * inv;
+        for (uint32_t j = 0; j < TOPK; j++) w[j] = w[j] / sum * route_scale;
     }
 }
 
