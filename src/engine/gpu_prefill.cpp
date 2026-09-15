@@ -2626,6 +2626,13 @@ bool gpu_graph_dspark_compressor_rollforward(
              * first verify batch.  V4.1's ratio-2 sources have coff 1 and agreed
              * by accident, which is why this survived until a V4 model ran. */
             const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+            /* The update kernel below needs a [1][head_dim] f32 scratch for the
+             * row it pools at a group boundary.  The value is discarded -- the
+             * pool's own row is already committed -- only the lane side effects
+             * (store, pool, shift) matter here. */
+            pulsar_gpu_tensor *latent_row = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
+                                                                   (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
+            if (!latent_row) return rollforward_fail(il, pos0, "no latent-row scratch for the rollforward");
             for (uint32_t t = 0; t < n_positions; t++) {
                 const uint32_t pos = pos0 + t;
                 pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
@@ -2634,40 +2641,78 @@ bool gpu_graph_dspark_compressor_rollforward(
                  * the saved (raw) score row is not what the lane holds.  Fold it
                  * here or the rolled-forward pending group is a different
                  * function of its own inputs than the live path's. */
+                int emitted = 0;
                 const bool ok = kv_view && sc_view &&
                     gpu_graph_comp_ape_fold(model, &weights->layer[il], sc_view, comp_width, ratio, pos, 1u) &&
-                    pulsar_gpu_csa2_compressor_store_tensor(kv_view, sc_view,
+                    /* THE UPDATE KERNEL, not a bare store.  This function's own
+                     * comment promises "same update kernels, same rows, same
+                     * order", and the live path's per-token update is what stores
+                     * the row, POOLS the group when it closes and SHIFTS the
+                     * completed group into the carry half.  A store alone never
+                     * promotes a completed group, so the carry keeps whatever the
+                     * rejected batch left there and the NEXT group's pool reads
+                     * exactly that: the compressed row for the group at positions
+                     * 28..31 came out ~80% off dev's while every one of its raw
+                     * projections was bit-exact (L218 s121). */
+                    pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view,
                             g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
-                            PULSAR_N_HEAD_DIM, ratio, pos) != 0;
+                            model->map, model->size,
+                            weights->layer[il].attn_compressor_norm->abs_offset,
+                            weights->layer[il].attn_compressor_norm->type,
+                            PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
                 pulsar_gpu_tensor_free(sc_view);
                 pulsar_gpu_tensor_free(kv_view);
-                if (!ok) return rollforward_fail(il, pos, "pending-slot store (row view or kernel)");
+                if (!ok) return rollforward_fail(il, pos, "pending-slot update (row view or kernel)");
             }
+            pulsar_gpu_tensor_free(latent_row);
             /* V4's indexer lane is a second recurrent state over the same rows:
              * roll it from ITS saved projections, or the next group pools
-             * positions the rejected draft put there.  Store only -- the emitted
-             * rows are in the pool already and the frontier is set by formula. */
+             * positions the rejected draft put there.  The SAME reasoning as the
+             * attention lane above: through the UPDATE kernel, not a bare store,
+             * or a replayed prefix that closes a group never promotes it into the
+             * indexer's carry half.  Two differences from the attention lane:
+             * this kernel applies the ape ITSELF (so no caller-side fold), and it
+             * writes the pool row it emits -- `out_row` is the frontier the closed
+             * group occupies (pos/ratio), whose row the live batch already wrote,
+             * so the replay rewrites it with the same bytes. */
             if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
                 if (!g->spec_icomp_kv_save[il] || !g->spec_icomp_sc_save[il])
                     return rollforward_fail(il, pos0, "no saved indexer-compressor projections for this kv source");
                 const pulsar_layer_weights *lw = &weights->layer[il];
                 const uint32_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+                const float idx_freq_base = layer_rope_freq_base(il);
+                const float idx_freq_scale = layer_rope_freq_scale(il);
+                const float idx_ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+                float idx_attn_factor = 1.0f;
+                if (idx_ext_factor != 0.0f && idx_freq_scale > 0.0f)
+                    idx_attn_factor /= 1.0f + 0.1f * logf(1.0f / idx_freq_scale);
+                pulsar_gpu_tensor *idx_latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
+                                                    (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
+                if (!idx_latent) return rollforward_fail(il, pos0, "no indexer latent scratch for the rollforward");
                 for (uint32_t t = 0; t < n_positions; t++) {
                     const uint32_t pos = pos0 + t;
                     pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, iw);
                     pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, iw);
+                    int idx_emitted = 0;
                     const bool ok = kv_view && sc_view &&
-                        pulsar_gpu_csa2_comp_ape_add_tensor(sc_view, model->map, model->size,
-                                                            lw->indexer_compressor_ape->abs_offset,
-                                                            lw->indexer_compressor_ape->type,
-                                                            iw, ratio, pos, 1u) &&
-                        pulsar_gpu_csa2_compressor_store_tensor(kv_view, sc_view,
+                        pulsar_gpu_indexer_compressor_update_tensor(
+                                g->layer_index_comp_cache[il], idx_latent,
                                 g->layer_index_state_kv[il], g->layer_index_state_score[il],
-                                PULSAR_N_INDEXER_HEAD_DIM, ratio, pos) != 0;
+                                sc_view, kv_view,
+                                model->map, model->size,
+                                lw->indexer_compressor_ape->abs_offset, lw->indexer_compressor_ape->type,
+                                lw->indexer_compressor_norm->abs_offset,
+                                lw->indexer_compressor_norm->type,
+                                pos / ratio, PULSAR_N_INDEXER_HEAD_DIM, ratio, pos,
+                                PULSAR_N_ROT, (uint32_t)PULSAR_ROPE_ORIG_CTX,
+                                idx_freq_base, idx_freq_scale, idx_ext_factor, idx_attn_factor,
+                                PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                                PULSAR_RMS_EPS, &idx_emitted) != 0;
                     pulsar_gpu_tensor_free(sc_view);
                     pulsar_gpu_tensor_free(kv_view);
-                    if (!ok) return rollforward_fail(il, pos, "indexer pending-slot store");
+                    if (!ok) return rollforward_fail(il, pos, "indexer pending-slot update");
                 }
+                pulsar_gpu_tensor_free(idx_latent);
             }
         }
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = (pos0 + n_positions) / ratio;
