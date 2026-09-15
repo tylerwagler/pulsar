@@ -133,6 +133,11 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
 bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    /* The chat template family follows the LOADED model (L218 s123): the
+     * renderer, the forced-prefill and the KV-key suffix builders all read it
+     * from the request, so a 0731 artifact cannot be primed with V4.1's
+     * template by one of them and V4's by another. */
+    r->chat_v41 = pulsar_engine_chat_v41(e);
     if (err && errlen) err[0] = '\0';
     const char *p = body;
     bool got_messages = false;
@@ -319,7 +324,7 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode, r->chat_v41);
     /* tool_choice="required": force a tool call by prefilling the assistant turn
      * into an open DSML tool_calls block. render_chat_prompt_text ends the turn
      * with "<｜Assistant｜><think>" (or "</think>"); rewrite it to skip thinking
@@ -374,6 +379,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_ANTHROPIC;
     if (err && errlen) err[0] = '\0';
     const char *p = body;
@@ -573,7 +579,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode, r->chat_v41);
     if (tool_choice_forced && r->has_tools && r->prompt_text) {
         r->force_tool_call = true;
         request_apply_forced_tool_prefill(r);
@@ -1297,6 +1303,7 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_RESPONSES;
     const char *p = body;
     bool got_input = false;
@@ -1537,7 +1544,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode, r->chat_v41);
     pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -1598,6 +1605,7 @@ static bool parse_prompt(const char **p, char **out) {
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    r->chat_v41 = pulsar_engine_chat_v41(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;

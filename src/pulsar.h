@@ -178,6 +178,16 @@ int pulsar_engine_vocab_size(pulsar_engine *e);
  * check it against pulsar_engine_vocab_size. */
 int pulsar_engine_logits_width(const pulsar_engine *e);
 const char *pulsar_engine_model_name(pulsar_engine *e);
+/** Does the loaded model use the V4.1 conversation TEMPLATE?  The server's chat
+ * renderer needs the fact: V4 (0731) and V4.1 were trained on different
+ * templates -- the DSML tag spelling, the tools-prompt text, where the tool
+ * schemas sit, how user-side messages merge, whether a mid-conversation system
+ * message is an in-place System token -- so a prompt primed with the other
+ * family's template is a different prompt (L218 s123: a 0731 artifact primed
+ * with V4.1's tags answered with a DSML invoke and no block opener at all).
+ * Follows the loaded profile (pulsar_shape::variant); an engine-less caller
+ * reads as V4.1, the compile-time default profile. */
+bool pulsar_engine_chat_v41(const pulsar_engine *e);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often

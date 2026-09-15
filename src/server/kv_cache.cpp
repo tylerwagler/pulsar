@@ -97,10 +97,17 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         const char *start;
         const char *end;
     } forms[] = {
+        /* Every spelling either family renders, so the scanner finds the last
+         * tool block whatever produced the transcript (the shipped 0731
+         * artifacts sample V4's unspaced tags, V4.1 the spaced ones). */
         {"\n\n" PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
         {PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
         {"\n\n" PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
         {PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
+        {"\n\n" PULSAR_TOOL_CALLS_START_V4, PULSAR_TOOL_CALLS_END_V4},
+        {PULSAR_TOOL_CALLS_START_V4, PULSAR_TOOL_CALLS_END_V4},
+        {"\n\n" PULSAR_TOOL_CALLS_START_SHORT_V4, PULSAR_TOOL_CALLS_END_SHORT_V4},
+        {PULSAR_TOOL_CALLS_START_SHORT_V4, PULSAR_TOOL_CALLS_END_SHORT_V4},
         {"\n\n<tool_calls>", "</tool_calls>"},
         {"<tool_calls>", "</tool_calls>"},
     };

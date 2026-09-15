@@ -35,6 +35,27 @@
 #define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME
 #define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME ">"
 
+/* V4 (0731): the same markup with NO leading space in the tag name -- the
+ * spelling dev's tree renders and this artifact samples.  Both families are
+ * PARSED either way (the table below carries every row and the parsers loop);
+ * this set exists for the RENDERER, which must prime the model with the tags it
+ * was trained on. */
+#define PULSAR_DSML_V4_CALLS_NAME "tool_calls"
+#define PULSAR_DSML_V4_INVOKE_NAME "invoke"
+#define PULSAR_DSML_V4_PARAM_NAME "parameter"
+#define PULSAR_TOOL_CALLS_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_CALLS_NAME ">"
+#define PULSAR_TOOL_CALLS_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_CALLS_NAME ">"
+#define PULSAR_INVOKE_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_INVOKE_NAME
+#define PULSAR_INVOKE_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_INVOKE_NAME ">"
+#define PULSAR_PARAM_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_PARAM_NAME
+#define PULSAR_PARAM_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_PARAM_NAME ">"
+#define PULSAR_TOOL_CALLS_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_CALLS_NAME ">"
+#define PULSAR_TOOL_CALLS_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_CALLS_NAME ">"
+#define PULSAR_INVOKE_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_INVOKE_NAME
+#define PULSAR_INVOKE_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_INVOKE_NAME ">"
+#define PULSAR_PARAM_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_PARAM_NAME
+#define PULSAR_PARAM_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_PARAM_NAME ">"
+
 /** The six marker literals of one DSML spelling. */
 typedef struct {
     const char *tool_calls_start;  ///< opens the tool-calls block
@@ -45,17 +66,24 @@ typedef struct {
     const char *param_end;         ///< closes it
 } pulsar_dsml_syntax;
 
-/** Rows: [0] canonical "<｜DSML｜ ...", [1] the first-bar-omitted
- * "<DSML｜ ..." V4 sampled often enough to earn a row.  Row 0 is the spelling
- * the renderer WRITES; row 1 is a tolerance the parser extends to the model.
- * V4's plain-XML "<tool_calls>" row was retired with V4 (L218): a V4.1
- * spelling earns a row here only from observed samples, never in advance.
- * Order is the parser's preference when a text carries more than one. */
-#define PULSAR_DSML_SYNTAXES 2
+/** Rows: [0] V4.1's "<｜DSML｜ calls>", [1] V4.1 with the first bar omitted, [2]
+ * V4's "<｜DSML｜tool_calls>", [3] V4 with the first bar omitted.  The renderer
+ * WRITES one family's row (see pulsar_dsml_canonical); the parser loops over
+ * ALL of them, so a model that samples the other family's spelling -- or a
+ * client replaying an old transcript -- still parses.  Order is the parser's
+ * preference when a text carries more than one. */
+#define PULSAR_DSML_SYNTAXES 4
 extern const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES];
 
-/** The renderer-side spelling (row 0). */
+/** The renderer-side spelling of the loaded model's family: V4.1's row when
+ * `v41`, V4's otherwise.  One call site per writer, one authority (the engine's
+ * variant) behind it. */
+const pulsar_dsml_syntax *pulsar_dsml_canonical(bool v41);
+
+/** V4.1's row (the default profile's / agent-UI spelling). */
 #define PULSAR_DSML_CANONICAL (&pulsar_dsml_syntaxes[0])
+/** V4's row. */
+#define PULSAR_DSML_CANONICAL_V4 (&pulsar_dsml_syntaxes[2])
 
 /* ---- the one entity encode/decode pair ----------------------------------
  *

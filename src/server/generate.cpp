@@ -290,7 +290,7 @@ char *build_tool_checkpoint_suffix(const request *r, const char *content,
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     buf suffix = {0};
     append_assistant_turn_sampled(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
-                                  content, calls);
+                                  content, calls, r->chat_v41);
     return buf_take(&suffix);
 }
 
@@ -312,7 +312,7 @@ char *build_responses_visible_assistant_suffix(const request *r,
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     const bool replay = think && r->reasoning_summary_emit && calls && calls->len > 0;
     append_assistant_turn_sampled(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
-                                  content, calls);
+                                  content, calls, r->chat_v41);
     return buf_take(&suffix);
 }
 
@@ -347,7 +347,7 @@ char *build_toolless_thinking_visible_text(const request *r,
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
     /* the stripped turn: no opener, the think close, the content, EOS */
-    append_assistant_turn_close(&visible, true, NULL, content, NULL);
+    append_assistant_turn_close(&visible, true, NULL, content, NULL, r->chat_v41);
     return buf_take(&visible);
 }
 

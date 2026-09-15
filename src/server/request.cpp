@@ -35,9 +35,13 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
  * output seed - they must stay byte-identical or the DSML tracker and the
  * prompt disagree about parser state. */
 void request_forced_tool_seed(const request *r, buf *out) {
-    buf_puts(out, "</think>\n\n" PULSAR_TOOL_CALLS_START "\n");
+    const pulsar_dsml_syntax *d = pulsar_dsml_canonical(r->chat_v41);
+    buf_puts(out, "</think>\n\n");
+    buf_puts(out, d->tool_calls_start);
+    buf_puts(out, "\n");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, PULSAR_INVOKE_START " name=\"");
+        buf_puts(out, d->invoke_start);
+        buf_puts(out, " name=\"");
         buf_puts(out, r->forced_tool_name);
         buf_puts(out, "\">\n");
     }
@@ -259,6 +263,10 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_p = PULSAR_DEFAULT_TOP_P;
     r->min_p = PULSAR_DEFAULT_MIN_P;
     r->think_mode = PULSAR_THINK_DEFAULT;
+    /* The template family, defaulted to the compile-time default PROFILE
+     * (V4.1); a parser that holds the engine overwrites it from
+     * pulsar_engine_variant(). */
+    r->chat_v41 = true;
 }
 
 

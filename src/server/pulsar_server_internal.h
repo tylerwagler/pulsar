@@ -554,6 +554,18 @@ typedef struct {
     stop_list anthropic_live_call_ids;        ///< Anthropic tool_use ids this request refers to
     char *anthropic_live_suffix_text;         ///< Anthropic new-suffix text, owned
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
+    /** The chat TEMPLATE family the loaded model was trained on (L218's
+     * two-profile engine).  V4 (0731) and V4.1 render DIFFERENTLY: the DSML tag
+     * spelling, the tools-prompt text, where the tool schemas sit, how
+     * consecutive user-side messages merge, whether a mid-conversation system
+     * message is an in-place System token or a <system-reminder> note, and
+     * which assistant turns replay reasoning.  The parser sets this from
+     * pulsar_engine_variant(); every renderer AND every KV-key suffix builder
+     * reads THIS, so the live KV and the replay cannot disagree about which
+     * template produced the bytes.  True (V4.1, the compile-time default)
+     * unless a parser says otherwise, so hand-built requests keep the default
+     * profile's bytes. */
+    bool chat_v41;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -2521,9 +2533,10 @@ bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_system(const char **p, char **out);
 void append_tool_result_text(buf *b, const char *s);
-bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order);
+bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order,
+                                      bool v41 = true);
 void append_json_object_or_empty(buf *b, const char *json);
-void append_dsml_tool_calls_text(buf *b, const tool_calls *calls);
+void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41 = true);
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas);
 bool chat_history_preserves_reasoning(const chat_msgs *msgs,
@@ -2545,14 +2558,22 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
 /** Per-render state: the mode, the reasoning-replay facts of the message
  * list, and where the turn structure stands. */
 typedef struct {
+    bool v41;                 ///< the loaded model's template family (see request::chat_v41)
+    const pulsar_dsml_syntax *dsml;  ///< the spelling this family WRITES (a row of the table)
     bool think;               ///< thinking mode enabled: assistant turns carry a think block
     bool tool_context;        ///< tools advertised or used in the history: reasoning replays on every turn
     int last_user_idx;        ///< index of the last user-side message; assistant turns after it replay reasoning
     bool pending_assistant;   ///< a user-side turn is open; the next assistant turn (or the tail) opens with the role marker
     bool user_turn_open;      ///< a user-side turn (text and/or tool results) is open; further user-side parts join it with "\n\n"
+    /** V4 only: a tool-result message already opened its own turn, so further
+     * results continue it instead of opening another <｜User｜>.  The V4.1 rule
+     * merges every user-side part into one turn (user_turn_open), so this flag
+     * is inert there -- but it is what V4's renderer keyed on, and keeping the
+     * two flags separate is what lets both rules live in one function. */
+    bool pending_tool_result;
 } chat_render;
 void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
-                      pulsar_think_mode think_mode);
+                      pulsar_think_mode think_mode, bool v41);
 /** Append message `i` of `msgs`, which must not be a system-REGION message
  * (the caller owns that decision; a system message given here renders in
  * place as an environment note). */
@@ -2564,26 +2585,26 @@ void append_assistant_open(buf *out, bool think);
  * replayed block's body), the think close (when `close_think`), the visible
  * content, the DSML tool calls, EOS. */
 void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
-                                 const char *content, const tool_calls *calls);
+                                 const char *content, const tool_calls *calls, bool v41 = true);
 /** The same turn as the model SAMPLED it: a turn that ends in tool calls
  * stops at the closing tool_calls tag and has no EOS (the tail renders it);
  * a stop turn ends with the EOS it sampled.  This is what a checkpoint key
  * names -- the bytes of the live tokens -- while the replay is
  * append_assistant_turn_close (L196). */
 void append_assistant_turn_sampled(buf *out, bool close_think, const char *reasoning,
-                                   const char *content, const tool_calls *calls);
+                                   const char *content, const tool_calls *calls, bool v41 = true);
 /** Close a render: an open user-side turn gets the generation prefix. */
 void chat_render_finish(buf *out, const chat_render *r);
 /** The live-KV continuation suffix for msgs[start..): EOS, the new user-side
  * messages, the generation prefix. */
 char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
-                            pulsar_think_mode think_mode);
+                            pulsar_think_mode think_mode, bool v41 = true);
 /** The legacy /v1/completions template: a fixed system line and the prompt
  * as the one user turn, through the same renderer. */
 char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
-                                     pulsar_think_mode think_mode);
+                                     pulsar_think_mode think_mode, bool v41 = true);
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
 void anthropic_prepare_live_continuation(request *r,

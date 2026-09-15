@@ -17,7 +17,22 @@ const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES] = {
         PULSAR_INVOKE_START_SHORT, PULSAR_INVOKE_END_SHORT,
         PULSAR_PARAM_START_SHORT, PULSAR_PARAM_END_SHORT,
     },
+    /* V4 (0731): the same two spellings, tag names unspaced. */
+    {
+        PULSAR_TOOL_CALLS_START_V4, PULSAR_TOOL_CALLS_END_V4,
+        PULSAR_INVOKE_START_V4, PULSAR_INVOKE_END_V4,
+        PULSAR_PARAM_START_V4, PULSAR_PARAM_END_V4,
+    },
+    {
+        PULSAR_TOOL_CALLS_START_SHORT_V4, PULSAR_TOOL_CALLS_END_SHORT_V4,
+        PULSAR_INVOKE_START_SHORT_V4, PULSAR_INVOKE_END_SHORT_V4,
+        PULSAR_PARAM_START_SHORT_V4, PULSAR_PARAM_END_SHORT_V4,
+    },
 };
+
+const pulsar_dsml_syntax *pulsar_dsml_canonical(bool v41) {
+    return v41 ? PULSAR_DSML_CANONICAL : PULSAR_DSML_CANONICAL_V4;
+}
 
 
 

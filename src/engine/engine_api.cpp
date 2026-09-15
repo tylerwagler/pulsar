@@ -210,6 +210,14 @@ void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
 int pulsar_engine_logits_width(const pulsar_engine *e) { return e ? e->logits_width() : 0; }
 const char *pulsar_engine_model_name(pulsar_engine *e) { return e->model_name(); }
+/* The loaded shape IS the authority (pulsar_select_shape_from_metadata sets it
+ * once at load); `e` is taken so a caller must hold the engine it is asking
+ * about, exactly like the other engine facts.  One fact, one name: the chat
+ * TEMPLATE family, which is what the renderer forks on. */
+bool pulsar_engine_chat_v41(const pulsar_engine *e) {
+    if (!e) return true;   /* no engine: the compile-time default profile */
+    return g_pulsar_shape.variant != PULSAR_VARIANT_V4;
+}
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if (e) { e->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }
 bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
