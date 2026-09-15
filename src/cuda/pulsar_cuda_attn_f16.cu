@@ -274,8 +274,14 @@ __device__ static inline uint32_t af16_pack_qraw(
         rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
                                   qp.freq_base, qp.freq_scale, qp.ext_factor,
                                   qp.attn_factor, corr0, corr1, &r0, &r1);
-        x0 = __bfloat162float(__float2bfloat16(r0));
-        x1 = __bfloat162float(__float2bfloat16(r1));
+        /* f32, NOT narrowed here: the standalone arm stores this same f32
+         * rotation straight into the f16 buffer, and af16_pack below is the
+         * single narrowing.  Rounding to bf16 first cost 1-2 bf16 ULP on every
+         * rotated element, which is what made production's Q disagree with the
+         * standalone arm and with dev (2de728f3; the bare revert 683e406d put it
+         * back and this restores it). */
+        x0 = r0;
+        x1 = r1;
     }
     return af16_pack(x0, x1);
 }
