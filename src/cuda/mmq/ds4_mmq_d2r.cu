@@ -1444,6 +1444,35 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
         return -2;
     }
 
+    /* L210's rule for the SINGLE tensor, restored from dev: DECODE rows take the
+     * k-major GEMV at ANY width, PREFILL rows never take it, so a chunk's bytes
+     * do not depend on its size and a mixed step's prefill pass equals a solo
+     * prefill.  Before this the down tensor ran the N-starved MMA tile at decode
+     * (~1/8 N-fill per expert) while gate/up already had the GEMV -- and the two
+     * are DIFFERENT ARITHMETIC (exact f32 weights, split-K fma order), so taking
+     * the tile here is a byte difference from dev, not just a slower arm.
+     * The pair kernel's guards were removed in this tree, so pass W_soa/out
+     * twice exactly as dev's <false> arm did: acc_u duplicates acc_g and the
+     * second store writes the same value. */
+    if (pulsar_gpu_matmul_batch_decode_rows() > 0) {
+        if (K > kDecodeGemvMaxK) {
+            fprintf(stderr, "%s: decode GEMV tier holds K <= %d in shared memory, got K=%d -- refusing\n",
+                    tag, kDecodeGemvMaxK, (int)K);
+            return -1;
+        }
+        const dim3 dgrid((unsigned)((M + kDecodeGemvRows - 1) / kDecodeGemvRows), (unsigned)ne_get_rows, 1);
+        const dim3 dblock(kDecodeGemvRows, kDecodeGemvWarps, 1);
+        gateup_iq2_decode_gemv_kernel<<<dgrid, dblock, 0, stream>>>(
+            W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds,
+            out, out, M, K, (int)ne_get_rows, n_experts);
+        const cudaError_t derr = cudaGetLastError();
+        if (derr != cudaSuccess) {
+            fprintf(stderr, "%s: decode GEMV launch failed: %s\n", tag, cudaGetErrorString(derr));
+            return -3;
+        }
+        return 0;
+    }
+
     /* z = 1: leg is pinned to 0, so only W_soa / out are ever touched. */
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 1);
     const dim3 block(32, kWarps, 1);
