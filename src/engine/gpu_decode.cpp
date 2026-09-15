@@ -578,14 +578,30 @@ bool gpu_graph_dspark_draft_forward_banks(
             layer->attn_q_b->abs_offset,
             q_rank, PULSAR_N_HEAD * PULSAR_N_HEAD_DIM,
             g->batch_qr_norm, n_draft) != 0;
-        /* Q tail RoPE (V4.1: no per-head RMS; q_norm sits on the latent above) */
-        if (ok) ok = pulsar_gpu_rope_tail_tensor(
-            g->batch_q, n_draft,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
-            pos0, 0, false,
-            (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
-            banked ? meta_rope[li] : NULL) != 0;
+        /* Q norm + tail RoPE: the PROFILE picks the kernel, exactly as the
+         * target's prefill does (gpu_prefill.cpp's `PULSAR_Q_HEAD_NORM ?`).
+         * 0731 normalises Q per head here; V4.1 has no per-head pass (its
+         * q_norm sits on the latent above).  Running V4.1's arithmetic on a 0731
+         * drafter left `dsp_attn_norm` byte-exact while `dsp_heads` was not --
+         * the drafter's first bad step (L218 s117). */
+        if (ok) {
+            const pulsar_gpu_tensor *q_pos = banked ? meta_rope[li] : NULL;
+            ok = (PULSAR_Q_HEAD_NORM
+                ? pulsar_gpu_head_rms_norm_rope_tail_tensor(
+                    g->batch_q, n_draft,
+                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    pos0, 0, false,
+                    (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                    PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                    PULSAR_RMS_EPS, q_pos)
+                : pulsar_gpu_rope_tail_tensor(
+                    g->batch_q, n_draft,
+                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    pos0, 0, false,
+                    (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                    PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                    q_pos)) != 0;
+        }
 
         /* --- KV projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
