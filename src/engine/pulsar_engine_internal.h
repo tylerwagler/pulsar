@@ -336,6 +336,14 @@ typedef struct {
      * artifact missing its mix would otherwise collapse with V4.1's arithmetic
      * and produce a wrong head without failing.  plans/96-... s9/S1. */
     bool hc_head_mix;
+    /** Where the DSpark drafter's anchor hidden is captured inside a layer.
+     * The reference appends `h.mean(dim=2)` at `target_layer_ids` BEFORE
+     * `h = layer(h)` for V4.1 and AFTER the layer for 0731, so the drafter is
+     * conditioned on the layer's INPUT in one case and its OUTPUT in the other.
+     * False = capture at layer entry (V4.1); true = capture after the layer's
+     * HC swap (0731).  Getting this wrong feeds the drafter a structurally
+     * different hidden (measured 20-64% off) and walks its proposals off dev. */
+    bool dspark_anchor_after;
     /** The KV row family (see pulsar_kv_row_style).  Every row-geometry
      * question goes through pulsar_kv_row_bytes(), which reads this -- so no
      * caller names a format and the geometry cannot disagree with the packer. */

@@ -2467,6 +2467,43 @@ bool gpu_graph_encode_layer_ffn_batch(
 
 
 
+/* Capture the DSpark drafter anchors at layer `il` from `batch_cur_hc`, which
+ * holds the layer's INPUT when this is called at layer entry and its OUTPUT
+ * when called after the HC swap -- the caller picks the point, this function
+ * owns the capture.  Both the fused-spec verify anchor and the retraining bulk
+ * anchor are captured here so their placement cannot drift apart (dev keeps
+ * them adjacent for the same reason).
+ *
+ * An armed capture whose buffer is missing is an impossible state, not a skip:
+ * breaking with ok untouched let the round seed from STALE rows and lose
+ * acceptance silently -- the class gpu_decode.cpp's KV seed documents (L190 D2).
+ * Returns false, having captured nothing further, if any armed capture fails. */
+static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+    struct { uint32_t n; pulsar_gpu_tensor **dst; const char *what; } cap[2] = {
+        { g->dspark_capture_batch_n, g->dspark_target_h_batch, "anchor" },
+        { g->dspark_bulk_n,          g->dspark_bulk_h,          "bulk"   },
+    };
+    for (int c = 0; c < 2; c++) {
+        if (!cap[c].n) continue;
+        for (int slot = 0; slot < 3; slot++) {
+            if (il != g->dspark_target_layer_ids[slot]) continue;
+            if (!cap[c].dst[slot]) {
+                fprintf(stderr, "pulsar: drafter %s capture: layer %u is anchor slot %d but "
+                                "its buffer is not allocated -- refusing\n", cap[c].what, il, slot);
+                return false;
+            }
+            uint32_t cap_n = cap[c].n;
+            if (cap_n > n_tokens) cap_n = n_tokens;
+            if (!pulsar_gpu_dspark_hc_mean_reduce_batch(cap[c].dst[slot], g->batch_cur_hc,
+                                                       PULSAR_N_EMBD, PULSAR_N_HC, cap_n)) {
+                return false;
+            }
+            break;
+        }
+    }
+    return true;
+}
+
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
 bool gpu_graph_encode_layer_batch(
         pulsar_gpu_graph  *g,
@@ -2476,62 +2513,21 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     bool ok = true;
-    /* DRAFTER ANCHORS ARE THE TARGET LAYER'S INPUT (V4.1, Transformer.forward:
-     * `if i in target_layer_ids: main_hiddens.append(h.mean(dim=2))` BEFORE
-     * `h = layer(h)`; 0731 appended after).  So the captures below read
-     * batch_cur_hc before this layer touches it.
+    /* DRAFTER ANCHORS: the reference appends `h.mean(dim=2)` for its target
+     * layers at exactly one point in a layer, and the point is NOT the same in
+     * both profiles.  V4.1 (Transformer.forward) appends BEFORE `h = layer(h)`,
+     * so its drafter is conditioned on the anchor layer's INPUT; 0731 appends
+     * AFTER the layer, so its drafter sees that layer's OUTPUT.  The two arms
+     * are therefore not interchangeable and `dspark_anchor_after` names which
+     * one this artifact needs -- feeding the wrong arm's hidden is a structural
+     * difference (measured 20-64% off across every conditioning array), not a
+     * rounding one.
      *
      * Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
      * every batch position at the anchor layers, so the last-accepted position's
      * hidden is available without a replay decode. Off (0) during prefill and
      * plain decode. */
-    if (g->dspark_capture_batch_n) {
-        for (int slot = 0; slot < 3; slot++) {
-            if (il != g->dspark_target_layer_ids[slot]) continue;
-            if (!g->dspark_target_h_batch[slot]) {
-                /* L190 D2: the anchor layer matched but its capture buffer is
-                 * missing.  Breaking with ok untouched let the round seed from
-                 * STALE rows and lose acceptance silently -- the class
-                 * gpu_decode.cpp's KV seed documents. */
-                fprintf(stderr, "pulsar: drafter anchor capture: layer %u is anchor slot %d but "
-                                "its batch buffer is not allocated -- refusing\n", il, slot);
-                ok = false;
-                break;
-            }
-            uint32_t cap_n = g->dspark_capture_batch_n;
-            if (cap_n > n_tokens) cap_n = n_tokens;
-            if (!pulsar_gpu_dspark_hc_mean_reduce_batch(g->dspark_target_h_batch[slot],
-                                                     g->batch_cur_hc,
-                                                     PULSAR_N_EMBD, PULSAR_N_HC, cap_n)) {
-                ok = false;
-            }
-            break;
-        }
-    }
-    /* Bulk prefill capture for drafter retraining (PULSAR_DSPARK_PREFILL_DUMP):
-     * same reduction as the verify capture above, but over EVERY chunk position
-     * into the per-layer bulk buffers. Armed only by the prefill path. */
-    if (ok && g->dspark_bulk_n) {
-        for (int slot = 0; slot < 3; slot++) {
-            if (il != g->dspark_target_layer_ids[slot]) continue;
-            if (!g->dspark_bulk_h[slot]) {
-                /* same class as the verify capture above: armed with a
-                 * missing buffer is an impossible state, not a skip */
-                fprintf(stderr, "pulsar: drafter bulk capture: layer %u is anchor slot %d but "
-                                "its bulk buffer is not allocated -- refusing\n", il, slot);
-                ok = false;
-                break;
-            }
-            uint32_t cap_n = g->dspark_bulk_n;
-            if (cap_n > n_tokens) cap_n = n_tokens;
-            if (!pulsar_gpu_dspark_hc_mean_reduce_batch(g->dspark_bulk_h[slot],
-                                                     g->batch_cur_hc,
-                                                     PULSAR_N_EMBD, PULSAR_N_HC, cap_n)) {
-                ok = false;
-            }
-            break;
-        }
-    }
+    if (!g_pulsar_shape.dspark_anchor_after) ok = dspark_capture_anchors(g, il, n_tokens);
     if (ok) ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
         fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);
@@ -2547,6 +2543,9 @@ bool gpu_graph_encode_layer_batch(
         g->batch_cur_hc = g->batch_next_hc;
         g->batch_next_hc = tmp;
     }
+    /* 0731 takes its anchors HERE, after the swap, so the drafter is
+     * conditioned on the layer's OUTPUT hidden -- see the note at the top. */
+    if (ok && g_pulsar_shape.dspark_anchor_after) ok = dspark_capture_anchors(g, il, n_tokens);
     return ok;
 }
 

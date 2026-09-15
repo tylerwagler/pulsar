@@ -76,6 +76,7 @@ const pulsar_shape PULSAR_SHAPE_V4 = {
     .q_head_norm = true,              /* Attention.forward: q *= rsqrt(mean(q^2)+eps) per head */
     .chat_system_marker = false,      /* 0731's template: system text follows BOS directly */
     .hc_head_mix = true,              /* the head computes its own HC coefficients */
+    .dspark_anchor_after = true,      /* the reference appends the anchor after the layer */
     .kv_row_style = PULSAR_KV_ROWS_UNIFIED,
     .rms_eps = PULSAR_V4_RMS_EPS,
     .hc_eps = PULSAR_DEFAULT_HC_EPS,
@@ -134,6 +135,7 @@ const pulsar_shape PULSAR_SHAPE_V41 = {
     .q_head_norm = false,             /* q_norm sits on the low-rank latent, before wq_b */
     .chat_system_marker = true,       /* V4.1's template marks the lead-in system region */
     .hc_head_mix = false,             /* collapses with the carried pre */
+    .dspark_anchor_after = false,     /* the anchor is the layer's input, pre-`layer(h)` */
     .kv_row_style = PULSAR_KV_ROWS_CSA2,
     .rms_eps = PULSAR_V41_RMS_EPS,
     .hc_eps = PULSAR_DEFAULT_HC_EPS,
