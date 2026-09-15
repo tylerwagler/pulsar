@@ -446,8 +446,10 @@ static bool gpu_graph_bank_slabs_alloc(
                 managed_kv_cache, (uint64_t)n_banks * b->raw_bank_bytes);
         ok = b->raw[il] != NULL;
         /* CSA2 (L218): only a kv source owns a compressed pool, an index-K
-         * pool and (at ratio > 1) a compressor state lane. */
-        if (!ok || attn->mode != PULSAR_ATTN_FULL) continue;
+         * pool and (at ratio > 1) a compressor state lane.  A kv source is
+         * not the same question as an indexer -- 0731's ratio-128 HCA layers
+         * are kv sources that run none, so they get no index pool. */
+        if (!ok || !pulsar_attn_owns_kv(attn->mode)) continue;
 
         const bool indexed = pulsar_attn_runs_indexer(attn->mode);
         /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
@@ -458,7 +460,8 @@ static bool gpu_graph_bank_slabs_alloc(
         const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
         b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
                                  pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
-        b->index_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+        b->index_bank_bytes[il] = indexed
+            ? (uint64_t)dz->layer_comp_cap[il] * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX) : 0u;
         b->astate_bank_bytes[il] = attn_lane;
         /* Increment 2a: one cudaMallocManaged PER BANK (not one n_banks*bytes
          * slab) so the eviction guard can cudaFree a single idle bank's physical
@@ -466,22 +469,25 @@ static bool gpu_graph_bank_slabs_alloc(
         void *comp_ptr_h[PULSAR_MSEQ_MAX], *index_ptr_h[PULSAR_MSEQ_MAX];
         for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
             b->comp[il][bk] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
-            b->index[il][bk] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
-            ok = b->comp[il][bk] != NULL && b->index[il][bk] != NULL;
+            ok = b->comp[il][bk] != NULL;
+            if (ok && indexed) {
+                b->index[il][bk] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
+                ok = b->index[il][bk] != NULL;
+            }
             if (ok) {
                 comp_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->comp[il][bk]);
-                index_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->index[il][bk]);
+                index_ptr_h[bk] = indexed ? pulsar_gpu_tensor_device_ptr(b->index[il][bk]) : NULL;
             }
         }
         /* Device base-pointer tables (indexed by seq_id) the batched READ
          * kernels use instead of base + seq_id*comp_cap over one slab. */
         if (ok) b->comp_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
-        if (ok) b->index_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
-        ok = ok && b->comp_bases[il] && b->index_bases[il] &&
+        if (ok && indexed) b->index_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
+        ok = ok && b->comp_bases[il] && (!indexed || b->index_bases[il]) &&
              pulsar_gpu_tensor_write(b->comp_bases[il], 0, comp_ptr_h,
                                   (uint64_t)n_banks * sizeof(void *)) &&
-             pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
-                                  (uint64_t)n_banks * sizeof(void *));
+             (!indexed || pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
+                                  (uint64_t)n_banks * sizeof(void *)));
         /* V4's indexer keeps a SECOND recurrent lane (it compresses its own key);
          * V4.1 derives the index key from the latent and keeps none.  Same two
          * authorities, the indexer's width. */
@@ -603,7 +609,7 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
             b->comp[il][bank] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
             ok = b->comp[il][bank] != NULL;
         }
-        if (ok && !b->index[il][bank]) {
+        if (ok && b->index_bank_bytes[il] && !b->index[il][bank]) {
             b->index[il][bank] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
             ok = b->index[il][bank] != NULL;
         }
@@ -755,7 +761,8 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
         const uint64_t rows = g->ms_n_comp[src][il];
         if (rows) {
             ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, rows * attn_row) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, rows * idx_row) != 0;
+            if (ok && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode))
+                ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, rows * idx_row) != 0;
         }
         if (ok && b->astate_bank_bytes[il]) {
             ok = pulsar_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
@@ -919,9 +926,12 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
         pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
         g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
                 b->comp[il][bank], 0, b->comp_bank_bytes[il]);
-        g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
-                b->index[il][bank], 0, b->index_bank_bytes[il]);
-        ok = g->layer_attn_comp_cache[il] && g->layer_index_comp_cache[il];
+        /* The index-K pool exists only where an indexer runs (0731's ratio-128
+         * HCA layers publish none), so an absent pool is not a failure. */
+        g->layer_index_comp_cache[il] = b->index_bank_bytes[il]
+            ? pulsar_gpu_tensor_view(b->index[il][bank], 0, b->index_bank_bytes[il]) : NULL;
+        ok = g->layer_attn_comp_cache[il] &&
+             (!b->index_bank_bytes[il] || g->layer_index_comp_cache[il]);
         if (!ok || !b->astate_bank_bytes[il]) continue;   /* ratio 1: no state lane */
         pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
