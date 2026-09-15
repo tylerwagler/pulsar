@@ -1195,10 +1195,11 @@ GATE_TARGETS = unit-test-gate \
 .PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
-# pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
-# spec_sampling alone running 2x2500 trajectories; it is the wrong tool to sit
-# and watch after every edit.  These four are the ones that actually catch a
-# numerics or dispatch regression:
+# pre-merge instrument -- every target in GATE_TARGETS, each loading the model,
+# with spec_sampling alone running 2x2500 trajectories; it is the wrong tool to
+# sit and watch after every edit.  (This said "17 gates" as a second copy of a
+# fact that lives in GATE_TARGETS and had drifted to 10; the list is the count.)
+# These four are the ones that actually catch a numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
 #   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
 #   cuda-frontier-gate       frontier logits across banks
