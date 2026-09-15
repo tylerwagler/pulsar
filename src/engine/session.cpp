@@ -1528,6 +1528,10 @@ void pulsar_session::invalidate() {
         const uint32_t b = gpu_graph_cur_bank(&s->graph);
         s->graph.ms_spec_save_rows[b] = 0u;
         s->graph.ms_comp_state_stale[b] = false;
+        /* plan-33 inc C: a partial cut's boundary-row stash describes the replay
+         * that followed it.  A new conversation's emits start over row 0, so the
+         * hook must not byte-restore the dead conversation's row. */
+        s->graph.ms_emit_keep[b] = 0u;
     }
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first

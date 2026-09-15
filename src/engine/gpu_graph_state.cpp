@@ -164,6 +164,12 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.dspark_raw[i]);
         pulsar_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
+    /* plan-33 inc C boundary-row stash (one pair for the whole pool, so outside
+     * the per-layer loop above). */
+    pulsar_gpu_tensor_free(g->emit_stash_comp);
+    pulsar_gpu_tensor_free(g->emit_stash_index);
+    g->emit_stash_comp = NULL;
+    g->emit_stash_index = NULL;
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     pulsar_gpu_batched_copy_free(g->spec_snap_copies);

@@ -529,6 +529,16 @@ static bool gpu_graph_bank_slabs_alloc(
                                        (uint64_t)n_banks * (index_lane / sizeof(float)))));
         }
     }
+    /* plan-33 inc C: the partial-fork boundary-row stash (one packed comp row +
+     * one packed index row per (bank, layer); a few hundred KB total).  Read and
+     * written only by an overlapping compressor's partial cut. */
+    if (ok) {
+        const uint64_t stash_comp_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+        const uint64_t stash_idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+        g->emit_stash_comp = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * stash_comp_row);
+        g->emit_stash_index = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * stash_idx_row);
+        ok = g->emit_stash_comp && g->emit_stash_index;
+    }
     return ok;
 }
 
@@ -586,6 +596,9 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         /* Finding 2: a freed bank contributes 0 resident KV. */
         g->ms_n_comp[bank][il] = 0;
     }
+    /* plan-33: an evicted bank's boundary stash is meaningless -- disarm the
+     * emit-restore hook so a later cold refill cannot restore stale bytes. */
+    g->ms_emit_keep[bank] = 0u;
     if (!table_ok) {
         fprintf(stderr,
                 "pulsar: WARNING free_physical bank %u: base-table NULL device-write "
@@ -655,10 +668,13 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
 }
 
 /* plan-33 inc C: base alignment for a partial cut = LCM of the layer compress
- * ratios (2 on V4.1): a multiple-of-LCM cut leaves every compressor with an
- * EMPTY in-progress group, so the forked bank's rows below the cut are final
- * and its state is the canonical empty one (0731's ratio-4 overlap needed a
- * stashed boundary row here; CSA2 has no overlap). */
+ * ratios (128 on Flash): a multiple-of-LCM cut closes every group, so every
+ * row below it is final.  For a COFF-1 compressor the state at such a cut is
+ * the canonical empty group and the replay rebuilds everything from R.  An
+ * OVERLAPPING compressor (coff 2 -- and only ratio 4 overlaps, so one threshold
+ * names every such layer) pools the row for the group AT the cut from tokens on
+ * BOTH sides of it, so that single row is byte-stashed from src and restored
+ * over the replay's recomputation by gpu_graph_emit_keep_restore. */
 static uint32_t u32_gcd(uint32_t a, uint32_t b) { while (b) { const uint32_t t = a % b; a = b; b = t; } return a; }
 uint32_t pulsar_partial_fork_base_align(void) {
     static uint32_t a = 0;
@@ -677,22 +693,58 @@ uint32_t pulsar_partial_fork_base_align(void) {
     return a;
 }
 
-/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C). Clone bank src's KV
- * TRUNCATED at position R into dst (src==dst = in-place truncate: counters
- * only). Preconds: pool on, R >= align, R % align == 0, R <= src_len. Wrapped-
- * ring guard: if src's ring has scrolled past R - raw_window, the replay's
- * attention would read scrolled-out raw rows -- REFUSE (caller cold-prefills).
- * Per layer: raw [0,R) (or the whole wrapped ring); per kv source the comp and
- * index-K rows [0, R/ratio) -- a multiple-of-LCM cut closes every group, so
- * those rows are final and the compressor state at R is the canonical empty
- * one, which dst gets by reset rather than by copy. Caller validates tokens +
- * pins src FIRST. */
+/* plan-33 inc C: byte-REPLACE the recomputed overlapping compressor's boundary
+ * row with the stash.  Fires after any emit that wrote rows starting below the
+ * bank's keep threshold (R/ratio + 1) and self-deactivates once emits move past
+ * it.  Byte-copy -- NEVER re-encode (the MXFP4 QAT is non-idempotent; the
+ * MXFP8 pack byte-copy is trivially bit-exact too).  Same-stream D2D: ordered
+ * after the emit's store and before any later attention read.  No-op when the
+ * pool or the stash is absent, when keep is 0, or when this layer's compressor
+ * has no overlap (its boundary row is reproducible from the replay's own rows). */
+bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+                                 uint32_t row0, uint32_t rows, bool indexer) {
+    if (!g || rows == 0u || bank >= PULSAR_MSEQ_MAX) return true;
+    const uint32_t keep = g->ms_emit_keep[bank];
+    if (keep == 0u || row0 >= keep) return true;
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (ratio == 0u || pulsar_compress_coff(ratio) == 1u) return true;
+    /* Only an index-pool-owning source has the index twin to restore. */
+    if (indexer && !gpu_graph_layer_has_index_pool(il)) return true;
+    pulsar_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
+    if (!stash) return true;
+    const uint64_t row_bytes = indexer ? pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)
+                                       : pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint32_t boundary = keep - 1u;              /* the boundary row index R/ratio */
+    pulsar_gpu_tensor *cache = indexer ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                       : gpu_graph_bank_attn_comp_view(g, il, bank);
+    if (!cache) return false;
+    const bool ok = pulsar_gpu_tensor_copy(cache, (uint64_t)boundary * row_bytes,
+                                           stash,
+                                           ((uint64_t)bank * PULSAR_N_LAYER + il) * row_bytes,
+                                           row_bytes) != 0;
+    pulsar_gpu_tensor_free(cache);
+    return ok;
+}
+
+/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C, the risky core). Clone
+ * bank src's KV TRUNCATED at position R into dst (src==dst = in-place truncate:
+ * no copies, counters/stash only). Preconds: pool on, R >= align, R % align == 0,
+ * R+4 <= src_len (the boundary row R/ratio pools [R-ratio, R+ratio) -- all inside
+ * the validated prefix). Wrapped-ring guard: if src's ring has scrolled past
+ * R - raw_window, the replay's attention would read scrolled-out raw rows --
+ * REFUSE (caller cold-prefills). Per layer: raw [0,R) (or the whole wrapped
+ * ring); per kv source the comp rows [0, R/ratio) -- plus, for an overlapping
+ * compressor, the boundary row R/ratio, kept present-but-invisible (counters at
+ * R/ratio) and armed for byte-restore by the replay's first emit; the index-K
+ * pool likewise where the source owns one. State lanes are copied for hygiene
+ * (the replay re-seeds the compressor state from its own rows). Caller validates
+ * tokens + pins src FIRST. */
 bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t dst,
                                   uint32_t R, uint32_t src_len) {
     if (!g || g->banks.n_banks == 0) return false;
     if (src >= g->banks.n_banks || dst >= g->banks.n_banks) return false;
     const uint32_t align = pulsar_partial_fork_base_align();
-    if (R < align || (R % align) != 0u || R > src_len) return false;
+    if (R < align || (R % align) != 0u || (uint64_t)R + 4u > src_len) return false;
     if (gpu_graph_bank_is_evicted(g, src)) return false;
     if (src != dst && gpu_graph_bank_is_evicted(g, dst) &&
         !gpu_graph_bank_alloc_physical(g, dst)) return false;
@@ -702,34 +754,70 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
     const uint32_t rcap = g->raw_cap;
     const uint64_t oldest = src_len > rcap ? (uint64_t)src_len - rcap : 0u;
     if ((uint64_t)R < oldest + g->raw_window) return false;   /* scrolled out */
+    if (!g->emit_stash_comp || !g->emit_stash_index) return false;
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     const uint64_t raw_row_bytes = b->raw_bank_bytes / rcap;
+    uint32_t keep = 0u;
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
+        const bool source = pulsar_attn_owns_kv(attn->mode);
+        const bool overlap = source && pulsar_compress_coff(attn->ratio) != 1u;
+        const bool index_pool = gpu_graph_layer_has_index_pool(il);
+        if (overlap) keep = R / attn->ratio + 1u;
         if (src != dst) {
             const uint64_t raw_bytes = (uint64_t)(src_len <= rcap ? R : rcap) * raw_row_bytes;
             if (raw_bytes)
                 ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
                                          b->raw[il], (uint64_t)src * b->raw_bank_bytes,
                                          raw_bytes) != 0;
-            if (ok && pulsar_attn_owns_kv(attn->mode)) {
-                const uint64_t crows = (uint64_t)R / attn->ratio;
+            if (ok && source) {
+                /* An overlapping compressor keeps the boundary row too: one row
+                 * past its frontier, invisible to readers (which cap at n_comp)
+                 * and byte-restored once the replay recomputes it. */
+                const uint64_t crows = (uint64_t)R / attn->ratio + (overlap ? 1u : 0u);
                 if (crows) {
                     ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0,
                                              crows * attn_row) != 0;
-                    /* The index-K pool exists only where an indexer does. */
-                    if (ok && gpu_graph_layer_has_index_pool(il)) {
+                    if (ok && index_pool)
                         ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
                                                  crows * idx_row) != 0;
-                    }
+                }
+                if (ok && b->astate_bank_bytes[il]) {
+                    const uint64_t lane = b->astate_bank_bytes[il];
+                    ok = pulsar_gpu_tensor_copy(b->askv[il], (uint64_t)dst * lane,
+                                             b->askv[il], (uint64_t)src * lane, lane) != 0;
+                    if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * lane,
+                                                     b->assc[il], (uint64_t)src * lane, lane) != 0;
+                }
+                if (ok && b->istate_bank_bytes[il]) {
+                    const uint64_t lane = b->istate_bank_bytes[il];
+                    ok = pulsar_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * lane,
+                                             b->iskv[il], (uint64_t)src * lane, lane) != 0;
+                    if (ok) ok = pulsar_gpu_tensor_copy(b->issc[il], (uint64_t)dst * lane,
+                                                     b->issc[il], (uint64_t)src * lane, lane) != 0;
                 }
             }
         }
-        if (ok && pulsar_attn_owns_kv(attn->mode)) g->ms_n_comp[dst][il] = R / attn->ratio;
+        if (!ok) break;
+        /* Boundary-row stash (from SRC's rows -- identical to dst's copy, and the
+         * only source for the src==dst truncate). */
+        if (overlap) {
+            const uint32_t boundary = R / attn->ratio;
+            ok = pulsar_gpu_tensor_copy(g->emit_stash_comp,
+                                     ((uint64_t)dst * PULSAR_N_LAYER + il) * attn_row,
+                                     b->comp[il][src], (uint64_t)boundary * attn_row,
+                                     attn_row) != 0;
+            if (ok && index_pool)
+                ok = pulsar_gpu_tensor_copy(g->emit_stash_index,
+                                         ((uint64_t)dst * PULSAR_N_LAYER + il) * idx_row,
+                                         b->index[il][src], (uint64_t)boundary * idx_row,
+                                         idx_row) != 0;
+        }
+        if (ok && source) g->ms_n_comp[dst][il] = R / attn->ratio;
     }
-    if (ok) ok = gpu_graph_compressor_state_reset(g, dst);
+    if (ok && keep) g->ms_emit_keep[dst] = keep;
     return ok;
 }
 
@@ -786,6 +874,9 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
                                              b->istate_bank_bytes[il]) != 0;
         }
     }
+    /* A full-prefix clone carries every row, so it needs no boundary stash: clear
+     * any threshold a previous partial cut left on this bank. */
+    g->ms_emit_keep[dst] = 0u;
     return ok;
 }
 

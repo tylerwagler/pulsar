@@ -508,6 +508,12 @@ static bool gpu_graph_csa2_produce(
                                                                n_tokens, before, pos0,
                                                                ratio, freq_base, freq_scale, ext_factor, attn_factor);
         if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, pos0, ratio);
+        /* plan-33 inc C: the partial-fork boundary row -- byte-restore it over
+         * whatever the emit just recomputed.  Both lanes: one emit writes the
+         * comp row and (V4.1) the index-K row, and V4's own index compressor
+         * wrote its row before this call. */
+        if (ok) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, false);
+        if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, true);
         if (ok) {
             g->ms_n_comp[run_bank][il] = before + n_groups;
             for (uint32_t t = 0; t < n_tokens; t++) comp_counts[t] = (pos0 + t + 1u) / ratio;
@@ -585,6 +591,9 @@ static bool gpu_graph_csa2_produce(
                 ok = false;
             }
             if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, bank, 1u, row, pos + 1u - ratio, ratio);
+            /* plan-33 inc C: same boundary-row restore as the batched arm. */
+            if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, false);
+            if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, true);
             if (ok) (*n_comp_slot)++;
         }
         if (ok) comp_counts[t] = *n_comp_slot;

@@ -1411,6 +1411,24 @@ typedef struct {
      * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
      * initialised with the graph. */
     uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
+    /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment C).
+     * ms_emit_keep[bank] is the boundary-row restore threshold: 0 = inactive (a
+     * full-prefix fork clears it; the partial cut sets R/ratio + 1 and the emit
+     * hook overwrites the recomputed boundary row with the packed stash while
+     * row0 < it).  An overlapping compressor (coff 2, 0731's ratio 4) pools a
+     * group's row from tokens on BOTH sides of the group, so the row at the cut
+     * is not reproducible from the replay's own rows; a coff-1 compressor's
+     * boundary row is, and its threshold is never armed. */
+    uint32_t ms_emit_keep[PULSAR_MSEQ_MAX];  ///< boundary-row restore threshold; 0 = inactive
+    /** Boundary-row stash (increment C): one PACKED row per (bank, layer) -- the
+     * overlapping compressor's comp row R/ratio and (where the source has one)
+     * its index-K row, copied byte-for-byte at fork_copy_cut and byte-REPLACED
+     * over the replay's recomputed row by gpu_graph_emit_keep_restore (never
+     * re-encoded: bit-exact for the MXFP8 pack AND the non-idempotent MXFP4 QAT
+     * alike).  Sized n_banks * PULSAR_N_LAYER * row_bytes at slab alloc; NULL
+     * when the pool is disabled. */
+    pulsar_gpu_tensor *emit_stash_comp;   ///< stashed packed comp row per (bank, layer)
+    pulsar_gpu_tensor *emit_stash_index;  ///< stashed packed index row per (bank, layer)
 
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
@@ -2924,6 +2942,12 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t 
  * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il);
+/** plan-33 inc C: after an emit wrote rows [row0, row0+rows) for kv source `il`
+ * on `bank`, byte-replace the overlapping compressor's boundary row with the
+ * stash a partial cut left.  `indexer` selects the index-K lane.  A no-op for a
+ * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
+bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+                                 uint32_t row0, uint32_t rows, bool indexer);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
