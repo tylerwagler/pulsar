@@ -531,6 +531,183 @@ __global__ static void router_select_warp_topk_kernel(
     router_topk_select_warp<NE, TOPK>(local_prob, local_score, sel, w, route_scale);
 }
 
+__device__ static inline float swiglu_act_load(const float *p, uint32_t i) { return p[i]; }
+__device__ static inline float swiglu_act_load(const __half *p, uint32_t i) {
+    float v = __half2float(p[i]);
+    if (isinf(v)) v = copysignf(65504.0f, v);
+    return v;
+}
+
+template <typename AT>
+__global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, uint32_t n, float clamp, float weight,
+                                     __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = pulsar_swiglu_elem(swiglu_act_load(gate, i), swiglu_act_load(up, i), weight, clamp);
+    /* `out` is NULL when the launcher was told the f32 store is dead -- the
+     * MXFP8 consumer reads the encoding below instead.  The branch is uniform
+     * across the whole launch, so it costs nothing in a bandwidth-bound
+     * kernel, and it removes the widest store this kernel makes. */
+    if (out) out[i] = v;
+    if (out_q) {
+        pulsar_mx_emit_block(v, i % mid_dim, i / mid_dim, mid_dim, out_kbp, out_q, out_sf);
+    }
+}
+
+
+
+__global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + b[i];
+}
+
+
+
+__global__ static void directional_steering_project_kernel(
+        float       *x,
+        const float *directions,
+        uint32_t     layer,
+        uint32_t     width,
+        uint32_t     rows,
+        float        scale) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows || width == 0) return;
+
+    float *xr = x + (uint64_t)row * width;
+    const float *dir = directions + (uint64_t)layer * width;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
+        sum += xr[i] * dir[i];
+    }
+
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    const float coeff = scale * partial[0];
+    for (uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
+        xr[i] -= coeff * dir[i];
+    }
+}
+
+
+int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
+                                uint32_t n, float clamp, float weight,
+                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
+                                int skip_f32) {
+    /* gate/up carry their own element size (L033 increment 2: prefill stages
+     * them f16; decode's fused path passes f32 scratch and takes the float
+     * instantiation untouched).  They must AGREE — one f16 and one f32 means a
+     * caller narrowed half a pair, the [[L035]] shape. */
+    const uint32_t act_esz = pulsar_tensor_esz(gate);
+    if (!out || !gate || !up ||
+        act_esz != pulsar_tensor_esz(up) ||
+        (act_esz != sizeof(float) && act_esz != sizeof(__half)) ||
+        out->bytes < (uint64_t)n * sizeof(float) ||
+        gate->bytes < (uint64_t)n * act_esz ||
+        up->bytes < (uint64_t)n * act_esz) {
+        if (gate && up && pulsar_tensor_esz(gate) != pulsar_tensor_esz(up))
+            fprintf(stderr, "pulsar: swiglu gate/up element sizes disagree (%u vs %u) -- refusing\n",
+                    pulsar_tensor_esz(gate), pulsar_tensor_esz(up));
+        return 0;
+    }
+    /* skip_f32 without an encoding to replace it would write NOTHING and leave
+     * the consumer reading stale bytes.  Same failure shape as a skipped
+     * emission, so it gets the same treatment: refuse, do not silently
+     * downgrade to storing f32 (that would hide a caller bug behind a
+     * correct-looking run). */
+    if (skip_f32 && !out_q) {
+        fprintf(stderr, "pulsar: swiglu asked to skip the f32 store with no E4M3 slot "
+                        "(n=%u mid_dim=%u) -- refusing\n", n, mid_dim);
+        return 0;
+    }
+    /* FAIL LOUD rather than silently skip the emission: the caller arms the
+     * activation cache off the same slot pointer, so a skipped emission leaves
+     * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
+     * n must fill whole blocks (no lane exits before the warp shuffle) and
+     * mid_dim must be a whole number of MX blocks. */
+    if (out_q && ((n % 256u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
+        fprintf(stderr, "pulsar: swiglu cannot emit MX for n=%u mid_dim=%u "
+                        "(need n %% 256 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
+        return 0;
+    }
+    /* Announce once per shape.  A byte-identical gate cannot tell "the store
+     * was skipped" from "the skip never fired", and a silently-inert
+     * optimisation looks exactly like a working one -- same reason the A8 GEMV
+     * arms announce themselves in pulsar_cuda_matmul.cu. */
+    if (skip_f32) {
+        static uint32_t seen_n[8] = {0};
+        static int n_seen = 0;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_n[i] == n) { known = 1; break; }
+        if (!known && n_seen < 8) {
+            seen_n[n_seen++] = n;
+            fprintf(stderr, "pulsar: swiglu f32 store SKIPPED (n=%u mid_dim=%u, %.1f MiB/layer)\n",
+                    n, mid_dim, (double)n * sizeof(float) / (1024.0 * 1024.0));
+        }
+    }
+    if (act_esz == sizeof(__half)) {
+        /* Announce once: a byte gate cannot distinguish "reading the f16
+         * staging" from "the narrowing never went live" (same rule as the
+         * skip announcement above). */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: swiglu reading F16 gate/up staging (n=%u mid_dim=%u)\n",
+                    n, mid_dim);
+        }
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const __half *)gate->ptr, (const __half *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    } else {
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    }
+    return cuda_ok(cudaGetLastError(), "swiglu launch");
+}
+
+
+
+int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
+    if (!out || !a || !b ||
+        out->bytes < (uint64_t)n * sizeof(float) ||
+        a->bytes < (uint64_t)n * sizeof(float) ||
+        b->bytes < (uint64_t)n * sizeof(float)) return 0;
+    add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    return cuda_ok(cudaGetLastError(), "add launch");
+}
+
+
+int pulsar_gpu_directional_steering_project_tensor(
+        pulsar_gpu_tensor       *x,
+        const pulsar_gpu_tensor *directions,
+        uint32_t                layer,
+        uint32_t                width,
+        uint32_t                rows,
+        float                   scale) {
+    if (!x || !directions || width == 0 || rows == 0 || scale == 0.0f) return 0;
+    const uint64_t x_bytes = (uint64_t)width * rows * sizeof(float);
+    const uint64_t dir_bytes = (uint64_t)(layer + 1u) * width * sizeof(float);
+    if (x->bytes < x_bytes || directions->bytes < dir_bytes) return 0;
+
+    uint32_t nth = 256u;
+    while (nth > width && nth > 1u) nth >>= 1;
+    directional_steering_project_kernel<<<rows, nth>>>(
+            (float *)x->ptr,
+            (const float *)directions->ptr,
+            layer,
+            width,
+            rows,
+            scale);
+    return cuda_ok(cudaGetLastError(), "directional steering launch");
+}
+
 /* The HASH-ROUTED arm -- 0731's leading layers (pulsar_shape::n_hash_layer),
  * which name their experts by TOKEN ID instead of selecting them from the
  * logits.  Restored for the two-profile engine (PLAN 96 s16); V4.1 has no such
