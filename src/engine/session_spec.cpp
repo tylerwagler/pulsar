@@ -309,19 +309,33 @@ static void spec_frontier_free(pulsar_spec_frontier *f) {
  * only builds descriptor tables, so retrying is cheap. */
 static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return true;
-    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 2];
-    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 2];
-    uint64_t bytes[PULSAR_MAX_LAYER * 2];
+    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
+    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
+    uint64_t bytes[PULSAR_MAX_LAYER * 4];
     uint32_t n = 0;
     uint64_t mx = 0;
     /* CSA2 (L218): the only recurrent state is the ratio-2 kv sources' pending
-     * group (kv + score); ratio-1 sources and member layers carry none. */
+     * group (kv + score); ratio-1 sources and member layers carry none.
+     * V4 has a SECOND such lane: the indexer's own compressor, which exists
+     * exactly where the profile says so (s119 found this copy set missing it;
+     * a rejected round then rolled the attention lane back and left the
+     * indexer's carry where the rejected draft had put it). */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
         const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
         dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
         if (ab > mx) mx = ab;
+        if (g->layer_index_state_kv[il]) {
+            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            dst[n] = g->spec_index_state_kv[il];
+            src[n] = g->layer_index_state_kv[il];
+            bytes[n++] = ib;
+            dst[n] = g->spec_index_state_score[il];
+            src[n] = g->layer_index_state_score[il];
+            bytes[n++] = ib;
+            if (ib > mx) mx = ib;
+        }
     }
     if (n == 0) {
         /* No stateful compressor: there is genuinely nothing to copy (copy_n

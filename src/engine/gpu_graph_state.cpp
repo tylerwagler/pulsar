@@ -134,6 +134,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
+        pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
+        pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */
@@ -149,8 +151,12 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.index_bases[il]);
         pulsar_gpu_tensor_free(g->banks.askv[il]);
         pulsar_gpu_tensor_free(g->banks.assc[il]);
+        pulsar_gpu_tensor_free(g->banks.iskv[il]);
+        pulsar_gpu_tensor_free(g->banks.issc[il]);
         pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
         pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */

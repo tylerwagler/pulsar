@@ -449,6 +449,7 @@ static bool gpu_graph_bank_slabs_alloc(
          * pool and (at ratio > 1) a compressor state lane. */
         if (!ok || attn->mode != PULSAR_ATTN_FULL) continue;
 
+        const bool indexed = pulsar_attn_runs_indexer(attn->mode);
         /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
          * state is twice as wide and twice as tall as V4.1's.  coff is 1 for
          * every ratio V4.1 uses, so this is inert there. */
@@ -481,22 +482,45 @@ static bool gpu_graph_bank_slabs_alloc(
                                   (uint64_t)n_banks * sizeof(void *)) &&
              pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
                                   (uint64_t)n_banks * sizeof(void *));
+        /* V4's indexer keeps a SECOND recurrent lane (it compresses its own key);
+         * V4.1 derives the index key from the latent and keeps none.  Same two
+         * authorities, the indexer's width. */
+        const bool own_index = g_pulsar_shape.indexer_own_compressor && indexed;
+        const uint64_t index_lane = own_index && attn_rows
+            ? pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
+              pulsar_comp_state_rows(attn->ratio) * sizeof(float) : 0u;
+        b->istate_bank_bytes[il] = index_lane;
         if (ok && attn_lane) {
             b->askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
             b->assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+            if (index_lane) {
+                b->iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                b->issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            }
             /* L183 grid snapshot lanes: written by a save before any restore reads them. */
             if (enable_spec) {
                 /* No fill: a snapshot always writes a lane before its restore
                  * reads it, and nothing else reads these. */
                 b->spec_askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
                 b->spec_assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+                if (index_lane) {
+                    b->spec_iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                    b->spec_issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                    ok = ok && b->spec_iskv[il] && b->spec_issc[il];
+                }
                 ok = ok && b->spec_askv[il] && b->spec_assc[il];
             }
             ok = ok && b->askv[il] && b->assc[il] &&
+                 (!index_lane || (b->iskv[il] && b->issc[il])) &&
                  gpu_tensor_fill_f32(b->askv[il], 0.0f,
                                      (uint64_t)n_banks * attn_width * attn_rows) &&
                  gpu_tensor_fill_f32(b->assc[il], PULSAR_NEG_INF,
-                                     (uint64_t)n_banks * attn_width * attn_rows);
+                                     (uint64_t)n_banks * attn_width * attn_rows) &&
+                 (!index_lane ||
+                  (gpu_tensor_fill_f32(b->iskv[il], 0.0f,
+                                       (uint64_t)n_banks * (index_lane / sizeof(float))) &&
+                   gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
+                                       (uint64_t)n_banks * (index_lane / sizeof(float)))));
         }
     }
     return ok;
@@ -741,6 +765,16 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
                                              b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
                                              b->astate_bank_bytes[il]) != 0;
         }
+        /* V4's indexer-compressor lane is a second recurrent lane and clones with
+         * the rest of the bank. */
+        if (ok && b->istate_bank_bytes[il]) {
+            ok = pulsar_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                     b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                     b->istate_bank_bytes[il]) != 0;
+            if (ok) ok = pulsar_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                             b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                             b->istate_bank_bytes[il]) != 0;
+        }
     }
     return ok;
 }
@@ -773,6 +807,28 @@ bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
         pulsar_gpu_tensor_free(vk);
         pulsar_gpu_tensor_free(vs);
         if (!ok) { fprintf(stderr, "pulsar: compressor state reset failed at layer %u\n", il); return false; }
+        /* V4: the indexer's own compressor is a SECOND recurrent lane with the
+         * same empty group (kv 0 / score -INF).  It lives only on an indexed
+         * ratio-4 source, and leaving it unreset would carry a stale slot into
+         * the next bank that uses this one. */
+        if (g->banks.n_banks) {
+            pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, bank);
+            pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, bank);
+            if (!ik && !is) continue;   /* V4.1: no such lane */
+            const bool iok = ik && is &&
+                             gpu_tensor_fill_f32(ik, 0.0f, pulsar_gpu_tensor_bytes(ik) / sizeof(float)) &&
+                             gpu_tensor_fill_f32(is, PULSAR_NEG_INF, pulsar_gpu_tensor_bytes(is) / sizeof(float));
+            pulsar_gpu_tensor_free(is);
+            pulsar_gpu_tensor_free(ik);
+            if (!iok) { fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il); return false; }
+        } else if (g->layer_index_state_kv[il]) {
+            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, ib / sizeof(float)) ||
+                !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, ib / sizeof(float))) {
+                fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il);
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -797,6 +853,13 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
          * name until the carry is stashed; the caller invalidates the checkpoint,
          * which is the honest outcome.  See s29 for the design. */
         if (pulsar_compress_coff(ratio) != 1u) {
+            /* This refusal is also what keeps V4's SECOND recurrent lane (the
+             * indexer's own compressor) honest: an index lane exists only on an
+             * indexed ratio-4 source, and ratio 4 is exactly coff 2, so a lane
+             * whose carry cannot be rebuilt never reaches the rebuild below.
+             * That is why the index lane is reset above but not replayed here; a
+             * profile that ever indexes a non-overlapping ratio must extend this
+             * with the same replay the attention lane gets. */
             fprintf(stderr,
                     "pulsar: kv source %u: rewind to %u would rebuild only the pending group, and the "
                     "overlap lane's carry half is not recoverable from the verify saves -- refusing\n",
@@ -869,6 +932,30 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
                 b->assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
                 b->astate_bank_bytes[il]);
         ok = g->layer_attn_state_kv[il] && g->layer_attn_state_score[il];
+        /* V4: the indexer-compressor lane follows the bank too (views only; the
+         * lane is eager slab memory, not per-bank managed). */
+        if (ok && b->istate_bank_bytes[il]) {
+            pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
+            pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
+            g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
+                    b->iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                    b->istate_bank_bytes[il]);
+            g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
+                    b->issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                    b->istate_bank_bytes[il]);
+            ok = g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+            if (ok && b->spec_iskv[il]) {
+                pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
+                pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
+                g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                        b->spec_iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+                g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                        b->spec_issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+                ok = g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+            }
+        }
         /* inc 6: the spec frontier snapshot lanes follow the live views, so
          * the snapshot machinery (incl. its re-prepared copy tables) is
          * bank-correct with no call-site changes. */
@@ -1011,6 +1098,20 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32
 pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
     return bank_lane_view(g, g->banks.assc[il], g->banks.astate_bank_bytes,
                           g->layer_attn_state_score[il], il, bank);
+}
+
+pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    /* No lane at all on a profile whose indexer keeps none: hand back NULL so a
+     * caller can tell "this model has no such lane" from "the bank is wrong". */
+    if (!g || il >= PULSAR_N_LAYER || g->banks.istate_bank_bytes[il] == 0u) return NULL;
+    return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
+                          g->layer_index_state_kv[il], il, bank);
+}
+
+pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    if (!g || il >= PULSAR_N_LAYER || g->banks.istate_bank_bytes[il] == 0u) return NULL;
+    return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
+                          g->layer_index_state_score[il], il, bank);
 }
 
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
@@ -1552,13 +1653,21 @@ bool gpu_graph_alloc_raw_cap(
              * full of whatever the allocator handed back. */
             if (g_pulsar_shape.indexer_own_compressor && indexed && attn_rows != 0u) {
                 if (banked) {
-                    /* The bank slab carries askv/assc but no index twin yet, and
-                     * handing a per-bank caller ONE lane would have every bank
-                     * share the indexer's carry -- a wrong answer, not a crash.
-                     * Refuse by name until the twin lands. */
-                    fprintf(stderr, "pulsar: layer %u: banked mode has no indexer-compressor state lane yet "
-                                    "(%u banks) -- refusing\n", il, g->banks.n_banks);
-                    state_init_ok = false;
+                    /* V4's indexer-compressor lane, per bank, from the slab. */
+                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.iskv[il], 0, g->banks.istate_bank_bytes[il]);
+                    g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
+                            g->banks.issc[il], 0, g->banks.istate_bank_bytes[il]);
+                    if (enable_spec) {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_iskv[il], 0, g->banks.istate_bank_bytes[il]);
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_issc[il], 0, g->banks.istate_bank_bytes[il]);
+                        state_init_ok = state_init_ok &&
+                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                    }
+                    state_init_ok = state_init_ok &&
+                                    g->layer_index_state_kv[il] && g->layer_index_state_score[il];
                 } else {
                     const uint64_t index_state_bytes =
                             pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
@@ -1570,6 +1679,12 @@ bool gpu_graph_alloc_raw_cap(
                                 il, (unsigned long long)index_state_bytes);
                     }
                     state_init_ok = state_init_ok && g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+                    if (enable_spec) {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                        state_init_ok = state_init_ok &&
+                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                    }
                     if (state_init_ok) {
                         const uint64_t n = index_state_bytes / sizeof(float);
                         if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) ||
@@ -1722,14 +1837,25 @@ bool gpu_graph_alloc_raw_cap(
             layer_cache_ok = false;
             break;
         }
+        /* V4's indexer keeps a second recurrent lane; demand it exactly where the
+         * profile says it exists (the same predicate the allocation used). */
+        const bool own_index = g_pulsar_shape.indexer_own_compressor && indexed;
         if (gpu_graph_layer_has_comp_state(il) &&
             (!g->layer_attn_state_kv[il] || !g->layer_attn_state_score[il] ||
-             (enable_spec && (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il])))) {
-            fprintf(stderr, "pulsar: layer %u: compressor state missing (attn %s/%s, spec %s/%s) -- refusing\n",
+             (own_index && (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il])) ||
+             (enable_spec && (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il])) ||
+             (enable_spec && own_index &&
+              (!g->spec_index_state_kv[il] || !g->spec_index_state_score[il])))) {
+            fprintf(stderr, "pulsar: layer %u: compressor state missing (attn %s/%s, index %s/%s, "
+                            "spec %s/%s, spec index %s/%s) -- refusing\n",
                     il, g->layer_attn_state_kv[il] ? "ok" : "MISSING",
                     g->layer_attn_state_score[il] ? "ok" : "MISSING",
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_kv[il] ? "ok" : "MISSING"),
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_score[il] ? "ok" : "MISSING"),
                     !enable_spec ? "off" : (g->spec_attn_state_kv[il] ? "ok" : "MISSING"),
-                    !enable_spec ? "off" : (g->spec_attn_state_score[il] ? "ok" : "MISSING"));
+                    !enable_spec ? "off" : (g->spec_attn_state_score[il] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_kv[il] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_score[il] ? "ok" : "MISSING"));
             layer_cache_ok = false;
             break;
         }
