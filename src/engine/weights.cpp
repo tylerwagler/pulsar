@@ -115,6 +115,21 @@ static void tensor_expect_layout(
 
 
 
+/* Layout check for a tensor the artifact may legitimately omit: absent is fine,
+ * present must be right.  (dev's L216 helper; the merge lost it while keeping
+ * its three callers -- the branch's side had reformatted this spot.) */
+static void tensor_expect_optional(
+        const pulsar_tensor *t,
+        uint32_t          type,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
+}
+
+
+
 /* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
  * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
  * accounting; the FP8 matmul resolver dispatches on the registered offset. */
@@ -325,8 +340,9 @@ static void tensor_expect_routed_expert_combo(
     if (gate_up_pair && gate_ok && down_ok) return;
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s\n"
-            "  gate/up must match, and each of gate/up and down must be one of:",
+            "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
+            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq_k (44); "
+            "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),
@@ -556,10 +572,13 @@ static void weights_validate_layout(
          * (== n_expert for un-pruned models). */
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
-        /* OPTIONAL: absent from Vision-Exp's serving artifact; the router has a
-         * bias-less arm and the bind below is optional_tensorf. */
-        if (l->ffn_exp_probs_b)
-            tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        /* OPTIONAL: 0731's and V4.1's artifacts ship it, Vision-Exp's serving
+         * artifact does not; the router has a bias-less arm and the bind below is
+         * optional_tensorf. */
+        tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        /* Vision-Exp only: the router adds THIS instead of the bias above for
+         * tokens whose id is >= vocab_size (image slots). */
+        tensor_expect_optional(l->ffn_exp_probs_b_vl, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
         if (l->ffn_gate_tid2eid) {
             /* [n_expert_used, n_vocab]: one row of expert ids per token id. */
             tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2,
@@ -1107,6 +1126,97 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
 
 
 
+/* ---- E8M0 scale-plane validation ----------------------------------------
+ *
+ * The custom decode GEMVs decode an E8M0 scale byte as __int_as_float(b << 23),
+ * so 0xFF is +Inf.  cuBLASLt's VEC32_UE8M0 and the CUTLASS block-scaled MMA
+ * read the same byte as NaN (OCP), and the host codec's ldexpf(1, b-127) also
+ * gives +Inf.  Producers clamp to <=254, so 0xFF can only arrive from a foreign
+ * or corrupt file -- and when it does, one artifact runs two different
+ * arithmetics on the same weight.  Scan the E8M0 planes once on the cold load
+ * path (~1/32 of the weight bytes) and refuse the tensor by name.  Data planes
+ * are not scanned: E2M1/E4M3 payload bytes have no invalid encoding.
+ *
+ * E8M0 plane geometry per accepted type (see the consumers for the authority):
+ *   41 mxfp8_lt       [E4M3 data: one byte per element][swizzled E8M0 scale]
+ *   38 fp8_e4m3       33-byte interleaved blocks [E8M0][32 x E4M3]
+ *   40 cutlass_mxfp4   expert-major [data N*K/2][swizzled E8M0 SF] per expert
+ *   46 fp8_e4m3_soa_k [E8M0 scales: E x V/32][E4M3 payload]
+ *
+ * The scan is blocks of block_len bytes every stride bytes; a contiguous plane
+ * is one block.  Sizing that does not match the type's layout is left to the
+ * consumers' own refusals -- this pass must never be the thing that rejects a
+ * shape the engine would otherwise read. */
+static void e8m0_scan_blocks(
+        const pulsar_model *m,
+        const pulsar_tensor *t,
+        uint64_t         off,
+        uint64_t         block_len,
+        uint64_t         stride,
+        uint64_t         nblocks,
+        const char      *what) {
+    if (nblocks == 0 || block_len == 0) return;
+    const uint64_t base = t->abs_offset;
+    /* off + (nblocks-1)*stride + block_len, overflow-checked. */
+    if (off > t->bytes || block_len > t->bytes - off) return;
+    const uint64_t last = off + (nblocks - 1u) * stride;
+    if (last < off || last > t->bytes || block_len > t->bytes - last) return;
+    const uint8_t *map = t->ext_map ? t->ext_map : m->map;
+    const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+    if (base > map_size || last > map_size - base || block_len > map_size - base - last) return;
+
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const uint8_t *p = map + base + off + b * stride;
+        for (uint64_t i = 0; i < block_len; i++) {
+            if (p[i] != 0xFFu) continue;
+            fprintf(stderr,
+                    "pulsar: tensor %.*s: %s E8M0 scale byte 0xFF at plane offset %llu\n",
+                    (int)t->name.len, t->name.ptr, what,
+                    (unsigned long long)(off + b * stride + i));
+            fprintf(stderr,
+                    "pulsar: 0xFF never decodes consistently (custom GEMVs read +Inf, "
+                    "cuBLASLt/CUTLASS read NaN); refusing the artifact\n");
+            exit(1);
+        }
+    }
+}
+
+
+
+static void weights_reject_bad_e8m0(const pulsar_model *m) {
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor *t = &m->tensors[i];
+        switch (t->type) {
+        case PULSAR_TENSOR_MXFP8_LT:
+            /* One E4M3 byte per element, then the scale plane; do not restate
+             * the swizzle geometry here. */
+            if (t->elements > t->bytes) break;
+            e8m0_scan_blocks(m, t, t->elements, t->bytes - t->elements, 0, 1, "MXFP8");
+            break;
+        case PULSAR_TENSOR_FP8_E4M3:
+            e8m0_scan_blocks(m, t, 0, 1, 33u, t->bytes / 33u, "FP8");
+            break;
+        case PULSAR_TENSOR_CUTLASS_MXFP4: {
+            uint64_t data = 0, sf = 0, stride = 0;
+            if (t->ndim < 3) break;
+            cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data, &sf, &stride);
+            e8m0_scan_blocks(m, t, data, sf, stride, t->dim[2], "MXFP4");
+            break;
+        }
+        case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+            /* dims (V, E): scales E x V/32, then the E4M3 payload.  A V not
+             * divisible by 32 is refused by the consumer. */
+            if (t->ndim < 2 || (t->dim[0] & 31u)) break;
+            e8m0_scan_blocks(m, t, 0, t->dim[1] * (t->dim[0] >> 5), 0, 1, "SoA");
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+
+
 static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
     /* 0731's HC head mix.  REQUIRED where the profile says the head computes its
      * own coefficients: a 0731 artifact missing the group would otherwise
@@ -1209,6 +1319,10 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
     /* OPTIONAL, like the drafter's: text-only artifacts do not ship it. */
     l->ffn_exp_probs_b = optional_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    /* Vision-Exp only: the router adds THIS bias instead of ffn_exp_probs_b for
+     * tokens whose id is >= vocab_size (image slots).  Optional for the same
+     * reason as the drafter's: text-only artifacts do not ship it. */
+    l->ffn_exp_probs_b_vl = optional_tensorf(m, "blk.%u.exp_probs_b_vl.bias", il);
     /* 0731's leading layers route by token id.  Required exactly on the hash
      * layers and REFUSED on any other, so an artifact cannot carry a table that
      * would silently replace the gate's routing. */
@@ -1240,6 +1354,7 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
 void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->token_embd = required_tensor(m, "token_embd.weight");
     weights_bind_output(w, m, true, false);
@@ -1305,9 +1420,10 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_layout(l->hc_ffn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
+        /* The DRAFTER's router width, not the target's: 128 experts / top-3 on
+         * V4.1 against a 384 / top-6 target, and 256 / top-6 on 0731. */
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
-        if (l->ffn_exp_probs_b)
-            tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
@@ -1353,6 +1469,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
     /* The drafter's SHAPE is not in the artifact's metadata beyond embedding_length:
@@ -1395,8 +1512,16 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
         l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
         l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
-        /* the drafter's trained router bias (L216: every shipped 0731 artifact
-         * routed its drafter without it; V4.1 ships one per drafter layer) */
+        /* The drafter's expert routing carries the same trained correction bias
+         * as the target's layers (mtp.N.ffn.gate.bias -> dspark.N.exp_probs_b.bias,
+         * F32 [n_expert]).  OPTIONAL, like the target's blk.N.exp_probs_b.bias:
+         * the Vision-Exp artifact ships it on every drafter layer, while the
+         * shipped 0731 drafter predates the template fix and has no such tensor
+         * -- refusing it here would refuse the artifact in production today.
+         * When present the shared layer encoder threads it into the router
+         * (gpu_prefill.cpp, has_bias = ffn_exp_probs_b != NULL), which the
+         * drafter now reaches through the same gpu_graph_encode_layer_ffn_batch.
+         * 0731's drafter rebuild with the bias is a separate follow-up. */
         l->ffn_exp_probs_b = optional_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
         l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
         l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
@@ -1437,6 +1562,77 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     }
 
     dspark_weights_validate_layout(w);
+}
+
+
+/* Vision-Exp tower bind + layout validation.  The artifact carries the vision
+ * tensors but no vision metadata, so every dim is checked against the compiled
+ * PULSAR_VISION_* shape here -- a wrong or half-present tower refuses loudly
+ * rather than producing garbage image features.  Absent tower (no
+ * vision.patch_embed.proj.weight) is not an error: text-only artifacts stay
+ * loadable.  Reference: the checkpoint's inference/vision.py. */
+bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
+    memset(w, 0, sizeof(*w));
+    if (!model_find_tensor(m, "vision.patch_embed.proj.weight")) return false;
+
+    const uint64_t D  = PULSAR_VISION_DIM;
+    const uint64_t N  = PULSAR_VISION_HEADS;
+    const uint64_t I  = PULSAR_VISION_INTER;
+    const uint64_t P  = 3ull * PULSAR_VISION_PATCH * PULSAR_VISION_PATCH;
+    const uint64_t A1 = D * PULSAR_VISION_DOWNSAMPLE * PULSAR_VISION_DOWNSAMPLE;
+    const uint64_t T  = PULSAR_N_EMBD;
+
+    w->patch_proj    = required_tensor(m, "vision.patch_embed.proj.weight");
+    w->patch_bias    = required_tensor(m, "vision.patch_embed.proj.bias");
+    w->norm          = required_tensor(m, "vision.norm.weight");
+    w->aligner_w1    = required_tensor(m, "aligner.w1.weight");
+    w->aligner_b1    = required_tensor(m, "aligner.w1.bias");
+    w->aligner_w2    = required_tensor(m, "aligner.w2.weight");
+    w->aligner_b2    = required_tensor(m, "aligner.w2.bias");
+    w->image_start   = required_tensor(m, "image_start");
+    w->image_end     = required_tensor(m, "image_end");
+    w->image_newline = required_tensor(m, "image_newline");
+    w->image_pad     = required_tensor(m, "image_pad");
+
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li);
+        w->block[li].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li);
+        w->block[li].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li);
+        w->block[li].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li);
+        w->block[li].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li);
+        w->block[li].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li);
+        w->block[li].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li);
+        w->block[li].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li);
+    }
+    w->n_layers = PULSAR_VISION_LAYERS;
+
+    tensor_expect_f32_or_bf16(w->patch_proj, 2, P, D, 0);
+    tensor_expect_f32_or_bf16(w->patch_bias, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->norm, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w1, 2, A1, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b1, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w2, 2, T, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b2, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_start, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_end, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_newline, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
+
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv, 2, D, 3u * D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv_bias, 1, 3u * D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo, 2, D, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo_bias, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].norm2, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w1, 2, D, 2u * I, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w2, 2, I, D, 0);
+    }
+    /* The head count must divide the width; the tower asserts it here so the
+     * forward can assume a whole head_dim. */
+    if (D % N != 0)
+        pulsar_die("vision: dim is not a multiple of n_heads");
+    return true;
 }
 
 

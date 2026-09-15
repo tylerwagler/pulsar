@@ -9,10 +9,21 @@
  *  1. CO-SCHEDULING NEUTRALITY (the reason the gate exists): a session's
  *     emitted token stream must not depend on WHICH other sessions share its
  *     batch, nor on how many -- bank k's stream over STEPS greedy steps at
- *     N=2 must be token-identical to bank k's stream at N=3.  N=1 is not in
- *     the comparison: a 1-row batch dispatches the single-row kernel tiers,
- *     so N=1 against N>=2 compares two kernel paths rather than
- *     co-scheduling (cuda-row-neutrality-gate compares those, on logits).
+ *     N=2 must be token-identical to bank k's stream at N=3, AND the raw
+ *     step-1 logits of the shared banks must be byte-identical across the two
+ *     widths.  N=1 is not in the comparison: a 1-row batch dispatches the
+ *     single-row kernel tiers, so N=1 against N>=2 compares two kernel paths
+ *     rather than co-scheduling (cuda-row-neutrality-gate compares those, on
+ *     logits).  STEPS is 64 (L220), not 512: the width-keyed branch is the
+ *     per-row-count instantiation switch (pulsar_cuda_matmul.cu `switch
+ *     (n_tok) case 2: case 3:`; the MoE small-batch GEMV takes every decode
+ *     row at any width), and it is selected by n_active on the FIRST step and
+ *     re-selected identically on every later one -- steps 2..512 re-run the
+ *     same two instantiations over the same banks, so they buy repetition,
+ *     not coverage.  The position-keyed dispatch the long run was once
+ *     thought to reach (the indexer top-k buckets at n_comp 1024/2048/4096)
+ *     is not reached at STEPS=512 either: the longest bank's ratio-4 index
+ *     comp count is ~255 there and ~143 at 64, both inside the <=1024 arm.
  *  2. MIXED-ENTRY IDENTITY: pulsar_session_decode_mixed (heap descriptors,
  *     the server worker's entry) must equal pulsar_session_decode_multiseq
  *     (stack descriptors) for a decode-only batch -- token streams over
@@ -426,14 +437,26 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int k = 0; k < n; k++) multi[n - 1][k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
         ref_l1[n - 1] = (float *)malloc((size_t)n * vocab_w * sizeof(float));
         double secs = 0.0;
+        pulsar_gate_shape s0; pulsar_gate_shape_read(&s0);
         if (!multi_run(s, n, steps, multi[n - 1], &secs, false, ref_l1[n - 1], n == maxn)) {
             CHECK(0, "N=%d: multi run failed", n);
             continue;
         }
+        /* NON-VACUITY (L220): this leg must have run `steps` batched steps at
+         * EXACTLY width n -- the engine's own funnel counter, not a second
+         * copy.  A leg that silently collapsed to another width would make the
+         * cross-width comparison below vacuous while still passing. */
+        pulsar_gate_shape s1; pulsar_gate_shape_read(&s1);
+        const uint64_t dc = s1.step_calls - s0.step_calls, dr = s1.step_rows - s0.step_rows;
+        CHECK(dc == (uint64_t)steps && dr == (uint64_t)n * (uint64_t)steps,
+              "N=%d: the leg ran %llu step call(s) / %llu row(s), want %d of %d -- the "
+              "width axis was not exercised", n, (unsigned long long)dc,
+              (unsigned long long)dr, steps, n * steps);
         have[n - 1] = true;
         printf("N=%d: %d steps x %d sessions in %.1fs -> aggregate %.2f tok/s "
-               "(%.2f tok/s/session)\n",
-               n, steps, n, secs, (double)n * steps / secs, (double)steps / secs);
+               "(%.2f tok/s/session) [shape: %llu calls / %llu rows]\n",
+               n, steps, n, secs, (double)n * steps / secs, (double)steps / secs,
+               (unsigned long long)dc, (unsigned long long)dr);
     }
 
     /* HARD GATE 2: the mixed-descriptor entry must be BYTE-IDENTICAL to the
@@ -473,9 +496,25 @@ int GATE_ENTRY(int argc, char **argv) {
     }
 
     /* HARD GATE 1: co-scheduling neutrality -- bank k's stream must not
-     * depend on which/how many OTHER sessions share the batch (n >= 2). */
+     * depend on which/how many OTHER sessions share the batch (n >= 2), and
+     * (L220) the shared banks' step-1 logits must be byte-identical across
+     * the widths.  The logits leg is the level the engine's contract is
+     * written at ("a decode row's bytes depend on neither its batchmates nor
+     * the batch width", pulsar_gpu.h); the argmax-stream leg walks it past
+     * the descriptor/head-layout risk that logits alone would not. */
     for (int n = 3; n <= maxn; n++) {
         if (!have[n - 1] || !have[1]) continue;
+        /* The reference run is N=2 (banks 0,1); both banks exist at every
+         * n >= 2, so 2*vocab floats are shared. */
+        const size_t lb = (size_t)2 * vocab_w * sizeof(float);
+        const int ldiff = memcmp(ref_l1[n - 1], ref_l1[1], lb);
+        CHECK(ldiff == 0,
+              "co-scheduling NOT neutral at the byte level: banks 0,1 step-1 "
+              "logits at N=%d differ from N=2 (memcmp != 0) -- the batch width "
+              "reached a row's numerics", n);
+        if (ldiff == 0)
+            printf("CO-SCHED NEUTRALITY: banks 0,1 step-1 logits byte-identical "
+                   "at N=2 and N=%d (2 x %d floats)\n", n, vocab_w);
         for (int k = 0; k < 2; k++) {
             int diff = -1;
             for (int j = 0; j <= steps; j++) {

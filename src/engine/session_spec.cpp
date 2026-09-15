@@ -192,7 +192,10 @@ int gpu_graph_spec_dump_active(void) {
  * below is re-measured on the same instrument; guard = step / plain, so both sides
  * carry the same ~3% profiler overhead and the ratio is clean. */
 #define PULSAR_QUENCH_FLAT_MS    45.0f
-#define PULSAR_QUENCH_ROW_MS     7.17f
+/* The row term is the engine-wide authority (PULSAR_SPEC_ROW_MS, pulsar.h):
+ * the server's overflow K-allocator prices the same row, so the number lives
+ * in exactly one place. */
+#define PULSAR_QUENCH_ROW_MS     PULSAR_SPEC_ROW_MS
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
@@ -488,7 +491,10 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
     pulsar_engine *e = s->engine;
     for (int i = 0; i < 3; i++) {
         if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
-        if (!pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
+        /* Async: project_main_x below reads these on the same (per-thread)
+         * stream; nothing on the host reads them before the sync that already
+         * bounds the step. */
+        if (!pulsar_gpu_tensor_copy_async(g->dspark_target_h[i], 0,
                                  g->dspark_target_h_batch[i],
                                  (uint64_t)row * PULSAR_N_EMBD * sizeof(float),
                                  (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;
@@ -1096,6 +1102,13 @@ static int spec_round_begin(pulsar_session *s, int first_token,
             if (d < g->spec_compact_acc_delta) g->spec_compact_acc_delta = d;
         }
         g->spec_compact_acc_n++;
+        /* L219: the greedy arm.  temperature <= 0 is the only condition: the
+         * walk then consults row argmaxes and nothing else, which a device
+         * argmax readback can supply without the full rows. */
+        const bool greedy = temperature <= 0.0f;
+        if (g->spec_argmax_acc_n == 0) g->spec_argmax_acc_ok = greedy;
+        else                           g->spec_argmax_acc_ok = g->spec_argmax_acc_ok && greedy;
+        g->spec_argmax_acc_n++;
     }
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
@@ -1603,6 +1616,12 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     g->spec_compact_delta = g->spec_compact_acc_delta;
     g->spec_compact_acc_n = 0;
     g->spec_compact_acc_ok = false;
+    /* The fused lane already has device row argmaxes from
+     * gpu_graph_verify_suffix_tops, so it never arms the greedy readback --
+     * but it must retire the accumulator this round fed. */
+    g->spec_argmax_armed = false;
+    g->spec_argmax_acc_n = 0;
+    g->spec_argmax_acc_ok = false;
     bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
                                            &s->checkpoint,
                                            (uint32_t)r.saved_len, r.n_batch,
@@ -1851,6 +1870,20 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
         return spec_round_end(s, r, first_token, eos_token,
                               temperature, top_k, top_p, min_p, rng,
                               spec_row_read_dev, &src, row0, g->spec_compact_host,
+                              true /* L150: redraft deferred to the batch */,
+                              0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
+                              forced_truth, accepted, accepted_cap, err, errlen);
+    }
+    /* L219: the greedy readback replaced the full rows with per-row argmaxes.
+     * The walk needs only these; the one full row the s->logits refresh wants
+     * is read from the device on demand. */
+    if (g->spec_argmax_rows >= row0 + r->n_batch && g->spec_argmax_host) {
+        for (uint32_t i = 0; i < r->K && i < 16u; i++)
+            r->row_tops[i] = g->spec_argmax_host[row0 + i];
+        spec_dev_rows src = { g, row0 };
+        return spec_round_end(s, r, first_token, eos_token,
+                              temperature, top_k, top_p, min_p, rng,
+                              spec_row_read_dev, &src, row0, NULL,
                               true /* L150: redraft deferred to the batch */,
                               0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                               forced_truth, accepted, accepted_cap, err, errlen);
@@ -2351,10 +2384,17 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
     if (n_rows > 0) {
         g->spec_compact_armed = g->spec_compact_acc_n > 0 && g->spec_compact_acc_ok;
         g->spec_compact_delta = g->spec_compact_acc_delta;
+        g->spec_argmax_armed = !g->spec_compact_armed &&
+                               g->spec_argmax_acc_n > 0 && g->spec_argmax_acc_ok;
     } else {
         g->spec_compact_armed = false;
         g->spec_compact_acc_n = 0;
         g->spec_compact_acc_ok = false;
+        /* The argmax rows stay live for the per-bank round ends that follow the
+         * step; only the arming and the accumulator retire here. */
+        g->spec_argmax_armed = false;
+        g->spec_argmax_acc_n = 0;
+        g->spec_argmax_acc_ok = false;
     }
 }
 

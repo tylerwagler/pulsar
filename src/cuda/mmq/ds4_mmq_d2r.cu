@@ -1104,6 +1104,12 @@ __device__ __forceinline__ static float d2r_e4m3_to_f32(uint8_t bits) {
     return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
 }
 
+/* PAIR=false is the down-tensor arm (L210's decode tier applied to the single
+ * tensor): the same dataflow minus the up half, so the down projection stops
+ * running the N-starved MMA tile at decode.  PAIR=true must stay the gate/up
+ * arithmetic byte-for-byte; the guard around the up computation is what keeps
+ * the gate accumulation order untouched. */
+template <bool PAIR>
 __global__ void __launch_bounds__(kDecodeGemvRows * kDecodeGemvWarps)
 gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
                               const void * __restrict__ up_soa,
@@ -1169,11 +1175,11 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
     for (int b256 = warp; b256 < nb; b256 += kDecodeGemvWarps) {
         if (!row_ok) break;
         const float dgb = __half2float(dg[(uint64_t)b256 * (uint64_t)M + row]);
-        const float dub = __half2float(du[(uint64_t)b256 * (uint64_t)M + row]);
+        const float dub = PAIR ? __half2float(du[(uint64_t)b256 * (uint64_t)M + row]) : 0.0f;
         const uint2 *qgb = qg + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
         const uint2 *qub = qu + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
         const float *xb = s_x + b256 * 256;
-        /* All 16 code words of this k256 block (8 gate, 8 up; 256 contiguous bytes
+        /* All code words of this k256 block (8 per matrix, 256 contiguous bytes
          * per warp each) are fetched before any of them is used: the round-3
          * profile was 77% long_scoreboard with one or two loads in flight per
          * warp.  Same lesson as L203 on the tile. */
@@ -1181,12 +1187,11 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
 #pragma unroll
         for (int cw = 0; cw < 8; ++cw) {
             cgw[cw] = qgb[(uint64_t)cw * (uint64_t)M];
-            cuw[cw] = qub[(uint64_t)cw * (uint64_t)M];
+            if constexpr (PAIR) cuw[cw] = qub[(uint64_t)cw * (uint64_t)M];
         }
 #pragma unroll
         for (int cw = 0; cw < 8; ++cw) {
             const uint2 cg = cgw[cw];
-            const uint2 cu = cuw[cw];
             /* The activations come out of shared memory as two float4 broadcasts
              * per 8-weight group -- ONE shared load per 4 MACs per matrix. The
              * first cut loaded one float per weight and saturated the LSU pipe
@@ -1196,41 +1201,53 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
                 const uint64_t grid_g = s_grid[(cg.x >> (8 * g)) & 0xffu];
-                const uint64_t grid_u = s_grid[(cu.x >> (8 * g)) & 0xffu];
                 const uint32_t sgn_g = ds4_unpack_ksigns((uint8_t)((cg.y >> (7 * g)) & 0x7fu));
-                const uint32_t sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
                 const float4 xa = x4[g * 2], xb4 = x4[g * 2 + 1];
                 const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb4.x, xb4.y, xb4.z, xb4.w};
                 const uint32_t glo = (uint32_t)grid_g, ghi = (uint32_t)(grid_g >> 32);
-                const uint32_t ulo = (uint32_t)grid_u, uhi = (uint32_t)(grid_u >> 32);
+                uint32_t ulo = 0, uhi = 0, sgn_u = 0;
+                if constexpr (PAIR) {
+                    const uint2 cu = cuw[cw];
+                    const uint64_t grid_u = s_grid[(cu.x >> (8 * g)) & 0xffu];
+                    sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
+                    ulo = (uint32_t)grid_u, uhi = (uint32_t)(grid_u >> 32);
+                }
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     /* byte j of the 8-byte grid entry, zero-extended in one op */
                     const uint32_t bg = __byte_perm(j < 4 ? glo : ghi, 0u, 0x4440u | (uint32_t)(j & 3));
-                    const uint32_t bu = __byte_perm(j < 4 ? ulo : uhi, 0u, 0x4440u | (uint32_t)(j & 3));
                     /* sign = bit j of the sign byte, moved to the float sign bit */
                     const float mg = __uint_as_float(__float_as_uint((float)bg) | (((sgn_g >> j) & 1u) << 31));
-                    const float mu = __uint_as_float(__float_as_uint((float)bu) | (((sgn_u >> j) & 1u) << 31));
                     sg = fmaf(mg, xv[j], sg);
-                    su = fmaf(mu, xv[j], su);
+                    if constexpr (PAIR) {
+                        const uint32_t bu = __byte_perm(j < 4 ? ulo : uhi, 0u, 0x4440u | (uint32_t)(j & 3));
+                        const float mu = __uint_as_float(__float_as_uint((float)bu) | (((sgn_u >> j) & 1u) << 31));
+                        su = fmaf(mu, xv[j], su);
+                    }
                 }
             }
             const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
-            const float lsu = (float)((int)(cu.y >> 27) | 1) * 0.125f;
             acc_g = fmaf(dgb * lsg, sg, acc_g);
-            acc_u = fmaf(dub * lsu, su, acc_u);
+            if constexpr (PAIR) {
+                const uint2 cu = cuw[cw];
+                const float lsu = (float)((int)(cu.y >> 27) | 1) * 0.125f;
+                acc_u = fmaf(dub * lsu, su, acc_u);
+            }
         }
     }
     s_red[warp][lane][0] = acc_g;
-    s_red[warp][lane][1] = acc_u;
+    if constexpr (PAIR) s_red[warp][lane][1] = acc_u;
     __syncthreads();
     if (warp == 0 && row_ok) {
         float g = 0.0f, u = 0.0f;
 #pragma unroll
-        for (int w = 0; w < kDecodeGemvWarps; ++w) { g += s_red[w][lane][0]; u += s_red[w][lane][1]; }
+        for (int w = 0; w < kDecodeGemvWarps; ++w) {
+            g += s_red[w][lane][0];
+            if constexpr (PAIR) u += s_red[w][lane][1];
+        }
         const uint64_t o = (uint64_t)ids_dst[col] * (uint64_t)M + (uint64_t)row;
         out_gate[o] = g;
-        out_up[o] = u;
+        if constexpr (PAIR) out_up[o] = u;
     }
 }
 
@@ -1303,7 +1320,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
         }
         const dim3 grid((unsigned)((M + kDecodeGemvRows - 1) / kDecodeGemvRows), (unsigned)ne_get_rows, 1);
         const dim3 block(kDecodeGemvRows, kDecodeGemvWarps, 1);
-        gateup_iq2_decode_gemv_kernel<<<grid, block, 0, stream>>>(
+        gateup_iq2_decode_gemv_kernel<true><<<grid, block, 0, stream>>>(
             gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds,
             out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
         const cudaError_t gerr = cudaGetLastError();
@@ -1376,6 +1393,11 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
  * exactly one tensor.  up_soa/out_up are passed as the gate pointers and are
  * never dereferenced.
  *
+ * L210 extension: decode rows take the k-major GEMV tier (PAIR=false) before
+ * the tile is considered, because the tile's N is one expert's assignments and
+ * at decode that is ~6 rows.  The tile remains for prefill rows, where its
+ * N-fill is real.
+ *
  * Appended to cuda/mmq/ds4_mmq_d2r.cu; declared in ds4_mmq_d2r.cuh.
  */
 int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
@@ -1417,6 +1439,40 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     if (soa_blocks < expected_soa_blocks) {
         return -1;
     }
+
+    /* L210's rule, now for the single tensor too: DECODE rows take the k-major
+     * GEMV at ANY width, PREFILL rows never take it, so a chunk's bytes do not
+     * depend on its size and a mixed step's prefill pass equals a solo prefill.
+     * Before this the down tensor ran the N-starved MMA tile at decode (~1/8
+     * N-fill per expert) while gate/up already had the GEMV.  Same predicate as
+     * the pair launch: the mixed step's two-pass split leaves this global at
+     * n_tokens for the decode pass and 0 for the prefill pass.  Different
+     * arithmetic from the tile (exact f32 weights, split-K fma order), so the
+     * decode byte gates re-anchor exactly as they did for gate/up (rows/L210.md). */
+    if (pulsar_gpu_matmul_batch_decode_rows() > 0) {
+        if (K > kDecodeGemvMaxK) {
+            fprintf(stderr, "%s: decode GEMV tier holds K <= %d in shared memory, got K=%d -- refusing\n",
+                    tag, kDecodeGemvMaxK, (int)K);
+            return -1;
+        }
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: L210 routed IQ2 down decode tier = k-major GEMV (decode rows, any width)\n");
+        }
+        const dim3 grid((unsigned)((M + kDecodeGemvRows - 1) / kDecodeGemvRows), (unsigned)ne_get_rows, 1);
+        const dim3 block(kDecodeGemvRows, kDecodeGemvWarps, 1);
+        gateup_iq2_decode_gemv_kernel<false><<<grid, block, 0, stream>>>(
+            W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds,
+            out, out, M, K, (int)ne_get_rows, n_experts);
+        const cudaError_t gerr = cudaGetLastError();
+        if (gerr != cudaSuccess) {
+            fprintf(stderr, "%s: decode GEMV launch failed: %s\n", tag, cudaGetErrorString(gerr));
+            return -2;
+        }
+        return 0;
+    }
+
     const bool narrow = d2r_use_narrow_tile(ne_get_rows);
     const int64_t capacity64 = d2r_work_capacity_for_tile(
         ne_get_rows, n_experts, narrow ? kNTileNarrow : kNTile);

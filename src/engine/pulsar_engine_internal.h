@@ -749,6 +749,7 @@ typedef struct {
     uint32_t n_expert;
     uint32_t n_expert_used;
     uint32_t n_expert_present;
+    pulsar_tensor *ffn_exp_probs_b_vl; ///< image-token router bias (Vision-Exp only): the router adds THIS instead of ffn_exp_probs_b for tokens whose id is >= vocab_size
     pulsar_tensor *ffn_gate_exps;    ///< ROUTED experts, gate projection (expert-major)
     pulsar_tensor *ffn_up_exps;      ///< routed experts, up projection
     pulsar_tensor *ffn_down_exps;    ///< routed experts, down projection
@@ -800,6 +801,42 @@ typedef struct {
     pulsar_tensor *hc_head_scale;    ///< drafter head mix row scale
     pulsar_tensor *hc_head_base;     ///< drafter head mix per-stream bias
 } pulsar_dspark_weights;
+
+/** DeepSeek Vision-Exp tower weights.  The tower's SHAPE constants
+ * (PULSAR_VISION_*) and the CUDA-facing offset contract live in pulsar_gpu.h:
+ * the CUDA TUs cannot see this header, and every kernel takes (map, size,
+ * offset) rather than engine types.  This struct is the engine-side binding;
+ * vision_offsets_from_weights() flattens it for the kernels.
+ *
+ * The reference is the checkpoint's own inference/vision.py: RMSNorm(1e-6),
+ * fused QKV, 2D RoPE with 16 frequencies per axis over the 64-wide head,
+ * bias-free SwiGLU, bidirectional attention; and inference/model.py's
+ * merge_image_embeddings, which permutes the aligner output into the text span
+ * with image_start/pad/newline/end filling the non-IMAGE slots. */
+typedef struct {
+    pulsar_tensor *patch_proj;   ///< patch embedding (3*patch^2 -> dim), with bias
+    pulsar_tensor *patch_bias;
+    pulsar_tensor *norm;         ///< final RMSNorm over the tower output
+    pulsar_tensor *aligner_w1;   ///< aligner 1st projection (dim*ratio^2 -> text dim)
+    pulsar_tensor *aligner_b1;
+    pulsar_tensor *aligner_w2;   ///< aligner 2nd projection (text dim -> text dim)
+    pulsar_tensor *aligner_b2;
+    pulsar_tensor *image_start;  ///< text-space embedding for an IMAGE_START slot
+    pulsar_tensor *image_end;
+    pulsar_tensor *image_newline;
+    pulsar_tensor *image_pad;
+    struct {
+        pulsar_tensor *norm1;    ///< pre-attention RMSNorm
+        pulsar_tensor *wqkv;     ///< fused QKV (dim -> 3*dim), with bias
+        pulsar_tensor *wqkv_bias;
+        pulsar_tensor *wo;       ///< attention output projection (dim -> dim), with bias
+        pulsar_tensor *wo_bias;
+        pulsar_tensor *norm2;    ///< pre-MLP RMSNorm
+        pulsar_tensor *w1;       ///< SwiGLU gate+up (dim -> 2*inter), NO bias
+        pulsar_tensor *w2;       ///< SwiGLU down (inter -> dim), NO bias
+    } block[PULSAR_VISION_LAYERS];
+    uint32_t n_layers;           ///< bound layers; equals PULSAR_VISION_LAYERS or the tower is absent
+} pulsar_vision_weights;
 
 /* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
  *
@@ -975,6 +1012,18 @@ typedef struct {
  * rather than any one bank's frontier -- see the multiseq block below, which
  * is the part to read before touching decode state.
  */
+
+/** The images a prefill must merge, bound to the tower that encodes them.  Lives
+ * on the graph (pulsar_gpu_graph::vision_req) as a BORROW for the duration of one
+ * prefill, the same way `prompt` is borrowed: the owner sets it before entering
+ * the prefill and clears it on every exit.  Declared here because the graph
+ * carries the pointer. */
+typedef struct {
+    const pulsar_image_ref      *images;
+    int                          n_images;
+    const pulsar_vision_weights *weights;
+} pulsar_vision_request;
+
 typedef struct {
     /** One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -1156,6 +1205,18 @@ typedef struct {
     float    spec_compact_delta;
     int32_t *spec_compact_host;   ///< PULSAR_SPEC_LOGITS_ROWS x PULSAR_DSPARK_PREFILTER_ROW_I32, owned
     uint32_t spec_compact_rows;   ///< rows [0, spec_compact_rows) hold this step's compact output (0 = none)
+    /** L219 greedy verify rows: spec_round_begin accumulates, over the rounds
+     * begun since the last step, whether EVERY one is greedy (temperature <= 0).
+     * An armed ALL_ROWS head then runs the per-row argmax on device and reads
+     * int32s into spec_argmax_host instead of the full 517 KB rows -- the walk
+     * on a greedy round consults only row argmaxes, and the single row the
+     * s->logits refresh needs is read from the device on demand.  Greedy and
+     * compact are mutually exclusive by temperature. */
+    bool     spec_argmax_acc_ok;
+    uint32_t spec_argmax_acc_n;
+    bool     spec_argmax_armed;
+    int32_t *spec_argmax_host;    ///< PULSAR_SPEC_LOGITS_ROWS int32, owned
+    uint32_t spec_argmax_rows;    ///< rows [0, spec_argmax_rows) hold this step's argmaxes (0 = none)
     pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
     pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
     pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
@@ -1173,6 +1234,14 @@ typedef struct {
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
     pulsar_gpu_tensor *prefill_tokens;
+    /** L216 image-span visibility for the CURRENT prefill chunk: `prefill_cap`
+     * int32 left counts followed by `prefill_cap` int32 right counts (the
+     * reference's get_image_visible).  Uploaded once per chunk by
+     * gpu_graph_upload_vision_visible; vision_visible_tokens is 0 unless THIS
+     * chunk carries sentinel ids, which is what keeps every text prefill on the
+     * NULL path it took before. */
+    pulsar_gpu_tensor *vision_visible;
+    uint32_t           vision_visible_tokens;
     pulsar_gpu_tensor *batch_cur_hc;                ///< batched twin: HC residual carrier
     pulsar_gpu_tensor *batch_next_hc;               ///< batched twin: HC residual for the next layer (swapped with batch_cur_hc each layer)
     pulsar_gpu_tensor *batch_flat_hc;               ///< batched twin: HC streams flattened for the mix GEMV
@@ -1337,6 +1406,10 @@ typedef struct {
      * and the banked arms publish per bank instead. */
     bool batch_multiseq;
     uint32_t batch_multiseq_rows;         ///< rows in the current step
+    /** Borrowed for ONE prefill: the images to merge and the tower to encode them
+     * with, or NULL for the text-only path.  Set and cleared by the prefill's
+     * owner (pulsar_session::sync); nothing else may leave it set. */
+    const pulsar_vision_request *vision_req;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1466,6 +1539,7 @@ struct pulsar_vocab {
     int think_start_id;    ///< opens a reasoning span
     int think_end_id;      ///< closes a reasoning span
     int dsml_id;           ///< DSML tool-call marker
+    int image_id;          ///< PULSAR_IMAGE_PLACEHOLDER's id, or -1 when the artifact has no such token
     str_i32_table token_to_id;  ///< token bytes -> id, for the BPE merge loop
     str_i32_table merge_rank;   ///< BPE merge priority; lower rank merges first
 
@@ -1479,8 +1553,13 @@ struct pulsar_vocab {
     void bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const;
     /** Tokenize plain text: pre-tokenize, then BPE-merge each piece. */
     void bpe_tokenize_text(const char *text, token_vec *out) const;
-    /** Exact-match lookup of a token's id. @return the id, or -1 if absent. */
+    /** Exact-match lookup of a REQUIRED token's id.  A missing token is a fatal
+     * load error (exits), so only callers whose token every served artifact
+     * carries may use it. @return the id. */
     int vocab_lookup(const char *text) const;
+    /** Exact-match lookup that returns -1 when the token is absent -- the
+     * OPTIONAL counterpart of vocab_lookup, which exits on a missing token. */
+    int vocab_find(const char *text) const;
     /** Populate the vocabulary from the model's GGUF metadata. */
     void vocab_load(const pulsar_model *model);
     /** Release the vocabulary's owned tables. */
@@ -1520,6 +1599,8 @@ struct pulsar_engine {
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
+    pulsar_vision_weights vision_weights;  ///< resolved ViT tower/aligner tensors (Vision-Exp artifacts)
+    bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
     pulsar_model overlay_model; ///< donor GGUF for --expert-overlay, if any
     bool overlay_ready;         ///< overlay tensors resolved and swapped in
     /** Prometheus /metrics spec-decode counters (server /metrics endpoint via
@@ -2033,7 +2114,8 @@ struct pulsar_session {
     int bank_fork_partial_feasible(uint32_t src, int n_cached);
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
-    int sync(const pulsar_tokens *prompt, char *err, size_t errlen);
+    int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
+             char *err, size_t errlen);
     /** Rewrite the session to `prompt` given an already-computed `common`
      * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
@@ -2471,6 +2553,161 @@ void config_validate_model(const pulsar_model *m);
  */
 void weights_bind(pulsar_weights *w, const pulsar_model *m);
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
+/** Bind + layout-validate the Vision-Exp tower.  Returns false (and leaves the
+ * struct zeroed) when the artifact carries no `vision.patch_embed.proj.weight`,
+ * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
+ * type or missing tensor refuses loudly. */
+bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
+
+/* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
+ * Pure functions of the image dimensions and the block's position in the prompt,
+ * so they are graded directly against the reference by tests/vision_layout_gate.cpp
+ * (goldens generated by running image_processor.py itself).  `types` are the
+ * sentinel roles IMAGE_START/PAD/IMAGE/NEWLINE/END = 0..4; their token ids are
+ * vocab_size + type (out-of-vocab, per the reference). */
+typedef struct {
+    int n_llm_h, n_llm_w;   ///< aligner grid, i.e. text rows/cols the image occupies
+    int num_tokens;         ///< sentinel-block length incl. row padding and the compressor pad
+} pulsar_vision_grid;
+typedef struct {
+    int n_llm_h, n_llm_w;   ///< aligner grid after the fit
+    int best_height, best_width;  ///< patch-aligned pixel size the image is resized to
+    int num_tokens;         ///< sentinel-block length at that size
+} pulsar_vision_resize;
+pulsar_vision_grid vision_grid_tokens(int best_height, int best_width,
+                                      int patch_size, int downsample_ratio);
+pulsar_vision_resize vision_solve_resize_ratio(int height, int width,
+                                               int patch_size, int downsample_ratio,
+                                               int max_n_token);
+/** Shrink until the grid fits `max_n_token` minus the compressor pad.  Returns 0
+ * when the reference's `max_w > 1` assert would fire (caller refuses the image). */
+int vision_safe_resize(int height, int width, int best_height, int best_width,
+                       int patch_size, int downsample_ratio, int max_n_token,
+                       pulsar_vision_resize *out);
+/** Build the sentinel block for a grid at `start_pos`.  Returns the types count
+ * (<= types_cap) or -1 when a buffer is too small; `perm` receives
+ * n_llm_h*n_llm_w aligner-row indices for the IMAGE slots. */
+int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
+                             int *types_out, int types_cap,
+                             int *perm_out, int perm_cap);
+/** Run the bound tower over one image's patches (n_h*n_w*3*PATCH*PATCH bf16
+ * values) and write (out_rows, PULSAR_N_EMBD) bf16 embeddings.  Returns 0 on
+ * refusal.  Needs a GPU and a bound tower. */
+int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
+                   const uint16_t *patches, int n_h, int n_w,
+                   uint16_t *out, int out_cap, int *out_rows,
+                   uint16_t *dbg, uint32_t dbg_blocks);
+
+/** The vision config the preprocessing reads (mirrors the reference's args). */
+typedef struct {
+    int   patch_size;
+    int   downsample_ratio;
+    int   max_n_token;
+    int   min_pixels;
+    float max_wh_ratio;   ///< <= 0 means the reference's None (no clamp, no stretch)
+} pulsar_vision_args;
+/** What one preprocessed image produced. */
+typedef struct {
+    int n_vit_h, n_vit_w;         ///< ViT patch grid
+    int n_llm_h, n_llm_w;         ///< text grid after the aligner merge
+    int best_width, best_height;  ///< the resized/padded canvas the patches came from
+} pulsar_vision_image;
+/** Pixel half of image_processor.load_image(): decode-free.  Runs Pillow's
+ * bicubic resample, ImageOps.contain/pad (127-grey), the (x/255-0.5)/0.5
+ * normalisation and the patchify, all bit-exact with the reference.  `rgb` is
+ * width*height*3 bytes; `patch_out` receives n_vit_h*n_vit_w*3*patch^2 bf16
+ * values (as bit patterns).  Returns 0 on refusal (grid that the reference's
+ * assert would reject, or a cap too small). */
+int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
+                          const pulsar_vision_args *args,
+                          uint16_t *patch_out, size_t patch_cap,
+                          pulsar_vision_image *out);
+/** The grid a decoded image WILL produce, without touching its pixels: the one
+ * place the geometry lives, so a caller can size its patch buffer first (the
+ * canvas can be larger than the input, because min_pixels upscales). */
+int vision_image_grid(int width, int height, const pulsar_vision_args *args,
+                      pulsar_vision_image *out);
+/** Decode image BYTES to 8-bit RGB.  PNG (libpng) and JPEG (libjpeg-turbo, with
+ * Pillow's settings, which are libjpeg's defaults) only -- the caller fails
+ * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
+ * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
+ * own .convert("RGB") is a different transform from libjpeg's. */
+int vision_decode_rgb(const uint8_t *bytes, size_t len,
+                      uint8_t **rgb_out, int *w_out, int *h_out);
+
+/** One image READY for the model: the reference's per-image half of
+ * prepare_vl_inputs.  `span_ids` are the sentinel token ids (vocab_size + type),
+ * `span_types` the roles, `perm` the aligner-row order for the IMAGE slots, and
+ * `patches` the ViT input.  All buffers are malloc'd; free with
+ * vision_prepared_free(). */
+typedef struct {
+    uint16_t *patches;      ///< n_patches * 3 * PATCH * PATCH bf16
+    int32_t  *span_ids;     ///< span_len ids: vocab_size + type
+    int32_t  *span_types;   ///< span_len roles (IMAGE_START..IMAGE_END)
+    int32_t  *perm;         ///< n_perm aligner-row indices for the IMAGE slots
+    int n_patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w, span_len, n_perm;
+} pulsar_vision_prepared;
+/** Decode + preprocess + build the sentinel span for ONE image at `start_pos`
+ * (its token index in the prompt).  `vocab_size` is the text model's n_vocab,
+ * which the sentinel ids are offset by.  Returns 0 on refusal. */
+int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_args *args,
+                         int start_pos, int vocab_size, pulsar_vision_prepared *out);
+void vision_prepared_free(pulsar_vision_prepared *p);
+/** The reference's prepare_vl_inputs(): expand every image placeholder in `in`
+ * into that image's sentinel block in `out` (which the caller owns and must have
+ * emptied).  `out`'s ids become `vocab_size + role` in build_image_block's order,
+ * and `starts[k]` receives image k's BLOCK start -- the value
+ * pulsar_image_ref::start_pos must carry.  `preps[k]` receives the prepared image
+ * for the later merge.  Refuses when the placeholder count and the image count
+ * disagree, or when an image cannot be prepared. */
+int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in,
+                                     int placeholder_id,
+                                     const pulsar_image_ref *images, int n_images,
+                                     const pulsar_vision_args *args, int vocab_size,
+                                     pulsar_vision_prepared *preps, int *starts);
+
+/* The reference's sentinel ROLES (image_processor: IMAGE_START, IMAGE_PAD,
+ * IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)).  A prompt slot belonging to an
+ * image block carries `vocab_size + role`, so these are the ONLY ids at or above
+ * vocab_size the engine will accept -- which is what lets the prefill token
+ * upload distinguish a sentinel from a bad id. */
+#define PULSAR_VISION_ROLE_IMAGE_START 0
+#define PULSAR_VISION_ROLE_IMAGE_PAD   1
+#define PULSAR_VISION_ROLE_IMAGE       2
+#define PULSAR_VISION_ROLE_NEWLINE     3
+#define PULSAR_VISION_ROLE_IMAGE_END   4
+
+/** The image sentinel BLOCK beginning at `start_pos` (the reference's
+ * ImageInput.start: the block's first slot, which is a compressor pad, with the
+ * IMAGE_START sentinel a few slots in).  `*len_out` receives the BLOCK length --
+ * what merge_image_embeddings writes and what the chunk planner must not split.
+ * Returns 0 if the ids there are not such a block.  The ONE place the sentinel
+ * roles are resolved for a scan. */
+int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
+
+/** The reference's get_image_visible(): per-token visible counts to the
+ * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function
+ * of the token ids, so it is graded directly against the reference by
+ * tests/vision_visible_gate.cpp.  Prefill only -- an image span must arrive in
+ * one chunk. */
+void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_tokens,
+                          int32_t *left, int32_t *right);
+/** The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
+ * column count of the matrix vision_window_topk_visible() writes. */
+int vision_visible_width(int n, int window_size, int max_image_tokens);
+/** The reference's get_window_topk_idxs_visible(): the window index matrix,
+ * widened per query so a token inside an image span reaches the whole span.
+ * `out` receives n * vision_visible_width(...) int32 values. */
+void vision_window_topk_visible(int window_size, int n, const int32_t *left,
+                                const int32_t *right, int max_image_tokens,
+                                int32_t *out);
+/** The reference's merge_image_embeddings() for ONE prepared image: run the
+ * tower over its patches and scatter the aligner rows (in `perm` order) into the
+ * IMAGE slots, filling every other slot with its type's learned vector.  `out`
+ * receives span_len * PULSAR_N_EMBD bf16 values. */
+int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
+                      const pulsar_vision_prepared *prep,
+                      uint16_t *out, int out_cap, int *out_len);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
@@ -2723,6 +2960,29 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs,
         bool                   capture_cur);
+
+/** Work shape of everything the process has run through the two graph funnels:
+ * gpu_graph_prefill_layer_major (one call per prefill chunk, plus the L195
+ * state-only warm-up passes) and gpu_graph_decode_multiseq_batch (one call per
+ * classic decode step, per mixed-entry K-row run, and per speculative verify
+ * batch).  tests/gates_runner.cpp --shape snapshots this around each gate to
+ * say whether a gate's cost is DEPTH (max_pos), REPETITION (step_calls) or
+ * SETUP (prefill_calls/prefill_tokens) instead of guessing from its name.
+ *
+ * Process-global, not per-graph: the graph carries no back-pointer to the
+ * engine, and one process runs one battery.  The reader resets them per gate
+ * (pulsar_gate_shape_reset) so a reused engine's earlier work is not charged
+ * to a later gate.  Counters only -- no branch, no allocation. */
+typedef struct {
+    uint64_t prefill_calls;   /**< gpu_graph_prefill_layer_major calls */
+    uint64_t prefill_tokens;  /**< tokens covered by those calls (n_tokens summed) */
+    uint64_t step_calls;      /**< gpu_graph_decode_multiseq_batch calls */
+    uint64_t step_rows;       /**< rows across those calls (n_active summed) */
+    uint64_t max_pos;         /**< deepest position reached, +1 (a token count) */
+} pulsar_gate_shape;
+void pulsar_gate_shape_read(pulsar_gate_shape *out);
+void pulsar_gate_shape_reset(void);
+
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]);
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,
@@ -2862,6 +3122,32 @@ bool gpu_graph_upload_prompt_embeddings_hc(
         const token_vec    *prompt,
         uint32_t            pos0,
         uint32_t            n_tokens);
+/** Scatter a merged image span (vision_merge_span's n_rows * PULSAR_N_EMBD bf16
+ * rows) into the HC carrier at `row0`, replicating each row across all
+ * PULSAR_N_HC streams the way the reference's post-merge HC expansion does.
+ * Returns false, without writing, if the span does not fit the carrier. */
+bool gpu_graph_write_vision_span(pulsar_gpu_tensor *out_hc, const uint16_t *rows,
+                                 uint32_t n_rows, uint32_t row0, uint32_t n_tokens);
+/** Merge every image span that lies inside [pos0, pos0 + n_tokens) into the HC
+ * carrier: decode, preprocess, run the tower, and scatter the result.  `ids` is
+ * the whole prompt (the span extent comes from vision_span_extent, not from the
+ * image), so a request whose prompt does not carry the span it claims is
+ * refused.  Returns false on any refusal; true (a no-op) when `vr` is NULL. */
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
+                                 const int32_t *ids, int n_ids,
+                                 const pulsar_vision_request *vr,
+                                 uint32_t pos0, uint32_t n_tokens);
+/** Compute THIS chunk's image-span visibility and upload it to
+ * g->vision_visible, once per chunk, before any layer's attention runs.  A
+ * chunk with no sentinel id (every text chunk, and every chunk of an image
+ * request that is not the first) leaves g->vision_visible_tokens == 0, which is
+ * what keeps the text path bit-identical: the attention entries then receive
+ * NULL pointers.  Refuses (returns false) a visibility span that cannot be
+ * addressed in one pass rather than clipping it.  A no-op when the graph has no
+ * borrowed image request. */
+bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
+                                     int n_ids, uint32_t start, uint32_t n_tokens);
+
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,
@@ -3004,6 +3290,10 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to
  * row0+n_rows on success, 0 on failure. Blocking read (one small copy). */
 bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
+/** L219: the greedy twin of the compact read -- per-row argmax over
+ * spec_logits rows [row0, row0+n_rows) into g->spec_argmax_host; sets
+ * g->spec_argmax_rows to row0+n_rows on success, 0 on failure. */
+bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
 /** Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch.
  */

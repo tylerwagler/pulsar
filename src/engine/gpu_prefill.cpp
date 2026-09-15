@@ -71,8 +71,16 @@ bool gpu_graph_upload_prompt_tokens(
     int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
     for (uint32_t i = 0; i < n_tokens; i++) {
         tokens[i] = prompt->v[pos0 + i];
-        /* L188: the embed kernel clamps a negative id to 0 -- refuse it here */
-        if (tokens[i] < 0 || tokens[i] >= (int32_t)PULSAR_N_VOCAB) {
+        /* L188: the embed kernel clamps a negative id to 0 -- refuse it here.
+         *
+         * L216: an image block's slots carry `vocab_size + role` sentinel ids,
+         * so the bound is not simply n_vocab.  The roles are 0..IMAGE_END and
+         * nothing else may sit at or above vocab_size, which keeps this a real
+         * check rather than a hole.  pulsar_session::sync refuses such an id
+         * when the request carries no image, so reaching here with one means a
+         * merge will fill the row; the embedder zero-masks it until then. */
+        if (tokens[i] < 0 ||
+            tokens[i] > (int32_t)(PULSAR_N_VOCAB + PULSAR_VISION_ROLE_IMAGE_END)) {
             fprintf(stderr, "pulsar: prefill token %d at position %u is not a vocab id -- refusing\n",
                     tokens[i], pos0 + i);
             free(tokens);
@@ -595,6 +603,196 @@ bool gpu_graph_upload_prompt_embeddings_hc(
 
 
 
+/* Scatter a MERGED image span into the HC carrier.
+ *
+ * vision_merge_span() produces one bf16 embedding per span position on the HOST
+ * (the sentinel's learned vector, or an aligner row for an IMAGE slot).  The
+ * reference writes that block into h BEFORE expanding to hc_mult copies --
+ * `merge_image_embeddings` runs, then `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`
+ * -- so every HC stream carries the SAME merged row.  That is what this
+ * replicates: n_hc copies of one n_embd row, not a broadcast the downstream
+ * kernels would have to know about.
+ *
+ * The rows are raw bf16 bits (pulsar_hc_t is __nv_bfloat16, 2 bytes), so the
+ * copies are memcpys and no numerics live here.  The carrier layout is
+ * [token][hc][embd], contiguous per token, so one tensor_write covers the span.
+ *
+ * Returns false, without writing, if the span does not fit the carrier. */
+bool gpu_graph_write_vision_span(
+        pulsar_gpu_tensor *out_hc,
+        const uint16_t    *rows,      /* n_rows * PULSAR_N_EMBD bf16 bits */
+        uint32_t           n_rows,
+        uint32_t           row0,      /* the span's first row within the chunk */
+        uint32_t           n_tokens) {
+    if (!out_hc || !rows || n_rows == 0) return false;
+    if (row0 > n_tokens || n_rows > n_tokens - row0) return false;
+    const uint64_t row_elt = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+    const size_t per_row = (size_t)row_elt * PULSAR_HC_ELT_SIZE;
+    if (pulsar_gpu_tensor_bytes(out_hc) < (uint64_t)n_tokens * per_row) return false;
+
+    uint16_t *stage = (uint16_t *)malloc((size_t)n_rows * per_row);
+    if (!stage) return false;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const uint16_t *src = rows + (size_t)r * PULSAR_N_EMBD;
+        uint16_t *dst = (uint16_t *)(void *)((char *)stage + (size_t)r * per_row);
+        for (uint32_t h = 0; h < PULSAR_N_HC; h++)
+            memcpy(dst + (size_t)h * PULSAR_N_EMBD, src,
+                   (size_t)PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE);
+    }
+    const bool ok = pulsar_gpu_tensor_write(out_hc, (uint64_t)row0 * per_row, stage,
+                                            (uint64_t)n_rows * per_row) != 0;
+    free(stage);
+    return ok;
+}
+
+
+
+/* The reference's image-preprocessing args.  Patch size and downsample ratio are
+ * tower dims the binder already validates against the tensors; the other three
+ * are the checkpoint's policy constants (see PULSAR_VISION_MAX_N_TOKEN).  Built
+ * here rather than at each call so there is one place that knows the mapping. */
+static void vision_default_args(pulsar_vision_args *a) {
+    a->patch_size       = (int)PULSAR_VISION_PATCH;
+    a->downsample_ratio = (int)PULSAR_VISION_DOWNSAMPLE;
+    a->max_n_token      = PULSAR_VISION_MAX_N_TOKEN;
+    a->min_pixels       = PULSAR_VISION_MIN_PIXELS;
+    a->max_wh_ratio     = PULSAR_VISION_MAX_WH_RATIO;
+}
+
+/* Decode + preprocess + encode + scatter, for every image span inside the chunk.
+ *
+ * The span EXTENT comes from the prompt's own sentinel ids (vision_span_extent),
+ * not from the image, so an image whose span is not actually in the prompt is a
+ * refusal rather than a silently misplaced block.  An image whose span lies in
+ * another chunk is skipped: the chunk planner has already refused any request
+ * that would split one, so this only ever skips images that a later chunk owns.
+ *
+ * The reference does exactly this merge between `h = self.embed(input_ids)` and
+ * the first layer, which is why the caller runs it right after the embedding
+ * gather. */
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
+                                 const int32_t *ids, int n_ids,
+                                 const pulsar_vision_request *vr,
+                                 uint32_t pos0, uint32_t n_tokens) {
+    if (!vr || vr->n_images <= 0) return true;      /* text-only: nothing to do */
+    if (!out_hc || !model || !vr->weights || !ids || n_ids <= 0) return false;
+
+    pulsar_vision_args args;
+    vision_default_args(&args);
+
+    for (int i = 0; i < vr->n_images; i++) {
+        const pulsar_image_ref *img = &vr->images[i];
+        if (!img->bytes || img->len == 0 || img->start_pos < 0) return false;
+        int span_len = 0;
+        if (!vision_span_extent(ids, n_ids, (int)PULSAR_N_VOCAB, img->start_pos, &span_len)) {
+            fprintf(stderr, "pulsar: image %d claims a span at token %d that the prompt does not "
+                            "carry (no IMAGE_START sentinel there, or no IMAGE_END after it)\n",
+                    i, img->start_pos);
+            return false;
+        }
+        const uint32_t s0 = (uint32_t)img->start_pos;
+        if (s0 < pos0 || s0 + (uint32_t)span_len > pos0 + n_tokens) continue;   /* another chunk */
+
+        pulsar_vision_prepared prep = {};
+        if (!vision_prepare_image(img->bytes, img->len, &args, (int)s0, (int)PULSAR_N_VOCAB, &prep)) {
+            fprintf(stderr, "pulsar: image %d at token %d failed to decode/preprocess\n", i, img->start_pos);
+            return false;
+        }
+        const int cap = prep.span_len * (int)PULSAR_N_EMBD;
+        uint16_t *rows = (uint16_t *)malloc((size_t)cap * sizeof(uint16_t));
+        if (!rows) { vision_prepared_free(&prep); return false; }
+        int n_rows = 0;
+        const bool merged = vision_merge_span(vr->weights, model, &prep, rows, cap, &n_rows) &&
+                            n_rows == prep.span_len &&
+                            gpu_graph_write_vision_span(out_hc, rows, (uint32_t)n_rows,
+                                                        s0 - pos0, n_tokens);
+        free(rows);
+        vision_prepared_free(&prep);
+        if (!merged) {
+            fprintf(stderr, "pulsar: image %d at token %d failed to merge (span %d rows)\n",
+                    i, img->start_pos, prep.span_len);
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
+/* Per-chunk image-span VISIBILITY, computed once and uploaded once for the
+ * chunk's attention launches.
+ *
+ * The reference makes an image span the ONE bidirectional region: a query
+ * inside [IMAGE_START, IMAGE_END] sees `left` back to the span's first slot and
+ * `right` forward to its end (get_image_visible), on top of the sliding window.
+ * The kernel cannot express that forward reach from the window alone, so it
+ * takes the two counts.  The arrays are stored left-half then right-half in one
+ * tensor (`prefill_cap` int32 each) so there is one allocation and one layout.
+ *
+ * A TEXT chunk -- and every later chunk of an image request, which is all text --
+ * matches no sentinel and leaves vision_visible_tokens at 0.  That is what keeps
+ * the text prefill bit-identical: the attention entries then receive NULL
+ * pointers and the kernel runs its pre-L216 plan literally. */
+bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
+                                     int n_ids, uint32_t start, uint32_t n_tokens) {
+    if (!g || !g->vision_visible) return false;
+    g->vision_visible_tokens = 0;
+    if (!g->vision_req || g->vision_req->n_images <= 0) return true;   /* text: nothing to compute */
+    if (!ids || n_ids <= 0 || start > (uint32_t)n_ids ||
+        n_tokens > (uint32_t)n_ids - start || n_tokens > g->prefill_cap) {
+        return false;
+    }
+    const int32_t *chunk = ids + start;
+    int has_span = 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (chunk[i] >= (int32_t)PULSAR_N_VOCAB) { has_span = 1; break; }
+    }
+    if (!has_span) return true;   /* this chunk owns no sentinel: NULL path */
+
+    int32_t *host = (int32_t *)xmalloc(2ull * n_tokens * sizeof(int32_t));
+    if (!host) return false;
+    int32_t *left = host, *right = host + n_tokens;
+    vision_image_visible(chunk, (int)n_tokens, (int)PULSAR_N_VOCAB,
+                         PULSAR_VISION_MAX_N_TOKEN, left, right);
+
+    /* The widest raw span any query now reaches is [q - left[q], q + right[q]];
+     * its length is left+right+1, at least the sliding window.  The kernel's
+     * raw-row scratch covers the reference's own clamps (AF16_RAWROWS in
+     * pulsar_cuda_attn_f16.cu derives from PULSAR_VISION_MAX_N_TOKEN), so the
+     * only remaining bound is the ring itself.  A span the ring cannot hold
+     * cannot be attended in one pass: refuse rather than clip it, because a
+     * clipped span is a silently different (causal-only) answer. */
+    uint32_t widest = 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const int64_t w = (int64_t)left[i] + (int64_t)right[i] + 1;
+        if (w > (int64_t)widest) widest = (uint32_t)w;
+    }
+    if (widest > g->raw_cap) {
+        fprintf(stderr, "pulsar: image visibility at token %u needs %u raw rows but the raw ring "
+                        "holds %u -- refusing (an image span must be attendable in one pass)\n",
+                start, widest, g->raw_cap);
+        free(host);
+        return false;
+    }
+
+    const uint64_t half = (uint64_t)g->prefill_cap * sizeof(int32_t);
+    const bool ok = pulsar_gpu_tensor_write(g->vision_visible, 0, left,
+                                            (uint64_t)n_tokens * sizeof(int32_t)) != 0 &&
+                    pulsar_gpu_tensor_write(g->vision_visible, half, right,
+                                            (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    free(host);
+    if (!ok) return false;
+    g->vision_visible_tokens = n_tokens;
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: image-span visibility armed for prefill attention "
+                        "(%u-token chunk, widest reach %u raw rows)\n", n_tokens, widest);
+    }
+    return true;
+}
+
+
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,
@@ -757,8 +955,22 @@ static bool gpu_graph_indexed_attention_span(
     /* FULL / REINDEX score and select here; REUSE reads the selection its index
      * source wrote.  The unindexed and window modes never reach this span. */
     const bool selects = pulsar_attn_runs_indexer(attn->mode);
+    /* L216 image-span visibility for THIS span's rows, offset by s0 into the
+     * chunk's arrays: the kernel indexes the counts by its own token axis, the
+     * same axis positions uses.  A text chunk leaves vision_visible_tokens at 0
+     * and passes NULL (the pre-L216 path); a banked multiseq span never carries
+     * vision. */
+    pulsar_gpu_tensor *vleft_view = NULL, *vright_view = NULL;
+    if (!op->mseq && g->vision_visible_tokens != 0u) {
+        vleft_view = pulsar_gpu_tensor_view(g->vision_visible,
+                (uint64_t)s0 * sizeof(int32_t), (uint64_t)sn * sizeof(int32_t));
+        vright_view = pulsar_gpu_tensor_view(g->vision_visible,
+                ((uint64_t)g->prefill_cap + s0) * sizeof(int32_t),
+                (uint64_t)sn * sizeof(int32_t));
+    }
     bool ok = iq_view && iw_view && sq_view && sh_view && sel_view &&
-              (!op->mseq || (sp_view && ss_view));
+              (!op->mseq || (sp_view && ss_view)) &&
+              (!g->vision_visible_tokens || op->mseq || (vleft_view && vright_view));
 
     /* L121: a banked multi-row span is scored per bank run through the
      * block-scaled MXFP4 tier against the bank's own comp slab (the generic
@@ -872,9 +1084,12 @@ static bool gpu_graph_indexed_attention_span(
                                                                   op->comp_bases,
                                                                   op->comp_cap,
                                                                   op->n_banks,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          vleft_view, vright_view) != 0;
     }
     pulsar_gpu_tensor_free(sel_view);
+    pulsar_gpu_tensor_free(vright_view);
+    pulsar_gpu_tensor_free(vleft_view);
     pulsar_gpu_tensor_free(ss_view);
     pulsar_gpu_tensor_free(sp_view);
     pulsar_gpu_tensor_free(sh_view);
@@ -976,8 +1191,22 @@ bool gpu_graph_encode_layer_attention_batch(
             : NULL;
     pulsar_gpu_tensor *after_attn_hc_view = pulsar_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);  ///< carrier
+    /* L216 image-span visibility for THIS chunk, or NULL/NULL when the chunk has
+     * no span (vision_visible_tokens == 0 -- every text chunk).  The two halves
+     * live in one tensor, left at 0 and right at prefill_cap counts.  The views
+     * are passed to every whole-chunk attention launch below; the indexed span
+     * path offsets its own from these in gpu_graph_indexed_attention_span. */
+    const bool chunk_vis = g->vision_visible_tokens == n_tokens && n_tokens != 0u;
+    pulsar_gpu_tensor *vis_left_view = chunk_vis
+            ? pulsar_gpu_tensor_view(g->vision_visible, 0,
+                                     (uint64_t)n_tokens * sizeof(int32_t)) : NULL;
+    pulsar_gpu_tensor *vis_right_view = chunk_vis
+            ? pulsar_gpu_tensor_view(g->vision_visible,
+                                     (uint64_t)g->prefill_cap * sizeof(int32_t),
+                                     (uint64_t)n_tokens * sizeof(int32_t)) : NULL;
     bool ok = hc_mix_view && hc_split_view && after_attn_hc_view &&
-              (attn_cur_view || !g->batch_attn_cur);
+              (attn_cur_view || !g->batch_attn_cur) &&
+              (!chunk_vis || (vis_left_view && vis_right_view));
     /* The f16 activation slot and its flat_hc_skip_f32 companion are gone with
      * the last F16 weight (2026-08-16).  They existed so an F16 mix GEMM could
      * read a 2-byte activation and the widest f32 store in the layer could be
@@ -1409,7 +1638,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           PULSAR_N_HEAD,
                                                           PULSAR_N_HEAD_DIM,
                                                           mseq ? g->batch_positions : NULL,
-                                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                                          g->q_prep_active ? &g->q_prep : NULL,
+                                                          vis_left_view, vis_right_view) != 0;
         if (ok) batch_attention_done = true;
     } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
         /*
@@ -1761,7 +1991,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
                                                                        PULSAR_N_HEAD_DIM,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          vis_left_view, vis_right_view) != 0;
             if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
             if (ok) batch_attention_done = true;
         }
@@ -1813,7 +2044,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
                                                               &gact_emitted,
                                           mseq ? g->batch_positions : NULL,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          vis_left_view, vis_right_view) != 0;
         }
         if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
         if (raw_prefix_tokens < n_tokens) {
@@ -1938,7 +2170,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               PULSAR_N_HEAD,
                                                                               PULSAR_N_HEAD_DIM,
                                                                               NULL, NULL, NULL, 0, 1,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          /* A per-token row never carries image visibility: an
+                                           * image chunk is handled whole by the arms above. */
+                                          NULL, NULL) != 0;
                 } else if (ok) {
                     /* No selection this token: the same one-row step the
                      * batched decode takes, through the same entry -- the
@@ -2076,6 +2311,8 @@ bool gpu_graph_encode_layer_attention_batch(
     }
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor_free(after_attn_hc_view);
+    pulsar_gpu_tensor_free(vis_right_view);
+    pulsar_gpu_tensor_free(vis_left_view);
     pulsar_gpu_tensor_free(attn_cur_view);
     pulsar_gpu_tensor_free(hc_split_view);
     pulsar_gpu_tensor_free(hc_mix_view);
@@ -2266,7 +2503,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       layer->n_expert,
                                                       layer->n_expert_used,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,
-                                                      n_tokens) != 0;
+                                                      n_tokens,
+                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : 0,
+                                                      PULSAR_N_VOCAB,
+                                                      layer->ffn_exp_probs_b_vl != NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * layer->n_expert, il, pos0);
@@ -2401,8 +2641,15 @@ bool gpu_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * layer->n_expert_used * down_in_dim, il, pos0);
     }
     if (ok) {
+        /* ARM-DEPENDENT, like ffn_moe_up_clamped above: every routed arm now
+         * emits the folded SwiGLU leaf as E4M3 from its own epilogue (L219), so
+         * this f32 scratch no longer holds the leaf anywhere -- on the MMQ
+         * gate/up arms it is the RAW UP the pair GEMM wrote (same caveat as
+         * ffn_moe_up_clamped), and on the pure type-40 arm it is stale.  The
+         * element count reads the LAYER's router width, not the target's: a
+         * drafter layer routes 128 experts / top-3 (L218 audit risk #2). */
         const uint64_t routed_mid_elems = (uint64_t)n_tokens * layer->n_expert_used * down_in_dim;
-        gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
+        gpu_graph_debug_dump_tensor("ffn_moe_mid_raw_up", g->batch_routed_mid,
                                       routed_mid_elems, il, pos0);
     }
     if (ok) {

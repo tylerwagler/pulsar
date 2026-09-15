@@ -1003,16 +1003,23 @@ int pulsar_cutlass_expert_ffn_gemv_small(
 }
 
 
-/* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
+/* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout).
+ *
+ * L219: emit_q non-NULL selects the E4M3 epilogue -- the same template arm the
+ * small-batch FFN path uses -- and `mid` is not written.  The caller (mixed
+ * case A at decode) then hands those bytes to the MMQ down, exactly like the
+ * fold-emitted slot the other arms produce. */
 int pulsar_cutlass_gemv_gateup(
     float *mid, const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
-    const void *act_q, const void *act_sf, int act_kbp) {
+    const void *act_q, const void *act_sf, int act_kbp,
+    void *emit_q, void *emit_sf, int emit_kbp) {
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
+  const bool emit = emit_q != NULL;
+  if (emit && (mid_dim % 32 || !emit_sf || emit_kbp != pulsar_mx_rup(mid_dim / 32, 4))) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
-  dim3 g((unsigned)((mid_dim + 31) / 32), n_slots);
 
   /* The activation is the E4M3 the producing norm emitted, or the call refuses. */
   if (!act_q || !act_sf) {
@@ -1027,6 +1034,16 @@ int pulsar_cutlass_gemv_gateup(
     fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
                     "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
   }
+  if (emit) {
+    dim3 g((unsigned)(mid_dim / 32), n_slots);
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        nullptr, (uint8_t *)emit_q, (uint8_t *)emit_sf, emit_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+        selected, rweights, gate_w, up_w,
+        gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+  }
+  dim3 g((unsigned)((mid_dim + 31) / 32), n_slots);
   expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
       mid, nullptr, nullptr, 0,
       (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,

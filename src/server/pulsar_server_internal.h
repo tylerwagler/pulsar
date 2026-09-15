@@ -76,6 +76,17 @@
 #define PULSAR_SERVER_MAX_CLIENTS 64
 #define PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
+/* Long-lived /metrics/stream subscribers, capped separately from
+ * PULSAR_SERVER_MAX_CLIENTS. A stream holds its connection (and its thread)
+ * until the client goes away, so sharing the request budget would let a couple
+ * of idle dashboards lock real requests out of the server. */
+#define PULSAR_SERVER_MAX_STREAMS 8
+
+/* Silence on the stream for this long means the connection is unverified, so
+ * the pump sends an SSE comment. Comfortably inside the idle timeouts of the
+ * proxies and NATs this is expected to run behind. */
+#define PULSAR_METRICS_STREAM_KEEPALIVE_MS 15000
+
 /* Multi-session serving increment 2: the worker steps each job as a resumable
  * state machine in bounded quanta instead of running it to completion. A
  * decode quantum yields back to the worker loop once it has emitted at least
@@ -281,10 +292,25 @@ typedef struct {
     int cap;               ///< tools allocated
 } tool_schema_orders;
 
+/** One inline image attached to a chat message: the ENCODED image FILE
+ * (PNG or JPEG) exactly as the client's base64 data: URL carried it.  The
+ * engine decodes; the server never converts pixels. */
+typedef struct {
+    uint8_t *bytes;  ///< the encoded image file, owned
+    size_t   len;    ///< its length in bytes
+} chat_image;
+
 /** One message in a chat request, after parsing and before rendering. */
 typedef struct {
     char *role;           ///< "system", "user", "assistant", or "tool", owned
     char *content;        ///< message text, owned
+    /** Inline images in content order.  Each contributes one
+     * PULSAR_IMAGE_PLACEHOLDER to `content` at the position its block occupied,
+     * so the rendered prompt places the sentinel block where the client asked;
+     * the two lists must stay the same length. */
+    chat_image *images;   ///< owned, `images_len` entries
+    int   images_len;     ///< images present
+    int   images_cap;     ///< images allocated
     char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
     char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
     char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
@@ -448,6 +474,12 @@ typedef struct {
     req_kind kind;             ///< what the request asks for (completion, chat, embedding, ...)
     api_style api;             ///< which wire protocol it arrived on; the response must match
     pulsar_tokens prompt;      ///< the rendered prompt as tokens
+    /** Images for pulsar_session_sync_mm(), in message/content order, with
+     * `start_pos` already resolved by pulsar_expand_image_placeholders() at
+     * parse time.  Empty (n_images == 0) for every text-only request, which
+     * keeps pulsar_session_sync() as its exact path.  `bytes` are owned. */
+    pulsar_image_ref *images;  ///< owned, `n_images` entries
+    int n_images;              ///< images in the request
     char *model;               ///< model name to serve, owned
     bool model_from_request;   ///< the client named the model (vs the server default)
     stop_list stops;           ///< client-supplied stop sequences
@@ -993,14 +1025,21 @@ typedef struct {
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
 #define PULSAR_SESSION_POOL_CAP 16
-/* Auto-sizing cap: measured 2026-08-10, when the dense-step lanes capped
- * their fast paths at 8 rows -- N=12 aggregate decode held 29.2 tok/s at 8
- * banks vs 21.9 at 12 -- so the DEFAULT config never auto-sizes past 8 (the
- * lanes are 16-row neutral now; the cap awaits a re-measure).  POOL_CAP above is the hard
- * array bound = PULSAR_MSEQ_MAX, so an operator PULSAR_MSEQ_BANKS pin up to
- * 16 is safe (it was an out-of-bounds walk when the pin exceeded the array,
- * a latent bug up to and including the 5-slot era). */
-#define PULSAR_SESSION_POOL_AUTO_MAX 8
+/* Auto-sizing cap: raised 8 -> 16 on 2026-09-11 after the re-measure the old
+ * comment asked for (L219).  The 2026-08-10 measurement (N=12 aggregate held
+ * 29.2 tok/s at 8 banks vs 21.9 at 12) predated the row-neutral lanes; the
+ * dense, spec and attention lanes are 16-row neutral now, and the cliff is
+ * gone.  Locked-clock one-shot chat, thinking off, 200 tokens, ctx 8192:
+ *
+ *   banks  N=8          N=12                  N=16
+ *     8    54.2 t/s     50.7 (5x 25-31 s TTFT stalls)   --
+ *    12    53.9         56.2 (no stalls)      54.6 (4x 34-38 s stalls)
+ *    16    --           56.5                   56.5 (no stalls)
+ *
+ * 16 is the row-neutral maximum (PULSAR_MSEQ_MAX), so the cap moves there;
+ * auto-sizing still fits N to the KV budget below the cap (huge ctx yields
+ * fewer banks), and POOL_CAP above remains the hard array bound. */
+#define PULSAR_SESSION_POOL_AUTO_MAX 16
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
@@ -1284,6 +1323,12 @@ struct server {
      * eval pins behavior WITHOUT changing production defaults. */
     uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
     uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
+    /** Context-scaled KV one bank holds at the configured context — the
+     *  compressed rows plus their index. Demand-paged under overcommit, so it is
+     *  reserved as VA and resident only on touch; published because dividing the
+     *  budget by it is the only way to answer "how many tokens of KV does this
+     *  box actually hold", which the configured slot count does not answer. */
+    uint64_t     kv_bank_bytes;
     uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
@@ -1310,11 +1355,22 @@ struct server {
     pthread_mutex_t mu;          ///< guards the queue, client count, and every published metric
     pthread_cond_t cv;           ///< wakes the worker when a job is enqueued or state changes
     pthread_cond_t clients_cv;   ///< signals shutdown waiters as clients drain
+    /** Broadcast on every metrics publish and once at shutdown, waking
+     * /metrics/stream waiters. Separate from `cv` on purpose: `cv` wakes the
+     * single worker thread, and waking it on every metrics publish would spin
+     * it against an empty queue for no reason. */
+    pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
     bool stopping;               ///< shutdown in progress; stop accepting and drain
     time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;                 ///< connected clients, for the shutdown drain
+    int stream_clients;          ///< live /metrics/stream subscribers (under mu)
+    /** Bumped by publish_metrics_snapshot on every publish. A stream client
+     * waits for this to change rather than for anything in the payload: the
+     * snapshot is a dozen fields, and comparing it to decide "did anything
+     * move" is exactly the mistake pulsar-gui made and had to undo. */
+    unsigned long long metrics_generation;
     /** /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots
      * (0..n_slots, time-sliced by the single worker). m_* are cumulative
@@ -1359,6 +1415,13 @@ struct server {
      * demand-zero pages faulted back in on every touch cycle, a measured
      * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
     float   *spec_lane_logits;
+    /** L219: the plain and mixed batched lanes' logits landing buffer
+     * ((PULSAR_SESSION_POOL_CAP + 1) x vocab floats).  Same rationale as
+     * spec_lane_logits, one lane over: the per-quantum malloc/free re-faulted
+     * ~4 MB of demand-zero pages on every quantum of a
+     * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
+     * sequentially in one worker. */
+    float   *lane_logits;
     /** Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
@@ -1451,6 +1514,10 @@ struct server {
      * vLLM-oriented scraper ignores them.
      */
     bool send_metrics(int fd);
+    /** GET /metrics/stream: hold the connection open and emit one SSE frame
+     * per metrics publish. Returns false if the client went away or the
+     * stream cap was already reached. */
+    bool send_metrics_stream(int fd);
     /** Drop the connected-client count and signal anyone waiting on the
      * shutdown drain. Called from client threads. */
     void client_done();
@@ -2149,6 +2216,9 @@ typedef struct server_prefill_progress {
     const char *phase;   ///< current phase name, for log lines
     bool has_tools;      ///< the request declared tools
     bool responses_protocol;  ///< the request is on /responses
+    /** An image request is a COLD prefill whose sentinel blocks must not be
+     * checkpointed: the progress callback skips the continued KV store. */
+    bool image_request;  ///< the request carries images
     double t0;           ///< wall-clock at prefill start
     double last_t;       ///< wall-clock of the last progress event, for interval rates
     int last_current;    ///< `current` at that event
@@ -2404,6 +2474,11 @@ char *json_minify_raw_value(const char *json);
  * does not parse. */
 char *json_python_dumps_raw_value(const char *json);
 bool json_content(const char **p, char **out);
+/** Decode a standard base64 payload (RFC 4648 alphabet, '=' padding, no
+ * whitespace).  Returns a malloc'd buffer and sets `*out_len`, or NULL on
+ * malformed input.  The server's ONE base64 decoder; used for inline data:
+ * image URLs. */
+uint8_t *base64_decode(const char *in, size_t in_len, size_t *out_len);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
  * available (ids must never be predictable).  The ONE id generator: tool-call,
@@ -2442,8 +2517,8 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
 bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
-bool parse_messages(const char **p, chat_msgs *msgs);
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs);
+bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_system(const char **p, char **out);
 void append_tool_result_text(buf *b, const char *s);
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order);
@@ -2513,11 +2588,14 @@ void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
-/** parse_chat_request up to and including the rendered prompt TEXT, without
- * tokenising it -- what the renderer gate compares against the reference
- * encoder with no model loaded.  parse_chat_request is this plus the
- * tokenisation. */
-bool parse_chat_request_render(server *s, const char *body, int def_tokens,
+/** parse_chat_request up to and including the rendered prompt TEXT, plus --
+ * when `e` is non-NULL -- the tokenisation and the image-span resolution.  The
+ * engine is optional so the renderer gate can render request bodies with no
+ * model loaded and compare the TEXT against the reference encoder; with an
+ * engine, the reference's order is render, tokenise, then replace each image
+ * placeholder with that image's sentinel block (the decoded pixels live in the
+ * render's own message list, so that step cannot move out of this function). */
+bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen);
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen);
@@ -2531,6 +2609,19 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      request *r, char *err, size_t errlen);
 bool send_all(int fd, const void *p, size_t n);
+
+/* Emit one `event: metrics` frame per change of *generation, plus a `: keepalive`
+ * comment whenever nothing has changed for keepalive_ms, until the client goes
+ * away or *stop becomes true. Return false only when a write failed (the
+ * client is gone); a shutdown-driven exit returns true.
+ *
+ * Deliberately a free function taking no server and no engine: it is the part
+ * with the interesting failure modes — a missed wakeup, a keepalive that never
+ * fires, a shutdown that hangs the drain — and this signature is what lets all
+ * three be tested over a socketpair without a GPU. */
+bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
+                         const unsigned long long *generation, const bool *stop,
+                         int keepalive_ms);
 void json_escape(buf *b, const char *s);
 void json_escape_n(buf *b, const char *s, size_t n);
 void json_escape_fragment_n(buf *b, const char *s, size_t n);

@@ -49,6 +49,27 @@ typedef enum {
     PULSAR_LOG_ERROR,
 } pulsar_log_type;
 
+/** The tokenizer's image placeholder: the ONE text a renderer writes where an
+ * image belongs.  `pulsar_expand_image_placeholders()` replaces every
+ * occurrence with that image's sentinel block; its id is resolved from the
+ * vocab by string (never hard-coded), so an artifact without the token simply
+ * cannot serve images. */
+#define PULSAR_IMAGE_PLACEHOLDER "<｜deepseek_image｜>"
+
+/** One image to place in a prompt.  `start_pos` is the token index of the
+ * image BLOCK's first slot -- the reference's `ImageInput.start`, i.e. the
+ * length of the prompt at the moment the block was appended.  The renderer
+ * writes the block's ids as `vocab_size + role` (out-of-vocab sentinels, per the
+ * reference), so they are ids the tokenizer never produces and the embedder
+ * zero-masks; the block begins with a compressor pad, and its IMAGE_START
+ * sentinel therefore sits a few slots in.  `bytes`/`len` are the encoded image
+ * file (PNG or JPEG). */
+typedef struct {
+    const uint8_t *bytes;
+    size_t         len;
+    int            start_pos;
+} pulsar_image_ref;
+
 /** Growable token vector. Owns `v`; free with pulsar_tokens_free().
  *
  * `len` is the token count, `cap` the allocated slots. Many APIs accept a
@@ -379,6 +400,37 @@ typedef enum {
  * counts and row offsets every kernel sees are the same); otherwise the
  * backend state is refilled from scratch. */
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen);
+/** pulsar_session_sync() with images.  `n_images == 0` is the text-only path and
+ * is exactly what pulsar_session_sync() calls.
+ *
+ * An image request is a COLD prefill from token 0: the reference merges an
+ * image only on the start_pos == 0 pass and asserts that no sentinel id
+ * survives into a continuation, so a cached prefix is never reused for one.
+ * Every span must also fit inside a single prefill chunk -- a request that would
+ * split one is refused loudly rather than prefilled with sentinels whose
+ * embeddings were never merged. */
+int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
+                           const pulsar_image_ref *images, int n_images,
+                           char *err, size_t errlen);
+/** The renderer's half of prepare_vl_inputs(), and the ONLY producer of the
+ * out-of-vocab sentinel ids the engine's mm prefill consumes: walk `prompt` and
+ * replace every PULSAR_IMAGE_PLACEHOLDER token with that image's sentinel block,
+ * in request order, setting `images[i].start_pos` to the block's first slot
+ * (the token count at that moment; see pulsar_image_ref).
+ *
+ * `out` must be zero-initialized and is owned by the caller afterwards (it
+ * receives the expanded prompt); `images[i].bytes/len` are read for the decode.
+ * Refuses, with `err` set, when the placeholder and image counts disagree, when
+ * an image cannot be decoded or is not one the tower accepts, when the artifact
+ * carries no vision tower, or when the vocab has no placeholder token.  Text
+ * with no image passes through unchanged, but callers must NOT route a
+ * text-only request through here: pulsar_session_sync() is its path.
+ *
+ * The engine's sync API is BLOCK-based, so this call must happen before it: a
+ * placeholder id reaching pulsar_session_sync_mm() is a caller bug. */
+int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
+                                     pulsar_image_ref *images, int n_images,
+                                     pulsar_tokens *out, char *err, size_t errlen);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, -1 when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a
@@ -737,6 +789,15 @@ uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
 bool pulsar_engine_has_dspark(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
+/** ONE authority for the marginal wall cost of one spec-decode verify row
+ * (ms): L214's pinned-width refit of the yield-quench step model
+ * step = FLAT + ROW*n_batch on the a309ff8 kernels (landed dev 2275ad3,
+ * rows/L214.md).  The engine's terminal yield quench and the server's
+ * overflow K-allocator both price a draft row against this number; the
+ * allocator's private copy was 6.0f -- L134's stage-attribution estimate,
+ * 20% below the refit -- and decided how many rows it admits when demand
+ * exceeds PULSAR_SPEC_ROW_BUDGET (L219 B4). */
+#define PULSAR_SPEC_ROW_MS 7.17f
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
@@ -768,27 +829,30 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * from the grid point below its PREFILL frontier (header field 15) after a
  * 32-token state-only warm-up, so the raw window it carries reaches that far
  * below the checkpoint (raw_window + 127 + 32 rows).
- * v10 (L218, 2026-09-10, DeepSeek-V4.1 CSA2): compressed rows and index-K rows
- * are carried per kv SOURCE layer (one frontier count per layer, non-zero on the
- * four sources only; each source's comp rows, then its index-K rows, then --
- * at ratio 2 -- its pending-group state), no separate indexer frontier, no
- * indexer compressor state, no warm-up window (raw_window + 127 rows).  The
- * KV rows are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the
- * raw ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
- * header carries both strides (fields 13 and 16) plus the indexer's.  Earlier
- * files are refused.
- * v11 (L218 s122, 2026-09-15): the per-layer byte stream is derived from the
- * LOADED PROFILE instead of from V4.1's geometry.  v10 wrote its index-K rows
- * for every kv source, so a 0731 artifact -- whose ratio-128 (HCA) sources have
- * no indexer and no index pool -- refused to save at all; and it sized the
- * compressor state at head_dim x ratio, which is a QUARTER of the 32768 B lane
- * a V4 ratio-4 source keeps (coff 2), and omitted 0731's indexer-compressor
- * state lane entirely.  A shorter-than-the-lane span is the dangerous shape: the
- * save succeeds and the restore leaves the tail of a recurrent state primed.
- * So a 0731 payload now carries each source's comp rows, its index-K rows only
- * where an indexer runs, then the attention compressor's state, then -- V4 only
- * -- the indexer compressor's.  v10 files are refused: the per-layer layout
- * differs at the same strides. */
+ * v10 (2026-09-10/11) was developed TWICE on two trees, and BOTH parts are in
+ * v11: L218's per-layer stream and L219's trailing digest.
+ *   - L218, DeepSeek-V4.1 CSA2: compressed rows and index-K rows are carried
+ *     per kv SOURCE layer (one frontier count per layer; each source's comp
+ *     rows, then its index-K rows, then its pending-group state), no separate
+ *     indexer frontier, no warm-up window (raw_window + 127 rows).  The KV rows
+ *     are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the raw
+ *     ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
+ *     header carries both strides (fields 13 and 16) plus the indexer's.
+ *   - L219: a trailing 64-bit digest over every byte above; a damaged payload
+ *     refuses instead of decoding byte-rot into a live cache.
+ * v11 (L218 s122 + the L219 merge, 2026-09-15): the per-layer byte stream is
+ * derived from the LOADED PROFILE instead of from V4.1's geometry.  v10 wrote
+ * its index-K rows for every kv source, so a 0731 artifact -- whose ratio-128
+ * (HCA) sources have no indexer and no index pool -- refused to save at all;
+ * and it sized the compressor state at head_dim x ratio, which is a QUARTER of
+ * the 32768 B lane a V4 ratio-4 source keeps (coff 2), and omitted 0731's
+ * indexer-compressor state lane entirely.  A shorter-than-the-lane span is the
+ * dangerous shape: the save succeeds and the restore leaves the tail of a
+ * recurrent state primed.  So a payload carries each source's comp rows, its
+ * index-K rows only where an indexer runs, then the attention compressor's
+ * state, then -- V4 only -- the indexer compressor's, and the whole stream ends
+ * with the digest.  Earlier files are refused: the per-layer layout differs at
+ * the same strides. */
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(11)
 /** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u

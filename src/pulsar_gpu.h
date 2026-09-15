@@ -127,8 +127,9 @@
  * must check against THIS, or the number lives only in a comment. */
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
- * measured sublinear c4 scaling); the ROWCOST table says marginal row cost
- * is ~8-11 ms with no cliff, so a 32-row slab (+8.3 MB logits) lets the
+ * measured sublinear c4 scaling); the ROWCOST table (now the single authority
+ * PULSAR_SPEC_ROW_MS, pulsar.h: L214 re-fit 7.17 ms/row) says the marginal row
+ * cost has no cliff, so a 32-row slab (+8.3 MB logits) lets the
  * ranked allocator keep K near its survival optimum at c4. Every consumer
  * derives from THIS constant (slab alloc, driver reject, lane arrays,
  * dspark batch-capture buffer) -- audited 2026-08-27, rows/L117.md. */
@@ -317,6 +318,7 @@ enum {
 #define PULSAR_GPU_HD __host__ __device__   /* the helper is called from kernels too */
 #else
 #define PULSAR_GPU_HD
+
 #endif
 
 int pulsar_gpu_embed_tokens_hc_tensor(
@@ -466,7 +468,15 @@ int pulsar_gpu_attention_f16_prefill_mx(
          * for the fused Q rope only (positions[t] instead of t); the row plan is
          * the batch's own causal window either way. */
         const int *positions,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility: int32 [n_tokens] DEVICE arrays of the
+         * reference's get_image_visible() counts, or NULL/NULL (the text-only
+         * path, bit-identical to the pre-L216 kernel).  Non-NULL makes an image
+         * query see [q - vis_left[q], q + vis_right[q]] -- a FORWARD reach the
+         * plain causal window cannot express.  A half pair or a visibility
+         * launch mixed with non_causal is refused. */
+        const int *vis_left,
+        const int *vis_right);
 
 int pulsar_gpu_attention_f16_prefill(
         /* heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes per
@@ -493,7 +503,9 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const int               *vis_left,
+        const int               *vis_right);
 
 /** fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
@@ -538,7 +550,12 @@ int pulsar_gpu_attention_f16_indexed(
          * (the drafter's raw-window forward).  Only WHICH rows are visible
          * changes; compressed-row visibility and the fold are the same. */
         uint32_t                non_causal,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility: see pulsar_gpu_attention_f16_prefill_mx.  The
+         * arrays are indexed by this launch's own token axis (like positions),
+         * so a caller launching a sub-span offsets them by its first row. */
+        const int               *vis_left,
+        const int               *vis_right);
 
 /** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
@@ -1527,7 +1544,12 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope, int *mx_out,
-        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
+        /* Image-span visibility (L216): int32 [n_tokens] DEVICE tensor slices of
+         * get_image_visible()'s left/right counts, or NULL/NULL for a text
+         * chunk.  Non-NULL gives an image query a FORWARD reach the causal
+         * window cannot express; see the f16 entry for the exact range. */
+        const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right);
 
 int pulsar_gpu_attention_prefill_raw_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1540,7 +1562,8 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right);
 
 /** Batched decode attention.  The trailing descriptor quad enables multi-
  * session banked mode: positions/seq_id are int32 [n_tokens] DEVICE arrays
@@ -1644,7 +1667,9 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right);
 
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1672,7 +1697,9 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right);
 
 
 int pulsar_gpu_attention_output_batch_tensor(
@@ -1751,7 +1778,10 @@ int pulsar_gpu_router_select_batch_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint64_t                vl_bias_offset,
+        uint32_t                n_vocab,
+        bool                    has_vl_bias);
 
 
 int pulsar_gpu_routed_moe_batch_tensor(
@@ -1899,11 +1929,17 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
 
 /** Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
- * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
+ * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32.
+ *
+ * L219: when emit_q is non-NULL the SwiGLU epilogue writes the mid E4M3 + E8M0
+ * into that slot (rows = (token, slot) pairs, emit_sf's swizzle pitch is
+ * emit_kbp) and `mid` is NOT written; mid_dim must then be a multiple of 32.
+ * Pass NULL/NULL/0 for the historical f32 output. */
 int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float *rweights,
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
-    const void *act_q, const void *act_sf, int act_kbp);
+    const void *act_q, const void *act_sf, int act_kbp,
+    void *emit_q, void *emit_sf, int emit_kbp);
 /** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
  * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
 int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
@@ -2202,5 +2238,66 @@ __attribute__((constructor)) void pulsar_tu_archs_register_(void) {
 }
 }
 #endif
+
+/* ---------------------------------------------------------------------------
+ * L216: the Vision-Exp tower's shape and its CUDA-facing weight contract.
+ *
+ * These live HERE, not in the engine's internal header, because the CUDA TUs
+ * cannot see engine-internal types (pulsar_cuda_internal.h pulls in only
+ * cuda/cub headers) and every kernel in the tree takes (map, size, offset) for
+ * the same reason.  The engine builds the offsets from pulsar_vision_weights;
+ * the kernels read them against the mapped model base.
+ *
+ * The artifact carries the vision TENSORS but no vision metadata (the template
+ * writes only the text-side config keys), so these compiled values are the
+ * authority.  They match the checkpoint's config.json (vision_n_layers 32,
+ * vision_dim 1024, vision_n_heads 16, vision_inter_dim 2816,
+ * vision_patch_size 14, vision_downsample_ratio 3, vision_rope_theta 10000) and
+ * predict every `vision.*` tensor's dims. */
+#define PULSAR_VISION_LAYERS      32u
+#define PULSAR_VISION_DIM         1024u
+#define PULSAR_VISION_HEADS       16u
+#define PULSAR_VISION_INTER       2816u
+#define PULSAR_VISION_PATCH       14u
+#define PULSAR_VISION_DOWNSAMPLE  3u
+#define PULSAR_VISION_ROPE_THETA  10000.0f
+/* The reference's image-preprocessing POLICY (config.json: vision_max_n_token,
+ * vision_min_pixels, vision_max_wh_ratio).  Unlike PATCH/DOWNSAMPLE these are
+ * not derivable from any tensor shape -- they bound how large an image the model
+ * will accept -- and the artifact carries no metadata for them: every scalar key
+ * in the GGUF is deepseek4.<...> or dspark.<...>, with no vision.<...> scalar (the tower
+ * arrives as tensors only).  They are therefore constants of THIS checkpoint,
+ * exactly as the tower dims above are.  A future artifact that changes them
+ * needs them in the GGUF metadata, not a second constant here. */
+#define PULSAR_VISION_MAX_N_TOKEN  384
+#define PULSAR_VISION_MIN_PIXELS   147456
+#define PULSAR_VISION_MAX_WH_RATIO 8.0f
+
+/** One vision-tower tensor as a file offset into the model mapping.  The CUDA
+ * forward reads every weight through these; the engine fills them from the
+ * bound pulsar_vision_weights. */
+typedef struct {
+    uint64_t patch_proj, patch_bias, norm;
+    uint64_t aligner_w1, aligner_b1, aligner_w2, aligner_b2;
+    struct {
+        uint64_t norm1, wqkv, wqkv_bias, wo, wo_bias, norm2, w1, w2;
+    } block[PULSAR_VISION_LAYERS];
+    uint32_t n_layers;              ///< must be PULSAR_VISION_LAYERS
+    uint32_t text_dim;              ///< the aligner's output width (the text model's n_embd)
+} pulsar_vision_offsets;
+
+/** ViT + aligner over ONE image's patches: `patches` is
+ * (n_h*n_w, 3, PATCH, PATCH) bf16, the result is (out_rows, text_dim) bf16
+ * written to `out`.  Returns 0 on any refusal.
+ *
+ * `dbg` is an OPTIONAL instrument (NULL in production): when set it receives
+ * (2 + dbg_blocks) rows of n_h*n_w*PULSAR_VISION_DIM bf16 -- patch_embed,
+ * blocks 0..dbg_blocks-1, then the final norm -- which is how
+ * tests/vision_tower_gate.cpp localises a mismatch instead of guessing. */
+int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
+                               const void *map, uint64_t map_size,
+                               const uint16_t *patches, int n_h, int n_w,
+                               uint16_t *out, int out_cap, int *out_rows,
+                               uint16_t *dbg, uint32_t dbg_blocks);
 
 #endif

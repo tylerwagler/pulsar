@@ -1383,6 +1383,13 @@ void server::publish_metrics_snapshot() {
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
     s->m_decode_lane = s->w_decode_lane;
+    /* Bump and wake the /metrics/stream subscribers. A generation counter
+     * rather than a payload comparison on purpose: "did anything move" over a
+     * dozen fields is exactly the check pulsar-gui got wrong, because the
+     * derived rates are window-relative and differ on every sample even when
+     * nothing happened. The worker already knows when it published. */
+    s->metrics_generation++;
+    pthread_cond_broadcast(&s->stream_cv);
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1922,7 +1929,12 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
         g->batch_active = true;
     }
 
-    float *logits = (float *)server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
+    /* Persistent, like the spec lane's: a per-quantum malloc/free re-faults
+     * ~4 MB of demand-zero pages on every quantum (L219). */
+    if (!s->lane_logits)
+        s->lane_logits = (float *)server_xmalloc(
+                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    float *logits = s->lane_logits;
     pulsar_multiseq_req reqs[PULSAR_SESSION_POOL_CAP];
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
@@ -1999,7 +2011,6 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
-    free(logits);
     const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
     for (int i = 0; i < n; i++) {
         dec[i]->last_serviced_us = now_us;
@@ -2164,14 +2175,21 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * design upstream.
              * L111/L121 established the cost is DEPTH-FLAT (the old
              * 8.4→11 ramp was the naive score kernel's rows x depth
-             * term, not a property of the engine).  L136 refresh
-             * (ROWCOST 2026-08-31, dev 87eec09): 6.4 ms/row @2048,
-             * 5.9 @24576 — the 8.0 measured on 08-27 predated L129's
-             * MoE fusion, which moved the whole sweep ~9%.  A stage
-             * decomposition (L134) puts ~83% of this in routed-MoE
-             * expert compute, so expect the number to move with MoE
-             * kernel work, not with KV/indexer work. */
-            const float marginal_ms = 6.0f;
+             * term, not a property of the engine).  L136 set the price
+             * to 6.0 from L134's stage attribution; L214's pinned-width
+             * refit then measured 7.17 ms/row on the a309ff8 kernels,
+             * and the row price is ONE fact (PULSAR_SPEC_ROW_MS,
+             * pulsar.h) shared with the engine's yield quench -- this
+             * site's private 6.0f was the stale copy.  L219/B4 drove
+             * demand past the row budget and measured the correction's
+             * effect: the cut prices more rows (conc 8, mean/run:
+             * 41 -> 145 at 6.0 -> 7.17) while aggregate t/s is flat,
+             * and every price in [3, 9] ms sits on that plateau -- a
+             * 30 ms positive control costs 12-19%.  A stage decomposition
+             * (L134) puts ~83% of this in routed-MoE expert compute, so
+             * expect the number to move with MoE kernel work, not with
+             * KV/indexer work. */
+            const float marginal_ms = PULSAR_SPEC_ROW_MS;
             const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                               s->spec_ms_per_tok_ema : 45.0f;
             int thr_cut_rows = 0;
@@ -2628,7 +2646,11 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 
     const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
     pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
-    float *logits = (float *)server_xmalloc((size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    /* Persistent, like the spec lane's: see the lane_logits note in the header. */
+    if (!s->lane_logits)
+        s->lane_logits = (float *)server_xmalloc(
+                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    float *logits = s->lane_logits;
     /* last-position (len-1) logits captured from the final fused prefill run — the
      * decode seed for the prefill->decode handoff (byte-identical to classic per
      * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
@@ -2741,7 +2763,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
-    free(reqs); free(logits);
+    free(reqs);
 
     /* Reconcile the prefill bank (same recipe as a decode bank leaving the lane):
      * install its driver-maintained frontier (P0+pf_done) and advance the host

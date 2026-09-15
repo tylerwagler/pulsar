@@ -1,6 +1,18 @@
 #include "pulsar_engine_internal.h"
 
+/* The one place the two graph funnels' work is counted (see pulsar_gate_shape
+ * in pulsar_engine_internal.h).  imatrix.cpp holds both funnels -- prefill via
+ * gpu_graph_prefill_layer_major, stepping via gpu_graph_decode_multiseq_batch --
+ * so the counters and the accessor stay in one TU with them. */
+static pulsar_gate_shape g_gate_shape;
 
+void pulsar_gate_shape_read(pulsar_gate_shape *out) {
+    *out = g_gate_shape;
+}
+
+void pulsar_gate_shape_reset(void) {
+    memset(&g_gate_shape, 0, sizeof g_gate_shape);
+}
 
 bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
@@ -338,6 +350,25 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     fflush(f);
 }
 
+/* Seed the HC carrier for one chunk: gather the token embeddings, then merge any
+ * image span this chunk owns over them.  The reference's order is exactly this --
+ * `h = self.embed(input_ids)`, then merge_image_embeddings, then the layers --
+ * and this is the ONE place the carrier is seeded from token-derived data, so
+ * every prefill arm goes through it. */
+static bool gpu_graph_seed_chunk_hc(pulsar_gpu_graph *g, const pulsar_model *model,
+                                    const pulsar_weights *weights, const token_vec *prompt,
+                                    uint32_t start, uint32_t n_tokens) {
+    if (!gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens))
+        return false;
+    /* L216: the chunk's image-span visibility, once, before any layer's
+     * attention runs.  No image request -> no-op; a text chunk -> token count 0,
+     * so every attention launch below takes its NULL path unchanged. */
+    if (!gpu_graph_upload_vision_visible(g, prompt->v, prompt->len, start, n_tokens))
+        return false;
+    return gpu_graph_merge_image_spans(g->batch_cur_hc, model, prompt->v, prompt->len,
+                                       g->vision_req, start, n_tokens);
+}
+
 static bool gpu_graph_prefill_layer_major_inner(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -363,6 +394,12 @@ bool gpu_graph_prefill_layer_major(
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    /* Every prefill chunk and every L195 state-only warm-up pass joins the
+     * battery's shape report exactly once, here. */
+    g_gate_shape.prefill_calls++;
+    g_gate_shape.prefill_tokens += n_tokens;
+    if ((uint64_t)start + n_tokens > g_gate_shape.max_pos)
+        g_gate_shape.max_pos = (uint64_t)start + n_tokens;
     /* The collector reads each layer's f32 ffn_norm rows on the host; the
      * norm stores them only while this is set. */
     g->imatrix_f32_rows = imatrix != NULL;
@@ -421,7 +458,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     const bool split_commands = n_tokens > 2048 || imatrix != NULL;
 
     if (!split_commands) {
-        ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
+        ok = gpu_graph_seed_chunk_hc(g, model, weights, prompt, start, n_tokens);
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
             ok = gpu_graph_encode_layer_batch(g,
@@ -464,7 +501,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         return ok;
     }
 
-    ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
+    ok = gpu_graph_seed_chunk_hc(g, model, weights, prompt, start, n_tokens);
     if (!ok) {
         if (pulsar_gpu_synchronize() == 0) {
             fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill embed failure also failed\n");
@@ -645,6 +682,39 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
+    /* An image span is prefilled WHOLE, and only on the pass that begins at token
+     * 0: the reference merges images solely when start_pos == 0 and asserts
+     * `(input_ids < vocab_size).all()` for a continuation, i.e. no sentinel id may
+     * survive into a chunk that does not start at 0.  So every span must lie
+     * inside the FIRST chunk.  Refuse rather than degrade -- a split span would
+     * prefill sentinels whose embeddings were never merged. */
+    int32_t vision_span_end = 0;
+    if (g->vision_req && g->vision_req->n_images > 0) {
+        if (start != 0) {
+            fprintf(stderr, "pulsar: an image request cannot extend a cached prefix (start=%u); "
+                            "image spans are prefilled from token 0 in one chunk\n", start);
+            return false;
+        }
+        for (int i = 0; i < g->vision_req->n_images; i++) {
+            int len = 0;
+            if (!vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB,
+                                    g->vision_req->images[i].start_pos, &len)) {
+                fprintf(stderr, "pulsar: image %d claims a span at token %d that the prompt does not "
+                                "carry (no IMAGE_START sentinel there, or no IMAGE_END after it)\n",
+                        i, g->vision_req->images[i].start_pos);
+                return false;
+            }
+            const int32_t e = g->vision_req->images[i].start_pos + len;
+            if (e > vision_span_end) vision_span_end = e;
+        }
+        if (vision_span_end > (int32_t)chunk_cap) {
+            fprintf(stderr, "pulsar: image spans reach token %d but one prefill chunk holds only %u; "
+                            "an image span must fit in a single chunk (raise --prefill-chunk or send "
+                            "a smaller image)\n", vision_span_end, chunk_cap);
+            return false;
+        }
+    }
+
     const uint32_t end = start + n_tokens;
 
     if (progress) {
@@ -691,6 +761,12 @@ bool gpu_graph_prefill_chunked_range(
                 if (aligned_end > pos0) chunk = aligned_end - pos0;
             }
         }
+        /* The ratio alignment above may have pulled the boundary back INTO the
+         * span.  Only the first chunk can be inside one (the plan already refused
+         * a span that does not fit), so this only ever widens that chunk, at the
+         * cost of the compressor fallback for one boundary. */
+        if (pos0 < (uint32_t)vision_span_end && chunk < (uint32_t)vision_span_end - pos0)
+            chunk = (uint32_t)vision_span_end - pos0;
         const uint32_t chunk_end = pos0 + chunk;
         /* Only the final chunk's logits are consumed (the progress callback below
          * reports position only, never reads logits). Running the full output
@@ -957,6 +1033,15 @@ int gpu_graph_decode_multiseq_batch(
         return 0;
     }
 
+    /* Every accepted step joins the battery's shape report once, here: one
+     * call per classic decode token, per mixed-entry K-row run, per
+     * speculative verify batch; n_active is its row count. */
+    g_gate_shape.step_calls++;
+    g_gate_shape.step_rows += n_active;
+    for (uint32_t i = 0; i < n_active; i++)
+        if ((uint64_t)pos[i] + 1 > g_gate_shape.max_pos)
+            g_gate_shape.max_pos = (uint64_t)pos[i] + 1;
+
     /* Gather each session's current token into the batch input rows.  The
      * token embedding is position/bank-independent, so the existing prompt
      * uploader runs unmodified over a stack copy of the caller's array (this
@@ -1080,19 +1165,38 @@ int gpu_graph_decode_multiseq_batch(
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
-    if (head_all_rows && g->spec_compact_armed) {
+    if (head_all_rows && g->spec_argmax_armed) {
+        /* L219: every round in this step is greedy, so the walk consults only
+         * each row's argmax.  Run the per-row argmax on device (the same
+         * readback the fused lane and the classic verify use) and read ints
+         * instead of head_runs x 517 KB.  Greedy and compact are mutually
+         * exclusive by temperature; a device failure refuses rather than
+         * falling back to the full read (L174).
+         * The compact rows from an EARLIER compact step must be retired here:
+         * spec_round_end_block tests spec_compact_rows first, so a stale value
+         * would make the greedy walk read the previous step's candidates
+         * (review of 4fa5e0b6).  Mirror of the compact branch retiring
+         * spec_argmax_rows. */
+        g->spec_compact_rows = 0;
+        ok = gpu_graph_spec_argmax_read(g, 0u, head_runs);
+        if (!ok)
+            fprintf(stderr, "pulsar: spec argmax readback failed for %u rows -- refusing "
+                            "(no full-row readback fallback; L174)\n", head_runs);
+    } else if (head_all_rows && g->spec_compact_armed) {
         /* L149 phase 2: every round in this step is in the sparse min-p
          * contract -- read the prefilter's compact block (16 KB/row) instead of
          * the 517 KB rows; the caller's `logits` block is left untouched and
          * the accept walk builds from candidates.  A failed compact read used to
          * fall to the full readback silently -- a device error read as a slower
          * path (L174). */
+        g->spec_argmax_rows = 0;
         ok = gpu_graph_spec_compact_read(g, 0u, head_runs);
         if (!ok)
             fprintf(stderr, "pulsar: spec compact readback failed for %u rows -- refusing "
                             "(no full-row readback fallback; L174)\n", head_runs);
     } else {
         g->spec_compact_rows = 0;
+        g->spec_argmax_rows = 0;
         ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
                                  (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
     }
@@ -1121,6 +1225,35 @@ bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_
                                 (uint64_t)n_rows * row_i32 * sizeof(int32_t)))
         return false;
     g->spec_compact_rows = row0 + n_rows;
+    return true;
+}
+
+bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows) {
+    g->spec_argmax_rows = 0;
+    if (!g || !g->spec_logits || !g->spec_argmax_host || !g->comp_selected ||
+        n_rows == 0 || row0 + n_rows > PULSAR_SPEC_LOGITS_ROWS)
+        return false;
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t r = 0; ok && r < n_rows; r++) {
+        /* Per-row views, exactly the classic verify's readback shape. */
+        pulsar_gpu_tensor *row = pulsar_gpu_tensor_view(
+                g->spec_logits,
+                (uint64_t)(row0 + r) * PULSAR_N_VOCAB * sizeof(float),
+                (uint64_t)PULSAR_N_VOCAB * sizeof(float));
+        pulsar_gpu_tensor *dst = pulsar_gpu_tensor_view(
+                g->comp_selected,
+                (uint64_t)r * sizeof(int32_t), sizeof(int32_t));
+        ok = row && dst && pulsar_gpu_argmax_tensor(dst, row, PULSAR_N_VOCAB) != 0;
+        pulsar_gpu_tensor_free(row);
+        pulsar_gpu_tensor_free(dst);
+    }
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
+    if (ok)
+        ok = pulsar_gpu_tensor_read(g->comp_selected, 0, g->spec_argmax_host,
+                                    (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    if (!ok) return false;
+    g->spec_argmax_rows = row0 + n_rows;
     return true;
 }
 

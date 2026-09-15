@@ -13,4 +13,6 @@ Read `docs/ENGINEERING-RULES.md` before changing engine code. The short form:
 9. **Fail closed, loudly, once.**
 10. **Landing discipline:** battery 25/25 at an asserted sha, zero warnings, doxygen clean, ledger updated, one squashed commit, topic branch deleted.
 
+Two tiers: `make gates` is the pre-merge battery (every release-blocking gate, ~18 min). `make gates-dev` is the iteration tier — a fast subset selected from the paths the working tree touches — and it is **not** a substitute for `make gates` before merging.
+
 Process context lives in `~/Projects/pulsar-notes` (private): `OPEN-REGISTER.md` is the live index, `rows/Lnnn.md` are append-only. Check the register before proposing work.

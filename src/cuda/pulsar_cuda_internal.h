@@ -75,11 +75,29 @@ constexpr bool pulsar_idx_mxfp4_heads_supported(uint32_t n_head) {
  * reader decodes it in place, and the f32 arm had no caller left. */
 
 /*
- * The two KV rows (L218) -- WINDOW (the rings) and MAIN (the kv sources'
- * pools) -- are laid out and documented in src/pulsar_gpu.h, the one
- * definition both sides of the seam read.  Their decoders live below
- * (winkv_row_ld4 / mainkv_row_ld4), the packers in pulsar_cuda_kvrows.cu.
- * Quantise once, move bytes after; there is no other KV row format.
+ * The KV rows -- WINDOW (the rings) and MAIN (the kv sources' pools) for a
+ * CSA2 (V4.1) profile, UNIFIED PULSAR_ATTN_PACK for a 0731 one -- are laid
+ * out and documented in src/pulsar_gpu.h, the one definition both sides of
+ * the seam read.  Their decoders live below (winkv_row_ld4 /
+ * mainkv_row_ld4 / the packed-row accessors), the packers in
+ * pulsar_cuda_kvrows.cu.
+ *
+ * UNIFIED row (NVFP4, head_dim 512 / n_rot 64 -> 384 B):
+ *   [n_nope/2 e2m1 nibbles, low nibble first][n_nope/16 E4M3 scale codes]
+ *   [f32 row scale][n_rot bf16 rope] = 224 + 28 + 4 + 128.  A multiple of 16
+ * (cp.async stages whole 16 B chunks), the rope tail is 2-aligned and the f32
+ * row scale 4-aligned at +252.  Scale decode = e4m3(code) * row_scale via
+ * attn_pack_e4m3.  The nope payload is a lossy re-quantization of the QAT
+ * e4m3 values (L111 verdict: closer to source, accept >= the retired e4m3
+ * row); rope is bf16 verbatim -- quantized rope is what killed ATTN_MX.
+ *
+ * ⚠ Quantise EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
+ * misrounds ~33%% of blocks.  Every later move is a byte move; there is no
+ * conversion path from the retired e4m3 row -- stale payloads refuse.  The
+ * geometry macros (PULSAR_ATTN_PACK_*, PULSAR_KV4_NV_*, PULSAR_MXKV_*,
+ * PULSAR_WINKV_*, PULSAR_MAINKV_*) live in src/pulsar_gpu.h, the one
+ * definition both sides of the seam read (L159 inc 5).  Bumping any of these
+ * layouts MUST bump PULSAR_SESSION_PAYLOAD_VERSION.
  */
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.

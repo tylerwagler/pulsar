@@ -237,6 +237,7 @@ void server::close_resources() {
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_mutex_destroy(&s->capture_mu);
+    pthread_cond_destroy(&s->stream_cv);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
@@ -253,6 +254,8 @@ void server::close_resources() {
     s->sess = NULL;
     free(s->spec_lane_logits);
     s->spec_lane_logits = NULL;
+    free(s->lane_logits);
+    s->lane_logits = NULL;
     /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
      * generate.cpp writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
      * still spilled when the server exits would otherwise leave a stale
@@ -947,6 +950,9 @@ int main(int argc, char **argv) {
      * like every other bank. */
     s.slots[0].ctx_size = cfg.ctx_size;
     s.pool_ctx_size = cfg.ctx_size;
+    /* Unconditional: the context-scaled KV one bank holds is a property of the
+     * shape and the ctx, not of how admission happens to be gated. */
+    s.kv_bank_bytes = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
     if (s.pool_banks == 0) {
         s.slots[0].provisioned = true;
         s.slots[0].state = SLOT_IDLE;
@@ -1001,6 +1007,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
+    pthread_cond_init(&s.stream_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     pthread_mutex_init(&s.capture_mu, NULL);
@@ -1101,6 +1108,11 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&s.mu);
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
+    /* /metrics/stream subscribers are parked on their own condition and are
+     * not woken by `cv`. Without this they would sleep out a full keepalive
+     * interval each before noticing, and the client drain below would wait on
+     * them — a shutdown that hangs for as long as the slowest keepalive. */
+    pthread_cond_broadcast(&s.stream_cv);
     pthread_mutex_unlock(&s.mu);
     pthread_join(worker, NULL);
     {

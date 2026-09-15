@@ -412,6 +412,23 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
                 e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
     }
+    /* Vision-Exp tower: bound and layout-validated here so a wrong or
+     * half-present vision stack refuses at load rather than at first image.
+     * Absent tower is normal for text-only artifacts and simply leaves
+     * vision_ready false; the image path is refused until it is true. */
+    if (vision_weights_bind(&e->vision_weights, &e->model)) {
+        e->vision_ready = true;
+        fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
+                "patch %u, aligner %ux%d -> %u)\n",
+                e->vision_weights.n_layers, (unsigned)PULSAR_VISION_DIM,
+                (unsigned)PULSAR_VISION_HEADS, (unsigned)PULSAR_VISION_INTER,
+                (unsigned)PULSAR_VISION_PATCH,
+                (unsigned)PULSAR_VISION_DOWNSAMPLE, (unsigned)PULSAR_VISION_DOWNSAMPLE,
+                (unsigned)PULSAR_N_EMBD);
+    }
+
+    /* the vision tower binds before the inspect-only exit for the same reason
+     * the drafter does: --inspect proves the whole artifact binds */
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -810,7 +827,8 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) {
+int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                         int n_images, char *err, size_t errlen) {
     auto *s = this;
     s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -823,6 +841,42 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
     }
     pulsar_engine *e = s->engine;
     const char *backend_name = pulsar_backend_name(e->backend);
+
+    /* The image path is refused until the artifact actually carries a bound,
+     * layout-validated tower -- which is what vision_ready has always meant.
+     * An image request is then a COLD prefill from token 0: the reference merges
+     * only on the start_pos == 0 pass and asserts that no sentinel id survives a
+     * continuation, so neither cache-reuse path may run (the extend path and the
+     * L115 seam rescue are both gated on checkpoint_valid). */
+    if (n_images > 0) {
+        if (!e->vision_ready) {
+            snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
+            return 1;
+        }
+        for (int i = 0; i < n_images; i++) {
+            if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
+                snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
+                return 1;
+            }
+        }
+        s->checkpoint_valid = false;
+    } else {
+        /* A prompt carrying sentinel ids with no image to fill them would prefill
+         * rows whose embeddings never arrived -- the embedder zero-masks an
+         * out-of-vocab id, and only the merge puts anything there -- so refuse it
+         * here instead of silently serving a wrong answer.  A tokenizer never
+         * emits an id at or above vocab_size, so ANY such id is a sentinel.  The
+         * PLACEHOLDER id is in-vocab and would embed as ordinary text, so it is
+         * refused too: it is a renderer artifact that
+         * pulsar_expand_image_placeholders() must have replaced. */
+        for (int i = 0; i < prompt->len; i++) {
+            if (prompt->v[i] >= (int)PULSAR_N_VOCAB || prompt->v[i] == e->vocab.image_id) {
+                snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request "
+                                      "carries no images", i, prompt->v[i]);
+                return 1;
+            }
+        }
+    }
 
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
@@ -1002,11 +1056,25 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             memcpy(stitched.v + live_n, prompt->v + prompt_n,
                    (size_t)(prompt->len - prompt_n) * sizeof(int));
             stitched.len = stitched.cap;
-            const int rc = s->sync(&stitched, err, errlen);
+            const int rc = s->sync(&stitched, NULL, 0, err, errlen);
             free(stitched.v);
             return rc;
         }
     }
+
+    /* The images are BORROWED for exactly this prefill.  The driver reads them
+     * off the graph so that four prefill signatures do not grow a parameter that
+     * only this caller can ever fill; the scope clears the borrow on every exit,
+     * including the interrupted ones, so no later decode can see it. */
+    struct vision_scope {
+        pulsar_gpu_graph *g;
+        const pulsar_vision_request *prev;
+        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
+            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
+        ~vision_scope() { g->vision_req = prev; }
+    };
+    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
+    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
 
     bool ok;
     s->checkpoint_valid = false;
@@ -1121,7 +1189,7 @@ pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_t
     }
 
     if (common == s->checkpoint.len) {
-        return s->sync(prompt, err, errlen) == 0 ?
+        return s->sync(prompt, NULL, 0, err, errlen) == 0 ?
             PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
     }
 

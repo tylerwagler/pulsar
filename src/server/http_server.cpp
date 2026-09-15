@@ -211,12 +211,19 @@ bool server::send_health(int fd) {
     auto *s = this;
     const char *model = server_served_model_id(s);
     bool draining;
-    int n_slots, running, waiting;
+    int n_slots, running, waiting, capacity;
     time_t started;
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
     n_slots  = s->n_slots;
+    /* The pool the run was sized for, not the number of banks provisioned so
+     * far. Banks 1..pool_banks-1 are provisioned lazily as conversations
+     * arrive, so `total` ramps from 1 while this does not move — and a reader
+     * that wants to reserve space for the pool (pulsar-gui draws one row per
+     * slot) needs the number that will not change under it. Classic mode is a
+     * pool of one. */
+    capacity = s->pool_banks > 0 ? s->pool_banks : 1;
     running  = s->n_generating;
     waiting  = s->n_queued;
     started  = s->started;
@@ -235,10 +242,11 @@ bool server::send_health(int fd) {
     buf b = {0};
     buf_printf(&b,
         "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
-        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d},"
+        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d,"
+        "\"capacity\":%d},"
         "\"kv_cache_usage\":%.6f}\n",
         draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
-        uptime, n_slots, running, waiting, kv);
+        uptime, n_slots, running, waiting, capacity, kv);
     bool ok = http_response(fd, draining ? 503 : 200,
                             "application/json", b.ptr);
     buf_free(&b);
@@ -270,7 +278,8 @@ bool server::send_root(int fd) {
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
-        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\"]}\n",
+        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\","
+        "\"/metrics/stream\"]}\n",
         PULSAR_VERSION_STR);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -502,6 +511,14 @@ bool server::send_metrics(int fd) {
         const int idx = slot_phase_index(slot_phase[i]);
         if (idx == 1 || idx == 2) prefilling++;
     }
+    /* The pool this run was sized for. Publishes the same number /health
+     * reports as slots.capacity, so a scraper can compute "how much of the pool
+     * is in use" without polling /health — which matters because banks are
+     * provisioned lazily, so the set of pulsar:slot_* series grows from one
+     * slot to the full pool over the first minutes of a session. */
+    buf_puts(&b, "# HELP pulsar:slot_pool_capacity Decode banks this run was sized for.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_pool_capacity gauge\n");
+    buf_printf(&b, "pulsar:slot_pool_capacity %d\n", s->pool_banks > 0 ? s->pool_banks : 1);
     buf_puts(&b, "# HELP pulsar:spec_draft_depth Adaptive draft depth per slot (0 = no drafter/idle).\n");
     buf_puts(&b, "# TYPE pulsar:spec_draft_depth gauge\n");
     for (int i = 0; i < n_slots; i++)
@@ -609,6 +626,9 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_ledger_committed_bytes Session cost committed by the admission ledger.\n");
     buf_puts(&b, "# TYPE pulsar:kv_ledger_committed_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_committed_bytes %llu\n", ledger_committed);
+    buf_puts(&b, "# HELP pulsar:kv_bank_bytes KV bytes one bank holds at the configured context, compressed rows plus index. Demand-paged under overcommit: reserved as VA, resident on touch.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_bank_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_bank_bytes %llu\n", (unsigned long long)s->kv_bank_bytes);
     buf_puts(&b, "# HELP pulsar:kv_ledger_budget_bytes Admission ceiling computed at startup.\n");
     buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
@@ -661,6 +681,123 @@ bool server::send_metrics(int fd) {
 
     bool ok = http_response(fd, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
+    return ok;
+}
+
+
+
+/* ── /metrics/stream ───────────────────────────────────────────────────────
+ *
+ * Polling, inverted: instead of a client asking /metrics twenty times a second
+ * whether anything changed, it opens one connection and is told.
+ *
+ * Polling is unusually expensive here. Every response closes its connection
+ * (http_response hard-codes `Connection: close`) and the accept loop spawns a
+ * thread per connection against a client cap shared with real requests, so a
+ * 20 Hz scraper costs twenty handshakes and twenty thread creations per second
+ * on the machine it is measuring. One stream subscriber costs one thread for
+ * the life of the subscription and nothing at all in between.
+ *
+ * The event carries the generation and nothing else. Shipping the exposition
+ * body on every publish would be ~12 KiB per event, worse than the polling it
+ * replaces, so the client fetches /metrics itself when the generation moves —
+ * once per publish instead of twenty times per publish. */
+
+bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
+                         const unsigned long long *generation, const bool *stop,
+                         int keepalive_ms) {
+    unsigned long long last = 0;
+    bool sent = false;
+
+    for (;;) {
+        bool keepalive = false;
+        unsigned long long gen;
+
+        pthread_mutex_lock(mu);
+        if (*stop) {
+            pthread_mutex_unlock(mu);
+            return true;
+        }
+        gen = *generation;
+
+        if (sent && gen == last) {
+            /* Nothing published since the last frame. Wait for the worker to
+             * publish, or for long enough that the connection has to be
+             * proved still alive — whichever comes first. */
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += keepalive_ms / 1000;
+            deadline.tv_nsec += (long)(keepalive_ms % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec += 1;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(cv, mu, &deadline);
+
+            if (*stop) {
+                pthread_mutex_unlock(mu);
+                return true;
+            }
+            gen = *generation;
+            keepalive = (gen == last);
+        }
+        pthread_mutex_unlock(mu);
+
+        /* The write happens with mu released, and that is the whole of the
+         * no-backpressure argument: send_all bounds itself with its own
+         * deadline and returns false for a wedged reader, and while it is
+         * waiting no lock is held, so the worker publishing the next snapshot
+         * never queues behind a slow client. */
+        buf b = {0};
+        if (keepalive) {
+            /* An SSE comment: every parser skips it, and it keeps the socket
+             * warm through proxy idle timeouts. */
+            buf_puts(&b, ": keepalive\n\n");
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            buf_puts(&b, "event: metrics\ndata: {\"generation\":");
+            buf_printf(&b, "%llu", gen);
+            buf_puts(&b, ",\"t\":");
+            buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
+            buf_puts(&b, "}\n\n");
+            last = gen;
+            sent = true;
+        }
+        bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) return false;   /* client gone, or shutdown: send_all checks */
+    }
+}
+
+
+
+bool server::send_metrics_stream(int fd) {
+    auto *s = this;
+
+    pthread_mutex_lock(&s->mu);
+    const bool at_cap = s->stream_clients >= PULSAR_SERVER_MAX_STREAMS;
+    if (!at_cap) s->stream_clients++;
+    pthread_mutex_unlock(&s->mu);
+
+    if (at_cap) {
+        /* Refused rather than queued: a scraper that cannot stream should fall
+         * back to polling, which this server still serves. Blocking here would
+         * just move the queueing somewhere less visible. */
+        http_error(fd, 503, "too many metric streams");
+        return false;
+    }
+
+    bool ok = sse_headers(fd);
+    if (ok) {
+        ok = metrics_stream_pump(fd, &s->mu, &s->stream_cv,
+                                 &s->metrics_generation, &s->stopping,
+                                 PULSAR_METRICS_STREAM_KEEPALIVE_MS);
+    }
+
+    pthread_mutex_lock(&s->mu);
+    if (s->stream_clients > 0) s->stream_clients--;
+    pthread_mutex_unlock(&s->mu);
     return ok;
 }
 
@@ -725,6 +862,13 @@ void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
         s->send_metrics(fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    /* Blocks for the life of the subscription, which is why it gets its own
+     * cap and its own thread rather than sharing the request path. */
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics/stream")) {
+        s->send_metrics_stream(fd);
         http_request_free(&hr);
         goto done;
     }

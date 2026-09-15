@@ -1799,7 +1799,7 @@ static void test_inline_system_message_placement(void) {
         "{\"role\":\"system\",\"content\":\"Prefer bullet lists.\"}]";
     const char *p = messages;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 3);
     TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
     TEST_ASSERT(!strcmp(msgs.v[2].role, "system"));
@@ -2769,7 +2769,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
         "]";
     const char *p = json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 2);
     TEST_ASSERT(msgs.v[1].tool_call_id && !strcmp(msgs.v[1].tool_call_id, "toolu_exact"));
 
@@ -2944,7 +2944,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
         "]";
     const char *p = json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL, 0));
     TEST_ASSERT(msgs.len == 3);
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(msgs.v[0].calls.v[0].id &&
@@ -3433,6 +3433,15 @@ static void test_parse_sampling_key_contract(void) {
     p = "0.7,";
     TEST_ASSERT(parse_sampling_key("temperature", &p, &r) == 1);
     TEST_ASSERT(r.temperature > 0.69f && r.temperature < 0.71f);
+    /* strtod accepts nan/inf lexemes; a non-finite knob bypasses every clamp
+     * below (NaN fails each comparison) and would reach the sampler, so the
+     * parser refuses it (review B2). */
+    p = "nan,";
+    TEST_ASSERT(parse_sampling_key("temperature", &p, &r) == -1);
+    p = "-Infinity,";
+    TEST_ASSERT(parse_sampling_key("min_p", &p, &r) == -1);
+    p = "inf,";
+    TEST_ASSERT(parse_sampling_key("top_p", &p, &r) == -1);
     p = "1.5,"; /* out-of-range min_p disables the filter, never greedy-collapses */
     TEST_ASSERT(parse_sampling_key("min_p", &p, &r) == 1);
     TEST_ASSERT(r.min_p == 0.0f && r.has_min_p);
@@ -3444,6 +3453,26 @@ static void test_parse_sampling_key_contract(void) {
     TEST_ASSERT(parse_sampling_key("logprobs", &p, &r) == 0);
 
     request_free(&r);
+}
+
+/* The legacy /v1/completions surface has NO logprobs path: the ledger append and
+ * the response field are chat/Responses only.  Its catch-all used to SKIP the
+ * key, so a client that asked for distributions got HTTP 200, no payload, and
+ * speculation still enabled -- a silent fail-open (found while building the B5
+ * lane gate).  It refuses loudly now.  The refusal returns before tokenization,
+ * so a NULL engine is a valid probe of it; the "explicit null stays accepted"
+ * half reaches tokenization and is served-probed instead. */
+static void test_parse_completion_request_refuses_logprobs(void) {
+    request r;
+    char err[256];
+    const char *yes = "{\"prompt\": \"hi\", \"logprobs\": true}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_completion_request(NULL, yes, 16, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "not supported on /v1/completions") != NULL);
+    const char *top = "{\"prompt\": \"hi\", \"top_logprobs\": 3}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_completion_request(NULL, top, 16, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "not supported on /v1/completions") != NULL);
 }
 
 /* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
@@ -3472,6 +3501,158 @@ static void test_json_value_helpers_null_out_on_failure(void) {
         TEST_ASSERT(!ok);                /* the malformed value must fail */
         TEST_ASSERT(out == NULL);        /* ... and must have nulled *out */
         free(out);                       /* the fail-label free: no double-free */
+    }
+}
+
+
+
+/* The chat image surface: an OpenAI image_url block is decoded from its base64
+ * data: URL, attached to the message, and its placeholder is written into the
+ * content at the block's position.  A remote URL and a malformed data URL are
+ * refused with a message, never dropped, and an unknown non-text block fails
+ * closed instead of vanishing from the prompt. */
+static void test_chat_image_url_content_blocks(void) {
+    /* The 1x1 PNG, so the bytes are a real encoded FILE, not a re-encode. */
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"look\"},");
+    buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (!parsed) {
+        fprintf(stderr, "chat image parse refused: %s\n", err);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+        return;
+    }
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(msgs.v[0].images[0].len > 8);
+        TEST_ASSERT(msgs.v[0].images[0].bytes[0] == 0x89 && msgs.v[0].images[0].bytes[1] == 'P');
+        TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) != NULL);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    const char *remote =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]";
+    chat_msgs remote_msgs = {0};
+    p = remote; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &remote_msgs, err, sizeof err));
+    TEST_ASSERT(strstr(err, "http") != NULL);
+    chat_msgs_free(&remote_msgs);
+
+    const char *badb64 =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,!!!!\"}}]}]";
+    chat_msgs bad_msgs = {0};
+    p = badb64; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &bad_msgs, err, sizeof err));
+    TEST_ASSERT(strstr(err, "base64") != NULL);
+    chat_msgs_free(&bad_msgs);
+
+    const char *audio =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"data\":\"x\"}]}]";
+    chat_msgs audio_msgs = {0};
+    p = audio; err[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &audio_msgs, err, sizeof err));
+    chat_msgs_free(&audio_msgs);
+
+    /* The decoder itself: round trip, then the malformed shapes. */
+    static const char hello[] = "aGVsbG8=";   /* "hello" */
+    size_t n = 0;
+    uint8_t *bytes = base64_decode(hello, strlen(hello), &n);
+    TEST_ASSERT(bytes && n == 5 && !memcmp(bytes, "hello", 5));
+    free(bytes);
+    TEST_ASSERT(base64_decode("abc", 3, &n) == NULL);       /* impossible length */
+    TEST_ASSERT(base64_decode("ab=c", 4, &n) == NULL);      /* data after padding */
+    TEST_ASSERT(base64_decode("aaaa====", 8, &n) == NULL);  /* padding mid-stream */
+    TEST_ASSERT(base64_decode("a!b=", 4, &n) == NULL);      /* bad alphabet */
+}
+
+
+
+/* The Anthropic image surface: an image block's inline base64 is decoded from
+ * source.data, attached to the message, and its placeholder is written into
+ * the content at the block's position.  A remote-URL source, a malformed
+ * payload, an unsupported media_type and an unknown block type all refuse with
+ * a message; the silent drop was the bug this reader exists to remove. */
+static void test_anthropic_image_content_blocks(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"look\"},");
+    buf_puts(&json, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",");
+    buf_puts(&json, "\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_anthropic_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (!parsed) {
+        fprintf(stderr, "anthropic image parse refused: %s\n", err);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+        return;
+    }
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(msgs.v[0].images[0].len > 8);
+        TEST_ASSERT(msgs.v[0].images[0].bytes[0] == 0x89 && msgs.v[0].images[0].bytes[1] == 'P');
+        TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) != NULL);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* image/jpeg is the other media type the engine decodes. */
+    const char *jpeg =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+        "{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"aGVsbG8=\"}}]}]";
+    chat_msgs jmsgs = {0};
+    p = jpeg; err[0] = 0;
+    TEST_ASSERT(parse_anthropic_messages(&p, &jmsgs, err, sizeof err));
+    TEST_ASSERT(jmsgs.len == 1 && jmsgs.v[0].images_len == 1 &&
+                jmsgs.v[0].images[0].len == 5);
+    chat_msgs_free(&jmsgs);
+
+    struct { const char *json; const char *needle; } bad[] = {
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]",
+         "remote"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"!!!!\"}}]}]",
+         "base64"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/webp\",\"data\":\"aGVsbG8=\"}}]}]",
+         "media_type"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":"
+         "{\"type\":\"base64\",\"media_type\":\"image/png\"}}]}]",
+         "data"},
+        {"[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"data\":\"x\"}]}]",
+         "content block type"},
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        chat_msgs bad_msgs = {0};
+        p = bad[i].json; err[0] = 0;
+        TEST_ASSERT(!parse_anthropic_messages(&p, &bad_msgs, err, sizeof err));
+        TEST_ASSERT(strstr(err, bad[i].needle) != NULL);
+        TEST_ASSERT(bad_msgs.len == 0);
+        chat_msgs_free(&bad_msgs);
     }
 }
 
@@ -3585,7 +3766,8 @@ static void test_json_parser_handles_tool_heavy_requests(void) {
 
         const char *mp = messages.ptr;
         chat_msgs msgs = {0};
-        TEST_ASSERT(parse_messages(&mp, &msgs));
+        char perr[160] = {0};
+        TEST_ASSERT(parse_messages(&mp, &msgs, perr, sizeof perr));
         json_ws(&mp);
         TEST_ASSERT(*mp == '\0');
         TEST_ASSERT(msgs.len == 98);
@@ -5810,8 +5992,8 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     int cut = -1;
     memset(surv, 0, sizeof surv);
     memset(npend, 0, sizeof npend);
-    const float thr_fallback = 6.0f / 45.0f;   /* spec_ms_per_tok_ema unset */
-    const float thr_live = 6.0f / 30.0f;       /* a live EMA of 30 ms/tok */
+    const float thr_fallback = PULSAR_SPEC_ROW_MS / 45.0f;   /* spec_ms_per_tok_ema unset */
+    const float thr_live = PULSAR_SPEC_ROW_MS / 30.0f;       /* a live EMA of 30 ms/tok */
 
     /* (a) demand 3 + 12 = 15 < 16, one bank with hopeless confidence, a
      * fourth bank not decoding (npend 0): everything admitted, no cut. */
@@ -6776,6 +6958,528 @@ static void test_l179_mixed_giveup_only_on_recoverable_prefill_reject(void) {
 
 
 
+
+/* ── /metrics/stream ───────────────────────────────────────────────────────
+ *
+ * The stream exists so a dashboard can stop polling, and polling this server
+ * is not cheap: every response closes its connection and every accepted
+ * connection gets a thread. These tests cover the three ways the pump can go
+ * wrong that a compiler cannot see — missing a publish, never proving a quiet
+ * connection alive, and hanging a shutdown — plus the one property that
+ * matters most: a wedged reader must not be able to hold the metrics lock.
+ *
+ * The pump is a free function taking no server and no engine precisely so all
+ * of this can be driven over a socketpair on a machine with no GPU.
+ */
+
+typedef struct {
+    int fd;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    unsigned long long generation;
+    bool stop;
+    bool result;
+    bool done;
+    int keepalive_ms;
+} stream_fixture;
+
+static void *stream_pump_thread(void *arg) {
+    stream_fixture *f = (stream_fixture *)arg;
+    bool r = metrics_stream_pump(f->fd, &f->mu, &f->cv, &f->generation, &f->stop,
+                                 f->keepalive_ms);
+    pthread_mutex_lock(&f->mu);
+    f->result = r;
+    f->done = true;
+    pthread_mutex_unlock(&f->mu);
+    return NULL;
+}
+
+static void stream_fixture_init(stream_fixture *f, int fds[2], int keepalive_ms) {
+    memset(f, 0, sizeof(*f));
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    pthread_mutex_init(&f->mu, NULL);
+    pthread_cond_init(&f->cv, NULL);
+    f->fd = fds[0];
+    f->keepalive_ms = keepalive_ms;
+}
+
+static void stream_fixture_free(stream_fixture *f, int fds[2]) {
+    close(fds[0]);
+    close(fds[1]);
+    pthread_cond_destroy(&f->cv);
+    pthread_mutex_destroy(&f->mu);
+}
+
+/* Read whatever has arrived within `ms`; -1 on timeout or EOF. */
+static int stream_read_within(int fd, char *out, size_t cap, int ms) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int rc;
+    do { rc = poll(&pfd, 1, ms); } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return -1;
+    ssize_t n = recv(fd, out, cap - 1, 0);
+    if (n <= 0) return -1;
+    out[n] = '\0';
+    return (int)n;
+}
+
+static void stream_bump(stream_fixture *f, unsigned long long gen) {
+    pthread_mutex_lock(&f->mu);
+    f->generation = gen;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+}
+
+static void stream_stop(stream_fixture *f) {
+    pthread_mutex_lock(&f->mu);
+    f->stop = true;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+}
+
+/* A subscriber must learn the current state immediately, not at the next
+ * publish — otherwise a dashboard that connects to a quiet server shows
+ * nothing at all until something happens. */
+static void test_metrics_stream_sends_the_current_generation_first(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 5000);
+    f.generation = 7;
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "event: metrics") != NULL);
+    TEST_ASSERT(strstr(buf, "\"generation\":7") != NULL);
+    /* The frame must be terminated by a blank line or no SSE parser will
+     * dispatch it. */
+    TEST_ASSERT(strstr(buf, "\n\n") != NULL);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* One frame per publish, carrying that publish's generation. */
+static void test_metrics_stream_emits_one_frame_per_publish(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 5000);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+
+    stream_bump(&f, 11);
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+    TEST_ASSERT(strstr(buf, "\"generation\":11") != NULL);
+
+    stream_bump(&f, 12);
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+    TEST_ASSERT(strstr(buf, "\"generation\":12") != NULL);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* A publish that does not advance the generation must not produce a frame:
+ * otherwise a client would refetch /metrics for nothing. */
+static void test_metrics_stream_ignores_a_redundant_wakeup(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 5000);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+
+    /* Wake the waiter without changing anything. */
+    pthread_mutex_lock(&f.mu);
+    pthread_cond_broadcast(&f.cv);
+    pthread_mutex_unlock(&f.mu);
+
+    /* The next thing on the wire should be a keepalive, not an event. */
+    int n = stream_read_within(fds[1], buf, sizeof buf, 3000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strncmp(buf, ":", 1) == 0);
+    TEST_ASSERT(strstr(buf, "event: metrics") == NULL);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* Silence has to be broken periodically or proxies reap the connection and
+ * the client cannot tell a quiet server from a dead one. */
+static void test_metrics_stream_keepalives_when_quiet(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 150);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+    TEST_ASSERT(strstr(buf, "event: metrics") != NULL);
+
+    int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strncmp(buf, ":", 1) == 0);
+    TEST_ASSERT(strstr(buf, "keepalive") != NULL);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* Shutdown sets `stopping` and broadcasts. The pump must return promptly
+ * rather than sleeping out the rest of a keepalive interval, because the
+ * client drain waits on it — otherwise shutdown takes as long as the slowest
+ * subscriber's keepalive. */
+static void test_metrics_stream_exits_promptly_on_shutdown(void) {
+    stream_fixture f;
+    int fds[2];
+    /* A deliberately long keepalive: if the pump were relying on its timeout
+     * to notice shutdown, this test would take a minute. */
+    stream_fixture_init(&f, fds, 60000);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                            + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    TEST_ASSERT(elapsed_ms < 1000.0);
+    TEST_ASSERT(f.result == true);   /* a shutdown exit is not a failure */
+
+    stream_fixture_free(&f, fds);
+}
+
+/* A client that hangs up must end the subscription, and be reported as a
+ * failed write rather than as a clean shutdown, so the caller can tell them
+ * apart in its logs. */
+static void test_metrics_stream_reports_a_departed_client(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 100);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+
+    /* Hang up, then publish: the write is what discovers it. */
+    close(fds[1]);
+    stream_bump(&f, 99);
+
+    for (int i = 0; i < 100 && !f.done; i++) {
+        struct timespec nap = {.tv_sec = 0, .tv_nsec = 50000000L};
+        nanosleep(&nap, NULL);
+    }
+    TEST_ASSERT(f.done);
+    TEST_ASSERT(f.result == false);
+
+    close(fds[0]);
+    pthread_cond_destroy(&f.cv);
+    pthread_mutex_destroy(&f.mu);
+}
+
+/* The property the whole design hangs on: a subscriber that stops reading must
+ * not stall the metrics lock, so the worker publishing the next snapshot never
+ * queues behind a slow client.
+ *
+ * Getting this test to be honest took three corrections, all recorded because
+ * each one was a real misunderstanding:
+ *
+ *   - The first version leaked a hang: it made a socketpair with default
+ *     options, and a blocking send() on a full buffer waits forever, so
+ *     send_all's own deadline could never fire. Every accepted socket in the
+ *     server gets SO_SNDTIMEO through configure_client_socket; this now does
+ *     the same, scaled down from the production 10 s.
+ *   - The second version asserted the wedged thread exits inside 10 s. Measured
+ *     over 30 runs that is bimodal — usually 1.8 s, occasionally past 20 s —
+ *     because it depends on socket-buffer dynamics under a broadcast storm.
+ *     That bound is send_all's business, not this test's, so it is tested
+ *     separately and deterministically below.
+ *   - What remains here is the deterministic half: while the pump is provably
+ *     inside a blocked write, the lock must still be free.
+ */
+static void test_metrics_stream_write_does_not_hold_the_metrics_lock(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 60000);
+
+    /* What configure_client_socket does to every accepted socket, scaled down
+     * so a broken test fails fast instead of hanging the suite. */
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    TEST_ASSERT(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0);
+
+    int small = 4096;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    /* Feed publishes and read none of them, so the pump ends up wedged in a
+     * blocked write — the state a dead dashboard leaves it in. */
+    for (unsigned long long gen = 1; gen <= 8000 && !f.done; gen++) {
+        pthread_mutex_lock(&f.mu);
+        f.generation = gen;
+        pthread_cond_broadcast(&f.cv);
+        pthread_mutex_unlock(&f.mu);
+    }
+
+    struct timespec nap = {.tv_sec = 0, .tv_nsec = 300000000L};
+    nanosleep(&nap, NULL);
+    /* If this trips the buffer never filled and the test proves nothing, which
+     * is worth knowing rather than passing vacuously. */
+    TEST_ASSERT(!f.done);
+
+    /* The lock must still be free: the pump is inside send_all right now. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_mutex_lock(&f.mu);
+    pthread_mutex_unlock(&f.mu);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double held_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    TEST_ASSERT(held_ms < 500.0);
+
+    /* Teardown: draining unblocks the write, then shutdown wakes the wait.
+     * Without the drain this join would wait out the send timeout. */
+    char sink[4096];
+    for (int i = 0; i < 200 && !f.done; i++) {
+        if (stream_read_within(fds[1], sink, sizeof sink, 20) <= 0) break;
+    }
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* The other half, isolated: the guard that stops a wedged reader holding a
+ * thread forever. This is send_all's own stall deadline, and it is only
+ * reachable because the socket carries a send timeout — with a blocking socket
+ * and no timeout, send() never returns and the deadline is dead code. That
+ * distinction is the whole reason the test above was rewritten. */
+static void test_send_all_gives_up_on_a_wedged_socket(void) {
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    TEST_ASSERT(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0);
+
+    int small = 4096;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+
+    /* Fill the pipe so the next write has nowhere to go. */
+    char filler[1024];
+    memset(filler, 'x', sizeof filler);
+    for (int i = 0; i < 4096; i++) {
+        if (send(fds[0], filler, sizeof filler, 0) < 0) break;
+    }
+
+    char big[64 * 1024];
+    memset(big, 'y', sizeof big);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const bool ok = send_all(fds[0], big, sizeof big);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    const double took_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    TEST_ASSERT(ok == false);
+    /* Deadline is PULSAR_SERVER_SEND_STALL_TIMEOUT_MS; allow a wide margin for
+     * scheduler noise but nothing like the unbounded case. */
+    TEST_ASSERT(took_ms < 10000.0);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* The handler, not just the pump: a bare `server` with no engine behind it is
+ * enough, because send_metrics_stream touches only mu, stream_cv, the stream
+ * counter and the two caps. What matters here is the cap, since these
+ * connections are long-lived and must not be able to consume the budget real
+ * requests need. */
+
+typedef struct {
+    server *s;
+    int fd;
+    bool result;
+} stream_handler_arg;
+
+static void *stream_handler_thread(void *arg) {
+    stream_handler_arg *a = (stream_handler_arg *)arg;
+    a->result = a->s->send_metrics_stream(a->fd);
+    return NULL;
+}
+
+static void test_metrics_stream_handler_speaks_sse(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.stream_cv, NULL);
+    s.metrics_generation = 3;
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    stream_handler_arg a = {.s = &s, .fd = fds[0], .result = false};
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_handler_thread, &a) == 0);
+
+    /* Headers and the first event are separate writes and may or may not
+     * arrive in one read, so accumulate rather than assuming. */
+    char all[4096] = {0};
+    size_t used = 0;
+    for (int i = 0; i < 4 && !strstr(all, "event: metrics"); i++) {
+        char tmp[1024];
+        int n = stream_read_within(fds[1], tmp, sizeof tmp - 1, 1500);
+        if (n <= 0) break;
+        if (used + (size_t)n < sizeof all - 1) {
+            memcpy(all + used, tmp, (size_t)n);
+            used += (size_t)n;
+            all[used] = '\0';
+        }
+    }
+
+    TEST_ASSERT(strstr(all, "HTTP/1.1 200") != NULL);
+    TEST_ASSERT(strstr(all, "text/event-stream") != NULL);
+    TEST_ASSERT(strstr(all, "event: metrics") != NULL);
+    TEST_ASSERT(strstr(all, "\"generation\":3") != NULL);
+    /* One subscriber counted, and no request slot taken. */
+    TEST_ASSERT(s.stream_clients == 1);
+    TEST_ASSERT(s.clients == 0);
+
+    pthread_mutex_lock(&s.mu);
+    s.stopping = true;
+    pthread_cond_broadcast(&s.stream_cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(th, NULL);
+
+    /* The subscriber count is released on the way out, or a few reconnects
+     * would permanently wedge the endpoint at its cap. */
+    TEST_ASSERT(s.stream_clients == 0);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_cond_destroy(&s.stream_cv);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_metrics_stream_handler_refuses_past_its_own_cap(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.stream_cv, NULL);
+    s.stream_clients = PULSAR_SERVER_MAX_STREAMS;
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    /* Returns at once rather than blocking: a refused scraper falls back to
+     * polling, which this server still serves. */
+    TEST_ASSERT(s.send_metrics_stream(fds[0]) == false);
+
+    char buf[2048];
+    int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "503") != NULL);
+    TEST_ASSERT(strstr(buf, "text/event-stream") == NULL);
+
+    /* The refusal took nothing from the request budget and did not grow the
+     * stream count: a dashboard at its cap must not starve real requests. */
+    TEST_ASSERT(s.clients == 0);
+    TEST_ASSERT(s.stream_clients == PULSAR_SERVER_MAX_STREAMS);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_cond_destroy(&s.stream_cv);
+    pthread_mutex_destroy(&s.mu);
+}
+
+
+/* /health must report the pool the run was sized for separately from how many
+ * banks have actually been provisioned.
+ *
+ * Banks 1..pool_banks-1 are provisioned lazily, so `total` ramps from one over
+ * the first minutes of a session while `capacity` never moves. A client that
+ * reserves layout space for the pool — pulsar-gui draws a row per slot — needs
+ * the number that does not move, or its panel grows under it as the pool warms
+ * up. Reporting only `total` made that growth invisible to the client. */
+static void test_health_reports_pool_capacity_apart_from_provisioned(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.n_slots = 1;      /* one bank provisioned so far */
+    s.pool_banks = 8;   /* sized for eight this run */
+    s.n_generating = 1;
+    s.started = time(NULL);
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(s.send_health(fds[0]) == true);
+
+    char buf[2048];
+    const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "\"status\":\"ok\"") != NULL);
+    TEST_ASSERT(strstr(buf, "\"total\":1") != NULL);
+    TEST_ASSERT(strstr(buf, "\"capacity\":8") != NULL);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Classic mode is a pool of one, not a pool of zero: pool_banks == 0 there
+ * means "no pool", and a client asking for capacity must still get a sane
+ * row count. */
+static void test_health_capacity_is_one_in_classic_mode(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.n_slots = 1;
+    s.pool_banks = 0;
+    s.started = time(NULL);
+
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(s.send_health(fds[0]) == true);
+
+    char buf[2048];
+    const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(buf, "\"capacity\":1") != NULL);
+
+    close(fds[0]);
+    close(fds[1]);
+    pthread_mutex_destroy(&s.mu);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_logprob_token_json_sanitizes_ill_formed_utf8();
     test_random_prefixed_id_format();
@@ -6877,7 +7581,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
+    test_chat_image_url_content_blocks();
+    test_anthropic_image_content_blocks();
     test_parse_sampling_key_contract();
+    test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
@@ -6930,6 +7637,19 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
     test_l179_mixed_giveup_only_on_recoverable_prefill_reject();
+
+    test_metrics_stream_sends_the_current_generation_first();
+    test_metrics_stream_emits_one_frame_per_publish();
+    test_metrics_stream_ignores_a_redundant_wakeup();
+    test_metrics_stream_keepalives_when_quiet();
+    test_metrics_stream_exits_promptly_on_shutdown();
+    test_metrics_stream_reports_a_departed_client();
+    test_metrics_stream_write_does_not_hold_the_metrics_lock();
+    test_send_all_gives_up_on_a_wedged_socket();
+    test_metrics_stream_handler_speaks_sse();
+    test_metrics_stream_handler_refuses_past_its_own_cap();
+    test_health_reports_pool_capacity_apart_from_provisioned();
+    test_health_capacity_is_one_in_classic_mode();
 }
 
 

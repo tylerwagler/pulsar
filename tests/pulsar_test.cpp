@@ -1826,6 +1826,40 @@ static void test_sampler_dist_equivalence(void) {
         pulsar_sample_scratch_free(&fresh);
     }
 
+    /* (review B2) a NaN temperature is non-finite, fails the `<= 0` greedy
+     * test, and used to take the full-nucleus fast arm, whose inert +inf sum
+     * defeated the mass guard and emitted NaN probs.  +-Inf temperature and a
+     * non-finite top_p/min_p are the same class: they survive the clamps and
+     * make a FINITE mass (p = expf((v-max)/+-inf) = 1), so the mass guard does
+     * not catch them either -- each would silently become a uniform or
+     * unfiltered draw.  The engine refuses all of them at entry, and the plain
+     * sampler propagates -1 with the rng untouched. */
+    {
+        float row[256];
+        for (int i = 0; i < 256; i++) row[i] = (float)(i % 7);
+        const float temp_bad[3] = {NAN, INFINITY, -INFINITY};
+        for (int i = 0; i < 3; i++) {
+            pulsar_sample_dist nd;
+            memset(&nd, 0, sizeof(nd));
+            TEST_ASSERT(pulsar_sample_dist_build(row, 256, temp_bad[i], 0, 1.0f, 0.05f,
+                                                 &scratch, &nd) == 0);
+            TEST_ASSERT(nd.n == 0 && nd.ids == NULL && nd.probs == NULL);
+            uint64_t r = 0xABCD0000u;
+            TEST_ASSERT(sample_top_p_min_p(row, 256, temp_bad[i], 0, 1.0f, 0.05f, &r, NULL) == -1);
+            TEST_ASSERT(r == 0xABCD0000u);
+        }
+        const float tp_bad[2] = {NAN, INFINITY};
+        for (int i = 0; i < 2; i++) {
+            pulsar_sample_dist nd;
+            memset(&nd, 0, sizeof(nd));
+            TEST_ASSERT(pulsar_sample_dist_build(row, 256, 1.0f, 0, tp_bad[i], 0.05f,
+                                                 &scratch, &nd) == 0);
+            memset(&nd, 0, sizeof(nd));
+            TEST_ASSERT(pulsar_sample_dist_build(row, 256, 1.0f, 0, 1.0f, tp_bad[i],
+                                                 &scratch, &nd) == 0);
+        }
+    }
+
     pulsar_sample_scratch_free(&scratch);
     pulsar_sample_scratch_free(&plain_scratch);
     free(logits);
@@ -2675,7 +2709,7 @@ static void test_render_cases(void) {
         long id = idp ? strtol(idp + 6, NULL, 10) : -1;
         request r;
         char err[160];
-        if (!parse_chat_request_render(NULL, line, 128, &r, err, sizeof err)) {
+        if (!parse_chat_request_render(NULL, NULL, line, 128, &r, err, sizeof err)) {
             printf("===CASE %ld REFUSED %s===\n", id, err);
             refused++;
             continue;

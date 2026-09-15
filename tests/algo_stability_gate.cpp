@@ -11,15 +11,18 @@
  * METHOD: bank 0 is the fixed TARGET. Populate banks 0..M-1 from distinct prompts
  * (per-bank isolation means bank 0's output depends only on bank 0's KV), then run
  * ONE batched step through pulsar_session_decode_mixed at width M and capture bank 0's
- * logit row. Repeat for M in {1,2,4,5,8,12,16} on a FRESH session each time (no
+ * logit row. Repeat for M in {1,2,4,5,8,16} on a FRESH session each time (no
  * idempotency/poisoning artifacts). Bank 0's prompt/pos/token are identical every
- * time; only M (and which OTHER banks pad the batch) changes.
+ * time; only M (and which OTHER banks pad the batch) changes.  (The width-keyed
+ * arms today are named at the widths[] table below; the plan-34 M=4->5 cuBLASLt
+ * boundary this gate was built for is retired -- L167 made row KIND, not row
+ * count, choose the arm -- and the sweep is kept as the M-neutrality instrument.)
  *
  * ASSERTIONS:
  *  - HARD: bank 0's logits are byte-identical across the BATCHED tier M in
- *    {2,4,5,8,12,16} — i.e. adding rows, INCLUDING crossing the M=4->5
- *    custom->cuBLASLt boundary and the 8->9 MoE GEMV cap (L152), does not
- *    perturb the target. This is the property inc 4 relies on.
+ *    {2,4,5,8,16} — i.e. adding rows, INCLUDING crossing the single-row->batched
+ *    tier boundary and the outputs-per-warp arm at n_tok >= 6, does not perturb
+ *    the target. This is the property inc 4 relies on.
  *  - REPORTED: M=1 vs M=2 (the single-row kernel tier the inc-1 multiseq gate
  *    excludes by construction) — informational, not fatal by itself.
  * The first differing float index + the two values are printed so a real algo
@@ -109,8 +112,18 @@ int GATE_ENTRY(int argc, char **argv) {
 
     const int vocab = (int)PULSAR_N_VOCAB;
     /* 12 and 16 added 2026-09-02: the armed range above 8 rows had no width
-     * sweep in the battery (L152 lived at 9..16). */
-    const int widths[] = {1, 2, 4, 5, 8, 12, 16};
+     * sweep in the battery (L152 lived at 9..16).  L220 dropped 12: the
+     * width-KEYED arms are (a) 1 vs >=2 (the single-row tier, informational
+     * here), (b) the outputs-per-warp choice at n_tok >= 6 for the mid-size
+     * output dims (pulsar_cuda_matmul.cu), and (c) the MoE PREFILL GEMV cap of
+     * 8 -- which this gate never reaches, every row it runs is a decode row
+     * and the MoE takes the GEMV at any width there.  {1,2,4,5,8,16} spans
+     * every one of them (5 vs 8 straddles the ro arm; 8 and 16 keep the
+     * historical L152 9..16 band sampled on both sides), and the dropped
+     * width's own instantiation is asserted byte-identical against a solo row
+     * by cuda-mixed-neutrality-gate-wide (12 decode banks, fatal).
+     * 16 is PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
+    const int widths[] = {1, 2, 4, 5, 8, 16};
     const int nW = (int)(sizeof(widths) / sizeof(widths[0]));
     float *row[GATE_MAX_N]; memset(row, 0, sizeof row);
     for (int wi = 0; wi < nW; wi++) {
@@ -119,6 +132,27 @@ int GATE_ENTRY(int argc, char **argv) {
             fprintf(stderr, "ALGO-STABILITY GATE FAIL: width %d run failed\n", widths[wi]);
             g_fail = 1; goto done;
         }
+    }
+
+    /* NON-VACUITY (L220): the sweep must have run ONE batched step per width,
+     * at exactly that width -- the engine's own funnel counter (the same one
+     * --shape reports), not a second copy.  step_rows is the sum of the widths:
+     * a width that silently collapsed into another shape, or never ran, would
+     * make its comparison vacuous while still printing byte-identical. */
+    {
+        pulsar_gate_shape sh;
+        pulsar_gate_shape_read(&sh);
+        int want_rows = 0;
+        for (int wi = 0; wi < nW; wi++) want_rows += widths[wi];
+        if (sh.step_calls != (uint64_t)nW || sh.step_rows != (uint64_t)want_rows) {
+            fprintf(stderr, "ALGO-STABILITY GATE FAIL: width sweep shape %llu step call(s) / "
+                    "%llu row(s), want %d / %d -- a width did not run as its own batch\n",
+                    (unsigned long long)sh.step_calls, (unsigned long long)sh.step_rows, nW, want_rows);
+            g_fail = 1;
+            goto done;
+        }
+        printf("WIDTH SWEEP SHAPE: %d batched step(s), %llu row(s) total (sum of widths %d)\n",
+               nW, (unsigned long long)sh.step_rows, want_rows);
     }
 
     /* Reference = M=2 (the smallest BATCHED-tier width; M=1 is the single-row

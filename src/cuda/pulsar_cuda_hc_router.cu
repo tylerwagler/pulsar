@@ -101,9 +101,18 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
  * apart, individually coalesced) issue ONE AT A TIME, each waiting on the last.
  * Templating on the count lets all NHC loads be in flight together.
  *
- * BIT-EXACT: the accumulation order is unchanged (acc += c0*r0; acc += c1*r1;
- * ...), so this is an issue-order change only.  It is graded by the byte-exact
- * prefill gate, not the reference gate. */
+ * L219: the thread mapping is one thread per (t,d), computing ALL NHC
+ * destinations.  The old per-(t,dst,d) mapping re-read the same NHC residual
+ * values and the same block_out element once per destination -- 4x the residual
+ * traffic, and residual_hc is the bulk of this op's bytes ([t][hc][embd], read
+ * once here instead of four times).  Gathering the residuals once and looping
+ * the destinations in registers changes nothing about the per-output
+ * accumulation order, so it stays bit-exact by construction.
+ *
+ * BIT-EXACT: the per-output accumulation order is unchanged (acc starts at
+ * block_v*post[dst], then src_hc 0..NHC-1 in order), so this is an issue-order
+ * and dedupe change only.  It is graded by the byte-exact prefill gate, not the
+ * reference gate. */
 template <int NHC>
 __global__ static void hc_expand_kernel(
         pulsar_hc_t *out_hc,
@@ -118,28 +127,20 @@ __global__ static void hc_expand_kernel(
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    if (gid >= n_elem) return;
-    uint32_t d = gid % n_embd;
-    uint64_t tmp = gid / n_embd;
-    uint32_t dst_hc = tmp % n_hc;
-    uint32_t t = tmp / n_hc;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (NHC > 0) {
+        const uint64_t n_elem = (uint64_t)n_tokens * n_embd;
+        if (gid >= n_elem) return;
+        const uint32_t d = (uint32_t)(gid % n_embd);
+        const uint32_t t = (uint32_t)(gid / n_embd);
 
-    float block_v = block_out[(uint64_t)t * n_embd + d];
-    if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
-    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
-    if (NHC > 0) {
-        /* Gather first, accumulate second: the loads have no dependence on each
-         * other, so hoisting them out of the accumulate lets the compiler keep
-         * NHC of them in flight.  The adds then run in the SAME order as the
-         * rolled loop, which is what keeps this bit-exact. */
-        float comb_v[NHC > 0 ? NHC : 1];
-        float res_v[NHC > 0 ? NHC : 1];
+        float block_v = block_out[(uint64_t)t * n_embd + d];
+        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
+        float res_v[NHC];
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++) {
-            comb_v[src_hc] = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-            res_v[src_hc] = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
+        for (int src = 0; src < NHC; src++) {
+            res_v[src] = pulsar_hc_load(residual_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)src * n_embd + d);
         }
         /* PLAIN `acc += a*b`, DELIBERATELY, and this is a numerics decision --
          * read before "fixing" it back to __fmaf_rn.
@@ -159,28 +160,52 @@ __global__ static void hc_expand_kernel(
          * original model."  The prefill baseline was re-anchored for this
          * change; see PREFILL_BASELINE_REF in the Makefile. */
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++) acc += comb_v[src_hc] * res_v[src_hc];
+        for (int dst = 0; dst < NHC; dst++) {
+            float acc = block_v * post[(uint64_t)t * post_stride + dst];
+#pragma unroll
+            for (int src = 0; src < NHC; src++) {
+                const float comb_v = comb[(uint64_t)t * comb_stride + dst + (uint64_t)src * (uint64_t)NHC];
+                acc += comb_v * res_v[src];
+            }
+            pulsar_hc_store(out_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)dst * n_embd + d, acc);
+        }
     } else {
+        const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+        if (gid >= n_elem) return;
+        const uint32_t d = (uint32_t)(gid % n_embd);
+        const uint64_t tmp = gid / n_embd;
+        const uint32_t dst_hc = (uint32_t)(tmp % n_hc);
+        const uint32_t t = (uint32_t)(tmp / n_hc);
+
+        float block_v = block_out[(uint64_t)t * n_embd + d];
+        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
+        float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
         for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
             float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
             acc += comb_v * res_v;   /* matches the unrolled arm above */
         }
+        pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
     }
-    pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
 }
 
 
 
 /* One dispatch point for the three hc_expand callers.  PULSAR_N_HC is 4 on the
  * shipped artifact; anything else takes the runtime-loop instantiation, so a
- * differently-shaped model still runs (just without the unrolled gather). */
-static void hc_expand_launch(uint32_t blocks, uint32_t threads,
+ * differently-shaped model still runs (just without the unrolled gather).
+ * The grid differs by arm: NHC=4 maps one thread per (t,d), the runtime arm one
+ * per (t,dst,d). */
+static void hc_expand_launch(uint32_t threads,
                              pulsar_hc_t *out_hc, const float *block_out,
                              const float *block_add, const pulsar_hc_t *residual_hc,
                              const float *post, const float *comb,
                              uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
                              uint32_t post_stride, uint32_t comb_stride, int has_add) {
+    const uint64_t elems = n_hc == 4u ? (uint64_t)n_tokens * n_embd
+                                      : (uint64_t)n_tokens * n_hc * n_embd;
+    const uint32_t blocks = (uint32_t)((elems + threads - 1u) / threads);
     if (n_hc == 4u) {
         hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
                                                 post, comb, n_embd, n_hc, n_tokens,
@@ -374,44 +399,25 @@ __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai
 
 /* One warp per token: each lane holds NE/32 experts, the top-K selection is a
  * K-round warp argmax with ties broken toward the lower expert id (torch.topk
- * order on equal scores).  Scores select (with the correction bias), the raw
- * sqrt(softplus) probabilities weight; the normalisation is the reference's
- * `weights / (weights.sum() + 1e-20) * route_scale` in fp32.  V4.1 (L218):
- * 384 experts / top-6 on the target, 128 / top-3 on the DSpark drafter --
- * the two instantiations below; there are no hash-routed layers any more. */
+ * order on equal scores).  Scores select (with the correction bias, or with the
+ * vision image-token bias on an image slot), the raw sqrt(softplus)
+ * probabilities weight; the normalisation is the reference's `weights /
+ * (weights.sum() + 1e-20) * route_scale` in fp32.  Three instantiations:
+ * 0731's 256 / top-6 target and drafter, V4.1's 384 / top-6 target, and V4.1's
+ * 128 / top-3 DSpark drafter. */
+/* The K-round warp argmax, ONE implementation for both callers: the dense arm
+ * below and the hash kernel's IMAGE arm (a vision image slot on a hash layer
+ * must not take the tid2eid path -- that table has a row per real token only,
+ * model.py).  `local_score` is consumed (a taken expert is marked -inf) and both
+ * arrays are [NE/32] per lane; lane 0 writes the selection and the normalised
+ * weights. */
 template <uint32_t NE, uint32_t TOPK>
-__global__ static void router_select_warp_topk_kernel(
-        int32_t *selected,
-        float *weights,
-        float *probs,
-        const float *bias,
-        int has_bias,
-        const float *logits,
-        uint32_t n_tokens,
-        float route_scale) {
-    static_assert(NE % 32u == 0u, "experts per lane must be whole");
+__device__ __forceinline__ static void router_topk_select_warp(
+        float (&local_prob)[NE / 32u],
+        float (&local_score)[NE / 32u],
+        int32_t *sel, float *w, float route_scale) {
     constexpr uint32_t PER = NE / 32u;
     const uint32_t lane = threadIdx.x;
-    const uint32_t row_in_block = threadIdx.y;
-    const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
-    if (t >= n_tokens || lane >= 32u) return;
-
-    const float *log = logits + (uint64_t)t * NE;
-    float *prob = probs ? probs + (uint64_t)t * NE : NULL;
-    int32_t *sel = selected + (uint64_t)t * TOPK;
-    float *w = weights + (uint64_t)t * TOPK;
-    float local_prob[PER];
-    float local_score[PER];
-
-    #pragma unroll
-    for (uint32_t j = 0; j < PER; j++) {
-        const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
-        local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
-        if (prob) prob[e] = p;
-    }
-
     float out_prob[TOPK];
     uint32_t out_idx[TOPK];
     #pragma unroll
@@ -471,204 +477,59 @@ __global__ static void router_select_warp_topk_kernel(
     }
 }
 
+template <uint32_t NE, uint32_t TOPK>
+__global__ static void router_select_warp_topk_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const float *bias,
+        int has_bias,
+        const float *logits,
+        const int32_t *tokens,
+        int32_t token_scalar,
+        uint32_t n_tokens,
+        const float *vl_bias,
+        uint32_t n_vocab,
+        int has_vl_bias,
+        float route_scale) {
+    static_assert(NE % 32u == 0u, "experts per lane must be whole");
+    constexpr uint32_t PER = NE / 32u;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row_in_block = threadIdx.y;
+    const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
+    if (t >= n_tokens || lane >= 32u) return;
 
+    /* Vision-Exp: an image slot carries a token id at or above the vocabulary
+     * -- the reference emits out-of-vocab sentinels for every image position
+     * (model.py: image ids are vocab_size + type).  Such a position routes
+     * with bias_vl INSTEAD of the text bias, and on a hash layer it must NOT
+     * take the tid2eid path, because that table only has a row per real token
+     * (model.py: topk(scores + bias_vl) where the image mask holds).  Only the
+     * SELECTION is biased: the routing weights come from the unbiased scores,
+     * matching the reference's softmax over the selected logits. */
+    const int32_t tok_id = tokens ? tokens[t] : token_scalar;
+    const int is_image = has_vl_bias && tok_id >= (int32_t)n_vocab;
+    const int use_bias = is_image ? 1 : has_bias;
+    const float *use_bias_row = is_image ? vl_bias : bias;
 
-/* out_q/out_sf, when non-NULL, receive the E4M3 + E8M0 encoding of the SwiGLU
- * result straight from this epilogue, so the MXFP8 shared_down GEMM does not
- * wait on a separate quantize pass over batch_shared_mid.  The launcher only
- * supplies them when n is a multiple of the 256-thread block, so no lane takes
- * the `i >= n` exit before the warp-wide shuffle in pulsar_mx_emit_block.
- *
- * This kernel is launched FLAT over n = rows * mid_dim, so the MX (row, col)
- * has to be recovered by division.  mid_dim is a multiple of 32, so a warp's
- * 32 consecutive i never straddle a row and are 32-aligned within it. */
-/* Gate/up loads for the templated swiglu below.  The float overload is a
- * plain load — the float instantiation is instruction-identical to the
- * pre-template kernel.  The __half overload DEFUSES the narrow-store edge
- * (L033 increment 1): the gate clamp below is UPPER-bound-only, so a
- * large-negative gate that overflowed f16 to -inf would give
- * s = -inf/(1+expf(+inf)) = -inf/inf = NaN where the f32 path yields -0.
- * Pulling ±inf to ±max-finite keeps swiglu(-huge) ≈ -0 (the f32 answer) and
- * is the IDENTITY on every finite stored value; NaN is deliberately left to
- * propagate exactly as the f32 path would. */
-__device__ static inline float swiglu_act_load(const float *p, uint32_t i) { return p[i]; }
-__device__ static inline float swiglu_act_load(const __half *p, uint32_t i) {
-    float v = __half2float(p[i]);
-    if (isinf(v)) v = copysignf(65504.0f, v);
-    return v;
+    const float *log = logits + (uint64_t)t * NE;
+    float *prob = probs ? probs + (uint64_t)t * NE : NULL;
+    int32_t *sel = selected + (uint64_t)t * TOPK;
+    float *w = weights + (uint64_t)t * TOPK;
+    float local_prob[PER];
+    float local_score[PER];
+
+    #pragma unroll
+    for (uint32_t j = 0; j < PER; j++) {
+        const uint32_t e = lane + j * 32u;
+        const float p = sqrtf(softplus_dev(log[e]));
+        local_prob[j] = p;
+        local_score[j] = p + (use_bias ? use_bias_row[e] : 0.0f);
+        if (prob) prob[e] = p;
+    }
+
+    router_topk_select_warp<NE, TOPK>(local_prob, local_score, sel, w, route_scale);
 }
-
-template <typename AT>
-__global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, uint32_t n, float clamp, float weight,
-                                     __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = pulsar_swiglu_elem(swiglu_act_load(gate, i), swiglu_act_load(up, i), weight, clamp);
-    /* `out` is NULL when the launcher was told the f32 store is dead -- the
-     * MXFP8 consumer reads the encoding below instead.  The branch is uniform
-     * across the whole launch, so it costs nothing in a bandwidth-bound
-     * kernel, and it removes the widest store this kernel makes. */
-    if (out) out[i] = v;
-    if (out_q) {
-        pulsar_mx_emit_block(v, i % mid_dim, i / mid_dim, mid_dim, out_kbp, out_q, out_sf);
-    }
-}
-
-
-
-__global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = a[i] + b[i];
-}
-
-
-
-__global__ static void directional_steering_project_kernel(
-        float       *x,
-        const float *directions,
-        uint32_t     layer,
-        uint32_t     width,
-        uint32_t     rows,
-        float        scale) {
-    const uint32_t row = blockIdx.x;
-    if (row >= rows || width == 0) return;
-
-    float *xr = x + (uint64_t)row * width;
-    const float *dir = directions + (uint64_t)layer * width;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
-        sum += xr[i] * dir[i];
-    }
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-
-    const float coeff = scale * partial[0];
-    for (uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
-        xr[i] -= coeff * dir[i];
-    }
-}
-
-
-int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
-                                uint32_t n, float clamp, float weight,
-                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
-                                int skip_f32) {
-    /* gate/up carry their own element size (L033 increment 2: prefill stages
-     * them f16; decode's fused path passes f32 scratch and takes the float
-     * instantiation untouched).  They must AGREE — one f16 and one f32 means a
-     * caller narrowed half a pair, the [[L035]] shape. */
-    const uint32_t act_esz = pulsar_tensor_esz(gate);
-    if (!out || !gate || !up ||
-        act_esz != pulsar_tensor_esz(up) ||
-        (act_esz != sizeof(float) && act_esz != sizeof(__half)) ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
-        gate->bytes < (uint64_t)n * act_esz ||
-        up->bytes < (uint64_t)n * act_esz) {
-        if (gate && up && pulsar_tensor_esz(gate) != pulsar_tensor_esz(up))
-            fprintf(stderr, "pulsar: swiglu gate/up element sizes disagree (%u vs %u) -- refusing\n",
-                    pulsar_tensor_esz(gate), pulsar_tensor_esz(up));
-        return 0;
-    }
-    /* skip_f32 without an encoding to replace it would write NOTHING and leave
-     * the consumer reading stale bytes.  Same failure shape as a skipped
-     * emission, so it gets the same treatment: refuse, do not silently
-     * downgrade to storing f32 (that would hide a caller bug behind a
-     * correct-looking run). */
-    if (skip_f32 && !out_q) {
-        fprintf(stderr, "pulsar: swiglu asked to skip the f32 store with no E4M3 slot "
-                        "(n=%u mid_dim=%u) -- refusing\n", n, mid_dim);
-        return 0;
-    }
-    /* FAIL LOUD rather than silently skip the emission: the caller arms the
-     * activation cache off the same slot pointer, so a skipped emission leaves
-     * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
-     * n must fill whole blocks (no lane exits before the warp shuffle) and
-     * mid_dim must be a whole number of MX blocks. */
-    if (out_q && ((n % 256u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
-        fprintf(stderr, "pulsar: swiglu cannot emit MX for n=%u mid_dim=%u "
-                        "(need n %% 256 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
-        return 0;
-    }
-    /* Announce once per shape.  A byte-identical gate cannot tell "the store
-     * was skipped" from "the skip never fired", and a silently-inert
-     * optimisation looks exactly like a working one -- same reason the A8 GEMV
-     * arms announce themselves in pulsar_cuda_matmul.cu. */
-    if (skip_f32) {
-        static uint32_t seen_n[8] = {0};
-        static int n_seen = 0;
-        int known = 0;
-        for (int i = 0; i < n_seen; i++) if (seen_n[i] == n) { known = 1; break; }
-        if (!known && n_seen < 8) {
-            seen_n[n_seen++] = n;
-            fprintf(stderr, "pulsar: swiglu f32 store SKIPPED (n=%u mid_dim=%u, %.1f MiB/layer)\n",
-                    n, mid_dim, (double)n * sizeof(float) / (1024.0 * 1024.0));
-        }
-    }
-    if (act_esz == sizeof(__half)) {
-        /* Announce once: a byte gate cannot distinguish "reading the f16
-         * staging" from "the narrowing never went live" (same rule as the
-         * skip announcement above). */
-        static int announced = 0;
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr, "pulsar: swiglu reading F16 gate/up staging (n=%u mid_dim=%u)\n",
-                    n, mid_dim);
-        }
-        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
-                                                (const __half *)gate->ptr, (const __half *)up->ptr, n, clamp, weight,
-                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
-    } else {
-        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
-                                                (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
-                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
-    }
-    return cuda_ok(cudaGetLastError(), "swiglu launch");
-}
-
-
-
-int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
-    if (!out || !a || !b ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
-        a->bytes < (uint64_t)n * sizeof(float) ||
-        b->bytes < (uint64_t)n * sizeof(float)) return 0;
-    add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
-    return cuda_ok(cudaGetLastError(), "add launch");
-}
-
-
-int pulsar_gpu_directional_steering_project_tensor(
-        pulsar_gpu_tensor       *x,
-        const pulsar_gpu_tensor *directions,
-        uint32_t                layer,
-        uint32_t                width,
-        uint32_t                rows,
-        float                   scale) {
-    if (!x || !directions || width == 0 || rows == 0 || scale == 0.0f) return 0;
-    const uint64_t x_bytes = (uint64_t)width * rows * sizeof(float);
-    const uint64_t dir_bytes = (uint64_t)(layer + 1u) * width * sizeof(float);
-    if (x->bytes < x_bytes || directions->bytes < dir_bytes) return 0;
-
-    uint32_t nth = 256u;
-    while (nth > width && nth > 1u) nth >>= 1;
-    directional_steering_project_kernel<<<rows, nth>>>(
-            (float *)x->ptr,
-            (const float *)directions->ptr,
-            layer,
-            width,
-            rows,
-            scale);
-    return cuda_ok(cudaGetLastError(), "directional steering launch");
-}
-
-
 
 /* The HASH-ROUTED arm -- 0731's leading layers (pulsar_shape::n_hash_layer),
  * which name their experts by TOKEN ID instead of selecting them from the
@@ -678,7 +539,7 @@ int pulsar_gpu_directional_steering_project_tensor(
  * The logits are still needed: the table names the experts, but the WEIGHT is
  * the expert's sqrt(softplus(logit)) -- the bias-free probability, the same
  * value the top-k arm stores in `probs`, NOT the bias-corrected score.  So this
- * kernel takes no bias at all.
+ * kernel takes no text bias at all.
  *
  * A separate kernel rather than an arm inside router_select_warp_topk_kernel:
  * this one needs an NE-wide shared tile of probabilities, and paying 4-6 KB of
@@ -698,6 +559,9 @@ __global__ static void router_select_hash_kernel(
         int32_t token_scalar,
         uint32_t hash_rows,
         uint32_t n_tokens,
+        const float *vl_bias,
+        uint32_t n_vocab,
+        int has_vl_bias,
         float route_scale) {
     static_assert(NE % 32u == 0u, "experts per lane must be whole");
     constexpr uint32_t PER = NE / 32u;
@@ -707,6 +571,10 @@ __global__ static void router_select_hash_kernel(
     if (t >= n_tokens || lane >= 32u) return;
 
     const float *log = logits + (uint64_t)t * NE;
+    int32_t *sel = selected + (uint64_t)t * TOPK;
+    float *w = weights + (uint64_t)t * TOPK;
+    const int32_t tok_id = tokens ? tokens[t] : token_scalar;
+    const int is_image = has_vl_bias && tok_id >= (int32_t)n_vocab;
     __shared__ float sprob[4][NE];   /* 4 = the block's y dim */
 
     #pragma unroll
@@ -718,13 +586,27 @@ __global__ static void router_select_hash_kernel(
     }
     __syncwarp();
 
+    /* Vision-Exp: an image slot does NOT take the table path -- its id is
+     * vocab_size + type and the table has a row per real token only -- so it
+     * runs the same vl-biased top-k the dense arm runs (dev's per-row rule). */
+    if (is_image) {
+        float local_prob[PER];
+        float local_score[PER];
+        #pragma unroll
+        for (uint32_t j = 0; j < PER; j++) {
+            const uint32_t e = lane + j * 32u;
+            local_prob[j] = sprob[row_in_block][e];
+            local_score[j] = sprob[row_in_block][e] + vl_bias[e];
+        }
+        router_topk_select_warp<NE, TOPK>(local_prob, local_score, sel, w, route_scale);
+        return;
+    }
+
     /* One lane does the table walk and the normalisation -- there is one row of
      * table per token, so spreading it over the warp would need a broadcast for
      * no gain. */
     if (lane == 0) {
-        int32_t *sel = selected + (uint64_t)t * TOPK;
-        float *w = weights + (uint64_t)t * TOPK;
-        int32_t tok = tokens ? tokens[t] : token_scalar;
+        int32_t tok = tok_id;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;   /* fail closed on a bad id */
         const int32_t *row = hash + (uint64_t)tok * TOPK;
         float sum = 0.0f;
@@ -744,7 +626,14 @@ __global__ static void router_select_hash_kernel(
 }
 
 
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, bool has_bias, uint64_t tid2eid_offset, uint32_t tid2eid_rows, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int pulsar_gpu_router_select_batch_tensor(
+        pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs,
+        const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, bool has_bias,
+        uint64_t tid2eid_offset, uint32_t tid2eid_rows,
+        const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens,
+        uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens,
+        uint64_t vl_bias_offset, uint32_t n_vocab, bool has_vl_bias) {
     if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
@@ -766,7 +655,19 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
         if (!bias) return 0;
     }
+    /* Vision-Exp: the image-token bias, one n_expert-wide row per layer.  A
+     * text-only artifact has no such tensor and this stays NULL, which leaves
+     * the kernel's behaviour bit-identical to before. */
+    const float *vl_bias = NULL;
+    if (has_vl_bias) {
+        const uint64_t vl_bytes = (uint64_t)n_expert * sizeof(float);
+        if (vl_bias_offset > model_size || model_size - vl_bias_offset < vl_bytes) return 0;
+        vl_bias = (const float *)cuda_model_range_ptr(model_map, vl_bias_offset, vl_bytes, "router_bias_vl");
+        if (!vl_bias) return 0;
+    }
     const int hb = has_bias ? 1 : 0;
+    const int hv = has_vl_bias ? 1 : 0;
+    const int32_t *tokp = tokens ? (const int32_t *)tokens->ptr : NULL;
     dim3 block(32, 4, 1);
     const dim3 grid((n_tokens + 3u) / 4u);
     int32_t *sel = (int32_t *)selected->ptr;
@@ -801,25 +702,27 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
                                                                    table_bytes, "router_tid2eid");
         if (!hash) return 0;
         router_select_hash_kernel<256u, 6u><<<grid, block>>>(
-                sel, w, pr, hash, lg, (const int32_t *)tokens->ptr, 0,
-                tid2eid_rows, n_tokens, expert_weight_scale);
+                sel, w, pr, hash, lg, tokp, 0,
+                tid2eid_rows, n_tokens, vl_bias, n_vocab, hv, expert_weight_scale);
         return cuda_ok(cudaGetLastError(), "router_select hash launch");
     }
 
     /* the routers this engine serves: the V4.1 target, 0731's target and its
-     * DSpark drafter (0731 routes with 256/top-6 on both) */
+     * DSpark drafter (the drafter routes with its OWN width -- 128/top-3 on
+     * V4.1 against a 384/top-6 target) */
     if (n_expert == 384u && n_expert_used == 6u) {
-        router_select_warp_topk_kernel<384u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<384u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, tokp, 0, n_tokens, vl_bias, n_vocab, hv, expert_weight_scale);
     } else if (n_expert == 256u && n_expert_used == 6u) {
-        router_select_warp_topk_kernel<256u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<256u, 6u><<<grid, block>>>(sel, w, pr, bias, hb, lg, tokp, 0, n_tokens, vl_bias, n_vocab, hv, expert_weight_scale);
     } else if (n_expert == 128u && n_expert_used == 3u) {
-        router_select_warp_topk_kernel<128u, 3u><<<grid, block>>>(sel, w, pr, bias, hb, lg, n_tokens, expert_weight_scale);
+        router_select_warp_topk_kernel<128u, 3u><<<grid, block>>>(sel, w, pr, bias, hb, lg, tokp, 0, n_tokens, vl_bias, n_vocab, hv, expert_weight_scale);
     } else {
         fprintf(stderr, "pulsar: router_select has no arm for %u experts / top-%u -- refusing\n", n_expert, n_expert_used);
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
+
 
 
 
@@ -1134,9 +1037,8 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+    hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
@@ -1154,9 +1056,8 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+    hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,

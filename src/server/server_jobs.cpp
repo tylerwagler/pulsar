@@ -140,7 +140,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && p->slot && current > p->cached_tokens) {
+        if (p->srv && p->slot && !p->image_request && current > p->cached_tokens) {
             p->srv->kv_cache_maybe_store_continued(p->slot);
         }
         return;
@@ -196,7 +196,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && p->slot && current > p->cached_tokens) {
+    if (p->srv && p->slot && !p->image_request && current > p->cached_tokens) {
         p->srv->kv_cache_maybe_store_continued(p->slot);
     }
 }
@@ -224,7 +224,11 @@ void server::send_prefill_failure_response(const job *j,
         }
         return;
     }
-    http_error(j->fd, 500, err);
+    /* An image request that reaches the worker has already had its data: URL,
+     * tower and block count validated by the parser, so a prefill refusal here
+     * is about the client's image context (an image the tower cannot accept, a
+     * span that will not fit a chunk) -- a 400, not a server fault. */
+    http_error(j->fd, j->req.n_images > 0 ? 400 : 500, err);
 }
 
 
@@ -631,6 +635,14 @@ void server::gen_begin(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
+    /* An image request is a COLD prefill from token 0 through
+     * pulsar_session_sync_mm(): the engine refuses any continuation for one
+     * (the reference merges images only on the start_pos == 0 pass and no
+     * sentinel id may survive into a cached prefix).  The whole live/disk
+     * prefix resolver is skipped for it, so a stale prefix can never be
+     * reported as a cache read and no continuation prompt can re-derive a
+     * different start_pos than the one expansion computed. */
+    const bool image_request = j->req.n_images > 0;
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
      * bank). No-op in classic mode / when already live. Finding 1: a failed spill
@@ -663,15 +675,28 @@ void server::gen_begin(session_slot *sl) {
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int cached = 0;
+    const char *cache_source = "none";
+    int disk_cached = 0;
+    uint8_t disk_cache_ext_flags = 0;
+    if (image_request) {
+        /* No continued checkpoint exists for a cold image prompt; clear the
+         * slot watermark so a later request cannot resume from the previous
+         * conversation's frontier. */
+        sl->continued_last_store_tokens = 0;
+        server_log(PULSAR_LOG_PREFILL,
+                   "pulsar-server: image request (%d image%s): cold prefill, prefix cache bypassed",
+                   j->req.n_images, j->req.n_images == 1 ? "" : "s");
+    } else {
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = s->responses_live_visible_prefix_prompt(sl, &j->req, old_pos,
+    cached = s->responses_live_visible_prefix_prompt(sl, &j->req, old_pos,
                                                       &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
         if (s->responses_live_matches_request(sl, &j->req.responses_live_call_ids,
@@ -815,6 +840,7 @@ void server::gen_begin(session_slot *sl) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    }  /* !image_request */
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -853,6 +879,7 @@ void server::gen_begin(session_slot *sl) {
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
+        .image_request = image_request,
         .t0 = g->t0,
         .fd = j->fd,
         .stream = j->req.stream,
@@ -907,7 +934,8 @@ void server::gen_begin(session_slot *sl) {
 
     int cold_store_len = 0;
     g->cold_store_is_anchor = false;
-    if (cached == 0 &&
+    if (!image_request &&
+        cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0)
@@ -988,13 +1016,23 @@ void server::gen_step_prefill(session_slot *sl) {
      * the shared session. An earlier slot's prefill would then yield on ANOTHER
      * slot's progress and, interrupted before its own first chunk, be misread as a
      * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
-     * setting it here binds the correct callback for this exact sync. */
-    pulsar_session_set_cancel(s->sess, gen_prefill_cancel_cb, g);
+     * setting it here binds the correct callback for this exact sync.
+     *
+     * An IMAGE prefill is not interruptible this way: the sentinel blocks are
+     * merged on this one pass, and a resumed quantum would re-enter with a plain
+     * sync whose checkpoint already carries sentinel ids (refused). So no cancel
+     * callback is armed and the mm call runs to completion; a client that has
+     * gone away is noticed at the next quantum boundary. */
+    const int n_images = g->j->req.n_images;
+    pulsar_session_set_cancel(s->sess, n_images > 0 ? NULL : gen_prefill_cancel_cb, g);
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
-    const int rc = pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    const int rc = n_images > 0
+        ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
+                                 g->err, sizeof(g->err))
+        : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {
             /* Client cancelled mid-prefill: abandon rather than resume or fail, so
@@ -1053,7 +1091,9 @@ void server::gen_stream_begin(session_slot *sl) {
     if (!g->thinking_live_continuation) s->thinking_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_maybe_store_continued(sl);
+    /* An image prompt's KV is never checkpointed: its sentinel ids cannot be
+     * re-entered by a plain sync, so a stored prefix could never be reused. */
+    if (j->req.n_images == 0) s->kv_cache_maybe_store_continued(sl);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",

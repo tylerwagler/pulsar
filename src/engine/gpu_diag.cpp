@@ -1622,6 +1622,12 @@ bool gpu_graph_alloc_raw_cap(
     g->output_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->logits = pulsar_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->prefill_tokens = pulsar_gpu_tensor_alloc(pc * sizeof(int32_t));
+    /* L216 image-span visibility: one left half and one right half of
+     * prefill_cap int32 each, written per chunk only when the chunk carries
+     * sentinel ids (gpu_graph_upload_vision_visible).  vision_visible_tokens ==
+     * 0 means "no span in this chunk" and every attention launch gets NULL. */
+    g->vision_visible = pulsar_gpu_tensor_alloc(2ull * pc * sizeof(int32_t));
+    g->vision_visible_tokens = 0;
     /* Shared multi-row logits slab (PULSAR_SPEC_LOGITS_ROWS rows).  Unconditional, NOT gated on
      * speculation: every batched multi-row output head writes its rows here —
      * the DSpark draft/verify passes, gpu_graph_verify_suffix_tops, and the
@@ -1739,6 +1745,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->output_embd &&
                     g->output_norm && g->logits &&
                     g->prefill_tokens && g->spec_logits &&
+                    g->vision_visible &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split && g->batch_hc_pre &&
                     g->output_pre && g->output_weights &&
@@ -1918,6 +1925,12 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->spec_compact_rows = 0;
         g->spec_compact_armed = false;
         g->spec_compact_acc_n = 0;
+        g->spec_argmax_host = (int32_t *)xmalloc(
+            (size_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        g->spec_argmax_rows = 0;
+        g->spec_argmax_armed = false;
+        g->spec_argmax_acc_n = 0;
+        g->spec_argmax_acc_ok = false;
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
              g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&

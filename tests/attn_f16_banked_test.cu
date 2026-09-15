@@ -195,7 +195,8 @@ int main(int argc, char **argv) {
         dout, ds, dq, (const pulsar_winkv_row_t *)draw,
         (const pulsar_mainkv_row_t *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
-        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, 0u /* causal */, NULL);
+        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, 0u /* causal */, NULL,
+        NULL, NULL /* no image-span visibility: banked rows are decode rows */);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
