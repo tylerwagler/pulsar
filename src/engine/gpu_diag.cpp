@@ -1090,6 +1090,18 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
     if (!g || bank >= PULSAR_MSEQ_MAX) return false;
     g->ms_comp_state_stale[bank] = false;
     bool stale = false;
+    /* PASS 1 -- canonicalise EVERY lane before any value work.  This is the
+     * reset the rewind always did, and the ratio-128 leg depends on it: a ghost
+     * store above the rewind target leaves rows in the 128-slot window that the
+     * next 128-emit would pool as if they were committed, and the emit happens
+     * before the re-decode reaches them (L124).  A coff-2 lane is fully
+     * determined by its ring replay below, so resetting first is harmless there;
+     * a REFUSED coff-2 rewind leaves the canonical empty lane, which is what the
+     * pre-ring engine did and what the rewind gates encode as correct. */
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_has_comp_state(il)) continue;
+        if (!compressor_state_reset_layer(g, il, bank)) return false;
+    }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1117,7 +1129,6 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
             if (!gpu_graph_overlap_rewind_layer(g, il, bank, pos)) stale = true;
             continue;
         }
-        if (!compressor_state_reset_layer(g, il, bank)) return false;
         const uint32_t phase = pos % ratio;
         if (phase == 0u) continue;   /* a group boundary: the empty group IS the state */
         /* the group's committed positions [pos - phase, pos) must be saved */
