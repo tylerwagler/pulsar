@@ -464,6 +464,8 @@ uint64_t pulsar_session::payload_bytes() {
      * file size) did not.  The gate's written == payload_bytes() check is the
      * guard; keep them one fact. */
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
+    /* v12: the projection ring's covered span, one (lo, hi) pair. */
+    bytes += 2u * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
     /* v10: the trailing digest, appended raw after the data. */
     bytes += sizeof(uint64_t);
