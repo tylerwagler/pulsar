@@ -749,51 +749,70 @@ bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank
     return ok;
 }
 
-/* L120 value half: copy kv source `il`'s projection row for `pos` into the
- * bank's ring slot and advance the covered span.  Called from the CSA2 produce
- * path for every token whose projections are STORED into the state lane -- never
- * from a speculative candidate row, and never under a multiseq step (a step that
- * mixes banks would deposit other banks' positions into the installed bank's
- * span).  The row must be the one the store consumed: the attention score with
- * the compressor's ape already folded, the indexer score with ITS ape folded too
+/* L120 value half: deposit a contiguous run of a kv source's staged projection
+ * rows into the installed bank's ring, and advance the ring's covered span.  See
+ * the header for why this is a RANGE and not a per-token copy.
+ *
+ * The rows must be the ones the stores consumed: the attention score with the
+ * compressor's ape already folded, the indexer score with ITS ape folded too
  * (its kernel folds it in place), so a replay through the store kernel -- which
- * folds nothing -- reproduces the lane byte for byte.  A no-op where the source
- * has no ring. */
-bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
-                                 const pulsar_gpu_tensor *kv_row,
-                                 const pulsar_gpu_tensor *sc_row,
-                                 bool indexer) {
-    if (!g || il >= PULSAR_N_LAYER || !kv_row || !sc_row) return false;
-    pulsar_gpu_tensor *dk = indexer ? g->layer_index_proj_kv[il] : g->layer_attn_proj_kv[il];
-    pulsar_gpu_tensor *ds = indexer ? g->layer_index_proj_sc[il] : g->layer_attn_proj_sc[il];
-    if (!dk && !ds) return true;                  /* no ring on this source (coff 1) */
-    if (!dk || !ds) return false;                 /* half a ring is an impossible state */
-    const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    const uint32_t head_dim = indexer ? PULSAR_N_INDEXER_HEAD_DIM : PULSAR_N_HEAD_DIM;
-    const uint64_t row_bytes = (uint64_t)pulsar_comp_row_width(ratio, head_dim) * sizeof(float);
-    const uint64_t off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * row_bytes;
-    if (pulsar_gpu_tensor_bytes(dk) < off + row_bytes ||
-        pulsar_gpu_tensor_bytes(ds) < off + row_bytes ||
-        pulsar_gpu_tensor_bytes(kv_row) < row_bytes ||
-        pulsar_gpu_tensor_bytes(sc_row) < row_bytes) {
-        fprintf(stderr, "pulsar: kv source %u: projection ring bounds refuse (pos %u, %s lane)\n",
-                il, pos, indexer ? "index" : "attn");
-        return false;
+ * folds nothing -- reproduces the lane byte for byte. */
+static bool proj_ring_copy_rows(pulsar_gpu_tensor *ring, const pulsar_gpu_tensor *batch,
+                                uint64_t batch_row_bytes, uint32_t first_row, uint32_t n_rows,
+                                uint32_t pos_first, uint64_t ring_row_bytes) {
+    uint32_t done = 0;
+    while (done < n_rows) {
+        const uint32_t slot = (pos_first + done) % PULSAR_REWIND_RING_DEPTH;
+        uint32_t run = PULSAR_REWIND_RING_DEPTH - slot;
+        if (run > n_rows - done) run = n_rows - done;
+        if (pulsar_gpu_tensor_copy_async(ring, (uint64_t)slot * ring_row_bytes,
+                                         batch, (uint64_t)(first_row + done) * batch_row_bytes,
+                                         (uint64_t)run * ring_row_bytes) == 0) {
+            fprintf(stderr, "pulsar: projection ring deposit refused (slot %u, %u rows)\n", slot, run);
+            return false;
+        }
+        done += run;
     }
-    return pulsar_gpu_tensor_copy_async(dk, off, kv_row, 0, row_bytes) != 0 &&
-           pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;
+    return true;
 }
 
-void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
-    if (!g) return;
-    /* A gap restarts the span.  Deliberately conservative: after a rewind the
-     * next deposit lands below the stale hi and restarts the span, so slots
-     * claimed under a stale hi -- a ghost position's deposit -- can never be read
-     * back by a replay. */
-    if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;
-    g->proj_ring_hi = pos + 1u;
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
+                                 uint32_t row0, uint32_t n_rows) {
+    if (!g || il >= PULSAR_N_LAYER) return false;
+    if (n_rows == 0u) return true;
+    /* A multiseq step mixes banks: these rows are other sequences' positions and
+     * this span describes the installed bank's, so depositing them would make a
+     * later replay read another bank's row. */
+    if (g->batch_multiseq) return true;
+    pulsar_gpu_tensor *akv = g->layer_attn_proj_kv[il], *asc = g->layer_attn_proj_sc[il];
+    pulsar_gpu_tensor *ikv = g->layer_index_proj_kv[il], *isc = g->layer_index_proj_sc[il];
+    if (!akv && !asc && !ikv && !isc) return true;      /* coff 1: no ring on this source */
+    if (!akv || !asc) return false;                     /* half a ring is an impossible state */
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    const uint32_t attn_w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+    const uint32_t idx_w = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+    /* Only the last PULSAR_REWIND_RING_DEPTH rows can still be in the ring, and
+     * the positions they carry are the newest of the run. */
+    const uint32_t m = n_rows > PULSAR_REWIND_RING_DEPTH ? PULSAR_REWIND_RING_DEPTH : n_rows;
+    const uint32_t first = n_rows - m;
+    const uint32_t pos_first = pos0 + first;
+    const uint64_t arow = (uint64_t)attn_w * sizeof(float);
+    const uint64_t irow = (uint64_t)idx_w * sizeof(float);
+    bool ok = proj_ring_copy_rows(akv, g->batch_comp_kv, arow, row0 + first, m, pos_first, arow) &&
+              proj_ring_copy_rows(asc, g->batch_comp_sc, arow, row0 + first, m, pos_first, arow);
+    if (ok && ikv && isc) {
+        ok = proj_ring_copy_rows(ikv, g->batch_index_comp_kv, irow, row0 + first, m, pos_first, irow) &&
+             proj_ring_copy_rows(isc, g->batch_index_comp_sc, irow, row0 + first, m, pos_first, irow);
+    }
+    if (!ok) return false;
+    /* The span, in one step for the whole run: a gap from the previous hi
+     * restarts it, and the depth caps it.  Slots below the run's start were not
+     * written by this call, so they are claimed only while the cap allows. */
+    if (g->proj_ring_hi != pos_first) g->proj_ring_lo = pos_first;
+    g->proj_ring_hi = pos0 + n_rows;
     if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
         g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
+    return true;
 }
 
 /* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C, the risky core). Clone

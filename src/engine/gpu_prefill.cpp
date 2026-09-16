@@ -394,42 +394,6 @@ static bool gpu_graph_comp_ape_fold(
 }
 
 
-/* L120 value half: deposit a batch's projection rows into the installed bank's
- * ring, one position at a time.  Called AFTER both compressors for the source
- * have run, so each row is the one its store consumed -- the attention score
- * carries the compressor's ape (the caller folded it) and the indexer score
- * carries its own (that kernel folds it in place), which is what lets a replay
- * through the store kernel, which folds nothing, reproduce the lane.  A
- * multiseq step deposits NOTHING: its rows belong to other banks' positions and
- * the ring's span is per bank, so depositing them into the installed bank's span
- * would make a replay read another sequence's row. */
-static bool gpu_graph_proj_ring_deposit_batch(pulsar_gpu_graph *g, uint32_t il,
-                                              uint32_t pos0, uint32_t row0, uint32_t n_tokens,
-                                              bool mseq, bool own_index) {
-    if (mseq || n_tokens == 0u) return true;
-    const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    const uint32_t attn_w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
-    const uint32_t idx_w = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
-    bool ok = true;
-    for (uint32_t t = 0; ok && t < n_tokens; t++) {
-        const uint32_t row = row0 + t;
-        pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->batch_comp_kv, row, attn_w);
-        pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_comp_sc, row, attn_w);
-        ok = kv && sc && gpu_graph_proj_ring_deposit(g, il, pos0 + t, kv, sc, false);
-        pulsar_gpu_tensor_free(sc);
-        pulsar_gpu_tensor_free(kv);
-        if (ok && own_index) {
-            pulsar_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->batch_index_comp_kv, row, idx_w);
-            pulsar_gpu_tensor *isc = gpu_graph_tensor_row_view(g->batch_index_comp_sc, row, idx_w);
-            ok = ikv && isc && gpu_graph_proj_ring_deposit(g, il, pos0 + t, ikv, isc, true);
-            pulsar_gpu_tensor_free(isc);
-            pulsar_gpu_tensor_free(ikv);
-        }
-    }
-    if (ok) for (uint32_t t = 0; t < n_tokens; t++) gpu_graph_proj_ring_note_pos(g, pos0 + t);
-    return ok;
-}
-
 /* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
  * hold the kv / score projections of every row) and emit what completes.
  * Three arms, all bit-equivalent by construction:
@@ -552,7 +516,7 @@ static bool gpu_graph_csa2_produce(
         if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, true);
         /* L120 value half: the rows both stores just consumed go into the ring,
          * which is what a later rewind replays to rebuild the overlap's carry. */
-        if (ok) ok = gpu_graph_proj_ring_deposit_batch(g, il, pos0, 0u, n_tokens, mseq, own_index);
+        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos0, 0u, n_tokens);
         if (ok) {
             g->ms_n_comp[run_bank][il] = before + n_groups;
             for (uint32_t t = 0; t < n_tokens; t++) comp_counts[t] = (pos0 + t + 1u) / ratio;
@@ -623,7 +587,7 @@ static bool gpu_graph_csa2_produce(
             ok = false;
         }
         /* L120 value half: this row's own slot in the ring, after both stores. */
-        if (ok) ok = gpu_graph_proj_ring_deposit_batch(g, il, pos, t, 1u, mseq, own_index);
+        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos, t, 1u);
         if (ok && emitted) {
             const uint32_t row = *n_comp_slot;
             if (row != pos / ratio) {

@@ -3002,17 +3002,20 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
  * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
 bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
                                  uint32_t row0, uint32_t rows, bool indexer);
-/** L120 value half: copy kv source `il`'s projection row for position `pos` into
- * the bank's ring slot `pos % PULSAR_REWIND_RING_DEPTH`, then advance the covered
- * span.  A no-op on a coff-1 source (no ring lane) and where the source has no
- * such lane.  Both calls are ASYNC on the current stream, ordered after whatever
- * produced the row and before any later rewind could read it. */
-bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
-                                 const pulsar_gpu_tensor *kv_row,
-                                 const pulsar_gpu_tensor *sc_row,
-                                 bool indexer);
-/** Advance (or restart, on a gap) the ring's [lo, hi) covered span for `pos`. */
-void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos);
+/** L120 value half: deposit the staged projection rows [row0, row0+n_rows) of
+ * kv source `il` -- whose absolute positions are [pos0, pos0+n_rows) -- into the
+ * installed bank's ring, and advance its covered span.  A no-op on a coff-1
+ * source (no ring lane), under a multiseq step (those rows belong to other
+ * banks' positions and the span is per bank), and on a layer with no ring.
+ *
+ * RANGE, not per token: a contiguous source run maps to contiguous ring slots
+ * modulo the depth, so this is at most two ranged copies per lane.  The
+ * per-token shape cost 17% of prefill -- 4 copies x 21 overlapping layers x 4096
+ * tokens is ~344k small D2D launches per chunk, against ~52 MB of bytes.
+ * Copies are ASYNC on the current stream, ordered after whatever produced the
+ * rows and before any later rewind could read them. */
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
+                                 uint32_t row0, uint32_t n_rows);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
