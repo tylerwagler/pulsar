@@ -1099,6 +1099,21 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
          * boundary IS the canonical empty group, which is exactly what a reset
          * leaves, so the ring has nothing to add there. */
         if (pulsar_compress_coff(ratio) != 1u) {
+            /* A group BOUNDARY is the shape the ring answers: the carry is the
+             * only missing half, and the ring holds exactly the previous group's
+             * projection rows.  Mid-group, the pending rows themselves are what
+             * the verify saves cover and the carry they would need is beyond
+             * them, so the honest answer stays what it was before the ring --
+             * refuse, and let the caller invalidate the checkpoint.  (Replaying
+             * mid-group from the ring is what broke the ghost-rewind value leg:
+             * the ring's rows describe committed positions, not the ghost the
+             * rewind is trying to erase.) */
+            if (pos % ratio != 0u) {
+                fprintf(stderr, "pulsar: kv source %u: rewind to %u is inside an overlapping "
+                                "compressor's group and the verify saves do not carry its rows -- refusing\n",
+                        il, pos);
+                return false;
+            }
             if (!gpu_graph_overlap_rewind_layer(g, il, bank, pos)) stale = true;
             continue;
         }
@@ -1135,8 +1150,9 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
     if (g->proj_ring_lo > g->proj_ring_hi) g->proj_ring_lo = g->proj_ring_hi;
     if (stale) {
         g->ms_comp_state_stale[bank] = true;
-        fprintf(stderr, "pulsar: bank %u rewound to %u with no projection-ring coverage for an overlapping "
-                        "compressor's carry: its state is stale until a store at a group boundary\n", bank, pos);
+        fprintf(stderr, "pulsar: bank %u rewound to %u with no state coverage (the verify saves and the "
+                        "projection ring both miss it): its state is stale until a store at a group boundary\n",
+                bank, pos);
     }
     return true;
 }
