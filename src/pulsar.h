@@ -860,10 +860,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * dangerous shape: the save succeeds and the restore leaves the tail of a
  * recurrent state primed.  So a payload carries each source's comp rows, its
  * index-K rows only where an indexer runs, then the attention compressor's
- * state, then -- V4 only -- the indexer compressor's, and the whole stream ends
- * with the digest.  Earlier files are refused: the per-layer layout differs at
- * the same strides. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(11)
+ * state, then -- V4 only -- the indexer compressor's, then (v12) the L120
+ * committed-projection ring an OVERLAPPING compressor replays to rebuild its
+ * carry, plus that ring's covered span once in the counter region.  Earlier
+ * files are refused: the per-layer layout differs at the same strides. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(12)
 /** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 

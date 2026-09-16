@@ -116,7 +116,7 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
     const size_t cap = 64u * 1024u * 1024u;
     bool ok = true;
     uint64_t h = 1469598103934665603ull;
-    uint64_t attn_rows = 0, idx_rows = 0, attn_state = 0, idx_state = 0;
+    uint64_t attn_rows = 0, idx_rows = 0, attn_state = 0, idx_state = 0, attn_proj = 0, idx_proj = 0;
     uint8_t *buf = (uint8_t *)malloc(cap);
     if (!buf) return 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
@@ -137,18 +137,34 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
             for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             idx_rows += ncomp;
         }
+        /* L120 value half (v12): the projection ring an OVERLAPPING compressor
+         * replays, and the span that says which of its slots are readable.  The
+         * span is a host value, so it enters the fold as two words: a payload
+         * that carried the ring but not its span would restore rows nothing may
+         * read. */
         ok = fold_tensor(&h, g->layer_attn_state_kv[il], buf, cap, &attn_state) &&
              fold_tensor(&h, g->layer_attn_state_score[il], buf, cap, &attn_state) &&
              fold_tensor(&h, g->layer_index_state_kv[il], buf, cap, &idx_state) &&
-             fold_tensor(&h, g->layer_index_state_score[il], buf, cap, &idx_state);
+             fold_tensor(&h, g->layer_index_state_score[il], buf, cap, &idx_state) &&
+             fold_tensor(&h, g->layer_attn_proj_kv[il], buf, cap, &attn_proj) &&
+             fold_tensor(&h, g->layer_attn_proj_sc[il], buf, cap, &attn_proj) &&
+             fold_tensor(&h, g->layer_index_proj_kv[il], buf, cap, &idx_proj) &&
+             fold_tensor(&h, g->layer_index_proj_sc[il], buf, cap, &idx_proj);
+    }
+    for (int w = 0; w < 2; w++) {
+        const uint32_t v = w ? g->proj_ring_hi : g->proj_ring_lo;
+        for (int b = 0; b < 4; b++) { const uint8_t byte = (uint8_t)(v >> (8 * b)); h ^= byte; h *= 1099511628211ull; }
     }
     free(buf);
     if (!ok) return 0;
     fprintf(stderr, "  %-8s attn_comp_rows=%llu (%llu B/row)  idx_comp_rows=%llu (%llu B/row)  "
-                    "attn_state=%llu B  idx_state=%llu B  fnv=%016llx\n",
+                    "attn_state=%llu B  idx_state=%llu B  attn_proj=%llu B  idx_proj=%llu B  "
+                    "span=[%u,%u)  fnv=%016llx\n",
             tag, (unsigned long long)attn_rows, (unsigned long long)attn_row,
             (unsigned long long)idx_rows, (unsigned long long)idx_row,
             (unsigned long long)attn_state, (unsigned long long)idx_state,
+            (unsigned long long)attn_proj, (unsigned long long)idx_proj,
+            g->proj_ring_lo, g->proj_ring_hi,
             (unsigned long long)h);
     return h;
 }

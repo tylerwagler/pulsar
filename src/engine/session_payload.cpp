@@ -223,6 +223,28 @@ static uint64_t layer_index_state_bytes(uint32_t il) {
 
 
 
+/* L120 value half: the committed-projection ring an OVERLAPPING compressor
+ * replays to rebuild its carry after a resume.  It is not derivable from
+ * anything else in the payload -- the grouped and pooled rows are lossy -- so a
+ * restored checkpoint that resumes from its grid point needs it, or the first
+ * re-emitted row of every ratio-4 source pools against a carry from the wrong
+ * positions.  Sizes mirror the slab's lanes exactly. */
+static uint64_t layer_attn_proj_bytes(uint32_t il) {
+    if (!gpu_graph_layer_has_comp_state(il)) return 0u;
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (pulsar_compress_coff(ratio) == 1u) return 0u;   /* no overlap, no carry to replay */
+    return (uint64_t)PULSAR_REWIND_RING_DEPTH *
+           pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM) * sizeof(float);
+}
+
+static uint64_t layer_index_proj_bytes(uint32_t il) {
+    if (!g_pulsar_shape.indexer_own_compressor || !layer_has_index_pool(il)) return 0u;
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (pulsar_compress_coff(ratio) == 1u) return 0u;
+    return (uint64_t)PULSAR_REWIND_RING_DEPTH *
+           pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM) * sizeof(float);
+}
+
 /* Only the last logical sliding-window rows are needed from the raw cache.
  * The physical GPU tensor is a ring sized for ubatches, but after restore
  * the next suffix chunk will write its own raw rows before any attention read.
@@ -265,6 +287,8 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
         if (layer_has_index_pool(il)) bytes += rows * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
         bytes += 2u * layer_attn_state_bytes(il);
         bytes += 2u * layer_index_state_bytes(il);
+        bytes += 2u * layer_attn_proj_bytes(il);
+        bytes += 2u * layer_index_proj_bytes(il);
     }
     return bytes;
 }
@@ -626,6 +650,10 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_write_u32(&io, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
     }
+    /* L120: the ring's covered span travels with the ring -- the rows are only
+     * readable back when the span says they were deposited. */
+    if (payload_write_u32(&io, g->proj_ring_lo, err, errlen) != 0) return 1;
+    if (payload_write_u32(&io, g->proj_ring_hi, err, errlen) != 0) return 1;
 
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
@@ -660,6 +688,20 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
             rc = payload_write_tensor_span(&io, g->layer_index_state_kv[il], 0, index_state_bytes,
                                            buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
             if (rc == 0) rc = payload_write_tensor_span(&io, g->layer_index_state_score[il], 0, index_state_bytes,
+                                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        }
+        const uint64_t attn_proj_bytes = layer_attn_proj_bytes(il);
+        if (rc == 0 && attn_proj_bytes) {
+            rc = payload_write_tensor_span(&io, g->layer_attn_proj_kv[il], 0, attn_proj_bytes,
+                                           buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(&io, g->layer_attn_proj_sc[il], 0, attn_proj_bytes,
+                                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        }
+        const uint64_t index_proj_bytes = layer_index_proj_bytes(il);
+        if (rc == 0 && index_proj_bytes) {
+            rc = payload_write_tensor_span(&io, g->layer_index_proj_kv[il], 0, index_proj_bytes,
+                                           buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(&io, g->layer_index_proj_sc[il], 0, index_proj_bytes,
                                                         buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
     }
@@ -789,6 +831,23 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
             return 1;
         }
     }
+    /* L120: the ring's span, read before the lanes and installed once they are
+     * in place.  A span past the checkpoint's own length is corruption: it would
+     * let a replay read ring rows this checkpoint never deposited. */
+    uint32_t saved_ring_lo = 0, saved_ring_hi = 0;
+    if (payload_read_u32(&io, &saved_ring_lo, &remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (payload_read_u32(&io, &saved_ring_hi, &remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (saved_ring_lo > saved_ring_hi || saved_ring_hi > saved_tokens) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "KV checkpoint has an invalid projection-ring span");
+        return 1;
+    }
 
     if (pulsar_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
@@ -828,6 +887,20 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
             if (rc == 0) rc = payload_read_tensor_span(&io, g->layer_index_state_score[il], 0, index_state_bytes,
                                                        buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
+        const uint64_t attn_proj_bytes = layer_attn_proj_bytes(il);
+        if (rc == 0 && attn_proj_bytes) {
+            rc = payload_read_tensor_span(&io, g->layer_attn_proj_kv[il], 0, attn_proj_bytes,
+                                          buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(&io, g->layer_attn_proj_sc[il], 0, attn_proj_bytes,
+                                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
+        const uint64_t index_proj_bytes = layer_index_proj_bytes(il);
+        if (rc == 0 && index_proj_bytes) {
+            rc = payload_read_tensor_span(&io, g->layer_index_proj_kv[il], 0, index_proj_bytes,
+                                          buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(&io, g->layer_index_proj_sc[il], 0, index_proj_bytes,
+                                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
     }
     free(buf);
     if (rc != 0) {
@@ -864,6 +937,12 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp[il];
     }
+    /* L120: the restored ring's span, on the installed bank and mirrored for the
+     * hand-off, so a resume below the checkpoint can replay the carry. */
+    g->proj_ring_lo = saved_ring_lo;
+    g->proj_ring_hi = saved_ring_hi;
+    g->ms_proj_ring_lo[gpu_graph_cur_bank(g)] = saved_ring_lo;
+    g->ms_proj_ring_hi[gpu_graph_cur_bank(g)] = saved_ring_hi;
     s->prefill_frontier = (int)saved_prefill_frontier;   /* L195: the next sync resumes from the grid point below it */
     s->checkpoint_valid = true;
     /* a restored state invalidates any in-flight speculative lookahead: the
