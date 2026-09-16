@@ -1531,6 +1531,18 @@ int pulsar_gpu_csa2_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos);
 
+/** The overlapping compressor's (coff 2) end-of-group SHIFT, on its own: move
+ * the current half (rows [ratio, coff*ratio)) down into the carry half and clear
+ * what it left behind.  The emit does this after pooling; the L120 rewind replay
+ * (pulsar_session::rewind) does it to rebuild the carry a resume needs, which is
+ * the only other writer of the lane.  Refuses (0) on a non-overlapping ratio --
+ * there is no carry half to shift into. */
+int pulsar_gpu_csa2_compressor_shift_tensor(
+        pulsar_gpu_tensor       *state_kv,
+        pulsar_gpu_tensor       *state_score,
+        uint32_t                head_dim,
+        uint32_t                ratio);
+
 /** As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if
  * that tier actually ran and slots were supplied -- any other tier leaves it 0,

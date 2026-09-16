@@ -897,6 +897,19 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
               "boundary in pulsar_cuda_moe.cu, then raise "
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
+/** L120 value half: depth of the committed-projection ring an OVERLAPPING
+ * compressor (coff 2 -- 0731's ratio 4, and only that) uses to rebuild its state
+ * on a rewind.  A group's row is pooled from that group's tokens AND the group
+ * before them, so a replay that starts at the cut needs the previous group's
+ * projection rows, which nothing else retains.  The worst replay span is
+ * `ratio - 1 + 1` positions and a ghost overshoot is bounded by the draft depth,
+ * so 32 keeps every slot a replay reads collision-free; the ring's [lo, hi) span
+ * check is the structural half of the same guarantee.  coff-1 sources deposit
+ * nothing -- their state at a boundary is canonically empty and is rebuilt
+ * outright, which is what the CSA2 rewrite relied on when it deleted the ring
+ * (correct for V4.1, a V4 regression). */
+#define PULSAR_REWIND_RING_DEPTH 32u
+
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
  * take the M-independent arms whatever the batch width.  Lanes that own decode
@@ -975,6 +988,17 @@ typedef struct {
     pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];  ///< compressor state lane, score half
     pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, KV half
     pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, score half
+    /** L120 value half: per-bank lanes for the committed-projection ring an
+     * OVERLAPPING compressor replays (see PULSAR_REWIND_RING_DEPTH).  One bank's
+     * lane is PULSAR_REWIND_RING_DEPTH rows of `pulsar_comp_row_width(ratio,
+     * head_dim)` f32, kv and score plane separate; index_proj_* exists only where
+     * the source owns an index-K pool AND its indexer compresses its own key. */
+    uint64_t attn_proj_bank_bytes[PULSAR_MAX_LAYER];   ///< one bank's attention projection ring, f32 bytes; 0 where the compressor does not overlap
+    uint64_t index_proj_bank_bytes[PULSAR_MAX_LAYER];  ///< one bank's indexer projection ring; 0 without one
+    pulsar_gpu_tensor *attn_proj_kv[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, KV plane
+    pulsar_gpu_tensor *attn_proj_sc[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, score plane
+    pulsar_gpu_tensor *index_proj_kv[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, KV plane
+    pulsar_gpu_tensor *index_proj_sc[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, score plane
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -1069,6 +1093,30 @@ typedef struct {
      * V4.1 artifact: nothing would ever write it. */
     pulsar_gpu_tensor *layer_index_state_kv[PULSAR_MAX_LAYER];    ///< indexer compressor accumulator, KV half
     pulsar_gpu_tensor *layer_index_state_score[PULSAR_MAX_LAYER]; ///< indexer compressor accumulator, score half
+
+    /** L120 value half: rolling COMMITTED-projection rings for the overlapping
+     * compressor (coff 2, ratio 4 -- 0731 only), PULSAR_REWIND_RING_DEPTH slots
+     * at `pos % PULSAR_REWIND_RING_DEPTH` of one `pulsar_comp_row_width(ratio,
+     * head_dim)` f32 row each, kv and score plane separate, attention and
+     * indexer compressors.  A rewind replays store + shift over
+     * [ratio*(pos/ratio - 1), pos) from these to rebuild the carry half the
+     * overlap needs; nothing else retains the previous group's projection rows.
+     * Deposits happen at COMMIT points only -- the CSA2 produce path, never a
+     * speculative candidate row -- and never under a multiseq step, so the
+     * [lo, hi) span below is what tells a rewind whether the range it needs is
+     * still covered.  Banked mode: views into the slab's per-bank lanes,
+     * repointed with the state views. */
+    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];   ///< projection ring view, attention KV; NULL where the compressor does not overlap
+    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];   ///< projection ring view, attention score
+    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];  ///< projection ring view, indexer KV; NULL without one
+    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];  ///< projection ring view, indexer score
+    /** Contiguously-deposited span [lo, hi) of the projection ring, in absolute
+     * positions.  A rewind replays only when the span COVERS the range it needs;
+     * an uncovered span skips the value restore and degrades to the counter clamp
+     * (the pre-ring behaviour).  A gap restarts the span, so slots claimed under
+     * a stale hi -- a ghost position's deposit -- can never be read back. */
+    uint32_t proj_ring_lo;   ///< first position the ring still covers
+    uint32_t proj_ring_hi;   ///< one past the newest; lo == hi means empty
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
@@ -1411,6 +1459,12 @@ typedef struct {
      * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
      * initialised with the graph. */
     uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
+    /** L120 value half: the projection ring's covered span is per bank, captured
+     * and installed with the frontiers (a bank's deposits say nothing about
+     * another bank's positions).  `lo == hi` means the bank's ring is empty; both
+     * are zeroed on fork, on eviction and on install of a fresh bank. */
+    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];  ///< oldest position the bank's projection ring still covers
+    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];  ///< one past the newest
     /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment C).
      * ms_emit_keep[bank] is the boundary-row restore threshold: 0 = inactive (a
      * full-prefix fork clears it; the partial cut sets R/ratio + 1 and the emit
@@ -2948,6 +3002,17 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
  * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
 bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
                                  uint32_t row0, uint32_t rows, bool indexer);
+/** L120 value half: copy kv source `il`'s projection row for position `pos` into
+ * the bank's ring slot `pos % PULSAR_REWIND_RING_DEPTH`, then advance the covered
+ * span.  A no-op on a coff-1 source (no ring lane) and where the source has no
+ * such lane.  Both calls are ASYNC on the current stream, ordered after whatever
+ * produced the row and before any later rewind could read it. */
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
+                                 const pulsar_gpu_tensor *kv_row,
+                                 const pulsar_gpu_tensor *sc_row,
+                                 bool indexer);
+/** Advance (or restart, on a gap) the ring's [lo, hi) covered span for `pos`. */
+void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

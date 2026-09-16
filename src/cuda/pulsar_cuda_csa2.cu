@@ -507,3 +507,20 @@ int pulsar_gpu_csa2_compressor_store_tensor(
             head_dim, ratio, coff, slot_base, pos, 0u, 1u);
     return cuda_ok(cudaGetLastError(), "csa2 compressor store launch");
 }
+
+int pulsar_gpu_csa2_compressor_shift_tensor(
+        pulsar_gpu_tensor *state_kv,
+        pulsar_gpu_tensor *state_score,
+        uint32_t           head_dim,
+        uint32_t           ratio) {
+    const uint32_t coff = pulsar_compress_coff(ratio);
+    const uint64_t lane_bytes = (uint64_t)coff * ratio * coff * head_dim * sizeof(float);
+    if (coff != 2u || head_dim == 0u || ratio < 2u ||
+        !state_kv || !state_score ||
+        state_kv->bytes < lane_bytes || state_score->bytes < lane_bytes) {
+        fprintf(stderr, "pulsar: csa2 compressor shift: bad operands "
+                        "(ratio %u, head_dim %u, coff %u) -- refusing\n", ratio, head_dim, coff);
+        return 0;
+    }
+    return csa2_overlap_shift((float *)state_kv->ptr, (float *)state_score->ptr, head_dim, ratio);
+}

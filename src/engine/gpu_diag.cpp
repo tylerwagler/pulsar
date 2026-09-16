@@ -528,6 +528,25 @@ static bool gpu_graph_bank_slabs_alloc(
                    gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
                                        (uint64_t)n_banks * (index_lane / sizeof(float)))));
         }
+        /* L120 value half: the projection ring an OVERLAPPING compressor needs to
+         * rebuild its carry on a rewind, per bank like the state lanes (eager,
+         * never freed per bank -- a rewind reads one bank, and the [lo, hi) span
+         * check refuses rather than aliasing).  coff 1 gets none: its state at a
+         * boundary is canonically empty. */
+        if (pulsar_compress_coff(attn->ratio) != 1u) {
+            const uint64_t ring_row = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM) * sizeof(float);
+            b->attn_proj_bank_bytes[il] = (uint64_t)PULSAR_REWIND_RING_DEPTH * ring_row;
+            b->attn_proj_kv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->attn_proj_bank_bytes[il]);
+            b->attn_proj_sc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->attn_proj_bank_bytes[il]);
+            ok = ok && b->attn_proj_kv[il] && b->attn_proj_sc[il];
+            if (ok && own_index) {
+                const uint64_t irow = pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) * sizeof(float);
+                b->index_proj_bank_bytes[il] = (uint64_t)PULSAR_REWIND_RING_DEPTH * irow;
+                b->index_proj_kv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->index_proj_bank_bytes[il]);
+                b->index_proj_sc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->index_proj_bank_bytes[il]);
+                ok = ok && b->index_proj_kv[il] && b->index_proj_sc[il];
+            }
+        }
     }
     /* plan-33 inc C: the partial-fork boundary-row stash (one packed comp row +
      * one packed index row per (bank, layer); a few hundred KB total).  Read and
@@ -599,6 +618,10 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
     /* plan-33: an evicted bank's boundary stash is meaningless -- disarm the
      * emit-restore hook so a later cold refill cannot restore stale bytes. */
     g->ms_emit_keep[bank] = 0u;
+    /* L120: an evicted bank's projection ring is gone with its physical, so its
+     * span must not claim coverage a refill's replay would read. */
+    g->ms_proj_ring_lo[bank] = 0u;
+    g->ms_proj_ring_hi[bank] = 0u;
     if (!table_ok) {
         fprintf(stderr,
                 "pulsar: WARNING free_physical bank %u: base-table NULL device-write "
@@ -726,6 +749,53 @@ bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank
     return ok;
 }
 
+/* L120 value half: copy kv source `il`'s projection row for `pos` into the
+ * bank's ring slot and advance the covered span.  Called from the CSA2 produce
+ * path for every token whose projections are STORED into the state lane -- never
+ * from a speculative candidate row, and never under a multiseq step (a step that
+ * mixes banks would deposit other banks' positions into the installed bank's
+ * span).  The row must be the one the store consumed: the attention score with
+ * the compressor's ape already folded, the indexer score with ITS ape folded too
+ * (its kernel folds it in place), so a replay through the store kernel -- which
+ * folds nothing -- reproduces the lane byte for byte.  A no-op where the source
+ * has no ring. */
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
+                                 const pulsar_gpu_tensor *kv_row,
+                                 const pulsar_gpu_tensor *sc_row,
+                                 bool indexer) {
+    if (!g || il >= PULSAR_N_LAYER || !kv_row || !sc_row) return false;
+    pulsar_gpu_tensor *dk = indexer ? g->layer_index_proj_kv[il] : g->layer_attn_proj_kv[il];
+    pulsar_gpu_tensor *ds = indexer ? g->layer_index_proj_sc[il] : g->layer_attn_proj_sc[il];
+    if (!dk && !ds) return true;                  /* no ring on this source (coff 1) */
+    if (!dk || !ds) return false;                 /* half a ring is an impossible state */
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    const uint32_t head_dim = indexer ? PULSAR_N_INDEXER_HEAD_DIM : PULSAR_N_HEAD_DIM;
+    const uint64_t row_bytes = (uint64_t)pulsar_comp_row_width(ratio, head_dim) * sizeof(float);
+    const uint64_t off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * row_bytes;
+    if (pulsar_gpu_tensor_bytes(dk) < off + row_bytes ||
+        pulsar_gpu_tensor_bytes(ds) < off + row_bytes ||
+        pulsar_gpu_tensor_bytes(kv_row) < row_bytes ||
+        pulsar_gpu_tensor_bytes(sc_row) < row_bytes) {
+        fprintf(stderr, "pulsar: kv source %u: projection ring bounds refuse (pos %u, %s lane)\n",
+                il, pos, indexer ? "index" : "attn");
+        return false;
+    }
+    return pulsar_gpu_tensor_copy_async(dk, off, kv_row, 0, row_bytes) != 0 &&
+           pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;
+}
+
+void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
+    if (!g) return;
+    /* A gap restarts the span.  Deliberately conservative: after a rewind the
+     * next deposit lands below the stale hi and restarts the span, so slots
+     * claimed under a stale hi -- a ghost position's deposit -- can never be read
+     * back by a replay. */
+    if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;
+    g->proj_ring_hi = pos + 1u;
+    if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
+        g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
+}
+
 /* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C, the risky core). Clone
  * bank src's KV TRUNCATED at position R into dst (src==dst = in-place truncate:
  * no copies, counters/stash only). Preconds: pool on, R >= align, R % align == 0,
@@ -818,6 +888,10 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
         if (ok && source) g->ms_n_comp[dst][il] = R / attn->ratio;
     }
     if (ok && keep) g->ms_emit_keep[dst] = keep;
+    /* The cut copies KV rows, not projection rows: dst's ring has nothing until
+     * its own replay deposits, so its span starts empty. */
+    g->ms_proj_ring_lo[dst] = 0u;
+    g->ms_proj_ring_hi[dst] = 0u;
     return ok;
 }
 
@@ -875,8 +949,12 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
         }
     }
     /* A full-prefix clone carries every row, so it needs no boundary stash: clear
-     * any threshold a previous partial cut left on this bank. */
+     * any threshold a previous partial cut left on this bank.  Its projection
+     * ring is NOT cloned either (the ring is a rewind aid, and dst's span would
+     * otherwise claim source rows this bank never deposited). */
     g->ms_emit_keep[dst] = 0u;
+    g->ms_proj_ring_lo[dst] = 0u;
+    g->ms_proj_ring_hi[dst] = 0u;
     return ok;
 }
 
@@ -886,10 +964,8 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
  * cold prefill that ends on an even position leaves.  A rewound or forked bank
  * holds whatever its frontier left; reset it so the continuation's state is
  * the cold prefill's byte for byte.  Ratio-1 sources keep no state. */
-bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
-    if (!g) return false;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (!gpu_graph_layer_has_comp_state(il)) continue;
+static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    {
         pulsar_gpu_tensor *kv, *sc; uint64_t off, lane;
         if (g->banks.n_banks) {
             if (bank >= g->banks.n_banks) return false;
@@ -915,7 +991,7 @@ bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
         if (g->banks.n_banks) {
             pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, bank);
             pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, bank);
-            if (!ik && !is) continue;   /* V4.1: no such lane */
+            if (!ik && !is) return true;   /* V4.1: this profile keeps no such lane */
             const bool iok = ik && is &&
                              gpu_tensor_fill_f32(ik, 0.0f, pulsar_gpu_tensor_bytes(ik) / sizeof(float)) &&
                              gpu_tensor_fill_f32(is, PULSAR_NEG_INF, pulsar_gpu_tensor_bytes(is) / sizeof(float));
@@ -934,39 +1010,101 @@ bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
     return true;
 }
 
+bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
+    if (!g) return false;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_has_comp_state(il)) continue;
+        if (!compressor_state_reset_layer(g, il, bank)) return false;
+    }
+    return true;
+}
 
+
+
+/* L120 value half: rebuild an OVERLAPPING compressor's state lane for position
+ * `pos` from the projection ring.  The row for the group that ENDS at or after
+ * `pos` is pooled from that group's tokens AND the group before them, so the
+ * carry half holds the previous group's projection rows -- which no reset can
+ * supply and the verify saves do not cover (they span one spec round).  The ring
+ * is the retained copy: re-store [ratio*(pos/ratio - 1), pos) through the same
+ * store kernel the live path used and shift at the group close, and both halves
+ * come back byte for byte.
+ *
+ * Returns false when the ring's covered span does not hold that range -- a fresh,
+ * forked or spilled bank, or positions that were never deposited -- and the
+ * caller degrades to the counter clamp, which is what this did before the ring
+ * existed.  Both lanes (attention and, on a V4 source, the indexer's own) are
+ * rebuilt, because both carry the same overlap. */
+static bool gpu_graph_overlap_rewind_layer(pulsar_gpu_graph *g, uint32_t il,
+                                           uint32_t bank, uint32_t pos) {
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (pos < ratio) return false;
+    const uint32_t start = ratio * (pos / ratio - 1u);
+    if (start < g->proj_ring_lo || pos > g->proj_ring_hi) return false;
+    pulsar_gpu_tensor *st_kv = gpu_graph_bank_attn_state_kv_view(g, il, bank);
+    pulsar_gpu_tensor *st_sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
+    bool own_index = g_pulsar_shape.indexer_own_compressor &&
+                     gpu_graph_layer_has_index_pool(il) &&
+                     g->layer_index_proj_kv[il] && g->layer_index_proj_sc[il];
+    pulsar_gpu_tensor *ist_kv = NULL, *ist_sc = NULL;
+    if (own_index) {
+        ist_kv = gpu_graph_bank_index_state_kv_view(g, il, bank);
+        ist_sc = gpu_graph_bank_index_state_score_view(g, il, bank);
+        if (!ist_kv || !ist_sc) own_index = false;   /* no lane on this profile */
+    }
+    const uint64_t arow = (uint64_t)pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM) * sizeof(float);
+    const uint64_t irow = (uint64_t)pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM) * sizeof(float);
+    bool ok = st_kv && st_sc;
+    for (uint32_t p = start; ok && p < pos; p++) {
+        const uint64_t off = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH);
+        pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], off * arow, arow);
+        pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], off * arow, arow);
+        ok = akv && asc &&
+             pulsar_gpu_csa2_compressor_store_tensor(akv, asc, st_kv, st_sc,
+                                                     PULSAR_N_HEAD_DIM, ratio, p) != 0;
+        pulsar_gpu_tensor_free(asc);
+        pulsar_gpu_tensor_free(akv);
+        if (ok && own_index) {
+            pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], off * irow, irow);
+            pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], off * irow, irow);
+            ok = ikv && isc &&
+                 pulsar_gpu_csa2_compressor_store_tensor(ikv, isc, ist_kv, ist_sc,
+                                                         PULSAR_N_INDEXER_HEAD_DIM, ratio, p) != 0;
+            pulsar_gpu_tensor_free(isc);
+            pulsar_gpu_tensor_free(ikv);
+        }
+        if (ok && (p + 1u) % ratio == 0u) {
+            ok = pulsar_gpu_csa2_compressor_shift_tensor(st_kv, st_sc, PULSAR_N_HEAD_DIM, ratio) != 0;
+            if (ok && own_index)
+                ok = pulsar_gpu_csa2_compressor_shift_tensor(ist_kv, ist_sc, PULSAR_N_INDEXER_HEAD_DIM, ratio) != 0;
+        }
+    }
+    pulsar_gpu_tensor_free(ist_sc);
+    pulsar_gpu_tensor_free(ist_kv);
+    pulsar_gpu_tensor_free(st_sc);
+    pulsar_gpu_tensor_free(st_kv);
+    return ok;
+}
 
 bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return false;
-    if (!gpu_graph_compressor_state_reset(g, bank)) return false;
     g->ms_comp_state_stale[bank] = false;
     bool stale = false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        /* The OVERLAP lane is rebuilt from the ring; a coff-1 lane is reset and,
+         * mid-group, rebuilt from the verify saves below.  The split is the
+         * coff authority, not the profile: a coff-1 source's state at a group
+         * boundary IS the canonical empty group, which is exactly what a reset
+         * leaves, so the ring has nothing to add there. */
+        if (pulsar_compress_coff(ratio) != 1u) {
+            if (!gpu_graph_overlap_rewind_layer(g, il, bank, pos)) stale = true;
+            continue;
+        }
+        if (!compressor_state_reset_layer(g, il, bank)) return false;
         const uint32_t phase = pos % ratio;
         if (phase == 0u) continue;   /* a group boundary: the empty group IS the state */
-        /* The overlap (coff 2) lane holds TWO groups, and this rebuild only has
-         * the PENDING one in the verify saves.  The carry half would be left at
-         * the reset value -- kv 0 / score -inf -- so the next group to complete
-         * would pool its first-half positions from -inf and emit a latent built
-         * from the wrong tokens.  Still a number, still plausible.  Refuse by
-         * name until the carry is stashed; the caller invalidates the checkpoint,
-         * which is the honest outcome.  See s29 for the design. */
-        if (pulsar_compress_coff(ratio) != 1u) {
-            /* This refusal is also what keeps V4's SECOND recurrent lane (the
-             * indexer's own compressor) honest: an index lane exists only on an
-             * indexed ratio-4 source, and ratio 4 is exactly coff 2, so a lane
-             * whose carry cannot be rebuilt never reaches the rebuild below.
-             * That is why the index lane is reset above but not replayed here; a
-             * profile that ever indexes a non-overlapping ratio must extend this
-             * with the same replay the attention lane gets. */
-            fprintf(stderr,
-                    "pulsar: kv source %u: rewind to %u would rebuild only the pending group, and the "
-                    "overlap lane's carry half is not recoverable from the verify saves -- refusing\n",
-                    il, pos);
-            return false;
-        }
         /* the group's committed positions [pos - phase, pos) must be saved */
         const uint32_t first = pos - phase;
         const uint32_t s0 = g->ms_spec_save_pos0[bank], sn = g->ms_spec_save_rows[bank];
@@ -990,10 +1128,15 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         pulsar_gpu_tensor_free(st_kv);
         if (!ok) { fprintf(stderr, "pulsar: compressor state rewind failed at kv source %u (pos %u)\n", il, pos); return false; }
     }
+    /* The ring still holds ghost-position rows above pos (a speculative or
+     * rejected span's deposits), so the span must not claim to cover them for a
+     * future replay. */
+    if (g->proj_ring_hi > pos) g->proj_ring_hi = pos;
+    if (g->proj_ring_lo > g->proj_ring_hi) g->proj_ring_lo = g->proj_ring_hi;
     if (stale) {
         g->ms_comp_state_stale[bank] = true;
-        fprintf(stderr, "pulsar: bank %u rewound to %u inside a compressor group the verify saves do not cover: "
-                        "its pending state is stale until a store at a group boundary\n", bank, pos);
+        fprintf(stderr, "pulsar: bank %u rewound to %u with no projection-ring coverage for an overlapping "
+                        "compressor's carry: its state is stale until a store at a group boundary\n", bank, pos);
     }
     return true;
 }
@@ -1073,6 +1216,30 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
                     b->spec_assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
                     b->astate_bank_bytes[il]);
             ok = g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
+        }
+        /* L120 value half: the projection ring follows the bank too (views only;
+         * the lanes are eager slab memory, and the ring's span is per bank). */
+        if (ok && b->attn_proj_bank_bytes[il]) {
+            pulsar_gpu_tensor_free(g->layer_attn_proj_kv[il]);
+            pulsar_gpu_tensor_free(g->layer_attn_proj_sc[il]);
+            g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_view(
+                    b->attn_proj_kv[il], (uint64_t)bank * b->attn_proj_bank_bytes[il],
+                    b->attn_proj_bank_bytes[il]);
+            g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_view(
+                    b->attn_proj_sc[il], (uint64_t)bank * b->attn_proj_bank_bytes[il],
+                    b->attn_proj_bank_bytes[il]);
+            ok = g->layer_attn_proj_kv[il] && g->layer_attn_proj_sc[il];
+            if (ok && b->index_proj_bank_bytes[il]) {
+                pulsar_gpu_tensor_free(g->layer_index_proj_kv[il]);
+                pulsar_gpu_tensor_free(g->layer_index_proj_sc[il]);
+                g->layer_index_proj_kv[il] = pulsar_gpu_tensor_view(
+                        b->index_proj_kv[il], (uint64_t)bank * b->index_proj_bank_bytes[il],
+                        b->index_proj_bank_bytes[il]);
+                g->layer_index_proj_sc[il] = pulsar_gpu_tensor_view(
+                        b->index_proj_sc[il], (uint64_t)bank * b->index_proj_bank_bytes[il],
+                        b->index_proj_bank_bytes[il]);
+                ok = g->layer_index_proj_kv[il] && g->layer_index_proj_sc[il];
+            }
         }
     }
     /* Option F: swap the per-bank DSpark drafter ring views (present only when
@@ -1238,6 +1405,10 @@ void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[bank][i] = g->dspark_n_raw[i];
     g->ms_dspark_prompt_n[bank] = g->dspark_prompt_n;
     g->ms_dspark_prompt_lo[bank] = g->dspark_prompt_lo;
+    /* L120 value half: the projection ring's covered span is one more fact that
+     * describes THIS bank's positions, so it rides the same hand-off. */
+    g->ms_proj_ring_lo[bank] = g->proj_ring_lo;
+    g->ms_proj_ring_hi[bank] = g->proj_ring_hi;
 }
 
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
@@ -1249,6 +1420,8 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
     g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
+    g->proj_ring_lo = g->ms_proj_ring_lo[bank];
+    g->proj_ring_hi = g->ms_proj_ring_hi[bank];
 }
 
 /* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
@@ -1807,6 +1980,38 @@ bool gpu_graph_alloc_raw_cap(
                         }
                     }
                 }
+            }
+            /* L120 value half: the committed-projection ring an OVERLAPPING
+             * compressor replays.  Absent for coff 1 (V4.1's every ratio, and
+             * 0731's ratio 128), which is exactly why the CSA2 rewrite could drop
+             * it -- and why dropping it is a V4 regression. */
+            if (pulsar_compress_coff(attn->ratio) != 1u) {
+                if (banked) {
+                    g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.attn_proj_kv[il], 0, g->banks.attn_proj_bank_bytes[il]);
+                    g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_view(
+                            g->banks.attn_proj_sc[il], 0, g->banks.attn_proj_bank_bytes[il]);
+                    if (g_pulsar_shape.indexer_own_compressor && indexed) {
+                        g->layer_index_proj_kv[il] = pulsar_gpu_tensor_view(
+                                g->banks.index_proj_kv[il], 0, g->banks.index_proj_bank_bytes[il]);
+                        g->layer_index_proj_sc[il] = pulsar_gpu_tensor_view(
+                                g->banks.index_proj_sc[il], 0, g->banks.index_proj_bank_bytes[il]);
+                    }
+                } else {
+                    const uint64_t ring_row = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM) * sizeof(float);
+                    g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_alloc(PULSAR_REWIND_RING_DEPTH * ring_row);
+                    g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_alloc(PULSAR_REWIND_RING_DEPTH * ring_row);
+                    if (g_pulsar_shape.indexer_own_compressor && indexed) {
+                        const uint64_t irow = pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) * sizeof(float);
+                        g->layer_index_proj_kv[il] = pulsar_gpu_tensor_alloc(PULSAR_REWIND_RING_DEPTH * irow);
+                        g->layer_index_proj_sc[il] = pulsar_gpu_tensor_alloc(PULSAR_REWIND_RING_DEPTH * irow);
+                    }
+                }
+                /* No prime: a ring row is only ever READ back after the span
+                 * check says it was deposited, and the span starts empty. */
+                state_init_ok = state_init_ok && g->layer_attn_proj_kv[il] && g->layer_attn_proj_sc[il] &&
+                                (!(g_pulsar_shape.indexer_own_compressor && indexed) ||
+                                 (g->layer_index_proj_kv[il] && g->layer_index_proj_sc[il]));
             }
         }
     }
