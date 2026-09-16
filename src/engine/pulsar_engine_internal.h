@@ -908,7 +908,7 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
  * nothing -- their state at a boundary is canonically empty and is rebuilt
  * outright, which is what the CSA2 rewrite relied on when it deleted the ring
  * (correct for V4.1, a V4 regression). */
-#define PULSAR_REWIND_RING_DEPTH 160u
+#define PULSAR_REWIND_RING_DEPTH 288u
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
