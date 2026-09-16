@@ -977,7 +977,7 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
-PREFILL_BASELINE_REF ?= 684fa8d
+PREFILL_BASELINE_REF ?= f5bea7aa
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -986,13 +986,24 @@ PREFILL_BASELINE_REF ?= 684fa8d
 # straight to the new tracked name), then commit the blob + this line together.
 # The blob is ~2.5 MB and self-describing (ref stamp + model header + token FNV;
 # see tests/prefill_bitexact_gate.cpp and the .md next to the blob).
+#
+# ⚠ A BLOB IS ONLY MEANINGFUL FOR THE ARTIFACT IT WAS DUMPED ON (L218 s124).
+# The header pins the logits width and the prompt FNV -- NOT the weights -- so a
+# blob dumped through the `ds4flash.gguf` symlink (on sparky:
+# /srv/models/v5mx4-0731-srcfmt-v1-reapfix-lt.gguf) silently compared two
+# different 0731 artifacts' logits whenever the battery ran FRONTIER_MODEL=
+# /srv/models/v5-vexp-full256-iq2-t46.gguf, reporting 129280/129280 differing at
+# every depth -- a FAIL with no information in it.  The 684fa8d blob stays in
+# the tree for the ds4flash.gguf artifact it documents; f5bea7aa is the
+# Vision-Exp artifact the battery names, and it was dumped by ~/devref-clean's
+# own binary so the anchor is still the REFERENCE engine, not this branch.
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
 # L181: the decode-step twin -- one classic decode after each UNALIGNED prefill
 # (1001 / 4102 / 8197), logits of that step byte-compared against its own blob.
 # The prefill's own frontier logits never see the compressor state, ring or
 # seed the prefill leaves behind; this gate does.  Anchored separately (the
 # decode numerics move when the prefill's do not, and vice versa).
-PREFILL_DECODE_BASELINE_REF ?= cf30211f
+PREFILL_DECODE_BASELINE_REF ?= f5bea7aa
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
