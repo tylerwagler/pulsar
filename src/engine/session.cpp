@@ -966,14 +966,24 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             } else {
                 s->rewind((int)G);
                 if (!s->checkpoint_valid) {
-                    snprintf(err, errlen, "resume rewind to %u failed", G);
-                    return 1;
+                    /* The compressor state at G could not be re-established: no
+                     * projection-ring coverage and no boundary stash for that row
+                     * (L221).  Fall back to the cold path the `G == 0` arm above
+                     * already takes, rather than failing the request -- a rebuild
+                     * is slower, not wrong, and the alternative is decoding the
+                     * group that straddles G against a lane this rewind wiped. */
+                    fprintf(stderr, "pulsar: resume at %u on bank %u: compressor state at grid point %u "
+                                    "could not be re-established -- prefilling the prompt from 0\n",
+                            ck, bank, G);
+                    s->rewind(0);
+                    s->resume_origin = 0;
+                } else {
+                    s->resume_origin = (int)G;
+                    fprintf(stderr, "pulsar: resume at %u from grid point %u on bank %u (%u tokens recomputed)%s\n",
+                            ck, G, bank, ck - G,
+                            exact ? "" : " -- past the prefill frontier's reach: the generated tokens below stay as decoded, "
+                                         "not identical to a cold prefill");
                 }
-                s->resume_origin = (int)G;
-                fprintf(stderr, "pulsar: resume at %u from grid point %u on bank %u (%u tokens recomputed)%s\n",
-                        ck, G, bank, ck - G,
-                        exact ? "" : " -- past the prefill frontier's reach: the generated tokens below stay as decoded, "
-                                     "not identical to a cold prefill");
             }
         }
         const int suffix = prompt->len - s->checkpoint.len;

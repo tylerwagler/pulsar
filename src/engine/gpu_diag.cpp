@@ -1156,10 +1156,16 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              *     a rebuild, not a wrong row.  (The served path lands here
              *     whenever a multiseq step moved the frontier: multiseq rows are
              *     not deposited, so the ring cannot cover them.) */
-            if (pos % ratio != 0u) {
-                fprintf(stderr, "pulsar: kv source %u: rewind to %u is inside an overlapping "
-                                "compressor's group and the projection ring does not cover its "
-                                "rows -- refusing\n", il, pos);
+            /* An armed boundary stash is the ONE thing that makes an empty carry
+             * safe at a boundary: the first emit's bytes are byte-replaced with
+             * the stashed committed row, and that emit's shift rebuilds the carry
+             * for every group after it.  Without it the first emitted row is
+             * wrong and nothing would say so, so refuse there too -- a rebuild is
+             * slower, a silent wrong row is not acceptable. */
+            if (pos % ratio != 0u || g->ms_emit_keep[bank] != pos / ratio + 1u) {
+                fprintf(stderr, "pulsar: kv source %u: rewind to %u is not covered by the projection "
+                                "ring (mid-group or no boundary stash at that row) -- refusing\n",
+                        il, pos);
                 return false;
             }
             stale = true;
