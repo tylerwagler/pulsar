@@ -1142,7 +1142,27 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * may legitimately be empty on a fresh, forked or spilled bank --
              * and the counter clamp is then the honest half, exactly as before
              * the ring existed. */
-            if (!gpu_graph_overlap_rewind_layer(g, il, bank, pos)) stale = true;
+            if (gpu_graph_overlap_rewind_layer(g, il, bank, pos)) continue;
+            /* Uncovered.  The two shapes then behave DIFFERENTLY, because only
+             * one of them has a safety net:
+             *   - a group BOUNDARY survives an empty carry: the emit that pools
+             *     it is the next row up, its bytes are byte-restored from the
+             *     boundary stash when a cut armed one, and the shift that emit
+             *     performs rebuilds the carry for every row after it.  Degrade to
+             *     the counter clamp, as before the ring.
+             *   - MID-GROUP does not: the straddled group's own rows are gone, so
+             *     the next store would pool positions the lane never received.
+             *     Refuse by name and let the caller invalidate the checkpoint --
+             *     a rebuild, not a wrong row.  (The served path lands here
+             *     whenever a multiseq step moved the frontier: multiseq rows are
+             *     not deposited, so the ring cannot cover them.) */
+            if (pos % ratio != 0u) {
+                fprintf(stderr, "pulsar: kv source %u: rewind to %u is inside an overlapping "
+                                "compressor's group and the projection ring does not cover its "
+                                "rows -- refusing\n", il, pos);
+                return false;
+            }
+            stale = true;
             continue;
         }
         const uint32_t phase = pos % ratio;
