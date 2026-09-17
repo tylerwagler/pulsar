@@ -1130,21 +1130,18 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
          * boundary IS the canonical empty group, which is exactly what a reset
          * leaves, so the ring has nothing to add there. */
         if (pulsar_compress_coff(ratio) != 1u) {
-            /* A group BOUNDARY is the shape the ring answers: the carry is the
-             * only missing half, and the ring holds exactly the previous group's
-             * projection rows.  Mid-group, the pending rows themselves are what
-             * the verify saves cover and the carry they would need is beyond
-             * them, so the honest answer stays what it was before the ring --
-             * refuse, and let the caller invalidate the checkpoint.  (Replaying
-             * mid-group from the ring is what broke the ghost-rewind value leg:
-             * the ring's rows describe committed positions, not the ghost the
-             * rewind is trying to erase.) */
-            if (pos % ratio != 0u) {
-                fprintf(stderr, "pulsar: kv source %u: rewind to %u is inside an overlapping "
-                                "compressor's group and the verify saves do not carry its rows -- refusing\n",
-                        il, pos);
-                return false;
-            }
+            /* Both shapes are the ring's business on an overlapping compressor:
+             * a boundary needs the previous group for the carry, and a MID-GROUP
+             * position needs the same previous group plus the straddled group's
+             * already-committed rows, and the replay's [start, pos) span is
+             * exactly that.  Measured (rewind_frontier_gate's ghost value leg,
+             * per-row lane dump): the rebuilt lane is byte-identical to the
+             * pre-ghost lane on every row of both planes, mid-group included.
+             *
+             * An uncovered span stays a degradation, not a refusal -- the ring
+             * may legitimately be empty on a fresh, forked or spilled bank --
+             * and the counter clamp is then the honest half, exactly as before
+             * the ring existed. */
             if (!gpu_graph_overlap_rewind_layer(g, il, bank, pos)) stale = true;
             continue;
         }

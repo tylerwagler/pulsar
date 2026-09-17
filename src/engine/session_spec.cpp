@@ -1542,14 +1542,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * the invariant anyway, where both counts are known: rewind() clamps the
      * compressor frontier, drops the carry and drafter window (right -- the
      * carry was conditioned on positions that no longer exist), and rebuilds the
-     * compressor state.  `exposed_end` is an ARBITRARY position, so on a ratio-4
-     * (overlapping) source it usually lands MID-GROUP: rewind() then refuses by
-     * name and clears `checkpoint_valid`, so the next round re-prefills instead
-     * of reusing live KV.  That is the expensive-but-honest outcome, and
-     * `spec_carry_valid` is dropped just below for the same reason.  A
-     * group-ALIGNED trim replays the straddled group from the L120 projection
-     * ring and costs nothing.  The server's tripwire (server_sched.cpp) checks
-     * the same equality after every round. */
+     * compressor state from the L120 projection ring -- `exposed_end` is an
+     * arbitrary position and the replay's span covers a mid-group one as readily
+     * as a boundary.  `spec_carry_valid` is dropped just below regardless, since
+     * the carry described positions that no longer exist.  The server's tripwire
+     * (server_sched.cpp) checks the same equality after every round. */
     const int exposed_end = saved_len + n_accept;
     const bool trimmed = exposed_end < s->checkpoint.len;
     if (trimmed) s->rewind(exposed_end);
