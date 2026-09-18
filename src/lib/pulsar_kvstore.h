@@ -22,6 +22,12 @@
 #define PULSAR_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define PULSAR_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define PULSAR_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/** The AGENT writes its session/sysprompt files with an extra trailer holding
+ * the exact token ids the rendered text renders (agent-only; the server neither
+ * writes nor reads it).  It is what lets a payload-less ("stripped") file be
+ * restored WITHOUT re-tokenising its text, which cannot tell a control token
+ * from its literal spelling (L223) and may re-merge BPE across boundaries. */
+#define PULSAR_KVSTORE_EXT_AGENT_TOKENS      (1u << 4)
 
 typedef enum {
     PULSAR_KVSTORE_REASON_UNKNOWN   = 0,

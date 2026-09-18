@@ -141,6 +141,78 @@ void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
  * rendered text.  sysprompt.kv uses exact text because the file name is fixed;
  * saved sessions use their filename SHA: modern agent sessions hash the title
  * trailer plus created_at, while legacy sessions still hash rendered text. */
+/* The optional agent TOKEN trailer: the exact ids the rendered text renders.
+ * A payload-less ("stripped") file restored from it is exact, where
+ * re-tokenising the text is not (the text cannot tell a control token from its
+ * literal spelling -- L223 -- and BPE may re-merge across token boundaries). */
+bool agent_kv_write_token_trailer(FILE *fp, const pulsar_tokens *tokens,
+                                  char *err, size_t err_len) {
+    const uint32_t n = tokens && tokens->len > 0 ? (uint32_t)tokens->len : 0;
+    uint8_t nb[4];
+    pulsar_kvstore_le_put32(nb, n);
+    if (n == 0) return fwrite(nb, 1, sizeof(nb), fp) == sizeof(nb);
+    uint8_t *buf = (uint8_t *)agent_xmalloc((size_t)n * 4);
+    for (uint32_t i = 0; i < n; i++)
+        pulsar_kvstore_le_put32(buf + (size_t)i * 4, (uint32_t)tokens->v[i]);
+    const bool ok = fwrite(nb, 1, sizeof(nb), fp) == sizeof(nb) &&
+                    fwrite(buf, 1, (size_t)n * 4, fp) == (size_t)n * 4;
+    free(buf);
+    if (!ok && err && err_len) snprintf(err, err_len, "failed to write agent token trailer");
+    return ok;
+}
+
+
+
+/* Read the token trailer, leaving the file positioned where it was (just after
+ * the rendered text, which is the payload start the session loader expects). */
+bool agent_kv_read_token_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
+                                 pulsar_tokens *out, char *err, size_t err_len) {
+    if (out) memset(out, 0, sizeof(*out));
+    const off_t start = ftello(fp);
+    if (start < 0) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        return false;
+    }
+    bool ok = false;
+    uint8_t nb[4];
+    do {
+        if (hdr->payload_bytes > (uint64_t)LLONG_MAX ||
+            fseeko(fp, (off_t)hdr->payload_bytes, SEEK_CUR) != 0)
+            break;
+        if (hdr->ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) {
+            uint8_t tb[4];
+            if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) break;
+            if (fseeko(fp, (off_t)pulsar_kvstore_le_get32(tb), SEEK_CUR) != 0) break;
+        }
+        if (fread(nb, 1, sizeof(nb), fp) != sizeof(nb)) break;
+        const uint32_t n = pulsar_kvstore_le_get32(nb);
+        uint64_t remaining = 0;
+        if (!agent_fp_remaining(fp, &remaining) || (uint64_t)n * 4 > remaining) break;
+        if (n > (uint32_t)INT_MAX) break;
+        uint8_t *buf = n ? (uint8_t *)agent_xmalloc((size_t)n * 4) : NULL;
+        if (n && fread(buf, 1, (size_t)n * 4, fp) != (size_t)n * 4) {
+            free(buf);
+            break;
+        }
+        if (out && n) {
+            out->v = (int *)agent_xmalloc((size_t)n * sizeof(int));
+            for (uint32_t i = 0; i < n; i++)
+                out->v[i] = (int)pulsar_kvstore_le_get32(buf + (size_t)i * 4);
+            out->len = out->cap = (int)n;
+        }
+        free(buf);
+        ok = true;
+    } while (0);
+    if (!ok) {
+        if (out) pulsar_tokens_free(out);
+        if (err && err_len) snprintf(err, err_len, "missing agent token trailer");
+    }
+    fseeko(fp, start, SEEK_SET);
+    return ok;
+}
+
+
+
 bool agent_kv_load_path(agent_worker *w, const char *path,
                                const char *expected_sha,
                                const char *expected_text,
@@ -196,9 +268,23 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
         }
     }
 
+    pulsar_tokens trailer = {0};
+    bool have_trailer = false;
+    if (ok && hdr.payload_bytes == 0 && (hdr.ext_flags & PULSAR_KVSTORE_EXT_AGENT_TOKENS)) {
+        char terr[64];
+        have_trailer = agent_kv_read_token_trailer(fp, &hdr, &trailer, terr, sizeof(terr));
+    }
+
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
-        if (!rebuild_from_text) {
+        if (have_trailer) {
+            /* The exact ids are in the file: no re-tokenisation, no drift. */
+            expected_tokens = (uint32_t)trailer.len;
+            if (agent_worker_sync_tokens(w, &trailer, true, err, err_len) != 0) {
+                pulsar_session_invalidate(w->session);
+                ok = false;
+            }
+        } else if (!rebuild_from_text) {
             /* The caller holds the exact tokens whose render this text is (the
              * sysprompt bootstrap).  Re-tokenising the text cannot reproduce
              * them -- it would turn a control spelling inside client or tool
@@ -247,6 +333,7 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
                 agent_session_title_from_text(text, text_bytes, 0);
         }
     }
+    pulsar_tokens_free(&trailer);
     free(title);
     free(text);
     return ok;
@@ -335,7 +422,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
     pulsar_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             pulsar_kvstore_reason_code(reason),
-                            session_identity ? PULSAR_KVSTORE_EXT_SESSION_TITLE : 0,
+                            (uint8_t)((session_identity ? PULSAR_KVSTORE_EXT_SESSION_TITLE : 0) |
+                                      PULSAR_KVSTORE_EXT_AGENT_TOKENS),
                             (uint32_t)tokens->len, 0,
                             (uint32_t)pulsar_session_ctx(w->session),
                             created_at, now, payload_bytes);
@@ -351,6 +439,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
+              /* the exact ids, so a later /strip keeps the file restorable */
+              agent_kv_write_token_trailer(fp, tokens, save_err, sizeof(save_err)) &&
               fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {

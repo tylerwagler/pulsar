@@ -899,6 +899,14 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
               agent_kv_read_text(fp, text_bytes, &text, err, err_len);
     if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    /* The exact ids, when the file carries them: a stripped file must stay
+     * restorable WITHOUT re-tokenising its text (L223 -- the text cannot tell a
+     * control token from its literal spelling).  Read while the file is OPEN; a
+     * legacy file has no trailer and then the rendered text is the only count
+     * available, which is also what the loader rebuilds from. */
+    pulsar_tokens trailer = {0};
+    bool have_trailer = ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_AGENT_TOKENS) &&
+                        agent_kv_read_token_trailer(fp, &hdr, &trailer, err, err_len);
     fclose(fp);
     if (!ok) {
         if (!err[0]) snprintf(err, err_len, "failed to read session");
@@ -918,10 +926,15 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         return false;
     }
 
-    pulsar_tokens stripped_tokens = {0};
-    pulsar_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
-    uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
-    pulsar_tokens_free(&stripped_tokens);
+    uint32_t stripped_token_count = 0;
+    if (have_trailer) {
+        stripped_token_count = (uint32_t)trailer.len;
+    } else {
+        pulsar_tokens rebuilt = {0};
+        pulsar_tokenize_rendered_chat(w->engine, text, &rebuilt);
+        stripped_token_count = (uint32_t)rebuilt.len;
+        pulsar_tokens_free(&rebuilt);
+    }
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -931,6 +944,7 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
         free(tmp);
+        pulsar_tokens_free(&trailer);
         free(text);
         free(path);
         return false;
@@ -942,6 +956,7 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         close(fd);
         unlink(tmp);
         free(tmp);
+        pulsar_tokens_free(&trailer);
         free(text);
         free(path);
         return false;
@@ -949,7 +964,10 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+    const uint8_t ext_flags =
+        have_trailer ? (uint8_t)(hdr.ext_flags | PULSAR_KVSTORE_EXT_AGENT_TOKENS)
+                     : (uint8_t)(hdr.ext_flags & ~PULSAR_KVSTORE_EXT_AGENT_TOKENS);
+    pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, ext_flags,
                             stripped_token_count, hdr.hits, hdr.ctx_size,
                             hdr.created_at, now, 0);
     uint8_t tb[4];
@@ -961,6 +979,7 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
          fwrite(text, 1, text_bytes, fp) == text_bytes &&
          (!(hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) ||
           agent_kv_write_title_trailer(fp, title, err, err_len)) &&
+         (!have_trailer || agent_kv_write_token_trailer(fp, &trailer, err, err_len)) &&
          fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -982,6 +1001,7 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     free(tmp);
     free(title);
+    pulsar_tokens_free(&trailer);
     free(text);
     free(path);
     return ok;
