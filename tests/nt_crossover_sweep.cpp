@@ -155,10 +155,13 @@ int main(int argc, char **argv) {
         {"output head (bf16)", e->weights.output, NULL},
     };
     const bool cold = getenv("NTSWEEP_COLD") != NULL;
+    int cold_reps = 1;
+    if (const char *cr = getenv("NTSWEEP_COLD_REPS")) { const int v = atoi(cr); if (v > 0) cold_reps = v; }
     if (cold)
         printf("NTSWEEP_COLD: one call per LAYER, no per-call sync, /n_layers -- each timed call streams its\n"
                "              own weight from DRAM (the warm mode repeats one weight and is L2-served).\n"
-               "              The head/grouped blocks have no per-layer twin and stay warm.\n\n");
+               "              The head/grouped blocks have no per-layer twin and stay warm.\n"
+               "              NTSWEEP_COLD_REPS=n averages n passes and takes the MINIMUM.\n\n");
     const uint32_t Ms[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16};
     const int NM = (int)(sizeof(Ms) / sizeof(Ms[0]));
     const uint32_t MMAX = 16;
@@ -196,10 +199,21 @@ int main(int argc, char **argv) {
             double td, tp;
             int ncall = 0;
             if (cold && shapes[si].pick) {
-                if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
-                td = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, &ncall);
-                (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
-                tp = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, NULL);
+                /* One sample per layer is noisy (single-M outliers in the first
+                 * run); NTSWEEP_COLD_REPS averages whole passes, and the MINIMUM
+                 * is reported because a DRAM-bound pass can only be slowed by
+                 * interference, never sped up. */
+                double best_d = -1.0, best_p = -1.0;
+                for (int pass = 0; pass < cold_reps; pass++) {
+                    if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
+                    const double d = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, &ncall);
+                    (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+                    const double p2 = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, NULL);
+                    if (d > 0 && (best_d < 0 || d < best_d)) best_d = d;
+                    if (p2 > 0 && (best_p < 0 || p2 < best_p)) best_p = p2;
+                }
+                td = best_d; tp = best_p;
+                if (!td || td < 0) return 1;
                 c.w = w;   /* restore for the next shape's warm path / wbytes */
             } else {
                 if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
