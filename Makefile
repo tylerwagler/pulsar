@@ -188,7 +188,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick agent-test-gate cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick agent-test-gate host-checks cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -542,6 +542,17 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 	./tests/hc_carry_kernel_test
 	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 	./tests/vision_hc_gate
+
+# The host-only MODEL-FREE oracles, plus the eval extractor self-test.  Every
+# one of these was a loose target that no battery ran -- the shape L224 found
+# rotted (the agent suite had been ABORTING for days because no battery ran it).
+# They are seconds each, need no GPU and no model, and their binaries compile
+# their own sources one-shot (no shared objects), so the background sub-make
+# cannot race the runner's build.  pulsar-eval is a prerequisite of `gates` for
+# the same reason: the background sub-make may only RUN it.
+host-checks: attn-layout-check engram-hash-check compressor-pool-check \
+             indexer-score-check attn-pack-fixture-check
+	./pulsar-eval --self-test-extractors
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips
@@ -1329,7 +1340,8 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # CORE_OBJS is built by the targets above, so the background sub-makes only
 # RUN -- they do not race the runner's build (which reads the same objects).
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
-	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check
+	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check \
+	host-checks
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
@@ -1378,7 +1390,7 @@ GATE_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # the runner here (before any recipe line runs) means the whole CORE_OBJS set
 # is fresh before those sub-makes start -- they then only compile their own
 # test TU and link, so concurrent make processes cannot race shared objects.
-gates: tests/gates_runner
+gates: tests/gates_runner pulsar-eval
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
 	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
 	for g in $(GATE_TARGETS); do \
