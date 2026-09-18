@@ -9,6 +9,61 @@
  * prompt, and a 0731 artifact primed with it answered a tool request with a
  * DSML invoke and no block opener at all (L218 s123).  The DSML literals come
  * from the family's spelling row; nothing here is compiled per profile. */
+/* L223: record the byte range a client-data write occupies, so the tokeniser
+ * can treat those bytes as PLAIN TEXT (see buf's span fields).  begin/end nest
+ * (a depth counter and the outermost start) and a range that emitted nothing is
+ * dropped, so the list is disjoint and ascending -- which is what the tokeniser's
+ * single forward pass relies on. */
+void buf_text_begin(buf *b) {
+    if (!b) return;
+    if (!b->span_open) b->span_lo = (uint32_t)b->len;
+    b->span_open++;
+}
+
+void buf_text_end(buf *b) {
+    if (!b || !b->span_open) return;
+    if (--b->span_open) return;             /* an inner range closed; keep the outer open */
+    const uint32_t lo = b->span_lo;
+    const uint32_t hi = (uint32_t)b->len;
+    if (hi <= lo) return;
+    if (b->n_spans == b->cap_spans) {
+        const uint32_t cap = b->cap_spans ? b->cap_spans * 2u : 16u;
+        chat_text_span *grown = (chat_text_span *)server_xrealloc(b->spans, (size_t)cap * sizeof *grown);
+        b->spans = grown;
+        b->cap_spans = cap;
+    }
+    b->spans[b->n_spans].lo = lo;
+    b->spans[b->n_spans].hi = hi;
+    b->n_spans++;
+}
+
+void buf_spans_carry(buf *dst, buf *src, size_t offset) {
+    if (!dst || !src || !src->n_spans) { if (src) { free(src->spans); src->spans = NULL; src->n_spans = src->cap_spans = 0; } return; }
+    for (uint32_t i = 0; i < src->n_spans; i++) {
+        if (dst->n_spans == dst->cap_spans) {
+            const uint32_t cap = dst->cap_spans ? dst->cap_spans * 2u : 16u;
+            chat_text_span *grown = (chat_text_span *)server_xrealloc(dst->spans, (size_t)cap * sizeof *grown);
+            dst->spans = grown;
+            dst->cap_spans = cap;
+        }
+        dst->spans[dst->n_spans].lo = (uint32_t)offset + src->spans[i].lo;
+        dst->spans[dst->n_spans].hi = (uint32_t)offset + src->spans[i].hi;
+        dst->n_spans++;
+    }
+    free(src->spans);
+    src->spans = NULL;
+    src->n_spans = src->cap_spans = 0;
+}
+
+/** Write client-supplied bytes as plain text: the range is recorded so the
+ * tokeniser will not match a special-token spelling inside it. */
+static void buf_puts_content(buf *b, const char *s) {
+    if (!s || !s[0]) return;
+    buf_text_begin(b);
+    buf_puts(b, s);
+    buf_text_end(b);
+}
+
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
@@ -45,7 +100,7 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
             "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
             "Otherwise, output directly after </think> with tool calls or final response.\n\n"
             "### Available Tool Schemas\n\n");
-        buf_puts(b, tool_schemas);
+        buf_puts_content(b, tool_schemas);
         buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
                     "Use the exact parameter names from the schemas.");
         return;
@@ -68,7 +123,7 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
         "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
-    buf_puts(b, tool_schemas);
+    buf_puts_content(b, tool_schemas);
     buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
 }
 
@@ -222,12 +277,16 @@ static void append_dsml_json_literal(buf *b, const char *s) {
 
 static void append_dsml_arg(buf *b, const json_arg *arg) {
     buf_puts(b, PULSAR_PARAM_START " name=\"");
+    buf_text_begin(b);
     append_dsml_attr_escaped(b, arg->key);
+    buf_text_end(b);
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
+    buf_text_begin(b);
     if (arg->is_string) append_dsml_parameter_text(b, arg->value);
     else append_dsml_json_literal(b, arg->value);
+    buf_text_end(b);
     buf_puts(b, PULSAR_PARAM_END "\n");
 }
 
@@ -274,10 +333,14 @@ bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema
 
 
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
+    buf_text_begin(b);
     json_escape(b, arg->key);
+    buf_text_end(b);
     buf_puts(b, ":");
+    buf_text_begin(b);
     if (arg->is_string) json_escape(b, arg->value);
     else buf_puts(b, arg->value);
+    buf_text_end(b);
 }
 
 
@@ -434,9 +497,9 @@ void append_assistant_open(buf *out, bool think) {
 
 static void append_assistant_turn_body(buf *out, bool close_think, const char *reasoning,
                                        const char *content, const tool_calls *calls, bool v41) {
-    if (reasoning) buf_puts(out, reasoning);
+    if (reasoning) buf_puts_content(out, reasoning);
     if (close_think) buf_puts(out, "</think>");
-    buf_puts(out, content ? content : "");
+    buf_puts_content(out, content);
     append_dsml_tool_calls_text(out, calls, v41);
 }
 
@@ -476,7 +539,7 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
         } else {
             buf_puts(out, PULSAR_RENDER_USER "<system-reminder>\n");
         }
-        buf_puts(out, m->content ? m->content : "");
+        buf_puts_content(out, m->content);
         if (!r->v41) buf_puts(out, "\n</system-reminder>");
         r->pending_assistant = true;
         r->user_turn_open = false;
@@ -488,7 +551,7 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
          * user message and for the first tool result after one. */
         const bool join = r->v41 ? r->user_turn_open : false;
         buf_puts(out, join ? "\n\n" : PULSAR_RENDER_USER);
-        buf_puts(out, m->content ? m->content : "");
+        buf_puts_content(out, m->content);
         r->pending_assistant = true;
         r->user_turn_open = true;
         r->pending_tool_result = false;
@@ -496,7 +559,9 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
         const bool join = r->v41 ? r->user_turn_open : r->pending_tool_result;
         buf_puts(out, join ? "\n\n" : PULSAR_RENDER_USER);
         buf_puts(out, "<tool_result>");
+        buf_text_begin(out);
         append_tool_result_text(out, m->content);
+        buf_text_end(out);
         buf_puts(out, "</tool_result>");
         r->pending_assistant = true;
         r->pending_tool_result = true;
@@ -540,10 +605,18 @@ void chat_render_finish(buf *out, const chat_render *r) {
 
 
 
-char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     pulsar_think_mode think_mode, bool v41) {
+/* L223: the renderer ALSO hands back the byte ranges of the rendered text that
+ * came from client data, so the tokeniser can treat them as plain text.  The
+ * TEXT is byte-identical to what this function always produced -- the spans are a
+ * side channel, not a change to the prompt -- which is what keeps the renderer
+ * gate, the KV keys and every persisted session valid. */
+char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
+                                    const tool_schema_orders *tool_orders,
+                                    pulsar_think_mode think_mode, bool v41,
+                                    chat_text_span **spans_out, uint32_t *n_spans_out) {
     (void)tool_orders;
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
     chat_render r;
     chat_render_init(&r, msgs, tool_schemas && tool_schemas[0], think_mode, v41);
     buf system = {0};
@@ -565,7 +638,7 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         if (!role_is_system(m->role)) continue;
         if (!m->system_field && i >= leading_end) continue;  /* renders in place */
         if (system.len) buf_puts(&system, "\n\n");
-        buf_puts(&system, m->content ? m->content : "");
+        buf_puts_content(&system, m->content);
     }
     /* V4.1 renders the tool schemas AFTER the system content (system + "\n\n" +
      * render_tools); V4 renders them BEFORE it, which is the order its own
@@ -579,6 +652,9 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
             buf tools_first = {0};
             append_tools_prompt_text(&tools_first, tool_schemas, false);
             if (system.len) buf_puts(&tools_first, "\n\n");
+            /* V4 renders the schemas FIRST; the system content moves behind
+             * them, so its ranges shift by the tools text's length. */
+            buf_spans_carry(&tools_first, &system, tools_first.len);
             buf_append(&tools_first, system.ptr, system.len);
             buf_free(&system);
             system = tools_first;
@@ -597,6 +673,8 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
      * to change the answer. */
     if (v41 && (effort[0] || system.len)) buf_puts(&out, PULSAR_RENDER_SYSTEM);
     buf_puts(&out, effort);
+    /* The system region's client ranges land after everything written so far. */
+    buf_spans_carry(&out, &system, out.len);
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     for (int i = 0; i < msgs->len; i++) {
@@ -607,12 +685,25 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     chat_render_finish(&out, &r);
 
     buf_free(&system);
+    if (spans_out) {                    /* hand the ranges out; buf_take drops them */
+        *spans_out = out.spans;
+        *n_spans_out = out.n_spans;
+        out.spans = NULL;
+        out.n_spans = out.cap_spans = 0;
+    }
     return buf_take(&out);
+}
+
+char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                              const tool_schema_orders *tool_orders,
+                              pulsar_think_mode think_mode, bool v41) {
+    return render_chat_prompt_text_spans(msgs, tool_schemas, tool_orders, think_mode, v41, NULL, NULL);
 }
 
 
 
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode) {
+char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode,
+                                          chat_text_span **spans_out, uint32_t *n_spans_out) {
     chat_msgs msgs = {0};
     chat_msg system = {0};
     system.role = xstrdup("system");
@@ -622,9 +713,14 @@ char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_
     user.role = xstrdup("user");
     user.content = xstrdup(prompt ? prompt : "");
     chat_msgs_push(&msgs, user);
-    char *text = render_chat_prompt_text(&msgs, NULL, NULL, think_mode);
+    char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, think_mode, true,
+                                              spans_out, n_spans_out);
     chat_msgs_free(&msgs);
     return text;
+}
+
+char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode) {
+    return render_completion_prompt_text_spans(prompt, think_mode, NULL, NULL);
 }
 
 

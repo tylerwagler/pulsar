@@ -152,7 +152,11 @@ void buf_printf(buf *b, const char *fmt, ...) {
 
 
 char *buf_take(buf *b) {
-    if (!b->ptr) return xstrdup("");
+    /* L223: the client-data ranges are useless without the bytes they describe,
+     * so taking the bytes drops them.  A caller that needs them (the chat
+     * renderer) copies them out BEFORE this call. */
+    free(b->spans);
+    if (!b->ptr) { memset(b, 0, sizeof(*b)); return xstrdup(""); }
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
     return p;
@@ -162,6 +166,7 @@ char *buf_take(buf *b) {
 
 void buf_free(buf *b) {
     free(b->ptr);
+    free(b->spans);
     memset(b, 0, sizeof(*b));
 }
 

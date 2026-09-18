@@ -364,6 +364,22 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
 
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out);
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
+/** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt.
+ * The renderer produces these; the tokeniser treats them as plain text. */
+typedef struct {
+    uint32_t lo;   ///< first byte
+    uint32_t hi;   ///< one past the last byte
+} pulsar_text_span;
+
+/** As pulsar_tokenize_rendered_chat, but every byte inside one of the `n_spans`
+ * half-open [lo, hi) ranges is tokenised as PLAIN TEXT: no special-token matching
+ * happens there, so a spelling like `<|Assistant|>` or `｜DSML｜` that a client
+ * typed into a message becomes ordinary text instead of a control token.  The
+ * renderer records those ranges for exactly the bytes it copied from client data;
+ * an empty span list is byte-identical to the un-spanned entry. */
+void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
+                                         const pulsar_text_span *spans, uint32_t n_spans,
+                                         pulsar_tokens *out);
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,

@@ -211,13 +211,43 @@
 
 /* ---- shared types ---- */
 
+/** The engine's public span type, under the server's name for it. */
+typedef pulsar_text_span chat_text_span;
+
 /** Growable byte buffer. The server's workhorse for accumulating response
  * text, JSON, and SSE payloads. */
 typedef struct {
     char *ptr;   ///< bytes, owned
     size_t len;  ///< bytes used
     size_t cap;  ///< bytes allocated
+    /** L223: the byte ranges of this buffer that came from CLIENT data.
+     *
+     * The renderer writes client text (message content, reasoning, tool
+     * results, DSML argument values, the tool-schema blob) into the same string
+     * as its own control markers, and the prompt is then tokenised as one
+     * string.  pulsar_tokenize_rendered_chat matches a special-token spelling at
+     * ANY position, so without this record a client typing `<|Assistant|>` or
+     * `｜DSML｜` into a message gets a real control token -- the agent guards
+     * against exactly that for user text, and the server did not.
+     *
+     * A range is recorded by buf_text_begin()/buf_text_end() around the writes
+     * that copy client bytes, and the tokeniser skips special matching inside
+     * one.  The ranges are in the FINAL string's coordinates: the only buffer
+     * that moves bytes between buffers is the system region, which carries its
+     * spans with buf_spans_carry(). */
+    chat_text_span *spans;         ///< client-data ranges, ascending and disjoint, owned
+    uint32_t n_spans;              ///< ranges recorded
+    uint32_t cap_spans;            ///< ranges allocated
+    uint32_t span_open;            ///< >0 while a range is being recorded (nesting depth)
+    uint32_t span_lo;              ///< where the outermost open range started
 } buf;
+
+void buf_text_begin(buf *b);
+void buf_text_end(buf *b);
+/** Move `src`'s ranges into `dst`, shifted by `offset` (the number of bytes `src`
+ * will occupy in front of them), and free `src`'s array.  Used when a region is
+ * assembled in its own buffer and then concatenated. */
+void buf_spans_carry(buf *dst, buf *src, size_t offset);
 
 typedef enum {
     REQ_CHAT,
@@ -485,6 +515,8 @@ typedef struct {
     stop_list stops;           ///< client-supplied stop sequences
     char *raw_body;            ///< the original request body, owned; kept for tracing and replay
     char *prompt_text;         ///< the rendered prompt as text, owned
+    pulsar_text_span *prompt_spans;  ///< L223: prompt_text's client-data ranges, owned
+    uint32_t prompt_n_spans;   ///< ranges in prompt_spans
     tool_schema_orders tool_orders;  ///< tool declaration order, preserved so re-renders stay byte-stable
     int max_tokens;      ///< generation cap
     int top_k;           ///< top-k sampling cutoff
@@ -2602,6 +2634,16 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
 /** The legacy /v1/completions template: a fixed system line and the prompt
  * as the one user turn, through the same renderer. */
 char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode);
+char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode,
+                                          chat_text_span **spans_out, uint32_t *n_spans_out);
+/** As render_chat_prompt_text, but also hands back the rendered text's
+ * CLIENT-DATA ranges (see buf's span fields) so pulsar_tokenize_rendered_chat_spans
+ * can keep a client from injecting a control token.  `spans_out`/`n_spans_out` may
+ * be NULL, in which case this is exactly the old entry. */
+char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
+                                    const tool_schema_orders *tool_orders,
+                                    pulsar_think_mode think_mode, bool v41,
+                                    chat_text_span **spans_out, uint32_t *n_spans_out);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode, bool v41 = true);

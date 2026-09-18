@@ -323,8 +323,14 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode, r->chat_v41);
+    /* L223: keep the client-data ranges; the tokeniser below turns a spelling
+     * inside client text into ordinary tokens instead of a control token. */
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    r->prompt_text = render_chat_prompt_text_spans(&msgs, active_tool_schemas,
+                                                   &r->tool_orders, r->think_mode, r->chat_v41,
+                                                   &r->prompt_spans, &r->prompt_n_spans);
     /* tool_choice="required": force a tool call by prefilling the assistant turn
      * into an open DSML tool_calls block. render_chat_prompt_text ends the turn
      * with "<｜Assistant｜><think>" (or "</think>"); rewrite it to skip thinking
@@ -342,7 +348,8 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
      * whole contract, which is what that gate compares against the reference
      * encoder with no model loaded. */
     if (e) {
-        pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
+                                           r->prompt_n_spans, &r->prompt);
         /* Images, if any, are resolved here -- on the renderer's side, just
          * before the model -- into the sentinel BLOCK ids pulsar_session_sync_mm()
          * takes.  A placeholder reaching sync would be a caller bug; this is the
@@ -578,13 +585,20 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode, r->chat_v41);
+    /* L223: keep the client-data ranges; the tokeniser below turns a spelling
+     * inside client text into ordinary tokens instead of a control token. */
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    r->prompt_text = render_chat_prompt_text_spans(&msgs, active_tool_schemas,
+                                                   &r->tool_orders, r->think_mode, r->chat_v41,
+                                                   &r->prompt_spans, &r->prompt_n_spans);
     if (tool_choice_forced && r->has_tools && r->prompt_text) {
         r->force_tool_call = true;
         request_apply_forced_tool_prefill(r);
     }
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
+                                       r->prompt_n_spans, &r->prompt);
     /* Images, if any, are resolved here -- on the renderer's side, just before
      * the model -- into the sentinel BLOCK ids pulsar_session_sync_mm() takes.
      * The Anthropic block reader writes the same PULSAR_IMAGE_PLACEHOLDER the
@@ -1543,9 +1557,16 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode, r->chat_v41);
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* L223: keep the client-data ranges; the tokeniser below turns a spelling
+     * inside client text into ordinary tokens instead of a control token. */
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    r->prompt_text = render_chat_prompt_text_spans(&msgs, active_tool_schemas,
+                                                   &r->tool_orders, r->think_mode, r->chat_v41,
+                                                   &r->prompt_spans, &r->prompt_n_spans);
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
+                                       r->prompt_n_spans, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -1721,8 +1742,13 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
-    r->prompt_text = render_completion_prompt_text(prompt, r->think_mode);
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode,
+                                                         &r->prompt_spans, &r->prompt_n_spans);
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
+                                        r->prompt_n_spans, &r->prompt);
     free(prompt);
     return true;
 bad:

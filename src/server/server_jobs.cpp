@@ -344,7 +344,11 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     buf_puts(&rendered, suffix_text);
 
     pulsar_tokens canonical = {0};
-    pulsar_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    /* L223: the prefix is the rendered request prompt, whose client-data ranges
+     * are known; re-tokenising it with the plain matcher would put a control
+     * token back into the LIVE session for a spelling the client wrote. */
+    pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "",
+                                        j->req.prompt_spans, j->req.prompt_n_spans, &canonical);
     const int live_len = pulsar_session_pos(s->sess);
     const int common = pulsar_session_common_prefix(s->sess, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;

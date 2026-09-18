@@ -66,6 +66,25 @@ void request_apply_forced_tool_prefill(request *r) {
     }
     buf_free(&seed);
     free(r->prompt_text);
+    /* The prefix keeps the prompt's client-data ranges (this rewrite only drops a
+     * trailing server-written opener); a range that reached into the dropped tail
+     * is clamped to the new end. */
+    if (r->prompt_spans) {
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < r->prompt_n_spans; i++) {
+            pulsar_text_span sp = r->prompt_spans[i];
+            if (sp.lo >= blen) continue;
+            if (sp.hi > blen) sp.hi = (uint32_t)blen;
+            r->prompt_spans[k++] = sp;
+        }
+        pt.spans = r->prompt_spans;
+        pt.cap_spans = r->prompt_n_spans;
+        pt.n_spans = k;
+    }
+    r->prompt_spans = pt.spans;
+    r->prompt_n_spans = pt.n_spans;
+    pt.spans = NULL;
+    pt.n_spans = pt.cap_spans = 0;
     r->prompt_text = buf_take(&pt);
 }
 
@@ -281,6 +300,9 @@ void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);

@@ -685,8 +685,58 @@ void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
 
 
 
+/* L223: as above, but a byte inside one of the n half-open [lo, hi) ranges is
+ * PLAIN TEXT -- special-token matching is suppressed there.  The renderer records
+ * those ranges for every byte it copied from client data, so a client typing
+ * `<|Assistant|>` or `｜DSML｜` into a message gets ordinary text tokens instead of
+ * a control token.  Ranges are ascending and disjoint; a range is clamped to the
+ * string's end. */
+void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
+                                                      const pulsar_text_span *spans,
+                                                      uint32_t n_spans,
+                                                      token_vec *out) const {
+    const auto *vocab = this;
+    if (!text) text = "";
+    const char *base = text;
+    const char *end_of_text = text + strlen(text);
+    const char *span = text;
+    const char *p = text;
+    uint32_t si = 0;
+    while (*p) {
+        const size_t off = (size_t)(p - base);
+        while (si < n_spans && (off >= spans[si].hi || spans[si].hi <= spans[si].lo)) si++;
+        if (si < n_spans && off >= spans[si].lo) {
+            const char *end = base + spans[si].hi;
+            if (end > end_of_text) end = end_of_text;   /* clamp to the string */
+            vocab->tokenize_span(span, (size_t)(p - span), out);   /* flush the pending plain run */
+            vocab->tokenize_span(p, (size_t)(end - p), out);       /* client text: BPE only */
+            p = span = end;
+            si++;
+            continue;
+        }
+        int token = -1;
+        size_t len = 0;
+        if (vocab->special_token_at(p, &token, &len)) {
+            vocab->tokenize_span(span, (size_t)(p - span), out);
+            token_vec_push(out, token);
+            p += len;
+            span = p;
+            continue;
+        }
+        p++;
+    }
+    vocab->tokenize_span(span, (size_t)(p - span), out);
+}
+
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     e->vocab.tokenize_rendered_chat_vocab(text, out);
+}
+
+void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
+                                         const pulsar_text_span *spans, uint32_t n_spans,
+                                         pulsar_tokens *out) {
+    if (!n_spans || !spans) { pulsar_tokenize_rendered_chat(e, text, out); return; }
+    e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
 }
 
 
