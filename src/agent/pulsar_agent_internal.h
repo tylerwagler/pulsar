@@ -936,12 +936,23 @@ void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
                                   const char *text, uint32_t text_bytes,
                                   const char *title,
                                   char sha_out[41]);
+/** Load a KV file.  @param rebuild_from_text  a payload-less ("stripped")
+ *   checkpoint carries only rendered text.  `true` rebuilds its tokens by
+ *   tokenising that text -- the stripped-SESSION restore, which is LOSSY by
+ *   nature: the text cannot distinguish a control token from its literal
+ *   spelling, so a client or tool byte that spells a marker becomes a control
+ *   token again, and BPE may re-merge across token boundaries.  `false` refuses
+ *   the stripped form ("no KV payload") so the caller can supply the tokens it
+ *   already holds -- the sysprompt bootstrap renders the very text it would be
+ *   rebuilding from, so re-tokenising it could only ever produce a DIFFERENT
+ *   (and injectable) list. */
 bool agent_kv_load_path(agent_worker *w, const char *path,
                                const char *expected_sha,
                                const char *expected_text,
                                size_t expected_text_len,
                                pulsar_tokens *loaded_tokens,
                                agent_kv_session_meta *meta_out,
+                               bool rebuild_from_text,
                                char *err, size_t err_len);
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);

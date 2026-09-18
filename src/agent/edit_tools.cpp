@@ -427,7 +427,10 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
  * and string parameter values with the server's entity decoder, and still
  * accept the lenient closing-tag variants. */
 static void test_agent_dsml_parser_recognises_every_syntax(void) {
-    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 2);
+    /* The table is the authority; this pins its expected size -- V4.1 and V4,
+     * each with the first-bar-omitted spelling.  It still said 2 after the V4
+     * rows landed, which is why this test was aborting instead of passing. */
+    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 4);
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
         char text[1024];
@@ -499,10 +502,55 @@ static void test_agent_dsml_parser_recognises_every_syntax(void) {
     agent_dsml_parser_free(&p);
 }
 
+/* A payload-less ("stripped") agent checkpoint carries only rendered text.  A
+ * caller that already holds the tokens whose render that text is (the sysprompt
+ * bootstrap) must get a MISS, never a re-tokenisation of the text: the text
+ * cannot distinguish a control token from its literal spelling, so rebuilding it
+ * turns a client or tool byte that spells a marker back into a control token
+ * (L223).  Host-only -- the refusal happens before any engine or session is
+ * touched, which is the point. */
+static void test_agent_kv_stripped_checkpoint_is_a_miss(void) {
+    char dir[] = "/tmp/pulsar-agent-kv-test.XXXXXX";
+    if (!mkdtemp(dir)) {
+        AGENT_TEST_ASSERT(!"mkdtemp failed");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s/stripped.kv", dir);
+    const char *text = "<｜begin▁of▁sentence｜>PREFIX ｜User｜hello <think>"
+                       "｜DSML｜ calls><｜end▁of▁sentence｜>";
+    const uint32_t text_bytes = (uint32_t)strlen(text);
+
+    FILE *fp = fopen(path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
+        pulsar_kvstore_fill_header(h, 0, 2, PULSAR_KVSTORE_REASON_AGENT_SYSTEM, 0,
+                                  12, 0, 4096, 1, 2, 0);
+        uint8_t tb[4];
+        pulsar_kvstore_le_put32(tb, text_bytes);
+        bool wrote = fwrite(h, 1, sizeof h, fp) == sizeof h &&
+                     fwrite(tb, 1, sizeof tb, fp) == sizeof tb &&
+                     fwrite(text, 1, text_bytes, fp) == text_bytes;
+        fclose(fp);
+        AGENT_TEST_ASSERT(wrote);
+
+        agent_worker w;
+        memset(&w, 0, sizeof w);
+        char err[160] = {0};
+        AGENT_TEST_ASSERT(!agent_kv_load_path(&w, path, NULL, text, text_bytes,
+                                              NULL, NULL, false, err, sizeof err));
+        AGENT_TEST_ASSERT(strstr(err, "no KV payload") != NULL);
+        unlink(path);
+    }
+    rmdir(dir);
+}
+
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
+    test_agent_kv_stripped_checkpoint_is_a_miss();
 }
 
 

@@ -1016,8 +1016,10 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
 
     pulsar_tokens loaded = {0};
     agent_kv_session_meta meta = {0};
+    /* rebuild_from_text=true: a stripped session's only content is its rendered
+     * text (see the loader's note on why that rebuild is lossy). */
     bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
-                                 err, err_len);
+                                 true, err, err_len);
     if (ok) {
         pulsar_tokens_free(&w->transcript);
         w->transcript = loaded;

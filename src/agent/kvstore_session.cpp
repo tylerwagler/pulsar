@@ -147,6 +147,7 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
                                size_t expected_text_len,
                                pulsar_tokens *loaded_tokens,
                                agent_kv_session_meta *meta_out,
+                               bool rebuild_from_text,
                                char *err, size_t err_len) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -197,14 +198,24 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
 
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
-        pulsar_tokens rebuilt = {0};
-        pulsar_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        expected_tokens = (uint32_t)rebuilt.len;
-        if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
-            pulsar_session_invalidate(w->session);
+        if (!rebuild_from_text) {
+            /* The caller holds the exact tokens whose render this text is (the
+             * sysprompt bootstrap).  Re-tokenising the text cannot reproduce
+             * them -- it would turn a control spelling inside client or tool
+             * bytes back into a control token (L223) -- so report a miss and let
+             * the caller rebuild from its own list. */
+            snprintf(err, err_len, "stripped checkpoint has no KV payload");
             ok = false;
+        } else {
+            pulsar_tokens rebuilt = {0};
+            pulsar_tokenize_rendered_chat(w->engine, text, &rebuilt);
+            expected_tokens = (uint32_t)rebuilt.len;
+            if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
+                pulsar_session_invalidate(w->session);
+                ok = false;
+            }
+            pulsar_tokens_free(&rebuilt);
         }
-        pulsar_tokens_free(&rebuilt);
     } else if (ok &&
                pulsar_session_load_payload(w->session, fp, hdr.payload_bytes,
                                         load_err, sizeof(load_err)) != 0)
@@ -507,9 +518,11 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
     bool loaded = false;
     char load_err[160] = {0};
     if (w->sysprompt_path) {
+        /* rebuild_from_text=false: a stripped sysprompt file is a miss, not a
+         * re-tokenisation of the text we just rendered (L223). */
         loaded = agent_kv_load_path(w, w->sysprompt_path, NULL,
                                     text, text_len, &w->transcript,
-                                    NULL,
+                                    NULL, false,
                                     load_err, sizeof(load_err));
         if (loaded) {
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
@@ -667,4 +680,3 @@ bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len) {
     if (ok) printf("saved session %.8s (%d tokens)\n", sha, tokens);
     return ok;
 }
-

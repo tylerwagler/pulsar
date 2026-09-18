@@ -242,18 +242,29 @@ bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
  * name being the header's PULSAR_DSML_PARAM_NAME (leading space included, so
  * the force arms once the DSML marker itself has closed, before the name). */
 static size_t agent_dsml_close_force_min(void) {
-    static const char name_gt[] = PULSAR_DSML_PARAM_NAME ">";
     size_t min = (size_t)-1;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
-        const char *lit = pulsar_dsml_syntaxes[i].param_end;
-        const size_t n = strlen(lit);
-        if (n <= sizeof(name_gt) - 1 || strcmp(lit + n - (sizeof(name_gt) - 1), name_gt) != 0) {
-            fprintf(stderr, "pulsar-agent: DSML table row %zu param_end is not \"</\"marker\"" PULSAR_DSML_PARAM_NAME ">\": %s\n",
-                    i, lit);
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        /* "</" + the row's own marker.  The NAME that follows the marker
+         * differs by family (" parameter>" in V4.1, "parameter>" in V4), so the
+         * marker is derived from the row's openers -- "<" + marker is their
+         * common prefix -- instead of assuming one family's name.  Assuming it
+         * aborted the whole agent the first time a tool-argument value
+         * contained a '<' once the V4 rows landed (found 2026-09-16 by the
+         * agent unit test, which no battery ran). */
+        const char *a = syn->tool_calls_start;
+        const char *b = syn->param_start;
+        while (*a && *a == *b) { a++; b++; }
+        const size_t marker_with_lt = (size_t)(a - syn->tool_calls_start);
+        if (marker_with_lt < 3 || strncmp(syn->param_end, "</", 2) != 0 ||
+            strncmp(syn->param_end + 2, syn->param_start + 1, marker_with_lt - 1) != 0)
+        {
+            fprintf(stderr, "pulsar-agent: DSML table row %zu param_end is not \"</\"<marker>...: %s\n",
+                    i, syn->param_end);
             abort();
         }
-        const size_t marker = n - (sizeof(name_gt) - 1);   /* "</" + marker */
-        if (marker > 2 && marker < min) min = marker;
+        const size_t close_prefix = marker_with_lt + 1;    /* "</" + marker */
+        if (close_prefix < min) min = close_prefix;
     }
     return min;
 }
