@@ -1892,7 +1892,17 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
      * the compiler's own scheduling of this loop, which was already good.
      * Bit-exact both ways; the stall ncu reports here (20.7 cyc/warp L1TEX)
      * is cheaper than any register/branch price paid to hide it. Do not
-     * re-add without a branch-free formulation A/B'd solo. */
+     * re-add without a branch-free formulation A/B'd solo.
+     *
+     * L222 tries exactly that: unrolling the k loop by 2 is BRANCH-FREE (the
+     * trip count is in_dim/128, dynamic, so the compiler cannot do it itself),
+     * and it puts two independent k-chunks' loads in flight per warp, which is
+     * what the per-row stall profile says the narrow shapes want: attn_kv's
+     * marginal cost per extra verify row is 1.76 us against ~42 ns of pure FMA,
+     * i.e. 40x, with the weights already streamed once.  The accumulation order
+     * per output is untouched (two chunks, each its own base), so this is
+     * bit-exact. */
+    #pragma unroll 2
     for (int base = 0; base < in_dim; base += 128) {
         int k = base + lane * 4;
         int kb = k >> 5;
