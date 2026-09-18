@@ -214,9 +214,13 @@ static char *rendered_chat_system_region(const char *prompt_text) {
  * open think block, then exactly what the replay path renders for ONE tool
  * message after the assistant's call turn -- EOS, the tool_result, the
  * generation prefix (render_live_tool_tail) -- or next-turn prefix reuse dies. */
-static char *build_live_tool_result_suffix(const request *r,
-                                           const thinking_state *thinking,
-                                           const char *result_text) {
+static char *build_live_tool_result_suffix_spans(const request *r,
+                                                 const thinking_state *thinking,
+                                                 const char *result_text,
+                                                 chat_text_span **spans_out,
+                                                 uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
     const pulsar_think_mode mode = r ? r->think_mode : PULSAR_THINK_NONE;
     buf suffix = {0};
     if (pulsar_think_mode_enabled(mode) && thinking && thinking->inside) {
@@ -227,16 +231,30 @@ static char *build_live_tool_result_suffix(const request *r,
     result.role = xstrdup("tool");
     result.content = xstrdup(result_text ? result_text : "");
     chat_msgs_push(&msgs, result);
-    char *tail = render_live_tool_tail(&msgs, 0, r && r->has_tools, mode);
-    buf_puts(&suffix, tail);
+    /* The tool body is CLIENT data (L223): the tail marks it, and the ranges ride
+     * along so the caller tokenises those bytes as plain text. */
+    chat_text_span *tail_spans = NULL;
+    uint32_t tail_n = 0;
+    char *tail = render_live_tool_tail_spans(&msgs, 0, r && r->has_tools, mode, true,
+                                             &tail_spans, &tail_n);
+    buf_puts_spanned(&suffix, tail, tail_spans, tail_n);
     free(tail);
+    free(tail_spans);
     chat_msgs_free(&msgs);
+    if (spans_out) {
+        *spans_out = suffix.spans;
+        *n_spans_out = suffix.n_spans;
+        suffix.spans = NULL;
+        suffix.n_spans = suffix.cap_spans = 0;
+    }
     return buf_take(&suffix);
 }
 
-char *build_invalid_dsml_tool_error_suffix(const request *r,
-                                                  const thinking_state *thinking,
-                                                  const char *detail) {
+char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
+                                                 const thinking_state *thinking,
+                                                 const char *detail,
+                                                 chat_text_span **spans_out,
+                                                 uint32_t *n_spans_out) {
     char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
     buf tool_error = {0};
     buf_puts(&tool_error, "Tool error: invalid DSML tool call");
@@ -252,11 +270,19 @@ char *build_invalid_dsml_tool_error_suffix(const request *r,
         buf_puts(&tool_error, system);
     }
 
-    char *suffix = build_live_tool_result_suffix(r, thinking, tool_error.ptr ? tool_error.ptr : "");
+    char *suffix = build_live_tool_result_suffix_spans(r, thinking,
+                                                       tool_error.ptr ? tool_error.ptr : "",
+                                                       spans_out, n_spans_out);
 
     free(system);
     buf_free(&tool_error);
     return suffix;
+}
+
+char *build_invalid_dsml_tool_error_suffix(const request *r,
+                                                  const thinking_state *thinking,
+                                                  const char *detail) {
+    return build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail, NULL, NULL);
 }
 
 
@@ -285,21 +311,39 @@ bool should_remember_thinking_checkpoint(const request *r,
  * tail).  One primitive with the renderer (append_assistant_turn_sampled next
  * to append_assistant_turn_close), so the key byte-matches both the live KV
  * and the replay's prefix by construction (L196). */
-char *build_tool_checkpoint_suffix(const request *r, const char *content,
-                                          const char *reasoning, const tool_calls *calls) {
+char *build_tool_checkpoint_suffix_spans(const request *r, const char *content,
+                                         const char *reasoning, const tool_calls *calls,
+                                         chat_text_span **spans_out, uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     buf suffix = {0};
     append_assistant_turn_sampled(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
                                   content, calls, r->chat_v41);
+    if (spans_out) {
+        *spans_out = suffix.spans;
+        *n_spans_out = suffix.n_spans;
+        suffix.spans = NULL;
+        suffix.n_spans = suffix.cap_spans = 0;
+    }
     return buf_take(&suffix);
+}
+
+char *build_tool_checkpoint_suffix(const request *r, const char *content,
+                                          const char *reasoning, const tool_calls *calls) {
+    return build_tool_checkpoint_suffix_spans(r, content, reasoning, calls, NULL, NULL);
 }
 
 
 
-char *build_responses_visible_assistant_suffix(const request *r,
-                                                      const char *content,
-                                                      const char *reasoning,
-                                                      const tool_calls *calls) {
+char *build_responses_visible_assistant_suffix_spans(const request *r,
+                                                     const char *content,
+                                                     const char *reasoning,
+                                                     const tool_calls *calls,
+                                                     chat_text_span **spans_out,
+                                                     uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
     buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
@@ -313,7 +357,21 @@ char *build_responses_visible_assistant_suffix(const request *r,
     const bool replay = think && r->reasoning_summary_emit && calls && calls->len > 0;
     append_assistant_turn_sampled(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
                                   content, calls, r->chat_v41);
+    if (spans_out) {
+        *spans_out = suffix.spans;
+        *n_spans_out = suffix.n_spans;
+        suffix.spans = NULL;
+        suffix.n_spans = suffix.cap_spans = 0;
+    }
     return buf_take(&suffix);
+}
+
+char *build_responses_visible_assistant_suffix(const request *r,
+                                                      const char *content,
+                                                      const char *reasoning,
+                                                      const tool_calls *calls) {
+    return build_responses_visible_assistant_suffix_spans(r, content, reasoning, calls,
+                                                          NULL, NULL);
 }
 
 

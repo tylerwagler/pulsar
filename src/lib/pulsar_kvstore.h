@@ -178,10 +178,17 @@ bool pulsar_kvstore_byte_prefix_match(const char *text, size_t text_len,
 bool pulsar_kvstore_text_ends_with_live(pulsar_engine *engine, const char *text,
                                      size_t text_len, const pulsar_tokens *tokens);
 void pulsar_kvstore_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
+/** `exact_prefix`'s tokens, then `suffix_text` tokenised as RENDERED chat --
+ * except the bytes inside `spans`/`n_spans` (the suffix's CLIENT-DATA ranges),
+ * which are plain text (L223), so a client spelling in the suffix cannot become
+ * a control token.  `spans` may be NULL when the suffix is entirely the
+ * server's own text. */
 void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
+        const pulsar_text_span *spans,
+        uint32_t n_spans,
         pulsar_tokens *out);
 
 int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens);
@@ -229,6 +236,8 @@ int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,
                               pulsar_engine *engine,
                               pulsar_session *session,
                               const char *prompt_text,
+                              const pulsar_text_span *prompt_spans,
+                              uint32_t prompt_n_spans,
                               pulsar_tokens *effective_prompt,
                               pulsar_kvstore_load_result *result,
                               const pulsar_kvstore_trailer_hooks *hooks,

@@ -1020,6 +1020,8 @@ public:
     int try_load_text(pulsar_engine *engine,
                       pulsar_session *session,
                       const char *prompt_text,
+                      const pulsar_text_span *prompt_spans,
+                      uint32_t prompt_n_spans,
                       pulsar_tokens *effective_prompt,
                       pulsar_kvstore_load_result *result,
                       const pulsar_kvstore_trailer_hooks *hooks,
@@ -1094,10 +1096,19 @@ public:
                     /* The cache lookup was by bytes, but the graph state is
                      * still the exact token history stored in the payload.
                      * Build the prompt from that exact history and tokenize
-                     * only the text suffix after the byte prefix. */
+                     * only the text suffix after the byte prefix -- carrying the
+                     * request's client-data ranges into the suffix's coordinates,
+                     * so client bytes stay plain text there too (L223). */
+                    uint32_t tail_n = 0;
+                    pulsar_text_span *tail_spans =
+                        pulsar_text_spans_slice(prompt_spans, prompt_n_spans, text_bytes,
+                                                prompt_bytes > text_bytes
+                                                    ? prompt_bytes - text_bytes : 0,
+                                                &tail_n);
                     pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
                         engine, loaded_tokens, prompt_text + text_bytes,
-                        effective_prompt);
+                        tail_spans, tail_n, effective_prompt);
+                    free(tail_spans);
                 }
                 if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
                     hooks->load(hooks->ud, fp, hooks->load_wanted);
@@ -1411,13 +1422,17 @@ void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
+        const pulsar_text_span *spans,
+        uint32_t n_spans,
         pulsar_tokens *out) {
     pulsar_tokens_copy(out, exact_prefix);
 
     pulsar_tokens suffix = {};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
-     * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    pulsar_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+     * </think>, so use the rendered-chat tokenizer, not plain text BPE -- but
+     * its CLIENT-DATA ranges stay plain text (L223). */
+    pulsar_tokenize_rendered_chat_spans(engine, suffix_text ? suffix_text : "",
+                                        spans, n_spans, &suffix);
     pulsar::tokens_append(out, &suffix);
     pulsar_tokens_free(&suffix);
 }
@@ -1527,11 +1542,14 @@ int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,
                               pulsar_engine *engine,
                               pulsar_session *session,
                               const char *prompt_text,
+                              const pulsar_text_span *prompt_spans,
+                              uint32_t prompt_n_spans,
                               pulsar_tokens *effective_prompt,
                               pulsar_kvstore_load_result *result,
                               const pulsar_kvstore_trailer_hooks *hooks,
                               bool responses_protocol) {
     return KvStore(*kc).try_load_text(engine, session, prompt_text,
+                                      prompt_spans, prompt_n_spans,
                                       effective_prompt, result, hooks,
                                       responses_protocol);
 }

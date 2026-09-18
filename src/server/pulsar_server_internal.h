@@ -248,6 +248,11 @@ void buf_text_end(buf *b);
  * will occupy in front of them), and free `src`'s array.  Used when a region is
  * assembled in its own buffer and then concatenated. */
 void buf_spans_carry(buf *dst, buf *src, size_t offset);
+/** Append `text` (whose CLIENT-DATA ranges are `spans`, in `text`'s own
+ * coordinates) and shift those ranges into `dst`.  Ranges past the appended
+ * bytes are dropped, so the result stays in bounds and ascending. */
+void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
+                      uint32_t n_spans);
 
 typedef enum {
     REQ_CHAT,
@@ -582,9 +587,13 @@ typedef struct {
     bool responses_requires_live_reasoning;   ///< reasoning-mode replay: needs the prior reasoning item to be live
     stop_list responses_live_call_ids;        ///< call_ids this request's tool outputs refer to
     char *responses_live_suffix_text;         ///< the new suffix to append when the live prefix is authoritative, owned
+    pulsar_text_span *responses_live_suffix_spans;  ///< its CLIENT-DATA ranges (L223), owned
+    uint32_t responses_live_suffix_n_spans;   ///< ranges in responses_live_suffix_spans
     bool anthropic_requires_live_tool_state;  ///< Anthropic equivalent of responses_requires_live_tool_state
     stop_list anthropic_live_call_ids;        ///< Anthropic tool_use ids this request refers to
     char *anthropic_live_suffix_text;         ///< Anthropic new-suffix text, owned
+    pulsar_text_span *anthropic_live_suffix_spans;  ///< its CLIENT-DATA ranges (L223), owned
+    uint32_t anthropic_live_suffix_n_spans;   ///< ranges in anthropic_live_suffix_spans
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
     /** The chat TEMPLATE family the loaded model was trained on (L218's
      * two-profile engine).  V4 (0731) and V4.1 render DIFFERENTLY: the DSML tag
@@ -1628,7 +1637,9 @@ struct server {
     /** kv_cache_try_load() keyed on raw prompt TEXT rather than a request.
      * The cache is keyed by rendered bytes, so this is the primitive and the
      * request form is the wrapper. @return prefix tokens loaded, 0 for a miss. */
-    int kv_cache_try_load_text(session_slot *sl, const char *prompt_text, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
+    int kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
+                               const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
+                               pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
     /** Try to satisfy `req`'s prompt from the disk cache.
      * @param sl                    slot whose session receives the payload
      * @param req                   the request whose prompt is being resolved
@@ -1728,7 +1739,9 @@ struct server {
     bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
     /** Append only the newly-rendered suffix onto the live session, leaving the
      * committed prefix untouched. */
-    bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix, int *tokens_appended, char *err, size_t errlen);
+    bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix,
+                                                const pulsar_text_span *spans, uint32_t n_spans,
+                                                int *tokens_appended, char *err, size_t errlen);
     /** Recover from a malformed tool-call block by continuing generation rather
      * than failing the request. Attempted at most once per request
      * (gen_state::dsml_recovery_attempted). */
@@ -2631,6 +2644,12 @@ void chat_render_finish(buf *out, const chat_render *r);
  * messages, the generation prefix. */
 char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
                             pulsar_think_mode think_mode, bool v41 = true);
+/** As above, plus the tail's CLIENT-DATA ranges (L223) -- tool-result bodies and
+ * any replayed assistant content; the EOS, the role markers and the generation
+ * prefix are the renderer's own text. */
+char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
+                                  pulsar_think_mode think_mode, bool v41,
+                                  chat_text_span **spans_out, uint32_t *n_spans_out);
 /** The legacy /v1/completions template: a fixed system line and the prompt
  * as the one user turn, through the same renderer. */
 char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode);
@@ -2889,6 +2908,8 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
+        const pulsar_text_span *spans,
+        uint32_t n_spans,
         pulsar_tokens *out);
 int kv_cache_store_len(const kv_disk_cache *kc, int tokens);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
@@ -2996,15 +3017,36 @@ thinking_state thinking_state_from_prompt(const request *r);
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail);
+/** As above, but also hands back the suffix's CLIENT-DATA ranges (L223): the
+ * reminder embeds the client's system region and a tool result's bytes, and a
+ * suffix appended to the live session must not turn a client spelling into a
+ * control token.  `spans_out`/`n_spans_out` may be NULL. */
+char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
+                                                 const thinking_state *thinking,
+                                                 const char *detail,
+                                                 chat_text_span **spans_out,
+                                                 uint32_t *n_spans_out);
 bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish);
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls);
+/** As above, plus the suffix's CLIENT-DATA ranges (L223): the sampled content
+ * and reasoning are client-replayed bytes; the DSML framing is the server's own
+ * text and stays control text. */
+char *build_tool_checkpoint_suffix_spans(const request *r, const char *content,
+                                         const char *reasoning, const tool_calls *calls,
+                                         chat_text_span **spans_out, uint32_t *n_spans_out);
 char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
                                                       const tool_calls *calls);
+char *build_responses_visible_assistant_suffix_spans(const request *r,
+                                                     const char *content,
+                                                     const char *reasoning,
+                                                     const tool_calls *calls,
+                                                     chat_text_span **spans_out,
+                                                     uint32_t *n_spans_out);
 char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content);
 void *worker_main(void *arg);

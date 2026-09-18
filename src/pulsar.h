@@ -380,6 +380,15 @@ typedef struct {
 void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
                                          pulsar_tokens *out);
+
+/** The client-data ranges of `text[skip .. skip+len)` (a suffix slice of the
+ * same string the ranges were recorded against), rebased to the slice and
+ * clipped to it.  Returns a malloc'd array (free() it) or NULL when no range
+ * survives; `*n_out` is set to the count.  Used wherever a continuation appends
+ * a TAIL of a rendered prompt: the tail's client bytes must stay plain text
+ * there too. */
+pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
+                                          size_t skip, size_t len, uint32_t *n_out);
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,

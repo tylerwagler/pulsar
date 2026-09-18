@@ -35,6 +35,8 @@ bool complete_tool_call_inside_thinking(const char *text, size_t len,
 
 bool server::append_rendered_suffix_to_live_session(session_slot *sl,
                                                    const char *suffix,
+                                                   const pulsar_text_span *spans,
+                                                   uint32_t n_spans,
                                                    int *tokens_appended,
                                                    char *err, size_t errlen) {
     auto *s = this;
@@ -48,7 +50,7 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
     }
 
     pulsar_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, spans, n_spans, &target);
     const int before = pulsar_session_pos(s->sess);
     bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
@@ -68,11 +70,16 @@ bool server::continue_after_invalid_dsml(session_slot *sl,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
     auto *s = this;
-    char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    char *suffix = build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail,
+                                                             &spans, &n_spans);
     bool ok = s->append_rendered_suffix_to_live_session(sl, suffix,
+                                                     spans, n_spans,
                                                      tokens_appended,
                                                      err, errlen);
     free(suffix);
+    free(spans);
     return ok;
 }
 
@@ -337,18 +344,25 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
-    char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    chat_text_span *suffix_spans = NULL;
+    uint32_t suffix_n_spans = 0;
+    char *suffix_text = build_tool_checkpoint_suffix_spans(&j->req, content, reasoning, calls,
+                                                          &suffix_spans, &suffix_n_spans);
 
+    /* L223: BOTH halves carry client-replayed bytes -- the request prompt and
+     * the sampled assistant turn -- so tokenising either with the plain matcher
+     * would put a control token back into the LIVE session for a spelling a
+     * client wrote.  The suffix's DSML framing is the server's own text and
+     * stays control text (it is not inside any range). */
     buf rendered = {0};
-    buf_puts(&rendered, j->req.prompt_text);
-    buf_puts(&rendered, suffix_text);
+    buf_puts_spanned(&rendered, j->req.prompt_text, j->req.prompt_spans,
+                     j->req.prompt_n_spans);
+    buf_puts_spanned(&rendered, suffix_text, suffix_spans, suffix_n_spans);
+    free(suffix_spans);
 
     pulsar_tokens canonical = {0};
-    /* L223: the prefix is the rendered request prompt, whose client-data ranges
-     * are known; re-tokenising it with the plain matcher would put a control
-     * token back into the LIVE session for a spelling the client wrote. */
     pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "",
-                                        j->req.prompt_spans, j->req.prompt_n_spans, &canonical);
+                                        rendered.spans, rendered.n_spans, &canonical);
     const int live_len = pulsar_session_pos(s->sess);
     const int common = pulsar_session_common_prefix(s->sess, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
@@ -395,6 +409,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         char *path = NULL;
         pulsar_tokens effective = {0};
         int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
+                                            rendered.spans, rendered.n_spans,
                                             &effective, &path, NULL, false);
         if (loaded == 0) pulsar_session_invalidate(s->sess);
 

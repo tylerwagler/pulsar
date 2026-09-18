@@ -739,6 +739,28 @@ void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
     e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
 }
 
+pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
+                                          size_t skip, size_t len, uint32_t *n_out) {
+    if (n_out) *n_out = 0;
+    if (!spans || !n_spans || !len) return NULL;
+    pulsar_text_span *out = (pulsar_text_span *)xmalloc((size_t)n_spans * sizeof *out);
+    const size_t end = skip + len;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n_spans; i++) {
+        size_t lo = spans[i].lo, hi = spans[i].hi;
+        if (hi <= skip || lo >= end) continue;
+        if (lo < skip) lo = skip;
+        if (hi > end) hi = end;
+        if (hi <= lo) continue;
+        out[k].lo = (uint32_t)(lo - skip);
+        out[k].hi = (uint32_t)(hi - skip);
+        k++;
+    }
+    if (!k) { free(out); return NULL; }
+    if (n_out) *n_out = k;
+    return out;
+}
+
 
 
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens) {

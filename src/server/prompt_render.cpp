@@ -55,6 +55,28 @@ void buf_spans_carry(buf *dst, buf *src, size_t offset) {
     src->n_spans = src->cap_spans = 0;
 }
 
+void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
+                      uint32_t n_spans) {
+    if (!dst || !text) return;
+    const size_t at = dst->len;
+    buf_puts(dst, text);
+    const size_t appended = dst->len - at;
+    for (uint32_t i = 0; i < n_spans; i++) {
+        if (spans[i].lo >= appended) continue;      /* past the appended bytes */
+        const uint32_t hi = spans[i].hi > appended ? (uint32_t)appended : spans[i].hi;
+        if (hi <= spans[i].lo) continue;
+        if (dst->n_spans == dst->cap_spans) {
+            const uint32_t cap = dst->cap_spans ? dst->cap_spans * 2u : 16u;
+            chat_text_span *grown = (chat_text_span *)server_xrealloc(dst->spans, (size_t)cap * sizeof *grown);
+            dst->spans = grown;
+            dst->cap_spans = cap;
+        }
+        dst->spans[dst->n_spans].lo = (uint32_t)at + spans[i].lo;
+        dst->spans[dst->n_spans].hi = (uint32_t)at + hi;
+        dst->n_spans++;
+    }
+}
+
 /** Write client-supplied bytes as plain text: the range is recorded so the
  * tokeniser will not match a special-token spelling inside it. */
 static void buf_puts_content(buf *b, const char *s) {
@@ -742,8 +764,11 @@ char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary.  The bytes are the full render's bytes for the same
  * messages (append_chat_msg), so the live KV and the next replay agree. */
-char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
-                            pulsar_think_mode think_mode, bool v41) {
+char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
+                                  pulsar_think_mode think_mode, bool v41,
+                                  chat_text_span **spans_out, uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
     chat_render r;
     chat_render_init(&r, msgs, tools_advertised, think_mode, v41);
     buf out = {0};
@@ -758,7 +783,18 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
         append_chat_msg(&out, msgs, i, &r);
     }
     chat_render_finish(&out, &r);
+    if (spans_out) {                    /* hand the ranges out; buf_take drops them */
+        *spans_out = out.spans;
+        *n_spans_out = out.n_spans;
+        out.spans = NULL;
+        out.n_spans = out.cap_spans = 0;
+    }
     return buf_take(&out);
+}
+
+char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
+                            pulsar_think_mode think_mode, bool v41) {
+    return render_live_tool_tail_spans(msgs, start, tools_advertised, think_mode, v41, NULL, NULL);
 }
 
 
@@ -892,8 +928,13 @@ void responses_prepare_live_continuation(request *r,
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
+    free(r->responses_live_suffix_spans);
+    r->responses_live_suffix_spans = NULL;
+    r->responses_live_suffix_n_spans = 0;
     r->responses_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->has_tools, r->think_mode);
+        render_live_tool_tail_spans(msgs, tail_start, r->has_tools, r->think_mode, true,
+                                    &r->responses_live_suffix_spans,
+                                    &r->responses_live_suffix_n_spans);
 }
 
 
@@ -979,7 +1020,12 @@ void anthropic_prepare_live_continuation(request *r,
     if (r->anthropic_live_call_ids.len == 0) return;
 
     free(r->anthropic_live_suffix_text);
+    free(r->anthropic_live_suffix_spans);
+    r->anthropic_live_suffix_spans = NULL;
+    r->anthropic_live_suffix_n_spans = 0;
     r->anthropic_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->has_tools, r->think_mode);
+        render_live_tool_tail_spans(msgs, tail_start, r->has_tools, r->think_mode, true,
+                                    &r->anthropic_live_suffix_spans,
+                                    &r->anthropic_live_suffix_n_spans);
 }
 

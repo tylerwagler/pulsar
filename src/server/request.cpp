@@ -306,9 +306,15 @@ void request_free(request *r) {
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
+    free(r->responses_live_suffix_spans);
+    r->responses_live_suffix_spans = NULL;
+    r->responses_live_suffix_n_spans = 0;
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    free(r->anthropic_live_suffix_spans);
+    r->anthropic_live_suffix_spans = NULL;
+    r->anthropic_live_suffix_n_spans = 0;
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }

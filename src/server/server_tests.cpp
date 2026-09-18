@@ -6516,13 +6516,30 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         thinking_state th;
         memset(&th, 0, sizeof th);
         th.inside = true;
-        char *ws = build_live_tool_result_suffix(&r, &th, "results </tool_result> x");
+        chat_text_span *spans = NULL;
+        uint32_t n_spans = 0;
+        char *ws = build_live_tool_result_suffix_spans(&r, &th, "results </tool_result> x",
+                                                      &spans, &n_spans);
         chat_msgs one = {0};
         chat_msgs_push(&one, l185_msg("tool", "results </tool_result> x", NULL));
         char *tail = render_live_tool_tail(&one, 0, true, PULSAR_THINK_HIGH);
         TEST_ASSERT(!strncmp(ws, "</think>", 8) && !strcmp(ws + 8, tail));
         TEST_ASSERT(!strcmp(tail, "<｜end▁of▁sentence｜><｜User｜><tool_result>results &lt;/tool_result> x"
                                   "</tool_result><｜Assistant｜><think>"));
+        /* L223: the escaped tool body is ONE client-data range, and the
+         * renderer's own framing around it (the EOS, the role marker, the
+         * <tool_result> wrapper, the generation prefix) is not. */
+        TEST_ASSERT(spans != NULL && n_spans == 1);
+        const char *body = strstr(ws, "results &lt;/tool_result> x");
+        TEST_ASSERT(body != NULL);
+        if (spans && body) {
+            const size_t lo = (size_t)(body - ws);
+            TEST_ASSERT(spans[0].lo <= lo &&
+                        spans[0].hi >= lo + strlen("results &lt;/tool_result> x"));
+            TEST_ASSERT(spans[0].lo > strlen("</think>"));
+            TEST_ASSERT(spans[0].hi <= strlen(ws) - strlen("<｜Assistant｜><think>"));
+        }
+        free(spans);
         free(tail);
         free(ws);
         chat_msgs_free(&one);

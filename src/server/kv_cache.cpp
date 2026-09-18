@@ -440,10 +440,12 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
+        const pulsar_text_span *spans,
+        uint32_t n_spans,
         pulsar_tokens *out)
 {
     pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, out);
+        engine, exact_prefix, suffix_text, spans, n_spans, out);
 }
 
 
@@ -714,6 +716,8 @@ int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 
 
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
+                                  const pulsar_text_span *prompt_spans,
+                                  uint32_t prompt_n_spans,
                                   pulsar_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
@@ -727,7 +731,8 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
      * kc->continued_last_store_tokens = loaded) — bracket it per slot. */
     s->kv_cache_tracker_bind(sl);
     int loaded = pulsar_kvstore_try_load_text(&s->kv, s->engine, s->sess,
-                                           prompt_text, effective_prompt, &lr,
+                                           prompt_text, prompt_spans, prompt_n_spans,
+                                           effective_prompt, &lr,
                                            &hooks, responses_protocol);
     s->kv_cache_tracker_flush(sl);
     if (loaded > 0) {
@@ -746,6 +751,8 @@ int server::kv_cache_try_load(session_slot *sl, const request *req,
                              uint8_t *loaded_ext_flags_out) {
     auto *s = this;
     return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
+                                  req ? req->prompt_spans : NULL,
+                                  req ? req->prompt_n_spans : 0,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
@@ -776,9 +783,16 @@ int server::live_text_prefix_prompt(session_slot *sl, const request *req,
      * keep its sampled tokenization and tokenize only the request bytes that
      * come after it.  Reusing req->prompt's token suffix would be wrong: full
      * prompt BPE may have merged across this byte boundary. */
+    /* The appended tail is a slice of the rendered prompt, so its client-data
+     * ranges are the request's, rebased (L223). */
+    uint32_t tail_n = 0;
+    pulsar_text_span *tail_spans =
+        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, live_text_len,
+                                prompt_text_len - live_text_len, &tail_n);
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + live_text_len,
-        effective_prompt);
+        tail_spans, tail_n, effective_prompt);
+    free(tail_spans);
     free(live_text);
     return live_tokens->len;
 }
@@ -808,6 +822,7 @@ int server::responses_live_continuation_prompt(session_slot *sl,
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->responses_live_suffix_text,
+        req->responses_live_suffix_spans, req->responses_live_suffix_n_spans,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     return live_tokens->len;
@@ -838,6 +853,7 @@ int server::anthropic_live_continuation_prompt(session_slot *sl,
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
+        req->anthropic_live_suffix_spans, req->anthropic_live_suffix_n_spans,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return live_tokens->len;
@@ -889,9 +905,14 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
         return 0;
     }
 
+    uint32_t tail_n = 0;
+    pulsar_text_span *tail_spans =
+        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
+                                prompt_len - visible_len, &tail_n);
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+        tail_spans, tail_n, effective_prompt);
+    free(tail_spans);
     return live_tokens->len;
 }
 
@@ -941,9 +962,14 @@ int server::thinking_live_visible_prefix_prompt(session_slot *sl,
         return 0;
     }
 
+    uint32_t tail_n = 0;
+    pulsar_text_span *tail_spans =
+        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
+                                prompt_len - visible_len, &tail_n);
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+        tail_spans, tail_n, effective_prompt);
+    free(tail_spans);
     return live_tokens->len;
 }
 
