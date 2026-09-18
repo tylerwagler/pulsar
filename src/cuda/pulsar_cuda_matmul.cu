@@ -1858,6 +1858,58 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *
  * The activation cache is row-major [rows, K] (mxfp8_quant_act_kernel stores at
  * row*K + k), so a lane's 4 elements stay contiguous per token and the scale row
  * is simply the token index. */
+/* L222: ONE k-chunk of the verify-batch GEMV, shared by the two unroll shapes
+ * below so there is a single arithmetic body (house rule: the one-token and NT
+ * paths already share theirs).  `base` is the chunk's k offset; nothing here
+ * depends on how many chunks are in flight, and every output's accumulation
+ * order is the chunk sequence, so the two callers are bit-identical. */
+template <int NT, int RO>
+__device__ __forceinline__ static void mmvq_nt_a8_chunk(
+        float (&acc)[RO][NT],
+        const __nv_fp8_e4m3 *const (&rows)[RO],
+        const int (&orow)[RO],
+        const unsigned char *scale,
+        const __nv_fp8_e4m3 *xq,
+        const unsigned char *xs,
+        int in_dim, int KBp, int xKBp, int base, int lane) {
+    int k = base + lane * 4;
+    int kb = k >> 5;
+    uint32_t wpk[RO];
+    float sw[RO];
+    #pragma unroll
+    for (int r = 0; r < RO; r++) {
+        wpk[r] = *(const uint32_t *)(rows[r] + k);
+        sw[r] = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(orow[r], kb, KBp)] << 23);
+    }
+    /* L214: each weight byte is converted once per chunk, not once per token
+     * (and each activation byte once, not once per output row); the products
+     * are formed in the original order, (wf * af) * s, so nothing changes. */
+    float wf[RO][4];
+    #pragma unroll
+    for (int r = 0; r < RO; r++) {
+        const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk[r];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) wf[r][j] = __half2float((__half)qw[j]);
+    }
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
+        float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
+        const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
+        float af[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) af[j] = __half2float((__half)qa[j]);
+        #pragma unroll
+        for (int r = 0; r < RO; r++) {
+            const float s = sw[r] * sa;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                acc[r][t] += wf[r][j] * af[j] * s;
+            }
+        }
+    }
+}
+
 template <int NT, int RO, typename OT>
 __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                      const unsigned char *scale,
@@ -1893,43 +1945,30 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
      * Bit-exact both ways; the stall ncu reports here (20.7 cyc/warp L1TEX)
      * is cheaper than any register/branch price paid to hide it. Do not
      * re-add without a branch-free formulation A/B'd solo. */
-    for (int base = 0; base < in_dim; base += 128) {
-        int k = base + lane * 4;
-        int kb = k >> 5;
-        uint32_t wpk[RO];
-        float sw[RO];
-        #pragma unroll
-        for (int r = 0; r < RO; r++) {
-            wpk[r] = *(const uint32_t *)(rows[r] + k);
-            sw[r] = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(orow[r], kb, KBp)] << 23);
-        }
-        /* L214: each weight byte is converted once per chunk, not once per token
-         * (and each activation byte once, not once per output row); the products
-         * are formed in the original order, (wf * af) * s, so nothing changes. */
-        float wf[RO][4];
-        #pragma unroll
-        for (int r = 0; r < RO; r++) {
-            const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk[r];
-            #pragma unroll
-            for (int j = 0; j < 4; j++) wf[r][j] = __half2float((__half)qw[j]);
-        }
-        #pragma unroll
-        for (int t = 0; t < NT; t++) {
-            uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
-            float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
-            const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
-            float af[4];
-            #pragma unroll
-            for (int j = 0; j < 4; j++) af[j] = __half2float((__half)qa[j]);
-            #pragma unroll
-            for (int r = 0; r < RO; r++) {
-                const float s = sw[r] * sa;
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    acc[r][t] += wf[r][j] * af[j] * s;
-                }
-            }
-        }
+    /* L222: the k loop's trip count is in_dim/128 (dynamic), so the compiler
+     * cannot unroll it, and the narrow shapes are stall-bound -- attn_kv's
+     * marginal cost per extra verify row is 1.76 us against ~42 ns of pure FMA
+     * for that row, with the weights already streamed once.  Unrolling by 2 puts
+     * two independent k-chunks' loads in flight and measures, cold and averaged
+     * over 3 passes, on `make cuda-nt-sweep`:
+     *
+     *   NT = 2,3,4: attn_kv -22..-20%, attn_q_a -11%, ffn_gate_shexp -5..-6%,
+     *               ffn_down_shexp -1..-4%, and <= 2% on the wide shapes
+     *   NT = 5,6:   a wash at 5 (+/- few %) and a LOSS at 6 (attn_kv +30%,
+     *               q_a +12%, attn_output_b +11%, ffn_down_shexp +8%)
+     *
+     * So the unroll is applied where it measures a win -- NT <= 4, which is the
+     * verify width at spec depths 1..3, and depth 3 is the measured optimum --
+     * and the loop is left exactly as it was everywhere else.  Both arms call
+     * the SAME chunk helper, so the arithmetic body is one authority and every
+     * output's accumulation order is the chunk sequence either way. */
+    if constexpr (NT <= 4) {
+        #pragma unroll 2
+        for (int base = 0; base < in_dim; base += 128)
+            mmvq_nt_a8_chunk<NT, RO>(acc, rows, orow, scale, xq, xs, in_dim, KBp, xKBp, base, lane);
+    } else {
+        for (int base = 0; base < in_dim; base += 128)
+            mmvq_nt_a8_chunk<NT, RO>(acc, rows, orow, scale, xq, xs, in_dim, KBp, xKBp, base, lane);
     }
     #pragma unroll
     for (int r = 0; r < RO; r++) {
