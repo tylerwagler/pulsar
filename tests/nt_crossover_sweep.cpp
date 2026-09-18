@@ -70,6 +70,37 @@ static bool gemm_launch(void *vctx, uint32_t n_tok) {
                                           c->w->abs_offset, c->in_dim, c->out_dim, c->x, n_tok) != 0;
 }
 
+/* L222 COLD PASS.  time_launches() repeats ONE weight 40 times, so the small
+ * shapes are L2-resident in it (its own GB/s column reads above the ~273 GB/s
+ * cold DRAM figure at M = 1).  A real step reads each dense weight ONCE, and the
+ * 43 layers' copies of one shape sum to far more than L2, so this pass makes one
+ * call per layer with no per-call sync and divides by the layer count: every
+ * timed call streams its own weight from DRAM, which is what the production
+ * verify row actually pays.  Reference re-runs this in layer order so the layer
+ * k+1 weight cannot still be the one layer k wanted. */
+typedef const pulsar_tensor *(*shape_pick)(const pulsar_engine *e, uint32_t il);
+
+static double time_pass_cold(launch_fn fn, void *ctx, const pulsar_engine *e,
+                            shape_pick pick, uint32_t n_tok, int *calls_out) {
+    /* warm the LAUNCH path (not the weight) on the first layer, then time the
+     * whole layer sweep as one block so the sync is amortised exactly as the
+     * warm pass amortises it. */
+    if (!fn(ctx, n_tok) || !pulsar_gpu_end_commands()) return -1.0;
+    int calls = 0;
+    const double t0 = now_us();
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_tensor *w = pick(e, il);
+        if (!w) continue;
+        ((gemm_ctx *)ctx)->w = w;
+        if (!fn(ctx, n_tok)) return -1.0;
+        calls++;
+    }
+    if (!pulsar_gpu_end_commands()) return -1.0;
+    const double us = now_us() - t0;
+    if (calls_out) *calls_out = calls;
+    return calls ? us / calls : -1.0;
+}
+
 /* ---- the grouped attention-output 'a' + 'b' pair ---- */
 typedef struct {
     const pulsar_engine *e;
@@ -86,6 +117,15 @@ static bool attnout_launch(void *vctx, uint32_t n_tok) {
                c->L->attn_output_a->abs_offset, c->L->attn_output_b->abs_offset,
                c->group_dim, c->rank, c->n_groups, PULSAR_N_EMBD, c->heads, n_tok) != 0;
 }
+
+static const pulsar_tensor *pick_layer_shape(const pulsar_engine *e, uint32_t il) { return NULL; }
+static const pulsar_tensor *pick_q_a(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_a; }
+static const pulsar_tensor *pick_q_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_b; }
+static const pulsar_tensor *pick_kv(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_kv; }
+static const pulsar_tensor *pick_out_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_output_b; }
+static const pulsar_tensor *pick_gate_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_gate_shexp; }
+static const pulsar_tensor *pick_down_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_down_shexp; }
+static const pulsar_tensor *pick_router(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_gate_inp; }
 
 static const char *type_name(uint32_t t) {
     return t == PULSAR_TENSOR_BF16 ? "bf16" : "mxfp8";
@@ -107,12 +147,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "layer %u lacks a needed tensor\n", il);
         return 1;
     }
-    struct { const char *name; const pulsar_tensor *w; } shapes[] = {
-        {"attn_q_a", L->attn_q_a}, {"attn_q_b", L->attn_q_b}, {"attn_kv", L->attn_kv},
-        {"attn_output_b", L->attn_output_b}, {"ffn_gate_shexp", L->ffn_gate_shexp},
-        {"ffn_down_shexp", L->ffn_down_shexp}, {"router (bf16)", L->ffn_gate_inp},
-        {"output head (bf16)", e->weights.output},
+    struct { const char *name; const pulsar_tensor *w; shape_pick pick; } shapes[] = {
+        {"attn_q_a", L->attn_q_a, pick_q_a}, {"attn_q_b", L->attn_q_b, pick_q_b},
+        {"attn_kv", L->attn_kv, pick_kv},
+        {"attn_output_b", L->attn_output_b, pick_out_b}, {"ffn_gate_shexp", L->ffn_gate_shexp, pick_gate_shexp},
+        {"ffn_down_shexp", L->ffn_down_shexp, pick_down_shexp}, {"router (bf16)", L->ffn_gate_inp, pick_router},
+        {"output head (bf16)", e->weights.output, NULL},
     };
+    const bool cold = getenv("NTSWEEP_COLD") != NULL;
+    if (cold)
+        printf("NTSWEEP_COLD: one call per LAYER, no per-call sync, /n_layers -- each timed call streams its\n"
+               "              own weight from DRAM (the warm mode repeats one weight and is L2-served).\n"
+               "              The head/grouped blocks have no per-layer twin and stay warm.\n\n");
     const uint32_t Ms[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16};
     const int NM = (int)(sizeof(Ms) / sizeof(Ms[0]));
     const uint32_t MMAX = 16;
@@ -147,12 +193,23 @@ int main(int argc, char **argv) {
                               (w->type == PULSAR_TENSOR_BF16 ? 2.0 : 1.03);
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
-            if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
-            const double td = time_launches(gemm_launch, &c, M, reps);
-            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
-            const double tp = time_launches(gemm_launch, &c, M, reps);
-            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f\n", shapes[si].name, type_name(w->type),
-                   M, td, tp, td > 0 && tp > 0 ? tp / td : 0.0, td > 0 ? wbytes / td / 1e3 : 0.0);
+            double td, tp;
+            int ncall = 0;
+            if (cold && shapes[si].pick) {
+                if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
+                td = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, &ncall);
+                (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+                tp = time_pass_cold(gemm_launch, &c, e, shapes[si].pick, M, NULL);
+                c.w = w;   /* restore for the next shape's warm path / wbytes */
+            } else {
+                if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
+                td = time_launches(gemm_launch, &c, M, reps);
+                (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+                tp = time_launches(gemm_launch, &c, M, reps);
+            }
+            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f%s\n", shapes[si].name, type_name(w->type),
+                   M, td, tp, td > 0 && tp > 0 ? tp / td : 0.0, td > 0 ? wbytes / td / 1e3 : 0.0,
+                   cold ? (shapes[si].pick ? "  (cold, per-layer)" : "  (warm: no per-layer twin)") : "");
         }
         pulsar_gpu_mxfp8_act_cache_disarm();
         pulsar_gpu_tensor_free(c.x);
