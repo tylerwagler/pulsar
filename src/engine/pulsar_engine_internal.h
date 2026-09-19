@@ -1663,9 +1663,6 @@ struct pulsar_vocab {
     void tokenize_rendered_chat_vocab(const char *text, token_vec *out) const;
     void tokenize_rendered_chat_spans_vocab(const char *text, const pulsar_text_span *spans,
                                           uint32_t n_spans, token_vec *out) const;
-    /** Tokenize tool-result content, which may contain sequences that must not be
-     * interpreted as chat control tokens. */
-    void bpe_tokenize_tool_result_text(const char *content, token_vec *out);
     /** Debug: print ids with their decoded bytes to stderr. */
     void dump_tokens(const token_vec *tokens) const;
 };

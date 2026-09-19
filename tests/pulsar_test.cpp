@@ -3119,10 +3119,9 @@ static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *m
  * rows/L185.md.  The four are the shapes the agent/CLI feed that the server
  * renders differently -- see the row for the token-level evidence. */
 static const char *const twin_known_divergences[] = {
-    "user+tool(esc)",      /* tool-body BPE run tokenised in pieces, not as one run */
-    "tool+tool",           /* the V4 join after a preceding tool result (\n\n, no 2nd marker) */
-    "user+sys(mid)",       /* the V4 <system-reminder> wrapper around mid-conv system text */
-    "user+tool+sys+user",  /* the same wrapper in the agent's live loop shape */
+    /* EMPTY since the twin was rewritten to append the same TEXT runs the
+     * renderer does (L185 step 2): every shape below must now match the loaded
+     * template exactly.  A future divergence lands here only with a row entry. */
 };
 
 static void twin_expect(pulsar_engine *e, const char *name, const chat_msgs *msgs,
@@ -3144,16 +3143,8 @@ static void twin_expect(pulsar_engine *e, const char *name, const chat_msgs *msg
 }
 
 
-static void test_chat_twin_parity(void) {
-    const char *model = getenv("PULSAR_TEST_MODEL");
-    if (!model || !model[0]) {
-        fprintf(stderr, "pulsar-test: chat-twin-parity SKIPPED (PULSAR_TEST_MODEL unset)\n");
-        return;
-    }
-    pulsar_engine *e = test_get_engine();
-    if (!e) return;
-    const bool loaded = pulsar_engine_chat_v41(e);
-    printf("twin-parity: loaded template family v41=%d (the twin must match THIS one)\n", (int)loaded);
+static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
+    printf("twin-parity: %s (v41=%d, the twin must match it)\n", label, (int)loaded);
 
     for (int t = 0; t < 2; t++) {
         const pulsar_think_mode mode = t ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
@@ -3250,6 +3241,26 @@ static void test_chat_twin_parity(void) {
             chat_msgs_free(&m);
         }
     }
+}
+
+static void test_chat_twin_parity(void) {
+    const char *model = getenv("PULSAR_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "pulsar-test: chat-twin-parity SKIPPED (PULSAR_TEST_MODEL unset)\n");
+        return;
+    }
+    pulsar_engine *e = test_get_engine();
+    if (!e) return;
+    const bool loaded = pulsar_engine_chat_v41(e);
+    twin_run_corpus(e, loaded, "loaded template family");
+    /* The OTHER family: no V4.1 artifact is loadable on this box, but the family
+     * is the loader's global and the vocab carries every marker, so flipping the
+     * profile exercises the twin's V4.1 rules against the V4.1 render (the same
+     * trick the attention-layout tests use).  Both families must match. */
+    const pulsar_shape saved = g_pulsar_shape;
+    g_pulsar_shape = loaded ? PULSAR_SHAPE_V4 : PULSAR_SHAPE_V41;
+    twin_run_corpus(e, !loaded, "other template family (profile flipped for this test)");
+    g_pulsar_shape = saved;
 }
 
 

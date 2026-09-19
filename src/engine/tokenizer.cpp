@@ -571,6 +571,136 @@ void pulsar_vocab::vocab_free() {
  * conversation opens with the effort line (thinking on) or with system text,
  * then the effort line.  One authority for the CLI path; the server renderer
  * writes the same bytes (prompt_render.cpp). */
+/* --- L185: the chat template's TEXT rules, ONE authority --------------------
+ *
+ * The server renders the template as TEXT and tokenises it once, so a message's
+ * tokens span the text RUN between two markers: `user text` + `\n\n` +
+ * `<tool_result>` + body + `</tool_result>` is ONE BPE run, and a mid-conversation
+ * system message drags its `<system-reminder>` wrapper into the run around it.
+ * The twin used to tokenise each piece separately, which is why it disagreed
+ * with the renderer on four measured shapes.
+ *
+ * The twin now appends the same TEXT and RE-TOKENISES the open run -- the tokens
+ * after the last template marker -- whenever text joins it.  The run's text is
+ * recovered from the tokens themselves (vocab_token_text is the inverse the KV
+ * keys already rely on), so the twin carries NO state of its own: the rules
+ * below are the only authority, and token surgery by a caller (the CLI's
+ * lead-in insert, compaction's transcript swap) cannot desynchronise a state
+ * copy because there is none.
+ *
+ * The flush is eager: a run is tokenised as soon as its text is known, and
+ * joining more text re-tokenises it.  That can move tokens inside the OPEN run,
+ * which is exactly what the renderer does too -- a caller that has already synced
+ * that prefix sees a shorter common prefix and re-prefills from there. */
+
+/** The ids that bound a text run: every marker this template emits. */
+static bool chat_tmpl_marker(const pulsar_vocab *v, int id) {
+    return id == v->bos_id || id == v->eos_id || id == v->system_id ||
+           id == v->user_id || id == v->assistant_id ||
+           id == v->think_start_id || id == v->think_end_id;
+}
+
+static int chat_tmpl_run_start(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = t->len - 1; i >= 0; i--)
+        if (chat_tmpl_marker(v, t->v[i])) return i + 1;
+    return 0;
+}
+
+static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = t->len - 1; i >= 0; i--)
+        if (chat_tmpl_marker(v, t->v[i])) return t->v[i];
+    return -1;
+}
+
+/** Has a user or assistant message been appended yet?  A system message before
+ * one is the LEADING system region (plain content); after one it is a
+ * mid-conversation note (the wrapper rule applies). */
+static bool chat_tmpl_saw_turn(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = 0; i < t->len; i++)
+        if (t->v[i] == v->user_id || t->v[i] == v->assistant_id) return true;
+    return false;
+}
+
+static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
+                                int start, size_t *n_out) {
+    size_t n = 0;
+    for (int i = start; i < t->len; i++) {
+        size_t l = 0;
+        char *p = vocab_token_text(v, t->v[i], &l);
+        n += l;
+        free(p);
+    }
+    char *out = (char *)xmalloc(n + 1);
+    size_t at = 0;
+    for (int i = start; i < t->len; i++) {
+        size_t l = 0;
+        char *p = vocab_token_text(v, t->v[i], &l);
+        memcpy(out + at, p, l);
+        at += l;
+        free(p);
+    }
+    out[at] = '\0';
+    if (n_out) *n_out = at;
+    return out;
+}
+
+static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
+    token_vec_push((token_vec *)t, id);
+}
+
+/** Append TEXT to the open run and re-tokenise the run -- the one primitive that
+ * makes the twin's BPE boundary the renderer's. */
+static void chat_tmpl_append_text(const pulsar_vocab *v, pulsar_tokens *t, const char *text) {
+    if (!text || !text[0]) return;
+    const int start = chat_tmpl_run_start(v, t);
+    size_t run = 0;
+    char *have = chat_tmpl_run_text(v, t, start, &run);
+    const size_t add = strlen(text);
+    char *joined = (char *)xmalloc(run + add + 1);
+    memcpy(joined, have, run);
+    memcpy(joined + run, text, add + 1);
+    free(have);
+    t->len = start;                          /* drop the run, re-tokenise it joined */
+    v->tokenize_span(joined, run + add, (token_vec *)t);
+    free(joined);
+}
+
+struct chat_tmpl_escape_sink {
+    const pulsar_vocab *vocab;
+    pulsar_tokens *tokens;
+};
+
+static void chat_tmpl_escape_emit(void *ud, const char *bytes, size_t n) {
+    auto *sink = (chat_tmpl_escape_sink *)ud;
+    char *piece = (char *)xmalloc(n + 1);
+    memcpy(piece, bytes, n);
+    piece[n] = '\0';
+    chat_tmpl_append_text(sink->vocab, sink->tokens, piece);
+    free(piece);
+}
+
+/** Append a tool-result body with the sentinel escaped (pulsar_tool_result_escape
+ * is the ONE authority for that rule), into the open run. */
+static void chat_tmpl_append_tool_body(const pulsar_vocab *v, pulsar_tokens *t,
+                                       const char *content) {
+    chat_tmpl_escape_sink sink = { v, t };
+    pulsar_tool_result_escape(content, chat_tmpl_escape_emit, &sink);
+}
+
+/** Does the open run end with the tool-result wrapper's close?  That is the
+ * renderer's `pending_tool_result` fact, derived instead of stored. */
+static bool chat_tmpl_run_ends_tool_result(const pulsar_vocab *v, const pulsar_tokens *t) {
+    static const char end[] = "</tool_result>";
+    const size_t endlen = sizeof(end) - 1;
+    const int start = chat_tmpl_run_start(v, t);
+    size_t run = 0;
+    char *text = chat_tmpl_run_text(v, t, start, &run);
+    const bool yes = run >= endlen && memcmp(text + run - endlen, end, endlen) == 0;
+    free(text);
+    return yes;
+}
+
+
 static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
                                 pulsar_think_mode think_mode, token_vec *out) {
     const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
@@ -578,8 +708,11 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
      * V4.1 marks its lead-in system region, 0731 does not.  Writing it for both
      * cost V4 exactly one prompt token -- enough to change the answer. */
     if (PULSAR_CHAT_SYSTEM_MARKER && (effort_prefix[0] || has_system))
-        token_vec_push(out, vocab->system_id);
-    if (effort_prefix[0]) vocab->bpe_tokenize_text(effort_prefix, out);
+        chat_tmpl_push_marker(out, vocab->system_id);
+    /* The effort line is TEXT, and the system region joins it unchanged (the
+     * renderer writes marker + effort + region as one run), so it goes into the
+     * open run rather than being tokenised on its own. */
+    chat_tmpl_append_text(vocab, out, effort_prefix);
 }
 
 
@@ -594,15 +727,15 @@ static void encode_chat_prompt(
         const char      *prompt,
         pulsar_think_mode   think_mode,
         token_vec       *out) {
-    token_vec_push(out, vocab->bos_id);
+    chat_tmpl_push_marker(out, vocab->bos_id);
     const bool has_system = system && system[0];
     encode_chat_lead_in(vocab, has_system, think_mode, out);
-    if (has_system) {
-        vocab->bpe_tokenize_text(system, out);
-    }
-    token_vec_push(out, vocab->user_id);
-    vocab->bpe_tokenize_text(prompt, out);
-    token_vec_push(out, vocab->assistant_id);
+    /* The system FIELD is the leading system region: it joins the effort line's
+     * run with no marker of its own, exactly as the renderer writes it. */
+    chat_tmpl_append_text(vocab, out, system);
+    chat_tmpl_push_marker(out, vocab->user_id);
+    chat_tmpl_append_text(vocab, out, prompt);
+    chat_tmpl_push_marker(out, vocab->assistant_id);
     if (pulsar_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
     } else {
@@ -819,55 +952,65 @@ size_t pulsar_tool_result_escape(const char *s,
 
 
 
-struct tool_result_bpe_sink {
-    const pulsar_vocab *vocab;
-    token_vec *out;
-};
 
-static void tool_result_bpe_emit(void *ud, const char *bytes, size_t n) {
-    auto *sink = (tool_result_bpe_sink *)ud;
-    sink->vocab->tokenize_span(bytes, n, sink->out);
-}
-
-void pulsar_vocab::bpe_tokenize_tool_result_text(const char *content, token_vec *out) {
-    /* The escape RULE lives in pulsar_tool_result_escape; this only decides how
-     * its segments are tokenised (piecewise, like the rest of the twin). */
-    tool_result_bpe_sink sink = { this, out };
-    pulsar_tool_result_escape(content, tool_result_bpe_emit, &sink);
-}
 
 
 
 void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content) {
     pulsar_vocab *vocab = &e->vocab;
+    const bool v41 = pulsar_engine_chat_v41(e);
     if (!role) role = "user";
     if (!content) content = "";
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        vocab->bpe_tokenize_text(content, tokens);
-    } else if (!strcmp(role, "assistant")) {
-        token_vec_push(tokens, vocab->assistant_id);
-        if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
-            token_vec_push(tokens, vocab->think_end_id);
+        /* The renderer's system rule: a system message BEFORE any user/assistant
+         * turn is the leading system region (plain content, joined into the
+         * lead-in's run); after one it is a mid-conversation note -- V4.1 marks
+         * it in place with the System token, V4 wraps it in a user turn. */
+        if (!chat_tmpl_saw_turn(vocab, tokens)) {
+            chat_tmpl_append_text(vocab, tokens, content);
+        } else if (v41) {
+            chat_tmpl_push_marker(tokens, vocab->system_id);
+            chat_tmpl_append_text(vocab, tokens, content);
+        } else {
+            chat_tmpl_push_marker(tokens, vocab->user_id);
+            chat_tmpl_append_text(vocab, tokens, "<system-reminder>\n");
+            chat_tmpl_append_text(vocab, tokens, content);
+            chat_tmpl_append_text(vocab, tokens, "\n</system-reminder>");
         }
-        vocab->bpe_tokenize_text(content, tokens);
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-        token_vec_push(tokens, vocab->user_id);
-        vocab->bpe_tokenize_text("<tool_result>", tokens);
-        vocab->bpe_tokenize_tool_result_text(content, tokens);
-        vocab->bpe_tokenize_text("</tool_result>", tokens);
+        /* V4.1 joins consecutive user-SIDE messages (user text and tool results in
+         * any order) into one turn; V4 opens a fresh turn for each user message
+         * and for the first tool result after one, and joins after a tool result. */
+        const bool join = v41 ? chat_tmpl_last_marker(vocab, tokens) == vocab->user_id
+                              : chat_tmpl_run_ends_tool_result(vocab, tokens);
+        if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
+        else chat_tmpl_append_text(vocab, tokens, "\n\n");
+        chat_tmpl_append_text(vocab, tokens, "<tool_result>");
+        chat_tmpl_append_tool_body(vocab, tokens, content);
+        chat_tmpl_append_text(vocab, tokens, "</tool_result>");
+    } else if (!strcmp(role, "assistant")) {
+        /* Not reachable from this tree (no caller passes "assistant": the agent
+         * and the CLI append a SAMPLED turn's tokens, and the server owns the
+         * replay rules).  The old branch guessed a stripped replay and could not
+         * be right; refuse instead of guessing. */
+        pulsar_die("pulsar_chat_append_message: an assistant turn cannot be "
+                   "appended here -- append the sampled tokens, or render it "
+                   "through the server's renderer (L185)");
     } else {
-        token_vec_push(tokens, vocab->user_id);
-        vocab->bpe_tokenize_text(content, tokens);
+        const bool join = v41 && chat_tmpl_last_marker(vocab, tokens) == vocab->user_id;
+        if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
+        else chat_tmpl_append_text(vocab, tokens, "\n\n");
+        chat_tmpl_append_text(vocab, tokens, content);
     }
 }
 
 
 
 void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, pulsar_think_mode_enabled(think_mode) ?
-                   e->vocab.think_start_id : e->vocab.think_end_id);
+    chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
+    chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
+                          e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
 
