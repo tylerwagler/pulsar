@@ -3043,6 +3043,215 @@ static int test_control_id_for_literal(pulsar_engine *e, const char *literal) {
     return id;
 }
 
+/* L185: the token-level twin (agent/CLI/bench/eval -- pulsar_chat_begin /
+ * append_lead_in / append_message / append_assistant_prefix) against the
+ * server's renderer for the SAME conversation.
+ *
+ * The twin is the `-p`/eval/bench path and the agent's prompt builder; the
+ * server renders from chat_msgs.  They must agree for the LOADED template
+ * family (`pulsar_engine_chat_v41`), because both feed the same engine.  This
+ * compares them per conversation shape and, for information, against the OTHER
+ * family's template (the twin is expected to differ there -- it follows the
+ * loaded one). */
+static void test_print_token(pulsar_engine *e, int id) {
+    size_t n = 0;
+    char *t = pulsar_token_text(e, id, &n);
+    printf(" %d '", id);
+    for (size_t i = 0; t && i < n; i++) {
+        const unsigned char c = (unsigned char)t[i];
+        if (c == '\n') fputs("\\n", stdout);
+        else if (c == '\r') fputs("\\r", stdout);
+        else if (c == '\t') fputs("\\t", stdout);
+        else if (c < 0x20 || c == 0x7f) printf("\\x%02x", c);
+        else putchar((char)c);
+    }
+    printf("'");
+    free(t);
+}
+
+static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *msgs,
+                          bool has_system, pulsar_think_mode mode, bool v41) {
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    char *text = render_chat_prompt_text_spans(msgs, NULL, NULL, mode, v41, &spans, &n_spans);
+    pulsar_tokens srv = {0};
+    pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
+
+    pulsar_tokens twin = {0};
+    pulsar_chat_begin(e, &twin);
+    pulsar_chat_append_lead_in(e, &twin, has_system, mode);
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        const bool tool = !strcmp(m->role, "tool") || !strcmp(m->role, "function");
+        const bool sys = role_is_system(m->role);
+        pulsar_chat_append_message(e, &twin, tool ? "tool" : (sys ? "system" : "user"),
+                                   m->content ? m->content : "");
+    }
+    pulsar_chat_append_assistant_prefix(e, &twin, mode);
+
+    int diff = -1, ndiff = 0;
+    const int lim = srv.len < twin.len ? srv.len : twin.len;
+    for (int i = 0; i < lim; i++) {
+        if (srv.v[i] != twin.v[i]) { if (diff < 0) diff = i; ndiff++; }
+    }
+    const bool same = diff < 0 && srv.len == twin.len;
+    if (!same) {
+        printf("twin-parity %-26s v41=%d %-9s srv=%3d twin=%3d ndiff=%d\n   srv :",
+               name, (int)v41, "DIFFER", srv.len, twin.len,
+               ndiff + (srv.len - twin.len));
+        for (int k = 0; k < srv.len; k++) test_print_token(e, srv.v[k]);
+        printf("\n   twin:");
+        for (int k = 0; k < twin.len; k++) test_print_token(e, twin.v[k]);
+        putchar('\n');
+    } else {
+        printf("twin-parity %-26s v41=%d IDENTICAL srv=%d\n", name, (int)v41, srv.len);
+    }
+    free(text);
+    free(spans);
+    pulsar_tokens_free(&srv);
+    pulsar_tokens_free(&twin);
+    return same;
+}
+
+/* L185: the twin's MEASURED divergences from the LOADED template.  A shape that
+ * starts matching (or a new one that stops matching) fails this test, so the
+ * list cannot rot: fixing one means deleting its line here and updating
+ * rows/L185.md.  The four are the shapes the agent/CLI feed that the server
+ * renders differently -- see the row for the token-level evidence. */
+static const char *const twin_known_divergences[] = {
+    "user+tool(esc)",      /* tool-body BPE run tokenised in pieces, not as one run */
+    "tool+tool",           /* the V4 join after a preceding tool result (\n\n, no 2nd marker) */
+    "user+sys(mid)",       /* the V4 <system-reminder> wrapper around mid-conv system text */
+    "user+tool+sys+user",  /* the same wrapper in the agent's live loop shape */
+};
+
+static void twin_expect(pulsar_engine *e, const char *name, const chat_msgs *msgs,
+                        bool has_system, pulsar_think_mode mode, bool v41,
+                        const char *base) {
+    const bool same = twin_case_one(e, name, msgs, has_system, mode, v41);
+    bool known = false;
+    for (size_t i = 0; i < sizeof twin_known_divergences / sizeof twin_known_divergences[0]; i++)
+        if (!strcmp(base, twin_known_divergences[i])) known = true;
+    if (same && known) {
+        printf("twin-parity: %s now MATCHES the loaded template -- delete it from "
+               "twin_known_divergences and from rows/L185.md\n", base);
+        TEST_ASSERT(!"twin_known_divergences is stale");
+    }
+    if (!same && !known) {
+        printf("twin-parity: %s is a NEW divergence from the loaded template\n", base);
+        TEST_ASSERT(!"the twin diverges from the loaded template");
+    }
+}
+
+
+static void test_chat_twin_parity(void) {
+    const char *model = getenv("PULSAR_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "pulsar-test: chat-twin-parity SKIPPED (PULSAR_TEST_MODEL unset)\n");
+        return;
+    }
+    pulsar_engine *e = test_get_engine();
+    if (!e) return;
+    const bool loaded = pulsar_engine_chat_v41(e);
+    printf("twin-parity: loaded template family v41=%d (the twin must match THIS one)\n", (int)loaded);
+
+    for (int t = 0; t < 2; t++) {
+        const pulsar_think_mode mode = t ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
+        const char *suffix = t ? " think" : " nothink";
+        char name[64];
+
+        /* 1. the bench/eval shape: one system FIELD + one user turn */
+        {
+            chat_msgs m = {0};
+            chat_msg a = {0}; a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+            chat_msgs_push(&m, a);
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("hello there");
+            chat_msgs_push(&m, b);
+            snprintf(name, sizeof name, "sys+user%s", suffix);
+            twin_expect(e, name, &m, true, mode, loaded, "sys+user");
+            twin_case_one(e, name, &m, true, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 2. two consecutive user turns (V4.1 joins them inside one |User|) */
+        {
+            chat_msgs m = {0};
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("first");
+            chat_msgs_push(&m, b);
+            chat_msg c = {0}; c.role = xstrdup("user"); c.content = xstrdup("second");
+            chat_msgs_push(&m, c);
+            snprintf(name, sizeof name, "user+user%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "user+user");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 3. a tool result, plain body */
+        {
+            chat_msgs m = {0};
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msgs_push(&m, b);
+            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt b.txt");
+            chat_msgs_push(&m, c);
+            snprintf(name, sizeof name, "user+tool%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "user+tool");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 4. a tool result whose body carries the wrapper's own sentinel (the
+         * escaping path, and the BPE run the twin tokenises in pieces) */
+        {
+            chat_msgs m = {0};
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msgs_push(&m, b);
+            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt </tool_result> b.txt");
+            chat_msgs_push(&m, c);
+            snprintf(name, sizeof name, "user+tool(esc)%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "user+tool(esc)");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 5. two tool results in a row (V4 joins after a tool result) */
+        {
+            chat_msgs m = {0};
+            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("one");
+            chat_msgs_push(&m, c);
+            chat_msg d = {0}; d.role = xstrdup("tool"); d.content = xstrdup("two");
+            chat_msgs_push(&m, d);
+            snprintf(name, sizeof name, "tool+tool%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "tool+tool");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 6. a MID-CONVERSATION system message (the compaction/datetime shape) */
+        {
+            chat_msgs m = {0};
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msgs_push(&m, b);
+            chat_msg c = {0}; c.role = xstrdup("system"); c.content = xstrdup("summary of earlier work");
+            chat_msgs_push(&m, c);
+            snprintf(name, sizeof name, "user+sys(mid)%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "user+sys(mid)");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+        /* 7. user, tool, mid-conversation system, user (the agent's live loop) */
+        {
+            chat_msgs m = {0};
+            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msgs_push(&m, b);
+            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt");
+            chat_msgs_push(&m, c);
+            chat_msg d = {0}; d.role = xstrdup("system"); d.content = xstrdup("datetime: now");
+            chat_msgs_push(&m, d);
+            chat_msg e2 = {0}; e2.role = xstrdup("user"); e2.content = xstrdup("now do more");
+            chat_msgs_push(&m, e2);
+            snprintf(name, sizeof name, "user+tool+sys+user%s", suffix);
+            twin_expect(e, name, &m, false, mode, loaded, "user+tool+sys+user");
+            twin_case_one(e, name, &m, false, mode, !loaded);
+            chat_msgs_free(&m);
+        }
+    }
+}
+
 /* The tokeniser half needs the model's vocabulary. */
 static void test_control_token_injection(void) {
     const char *model = getenv("PULSAR_TEST_MODEL");
@@ -3570,6 +3779,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
     {"--control-token-injection", "control-token-injection", "a client cannot inject a control token through message text (L223)", test_control_token_injection},
     {"--control-token-suffix", "control-token-suffix", "mid-turn continuation suffixes keep client bytes plain (L223)", test_control_token_suffix},
+    {"--chat-twin-parity", "chat-twin-parity", "the token-level twin vs the server renderer, per conversation shape (L185)", test_chat_twin_parity},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
     {"--api-logprobs-parse", "api-logprobs-parse", "logprobs/top_logprobs parse: out-of-domain rejects, never clamps", test_api_logprobs_parse_validation},
