@@ -264,7 +264,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     chat_msgs msgs = {0};
     buf loaded = {0};
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders, NULL, 0));
     TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "\"name\":\"mcp__perplexity__perplexity_search\""));
     const tool_schema_order *order =
         tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
@@ -291,7 +291,7 @@ static void test_responses_input_tool_search_output_rejects_bad_tools(void) {
     chat_msgs msgs = {0};
     buf loaded = {0};
     tool_schema_orders orders = {0};
-    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders, NULL, 0));
     buf_free(&loaded);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
@@ -316,7 +316,7 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
         "\"arguments\":{\"query\":\"deepseek\"}}]";
     const char *input_p = input_json;
     chat_msgs msgs = {0};
-    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL, NULL, 0));
     TEST_ASSERT(msgs.len == 1);
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
@@ -3485,12 +3485,20 @@ static void test_parse_completion_request_refuses_logprobs(void) {
  * idiom: seed the out-pointer with a heap value (as a first key would), free
  * it, reparse a malformed value, and assert the helper nulled the pointer so
  * the trailing free is a free(NULL) no-op. */
+
+/* The new Responses content reader takes the message an image block attaches to
+ * (and an err buffer); this adapter keeps the failure-idiom probe driving the
+ * same (const char **, char **) shape as its siblings. */
+static bool responses_content_probe(const char **p, char **out) {
+    return parse_responses_content_array(p, out, NULL, NULL, 0);
+}
+
 static void test_json_value_helpers_null_out_on_failure(void) {
     struct { const char *name; bool (*fn)(const char **, char **); const char *bad; } cases[] = {
         {"json_content",       json_content,       "[}"},
         {"json_raw_value",     json_raw_value,     "tru"},
         {"parse_prompt",       parse_prompt,       "[42, "},
-        {"parse_responses_content_array", parse_responses_content_array, "[{"},
+        {"parse_responses_content_array", responses_content_probe, "[{"},
         {"parse_anthropic_system",        parse_anthropic_system,        "[{\"type\":}"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -3578,6 +3586,301 @@ static void test_chat_image_url_content_blocks(void) {
     TEST_ASSERT(base64_decode("ab=c", 4, &n) == NULL);      /* data after padding */
     TEST_ASSERT(base64_decode("aaaa====", 8, &n) == NULL);  /* padding mid-stream */
     TEST_ASSERT(base64_decode("a!b=", 4, &n) == NULL);      /* bad alphabet */
+}
+
+
+
+/* The Responses image surface: an `input_image` block decodes through the same
+ * authority as the chat `image_url` block -- the encoded file attaches to the
+ * message and its placeholder takes the block's position in the content, so the
+ * renderer's image expander sees the shape it already handles.  Everything the
+ * reader cannot honor refuses with a message (remote URL, file_id, malformed
+ * base64, unknown type, an image where no message exists to attach it to); the
+ * silent 400-on-any-image this replaces was a served-surface hole, since the
+ * vision build is what the server loads. */
+static void test_responses_input_image_blocks(void) {
+    /* The 1x1 PNG, so the bytes are a real encoded FILE, not a re-encode. */
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"type\":\"message\",\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"input_text\",\"text\":\"look\"},");
+    /* The spec spells image_url as a bare string, which is the shape the
+     * Responses schema documents. */
+    buf_puts(&json, "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\",\"detail\":\"high\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[192] = {0};
+    const bool parsed = parse_responses_input(&p, &msgs, NULL, NULL, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (!parsed) {
+        fprintf(stderr, "responses image parse refused: %s\n", err);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+        return;
+    }
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(!strcmp(msgs.v[0].role, "user"));
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(msgs.v[0].images[0].len > 8);
+        TEST_ASSERT(msgs.v[0].images[0].bytes[0] == 0x89 && msgs.v[0].images[0].bytes[1] == 'P');
+        /* The placeholder OFFSET is adopted with the image: the item parser
+         * collects both in a scratch message, and a message that keeps the image
+         * but not the offset renders as one client span, so the placeholder never
+         * becomes an image token (the L226 defect). */
+        TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
+        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+                             PULSAR_IMAGE_PLACEHOLDER, strlen(PULSAR_IMAGE_PLACEHOLDER)));
+        /* Text first, then the sentinel where the image block sat. */
+        TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) != NULL);
+        TEST_ASSERT(strstr(msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER) > msgs.v[0].content);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* The chat-shaped wrapper and the chat block-type alias both land: the two
+     * surfaces share one reader, so a payload ported between them works. */
+    {
+        buf w = {0};
+        buf_puts(&w, "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+                      "\"image_url\":{\"url\":\"data:image/png;base64,");
+        buf_puts(&w, png_b64);
+        buf_puts(&w, "\"}}]}]");
+        chat_msgs wrapped_msgs = {0};
+        p = w.ptr; err[0] = 0;
+        TEST_ASSERT(parse_responses_input(&p, &wrapped_msgs, NULL, NULL, err, sizeof err));
+        TEST_ASSERT(wrapped_msgs.len == 1);
+        TEST_ASSERT(wrapped_msgs.v[0].images_len == 1);
+        TEST_ASSERT(!strcmp(wrapped_msgs.v[0].content, PULSAR_IMAGE_PLACEHOLDER));
+        chat_msgs_free(&wrapped_msgs);
+        buf_free(&w);
+    }
+
+    const char *remote =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+        "\"image_url\":\"https://example.com/a.png\"}]}]";
+    chat_msgs remote_msgs = {0};
+    p = remote; err[0] = 0;
+    TEST_ASSERT(!parse_responses_input(&p, &remote_msgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "http") != NULL);
+    chat_msgs_free(&remote_msgs);
+
+    const char *badb64 =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+        "\"image_url\":\"data:image/png;base64,!!!!\"}]}]";
+    chat_msgs bad_msgs = {0};
+    p = badb64; err[0] = 0;
+    TEST_ASSERT(!parse_responses_input(&p, &bad_msgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "base64") != NULL);
+    chat_msgs_free(&bad_msgs);
+
+    /* file_id: an uploaded-file reference this server cannot fetch.  Refused by
+     * NAME, so the client is told what to send instead. */
+    const char *file_id =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+        "\"file_id\":\"file-abc123\"}]}]";
+    chat_msgs file_msgs = {0};
+    p = file_id; err[0] = 0;
+    TEST_ASSERT(!parse_responses_input(&p, &file_msgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "file_id") != NULL);
+    chat_msgs_free(&file_msgs);
+
+    /* An unknown block type in a Responses content array names itself. */
+    const char *audio =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_audio\","
+        "\"data\":\"x\"}]}]";
+    chat_msgs audio_msgs = {0};
+    p = audio; err[0] = 0;
+    TEST_ASSERT(!parse_responses_input(&p, &audio_msgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "input_audio") != NULL);
+    chat_msgs_free(&audio_msgs);
+
+    /* A tool output's content has no message to attach an image to: fail closed
+     * rather than carry a placeholder nothing will expand. */
+    const char *in_output =
+        "[{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":["
+        "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAA=\"}]}]";
+    chat_msgs out_msgs = {0};
+    p = in_output; err[0] = 0;
+    TEST_ASSERT(!parse_responses_input(&p, &out_msgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "position") != NULL);
+    chat_msgs_free(&out_msgs);
+}
+
+
+
+/* L226: the tokeniser resolves a control token ONLY outside a client-text span,
+ * so the placeholder the PARSER inserted must fall outside every span (else the
+ * image token never appears and the engine refuses -- the L223 regression), while
+ * a placeholder occurrence the CLIENT typed must stay inside its span (else a
+ * user could inject an image token).  Model-free, and the gate whose absence let
+ * every image silently stop working. */
+static void test_image_placeholder_is_not_client_text(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const size_t ph_len = strlen(PULSAR_IMAGE_PLACEHOLDER);
+
+    /* One image block with client text on BOTH sides, so the span has to split. */
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"before\"},");
+    buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}},");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"after\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(msgs.len == 1 && msgs.v[0].images_len == 1);
+        /* The parser recorded where IT put the placeholder (the content keeps
+         * going after it: "before" + placeholder + "after"). */
+        TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
+        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+                             PULSAR_IMAGE_PLACEHOLDER, ph_len));
+
+        pulsar_text_span *spans = NULL;
+        uint32_t n_spans = 0;
+        char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, PULSAR_THINK_HIGH, true,
+                                                   &spans, &n_spans);
+        TEST_ASSERT(text != NULL);
+        if (text) {
+            const char *ph = strstr(text, PULSAR_IMAGE_PLACEHOLDER);
+            TEST_ASSERT(ph != NULL);
+            if (ph) {
+                const uint32_t lo = (uint32_t)(ph - text);
+                const uint32_t hi = (uint32_t)(lo + ph_len);
+                for (uint32_t i = 0; i < n_spans; i++) {
+                    /* No span may overlap the parser's placeholder: it must be
+                     * resolvable to the image token. */
+                    TEST_ASSERT(!(spans[i].lo < hi && spans[i].hi > lo));
+                }
+            }
+            /* The client's own words are still client text (still spanned). */
+            const char *before = strstr(text, "before");
+            TEST_ASSERT(before != NULL);
+            bool covered = false;
+            if (before) {
+                const uint32_t b = (uint32_t)(before - text);
+                for (uint32_t i = 0; i < n_spans; i++) {
+                    if (spans[i].lo <= b && spans[i].hi >= b + 6) covered = true;
+                }
+            }
+            TEST_ASSERT(covered);
+            free(text);
+        }
+        free(spans);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* The same spelling TYPED BY THE CLIENT carries no image and must stay
+     * inside its span, or a message could inject an image token. */
+    const char *typed =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":"
+        "\"say " PULSAR_IMAGE_PLACEHOLDER " please\"}]}]";
+    p = typed;
+    chat_msgs typed_msgs = {0};
+    err[0] = 0;
+    TEST_ASSERT(parse_messages(&p, &typed_msgs, err, sizeof err));
+    TEST_ASSERT(typed_msgs.len == 1 && typed_msgs.v[0].images_len == 0);
+    pulsar_text_span *tspans = NULL;
+    uint32_t tn = 0;
+    char *ttext = render_chat_prompt_text_spans(&typed_msgs, NULL, NULL, PULSAR_THINK_HIGH, true,
+                                                &tspans, &tn);
+    TEST_ASSERT(ttext != NULL);
+    if (ttext) {
+        const char *tph = strstr(ttext, PULSAR_IMAGE_PLACEHOLDER);
+        TEST_ASSERT(tph != NULL);
+        if (tph) {
+            const uint32_t lo = (uint32_t)(tph - ttext);
+            bool inside = false;
+            for (uint32_t i = 0; i < tn; i++) {
+                if (tspans[i].lo <= lo && tspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+            }
+            TEST_ASSERT(inside);
+        }
+        free(ttext);
+    }
+    free(tspans);
+    chat_msgs_free(&typed_msgs);
+
+    /* Both at once: the client types the spelling AND attaches a real image.  The
+     * parser's occurrence must be the only one outside a span -- exactly one
+     * image token, and the client's look-alike cannot ride along. */
+    buf both = {0};
+    buf_puts(&both, "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"say "
+                     PULSAR_IMAGE_PLACEHOLDER " please\"},");
+    buf_puts(&both, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&both, png_b64);
+    buf_puts(&both, "\"}}]}]");
+    p = both.ptr;
+    chat_msgs both_msgs = {0};
+    err[0] = 0;
+    TEST_ASSERT(parse_messages(&p, &both_msgs, err, sizeof err));
+    TEST_ASSERT(both_msgs.len == 1 && both_msgs.v[0].images_len == 1);
+    pulsar_text_span *bspans = NULL;
+    uint32_t bn = 0;
+    char *btext = render_chat_prompt_text_spans(&both_msgs, NULL, NULL, PULSAR_THINK_HIGH, true,
+                                                &bspans, &bn);
+    TEST_ASSERT(btext != NULL);
+    if (btext) {
+        int unspanned = 0, spans_in = 0;
+        for (const char *q = btext; (q = strstr(q, PULSAR_IMAGE_PLACEHOLDER)) != NULL; q += ph_len) {
+            const uint32_t lo = (uint32_t)(q - btext);
+            bool inside = false;
+            for (uint32_t i = 0; i < bn; i++) {
+                if (bspans[i].lo <= lo && bspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+            }
+            if (inside) spans_in++; else unspanned++;
+        }
+        TEST_ASSERT(spans_in == 1);    /* the client's own spelling */
+        TEST_ASSERT(unspanned == 1);   /* the parser's, the only image token */
+        free(btext);
+    }
+    free(bspans);
+    chat_msgs_free(&both_msgs);
+    buf_free(&both);
+}
+
+
+
+/* The request-level half of the image surface: a named refusal must survive to
+ * the client.  It did not -- parse_responses_request's bad: label overwrote the
+ * parser's message with the generic "invalid JSON request", so a client sending
+ * a remote image URL learned nothing about the rule while the parse-level test
+ * above still passed (the message was correct until the request layer replaced
+ * it).  A NULL engine is enough: the refusal happens before anything needs it. */
+static void test_responses_request_keeps_image_refusal_message(void) {
+    request r;
+    char err[256];
+
+    const char *remote =
+        "{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":["
+        "{\"type\":\"input_image\",\"image_url\":\"https://example.com/a.png\"}]}]}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_responses_request(NULL, NULL, remote, 64, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "http") != NULL);
+    TEST_ASSERT(strstr(err, "invalid JSON request") == NULL);
+
+    const char *file_id =
+        "{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":["
+        "{\"type\":\"input_image\",\"file_id\":\"file-abc\"}]}]}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_responses_request(NULL, NULL, file_id, 64, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "file_id") != NULL);
+
+    /* A plain shape error still falls back to the generic. */
+    err[0] = '\0';
+    TEST_ASSERT(!parse_responses_request(NULL, NULL, "{\"input\": [{\"type\":", 64, &r, err,
+                                        sizeof err));
+    TEST_ASSERT(strstr(err, "invalid JSON request") != NULL);
 }
 
 
@@ -7603,6 +7906,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
     test_chat_image_url_content_blocks();
+    test_responses_input_image_blocks();
+    test_image_placeholder_is_not_client_text();
+    test_responses_request_keeps_image_refusal_message();
     test_anthropic_image_content_blocks();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();

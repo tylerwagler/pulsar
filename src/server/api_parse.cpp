@@ -629,12 +629,21 @@ bad:
 
 
 
-/* Responses API: convert a content-array item (input_text/output_text/text) into a
- * concatenated string. Strict shape check: bare string, null, or an array of
- * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
- * level all reject so the client sees a 400 instead of an answer built on
- * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+/* Responses API: convert a content-array item (input_text/output_text/text/
+ * input_image) into a concatenated string. Strict shape check: bare string,
+ * null, or an array of recognized blocks. Numbers / objects / arrays-of-
+ * primitives at the top level all reject so the client sees a 400 instead of an
+ * answer built on silently dropped context.
+ *
+ * An `input_image` block decodes exactly like a chat `image_url` block (one
+ * authority: server_add_image_block): the encoded file is attached to `msg` and
+ * a PULSAR_IMAGE_PLACEHOLDER takes the block's position in the text, so the
+ * renderer's image expander sees the same shape it sees from the other two
+ * endpoints.  `msg` is NULL in the two positions where an image is not a thing
+ * (a tool output's content, a reasoning summary) and an image there fails
+ * closed. */
+static bool parse_responses_content_array(const char **p, char **out, chat_msg *msg,
+                                          char *err, size_t errlen) {
     *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -658,12 +667,16 @@ static bool parse_responses_content_array(const char **p, char **out) {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *image_url = NULL;
+            char *file_id = NULL;
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 json_ws(p);
@@ -671,6 +684,8 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 (*p)++;
@@ -679,6 +694,8 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     if (!json_string(p, &type)) {
                         free(key);
                         free(text);
+                        free(image_url);
+                        free(file_id);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
@@ -692,12 +709,95 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     } else if (!json_string(p, &text)) {
                         free(key);
                         free(type);
+                        free(image_url);
+                        free(file_id);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    /* The Responses schema spells this field as a bare string;
+                     * tolerate OpenAI's {"url": ...} wrapper too, exactly as the
+                     * chat reader does, so a payload ported between the two
+                     * surfaces lands instead of dying on a shape difference. */
+                    free(image_url);
+                    json_ws(p);
+                    if (**p == '{') {
+                        (*p)++;
+                        json_ws(p);
+                        while (**p && **p != '}') {
+                            char *ik = NULL;
+                            if (!json_string(p, &ik)) {
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            json_ws(p);
+                            if (**p != ':') {
+                                free(ik);
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            (*p)++;
+                            if (!strcmp(ik, "url")) {
+                                free(image_url);
+                                if (!json_string(p, &image_url)) {
+                                    free(ik);
+                                    free(key);
+                                    free(type);
+                                    free(text);
+                                    free(file_id);
+                                    goto fail;
+                                }
+                            } else if (!json_skip_value(p)) {
+                                free(ik);
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            free(ik);
+                            json_ws(p);
+                            if (**p == ',') (*p)++;
+                            json_ws(p);
+                        }
+                        if (**p != '}') {
+                            free(key);
+                            free(type);
+                            free(text);
+                            free(file_id);
+                            goto fail;
+                        }
+                        (*p)++;
+                    } else if (!json_string(p, &image_url)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(file_id);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "file_id")) {
+                    /* An uploaded-file reference. This server does not fetch
+                     * remote content, so the value is captured only to name it
+                     * in the refusal below rather than being dropped silently. */
+                    free(file_id);
+                    if (!json_string(p, &file_id)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(image_url);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 free(key);
@@ -708,28 +808,65 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(image_url);
+                free(file_id);
                 goto fail;
             }
             (*p)++;
-            /* Fail closed: a content object must carry a known text-like type
-             * AND a text field. Anything else — missing type, missing text,
-             * image/file/audio types, future schema-drift — is rejected so the
+            /* Fail closed: a content object must carry a known type AND the
+             * field that type needs. Anything else -- missing type, missing
+             * text, file/audio types, future schema-drift -- is rejected so the
              * client gets a 400 instead of an answer built on context the
-             * server discarded silently. */
-            bool is_text_block = type && (
+             * server discarded silently. `image_url` is accepted as an alias of
+             * `input_image` for the same reason the text branch accepts five
+             * spellings. */
+            const bool is_text_block = type && (
                 !strcmp(type, "input_text") ||
                 !strcmp(type, "output_text") ||
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            if (!is_text_block || !text) {
+            const bool is_image_block = type && (
+                !strcmp(type, "input_image") ||
+                !strcmp(type, "image_url"));
+            if (is_image_block) {
+                if (!image_url || !image_url[0]) {
+                    if (err && errlen) {
+                        snprintf(err, errlen,
+                                 "input_image needs an inline \"image_url\" base64 data: URL%s",
+                                 file_id ? " (a file_id is not fetched by this server)" : "");
+                    }
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    free(file_id);
+                    goto fail;
+                }
+                if (!server_add_image_block(msg, image_url, &b, err, errlen)) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    free(file_id);
+                    goto fail;
+                }
+            } else if (!is_text_block || !text) {
+                if (!is_text_block && err && errlen) {
+                    snprintf(err, errlen,
+                             "unsupported content block type \"%s\"; this server accepts text, "
+                             "input_image and image_url blocks", type ? type : "(missing)");
+                }
                 free(type);
                 free(text);
+                free(image_url);
+                free(file_id);
                 goto fail;
+            } else {
+                buf_puts(&b, text);
             }
-            buf_puts(&b, text);
             free(type);
             free(text);
+            free(image_url);
+            free(file_id);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -769,12 +906,23 @@ fail:
  * render_chat_prompt_text can wrap them in <think>. */
 bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders) {
+                                  tool_schema_orders *orders,
+                                  char *err, size_t errlen) {
+    char local_err[192];
+    if (!err || errlen == 0) {
+        err = local_err;
+        errlen = sizeof local_err;
+    }
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
 
     buf pending_reasoning = {0};
+    /* An item's content is parsed before the item's type is known (JSON keys
+     * arrive in any order), so images land here first and are adopted by the
+     * message the item turns out to be -- or dropped when it is not a
+     * message. */
+    chat_msg item_images = {0};
 
     json_ws(p);
     while (**p && **p != ']') {
@@ -819,7 +967,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array(p, &content, &item_images, err, errlen)) {
                     free(key);
                     goto item_fail;
                 }
@@ -863,7 +1011,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array(p, &output, NULL, err, errlen)) {
                         free(key);
                         goto item_fail;
                     }
@@ -890,7 +1038,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array(p, &summary, NULL, err, errlen)) {
                     free(key);
                     goto item_fail;
                 }
@@ -953,6 +1101,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -999,6 +1148,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -1029,6 +1179,19 @@ item_fail:
             msg.role = xstrdup(role ? role : "user");
             msg.content = content ? content : xstrdup("");
             content = NULL;
+            /* Adopt the item's images: they belong to this message, and each
+             * block's placeholder already sits in `content` at its position.
+             * The placeholder offsets move with them -- one fact, one owner:
+             * without them the renderer cannot tell the placeholder the parser
+             * wrote from text the client typed, and the image is lost. */
+            msg.images = item_images.images;
+            msg.images_len = item_images.images_len;
+            msg.images_cap = item_images.images_cap;
+            msg.image_ph_off = item_images.image_ph_off;
+            item_images.images = NULL;
+            item_images.image_ph_off = NULL;
+            item_images.images_len = 0;
+            item_images.images_cap = 0;
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
                 msg.reasoning = buf_take(&pending_reasoning);
             }
@@ -1196,6 +1359,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -1215,6 +1379,9 @@ item_fail:
         free(result);
         free(tools_json);
         free(status_str);
+        /* Anything the item collected but did not adopt (a non-message item
+         * that carried a content array, or a message that failed to push). */
+        chat_msg_clear_images(&item_images);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -1235,6 +1402,7 @@ item_fail:
     buf_free(&pending_reasoning);
     return true;
 fail:
+    chat_msg_clear_images(&item_images);
     buf_free(&pending_reasoning);
     return false;
 }
@@ -1360,7 +1528,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
                 msg.content = plain;
                 chat_msgs_push(&msgs, msg);
             } else if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas,
-                                              &r->tool_orders)) {
+                                              &r->tool_orders, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -1567,6 +1735,21 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
                                                    &r->prompt_spans, &r->prompt_n_spans);
     pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
                                        r->prompt_n_spans, &r->prompt);
+    /* Images, if any: gather them from the messages and replace each placeholder
+     * with that image's sentinel BLOCK ids -- the same authority (and the same
+     * place, right after tokenisation) as the chat and Anthropic paths.  Without
+     * this a Responses request carrying `input_image` would answer 200 with the
+     * image silently missing.  `e == NULL` is the parse-without-engine test
+     * shape, which carries no images either. */
+    if (e && !request_prepare_images(e, &msgs, r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -1578,7 +1761,12 @@ bad:
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    /* A refusal that named its reason -- an image block's data: URL, a remote
+     * URL, a file_id this server cannot fetch, a malformed base64 payload --
+     * keeps that message so the client is told what to send instead.  Only a
+     * plain shape error falls back to the generic.  Same rule as the chat and
+     * Anthropic paths. */
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }

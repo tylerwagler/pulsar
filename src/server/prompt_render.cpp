@@ -79,11 +79,54 @@ void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
 
 /** Write client-supplied bytes as plain text: the range is recorded so the
  * tokeniser will not match a special-token spelling inside it. */
+static void buf_puts_content_n(buf *b, const char *s, size_t n) {
+    if (!s || !n) return;
+    buf_text_begin(b);
+    buf_append(b, s, n);
+    buf_text_end(b);
+}
+
 static void buf_puts_content(buf *b, const char *s) {
     if (!s || !s[0]) return;
-    buf_text_begin(b);
-    buf_puts(b, s);
-    buf_text_end(b);
+    buf_puts_content_n(b, s, strlen(s));
+}
+
+/* Message content that may carry inline images.  The client's text keeps its
+ * client-text span (the L223 invariant: a spelling inside client text must not
+ * become a control token), but each placeholder the PARSER inserted -- the
+ * offsets in `m->image_ph_off`, one per image -- is emitted OUTSIDE the span so
+ * the tokeniser resolves exactly it to the image token.  This is the one place
+ * that distinction is made, and it is made from WHERE the placeholder came
+ * from, never from what the text looks like: a client who types the placeholder
+ * spelling has it inside its span and it stays ordinary text.
+ *
+ * An offset list that does not fit the content (a parser bug, not a client's)
+ * falls back to the whole content as one client span: the prompt then carries no
+ * image token and the engine refuses the request loudly, which is the failure we
+ * want -- never a prompt that silently lost the image. */
+static void buf_puts_content_images(buf *b, const chat_msg *m) {
+    const char *s = m->content;
+    const size_t len = s ? strlen(s) : 0;
+    const size_t ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
+    if (m->images_len <= 0 || !m->image_ph_off || !len) {
+        buf_puts_content(b, s);
+        return;
+    }
+    size_t pos = 0;
+    for (int i = 0; i < m->images_len; i++) {
+        const size_t off = m->image_ph_off[i];
+        if (off < pos || off + ph > len || strncmp(s + off, PULSAR_IMAGE_PLACEHOLDER, ph) != 0) {
+            buf_puts_content(b, s);   /* mismatch: no image tokens, engine refuses */
+            return;
+        }
+    }
+    for (int i = 0; i < m->images_len; i++) {
+        const size_t off = m->image_ph_off[i];
+        buf_puts_content_n(b, s + pos, off - pos);
+        buf_puts(b, PULSAR_IMAGE_PLACEHOLDER);
+        pos = off + ph;
+    }
+    buf_puts_content_n(b, s + pos, len - pos);
 }
 
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
@@ -554,7 +597,7 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
         } else {
             buf_puts(out, PULSAR_RENDER_USER "<system-reminder>\n");
         }
-        buf_puts_content(out, m->content);
+        buf_puts_content_images(out, m);
         if (!r->v41) buf_puts(out, "\n</system-reminder>");
         r->pending_assistant = true;
         r->user_turn_open = false;
@@ -566,7 +609,7 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
          * user message and for the first tool result after one. */
         const bool join = r->v41 ? r->user_turn_open : false;
         buf_puts(out, join ? "\n\n" : PULSAR_RENDER_USER);
-        buf_puts_content(out, m->content);
+        buf_puts_content_images(out, m);
         r->pending_assistant = true;
         r->user_turn_open = true;
         r->pending_tool_result = false;

@@ -153,25 +153,38 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 
 
 
-static void chat_msg_clear_images(chat_msg *m) {
+/* De-static'd for api_parse.cpp: the Responses reader parses an item's content
+ * into a scratch message and must drop the images it collected when the item
+ * turns out not to be a message (see parse_responses_input).  Frees the
+ * placeholder offsets with the images -- one fact, one lifetime. */
+void chat_msg_clear_images(chat_msg *m) {
     for (int i = 0; i < m->images_len; i++) free(m->images[i].bytes);
     free(m->images);
+    free(m->image_ph_off);
     m->images = NULL;
+    m->image_ph_off = NULL;
     m->images_len = 0;
     m->images_cap = 0;
 }
 
 
 
-/* Take ownership of one decoded image. */
-static void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len) {
+/* Take ownership of one decoded image and record WHERE its placeholder sits in
+ * `content`.  Both are pushed together so an image and its offset cannot
+ * desync; `placeholder_off` is the offset the placeholder was (or is about to
+ * be) written at. */
+static void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len,
+                               size_t placeholder_off) {
     if (m->images_len == m->images_cap) {
         m->images_cap = m->images_cap ? m->images_cap * 2 : 4;
         m->images = (chat_image *)server_xrealloc(m->images,
                                                   (size_t)m->images_cap * sizeof(m->images[0]));
+        m->image_ph_off = (size_t *)server_xrealloc(m->image_ph_off,
+                                                    (size_t)m->images_cap * sizeof(m->image_ph_off[0]));
     }
     m->images[m->images_len].bytes = bytes;
     m->images[m->images_len].len = len;
+    m->image_ph_off[m->images_len] = placeholder_off;
     m->images_len++;
 }
 
@@ -1483,6 +1496,34 @@ static uint8_t *decode_image_data_url(const char *url, size_t *len_out,
 
 
 
+/* The ONE authority for attaching an inline image to a message: decode the
+ * block's data: URL, take ownership of the encoded file, and write the sentinel
+ * the renderer later expands back into that image at this position.  Both
+ * readers that accept images -- the chat `image_url` block and the Responses
+ * `input_image` block -- call this, so the two surfaces cannot drift on what an
+ * image block means or on how a bad URL is refused.  `err` may be NULL; the
+ * decode messages are then discarded rather than written. */
+bool server_add_image_block(chat_msg *msg, const char *url, buf *out,
+                            char *err, size_t errlen) {
+    char local_err[192];
+    if (!err || errlen == 0) {
+        err = local_err;
+        errlen = sizeof local_err;
+    }
+    if (!msg) {
+        snprintf(err, errlen, "images are not accepted in this position");
+        return false;
+    }
+    size_t n = 0;
+    uint8_t *bytes = decode_image_data_url(url, &n, err, errlen);
+    if (!bytes) return false;
+    chat_msg_add_image(msg, bytes, n, out->len);
+    buf_puts(out, PULSAR_IMAGE_PLACEHOLDER);
+    return true;
+}
+
+
+
 /* Message content: a plain string, null, or an array of typed blocks.  Unlike
  * json_content (which extracts any "text" field and drops the rest), this is
  * the FAIL-CLOSED reader for a chat message's content: a text-like block
@@ -1605,11 +1646,7 @@ static bool parse_chat_content(const char **p, chat_msg *msg, char *err, size_t 
             if (**p != '}') goto block_fail;
             (*p)++;
             if (image) {
-                size_t n = 0;
-                uint8_t *bytes = decode_image_data_url(url, &n, err, errlen);
-                if (!bytes) goto block_fail;
-                chat_msg_add_image(msg, bytes, n);
-                buf_puts(&b, PULSAR_IMAGE_PLACEHOLDER);
+                if (!server_add_image_block(msg, url, &b, err, errlen)) goto block_fail;
             } else if (text) {
                 buf_puts(&b, text);
             } else {
@@ -1973,7 +2010,8 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
             snprintf(err, errlen, "malformed base64 in the image source data");
             goto bad;
         }
-        chat_msg_add_image(msg, bytes, n);
+        const size_t ph_off = msg->content ? strlen(msg->content) : 0;
+        chat_msg_add_image(msg, bytes, n, ph_off);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, PULSAR_IMAGE_PLACEHOLDER);

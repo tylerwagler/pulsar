@@ -346,6 +346,13 @@ typedef struct {
     chat_image *images;   ///< owned, `images_len` entries
     int   images_len;     ///< images present
     int   images_cap;     ///< images allocated
+    /** Byte offset in `content` of each image's placeholder, parallel to
+     * `images` (same length, owned).  The renderer emits exactly these ranges
+     * OUTSIDE the message's client-text span, which is how the tokeniser knows
+     * to resolve them to the image token -- the surrounding client text keeps
+     * its BPE-only span.  A placeholder occurrence the CLIENT typed is not in
+     * this list and therefore stays ordinary text (the L223 invariant). */
+    size_t *image_ph_off; ///< owned, `images_len` entries
     char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
     char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
     char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
@@ -2576,6 +2583,12 @@ void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
+/* Attach one inline image block to `msg` and write its placeholder into `out`.
+ * The single authority behind the chat `image_url` and Responses `input_image`
+ * readers. */
+bool server_add_image_block(chat_msg *msg, const char *url, buf *out,
+                            char *err, size_t errlen);
+void chat_msg_clear_images(chat_msg *m);
 bool parse_anthropic_system(const char **p, char **out);
 void append_tool_result_text(buf *b, const char *s);
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order,
@@ -2685,7 +2698,8 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
                                     request *r, char *err, size_t errlen);
 bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders);
+                                  tool_schema_orders *orders,
+                                  char *err, size_t errlen);
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen);
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
