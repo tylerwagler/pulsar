@@ -704,7 +704,8 @@ void server::gen_begin(session_slot *sl) {
          * conversation's frontier. */
         sl->continued_last_store_tokens = 0;
         server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: image request (%d image%s): cold prefill, prefix cache bypassed",
+                   "pulsar-server: image request (%d image%s): disk/prefix resolver and cold store "
+                   "bypassed; the engine reuses the live prefix when the images are already in it",
                    j->req.n_images, j->req.n_images == 1 ? "" : "s");
     } else {
     /* Responses gets the first chance to continue from live state.  This is

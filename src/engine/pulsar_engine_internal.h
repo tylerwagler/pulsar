@@ -2026,6 +2026,12 @@ typedef struct pulsar_bank_carry {
     /** scalar mirrors: */
     bool      checkpoint_valid;
     int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
+    /** L226: mirror of pulsar_session::live_image_fp / _barrier -- the image
+     * identity travels with the bank, exactly like the checkpoint it describes,
+     * so a fork or a bank switch can never pair one conversation's barrier with
+     * another's KV. */
+    uint64_t  live_image_fp;
+    int       live_image_barrier;
     /** Whole speculative/DSpark shadow, mirrored by value (single assignment in
      * save/restore).  NOTE: pulsar_session.mseq_dirty is deliberately NOT carried:
      * it is a property of the GRAPH's scalar frontier counters, not of a bank's
@@ -2076,6 +2082,15 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
+    /** Identity of the images whose sentinel blocks are inside `checkpoint`
+     * (0 = none), and the exclusive end of the last of those blocks.  The
+     * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never
+     * the pixels, so a client that swaps an image for a different one of the
+     * same size produces an identical token prefix -- the fingerprint is what
+     * keeps such a request from reusing KV rows computed from the other image.
+     * Cleared by rewind() when the truncation drops a block (see L226). */
+    uint64_t live_image_fp;
+    int live_image_barrier;
     int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
     int prefill_frontier;                  ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
     /** A multiseq step has run and this session's per-bank state is no longer

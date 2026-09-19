@@ -815,6 +815,143 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
     return ok;
 }
 
+/* L226 gate: an image conversation's REUSED continuation must equal its COLD
+ * prefill.  The engine may extend the live prefix for a follow-up turn whose
+ * images are already in it (the rows for those blocks were merged from these same
+ * images at these same positions); this asserts the equality the shortcut rests on
+ * instead of arguing it -- full-vocab logits, byte-compared, from two sessions:
+ * one that syncs turn 1 and then extends to turn 2 (reuse), one that cold-prefills
+ * turn 2 outright.  The image identity is part of the licence, so a swap of the
+ * bytes (same geometry, different pixels) is its own case below.
+ *
+ * MODEL-DEPENDENT: needs an artifact with a bound vision tower.  A text-only
+ * artifact SKIPS loudly rather than passing quietly. */
+static const unsigned char test_reuse_png[] = {
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+    0, 0, 0, 128, 0, 0, 0, 128, 8, 2, 0, 0, 0, 76, 92, 246,
+    156, 0, 0, 1, 141, 73, 68, 65, 84, 120, 156, 237, 209, 193, 9, 192,
+    0, 16, 132, 192, 235, 191, 233, 164, 136, 60, 134, 37, 130, 127, 5, 239,
+    185, 155, 70, 251, 63, 163, 253, 13, 240, 9, 13, 88, 70, 251, 27, 224,
+    19, 26, 48, 141, 246, 55, 192, 39, 52, 96, 25, 237, 111, 128, 79, 104,
+    192, 52, 218, 223, 0, 159, 208, 128, 101, 180, 191, 1, 62, 161, 1, 211,
+    104, 127, 3, 124, 66, 3, 150, 209, 254, 6, 248, 132, 6, 76, 163, 253,
+    13, 240, 9, 13, 88, 70, 251, 27, 224, 19, 26, 48, 141, 246, 55, 192,
+    39, 52, 96, 25, 237, 111, 128, 79, 104, 192, 52, 218, 223, 0, 159, 208,
+    128, 101, 180, 191, 1, 62, 161, 1, 211, 104, 127, 3, 124, 66, 3, 150,
+    209, 254, 6, 248, 132, 6, 76, 163, 253, 13, 240, 9, 13, 88, 70, 251,
+    27, 224, 19, 26, 48, 141, 246, 55, 192, 39, 52, 96, 25, 237, 111, 128,
+    79, 104, 192, 52, 218, 223, 0, 159, 208, 128, 101, 180, 191, 1, 62, 161,
+    1, 211, 104, 127, 3, 124, 66, 3, 150, 209, 254, 6, 248, 132, 6, 76,
+    163, 253, 13, 240, 9, 13, 88, 70, 251, 27, 224, 19, 26, 48, 141, 246,
+    55, 192, 39, 52, 96, 25, 237, 111, 128, 79, 104, 192, 52, 218, 223, 0,
+    159, 208, 128, 101, 180, 191, 1, 62, 161, 1, 211, 104, 127, 3, 124, 66,
+    3, 150, 209, 254, 6, 248, 132, 6, 76, 163, 253, 13, 240, 9, 13, 88,
+    70, 251, 27, 224, 19, 26, 48, 141, 246, 55, 192, 39, 52, 96, 25, 237,
+    111, 128, 79, 104, 192, 52, 218, 223, 0, 159, 208, 128, 101, 180, 191, 1,
+    62, 161, 1, 211, 104, 127, 3, 124, 66, 3, 150, 209, 254, 6, 248, 132,
+    6, 76, 163, 253, 13, 240, 9, 13, 88, 70, 251, 27, 224, 19, 26, 48,
+    141, 246, 55, 192, 39, 52, 96, 25, 237, 111, 128, 79, 104, 192, 52, 218,
+    223, 0, 159, 208, 128, 101, 180, 191, 1, 62, 161, 1, 211, 104, 127, 3,
+    124, 66, 3, 150, 209, 254, 6, 248, 132, 6, 76, 163, 253, 13, 240, 9,
+    13, 88, 70, 251, 27, 224, 19, 26, 48, 141, 246, 55, 192, 39, 252, 122,
+    192, 11, 92, 168, 195, 178, 131, 8, 10, 170, 0, 0, 0, 0, 73, 69,
+    78, 68, 174, 66, 96, 130
+};
+
+static void test_image_conversation_reuse_matches_cold(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    pulsar_image_ref img = {0};
+    img.bytes = (uint8_t *)test_reuse_png;
+    img.len = sizeof test_reuse_png;
+
+    /* A short text prefix, the image placeholder, and a text tail: the shape the
+     * server renders for one image with a question after it.  The placeholder
+     * text is tokenised exactly as the renderer tokenises it (special_token_at
+     * resolves it to the vocab's image id). */
+    pulsar_tokens turn1_raw = {0};
+    /* The image sits early and a longer text tail follows, which is the shape in
+     * which reuse is licensed at all: the start of a resumed prefill must be a
+     * PULSAR_RESUME_GRID multiple at or above the image block (so no merged row is
+     * re-evaluated) and inside the checkpoint.  With the images near the frontier
+     * there is no such grid point and the engine correctly rebuilds cold -- the
+     * served test's boundary. */
+    {
+        char text[4096];
+        size_t n = (size_t)snprintf(text, sizeof text, "describe " PULSAR_IMAGE_PLACEHOLDER " in one line. ");
+        for (int r = 0; r < 24 && n < sizeof text - 64; r++)
+            n += (size_t)snprintf(text + n, sizeof text - n,
+                                  "The quick brown fox jumps over the lazy dog. ");
+        pulsar_tokenize_rendered_chat(engine, text, &turn1_raw);
+    }
+    char err[256] = {0};
+    pulsar_tokens turn1 = {0};
+    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, &img, 1, &turn1, err, sizeof err)) {
+        fprintf(stderr, "image-reuse gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
+        pulsar_tokens_free(&turn1_raw);
+        return;
+    }
+    TEST_ASSERT(img.start_pos > 0);   /* text comes first, so the block is not at 0 */
+
+    /* Turn 2 = turn 1 + a few more text tokens (the client's next question). */
+    pulsar_tokens turn2 = {0};
+    pulsar_tokens_copy(&turn2, &turn1);
+    for (int t = 700; t < 712; t++) pulsar_tokens_push(&turn2, t);
+
+    const int vocab = pulsar_engine_logits_width(engine);
+    float *reuse_logits = (float *)xmalloc((size_t)vocab * sizeof(float));
+    float *cold_logits = (float *)xmalloc((size_t)vocab * sizeof(float));
+
+    /* Session A: cold turn 1 (which merges), then EXTEND to turn 2. */
+    pulsar_session *sa = NULL;
+    TEST_ASSERT(pulsar_session_create(&sa, engine, 4096) == 0);
+    pulsar_image_ref first = img;
+    bool ok = sa && pulsar_session_sync_mm(sa, &turn1, &first, 1, err, sizeof err) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) fprintf(stderr, "  cold turn-1 sync refused: %s\n", err);
+    if (ok) {
+        pulsar_image_ref again = img;
+        ok = pulsar_session_sync_mm(sa, &turn2, &again, 1, err, sizeof err) == 0;
+        TEST_ASSERT(ok);
+        if (!ok) fprintf(stderr, "  reuse sync refused: %s\n", err);
+        ok = ok && pulsar_session_copy_logits(sa, reuse_logits, vocab) == vocab;
+        TEST_ASSERT(ok);
+    }
+    if (sa) pulsar_session_free(sa);
+
+    /* Session B: cold prefill of turn 2 in one pass. */
+    pulsar_session *sb = NULL;
+    TEST_ASSERT(pulsar_session_create(&sb, engine, 4096) == 0);
+    bool okb = sb && pulsar_session_sync_mm(sb, &turn2, &img, 1, err, sizeof err) == 0;
+    TEST_ASSERT(okb);
+    if (okb) {
+        okb = pulsar_session_copy_logits(sb, cold_logits, vocab) == vocab;
+        TEST_ASSERT(okb);
+    }
+    if (sb) pulsar_session_free(sb);
+
+    if (ok && okb) {
+        int differing = 0;
+        double worst = 0.0;
+        for (int i = 0; i < vocab; i++) {
+            if (reuse_logits[i] != cold_logits[i]) differing++;
+            const double d = fabs((double)reuse_logits[i] - (double)cold_logits[i]);
+            if (d > worst) worst = d;
+        }
+        fprintf(stderr, "image-reuse gate: %d/%d logits differ from the cold prefill (worst |delta| %.3g)\n",
+                differing, vocab, worst);
+        TEST_ASSERT(differing == 0);
+    }
+
+    free(reuse_logits);
+    free(cold_logits);
+    pulsar_tokens_free(&turn1);
+    pulsar_tokens_free(&turn2);
+    pulsar_tokens_free(&turn1_raw);
+}
+
+
+
 static bool test_mpp_capture_logits_only(pulsar_engine *engine,
                                          const test_mpp_eq_case *tc,
                                          float *logits) {
@@ -4048,6 +4185,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
+    {"--image-reuse", "image-reuse", "an image conversation's reused continuation equals its cold prefill, byte for byte (L226)", test_image_conversation_reuse_matches_cold},
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},

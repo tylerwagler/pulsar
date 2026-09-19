@@ -207,7 +207,7 @@ static int bank_fork_partial_host_check(pulsar_session *s, uint32_t src,
     pulsar_gpu_graph *g = &s->graph;
     if (g->banks.n_banks == 0 || src >= g->banks.n_banks) return PULSAR_FORK_EINVAL;
     const uint32_t align = pulsar_partial_fork_base_align();
-    const uint32_t R = (uint32_t)((n_cached - 4) / (int)align) * align;
+    uint32_t R = (uint32_t)((n_cached - 4) / (int)align) * align;
     if (R < align) return PULSAR_FORK_SHALLOW;
     const uint32_t cur = g->banks.cur_bank;
     const token_vec *hist = NULL;
@@ -219,6 +219,27 @@ static int bank_fork_partial_host_check(pulsar_session *s, uint32_t src,
     }
     if (!hist) return PULSAR_FORK_NOHIST;
     if (hist->len < (int)(R + 4u)) return PULSAR_FORK_EINVAL;
+    /* L226: a cut may not TRUNCATE AN IMAGE BLOCK.  The rows inside a block hold
+     * values only because the merge wrote them, so a bank cut below a block's end
+     * loses rows the request's re-prefill cannot re-create without re-merging --
+     * which is exactly the cold prefill this fork exists to avoid.  Snap the cut
+     * UP to the next aligned point at or above the source bank's barrier (a NEWER
+     * cut: still aligned, still token-validated below, and needing less ring
+     * lookback than the one it replaces).  No room above the barrier means no
+     * legal cut: refuse, and the caller cold-prefills as before.
+     *
+     * This lives in the SHARED host check on purpose: the routing-time
+     * feasibility probe and the fork itself both run it (`feasible` passes NULL
+     * for R), so the two can never disagree about which cut is legal. */
+    {
+        const int64_t barrier = (src == cur) ? s->live_image_barrier
+                                             : s->bank_carry[src].live_image_barrier;
+        if (barrier > 0 && (int64_t)R < barrier) {
+            const uint32_t raised = (uint32_t)(((uint64_t)barrier + align - 1u) / align) * align;
+            if (raised == 0 || hist->len < (int)(raised + 4u)) return PULSAR_FORK_EINVAL;
+            R = raised;
+        }
+    }
     /* Wrapped-ring window guard (mirrors gpu_graph_bank_fork_copy_cut): the
      * replay from R attends over raw rows [R - raw_window, R); once the ring
      * has scrolled past them the cut is unreplayable — and permanently so,
@@ -288,6 +309,19 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         token_vec_set_prefix_from(&c->checkpoint, hist, (int)R);
         c->checkpoint_valid = true;
         if (c->prefill_frontier > (int)R) c->prefill_frontier = (int)R;   /* L195: the cut is the new frontier */
+        /* L226: the image identity follows the cut.  The source's blocks are all
+         * below R (the host check above refuses any cut that would truncate one),
+         * so dst inherits them; the truncation arm is the same rule rewind() uses,
+         * written here so a future cut that skipped the raise cannot leave a
+         * barrier describing rows the cut removed. */
+        {
+            const uint64_t src_fp = (src == cur) ? s->live_image_fp
+                                                 : s->bank_carry[src].live_image_fp;
+            const int src_barrier = (src == cur) ? s->live_image_barrier
+                                                 : s->bank_carry[src].live_image_barrier;
+            c->live_image_fp = src_barrier > 0 && src_barrier <= (int)R ? src_fp : 0;
+            c->live_image_barrier = c->live_image_fp ? src_barrier : 0;
+        }
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
         c->spec.spec_carry_valid = false;
@@ -315,6 +349,10 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
          * clamp of 0 is 0: the resume went cold (see the full fork above). */
         s->prefill_frontier = dst < s->bank_carry_n ? s->bank_carry[dst].prefill_frontier : 0;
         if (s->prefill_frontier > (int)R) s->prefill_frontier = (int)R;
+        /* L226: the live session now describes the cut bank, so it takes that
+         * bank's image identity -- including the "cut removed them" case. */
+        s->live_image_fp = dst < s->bank_carry_n ? s->bank_carry[dst].live_image_fp : 0;
+        s->live_image_barrier = dst < s->bank_carry_n ? s->bank_carry[dst].live_image_barrier : 0;
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
@@ -527,6 +565,8 @@ void pulsar_session::bank_state_save(uint32_t bank) {
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
     c->prefill_frontier       = s->prefill_frontier;   /* L195 */
+    c->live_image_fp          = s->live_image_fp;      /* L226: travels with the checkpoint */
+    c->live_image_barrier     = s->live_image_barrier;
     /* Whole speculative/DSpark shadow in one assignment — a new field added to
      * pulsar_spec_carry_state is carried here for free (the old field-by-field
      * mirror was a silent-corruption footgun: miss one and the entering bank
@@ -571,6 +611,8 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     }
     s->checkpoint_valid       = c->checkpoint_valid;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
+    s->live_image_fp          = c->live_image_fp;      /* L226 */
+    s->live_image_barrier     = c->live_image_barrier;
     /* Mirror of the save above: one assignment restores the whole shadow. */
     s->spec = c->spec;
     /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
