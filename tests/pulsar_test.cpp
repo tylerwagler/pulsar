@@ -3252,6 +3252,256 @@ static void test_chat_twin_parity(void) {
     }
 }
 
+
+/* L185 step 1: freeze the SERVER renderer's exact bytes.
+ *
+ * The renderer is the authority both the server and (eventually) the engine's
+ * token-level twin must agree with, and the reference checkpoint's `encoding/`
+ * tree is a dangling LFS farm on both hosts, so the L218 renderer gate cannot
+ * run.  The biggest rule it owns -- V4's `<|User|><system-reminder>` wrapper for
+ * a MID-CONVERSATION system message -- is not pinned by any unit test either
+ * (server_tests.cpp has zero occurrences of "system-reminder").
+ *
+ * So this captures the renderer's output for a corpus of conversation shapes, at
+ * both template families and both thinking modes, and compares byte for byte.
+ * The corpus deliberately includes every shape L185's twin analysis found
+ * divergent (joins, wrappers, the tool-result escape, the DSML replay) plus the
+ * tool-schema preamble, whose ORDER differs between the families.
+ *
+ * Capture (a diagnostic, not a variant):
+ *   PULSAR_RENDER_BYTES_WRITE=/tmp/render-bytes.txt ./pulsar_test --render-bytes
+ * Compare: the default run, against tests/test-vectors/render-bytes-<ref>.txt
+ */
+
+typedef struct {
+    const char *name;
+    int shape;
+} render_bytes_case;
+
+/* The corpus: shape ids are built by render_bytes_build(). */
+static const render_bytes_case render_bytes_cases[] = {
+    {"sys+user",              0},
+    {"user+user",             1},
+    {"user+tool",             2},
+    {"user+tool(escaped)",    3},
+    {"tool+tool",             4},
+    {"user+sys(mid)",         5},
+    {"user+tool+sys+user",    6},
+    {"assistant replay",      7},
+    {"two assistant turns",   8},
+    {"leading system msg",    9},
+    {"sys+user+tools",       10},
+};
+
+static const char *render_bytes_tools(void) {
+    return "{\"type\":\"function\",\"function\":{\"name\":\"f\","
+           "\"description\":\"d\",\"parameters\":{\"type\":\"object\","
+           "\"properties\":{\"q\":{\"type\":\"string\"}}}}}";
+}
+
+static void render_bytes_build(int shape, chat_msgs *m) {
+    chat_msg a = {0};
+    chat_msg b = {0};
+    chat_msg c = {0};
+    switch (shape) {
+    case 0:  /* the bench/eval shape */
+        a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+        chat_msgs_push(m, a);
+        b.role = xstrdup("user"); b.content = xstrdup("hello there");
+        chat_msgs_push(m, b);
+        break;
+    case 1:
+        b.role = xstrdup("user"); b.content = xstrdup("first");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("user"); c.content = xstrdup("second");
+        chat_msgs_push(m, c);
+        break;
+    case 2:
+        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("tool"); c.content = xstrdup("a.txt b.txt");
+        chat_msgs_push(m, c);
+        break;
+    case 3:
+        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("tool"); c.content = xstrdup("a.txt </tool_result> b.txt");
+        chat_msgs_push(m, c);
+        break;
+    case 4:
+        c.role = xstrdup("tool"); c.content = xstrdup("one");
+        chat_msgs_push(m, c);
+        b.role = xstrdup("tool"); b.content = xstrdup("two");
+        chat_msgs_push(m, b);
+        break;
+    case 5:
+        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("system"); c.content = xstrdup("summary of earlier work");
+        chat_msgs_push(m, c);
+        break;
+    case 6:
+        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("tool"); c.content = xstrdup("a.txt");
+        chat_msgs_push(m, c);
+        a.role = xstrdup("system"); a.content = xstrdup("datetime: now");
+        chat_msgs_push(m, a);
+        b.role = xstrdup("user"); b.content = xstrdup("now do more");
+        chat_msgs_push(m, b);
+        break;
+    case 7: {  /* assistant replay with reasoning and a tool call */
+        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("assistant");
+        c.reasoning = xstrdup("I should list the directory");
+        c.content = xstrdup("listing now");
+        tool_call call = {0};
+        call.id = xstrdup("call_1");
+        call.name = xstrdup("f");
+        call.arguments = xstrdup("{\"q\":\"ls\"}");
+        tool_calls_push(&c.calls, call);
+        chat_msgs_push(m, c);
+        break;
+    }
+    case 8:  /* two assistant messages in a row (the second-header branch) */
+        b.role = xstrdup("user"); b.content = xstrdup("hi");
+        chat_msgs_push(m, b);
+        c.role = xstrdup("assistant"); c.content = xstrdup("first answer");
+        chat_msgs_push(m, c);
+        a.role = xstrdup("assistant"); a.content = xstrdup("second answer");
+        chat_msgs_push(m, a);
+        break;
+    case 9:  /* a leading system MESSAGE (not the field): the system region */
+        a.role = xstrdup("system"); a.content = xstrdup("region text");
+        chat_msgs_push(m, a);
+        b.role = xstrdup("user"); b.content = xstrdup("hello");
+        chat_msgs_push(m, b);
+        break;
+    case 10:  /* tools advertised: the preamble, whose order differs by family */
+        a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+        chat_msgs_push(m, a);
+        b.role = xstrdup("user"); b.content = xstrdup("hello");
+        chat_msgs_push(m, b);
+        break;
+    default:
+        break;
+    }
+}
+
+static void render_bytes_escape(const char *s, size_t n, FILE *fp) {
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch == '\\') fputs("\\\\", fp);
+        else if (ch == '\n') fputs("\\n", fp);
+        else if (ch == '\r') fputs("\\r", fp);
+        else if (ch == '\t') fputs("\\t", fp);
+        else fputc((char)ch, fp);
+    }
+}
+
+/* Unescape one line back to bytes; returns the length, or (size_t)-1. */
+static size_t render_bytes_unescape(const char *s, size_t n, char *out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '\\' && i + 1 < n) {
+            const char nx = s[++i];
+            if (nx == 'n') ch = '\n';
+            else if (nx == 'r') ch = '\r';
+            else if (nx == 't') ch = '\t';
+            else if (nx == '\\') ch = '\\';
+            else return (size_t)-1;
+        }
+        if (o + 1 >= cap) return (size_t)-1;
+        out[o++] = ch;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+static void test_render_bytes(void) {
+    const char *write_path = getenv("PULSAR_RENDER_BYTES_WRITE");
+    const char *ref = getenv("PULSAR_RENDER_BYTES_REF");
+    char golden[256];
+    snprintf(golden, sizeof golden, "tests/test-vectors/render-bytes-%s.txt",
+             (ref && ref[0]) ? ref : "3ed8f4b7");
+
+    const pulsar_think_mode modes[2] = {PULSAR_THINK_NONE, PULSAR_THINK_HIGH};
+    FILE *out = NULL;
+    if (write_path && write_path[0]) {
+        out = fopen(write_path, "wb");
+        TEST_ASSERT(out != NULL);
+        if (!out) return;
+        fprintf(out, "# the server renderer's exact bytes, one case per line\n");
+    }
+    FILE *in = NULL;
+    static char line[65536];
+    if (!out) {
+        in = fopen(golden, "rb");
+        if (!in) {
+            fprintf(stderr, "pulsar-test: render-bytes SKIPPED (no %s; capture with "
+                            "PULSAR_RENDER_BYTES_WRITE=...)\\n", golden);
+            return;
+        }
+    }
+
+    int cases = 0;
+    for (int v = 0; v < 2; v++) {
+        for (int t = 0; t < 2; t++) {
+            for (size_t k = 0; k < sizeof render_bytes_cases / sizeof render_bytes_cases[0]; k++) {
+                chat_msgs m = {0};
+                render_bytes_build(render_bytes_cases[k].shape, &m);
+                const char *tools = render_bytes_cases[k].shape == 10 ? render_bytes_tools() : NULL;
+                char *text = render_chat_prompt_text(&m, tools, NULL, modes[t], v == 1);
+                TEST_ASSERT(text != NULL);
+                char tag[160];
+                snprintf(tag, sizeof tag, "v41=%d %-6s %s", v,
+                         t ? "think" : "nothink", render_bytes_cases[k].name);
+                if (out) {
+                    fprintf(out, "%s\t", tag);
+                    render_bytes_escape(text ? text : "", text ? strlen(text) : 0, out);
+                    fputc('\n', out);
+                } else {
+                    TEST_ASSERT(fgets(line, sizeof line, in) != NULL);
+                    size_t ln = strlen(line);
+                    while (ln && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) line[--ln] = '\0';
+                    if (ln == 0 || line[0] == '#') { k--; continue; }
+                    char *tab = strchr(line, '\t');
+                    TEST_ASSERT(tab != NULL);
+                    if (tab) {
+                        *tab = '\0';
+                        if (strcmp(line, tag) != 0) {
+                            fprintf(stderr, "render-bytes: case order mismatch: golden '%s' vs '%s'\n",
+                                    line, tag);
+                            TEST_ASSERT(!"render-bytes golden is stale");
+                        }
+                        static char want[65536];
+                        const size_t wn = render_bytes_unescape(tab + 1, strlen(tab + 1), want, sizeof want);
+                        TEST_ASSERT(wn != (size_t)-1);
+                        const size_t gn = text ? strlen(text) : 0;
+                        if (wn != gn || (gn && memcmp(want, text, gn) != 0)) {
+                            fprintf(stderr, "render-bytes: %s DIFFERS (golden %zu bytes, now %zu)\\n",
+                                    tag, wn, gn);
+                            TEST_ASSERT(!"the renderer's bytes moved");
+                        }
+                    }
+                }
+                free(text);
+                chat_msgs_free(&m);
+                cases++;
+            }
+        }
+    }
+    if (out) {
+        fclose(out);
+        fprintf(stderr, "render-bytes: captured %d cases -> %s\n", cases, write_path);
+    } else {
+        fclose(in);
+        fprintf(stderr, "render-bytes: %d cases byte-identical to %s\n", cases, golden);
+    }
+}
+
 /* The tokeniser half needs the model's vocabulary. */
 static void test_control_token_injection(void) {
     const char *model = getenv("PULSAR_TEST_MODEL");
@@ -3780,6 +4030,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--control-token-injection", "control-token-injection", "a client cannot inject a control token through message text (L223)", test_control_token_injection},
     {"--control-token-suffix", "control-token-suffix", "mid-turn continuation suffixes keep client bytes plain (L223)", test_control_token_suffix},
     {"--chat-twin-parity", "chat-twin-parity", "the token-level twin vs the server renderer, per conversation shape (L185)", test_chat_twin_parity},
+    {"--render-bytes", "render-bytes", "the server renderer's exact bytes, frozen per conversation shape (L185)", test_render_bytes},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
     {"--api-logprobs-parse", "api-logprobs-parse", "logprobs/top_logprobs parse: out-of-domain rejects, never clamps", test_api_logprobs_parse_validation},
