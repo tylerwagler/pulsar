@@ -3713,6 +3713,108 @@ static void test_responses_input_image_blocks(void) {
 
 
 
+/* Two images in one message: each block gets its own image, its own placeholder
+ * and its own recorded offset, and BOTH placeholders must sit outside the
+ * client-text span -- a fix that only handles the first image (or that adopts one
+ * offset) would look green on every single-image test and lose the second image
+ * at the engine.  Also covers the Responses item path, where the images and their
+ * offsets are adopted out of the item parser's scratch message. */
+static void test_multi_image_blocks_and_offsets(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const size_t ph_len = strlen(PULSAR_IMAGE_PLACEHOLDER);
+
+    /* Chat: text, image, text, image. */
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"one\"},");
+    buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}},");
+    buf_puts(&json, "{\"type\":\"text\",\"text\":\"and\"},");
+    buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[160] = {0};
+    const bool parsed = parse_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(msgs.len == 1);
+        TEST_ASSERT(msgs.v[0].images_len == 2);
+        TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
+        if (msgs.v[0].images_len == 2 && msgs.v[0].image_ph_off) {
+            /* Both offsets are recorded, distinct, ascending, and each points at
+             * a placeholder. */
+            TEST_ASSERT(msgs.v[0].image_ph_off[0] < msgs.v[0].image_ph_off[1]);
+            for (int i = 0; i < 2; i++) {
+                TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[i],
+                                     PULSAR_IMAGE_PLACEHOLDER, ph_len));
+            }
+            int occurrences = 0;
+            for (const char *q = msgs.v[0].content;
+                 (q = strstr(q, PULSAR_IMAGE_PLACEHOLDER)) != NULL; q += ph_len) occurrences++;
+            TEST_ASSERT(occurrences == 2);
+
+            pulsar_text_span *spans = NULL;
+            uint32_t n_spans = 0;
+            char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, PULSAR_THINK_HIGH, true,
+                                                       &spans, &n_spans);
+            TEST_ASSERT(text != NULL);
+            if (text) {
+                int unspanned = 0, spanned = 0;
+                for (const char *q = text;
+                     (q = strstr(q, PULSAR_IMAGE_PLACEHOLDER)) != NULL; q += ph_len) {
+                    const uint32_t lo = (uint32_t)(q - text);
+                    bool inside = false;
+                    for (uint32_t i = 0; i < n_spans; i++) {
+                        if (spans[i].lo <= lo && spans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                    }
+                    if (inside) spanned++; else unspanned++;
+                }
+                TEST_ASSERT(unspanned == 2);   /* both images become image tokens */
+                TEST_ASSERT(spanned == 0);
+                free(text);
+            }
+            free(spans);
+        }
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* Responses: the same two blocks through an input item, whose images and
+     * offsets are adopted out of the parser's scratch message. */
+    buf resp = {0};
+    buf_puts(&resp, "[{\"type\":\"message\",\"role\":\"user\",\"content\":[");
+    buf_puts(&resp, "{\"type\":\"input_text\",\"text\":\"one\"},");
+    buf_puts(&resp, "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&resp, png_b64);
+    buf_puts(&resp, "\"},");
+    buf_puts(&resp, "{\"type\":\"input_text\",\"text\":\"and\"},");
+    buf_puts(&resp, "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&resp, png_b64);
+    buf_puts(&resp, "\"}]}]");
+    p = resp.ptr;
+    chat_msgs rmsgs = {0};
+    err[0] = 0;
+    TEST_ASSERT(parse_responses_input(&p, &rmsgs, NULL, NULL, err, sizeof err));
+    TEST_ASSERT(rmsgs.len == 1);
+    TEST_ASSERT(rmsgs.v[0].images_len == 2);
+    TEST_ASSERT(rmsgs.v[0].image_ph_off != NULL);
+    if (rmsgs.v[0].image_ph_off) {
+        TEST_ASSERT(rmsgs.v[0].image_ph_off[0] < rmsgs.v[0].image_ph_off[1]);
+        for (int i = 0; i < rmsgs.v[0].images_len; i++) {
+            TEST_ASSERT(!strncmp(rmsgs.v[0].content + rmsgs.v[0].image_ph_off[i],
+                                 PULSAR_IMAGE_PLACEHOLDER, ph_len));
+        }
+    }
+    chat_msgs_free(&rmsgs);
+    buf_free(&resp);
+}
+
+
+
 /* L226: the tokeniser resolves a control token ONLY outside a client-text span,
  * so the placeholder the PARSER inserted must fall outside every span (else the
  * image token never appears and the engine refuses -- the L223 regression), while
@@ -7908,6 +8010,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_chat_image_url_content_blocks();
     test_responses_input_image_blocks();
     test_image_placeholder_is_not_client_text();
+    test_multi_image_blocks_and_offsets();
     test_responses_request_keeps_image_refusal_message();
     test_anthropic_image_content_blocks();
     test_parse_sampling_key_contract();
