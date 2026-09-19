@@ -262,22 +262,15 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
 
 
 
+static void tool_result_buf_emit(void *ud, const char *bytes, size_t n) {
+    buf_append((buf *)ud, bytes, n);
+}
+
 void append_tool_result_text(buf *b, const char *s) {
-    /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
-     * <tool_result>...</tool_result>, so preserving literal '<', '>' and '&' is
-     * important for read-file tools and shell output.  The only delimiter we must
-     * protect is the wrapper's own closing tag; otherwise a file containing that
-     * exact sentinel would terminate the result early. */
-    const char *end = "</tool_result>";
-    const size_t endlen = strlen(end);
-    for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
-            s++;
-        } else {
-            buf_putc(b, *s++);
-        }
-    }
+    /* The escape RULE is the engine's (pulsar_tool_result_escape, L185) so the
+     * server's renderer and the engine's token-level twin cannot drift; this
+     * only decides where the bytes go. */
+    pulsar_tool_result_escape(s, tool_result_buf_emit, b);
 }
 
 

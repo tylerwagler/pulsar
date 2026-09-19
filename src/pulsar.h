@@ -389,6 +389,18 @@ void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
  * there too. */
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
                                           size_t skip, size_t len, uint32_t *n_out);
+
+/** ONE authority for the tool-result body's escape rule (L185): emit `s` with
+ * every literal `</tool_result>` rewritten so the body cannot close its own
+ * wrapper early -- the `<` becomes `&lt;` and the rest of the sentinel is kept
+ * (`&lt;/tool_result>`).  `emit` is called once per segment with a pointer into
+ * `s` or into the static entity; there is no allocation and no copy.  Returns
+ * the total bytes emitted.  Every producer of a tool-result body uses this --
+ * the server's renderer and the engine's token-level twin -- so the rule exists
+ * once. */
+size_t pulsar_tool_result_escape(const char *s,
+                                 void (*emit)(void *ud, const char *bytes, size_t n),
+                                 void *ud);
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,

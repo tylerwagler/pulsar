@@ -787,27 +787,53 @@ void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool ha
 
 
 
-void pulsar_vocab::bpe_tokenize_tool_result_text(const char *content, token_vec *out) {
-    auto *vocab = this;
-    /* Tool output is plain data inside <tool_result>...</tool_result>.
-     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
-     * intact, but escape the exact closing sentinel so a malicious or accidental
-     * tool payload cannot terminate the wrapper early. */
-    const char *end = "</tool_result>";
-    const size_t endlen = strlen(end);
-    const char *span = content ? content : "";
+size_t pulsar_tool_result_escape(const char *s,
+                                 void (*emit)(void *ud, const char *bytes, size_t n),
+                                 void *ud) {
+    /* Tool output is plain data inside <tool_result>...</tool_result>.  Preserve
+     * literal '<', '>' and '&' so shell output and file snippets stay intact, but
+     * escape the exact closing sentinel so a malicious or accidental tool payload
+     * cannot terminate the wrapper early.  ONE authority (L185): the server's
+     * renderer and the engine's token-level twin both walk this. */
+    static const char end[] = "</tool_result>";
+    static const char entity[] = "&lt;";
+    const size_t endlen = sizeof(end) - 1;
+    size_t total = 0;
+    const char *span = s ? s : "";
     const char *p = span;
     while (*p) {
         if (!strncmp(p, end, endlen)) {
-            vocab->tokenize_span(span, (size_t)(p - span), out);
-            vocab->bpe_tokenize_text("&lt;", out);
+            const size_t n = (size_t)(p - span);
+            if (n) { emit(ud, span, n); total += n; }
+            emit(ud, entity, sizeof(entity) - 1);
+            total += sizeof(entity) - 1;
             p++;
             span = p;
         } else {
             p++;
         }
     }
-    vocab->tokenize_span(span, (size_t)(p - span), out);
+    if (p != span) { emit(ud, span, (size_t)(p - span)); total += (size_t)(p - span); }
+    return total;
+}
+
+
+
+struct tool_result_bpe_sink {
+    const pulsar_vocab *vocab;
+    token_vec *out;
+};
+
+static void tool_result_bpe_emit(void *ud, const char *bytes, size_t n) {
+    auto *sink = (tool_result_bpe_sink *)ud;
+    sink->vocab->tokenize_span(bytes, n, sink->out);
+}
+
+void pulsar_vocab::bpe_tokenize_tool_result_text(const char *content, token_vec *out) {
+    /* The escape RULE lives in pulsar_tool_result_escape; this only decides how
+     * its segments are tokenised (piecewise, like the rest of the twin). */
+    tool_result_bpe_sink sink = { this, out };
+    pulsar_tool_result_escape(content, tool_result_bpe_emit, &sink);
 }
 
 
