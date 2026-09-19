@@ -1172,26 +1172,46 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
     const bool row_ok = row < M;
 
     float acc_g = 0.0f, acc_u = 0.0f;
-    for (int b256 = warp; b256 < nb; b256 += kDecodeGemvWarps) {
-        if (!row_ok) break;
-        const float dgb = __half2float(dg[(uint64_t)b256 * (uint64_t)M + row]);
-        const float dub = PAIR ? __half2float(du[(uint64_t)b256 * (uint64_t)M + row]) : 0.0f;
-        const uint2 *qgb = qg + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
-        const uint2 *qub = qu + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
-        const float *xb = s_x + b256 * 256;
-        /* All code words of this k256 block (8 per matrix, 256 contiguous bytes
-         * per warp each) are fetched before any of them is used: the round-3
-         * profile was 77% long_scoreboard with one or two loads in flight per
-         * warp.  Same lesson as L203 on the tile. */
+    /* L210 EXPERIMENT (REJECTED, see rows/L210.md): rolling software prefetch of
+     * the k256 loop -- the next block's code words issue into the slots the fold
+     * consumes.  Bit-exact by construction, but it measured -1.1..-1.3% on decode
+     * t/s (interleaved cold A/B, 20.37/20.43/20.45 vs 20.10/20.20/20.21), so it
+     * never lands.  Kept as the record. */
+    if (row_ok) {
+        int b256 = warp;
+        float dgb = 0.0f, dub = 0.0f;
         uint2 cgw[8], cuw[8];
+        if (b256 < nb) {
+            dgb = __half2float(dg[(uint64_t)b256 * (uint64_t)M + row]);
+            dub = PAIR ? __half2float(du[(uint64_t)b256 * (uint64_t)M + row]) : 0.0f;
+            const uint2 *qgb = qg + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
+            const uint2 *qub = qu + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
 #pragma unroll
-        for (int cw = 0; cw < 8; ++cw) {
-            cgw[cw] = qgb[(uint64_t)cw * (uint64_t)M];
-            if constexpr (PAIR) cuw[cw] = qub[(uint64_t)cw * (uint64_t)M];
+            for (int cw = 0; cw < 8; ++cw) {
+                cgw[cw] = qgb[(uint64_t)cw * (uint64_t)M];
+                if constexpr (PAIR) cuw[cw] = qub[(uint64_t)cw * (uint64_t)M];
+            }
         }
+        for (; b256 < nb; b256 += kDecodeGemvWarps) {
+            const int bnext = b256 + kDecodeGemvWarps;
+            float ndgb = 0.0f, ndub = 0.0f;
+            const uint2 *qgn = NULL, *qun = NULL;
+            if (bnext < nb) {
+                ndgb = __half2float(dg[(uint64_t)bnext * (uint64_t)M + row]);
+                ndub = PAIR ? __half2float(du[(uint64_t)bnext * (uint64_t)M + row]) : 0.0f;
+                qgn = qg + ((uint64_t)bnext * 8ull) * (uint64_t)M + row;
+                qun = qu + ((uint64_t)bnext * 8ull) * (uint64_t)M + row;
+            }
+            const float *xb = s_x + b256 * 256;
 #pragma unroll
         for (int cw = 0; cw < 8; ++cw) {
             const uint2 cg = cgw[cw];
+            uint2 cu;
+            if constexpr (PAIR) cu = cuw[cw];
+            if (bnext < nb) {
+                cgw[cw] = qgn[(uint64_t)cw * (uint64_t)M];
+                if constexpr (PAIR) cuw[cw] = qun[(uint64_t)cw * (uint64_t)M];
+            }
             /* The activations come out of shared memory as two float4 broadcasts
              * per 8-weight group -- ONE shared load per 4 MACs per matrix. The
              * first cut loaded one float per weight and saturated the LSU pipe
@@ -1207,7 +1227,6 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
                 const uint32_t glo = (uint32_t)grid_g, ghi = (uint32_t)(grid_g >> 32);
                 uint32_t ulo = 0, uhi = 0, sgn_u = 0;
                 if constexpr (PAIR) {
-                    const uint2 cu = cuw[cw];
                     const uint64_t grid_u = s_grid[(cu.x >> (8 * g)) & 0xffu];
                     sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
                     ulo = (uint32_t)grid_u, uhi = (uint32_t)(grid_u >> 32);
@@ -1229,10 +1248,12 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
             const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
             acc_g = fmaf(dgb * lsg, sg, acc_g);
             if constexpr (PAIR) {
-                const uint2 cu = cuw[cw];
                 const float lsu = (float)((int)(cu.y >> 27) | 1) * 0.125f;
                 acc_u = fmaf(dub * lsu, su, acc_u);
             }
+        }
+            dgb = ndgb;
+            dub = ndub;
         }
     }
     s_red[warp][lane][0] = acc_g;
