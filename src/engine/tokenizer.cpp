@@ -544,7 +544,14 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     vocab->eos_id       = vocab->vocab_lookup("<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab->vocab_lookup("<｜User｜>");
     vocab->assistant_id = vocab->vocab_lookup("<｜Assistant｜>");
-    vocab->system_id    = vocab->vocab_lookup("<｜System｜>");
+    /* The System marker is V4.1's (the template that writes it is), and the
+     * 0731 artifacts built before that encoding landed do not carry it -- their
+     * vocab is otherwise complete.  Required-vs-optional is therefore a
+     * two-profile decision, not a format check: requiring it makes the unified
+     * engine refuse a 0731 artifact it served the day before.  Optional here,
+     * with the requirement enforced where the marker is actually written
+     * (chat_tmpl_push_system_marker). */
+    vocab->system_id    = vocab->vocab_find("<｜System｜>");
     vocab->think_start_id = vocab->vocab_lookup("<think>");
     vocab->think_end_id = vocab->vocab_lookup("</think>");
     vocab->dsml_id = vocab->vocab_lookup("｜DSML｜");
@@ -648,6 +655,31 @@ static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
     token_vec_push((token_vec *)t, id);
 }
 
+/** Push the System MARKER, refusing loudly if this artifact has no such token.
+ *
+ * The marker is the V4.1 template's (see encode_chat_lead_in), and V4.1's own
+ * vocab always carries it -- but the 0731 artifacts built before the V4.1
+ * encoding landed do NOT, and their vocab is otherwise complete (checked: the
+ * three shipped 0731 GGUFs differ in exactly this one marker).  Making the
+ * LOOKUP required therefore refused artifacts the engine served happily the day
+ * before, which is a two-profile regression, not a format check: at f5bea7aa
+ * `v5mx4-0731-srcfmt-v1-reapfix-lt.gguf` ran; one commit later it exited at load
+ * with "required tokenizer token is missing".
+ *
+ * So the lookup is optional (like the image placeholder) and the requirement
+ * lives HERE, at the point of use, where the family is already known: a V4.1
+ * prompt rendered against a vocab without the marker would silently drop it --
+ * exactly the silent-template-drift class the render-bytes gate exists for --
+ * so it refuses by name instead. */
+static void chat_tmpl_push_system_marker(const pulsar_vocab *v, pulsar_tokens *t) {
+    if (v->system_id < 0) {
+        fprintf(stderr, "pulsar: this artifact's vocabulary has no System marker, which the V4.1 chat "
+                        "template requires -- refusing to render a prompt without it\n");
+        exit(1);
+    }
+    chat_tmpl_push_marker(t, v->system_id);
+}
+
 /** Append TEXT to the open run and re-tokenise the run -- the one primitive that
  * makes the twin's BPE boundary the renderer's. */
 static void chat_tmpl_append_text(const pulsar_vocab *v, pulsar_tokens *t, const char *text) {
@@ -708,7 +740,7 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
      * V4.1 marks its lead-in system region, 0731 does not.  Writing it for both
      * cost V4 exactly one prompt token -- enough to change the answer. */
     if (PULSAR_CHAT_SYSTEM_MARKER && (effort_prefix[0] || has_system))
-        chat_tmpl_push_marker(out, vocab->system_id);
+        chat_tmpl_push_system_marker(vocab, out);
     /* The effort line is TEXT, and the system region joins it unchanged (the
      * renderer writes marker + effort + region as one run), so it goes into the
      * open run rather than being tokenised on its own. */
@@ -970,7 +1002,7 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
         if (!chat_tmpl_saw_turn(vocab, tokens)) {
             chat_tmpl_append_text(vocab, tokens, content);
         } else if (v41) {
-            chat_tmpl_push_marker(tokens, vocab->system_id);
+            chat_tmpl_push_system_marker(vocab, tokens);
             chat_tmpl_append_text(vocab, tokens, content);
         } else {
             chat_tmpl_push_marker(tokens, vocab->user_id);
