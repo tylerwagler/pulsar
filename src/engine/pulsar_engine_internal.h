@@ -2082,6 +2082,13 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
+    /** L226: a rewind whose compressor state could not be re-established was
+     * SALVAGED to the last prefill frontier (rounded to PULSAR_RESUME_GRID)
+     * rather than invalidating the whole checkpoint.  The tokens below that floor
+     * are still correct and the next sync re-prefills from it, but a DECODE in
+     * between would run against KV the rollback dropped -- so eval refuses until
+     * a sync has re-established the session (the same shape as mseq_dirty). */
+    bool kv_salvaged;
     /** Identity of the images whose sentinel blocks are inside `checkpoint`
      * (0 = none), and the exclusive end of the last of those blocks.  The
      * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never

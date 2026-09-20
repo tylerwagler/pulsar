@@ -776,59 +776,83 @@ static bool proj_ring_copy_rows(pulsar_gpu_tensor *ring, const pulsar_gpu_tensor
     return true;
 }
 
-bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
-                                 uint32_t row0, uint32_t n_rows) {
-    if (!g || il >= PULSAR_N_LAYER) return false;
-    if (n_rows == 0u) return true;
-    /* L226: a FUSED step mixes banks, but the ring is PER BANK -- each bank owns
-     * its own slab (`banks.attn_proj_kv[il]` is n_banks long and
-     * layer_attn_proj_kv is a view of the installed one).  So a fused step's rows
-     * CAN be deposited exactly: each into the ring of the bank that owns it, at
-     * that row's own position, with that bank's span updated where its span
-     * lives (`proj_ring_lo/hi` while it is installed, `ms_proj_ring_lo/hi[bank]`
-     * otherwise).  The per-row producer in the csa2 path calls this once per row
-     * (n_rows == 1, pos0 = that row's position, row0 = its batch row), which is
-     * all this needs.
-     *
-     * The old behaviour -- discard the whole step when batch_multiseq is set --
-     * left every bank's ring EMPTY on the served lane, so any ghost rewind over
-     * decoded rows was uncovered and `compressor_state_rewind` invalidated the
-     * whole checkpoint.  Measured: a full 39k-token rebuild (~34 s) on EVERY tool
-     * round of a served agentic session, because the spec lane rewinds ghost
-     * tokens at each tool boundary. */
-    uint32_t ring_bank = gpu_graph_cur_bank(g);
-    if (g->batch_multiseq) {
-        if (n_rows != 1u || !g->ms_seq_id || !g->ms_positions) return true;   /* the batched arm is never fused */
-        const uint32_t row_bank = (uint32_t)g->ms_seq_id[row0];
-        if (row_bank >= PULSAR_MSEQ_MAX) return true;
-        ring_bank = row_bank;
-    }
-    pulsar_gpu_tensor *akv, *asc, *ikv, *isc;
-    if (ring_bank == gpu_graph_cur_bank(g) || g->banks.n_banks == 0) {
+/* Deposit ONE row of a FUSED step into the ring of the bank that owns it, at
+ * that row's own position, updating that bank's span where its span lives (the
+ * live pair while the bank is installed, its per-bank mirror otherwise).  L226:
+ * the ring is per bank -- `banks.attn_proj_kv[il]` is n_banks long and
+ * `layer_attn_proj_kv` is a view of the installed one -- so a fused step's rows
+ * can be deposited exactly, each into its owner.  The old code skipped the whole
+ * step instead ("these rows are other sequences' positions"), which left every
+ * bank's ring EMPTY: a fused step is the served default, so no ghost rewind over
+ * decoded rows could ever be covered, and each tool round invalidated the
+ * checkpoint for a full-conversation rebuild (~34 s measured). */
+static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32_t t) {
+    const uint32_t bank = (uint32_t)g->ms_seq_id[t];
+    if (bank >= PULSAR_MSEQ_MAX) return true;
+    const uint32_t pos = (uint32_t)g->ms_positions[t];
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    const uint32_t attn_w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+    const uint32_t idx_w = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+    const uint64_t arow = (uint64_t)attn_w * sizeof(float);
+    const uint64_t irow = (uint64_t)idx_w * sizeof(float);
+    const uint32_t cur = gpu_graph_cur_bank(g);
+    pulsar_gpu_tensor *akv = NULL, *asc = NULL, *ikv = NULL, *isc = NULL;
+    if (bank == cur || g->banks.n_banks == 0) {
         akv = g->layer_attn_proj_kv[il];
         asc = g->layer_attn_proj_sc[il];
         ikv = g->layer_index_proj_kv[il];
         isc = g->layer_index_proj_sc[il];
     } else {
-        /* Another bank's slab: the SAME view the install path builds for it. */
         pulsar_bank_slabs *b = &g->banks;
-        if (ring_bank >= b->n_banks || !b->attn_proj_bank_bytes[il]) return true;
+        if (bank >= b->n_banks || !b->attn_proj_bank_bytes[il]) return true;
         akv = pulsar_gpu_tensor_view(b->attn_proj_kv[il],
-                                     (uint64_t)ring_bank * b->attn_proj_bank_bytes[il],
+                                     (uint64_t)bank * b->attn_proj_bank_bytes[il],
                                      b->attn_proj_bank_bytes[il]);
         asc = pulsar_gpu_tensor_view(b->attn_proj_sc[il],
-                                     (uint64_t)ring_bank * b->attn_proj_bank_bytes[il],
+                                     (uint64_t)bank * b->attn_proj_bank_bytes[il],
                                      b->attn_proj_bank_bytes[il]);
-        ikv = isc = NULL;
         if (b->index_proj_bank_bytes[il]) {
             ikv = pulsar_gpu_tensor_view(b->index_proj_kv[il],
-                                         (uint64_t)ring_bank * b->index_proj_bank_bytes[il],
+                                         (uint64_t)bank * b->index_proj_bank_bytes[il],
                                          b->index_proj_bank_bytes[il]);
             isc = pulsar_gpu_tensor_view(b->index_proj_sc[il],
-                                         (uint64_t)ring_bank * b->index_proj_bank_bytes[il],
+                                         (uint64_t)bank * b->index_proj_bank_bytes[il],
                                          b->index_proj_bank_bytes[il]);
         }
     }
+    if (!akv && !asc && !ikv && !isc) return true;      /* coff 1: no ring on this source */
+    if (!akv || !asc) return false;                     /* half a ring is an impossible state */
+    bool ok = proj_ring_copy_rows(akv, g->batch_comp_kv, arow, t, 1u, pos, arow) &&
+              proj_ring_copy_rows(asc, g->batch_comp_sc, arow, t, 1u, pos, arow);
+    if (ok && ikv && isc) {
+        ok = proj_ring_copy_rows(ikv, g->batch_index_comp_kv, irow, t, 1u, pos, irow) &&
+             proj_ring_copy_rows(isc, g->batch_index_comp_sc, irow, t, 1u, pos, irow);
+    }
+    if (!ok) return false;
+    uint32_t *lo = (bank == cur) ? &g->proj_ring_lo : &g->ms_proj_ring_lo[bank];
+    uint32_t *hi = (bank == cur) ? &g->proj_ring_hi : &g->ms_proj_ring_hi[bank];
+    if (*hi != pos) *lo = pos;
+    *hi = pos + 1u;
+    if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
+    return true;
+}
+
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
+                                 uint32_t row0, uint32_t n_rows) {
+    if (!g || il >= PULSAR_N_LAYER) return false;
+    if (n_rows == 0u) return true;
+    /* A fused step carries rows for SEVERAL banks, so each row is deposited into
+     * its own bank's ring (see above); the batched arm below is the single-bank
+     * prefill case. */
+    if (g->batch_multiseq) {
+        if (!g->ms_seq_id || !g->ms_positions) return true;
+        for (uint32_t t = row0; t < row0 + n_rows; t++) {
+            if (!proj_ring_deposit_fused_row(g, il, t)) return false;
+        }
+        return true;
+    }
+    pulsar_gpu_tensor *akv = g->layer_attn_proj_kv[il], *asc = g->layer_attn_proj_sc[il];
+    pulsar_gpu_tensor *ikv = g->layer_index_proj_kv[il], *isc = g->layer_index_proj_sc[il];
     if (!akv && !asc && !ikv && !isc) return true;      /* coff 1: no ring on this source */
     if (!akv || !asc) return false;                     /* half a ring is an impossible state */
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -850,16 +874,11 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
     if (!ok) return false;
     /* The span, in one step for the whole run: a gap from the previous hi
      * restarts it, and the depth caps it.  Slots below the run's start were not
-     * written by this call, so they are claimed only while the cap allows.
-     * The span is the SPAN'S BANK's (see above): the live pair for the installed
-     * bank, the per-bank mirror otherwise. */
-    uint32_t *lo = (ring_bank == gpu_graph_cur_bank(g))
-                 ? &g->proj_ring_lo : &g->ms_proj_ring_lo[ring_bank];
-    uint32_t *hi = (ring_bank == gpu_graph_cur_bank(g))
-                 ? &g->proj_ring_hi : &g->ms_proj_ring_hi[ring_bank];
-    if (*hi != pos_first) *lo = pos_first;
-    *hi = pos0 + n_rows;
-    if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
+     * written by this call, so they are claimed only while the cap allows. */
+    if (g->proj_ring_hi != pos_first) g->proj_ring_lo = pos_first;
+    g->proj_ring_hi = pos0 + n_rows;
+    if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
+        g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
     return true;
 }
 
@@ -1211,9 +1230,15 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * wrong and nothing would say so, so refuse there too -- a rebuild is
              * slower, a silent wrong row is not acceptable. */
             if (pos % ratio != 0u || g->ms_emit_keep[bank] != pos / ratio + 1u) {
+                /* The span and the stash are what decide this, so say them: a
+                 * reader can tell "the ring never covered it" from "the ring is
+                 * empty on this bank" from "the stash is missing" without a
+                 * rebuild-and-diff. */
                 fprintf(stderr, "pulsar: kv source %u: rewind to %u is not covered by the projection "
-                                "ring (mid-group or no boundary stash at that row) -- refusing\n",
-                        il, pos);
+                                "ring (mid-group or no boundary stash at that row) -- refusing "
+                                "[ratio %u, phase %u, ring %u..%u, emit_keep %u want %u, bank %u]\n",
+                        il, pos, ratio, pos % ratio, g->proj_ring_lo, g->proj_ring_hi,
+                        g->ms_emit_keep[bank], pos / ratio + 1u, bank);
                 return false;
             }
             stale = true;
@@ -1225,6 +1250,9 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         const uint32_t first = pos - phase;
         const uint32_t s0 = g->ms_spec_save_pos0[bank], sn = g->ms_spec_save_rows[bank];
         if (sn == 0u || first < s0 || pos > s0 + sn || !g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) {
+            fprintf(stderr, "pulsar: kv source %u: rewind to %u has no verify saves to rebuild the "
+                            "straddled group [%u,%u) -- stale [ratio %u, saves pos0 %u rows %u, bank %u]\n",
+                    il, pos, first, pos, ratio, s0, sn, bank);
             stale = true;
             continue;
         }

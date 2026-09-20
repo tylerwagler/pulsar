@@ -979,6 +979,12 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
     }
 
+    /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
+     * carry path re-prefills from a grid point at or above the salvage floor and
+     * the rebuild path prefills from 0 -- so a decode is legal again once it
+     * returns.  Cleared here rather than in either arm because BOTH make the
+     * session decodable again (and the carry path returns early). */
+    s->kv_salvaged = false;
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
      * (position stamping alone misses a same-length full rebuild.) */
@@ -1601,6 +1607,15 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
                  "first");
         return 1;
     }
+    /* L226: same shape for a salvaged rewind -- the KV above the salvage floor
+     * was dropped, so decoding from here would continue a truncated history.
+     * A sync re-prefills above the floor and clears this. */
+    if (s->kv_salvaged) {
+        snprintf(err, errlen,
+                 "session eval after a salvaged rewind: the compressor could not follow the rollback, "
+                 "so the KV is only valid to the last prefill frontier; re-sync the session first");
+        return 1;
+    }
     pulsar_engine *e = s->engine;
     /* L188: a refused sample is -1 (PULSAR_SAMPLE_REFUSED); the embed kernel
      * would clamp it to token 0 and the step would look like a good one.  The
@@ -1741,9 +1756,58 @@ void pulsar_session::rewind(int pos) {
      * -- the spec trim and the server's ghost rewind -- stay inside that
      * round), else the bank is marked stale and refuses a mid-group store. */
     if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, (uint32_t)pos)) {
-        fprintf(stderr, "pulsar: rewind to %u: compressor state could not be re-established -- checkpoint invalidated\n",
-                (unsigned)pos);
-        s->checkpoint_valid = false;
+        /* L226: the compressor produces its rows on PREFILL, so a rewind into the
+         * GENERATED region -- above the last prefill frontier -- has no rows to
+         * rebuild from and cannot be re-established.  Invalidating the whole
+         * checkpoint there costs a rebuild of the entire conversation; measured on
+         * a served agentic session, EVERY tool round did exactly that (34 s of
+         * prefill for a ~700-token span).  Salvage instead: roll back to the last
+         * prefill frontier, rounded to the resume grid so the re-prefill that
+         * follows is the engine's own byte-identical resume, keep the tokens below
+         * it (they are correct), and let the next sync re-prefill above it.  Only
+         * if the state cannot be established THERE either does the checkpoint get
+         * invalidated. */
+        /* Candidates, nearest first: the prefill frontier itself (the state there
+         * is a prefill's own), then one grid step below it, and so on.  A step is
+         * worth trying because the ring only reaches PULSAR_REWIND_RING_DEPTH
+         * back and a bank that was just forked or spilled starts with an empty
+         * one, so the frontier itself sometimes misses while a step below it --
+         * which the ring still covers, or which is a group boundary -- rebuilds.
+         * Four steps is the useful range; beyond that the ring cannot help and
+         * the rebuild we are avoiding is what is left. */
+        const int pf = s->prefill_frontier;
+        const int base = (pf > 0 && pf < pos) ? pf : pos - (int)PULSAR_RESUME_GRID;
+        bool salvaged = false;
+        for (int step = 0; step < 4 && !salvaged; step++) {
+            const int cand = base - step * (int)PULSAR_RESUME_GRID;
+            if (cand <= 0) break;
+            const uint32_t floor = (uint32_t)((cand / (int)PULSAR_RESUME_GRID) * (int)PULSAR_RESUME_GRID);
+            if (floor == 0u || floor >= (uint32_t)pos) continue;
+            if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, floor)) continue;
+            s->checkpoint.len = (int)floor;
+            s->prefill_frontier = (int)floor;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                if (!gpu_graph_layer_is_kv_source(il)) continue;
+                const uint32_t want = floor / pulsar_layer_compress_ratio(il);
+                if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
+            }
+            if (floor < (uint32_t)s->live_image_barrier) {
+                s->live_image_fp = 0;
+                s->live_image_barrier = 0;
+            }
+            s->kv_salvaged = true;
+            salvaged = true;
+            fprintf(stderr, "pulsar: rewind to %u: compressor state not re-establishable (generated region) -- "
+                            "salvaged to %u (%d grid step%s below the prefill frontier); the next sync "
+                            "re-prefills above it\n",
+                    (unsigned)pos, (unsigned)floor, step,
+                    step == 1 ? "" : "s");
+        }
+        if (!salvaged) {
+            fprintf(stderr, "pulsar: rewind to %u: compressor state could not be re-established -- checkpoint invalidated\n",
+                    (unsigned)pos);
+            s->checkpoint_valid = false;
+        }
     }
 }
 
