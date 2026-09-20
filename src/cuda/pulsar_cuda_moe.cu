@@ -853,7 +853,9 @@ static int routed_moe_launch_mixed40(
                 ok = 0;
             }
             if (ok && pulsar_cutlass_gemv_gateup(mid_flat, selected_ptr, (const float *)weights->ptr,
-                    (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
+                    mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                    mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                    gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     gq, gsf, gkbp, ca_q, ca_sf, ca_kbp) != 0) ok = 0;
         }
@@ -939,7 +941,8 @@ static int routed_moe_launch_mixed40(
              * slots (the routing weight is already in the mid E4M3 the gate/up epilogue emitted). */
             (void)out_g;
             if (pulsar_cutlass_gemv_down(down_flat, selected_ptr,
-                    (const uint8_t *)down_w, down_expert_bytes, down_row_bytes,
+                    mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
+                    down_expert_bytes, down_row_bytes,
                     (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim,
                     mq, msf, mkbp) != 0) ok = 0;
         }
@@ -1598,7 +1601,9 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             if (pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
+                        mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                        mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                        mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
                         gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,

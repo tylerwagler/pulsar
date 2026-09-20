@@ -1839,9 +1839,10 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         float          *down_out,
         const int32_t  *selected,
         const float    *rweights,
-        const uint8_t  *gate_w,
-        const uint8_t  *up_w,
-        const uint8_t  *down_w,
+        /* PLAN 94 phase 1: per-expert bytes, one device array per projection. */
+        const uint8_t *const *gate_tab,
+        const uint8_t *const *up_tab,
+        const uint8_t *const *down_tab,
         uint64_t        gate_stride,
         uint64_t        gate_data_bytes,
         uint64_t        down_stride,
@@ -1950,14 +1951,16 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
  * emit_kbp) and `mid` is NOT written; mid_dim must then be a multiple of 32.
  * Pass NULL/NULL/0 for the historical f32 output. */
 int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float *rweights,
-        const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
+        const uint8_t *const *gate_tab, const uint8_t *const *up_tab,   /* PLAN 94 phase 1 */
+        uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp,
     void *emit_q, void *emit_sf, int emit_kbp);
 /** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
  * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
 int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
-        const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
+        const uint8_t *const *down_tab,   /* PLAN 94 phase 1 */
+        uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
         const void *mid_q, const void *mid_sf, int mid_kbp);
 
