@@ -145,6 +145,46 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(rc2 == 0, "step on a rewound bank rejected (L120's production shape): %s",
           rc2 != 0 ? err : "");
 
+    /* LEG 2 -- an out-of-reach BOUNDARY.  The carry for the group ENDING at G
+     * needs [G-ratio, G), and the ring's span starts at 318 here, so a boundary
+     * below it cannot be replayed.  This is the shape production hits: a SHORT
+     * prefill that starts on the resume grid point sets the span's lo to that
+     * point, so the boundary at G wants exactly the group that is missing and the
+     * resume fell back to prefilling the prompt from 0 (2026-09-19 23:24:11:
+     * "resume at 62329 ... compressor state at grid point 62208 could not be
+     * re-established -- prefilling the prompt from 0").
+     *
+     * The assertion is deliberately NOT "the next step is accepted".  An empty
+     * lane survives a boundary store and pools a WRONG row silently -- that is how
+     * this gate's old green was a false pass at 603.  What has teeth is what the
+     * NEXT SYNC does: an unrepaired state makes it set resume_origin = 0 and
+     * PREFILL THE WHOLE PROMPT, which is the full-conversation rebuild the
+     * objective is about. */
+    {
+        const uint32_t ratio2 = pulsar_layer_compress_ratio(2);
+        const int G = 256;
+        printf("\nleg 2: rewind to boundary %d (layer 2 ratio %u, ring span starts above it)\n",
+               G, ratio2);
+        CHECK(ratio2 != 0u && (uint32_t)G % ratio2 == 0u, "G must be a ratio-%u boundary", ratio2);
+        pulsar_session_rewind(s, G);
+        CHECK(pulsar_session_pos(s) == G, "rewind did not land on %d (pos %d)", G,
+              pulsar_session_pos(s));
+        /* resume_origin is pre-set to -1 so a sync that never reaches the decision
+         * cannot pass by default. */
+        pulsar_tokens p2;
+        memset(&p2, 0, sizeof p2);
+        p2.v = &toks[G]; p2.len = p2.cap = 4;
+        s->resume_origin = -1;
+        if (pulsar_session_sync(s, &p2, err, sizeof err) != 0) {
+            CHECK(0, "sync after the boundary rewind failed: %s", err);
+        } else {
+            CHECK(s->resume_origin == G,
+                  "rewind to boundary %d was not repaired: the next sync resumed from "
+                  "%d instead of %d (0 = prefilling the prompt from 0)", G,
+                  s->resume_origin, G);
+        }
+    }
+
     free(logits);
     pulsar_session_free(s);
     gate_engine_close(e);
