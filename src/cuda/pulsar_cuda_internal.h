@@ -636,6 +636,18 @@ int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm
  * bytes are used. */
 int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm);
 
+/* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
+ * (CUTLASS MXFP4) stack (pulsar_cuda_moe.cu).  Returns a device array of
+ * `n_total` pointers, entry e holding expert e's first byte -- today that is
+ * `base + e*stride`, built once per (base, stride, n_total) and cached for the
+ * life of the engine.  Phase 2 changes only what FILLS it.  NULL on failure.
+ * The entries point into the model arena, so they are freed by
+ * `mxfp4_expert_tables_clear()` at backend cleanup -- a second engine open in
+ * the same process would otherwise be served the first model's addresses (the
+ * fp8 pointer cache's hazard, same contract). */
+const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total);
+void mxfp4_expert_tables_clear(void);
+
 /* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----
  * They turn `selected[]` -- one router id per (token, slot) -- into the
  * expert-major schedule the grouped CUTLASS MXFP4 lane and the mixed type-40/44

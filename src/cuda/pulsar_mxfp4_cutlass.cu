@@ -340,7 +340,7 @@ __global__ static void g_build_arrays(
     const GElemC **ptrC, GStrideC *dC, GElemD **ptrD, GStrideD *dD,
     const uint32_t *counts, const uint32_t *padded_off,
     const uint8_t *A_data, const uint8_t *A_sf, long per_mtile_sfA,
-    const uint8_t *B_base, uint64_t B_stride, uint64_t B_data_bytes,
+    const uint8_t *const *B_tab, uint64_t B_data_bytes,
     GElemD *D_base, int N, int K, int n_total){
   int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n_total) return;
@@ -355,8 +355,8 @@ __global__ static void g_build_arrays(
   lSFB[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
   ptrA[e]   = reinterpret_cast<const GElemA*>(A_data + (size_t)roff * K);   /* E4M3 A: K bytes/row */
   ptrSFA[e] = reinterpret_cast<const GElemSF*>(A_sf + (size_t)(roff / 128u) * per_mtile_sfA);
-  ptrB[e]   = reinterpret_cast<const GElemB*>(B_base + (size_t)e * B_stride);
-  ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_base + (size_t)e * B_stride + B_data_bytes);
+  ptrB[e]   = reinterpret_cast<const GElemB*>(B_tab[e]);
+  ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_tab[e] + B_data_bytes);
   ptrC[e]   = nullptr;                                    // beta = 0, C unused
   ptrD[e]   = D_base + (size_t)roff * N;
 }
@@ -518,9 +518,9 @@ size_t pulsar_cutlass_grouped_moe_scratch_bytes(
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
 int pulsar_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
-    const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
-    uint64_t gate_stride, uint64_t gate_data_bytes,
-    uint64_t down_stride, uint64_t down_data_bytes,
+    const uint8_t *const *gate_tab, const uint8_t *const *up_tab, const uint8_t *const *down_tab,
+    uint64_t gate_data_bytes,
+    uint64_t down_data_bytes,
     float clamp, int n_total_expert,
     int in_dim, int mid_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
@@ -563,20 +563,20 @@ int pulsar_cutlass_grouped_moe(
   // gate arrays (D = gate) and up arrays (share A/SFA, D = up) — built as two calls.
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
-      gate_w,gate_stride,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
+      gate_tab,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
   if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (gate)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
-      up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
+      up_tab,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
   if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (up)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   if (swiglu_pack_activation(midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
-      down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
+      down_tab,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
   if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (down)")) return 3;
   if (run_grouped_gemm(n_total_expert, dn, ws_dn, sm) != 0) return 3;
   return 0;
@@ -609,7 +609,7 @@ size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_e
 }
 int pulsar_cutlass_grouped_proj(
     float *out, const float *x_gathered,
-    const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+    const uint8_t *const *W_tab, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
     uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a,
@@ -649,7 +649,7 @@ int pulsar_cutlass_grouped_proj(
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   g_build_arrays<<<bb,bt>>>(g.prob, g.ptrA,g.dA,g.ptrSFA,g.lSFA, g.ptrB,g.dB,g.ptrSFB,g.lSFB,
       g.ptrC,g.dC,g.ptrD,g.dD, counts, padded_offsets, xA,(const uint8_t*)xSF, pmt,
-      W_base, W_stride, W_data_bytes, out, out_dim, in_dim, n_total_expert);
+      W_tab, W_data_bytes, out, out_dim, in_dim, n_total_expert);
   if (!cuda_ok(cudaGetLastError(), "grouped projection g_build_arrays")) return 3;
   return run_grouped_gemm(n_total_expert, g, ws, sm) == 0 ? 0 : 3;
 }

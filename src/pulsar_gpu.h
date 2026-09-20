@@ -1875,12 +1875,14 @@ int pulsar_cutlass_grouped_moe(
         float          *ffn_out,
         const float    *x_gathered,
         const float    *w_gathered,
-        const uint8_t  *gate_w,
-        const uint8_t  *up_w,
-        const uint8_t  *down_w,
-        uint64_t        gate_stride,
+        /* PLAN 94 phase 1: one device array per projection holding expert e's
+         * bytes (scale factors at +data_bytes).  The ADDRESS is data now, not
+         * `base + e*stride`, so a slot cache can move an expert without any
+         * consumer knowing -- see mxfp4_expert_table(). */
+        const uint8_t *const *gate_tab,
+        const uint8_t *const *up_tab,
+        const uint8_t *const *down_tab,
         uint64_t        gate_data_bytes,
-        uint64_t        down_stride,
         uint64_t        down_data_bytes,
         float           clamp,
         int             n_total_expert,
@@ -1926,7 +1928,7 @@ size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
  * to that call's (the gate/up pair over one gathered activation). Ends the case-A double-encode. */
 size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
 int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
-        const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+        const uint8_t *const *W_tab, uint64_t W_data_bytes,   /* per-expert bytes (PLAN 94 phase 1) */
         int n_total_expert, int in_dim, int out_dim,
         const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
         uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a,

@@ -926,6 +926,9 @@ void pulsar_gpu_cleanup(void) {
      * served dangling MXFP8_LT pointers (the second engine's mmap typically
      * reuses the same base address, so the cache guard cannot catch it). */
     cuda_fp8_weight_cache_clear();
+    /* PLAN 94 phase 1: the same hazard -- expert table entries point into the
+     * arena freed just below. */
+    mxfp4_expert_tables_clear();
     cuda_model_range_release_all();
     cuda_model_load_progress_reset();
     for (int s = 0; s < CUDA_SCRATCH_SLOTS; s++) {

@@ -10,6 +10,77 @@
  * array index, and they are declared in pulsar_cuda_internal.h together with
  * the `moe_route_oob_code` arm tag each call site below passes. */
 
+/* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
+ * (CUTLASS MXFP4) stack.
+ *
+ * Today every consumer derives an expert's bytes arithmetically: the grouped
+ * setup writes `ptrB[e] = B_base + e*B_stride` and the GEMV arms compute
+ * `gate_w + e*stride` inline.  That makes an expert's address a FACT OF THE
+ * MODEL LAYOUT, which is exactly what phase 2 has to break: an expert will live
+ * in a slot that the slab cache assigns, moves and evicts at runtime, and no
+ * arithmetic over `e` can express it.
+ *
+ * So the address becomes data.  One device array of `n_total` pointers per
+ * stack, built ONCE per (base, stride, n_total) from the same arithmetic the
+ * consumers used to perform, and read by them instead.  This commit is
+ * deliberately bit-identical -- the contents are `base + e*stride` -- and its
+ * whole value is that it isolates the kernel-side change from the allocation
+ * and IO that phase 2 adds: when the slab lands, only the FILL changes.
+ *
+ * Ownership follows L188's non-finite flag and the fp8 pointer cache: entries
+ * point into the per-engine model arena, so they are freed at backend cleanup
+ * (`pulsar_gpu_cleanup` -> `mxfp4_expert_tables_clear`).  A later engine open in
+ * the same process typically maps the model at the same base address, so a
+ * surviving entry would false-positive and serve a dangling pointer. */
+struct mxfp4_expert_table {
+    const void *base;                 /* the arena base the entries were derived from */
+    uint64_t    stride;               /* one expert's bytes (data + scale factors) */
+    uint32_t    n_total;
+    const uint8_t **entries;          /* device array [n_total] */
+    struct mxfp4_expert_table *next;
+};
+
+static struct mxfp4_expert_table *g_mxfp4_expert_tables = NULL;
+
+__global__ static void moe_fill_expert_table_kernel(
+        const uint8_t **entries, const uint8_t *base, uint64_t stride, uint32_t n_total) {
+    uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (e < n_total) entries[e] = base + (size_t)e * stride;
+}
+
+const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total) {
+    if (!base || !stride || !n_total) return NULL;
+    for (struct mxfp4_expert_table *t = g_mxfp4_expert_tables; t; t = t->next)
+        if (t->base == base && t->stride == stride && t->n_total == n_total) return t->entries;
+    const uint8_t **entries = NULL;
+    if (!cuda_ok(cudaMalloc((void **)&entries, (size_t)n_total * sizeof(*entries)), "expert table alloc"))
+        return NULL;
+    moe_fill_expert_table_kernel<<<(n_total + 255u) / 256u, 256>>>(entries, (const uint8_t *)base, stride, n_total);
+    if (!cuda_ok(cudaGetLastError(), "expert table fill launch")) {
+        (void)cudaFree((void *)entries);
+        return NULL;
+    }
+    struct mxfp4_expert_table *t = (struct mxfp4_expert_table *)calloc(1, sizeof(*t));
+    if (!t) {
+        (void)cudaFree((void *)entries);
+        return NULL;
+    }
+    t->base = base; t->stride = stride; t->n_total = n_total; t->entries = entries;
+    t->next = g_mxfp4_expert_tables;
+    g_mxfp4_expert_tables = t;
+    return entries;
+}
+
+void mxfp4_expert_tables_clear(void) {
+    for (struct mxfp4_expert_table *t = g_mxfp4_expert_tables; t; ) {
+        struct mxfp4_expert_table *next = t->next;
+        (void)cudaFree((void *)t->entries);
+        free(t);
+        t = next;
+    }
+    g_mxfp4_expert_tables = NULL;
+}
+
 /* The three sorted-pair builders (count, prefix sum, scatter) live in
  * pulsar_cuda_moe_pairs.cu -- they hold the one place a router id becomes an
  * array index, and they are declared in pulsar_cuda_internal.h. */
@@ -336,6 +407,13 @@ static int routed_moe_launch_cutlass_grouped(
     const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total_bytes, "moe_grouped_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total_bytes, "moe_grouped_down");
     if (!gate_w || !up_w || !down_w) return 0;
+    /* PLAN 94 phase 1: the expert ADDRESSES become data (mxfp4_expert_table).
+     * Built from the same arithmetic the grouped setup used to perform, so this
+     * is bit-identical; phase 2 changes only what fills the tables. */
+    const uint8_t *const *gate_tab = mxfp4_expert_table(gate_w, gate_stride, n_total_expert);
+    const uint8_t *const *up_tab   = mxfp4_expert_table(up_w,   gate_stride, n_total_expert);
+    const uint8_t *const *down_tab = mxfp4_expert_table(down_w, down_stride, n_total_expert);
+    if (!gate_tab || !up_tab || !down_tab) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
     /* Host upper bound on padded rows: every active expert adds <=127 padding; round to 128. */
@@ -448,8 +526,8 @@ static int routed_moe_launch_cutlass_grouped(
     }
     if (ok) {
         int rc = pulsar_cutlass_grouped_moe(ffn_out, NULL /* x arrives as E4M3 */, w_gathered,
-                (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
-                gate_stride, gate_data_bytes, down_stride, down_data_bytes,
+                gate_tab, up_tab, down_tab,
+                gate_data_bytes, down_data_bytes,
                 clamp, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
                 counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes,
                 act_q, act_sf, act_kbp, row_src_tok);
@@ -727,16 +805,18 @@ static int routed_moe_launch_mixed40(
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
-            if (ok && pulsar_cutlass_grouped_proj(gate_g, NULL, (const uint8_t *)gate_w,
-                    gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+            if (ok && pulsar_cutlass_grouped_proj(gate_g, NULL,
+                    mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                    gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
                     mq, msf,
                     mkbp, row_src_tok) != 0) ok = 0;
             /* reuse_packed_a: same x_gathered, same scratch, same layout -- the
              * up leg consumes the gate leg's E4M3 encoding instead of packing
              * the identical values a second time. */
-            if (ok && pulsar_cutlass_grouped_proj(up_g, NULL, (const uint8_t *)up_w,
-                    gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+            if (ok && pulsar_cutlass_grouped_proj(up_g, NULL,
+                    mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                    gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 1,
                     mq, msf,
                     mkbp, row_src_tok) != 0) ok = 0;
@@ -844,8 +924,9 @@ static int routed_moe_launch_mixed40(
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40B pair map");
-            if (ok && pulsar_cutlass_grouped_proj(out_g, NULL, (const uint8_t *)down_w,
-                    down_expert_bytes, down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
+            if (ok && pulsar_cutlass_grouped_proj(out_g, NULL,
+                    mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
+                    down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
                     mq, msf, mkbp, padded_pair) != 0) ok = 0;
             if (ok) {
