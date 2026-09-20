@@ -929,25 +929,110 @@ void vision_prepared_free(pulsar_vision_prepared *p) {
  *     params = stack([image_start, image_pad, image_pad, image_newline, image_end])
  *     block = params[types]; block[types == IMAGE] = encode_image(...)[perm]
  */
-int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
-                      const pulsar_vision_prepared *prep,
-                      uint16_t *out, int out_cap, int *out_len) {
-    const int T = (int)PULSAR_N_EMBD;
-    if (!w || !m || !prep || !prep->span_types || !prep->perm) return 0;
-    if (prep->span_len <= 0 || prep->span_len > out_cap / T) return 0;
+/* ---- L226: the encoded-span cache ------------------------------------------
+ *
+ * The ViT forward is the WHOLE cost of an image (measured 2026-09-19 on the GB10:
+ * 16,497 ms to encode a 1024x1024 image into 346 span rows, against 26 ms to
+ * decode and preprocess it).  KV reuse removes it whenever the conversation's
+ * prefix is extended, but a cold prefill for an image the process has ALREADY
+ * encoded pays it again -- a second conversation about the same picture, a
+ * changed prefix, an evicted bank, or the "no legal grid point" case where the
+ * engine correctly rebuilds cold.
+ *
+ * What is cached is exactly `vision_forward`'s output: the aligner rows.  They
+ * depend on the image bytes and the geometry args ONLY -- the span position
+ * enters later, in the assembly of sentinel/newsline/IMAGE rows (span_types and
+ * perm), which stays per request and costs memcpys.  So the key is the image
+ * bytes plus the args, and a hit skips the forward but still rebuilds the exact
+ * span for this position.
+ *
+ * Byte-capped FIFO, process-global, no lock: the engine's GPU state is shared and
+ * merges are serial by construction (the server prefills serially), so the cache
+ * inherits the same discipline.  It is cleared when the bound tower changes --
+ * pulsar_test opens several engines in one process, and a stale row from another
+ * tower would be a silently wrong embedding. */
+#define VISION_SPAN_CACHE_BYTES (64u * 1024u * 1024u)
+typedef struct {
+    uint64_t key;
+    size_t   src_len;   ///< the image's byte length, checked with the key
+    int      rows;      ///< aligner rows stored
+    size_t   bytes;     ///< their size
+    uint16_t *data;
+} vision_span_cache_entry;
+static vision_span_cache_entry g_span_cache[16];
+static int      g_span_cache_n = 0;
+static size_t   g_span_cache_bytes = 0;
+static const pulsar_vision_weights *g_span_cache_owner = NULL;
 
-    uint16_t *aligner = (uint16_t *)malloc((size_t)prep->n_llm_h * (size_t)prep->n_llm_w *
-                                           (size_t)T * sizeof(uint16_t));
-    if (!aligner) return 0;
-    int rows = 0;
-    if (!vision_forward(w, m, prep->patches, prep->n_vit_h, prep->n_vit_w,
-                        aligner, prep->n_llm_h * prep->n_llm_w * T, &rows,
-                        NULL, 0) ||
-        rows != prep->n_llm_h * prep->n_llm_w) {
-        free(aligner);
-        return 0;
+static uint64_t vision_span_key(const uint8_t *bytes, size_t len, const pulsar_vision_args *a) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; i++) { h ^= bytes[i]; h *= 1099511628211ull; }
+    const uint64_t fields[5] = { (uint64_t)a->patch_size, (uint64_t)a->downsample_ratio,
+                                 (uint64_t)a->max_n_token, (uint64_t)a->min_pixels,
+                                 (uint64_t)(uint32_t)(int32_t)(a->max_wh_ratio * 1000.0f) };
+    for (int f = 0; f < 5; f++)
+        for (int b = 0; b < 8; b++) { h ^= (fields[f] >> (8 * b)) & 0xffu; h *= 1099511628211ull; }
+    return h ? h : 1u;
+}
+
+static void vision_span_cache_reset(void) {
+    for (int i = 0; i < g_span_cache_n; i++) free(g_span_cache[i].data);
+    g_span_cache_n = 0;
+    g_span_cache_bytes = 0;
+}
+
+/* Look up (key, rows).  Returns the stored rows or NULL. */
+static const uint16_t *vision_span_cache_get(uint64_t key, size_t src_len, int rows) {
+    for (int i = 0; i < g_span_cache_n; i++) {
+        if (g_span_cache[i].key == key && g_span_cache[i].src_len == src_len &&
+            g_span_cache[i].rows == rows) {
+            return g_span_cache[i].data;
+        }
     }
+    return NULL;
+}
 
+static void vision_span_cache_put(uint64_t key, size_t src_len, const uint16_t *data, int rows) {
+    const size_t bytes = (size_t)rows * PULSAR_N_EMBD * sizeof(uint16_t);
+    if (rows <= 0 || bytes > VISION_SPAN_CACHE_BYTES) return;   /* not worth caching */
+    while (g_span_cache_bytes + bytes > VISION_SPAN_CACHE_BYTES && g_span_cache_n > 0) {
+        g_span_cache_bytes -= g_span_cache[0].bytes;
+        free(g_span_cache[0].data);
+        memmove(&g_span_cache[0], &g_span_cache[1],
+                (size_t)(g_span_cache_n - 1) * sizeof(g_span_cache[0]));
+        g_span_cache_n--;
+    }
+    if (g_span_cache_n == (int)(sizeof(g_span_cache) / sizeof(g_span_cache[0]))) {
+        g_span_cache_bytes -= g_span_cache[0].bytes;
+        free(g_span_cache[0].data);
+        memmove(&g_span_cache[0], &g_span_cache[1],
+                (size_t)(g_span_cache_n - 1) * sizeof(g_span_cache[0]));
+        g_span_cache_n--;
+    }
+    uint16_t *copy = (uint16_t *)malloc(bytes);
+    if (!copy) return;
+    memcpy(copy, data, bytes);
+    g_span_cache[g_span_cache_n].key = key;
+    g_span_cache[g_span_cache_n].src_len = src_len;
+    g_span_cache[g_span_cache_n].rows = rows;
+    g_span_cache[g_span_cache_n].bytes = bytes;
+    g_span_cache[g_span_cache_n].data = copy;
+    g_span_cache_n++;
+    g_span_cache_bytes += bytes;
+}
+
+
+
+/* Assemble one image's span rows from its aligner rows: IMAGE slots come from the
+ * aligner (in `perm` order), every other slot is the fixed sentinel/newline
+ * embedding.  Split out of vision_merge_span so the cached path below produces
+ * exactly the same bytes as the encoding path -- one assembler, two sources. */
+static int vision_span_assemble(const pulsar_vision_weights *w, const pulsar_model *m,
+                                const pulsar_vision_prepared *prep,
+                                const uint16_t *aligner, int rows,
+                                uint16_t *out, int out_cap, int *out_len) {
+    const int T = (int)PULSAR_N_EMBD;
+    if (prep->span_len <= 0 || prep->span_len > out_cap / T) return 0;
     /* types are IMAGE_START=0, IMAGE_PAD=1, IMAGE=2, IMAGE_NEWLINE=3, IMAGE_END=4;
      * `param` mirrors the reference's stack, with slot 2 filled from the aligner. */
     const pulsar_tensor *param[5] = { w->image_start, w->image_pad, NULL,
@@ -957,18 +1042,80 @@ int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
         const int ty = prep->span_types[p];
         uint16_t *dst = out + (size_t)p * T;
         if (ty == 2) {
-            if (j >= prep->n_perm) { free(aligner); return 0; }
+            if (j >= prep->n_perm) return 0;
             const int row = prep->perm[j++];
-            if (row < 0 || row >= rows) { free(aligner); return 0; }
+            if (row < 0 || row >= rows) return 0;
             memcpy(dst, aligner + (size_t)row * T, (size_t)T * sizeof(uint16_t));
         } else {
-            if (ty < 0 || ty > 4 || !param[ty]) { free(aligner); return 0; }
+            if (ty < 0 || ty > 4 || !param[ty]) return 0;
             const uint16_t *src = (const uint16_t *)(const void *)
                 ((const char *)tensor_map_base(m, param[ty]) + param[ty]->abs_offset);
             memcpy(dst, src, (size_t)T * sizeof(uint16_t));
         }
     }
-    free(aligner);
     *out_len = prep->span_len;
     return 1;
+}
+
+int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
+                      const pulsar_vision_prepared *prep,
+                      uint16_t *out, int out_cap, int *out_len) {
+    const int T = (int)PULSAR_N_EMBD;
+    if (!w || !m || !prep || !prep->span_types || !prep->perm) return 0;
+    if (prep->span_len <= 0 || prep->span_len > out_cap / T) return 0;
+
+    const int want_rows = prep->n_llm_h * prep->n_llm_w;
+    uint16_t *aligner = (uint16_t *)malloc((size_t)want_rows * (size_t)T * sizeof(uint16_t));
+    if (!aligner) return 0;
+    int rows = 0;
+    if (!vision_forward(w, m, prep->patches, prep->n_vit_h, prep->n_vit_w,
+                        aligner, want_rows * T, &rows, NULL, 0) ||
+        rows != want_rows) {
+        free(aligner);
+        return 0;
+    }
+    const int ok = vision_span_assemble(w, m, prep, aligner, rows, out, out_cap, out_len);
+    free(aligner);
+    return ok;
+}
+
+/* L226: the same result, but the tower runs only once per image per process.  A
+ * hit still assembles THIS request's span (position-dependent rows are not
+ * cached) and is byte-identical to the encoding path by construction -- the
+ * assembler is shared, and the cached bytes are the tower's own output. */
+int vision_merge_span_cached(const pulsar_vision_weights *w, const pulsar_model *m,
+                             const pulsar_vision_prepared *prep,
+                             const uint8_t *src_bytes, size_t src_len,
+                             const pulsar_vision_args *args,
+                             uint16_t *out, int out_cap, int *out_len, int *cache_hit) {
+    const int T = (int)PULSAR_N_EMBD;
+    if (cache_hit) *cache_hit = 0;
+    if (!w || !m || !prep || !prep->span_types || !prep->perm) return 0;
+    if (!src_bytes || src_len == 0 || !args) return vision_merge_span(w, m, prep, out, out_cap, out_len);
+    /* Another tower's rows must never be served: pulsar_test opens several
+     * engines in one process. */
+    if (g_span_cache_owner != w) {
+        vision_span_cache_reset();
+        g_span_cache_owner = w;
+    }
+    const int want_rows = prep->n_llm_h * prep->n_llm_w;
+    const uint64_t key = vision_span_key(src_bytes, src_len, args);
+    const uint16_t *cached = vision_span_cache_get(key, src_len, want_rows);
+    if (cached) {
+        if (cache_hit) *cache_hit = 1;
+        return vision_span_assemble(w, m, prep, cached, want_rows, out, out_cap, out_len);
+    }
+    uint16_t *aligner = (uint16_t *)malloc((size_t)want_rows * (size_t)T * sizeof(uint16_t));
+    if (!aligner) return 0;
+    int rows = 0;
+    if (!vision_forward(w, m, prep->patches, prep->n_vit_h, prep->n_vit_w,
+                        aligner, want_rows * T, &rows, NULL, 0) ||
+        rows != want_rows) {
+        free(aligner);
+        return 0;
+    }
+    vision_span_cache_put(key, src_len, aligner, rows);
+    const int ok = vision_span_assemble(w, m, prep, aligner, rows, out, out_cap, out_len);
+    free(aligner);
+    return ok;
 }

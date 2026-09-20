@@ -815,17 +815,6 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
     return ok;
 }
 
-/* L226 gate: an image conversation's REUSED continuation must equal its COLD
- * prefill.  The engine may extend the live prefix for a follow-up turn whose
- * images are already in it (the rows for those blocks were merged from these same
- * images at these same positions); this asserts the equality the shortcut rests on
- * instead of arguing it -- full-vocab logits, byte-compared, from two sessions:
- * one that syncs turn 1 and then extends to turn 2 (reuse), one that cold-prefills
- * turn 2 outright.  The image identity is part of the licence, so a swap of the
- * bytes (same geometry, different pixels) is its own case below.
- *
- * MODEL-DEPENDENT: needs an artifact with a bound vision tower.  A text-only
- * artifact SKIPS loudly rather than passing quietly. */
 static const unsigned char test_reuse_png[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
     0, 0, 0, 128, 0, 0, 0, 128, 8, 2, 0, 0, 0, 76, 92, 246,
@@ -857,6 +846,87 @@ static const unsigned char test_reuse_png[] = {
     192, 11, 92, 168, 195, 178, 131, 8, 10, 170, 0, 0, 0, 0, 73, 69,
     78, 68, 174, 66, 96, 130
 };
+
+
+/* L226 gate: the encoded-span cache must be TRANSPARENT.  Two cold syncs of the
+ * same image prompt, in two sessions: the first runs the ViT (cache miss), the
+ * second is served from the cached aligner rows (cache hit).  Full-vocab logits,
+ * byte-compared -- a cache that changes the answer is worse than no cache, and
+ * this is the same discipline the reuse gate uses. */
+static void test_image_span_cache_is_transparent(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    pulsar_image_ref img = {0};
+    img.bytes = (uint8_t *)test_reuse_png;
+    img.len = sizeof test_reuse_png;
+
+    pulsar_tokens raw = {0};
+    {
+        char text[4096];
+        size_t n = (size_t)snprintf(text, sizeof text, "describe " PULSAR_IMAGE_PLACEHOLDER " in one line. ");
+        for (int r = 0; r < 6 && n < sizeof text - 64; r++)
+            n += (size_t)snprintf(text + n, sizeof text - n,
+                                  "The quick brown fox jumps over the lazy dog. ");
+        pulsar_tokenize_rendered_chat(engine, text, &raw);
+    }
+    char err[256] = {0};
+    pulsar_tokens prompt = {0};
+    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+        fprintf(stderr, "image-span-cache gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
+        pulsar_tokens_free(&raw);
+        return;
+    }
+
+    const int vocab = pulsar_engine_logits_width(engine);
+    float *first = (float *)xmalloc((size_t)vocab * sizeof(float));
+    float *second = (float *)xmalloc((size_t)vocab * sizeof(float));
+    bool ok_first = false, ok_second = false;
+
+    for (int pass = 0; pass < 2; pass++) {
+        pulsar_session *sess = NULL;
+        TEST_ASSERT(pulsar_session_create(&sess, engine, 4096) == 0);
+        pulsar_image_ref again = img;
+        bool ok = sess && pulsar_session_sync_mm(sess, &prompt, &again, 1, err, sizeof err) == 0;
+        TEST_ASSERT(ok);
+        if (!ok) fprintf(stderr, "  span-cache pass %d sync refused: %s\n", pass, err);
+        if (ok) ok = pulsar_session_copy_logits(sess, pass == 0 ? first : second, vocab) == vocab;
+        TEST_ASSERT(ok);
+        if (pass == 0) ok_first = ok; else ok_second = ok;
+        if (sess) pulsar_session_free(sess);
+    }
+
+    if (ok_first && ok_second) {
+        int differing = 0;
+        double worst = 0.0;
+        for (int i = 0; i < vocab; i++) {
+            if (first[i] != second[i]) differing++;
+            const double d = fabs((double)first[i] - (double)second[i]);
+            if (d > worst) worst = d;
+        }
+        fprintf(stderr, "image-span-cache gate: %d/%d logits differ between the encoded and cached "
+                        "passes (worst |delta| %.3g)\n", differing, vocab, worst);
+        TEST_ASSERT(differing == 0);
+    }
+
+    free(first);
+    free(second);
+    pulsar_tokens_free(&prompt);
+    pulsar_tokens_free(&raw);
+}
+
+
+
+/* L226 gate: an image conversation's REUSED continuation must equal its COLD
+ * prefill.  The engine may extend the live prefix for a follow-up turn whose
+ * images are already in it (the rows for those blocks were merged from these same
+ * images at these same positions); this asserts the equality the shortcut rests on
+ * instead of arguing it -- full-vocab logits, byte-compared, from two sessions:
+ * one that syncs turn 1 and then extends to turn 2 (reuse), one that cold-prefills
+ * turn 2 outright.  The image identity is part of the licence, so a swap of the
+ * bytes (same geometry, different pixels) is its own case below.
+ *
+ * MODEL-DEPENDENT: needs an artifact with a bound vision tower.  A text-only
+ * artifact SKIPS loudly rather than passing quietly. */
 
 static void test_image_conversation_reuse_matches_cold(void) {
     pulsar_engine *engine = test_get_engine();
@@ -4186,6 +4256,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--image-reuse", "image-reuse", "an image conversation's reused continuation equals its cold prefill, byte for byte (L226)", test_image_conversation_reuse_matches_cold},
+    {"--image-span-cache", "image-span-cache", "the encoded-span cache is transparent: cached == freshly encoded, byte for byte (L226)", test_image_span_cache_is_transparent},
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},

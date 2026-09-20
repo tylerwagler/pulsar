@@ -755,14 +755,19 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *
         uint16_t *rows = (uint16_t *)malloc((size_t)cap * sizeof(uint16_t));
         if (!rows) { vision_prepared_free(&prep); return false; }
         int n_rows = 0;
-        const bool merged = vision_merge_span(vr->weights, model, &prep, rows, cap, &n_rows) &&
+        int cache_hit = 0;
+        const double vp_enc_t0 = now_sec();
+        const bool merged = vision_merge_span_cached(vr->weights, model, &prep,
+                                                     img->bytes, img->len, &args,
+                                                     rows, cap, &n_rows, &cache_hit) &&
                             n_rows == prep.span_len &&
                             gpu_graph_write_vision_span(out_hc, rows, (uint32_t)n_rows,
                                                         s0 - pos0, n_tokens);
         free(rows);
-        fprintf(stderr, "pulsar: image %d: decode+preprocess %.1f ms, ViT encode+scatter %.1f ms "
-                        "(%d span rows)\n", i, vp_prep_ms,
-                (now_sec() - vp_t0) * 1000.0 - vp_prep_ms, prep.span_len);
+        fprintf(stderr, "pulsar: image %d: decode+preprocess %.1f ms, %s %.1f ms (%d span rows)\n",
+                i, vp_prep_ms,
+                cache_hit ? "CACHED encode (tower skipped)" : "ViT encode+scatter",
+                (now_sec() - vp_enc_t0) * 1000.0, prep.span_len);
         vision_prepared_free(&prep);
         if (!merged) {
             fprintf(stderr, "pulsar: image %d at token %d failed to merge (span %d rows)\n",

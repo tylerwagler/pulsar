@@ -2830,6 +2830,15 @@ void vision_window_topk_visible(int window_size, int n, const int32_t *left,
 int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
                       const pulsar_vision_prepared *prep,
                       uint16_t *out, int out_cap, int *out_len);
+/** As vision_merge_span, but the tower runs at most once per (image bytes, args)
+ * per process: the aligner rows are cached and the span is still assembled for
+ * THIS request's positions.  `cache_hit` reports whether the tower was skipped.
+ * L226. */
+int vision_merge_span_cached(const pulsar_vision_weights *w, const pulsar_model *m,
+                             const pulsar_vision_prepared *prep,
+                             const uint8_t *src_bytes, size_t src_len,
+                             const pulsar_vision_args *args,
+                             uint16_t *out, int out_cap, int *out_len, int *cache_hit);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
