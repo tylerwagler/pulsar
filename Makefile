@@ -188,7 +188,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-type40 cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -1044,6 +1044,18 @@ PREFILL_BASELINE_REF ?= f5bea7aa
 # Vision-Exp artifact the battery names, and it was dumped by ~/devref-clean's
 # own binary so the anchor is still the REFERENCE engine, not this branch.
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
+# PLAN 94 phase 1 (L217): the SAME gate on the OTHER artifact, deliberately.
+# The battery's FRONTIER_MODEL (Vision-Exp v5-vexp-full256-iq2-t46) has NO
+# type-40 routed experts on its MAIN layers -- all 43 are type 44 and the only
+# type-40 stacks are the drafter's, which a plain prefill never runs.  So a
+# green battery grades the CUTLASS MXFP4 expert lane, the one phase 1's
+# per-expert indirection changes first, NOT AT ALL.  This artifact carries 12
+# main-model type-40 layers (47 tensors, 42.23 GiB), and the blob is the
+# committed 684fa8d one -- the same artifact at an OLDER anchor than the
+# battery's, which is the stronger comparison of the two.
+TYPE40_GATE_MODEL       ?= /srv/models/v5mx4-0731-srcfmt-v1-reapfix-lt.gguf
+PREFILL_TYPE40_BASELINE ?= tests/test-vectors/prefill_bitexact_baseline-684fa8d.bin
+PREFILL_TYPE40_BASELINE_REF_SHORT := 684fa8d
 # L181: the decode-step twin -- one classic decode after each UNALIGNED prefill
 # (1001 / 4102 / 8197), logits of that step byte-compared against its own blob.
 # The prefill's own frontier logits never see the compressor state, ring or
@@ -1116,6 +1128,21 @@ cuda-prefill-gate:
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
+
+# PLAN 94 phase 1 (L217): the type-40 half of the byte gate -- see
+# TYPE40_GATE_MODEL above for why the battery's own artifact cannot cover it.
+# SKIPs LOUDLY when the artifact is absent (the same choice the vision gates
+# make without VISION_MODEL): a box without the file has no type-40 coverage,
+# and saying so is better than a FAIL that reads like a numerics regression.
+cuda-prefill-gate-type40:
+	@if [ ! -f "$(TYPE40_GATE_MODEL)" ]; then \
+		echo "SKIP cuda-prefill-gate-type40: $(TYPE40_GATE_MODEL) is not on this box --"; \
+		echo "     NO type-40 CUTLASS MXFP4 expert coverage in this run."; \
+		exit 0; \
+	fi
+	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	./tests/prefill_bitexact_gate $(TYPE40_GATE_MODEL) --check $(PREFILL_TYPE40_BASELINE) \
+		$(PREFILL_TYPE40_BASELINE_REF_SHORT)
 
 # L181: decode-step byte gate (see PREFILL_DECODE_BASELINE above).
 cuda-prefill-decode-gate:
@@ -1367,6 +1394,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
+	cuda-prefill-gate-type40 \
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
