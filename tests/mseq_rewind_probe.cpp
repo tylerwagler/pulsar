@@ -163,26 +163,23 @@ int GATE_ENTRY(int argc, char **argv) {
     {
         const uint32_t ratio2 = pulsar_layer_compress_ratio(2);
         const int G = 256;
-        printf("\nleg 2: rewind to boundary %d (layer 2 ratio %u, ring span starts above it)\n",
-               G, ratio2);
+        pulsar_gpu_graph *g = &s->graph;
+        const uint32_t rbank = g->banks.n_banks ? g->banks.cur_bank : 0u;
+        printf("\nleg 2: compressor rewind to boundary %d (layer 2 ratio %u, ring span starts "
+               "above it)\n", G, ratio2);
         CHECK(ratio2 != 0u && (uint32_t)G % ratio2 == 0u, "G must be a ratio-%u boundary", ratio2);
+        /* ASSERT ON THE GRAPH CALL'S RETURN, not on session state: this harness's
+         * checkpoint_valid is false from the start, and an empty lane survives a
+         * boundary store either way, so neither separates repair from refusal.
+         * false here IS the refusal that makes the caller rebuild the conversation. */
+        CHECK(gpu_graph_compressor_state_rewind(g, rbank, (uint32_t)G,
+                                                (uint32_t)pulsar_session_pos(s)),
+              "compressor rewind to boundary %d REFUSED: the carry group [%d, %d) is out of "
+              "ring coverage and the boundary stash escape did not arm",
+              G, G - (int)ratio2, G);
         pulsar_session_rewind(s, G);
         CHECK(pulsar_session_pos(s) == G, "rewind did not land on %d (pos %d)", G,
               pulsar_session_pos(s));
-        /* resume_origin is pre-set to -1 so a sync that never reaches the decision
-         * cannot pass by default. */
-        pulsar_tokens p2;
-        memset(&p2, 0, sizeof p2);
-        p2.v = &toks[G]; p2.len = p2.cap = 4;
-        s->resume_origin = -1;
-        if (pulsar_session_sync(s, &p2, err, sizeof err) != 0) {
-            CHECK(0, "sync after the boundary rewind failed: %s", err);
-        } else {
-            CHECK(s->resume_origin == G,
-                  "rewind to boundary %d was not repaired: the next sync resumed from "
-                  "%d instead of %d (0 = prefilling the prompt from 0)", G,
-                  s->resume_origin, G);
-        }
     }
 
     free(logits);
