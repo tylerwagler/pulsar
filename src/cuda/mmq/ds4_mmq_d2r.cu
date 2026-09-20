@@ -913,17 +913,17 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         }
     }
     if (d2r_tid() == 0) {
-        const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
-        const uint64_t dq_bytes = (nblk * 2ull + 63ull) & ~63ull;
-        s_inv.w_base = (const char *)W_soa;
-        /* L202: fold this block's expert offset in once.  Type 44 orders each
-         * plane (expert, k, word, row), so the expert stride is nb*M halves in
-         * the d plane and nb*8*M words in the q plane. */
-        s_inv.iq2_dq_base = reinterpret_cast<const half *>(W_soa) +
-                            (uint64_t)expert * (uint64_t)nb * (uint64_t)M;
-        s_inv.iq2_qs_base =
-            reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(W_soa) + dq_bytes) +
-            (uint64_t)expert * (uint64_t)nb * 8ull * (uint64_t)M;
+        /* PLAN 94 phase 1 (L217): W_soa is the per-expert TWO-PLANE TABLE --
+         * an interleaved [d,q] pointer pair per expert (iq2_expert_table in
+         * pulsar_cuda_moe.cu).  The two planes are separate chunks but ONE
+         * eviction unit, which is exactly why they are one array: a per-plane
+         * free list would leave a half-evicted expert addressable.  L202's
+         * layout is unchanged -- d[(e*nb+k)*M+row], q[((e*nb+k)*8+pair)*M+row]
+         * -- only where the two plane bases come from. */
+        const void *const *pair = reinterpret_cast<const void *const *>(W_soa);
+        s_inv.w_base = reinterpret_cast<const char *>(pair[2 * (size_t)expert]);
+        s_inv.iq2_dq_base = reinterpret_cast<const half *>(pair[2 * (size_t)expert]);
+        s_inv.iq2_qs_base = reinterpret_cast<const uint2 *>(pair[2 * (size_t)expert + 1]);
         s_inv.act_tile_base = reinterpret_cast<const char *>(act) + (uint64_t)col_lo * sizeof(block_mx_act_mmq);
         s_inv.out = out;
         s_inv.sc_off_bytes = 0;
@@ -1161,14 +1161,14 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
 
     const int expert = s_expert;
     const int nb = K >> 8;                       /* k256 blocks per row */
-    const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
-    const uint64_t dq_bytes = (nblk * 2ull + 63ull) & ~63ull;
-    const half  *dg = reinterpret_cast<const half *>(gate_soa) + (uint64_t)expert * nb * (uint64_t)M;
-    const half  *du = reinterpret_cast<const half *>(up_soa)   + (uint64_t)expert * nb * (uint64_t)M;
-    const uint2 *qg = reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(gate_soa) + dq_bytes) +
-                      (uint64_t)expert * nb * 8ull * (uint64_t)M;
-    const uint2 *qu = reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(up_soa) + dq_bytes) +
-                      (uint64_t)expert * nb * 8ull * (uint64_t)M;
+    /* PLAN 94 phase 1 (L217): gate_soa/up_soa are per-expert two-plane
+     * tables; see the single-tensor site above for the layout. */
+    const void *const *pg = reinterpret_cast<const void *const *>(gate_soa);
+    const void *const *pu = reinterpret_cast<const void *const *>(up_soa);
+    const half  *dg = reinterpret_cast<const half *>(pg[2 * (size_t)expert]);
+    const half  *du = reinterpret_cast<const half *>(pu[2 * (size_t)expert]);
+    const uint2 *qg = reinterpret_cast<const uint2 *>(pg[2 * (size_t)expert + 1]);
+    const uint2 *qu = reinterpret_cast<const uint2 *>(pu[2 * (size_t)expert + 1]);
     const bool row_ok = row < M;
 
     float acc_g = 0.0f, acc_u = 0.0f;

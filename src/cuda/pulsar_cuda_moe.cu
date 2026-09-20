@@ -34,28 +34,37 @@
  * surviving entry would false-positive and serve a dangling pointer. */
 struct mxfp4_expert_table {
     const void *base;                 /* the arena base the entries were derived from */
-    uint64_t    stride;               /* one expert's bytes (data + scale factors) */
+    uint64_t    stride0;              /* plane 0's per-expert stride, in bytes */
+    uint64_t    off1;                 /* plane 1's offset from base (planes == 2 only) */
+    uint64_t    stride1;              /* plane 1's per-expert stride, in bytes */
     uint32_t    n_total;
-    const uint8_t **entries;          /* device array [n_total] */
+    uint32_t    planes;               /* 1 = type 40 (data; SF at +data_bytes), 2 = type 44 (d,q) */
+    const void **entries;             /* device array [planes * n_total] */
     struct mxfp4_expert_table *next;
 };
 
 static struct mxfp4_expert_table *g_mxfp4_expert_tables = NULL;
 
 __global__ static void moe_fill_expert_table_kernel(
-        const uint8_t **entries, const uint8_t *base, uint64_t stride, uint32_t n_total) {
+        const void **entries, const uint8_t *base,
+        uint64_t stride0, uint64_t off1, uint64_t stride1, uint32_t n_total, uint32_t planes) {
     uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (e < n_total) entries[e] = base + (size_t)e * stride;
+    if (e >= n_total) return;
+    entries[(size_t)e * planes] = base + (size_t)e * stride0;
+    if (planes > 1) entries[(size_t)e * planes + 1] = base + off1 + (size_t)e * stride1;
 }
 
-const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total) {
-    if (!base || !stride || !n_total) return NULL;
+static const void *const *expert_table_get(const void *base, uint32_t n_total, uint32_t planes,
+                                           uint64_t stride0, uint64_t off1, uint64_t stride1) {
+    if (!base || !n_total || !stride0) return NULL;
     for (struct mxfp4_expert_table *t = g_mxfp4_expert_tables; t; t = t->next)
-        if (t->base == base && t->stride == stride && t->n_total == n_total) return t->entries;
-    const uint8_t **entries = NULL;
-    if (!cuda_ok(cudaMalloc((void **)&entries, (size_t)n_total * sizeof(*entries)), "expert table alloc"))
-        return NULL;
-    moe_fill_expert_table_kernel<<<(n_total + 255u) / 256u, 256>>>(entries, (const uint8_t *)base, stride, n_total);
+        if (t->base == base && t->stride0 == stride0 && t->off1 == off1 && t->stride1 == stride1 &&
+            t->n_total == n_total && t->planes == planes) return t->entries;
+    const void **entries = NULL;
+    const size_t bytes = (size_t)n_total * planes * sizeof(*entries);
+    if (!cuda_ok(cudaMalloc((void **)&entries, bytes), "expert table alloc")) return NULL;
+    moe_fill_expert_table_kernel<<<(n_total + 255u) / 256u, 256>>>(
+        entries, (const uint8_t *)base, stride0, off1, stride1, n_total, planes);
     if (!cuda_ok(cudaGetLastError(), "expert table fill launch")) {
         (void)cudaFree((void *)entries);
         return NULL;
@@ -65,10 +74,27 @@ const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint
         (void)cudaFree((void *)entries);
         return NULL;
     }
-    t->base = base; t->stride = stride; t->n_total = n_total; t->entries = entries;
+    t->base = base; t->stride0 = stride0; t->off1 = off1; t->stride1 = stride1;
+    t->n_total = n_total; t->planes = planes; t->entries = entries;
     t->next = g_mxfp4_expert_tables;
     g_mxfp4_expert_tables = t;
     return entries;
+}
+
+const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total) {
+    return (const uint8_t *const *)expert_table_get(base, n_total, 1, stride, 0, 0);
+}
+
+/* The TYPE 44 arm: IQ2_XXS_MMQ_K is two planes per expert, at
+ *   d[e] = base + e*nb*M halves,  q[e] = base + align64(E*nb*M*2) + e*nb*8*M uint2s
+ * (L202's layout, ds4_mmq_d2r.cu:918-926).  Both must be rebased together when
+ * an expert moves, so the table is ONE array of [d,q] pairs rather than two
+ * arrays -- the pair IS the eviction unit. */
+const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t nb, uint32_t M) {
+    const uint64_t stride0 = (uint64_t)nb * M * 2ull;                    /* half per element   */
+    const uint64_t off1    = (stride0 * n_total + 63ull) & ~63ull;       /* q plane base       */
+    const uint64_t stride1 = (uint64_t)nb * M * 8ull * sizeof(uint2);    /* uint2 per element  */
+    return expert_table_get(base, n_total, 2, stride0, off1, stride1);
 }
 
 void mxfp4_expert_tables_clear(void) {
@@ -1194,7 +1220,9 @@ static int routed_moe_try_mmq_gate_up(
         return 0;
     }
     const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
-        gate_w, up_w, selected_ptr, gate_raw, up_raw,
+        iq2_expert_table(gate_w, n_total_expert, expert_in_dim >> 8, expert_mid_dim),
+        iq2_expert_table(up_w, n_total_expert, expert_in_dim >> 8, expert_mid_dim),
+        selected_ptr, gate_raw, up_raw,
         (int)expert_mid_dim, (int)expert_in_dim,
         (int)n_tokens, (int)n_total_expert,
         (int)n_expert, cudaStreamPerThread,
@@ -1260,7 +1288,8 @@ static int routed_moe_try_mmq_down(
      * runtime cache could never afford -- letting down compete for a 22.9 GiB
      * budget just starved late layers of gate/up (measured 566.46 vs 590.77).
      * With the layout on disk there is no budget to compete for. */
-    return ds4_mmq_iq2_xxs_moe_soa(down_w, selected_ptr, down_out,
+    return ds4_mmq_iq2_xxs_moe_soa(iq2_expert_table(down_w, n_total_expert, expert_mid_dim >> 8, out_dim),
+                                  selected_ptr, down_out,
                                    (int)out_dim, (int)expert_mid_dim,
                                    (int)pairs, (int)n_total_expert, 1,
                                    cudaStreamPerThread, mid_q, mid_sf, mid_kbp) == 0;

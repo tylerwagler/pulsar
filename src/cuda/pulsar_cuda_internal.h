@@ -646,6 +646,12 @@ int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm
  * the same process would otherwise be served the first model's addresses (the
  * fp8 pointer cache's hazard, same contract). */
 const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total);
+/** PLAN 94 phase 1: the same table for a TYPE 44 (IQ2_XXS_MMQ_K) stack, whose
+ *  expert is TWO planes (d and q).  Returns an interleaved device array of
+ *  [d,q] pointer pairs -- one eviction unit -- laid out exactly as
+ *  ds4_mmq_d2r.cu:918-926 derives it: d[e] = base + e*nb*M halves,
+ *  q[e] = base + align64(E*nb*M*2) + e*nb*8*M uint2s, with nb = K/256. */
+const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t nb, uint32_t M);
 void mxfp4_expert_tables_clear(void);
 
 /* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----
