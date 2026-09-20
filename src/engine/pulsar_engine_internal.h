@@ -1113,8 +1113,13 @@ typedef struct {
     /** Contiguously-deposited span [lo, hi) of the projection ring, in absolute
      * positions.  A rewind replays only when the span COVERS the range it needs;
      * an uncovered span skips the value restore and degrades to the counter clamp
-     * (the pre-ring behaviour).  A gap restarts the span, so slots claimed under
-     * a stale hi -- a ghost position's deposit -- can never be read back. */
+     * (the pre-ring behaviour).  A gap forward restarts the span and a run wholly
+     * behind it replaces it, so slots claimed under a stale hi -- a ghost
+     * position's deposit -- can never be read back; a run INSIDE the span leaves
+     * it alone, because that is a re-deposit of rows the ring still holds and
+     * shrinking there would discard live coverage.  `proj_ring_span_cover`
+     * (gpu_diag.cpp) is the one authority for the rule; a ghost rewind narrows
+     * the span with its own explicit clamp. */
     uint32_t proj_ring_lo;   ///< first position the ring still covers
     uint32_t proj_ring_hi;   ///< one past the newest; lo == hi means empty
     /** L226 DIAGNOSTIC: per-bank rows deposited into the ring and the newest
@@ -1125,6 +1130,7 @@ typedef struct {
      * message. */
     uint64_t ring_dep_rows[PULSAR_MSEQ_MAX];
     uint64_t ring_dep_last[PULSAR_MSEQ_MAX];
+    uint32_t ring_dep_hi[PULSAR_MSEQ_MAX];   ///< the span's hi as the last deposit left it
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the

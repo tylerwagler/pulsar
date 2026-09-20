@@ -776,6 +776,44 @@ static bool proj_ring_copy_rows(pulsar_gpu_tensor *ring, const pulsar_gpu_tensor
     return true;
 }
 
+/* Extend a ring's covered span [*lo, *hi) for a deposit that just wrote the
+ * run [a, b).  ONE authority for the span rule, both arms below.
+ *
+ * The span is a COVERAGE CLAIM: it may only ever describe rows the ring still
+ * holds.  A re-deposit writes the same slot at the same position, so a run that
+ * lands inside the span must leave it alone -- and the old code, which assigned
+ * `hi = b` unconditionally, did the opposite.  That is not conservative, it is
+ * wrong: it discards coverage the ring still has, so re-running an
+ * already-deposited chunk collapses the span back to that chunk.  The per-chunk
+ * warmup pass does exactly that, so on the served lane the span ended up pinned
+ * to the last PREFILL and every rewind into the generated region refused (L226
+ * dogfood 2026-09-19: last deposit left hi at 42224 while the span read 42037,
+ * with twenty identical regressions per chunk, one per ring-bearing source).
+ *
+ *   forward gap   -> coverage restarts at the run
+ *   contiguous up -> coverage extends
+ *   inside        -> UNCHANGED
+ *   behind        -> only the run is known again; a gap opened above it
+ * A ghost rewind narrows the span with an explicit clamp of its own, so removing
+ * draft rows from coverage is still the rewind's job, not a deposit's.
+ *
+ *   lo/hi  the span, in place
+ *   a, b   the deposited run [a, b) of absolute positions */
+static void proj_ring_span_cover(uint32_t *lo, uint32_t *hi, uint32_t a, uint32_t b) {
+    if (b == a) return;
+    if (a >= *hi) {
+        if (a > *hi) *lo = a;
+        *hi = b;
+    } else if (b <= *lo) {
+        if (b < *lo) *hi = b;
+        *lo = a;
+    } else {
+        if (a < *lo) *lo = a;
+        if (b > *hi) *hi = b;
+    }
+    if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
+}
+
 /* Deposit ONE row of a FUSED step into the ring of the bank that owns it, at
  * that row's own position, updating that bank's span where its span lives (the
  * live pair while the bank is installed, its per-bank mirror otherwise).  L226:
@@ -831,11 +869,10 @@ static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32
     if (!ok) return false;
     uint32_t *lo = (bank == cur) ? &g->proj_ring_lo : &g->ms_proj_ring_lo[bank];
     uint32_t *hi = (bank == cur) ? &g->proj_ring_hi : &g->ms_proj_ring_hi[bank];
-    if (*hi != pos) *lo = pos;
-    *hi = pos + 1u;
-    if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
+    proj_ring_span_cover(lo, hi, pos, pos + 1u);
     g->ring_dep_rows[bank] += 1u;
     g->ring_dep_last[bank] = pos;
+    g->ring_dep_hi[bank] = *hi;
     return true;
 }
 
@@ -877,14 +914,12 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
     /* The span, in one step for the whole run: a gap from the previous hi
      * restarts it, and the depth caps it.  Slots below the run's start were not
      * written by this call, so they are claimed only while the cap allows. */
-    if (g->proj_ring_hi != pos_first) g->proj_ring_lo = pos_first;
-    g->proj_ring_hi = pos0 + n_rows;
-    if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
-        g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
+    proj_ring_span_cover(&g->proj_ring_lo, &g->proj_ring_hi, pos_first, pos0 + n_rows);
     {
         const uint32_t cb = gpu_graph_cur_bank(g);
         g->ring_dep_rows[cb] += n_rows;
         g->ring_dep_last[cb] = pos0 + n_rows - 1u;
+        g->ring_dep_hi[cb] = g->proj_ring_hi;
     }
     return true;
 }
@@ -1254,13 +1289,14 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
                     fprintf(stderr, "pulsar: kv source %u: rewind to %u is not covered by the projection "
                                     "ring (mid-group or no boundary stash at that row) -- refusing "
                                     "[ratio %u, phase %u, ring %u..%u, emit_keep %u want %u, bank %u, "
-                                    "cur %u, bankring %u..%u, dep %llu last %llu, curdep %llu curlast %llu, "
+                                    "cur %u, bankring %u..%u, dep %llu last %llu dephi %u, curdep %llu curlast %llu, "
                                     "deptot %llu]\n",
                             il, pos, ratio, pos % ratio, g->proj_ring_lo, g->proj_ring_hi,
                             g->ms_emit_keep[bank], pos / ratio + 1u, bank,
                             cb, g->ms_proj_ring_lo[bank], g->ms_proj_ring_hi[bank],
                             (unsigned long long)g->ring_dep_rows[bank],
                             (unsigned long long)g->ring_dep_last[bank],
+                            g->ring_dep_hi[bank],
                             (unsigned long long)g->ring_dep_rows[cb],
                             (unsigned long long)g->ring_dep_last[cb],
                             (unsigned long long)deptot);
