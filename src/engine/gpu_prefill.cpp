@@ -719,6 +719,8 @@ static void vision_default_args(pulsar_vision_args *a) {
  * The reference does exactly this merge between `h = self.embed(input_ids)` and
  * the first layer, which is why the caller runs it right after the embedding
  * gather. */
+/* Timed at the caller-visible boundary: this is the ViT encode + scatter a
+ * prepared-span/merged-row cache would remove on a repeated image (L226). */
 bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
                                  const int32_t *ids, int n_ids,
                                  const pulsar_vision_request *vr,
@@ -743,10 +745,12 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *
         if (s0 < pos0 || s0 + (uint32_t)span_len > pos0 + n_tokens) continue;   /* another chunk */
 
         pulsar_vision_prepared prep = {};
+        const double vp_t0 = now_sec();
         if (!vision_prepare_image(img->bytes, img->len, &args, (int)s0, (int)PULSAR_N_VOCAB, &prep)) {
             fprintf(stderr, "pulsar: image %d at token %d failed to decode/preprocess\n", i, img->start_pos);
             return false;
         }
+        const double vp_prep_ms = (now_sec() - vp_t0) * 1000.0;
         const int cap = prep.span_len * (int)PULSAR_N_EMBD;
         uint16_t *rows = (uint16_t *)malloc((size_t)cap * sizeof(uint16_t));
         if (!rows) { vision_prepared_free(&prep); return false; }
@@ -756,6 +760,9 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *
                             gpu_graph_write_vision_span(out_hc, rows, (uint32_t)n_rows,
                                                         s0 - pos0, n_tokens);
         free(rows);
+        fprintf(stderr, "pulsar: image %d: decode+preprocess %.1f ms, ViT encode+scatter %.1f ms "
+                        "(%d span rows)\n", i, vp_prep_ms,
+                (now_sec() - vp_t0) * 1000.0 - vp_prep_ms, prep.span_len);
         vision_prepared_free(&prep);
         if (!merged) {
             fprintf(stderr, "pulsar: image %d at token %d failed to merge (span %d rows)\n",

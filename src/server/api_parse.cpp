@@ -115,10 +115,17 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
         }
     }
     pulsar_tokens expanded = {0};
+    /* The per-request image cost that KV reuse does NOT remove: the expander
+     * decodes and preprocesses every image to learn its span geometry, and that
+     * happens again on every turn even when the KV rows are reused.  Timed here
+     * because it is the thing a prepared-span cache would remove (L226). */
+    const double vp_t0 = server_now_sec();
     if (!pulsar_expand_image_placeholders(e, &r->prompt, r->images, r->n_images,
                                           &expanded, err, errlen)) {
         return false;
     }
+    server_log(PULSAR_LOG_PREFILL, "pulsar-server: image prepare: %d image(s) decoded+preprocessed in %.1f ms",
+               r->n_images, (server_now_sec() - vp_t0) * 1000.0);
     pulsar_tokens_free(&r->prompt);
     r->prompt = expanded;
     return true;
