@@ -625,6 +625,44 @@ void cuda_fp8_weight_cache_clear(void);
  * non-finite value, 0 when the flag is clear, -1 on a CUDA error.  Called once
  * per step at the stream drain (pulsar_gpu_end_commands); a 1 fails the step. */
 int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm);
+/** PLAN 94 phase 1 (L217): read-and-clear the routed experts' ROUTE BOUNDS flag
+ * (pulsar_cuda_moe_pairs.cu).  Returns 1 and names the first (layer, arm) whose
+ * sorted-pair build saw a `selected[]` expert id with no expert behind it (an
+ * id >= `n_expert_present`, which the REAP-padded router can emit and nothing
+ * remaps), 0 when the flag is clear, -1 on a CUDA error.  A negative id is the
+ * router's designed NaN route and is NOT a violation.  Called once per step at
+ * the stream drain; a 1 fails the step.  With L188's non-finite flag it is one
+ * of the two invariants `pulsar_gpu_end_commands` enforces before a step's
+ * bytes are used. */
+int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm);
+
+/* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----
+ * They turn `selected[]` -- one router id per (token, slot) -- into the
+ * expert-major schedule the grouped CUTLASS MXFP4 lane and the mixed type-40/44
+ * lane consume.  They own the route-bounds rule: an id with no expert behind it
+ * is clamped in bounds so the maps stay consistent, and recorded in the flag
+ * above.  The arm tag says which launch saw it, so the refusal can name both. */
+enum moe_route_oob_arm {
+    MOE_OOB_ARM_GROUPED_COUNT   = 1,   ///< grouped CUTLASS MXFP4 count (routed_moe_launch_cutlass_grouped)
+    MOE_OOB_ARM_GROUPED_SCATTER = 2,   ///< grouped CUTLASS MXFP4 scatter (routed_moe_launch_cutlass_grouped)
+    MOE_OOB_ARM_MIXED_COUNT     = 3,   ///< mixed type-40/44 count (routed_moe_launch_mixed40)
+    MOE_OOB_ARM_MIXED_SCATTER   = 4,   ///< mixed type-40/44 scatter (routed_moe_launch_mixed40)
+};
+
+/** The flag value a sorted-pair builder stores when it sees a `selected[]` id
+ *  with no expert behind it.  Code layout: bits 0..7 = layer_index + 1 (0 means
+ *  "clear"), bits 8..15 = arm -- the same layout as L188's non-finite flag. */
+static __host__ __device__ __forceinline__ uint32_t moe_route_oob_code(uint32_t layer_index, uint32_t arm) {
+    return (arm << 8) | ((layer_index + 1u) & 0xffu);
+}
+
+__global__ void moe_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected,
+                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code);
+__global__ void moe_prefix_sorted_pairs_kernel(uint32_t *offsets, uint32_t *cursors,
+                                               const uint32_t *counts, uint32_t expert_count);
+__global__ void moe_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors,
+                                                const int32_t *selected, uint32_t pair_count,
+                                                uint32_t n_total, uint32_t oob_code);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 

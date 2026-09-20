@@ -5,79 +5,24 @@
 
 #endif
 
-__global__ static void moe_count_sorted_pairs_kernel(
-        uint32_t *counts,
-        const int32_t *selected,
-        uint32_t pair_count) {
-    uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (pair >= pair_count) return;
-    int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
-    atomicAdd(counts + (uint32_t)expert_i, 1u);
-}
+/* The three sorted-pair builders (count, prefix sum, scatter) live in
+ * pulsar_cuda_moe_pairs.cu -- they hold the one place a router id becomes an
+ * array index, and they are declared in pulsar_cuda_internal.h together with
+ * the `moe_route_oob_code` arm tag each call site below passes. */
+
+/* The three sorted-pair builders (count, prefix sum, scatter) live in
+ * pulsar_cuda_moe_pairs.cu -- they hold the one place a router id becomes an
+ * array index, and they are declared in pulsar_cuda_internal.h. */
 
 
 
-/* Exclusive prefix sum over the per-expert counts.  This ran as <<<1,1>>>: one
- * CUDA thread walking 256 experts serially, on every CUTLASS layer of every
- * step, with two more launches either side of it.  Now a single block scans in
- * shared memory.
- *
- * The results are IDENTICAL, not merely equivalent: these are uint32 counts and
- * integer addition is associative and exact, so reassociating the sum cannot
- * move a value.  That is why this is safe to change under a bit-exactness
- * regime where the same edit on floats would not be.
- *
- * Chunked so expert_count > blockDim still works; the model's 256 fits one
- * pass. */
-__global__ static void moe_prefix_sorted_pairs_kernel(
-        uint32_t *offsets,
-        uint32_t *cursors,
-        const uint32_t *counts,
-        uint32_t expert_count) {
-    __shared__ uint32_t sh[256];
-    __shared__ uint32_t base;
-    const uint32_t tid = threadIdx.x;
-    if (tid == 0) base = 0u;
-    __syncthreads();
-
-    for (uint32_t chunk = 0; chunk < expert_count; chunk += 256u) {
-        const uint32_t e = chunk + tid;
-        const uint32_t v = (e < expert_count) ? counts[e] : 0u;
-        sh[tid] = v;
-        __syncthreads();
-        for (uint32_t off = 1u; off < 256u; off <<= 1) {
-            const uint32_t add = (tid >= off) ? sh[tid - off] : 0u;
-            __syncthreads();
-            sh[tid] += add;
-            __syncthreads();
-        }
-        if (e < expert_count) {
-            const uint32_t excl = base + sh[tid] - v;   /* inclusive -> exclusive */
-            offsets[e] = excl;
-            cursors[e] = excl;
-        }
-        __syncthreads();
-        if (tid == 255u) base += sh[255];
-        __syncthreads();
-    }
-    if (tid == 0) offsets[expert_count] = base;
-}
+/* Exclusive prefix sum over the per-expert counts -- see pulsar_cuda_moe_pairs.cu
+ * for the bit-exactness argument that makes the block scan safe here. */
 
 
 
-__global__ static void moe_scatter_sorted_pairs_kernel(
-        uint32_t *sorted_pairs,
-        uint32_t *cursors,
-        const int32_t *selected,
-        uint32_t pair_count) {
-    uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (pair >= pair_count) return;
-    int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
-    uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
-    sorted_pairs[pos] = pair;
-}
+/* The scattered pair -> expert-major schedule is built by
+ * pulsar_cuda_moe_pairs.cu's moe_scatter_sorted_pairs_kernel. */
 
 
 
@@ -477,7 +422,8 @@ static int routed_moe_launch_cutlass_grouped(
     if (ok && row_src_tok) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_bytes),
                                         "moe_grouped rsrc clear");
     if (ok) {
-        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_COUNT));
         ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
     }
     if (ok) {
@@ -485,7 +431,8 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped prefix launch");
     }
     if (ok) {
-        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_SCATTER));
         ok = cuda_ok(cudaGetLastError(), "moe_grouped scatter launch");
     }
     if (ok) {
@@ -728,11 +675,13 @@ static int routed_moe_launch_mixed40(
      * E4M3 gather zero-fills exactly those (what pre-zeroed f32 rows gave). */
     if (ok && rsrc_b) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_b), "mixed40 rsrc clear");
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
-    if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+    if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_COUNT));
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
     if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
-    if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+    if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_SCATTER));
               ok = cuda_ok(cudaGetLastError(), "mixed40 scatter"); }
     if (ok) { moe_padded_offsets_kernel<<<1, 1>>>(padded_off, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 padded offsets"); }

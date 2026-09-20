@@ -914,9 +914,12 @@ int pulsar_gpu_init(void) {
 
 void pulsar_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
-    {   /* L188: the flag is process state; a later engine open must start clear */
+    {   /* L188: the flag is process state; a later engine open must start clear.
+         * PLAN 94 phase 1: the route-bounds flag is the same kind of state. */
         uint32_t nf_layer = 0u; const char *nf_arm = NULL;
         (void)pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
+        uint32_t oob_layer = 0u; const char *oob_arm = NULL;
+        (void)pulsar_gpu_routed_moe_route_oob_take(&oob_layer, &oob_arm);
     }
     /* Invalidate the fp8 weight-pointer cache BEFORE freeing the model arenas
      * it points into -- a later engine open in this process would otherwise be
@@ -1531,14 +1534,29 @@ int pulsar_gpu_end_commands(void) {
     /* L188: the stream is drained -- this is where every step reads its logits
      * back -- so the routed experts' non-finite flag is read here, once, with no
      * extra synchronisation.  A set flag fails the step by name; nothing
-     * downstream rewrites a NaN into a number. */
+     * downstream rewrites a NaN into a number.
+     *
+     * PLAN 94 phase 1: the route-bounds flag is read at the same drain and
+     * fails the step the same way.  Both are taken BEFORE either is acted on,
+     * so a step that trips one cannot leave the other set to be charged to the
+     * next step's bytes. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf < 0) return 0;
+    uint32_t oob_layer = 0u;
+    const char *oob_arm = NULL;
+    const int oob = pulsar_gpu_routed_moe_route_oob_take(&oob_layer, &oob_arm);
+    if (oob < 0) return 0;
     if (nf > 0) {
         fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) -- refusing the step "
                         "(no sanitizer rewrites it; L188)\n", nf_layer, nf_arm);
+        return 0;
+    }
+    if (oob > 0) {
+        fprintf(stderr, "pulsar: routed expert id out of range at layer %u (%s) -- refusing the step "
+                        "(the router selected an expert the artifact does not hold; PLAN 94 phase 1)\n",
+                oob_layer, oob_arm);
         return 0;
     }
     return 1;
@@ -1552,14 +1570,21 @@ int pulsar_gpu_synchronize(void) {
      * pulsar_gpu_end_commands; a routed-expert non-finite flag set by a step
      * that did not complete would otherwise survive into the next step -- of
      * another bank, another request -- and be charged to it.  Consume it
-     * here too, by name. */
+     * here too, by name.  The route-bounds flag (PLAN 94 phase 1) is the same
+     * hazard and is drained the same way. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf > 0)
         fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) in a step that did not "
                         "complete -- flag cleared (L188)\n", nf_layer, nf_arm);
-    return nf >= 0;
+    uint32_t oob_layer = 0u;
+    const char *oob_arm = NULL;
+    const int oob = pulsar_gpu_routed_moe_route_oob_take(&oob_layer, &oob_arm);
+    if (oob > 0)
+        fprintf(stderr, "pulsar: routed expert id out of range at layer %u (%s) in a step that did not "
+                        "complete -- flag cleared (PLAN 94 phase 1)\n", oob_layer, oob_arm);
+    return nf >= 0 && oob >= 0;
 }
 
 
