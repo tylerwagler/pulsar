@@ -604,8 +604,11 @@ cuda-rewind-gate: tests/rewind_frontier_gate
 # L120's other half: a rewind must clamp the PER-BANK frontier as well as the
 # scalars, or the next multiseq step on that bank is rejected with production's
 # "frontier not position-true".  MODEL-DEPENDENT.
+# Pooled on purpose: leg 2 exercises the boundary-stash escape, and the stash is
+# allocated with the bank pool.  The runner cannot set this (one shared process,
+# pool size cached before this gate's entry), so THIS target is the vehicle.
 cuda-mseq-rewind-gate: tests/mseq_rewind_probe
-	./tests/mseq_rewind_probe $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=4 ./tests/mseq_rewind_probe $(FRONTIER_MODEL)
 
 # L115 token-seam gate: sampled-vs-canonical boundary drift keeps the live
 # KV (see the header of tests/token_seam_gate.cpp).  MODEL-DEPENDENT.

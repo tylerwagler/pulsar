@@ -62,6 +62,12 @@ static void show(pulsar_session *s, const char *when, int pos) {
 int GATE_ENTRY(int argc, char **argv) {
     g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
+    /* Leg 2 needs a bank pool: the boundary stash is allocated with it
+     * (n_banks * N_LAYER rows), so an unpooled run cannot reach the escape.
+     * Set BEFORE anything opens an engine or reads the pool size -- that read
+     * is cached on first use, and the engine-open path gets there first.
+     * overwrite=0, so an explicit caller value still wins. */
+    setenv("PULSAR_MSEQ_BANKS", "4", 0);
     pulsar_engine *e = NULL;
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -165,6 +171,18 @@ int GATE_ENTRY(int argc, char **argv) {
         const int G = 256;
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t rbank = g->banks.n_banks ? g->banks.cur_bank : 0u;
+        /* The boundary stash is allocated WITH the bank pool, so an unpooled run
+         * cannot exercise this leg at all.  The battery runs every runner gate in
+         * ONE process and that process reads the pool size (cached) before this
+         * gate's GATE_ENTRY runs, so the setenv above cannot win there -- hence a
+         * printed SKIP here and the real vehicle is the STANDALONE target, whose
+         * recipe sets PULSAR_MSEQ_BANKS before the process starts.  A printed
+         * SKIP, never a silent pass (the L080 precedent). */
+        if (g->banks.n_banks == 0) {
+            printf("leg 2 SKIPPED: no bank pool in this process (the boundarystash is "
+                   "allocated with it).  Vehicle: make cuda-mseq-rewind-gate, which "
+                   "sets PULSAR_MSEQ_BANKS in its recipe.\n");
+        } else {
         printf("\nleg 2: compressor rewind to boundary %d (layer 2 ratio %u, ring span starts "
                "above it)\n", G, ratio2);
         CHECK(ratio2 != 0u && (uint32_t)G % ratio2 == 0u, "G must be a ratio-%u boundary", ratio2);
@@ -180,6 +198,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_session_rewind(s, G);
         CHECK(pulsar_session_pos(s) == G, "rewind did not land on %d (pos %d)", G,
               pulsar_session_pos(s));
+        }
     }
 
     free(logits);
