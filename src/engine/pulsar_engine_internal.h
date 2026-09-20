@@ -1701,6 +1701,9 @@ struct pulsar_engine {
     uint64_t spec_num_drafts;     ///< draft rounds, i.e. verify steps carrying drafts
     uint64_t spec_gen_tokens;     ///< tokens emitted by the speculative loop
     uint64_t spec_accepted_per_pos[16];  ///< accepted count per draft position
+    uint64_t spec_verified_per_pos[16];  ///< rounds that VERIFIED position i (the trim kept
+                                         ///< it); the honest denominator for per-position
+                                         ///< acceptance under the L107 adaptive depth
 
     /** ---- methods (C++ port): 1:1 mirror of the pulsar_engine_* verb family.
      * The public API in pulsar.h stays the free-function facade (defined in

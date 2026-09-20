@@ -12,6 +12,19 @@ structured at/above spec, which convicts drafter-vs-quantized-main
 distributional distance and selects distillation as the fix. Rerun it after
 any change that might move acceptance (numerics campaigns, drafter work):
     python3 tests/alpha_diag.py          # server on 127.0.0.1:8000
+
+⚠ L075's "no positional cliff" was read from the waterfall at a STATIC depth
+(the L107 adaptive-depth controller landed 2026-08-25, after it), and the
+waterfall alone no longer supports that reading. With depth moving 2..5 per
+round, acc/round is a joint prefix probability the schedule drives, and the
+conditional derived from it mixes a real per-position decay with the trim's
+selection (position i is verified only if the drafter cleared tau at every
+shallower position), which is stricter with depth -- so a non-monotone
+conditional is neither drafter quality nor proof against it. This prints
+`attempts` (rounds that verified each position, from
+pulsar:spec_decode_num_verified_tokens_per_pos_total) and `rate`
+(accepted/verified) beside the old series. Re-read the per-position curve from
+`rate`, and re-run the cliff question at a PINNED depth before trusting either.
 """
 import json, urllib.request, sys
 
@@ -68,11 +81,26 @@ for domain, prompt in (("prose", PROSE), ("struct", STRUCT)):
         rounds = d[key1(m1, "num_drafts_total")]
         spec_gen = d.get("pulsar:spec_decode_gen_tokens_total", 0.0)
         alpha = accepted / drafted if drafted else 0.0
-        pos = []
-        for i in range(16):
+        def pick(prefix, i):
             for k in d:
-                if 'position="%d"' % i in k:
-                    pos.append(d[k] / rounds if rounds else 0.0)
+                if k.startswith(prefix) and 'position="%d"' % i in k:
+                    return d[k]
+            return 0.0
+
+        # Two per-position series, answering different questions.
+        #   acc/round is the vLLM convention: a per-position RATE only at a
+        #     FIXED draft depth. Under the L107 adaptive depth (2..5) a position
+        #     is absent from every round that never reached it, so this is a
+        #     joint prefix probability that the depth schedule moves.
+        #   acc/ver is the honest per-position rate: it divides by the rounds
+        #     that actually verified the position.
+        pos, ver = [], []
+        for i in range(16):
+            pos.append(pick("vllm:spec_decode_num_accepted_tokens_per_pos_total", i)
+                       / rounds if rounds else 0.0)
+            ver.append(pick("pulsar:spec_decode_num_verified_tokens_per_pos_total", i)
+                       / rounds if rounds else 0.0)
+        rate = [(pos[i] / ver[i] if ver[i] > 0 else 0.0) for i in range(16)]
         cond = []
         prev = 1.0
         for p in pos:
@@ -81,6 +109,8 @@ for domain, prompt in (("prose", PROSE), ("struct", STRUCT)):
             cond.append(p / prev if prev > 0 else 0.0)
             prev = p
         wf = " ".join("%.2f" % p for p in pos[:8])
+        at = " ".join("%.2f" % v for v in ver[:8])
+        rt = " ".join("%.2f" % r for r in rate[:8])
         cd = " ".join("%.2f" % c for c in cond[:8])
         print("%s temp=%.1f: alpha=%.3f acc/round=%.2f tok/round=%.2f "
               "rounds=%d drafted/round=%.2f" % (
@@ -90,6 +120,8 @@ for domain, prompt in (("prose", PROSE), ("struct", STRUCT)):
                   rounds,
                   drafted / rounds if rounds else 0.0))
         print("  waterfall  = " + wf)
+        print("  attempts   = " + at)
+        print("  rate       = " + rt)
         print("  conditional= " + cd)
         sys.stdout.flush()
 print("DIAG COMPLETE")

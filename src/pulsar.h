@@ -190,14 +190,29 @@ const char *pulsar_engine_model_name(pulsar_engine *e);
 bool pulsar_engine_chat_v41(const pulsar_engine *e);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
- * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often
- * draft position i was accepted; rate[i] = accepted_per_pos[i]/num_drafts. */
+ * cumulative/monotonic since engine open.
+ *
+ * accepted_per_pos[i] counts how often draft position i was accepted -- drafts
+ * being a prefix chain, that is how often the round's commit ran past i. Its
+ * denominator is verified_per_pos[i] (rounds where position i was actually
+ * VERIFIED, i.e. the confidence trim kept it), NOT num_drafts: under the L107
+ * adaptive depth the depth moves per round, so dividing by num_drafts
+ * understates every deep position by the fraction of rounds that never reached
+ * it. rate[i] = accepted_per_pos[i] / verified_per_pos[i].
+ *
+ * The conditional P(accept i | accept 0..i-1) = accepted_per_pos[i] /
+ * accepted_per_pos[i-1] is exactly that either way -- the prefix property makes
+ * its denominator implicit -- but it is confounded by the trim's selection,
+ * which is stricter with depth (position i is verified only when the drafter
+ * cleared tau at EVERY shallower position). A non-monotone conditional series
+ * is therefore a selection artifact, not evidence about drafter quality. */
 typedef struct {
     uint64_t accepted_tokens;       ///< accepted draft tokens
     uint64_t draft_tokens;          ///< proposed/verified draft tokens
     uint64_t num_drafts;            ///< draft rounds (verify steps carrying drafts)
     uint64_t gen_tokens;            ///< tokens emitted by the spec loop
-    uint64_t accepted_per_pos[16];  ///< accepted count per draft position; rate[i] = accepted_per_pos[i]/num_drafts
+    uint64_t accepted_per_pos[16];  ///< accepted count per draft position
+    uint64_t verified_per_pos[16];  ///< count of rounds verifying position i; rate[i] = accepted_per_pos[i]/verified_per_pos[i]
     int      max_draft;             ///< configured draft depth (pulsar_engine_options::dspark_draft_tokens)
     bool     has_dspark;            ///< true when speculative decode is active
 } pulsar_spec_metrics;

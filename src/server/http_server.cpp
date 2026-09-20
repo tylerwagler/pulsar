@@ -438,7 +438,16 @@ bool server::send_metrics(int fd) {
                model, (unsigned long long)m.num_drafts);
     /* Per-position accepted counters -> the scraper derives per-position
      * acceptance = count/num_drafts (the waterfall). Emit 0..max_draft-1 so the
-     * chart has a full row even before every position has fired. */
+     * chart has a full row even before every position has fired.
+     *
+     * ⚠ count/num_drafts is the vLLM convention and stays for compatibility,
+     * but it is only a per-position RATE at a fixed draft depth. We run the
+     * L107 adaptive depth, so a position is absent from rounds that never
+     * reached it and the quotient is a joint prefix probability the schedule
+     * moves. pulsar:spec_decode_num_verified_tokens_per_pos_total below is the
+     * attempt count; the true per-position rate is the ratio of the two, and a
+     * non-monotone vllm waterfall cannot be read as drafter quality on its own
+     * (pulsar.h's pulsar_spec_metrics comment has the derivation). */
     if (m.max_draft > 0) {
         int np = m.max_draft > 16 ? 16 : m.max_draft;
         buf_puts(&b, "# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted count per draft position.\n");
@@ -446,6 +455,11 @@ bool server::send_metrics(int fd) {
         for (int i = 0; i < np; i++)
             buf_printf(&b, "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"%s\",position=\"%d\"} %llu\n",
                        model, i, (unsigned long long)m.accepted_per_pos[i]);
+        buf_puts(&b, "# HELP pulsar:spec_decode_num_verified_tokens_per_pos_total Rounds that actually verified draft position i.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_decode_num_verified_tokens_per_pos_total counter\n");
+        for (int i = 0; i < np; i++)
+            buf_printf(&b, "pulsar:spec_decode_num_verified_tokens_per_pos_total{model_name=\"%s\",position=\"%d\"} %llu\n",
+                       model, i, (unsigned long long)m.verified_per_pos[i]);
     }
     /* Token-throughput counters (the scraper derives prompt/gen t/s from deltas). */
     buf_puts(&b, "# HELP vllm:prompt_tokens_total Cumulative prompt tokens prefilled.\n");

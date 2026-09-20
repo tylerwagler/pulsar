@@ -303,6 +303,25 @@ static spec_snap spec_take(pulsar_engine *e) {
     pulsar_spec_metrics m;
     memset(&m, 0, sizeof(m));
     pulsar_engine_spec_metrics(e, &m);
+    /* Counter contract, asserted rather than commented (ENGINEERING-RULES 4).
+     * One place increments these (session_spec.cpp's fused-verify accounting)
+     * and it does so in lockstep: every round adds K to draft_tokens and 1 to
+     * verified_per_pos[i] for each i < K, and adds commit to accepted_tokens and
+     * 1 to accepted_per_pos[i] for each i < commit. K and commit are both capped
+     * at 16, the array bound, so both per-position series must sum EXACTLY to
+     * their scalar at every point in the stream -- from the first round, since
+     * the engine counters start at zero. A drift means the per-position
+     * waterfall is measuring something other than the scalar the gates read,
+     * which would make every per-position alpha reading unsound. */
+    uint64_t vsum = 0, asum = 0;
+    for (int i = 0; i < 16; i++) { vsum += m.verified_per_pos[i]; asum += m.accepted_per_pos[i]; }
+    if (vsum != m.draft_tokens || asum != m.accepted_tokens) {
+        fprintf(stderr, "spec counter contract violated: sum verified %llu != drafted %llu, "
+                        "sum accepted %llu != accepted %llu\n",
+                (unsigned long long)vsum, (unsigned long long)m.draft_tokens,
+                (unsigned long long)asum, (unsigned long long)m.accepted_tokens);
+        exit(1);
+    }
     spec_snap s = { m.draft_tokens, m.accepted_tokens, m.num_drafts, m.gen_tokens };
     return s;
 }

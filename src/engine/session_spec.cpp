@@ -1335,13 +1335,19 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
     /* Prometheus /metrics spec-decode counters (server /metrics endpoint). The
      * base token is always emitted; K drafts were verified this step and the
-     * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
+     * accepted prefix is [0,commit). num_drafts counts draft rounds only.
+     * verified_per_pos is the per-position ATTEMPT count: position i was put to
+     * the target iff i < K, which under the L107 adaptive depth is not every
+     * round. Without it a scraper can only form accepted[i]/num_drafts, a joint
+     * prefix probability that the depth schedule moves; with it the per-position
+     * rate is accepted[i]/verified[i] at any schedule (pulsar.h). */
     e->spec_gen_tokens += 1u + (uint64_t)commit;
     s->spec.spec_gen_tokens += 1u + (uint64_t)commit;
     if (K > 0) {
         e->spec_draft_tokens += K;
         e->spec_accepted_tokens += (uint64_t)commit;
         e->spec_num_drafts += 1u;
+        for (uint32_t i = 0; i < K && i < 16u; i++) e->spec_verified_per_pos[i]++;
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
         s->spec.spec_draft_tokens += K;
         s->spec.spec_accepted_tokens += (uint64_t)commit;
