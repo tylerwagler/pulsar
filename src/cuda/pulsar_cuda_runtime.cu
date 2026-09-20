@@ -1788,6 +1788,25 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
                                             const char *label) {
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
 
+    /* L217 / PLAN 94 s2.5: the overlay is a SECOND allocation route into the
+     * same device budget, and it was the one route with no limit check.  The
+     * arena paths all test `g_model_range_bytes` against the cap
+     * (cuda_model_range_ensure), while this one registered its bytes without
+     * ever being tested -- so with two allocation routes and one unchecked,
+     * neither is authoritative: an overlay could cross the cap and the failure
+     * would surface later as some unrelated allocation refusing.  Refuse HERE,
+     * by name, before a byte is allocated, which is what the arena paths do. */
+    {
+        const uint64_t limit = cuda_model_cache_limit_bytes();
+        if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
+            fprintf(stderr, "pulsar: overlay range %s (%.2f GiB) does not fit: the weight cache holds "
+                            "%.2f of %.0f GiB -- refusing the overlay\n",
+                    label ? label : "overlay", (double)bytes / 1073741824.0,
+                    (double)g_model_range_bytes / 1073741824.0, (double)limit / 1073741824.0);
+            return 0;
+        }
+    }
+
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
