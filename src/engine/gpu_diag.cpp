@@ -780,12 +780,55 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
                                  uint32_t row0, uint32_t n_rows) {
     if (!g || il >= PULSAR_N_LAYER) return false;
     if (n_rows == 0u) return true;
-    /* A multiseq step mixes banks: these rows are other sequences' positions and
-     * this span describes the installed bank's, so depositing them would make a
-     * later replay read another bank's row. */
-    if (g->batch_multiseq) return true;
-    pulsar_gpu_tensor *akv = g->layer_attn_proj_kv[il], *asc = g->layer_attn_proj_sc[il];
-    pulsar_gpu_tensor *ikv = g->layer_index_proj_kv[il], *isc = g->layer_index_proj_sc[il];
+    /* L226: a FUSED step mixes banks, but the ring is PER BANK -- each bank owns
+     * its own slab (`banks.attn_proj_kv[il]` is n_banks long and
+     * layer_attn_proj_kv is a view of the installed one).  So a fused step's rows
+     * CAN be deposited exactly: each into the ring of the bank that owns it, at
+     * that row's own position, with that bank's span updated where its span
+     * lives (`proj_ring_lo/hi` while it is installed, `ms_proj_ring_lo/hi[bank]`
+     * otherwise).  The per-row producer in the csa2 path calls this once per row
+     * (n_rows == 1, pos0 = that row's position, row0 = its batch row), which is
+     * all this needs.
+     *
+     * The old behaviour -- discard the whole step when batch_multiseq is set --
+     * left every bank's ring EMPTY on the served lane, so any ghost rewind over
+     * decoded rows was uncovered and `compressor_state_rewind` invalidated the
+     * whole checkpoint.  Measured: a full 39k-token rebuild (~34 s) on EVERY tool
+     * round of a served agentic session, because the spec lane rewinds ghost
+     * tokens at each tool boundary. */
+    uint32_t ring_bank = gpu_graph_cur_bank(g);
+    if (g->batch_multiseq) {
+        if (n_rows != 1u || !g->ms_seq_id || !g->ms_positions) return true;   /* the batched arm is never fused */
+        const uint32_t row_bank = (uint32_t)g->ms_seq_id[row0];
+        if (row_bank >= PULSAR_MSEQ_MAX) return true;
+        ring_bank = row_bank;
+    }
+    pulsar_gpu_tensor *akv, *asc, *ikv, *isc;
+    if (ring_bank == gpu_graph_cur_bank(g) || g->banks.n_banks == 0) {
+        akv = g->layer_attn_proj_kv[il];
+        asc = g->layer_attn_proj_sc[il];
+        ikv = g->layer_index_proj_kv[il];
+        isc = g->layer_index_proj_sc[il];
+    } else {
+        /* Another bank's slab: the SAME view the install path builds for it. */
+        pulsar_bank_slabs *b = &g->banks;
+        if (ring_bank >= b->n_banks || !b->attn_proj_bank_bytes[il]) return true;
+        akv = pulsar_gpu_tensor_view(b->attn_proj_kv[il],
+                                     (uint64_t)ring_bank * b->attn_proj_bank_bytes[il],
+                                     b->attn_proj_bank_bytes[il]);
+        asc = pulsar_gpu_tensor_view(b->attn_proj_sc[il],
+                                     (uint64_t)ring_bank * b->attn_proj_bank_bytes[il],
+                                     b->attn_proj_bank_bytes[il]);
+        ikv = isc = NULL;
+        if (b->index_proj_bank_bytes[il]) {
+            ikv = pulsar_gpu_tensor_view(b->index_proj_kv[il],
+                                         (uint64_t)ring_bank * b->index_proj_bank_bytes[il],
+                                         b->index_proj_bank_bytes[il]);
+            isc = pulsar_gpu_tensor_view(b->index_proj_sc[il],
+                                         (uint64_t)ring_bank * b->index_proj_bank_bytes[il],
+                                         b->index_proj_bank_bytes[il]);
+        }
+    }
     if (!akv && !asc && !ikv && !isc) return true;      /* coff 1: no ring on this source */
     if (!akv || !asc) return false;                     /* half a ring is an impossible state */
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -807,11 +850,16 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
     if (!ok) return false;
     /* The span, in one step for the whole run: a gap from the previous hi
      * restarts it, and the depth caps it.  Slots below the run's start were not
-     * written by this call, so they are claimed only while the cap allows. */
-    if (g->proj_ring_hi != pos_first) g->proj_ring_lo = pos_first;
-    g->proj_ring_hi = pos0 + n_rows;
-    if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
-        g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
+     * written by this call, so they are claimed only while the cap allows.
+     * The span is the SPAN'S BANK's (see above): the live pair for the installed
+     * bank, the per-bank mirror otherwise. */
+    uint32_t *lo = (ring_bank == gpu_graph_cur_bank(g))
+                 ? &g->proj_ring_lo : &g->ms_proj_ring_lo[ring_bank];
+    uint32_t *hi = (ring_bank == gpu_graph_cur_bank(g))
+                 ? &g->proj_ring_hi : &g->ms_proj_ring_hi[ring_bank];
+    if (*hi != pos_first) *lo = pos_first;
+    *hi = pos0 + n_rows;
+    if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
     return true;
 }
 
