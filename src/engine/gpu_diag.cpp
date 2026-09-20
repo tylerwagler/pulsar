@@ -1249,6 +1249,51 @@ static bool proj_ring_replay_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t ba
     return ok;
 }
 
+/* Byte-stash the comp-pool row that the next emit at BOUNDARY row `row` will
+ * pool, and arm the restore threshold for it.  This is the escape a partial fork
+ * already gives its own cut (see the fork's `crows`/`emit_stash_comp` block, and
+ * gpu_graph_emit_keep_restore for what consumes it): the emit recomputes that one
+ * row from the rebuilt carry and then byte-replaces it with the stashed committed
+ * bytes, and its shift rebuilds the carry for every group after it.  The row is
+ * available because a rewind only ever clamps the comp frontier DOWN -- the bytes
+ * one past it are the pooled row for the group ending at `row`, computed from the
+ * session's own committed prefix, and readers cap at n_comp so they are invisible
+ * until that emit claims them.
+ *
+ * Returns false (caller refuses, as before) when there is no pool, no stash, or
+ * no such lane -- a fresh or spilled bank. */
+static bool proj_ring_stash_boundary(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+                                     uint32_t row) {
+    if (!g->emit_stash_comp || !gpu_graph_layer_has_comp_state(il)) return false;
+    pulsar_gpu_tensor *pool = gpu_graph_bank_attn_comp_view(g, il, bank);
+    if (!pool) return false;
+    const uint64_t arow = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    bool ok = pulsar_gpu_tensor_copy(g->emit_stash_comp,
+                                     ((uint64_t)bank * PULSAR_N_LAYER + il) * arow,
+                                     pool, (uint64_t)row * arow, arow) != 0;
+    pulsar_gpu_tensor_free(pool);
+    /* The indexer's own compressor carries the same overlap on a V4 source, so it
+     * needs the same stashed row when it owns a pool. */
+    if (ok) {
+        pulsar_gpu_tensor *ipool = gpu_graph_bank_index_comp_view(g, il, bank);
+        if (ipool) {
+            const uint64_t irow = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+            ok = pulsar_gpu_tensor_copy(g->emit_stash_index,
+                                        ((uint64_t)bank * PULSAR_N_LAYER + il) * irow,
+                                        ipool, (uint64_t)row * irow, irow) != 0;
+            pulsar_gpu_tensor_free(ipool);
+        }
+    }
+    if (!ok) return false;
+    /* Announce it: this is a repair path that used to refuse, so a reader of a log
+     * needs to know which of the two the boundary took, and an instrument that
+     * never prints is how we learn the path is unreachable rather than correct. */
+    fprintf(stderr, "pulsar: kv source %u bank %u: boundary row %u is out of the ring's reach "
+                    "-- stashed from the comp pool and armed the emit restore\n", il, bank, row);
+    g->ms_emit_keep[bank] = row + 1u;
+    return true;
+}
+
 /* L120 value half: rebuild an OVERLAPPING compressor's state lane for position
  * `pos` from the projection ring.  The row for the group that ENDS at or after
  * `pos` is pooled from that group's tokens AND the group before them, so the
@@ -1349,6 +1394,22 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * for every group after it.  Without it the first emitted row is
              * wrong and nothing would say so, so refuse there too -- a rebuild is
              * slower, a silent wrong row is not acceptable. */
+            /* A BOUNDARY whose carry group is out of the ring's reach is still
+             * repairable LOCALLY, and it is the shape that matters most in
+             * production: a resume whose checkpoint span starts exactly on the
+             * resume grid point (a short prefill that began there sets lo = G), so
+             * the boundary at G wants [G-ratio, G) and lo is G.  Arm the boundary
+             * stash from the surviving comp pool, exactly as a partial fork arms
+             * its own cut, and the emit that pools that row restores it byte for
+             * byte instead of pooling a lane the rewind reset.  Measured shape
+             * (2026-09-20 probe: resume grid point 19712 = 154*128 with the span
+             * starting there) and the reason the in-place advance survives what the
+             * resume does not: bank_fork_partial arms this and the resume never did.
+             *
+             * MID-GROUP still refuses: there the straddled group's own rows are the
+             * problem, and no single stashed row covers them. */
+            if (pos % ratio == 0u && proj_ring_stash_boundary(g, il, bank, pos / ratio))
+                continue;
             if (pos % ratio != 0u || g->ms_emit_keep[bank] != pos / ratio + 1u) {
                 /* The span and the stash are what decide this, so say them -- and
                  * say the TARGET BANK's own span and its deposit count beside the
