@@ -1374,26 +1374,7 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * may legitimately be empty on a fresh, forked or spilled bank --
              * and the counter clamp is then the honest half, exactly as before
              * the ring existed. */
-            {
-                /* Say WHY the overlap replay declined, once per (source, pos).  The
-                 * refusal message below only fires for the cases that get that far,
-                 * and the open question was which arm a boundary actually takes:
-                 * the ring may cover it, the verify saves may cover it, or neither. */
-                const uint32_t owstart = pos >= ratio ? ratio * (pos / ratio - 1u) : 0u;
-                const bool owcov = pos >= ratio && owstart >= g->proj_ring_lo &&
-                                   pos <= g->proj_ring_hi;
-                const bool owok = gpu_graph_overlap_rewind_layer(g, il, bank, pos);
-                if (!owok)
-                    fprintf(stderr, "pulsar: RINGDBG il=%u pos=%u ratio=%u phase=%u start=%u "
-                                    "cov=%d ring=%u..%u bankring=%u..%u emit_keep=%u want=%u "
-                                    "stash=%d\n",
-                            il, pos, ratio, pos % ratio, owstart, (int)owcov,
-                            g->proj_ring_lo, g->proj_ring_hi,
-                            g->ms_proj_ring_lo[bank], g->ms_proj_ring_hi[bank],
-                            g->ms_emit_keep[bank], pos / ratio + 1u,
-                            g->emit_stash_comp != NULL);
-                if (owok) continue;
-            }
+            if (gpu_graph_overlap_rewind_layer(g, il, bank, pos)) continue;
             /* Uncovered.  The two shapes then behave DIFFERENTLY, because only
              * one of them has a safety net:
              *   - a group BOUNDARY survives an empty carry: the emit that pools
