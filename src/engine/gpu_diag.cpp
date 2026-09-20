@@ -814,6 +814,32 @@ static void proj_ring_span_cover(uint32_t *lo, uint32_t *hi, uint32_t a, uint32_
     if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
 }
 
+/* Move the ring span for the bank that owns a deposited run.  The BANK's own
+ * pair is the fact; the installed pair is a view of whichever bank is mounted,
+ * so a deposit into the mounted bank has to move BOTH.
+ *
+ * `gpu_graph_bank_counters_capture` syncs the two at a hand-off, but nothing
+ * syncs them during a step, so a step that deposits while mounted followed by an
+ * install -- a repoint to the same bank, a fork, an eviction hand-off -- restored
+ * the pre-deposit value and silently discarded the coverage the deposit had just
+ * added.  Measured on the served lane (L226 dogfood 2026-09-19): every decode
+ * step grew the span (42038, 42044, 42045, 42048) and the next bank install put
+ * it back to the 42037 the last PREFILL had left, so the span was pinned to the
+ * last prefill and every rewind into the generated region refused. */
+static void proj_ring_span_commit(pulsar_gpu_graph *g, uint32_t bank, uint32_t a, uint32_t b) {
+    if (g->banks.n_banks == 0) {          /* no pool: the installed pair IS the span */
+        proj_ring_span_cover(&g->proj_ring_lo, &g->proj_ring_hi, a, b);
+        return;
+    }
+    uint32_t *lo = &g->ms_proj_ring_lo[bank];
+    uint32_t *hi = &g->ms_proj_ring_hi[bank];
+    proj_ring_span_cover(lo, hi, a, b);
+    if (bank == gpu_graph_cur_bank(g)) {  /* keep the mounted view in step with the fact */
+        g->proj_ring_lo = *lo;
+        g->proj_ring_hi = *hi;
+    }
+}
+
 /* Deposit ONE row of a FUSED step into the ring of the bank that owns it, at
  * that row's own position, updating that bank's span where its span lives (the
  * live pair while the bank is installed, its per-bank mirror otherwise).  L226:
@@ -867,12 +893,11 @@ static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32
              proj_ring_copy_rows(isc, g->batch_index_comp_sc, irow, t, 1u, pos, irow);
     }
     if (!ok) return false;
-    uint32_t *lo = (bank == cur) ? &g->proj_ring_lo : &g->ms_proj_ring_lo[bank];
-    uint32_t *hi = (bank == cur) ? &g->proj_ring_hi : &g->ms_proj_ring_hi[bank];
-    proj_ring_span_cover(lo, hi, pos, pos + 1u);
+    proj_ring_span_commit(g, bank, pos, pos + 1u);
     g->ring_dep_rows[bank] += 1u;
     g->ring_dep_last[bank] = pos;
-    g->ring_dep_hi[bank] = *hi;
+    g->ring_dep_hi[bank] = (bank == gpu_graph_cur_bank(g) && g->banks.n_banks != 0)
+                               ? g->proj_ring_hi : g->ms_proj_ring_hi[bank];
     return true;
 }
 
@@ -914,9 +939,9 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
     /* The span, in one step for the whole run: a gap from the previous hi
      * restarts it, and the depth caps it.  Slots below the run's start were not
      * written by this call, so they are claimed only while the cap allows. */
-    proj_ring_span_cover(&g->proj_ring_lo, &g->proj_ring_hi, pos_first, pos0 + n_rows);
     {
         const uint32_t cb = gpu_graph_cur_bank(g);
+        proj_ring_span_commit(g, cb, pos_first, pos0 + n_rows);
         g->ring_dep_rows[cb] += n_rows;
         g->ring_dep_last[cb] = pos0 + n_rows - 1u;
         g->ring_dep_hi[cb] = g->proj_ring_hi;
