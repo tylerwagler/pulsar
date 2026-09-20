@@ -701,6 +701,18 @@ public:
                  "largest %d tokens is not a byte prefix of this %zu-byte prompt "
                  "(client re-rendered the shared preamble)",
                  log_name(), eligible, rejected_tokens, prompt_bytes);
+        } else if (best >= 0 && rejected_tokens > (int)kc_.entry[best].tokens) {
+            /* A LONGER checkpoint was eligible and was NOT a byte prefix, so this
+             * request resumes from a shorter one.  That is a different situation
+             * from "the cache was cold": it means the client re-rendered the
+             * preamble somewhere below the longest checkpoint, and the resume
+             * point -- hence the prefill cost -- is decided here.  Silent before,
+             * which is how a resume grid point chosen from a shorter prefix went
+             * unexplained while we were looking for a 62k-token resume. */
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                 "%s: kv cache text-prefix: chose %u tokens, but %d tokens was eligible "
+                 "and is not a byte prefix of this %zu-byte prompt (re-rendered below it)",
+                 log_name(), (unsigned)kc_.entry[best].tokens, rejected_tokens, prompt_bytes);
         }
         return best;
     }
