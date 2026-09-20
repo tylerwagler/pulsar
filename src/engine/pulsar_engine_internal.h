@@ -1117,6 +1117,14 @@ typedef struct {
      * a stale hi -- a ghost position's deposit -- can never be read back. */
     uint32_t proj_ring_lo;   ///< first position the ring still covers
     uint32_t proj_ring_hi;   ///< one past the newest; lo == hi means empty
+    /** L226 DIAGNOSTIC: per-bank rows deposited into the ring and the newest
+     * position deposited.  A rewind refusal prints these so a reader can tell
+     * "the ring never saw the generated region" from "the ring is empty on this
+     * bank" from "the span is right but the stash is missing" without a
+     * rebuild-and-diff.  Counters, not state: nothing reads them but the
+     * message. */
+    uint64_t ring_dep_rows[PULSAR_MSEQ_MAX];
+    uint64_t ring_dep_last[PULSAR_MSEQ_MAX];
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the

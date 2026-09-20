@@ -834,6 +834,8 @@ static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32
     if (*hi != pos) *lo = pos;
     *hi = pos + 1u;
     if (*lo + PULSAR_REWIND_RING_DEPTH < *hi) *lo = *hi - PULSAR_REWIND_RING_DEPTH;
+    g->ring_dep_rows[bank] += 1u;
+    g->ring_dep_last[bank] = pos;
     return true;
 }
 
@@ -879,6 +881,11 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
     g->proj_ring_hi = pos0 + n_rows;
     if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
         g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
+    {
+        const uint32_t cb = gpu_graph_cur_bank(g);
+        g->ring_dep_rows[cb] += n_rows;
+        g->ring_dep_last[cb] = pos0 + n_rows - 1u;
+    }
     return true;
 }
 
@@ -1230,15 +1237,34 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * wrong and nothing would say so, so refuse there too -- a rebuild is
              * slower, a silent wrong row is not acceptable. */
             if (pos % ratio != 0u || g->ms_emit_keep[bank] != pos / ratio + 1u) {
-                /* The span and the stash are what decide this, so say them: a
-                 * reader can tell "the ring never covered it" from "the ring is
-                 * empty on this bank" from "the stash is missing" without a
-                 * rebuild-and-diff. */
-                fprintf(stderr, "pulsar: kv source %u: rewind to %u is not covered by the projection "
-                                "ring (mid-group or no boundary stash at that row) -- refusing "
-                                "[ratio %u, phase %u, ring %u..%u, emit_keep %u want %u, bank %u]\n",
-                        il, pos, ratio, pos % ratio, g->proj_ring_lo, g->proj_ring_hi,
-                        g->ms_emit_keep[bank], pos / ratio + 1u, bank);
+                /* The span and the stash are what decide this, so say them -- and
+                 * say the TARGET BANK's own span and its deposit count beside the
+                 * installed bank's, because the coverage test above reads the
+                 * installed pair: a reader can then tell "the ring never covered
+                 * it" from "the ring is empty on this bank" from "the span is
+                 * right but the stash is missing" from "the refusal is about the
+                 * wrong bank's ring" from "the rows went to the wrong bank",
+                 * without a rebuild-and-diff.  deptot is the sum over banks: it
+                 * rises whenever ANY deposit ran, so deptot flat across a whole
+                 * generated region means the fused lane never deposited at all. */
+                {
+                    uint64_t deptot = 0;
+                    for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) deptot += g->ring_dep_rows[b];
+                    const uint32_t cb = gpu_graph_cur_bank(g);
+                    fprintf(stderr, "pulsar: kv source %u: rewind to %u is not covered by the projection "
+                                    "ring (mid-group or no boundary stash at that row) -- refusing "
+                                    "[ratio %u, phase %u, ring %u..%u, emit_keep %u want %u, bank %u, "
+                                    "cur %u, bankring %u..%u, dep %llu last %llu, curdep %llu curlast %llu, "
+                                    "deptot %llu]\n",
+                            il, pos, ratio, pos % ratio, g->proj_ring_lo, g->proj_ring_hi,
+                            g->ms_emit_keep[bank], pos / ratio + 1u, bank,
+                            cb, g->ms_proj_ring_lo[bank], g->ms_proj_ring_hi[bank],
+                            (unsigned long long)g->ring_dep_rows[bank],
+                            (unsigned long long)g->ring_dep_last[bank],
+                            (unsigned long long)g->ring_dep_rows[cb],
+                            (unsigned long long)g->ring_dep_last[cb],
+                            (unsigned long long)deptot);
+                }
                 return false;
             }
             stale = true;
