@@ -1174,26 +1174,22 @@ bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
 
 
 
-/* L120 value half: rebuild an OVERLAPPING compressor's state lane for position
- * `pos` from the projection ring.  The row for the group that ENDS at or after
- * `pos` is pooled from that group's tokens AND the group before them, so the
- * carry half holds the previous group's projection rows -- which no reset can
- * supply and the verify saves do not cover (they span one spec round).  The ring
- * is the retained copy: re-store [ratio*(pos/ratio - 1), pos) through the same
- * store kernel the live path used and shift at the group close, and both halves
- * come back byte for byte.
+/* Replay the ring's rows for [start, pos) through the store kernel into this
+ * bank's compressor lanes, so they hold exactly what the live path had written
+ * for those positions.  The caller has already reset the lane (PASS 1 in
+ * gpu_graph_compressor_state_rewind) and checked that the ring COVERS the span;
+ * both are required.
  *
- * Returns false when the ring's covered span does not hold that range -- a fresh,
- * forked or spilled bank, or positions that were never deposited -- and the
- * caller degrades to the counter clamp, which is what this did before the ring
- * existed.  Both lanes (attention and, on a V4 source, the indexer's own) are
- * rebuilt, because both carry the same overlap. */
-static bool gpu_graph_overlap_rewind_layer(pulsar_gpu_graph *g, uint32_t il,
-                                           uint32_t bank, uint32_t pos) {
+ * Why this rebuilds either coff exactly: the pending group is a SLOT ARRAY
+ * indexed by phase -- csa2_compressor_store_kernel's own words, "coff 1: the
+ * lane IS the group; slot = pos % ratio.  No pooling, no shift" -- so storing a
+ * group's rows into a canonical lane reproduces the group, and the shift at a
+ * close is what an overlap additionally needs.  Both lanes (attention, and on a
+ * V4 source the indexer's own) are replayed together, because one source
+ * produces both. */
+static bool proj_ring_replay_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+                                   uint32_t start, uint32_t pos) {
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    if (pos < ratio) return false;
-    const uint32_t start = ratio * (pos / ratio - 1u);
-    if (start < g->proj_ring_lo || pos > g->proj_ring_hi) return false;
     pulsar_gpu_tensor *st_kv = gpu_graph_bank_attn_state_kv_view(g, il, bank);
     pulsar_gpu_tensor *st_sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
     bool own_index = g_pulsar_shape.indexer_own_compressor &&
@@ -1237,6 +1233,28 @@ static bool gpu_graph_overlap_rewind_layer(pulsar_gpu_graph *g, uint32_t il,
     pulsar_gpu_tensor_free(st_sc);
     pulsar_gpu_tensor_free(st_kv);
     return ok;
+}
+
+/* L120 value half: rebuild an OVERLAPPING compressor's state lane for position
+ * `pos` from the projection ring.  The row for the group that ENDS at or after
+ * `pos` is pooled from that group's tokens AND the group before them, so the
+ * carry half holds the previous group's projection rows -- which no reset can
+ * supply and the verify saves do not cover (they span one spec round).  The ring
+ * is the retained copy: re-store [ratio*(pos/ratio - 1), pos) through the same
+ * store kernel the live path used and shift at the group close, and both halves
+ * come back byte for byte.
+ *
+ * Returns false when the ring's covered span does not hold that range -- a fresh,
+ * forked or spilled bank, or positions that were never deposited -- and the
+ * caller degrades to the counter clamp, which is what this did before the ring
+ * existed. */
+static bool gpu_graph_overlap_rewind_layer(pulsar_gpu_graph *g, uint32_t il,
+                                           uint32_t bank, uint32_t pos) {
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (pos < ratio) return false;
+    const uint32_t start = ratio * (pos / ratio - 1u);
+    if (start < g->proj_ring_lo || pos > g->proj_ring_hi) return false;
+    return proj_ring_replay_layer(g, il, bank, start, pos);
 }
 
 bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos) {
@@ -1333,8 +1351,21 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         }
         const uint32_t phase = pos % ratio;
         if (phase == 0u) continue;   /* a group boundary: the empty group IS the state */
-        /* the group's committed positions [pos - phase, pos) must be saved */
+        /* the group's committed positions [pos - phase, pos) */
         const uint32_t first = pos - phase;
+        /* A coff-1 lane holds its group in phase-indexed slots, so the group's
+         * OWN rows rebuild it from the canonical lane PASS 1 left -- the same
+         * replay an overlapping source uses, over [first, pos) instead of the
+         * previous group.  Tried BEFORE the verify saves because it spans the
+         * whole group while the saves span one spec round: this is what repairs a
+         * mid-group rewind that no spec round covers (L120's probe rewinds 606 ->
+         * 603 on a ratio-128 source, whose group [512,640) the ring holds in full
+         * and the saves do not).  Only if the ring misses the span do the saves
+         * get their turn, and only if they miss it too is the lane honestly
+         * stale. */
+        if (first >= g->proj_ring_lo && pos <= g->proj_ring_hi &&
+            proj_ring_replay_layer(g, il, bank, first, pos))
+            continue;
         const uint32_t s0 = g->ms_spec_save_pos0[bank], sn = g->ms_spec_save_rows[bank];
         if (sn == 0u || first < s0 || pos > s0 + sn || !g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) {
             fprintf(stderr, "pulsar: kv source %u: rewind to %u has no verify saves to rebuild the "
