@@ -252,9 +252,10 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
+	./tests/expert_table_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -429,6 +430,16 @@ tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
 # reservation in the field.  Removing the clamp fails this gate.
 tests/moe_route_bounds_gate: tests/moe_route_bounds_gate.cu Makefile \
                              src/cuda/pulsar_cuda_moe_pairs.cu src/cuda/pulsar_cuda_internal.h
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE's contract.  Model-free:
+# it includes the table's TU and pins the arithmetic every consumer used to do
+# itself, the one-table-per-stack cache identity, the refusal on bad input, and
+# the type-44 layout against the shipped artifact's OWN tensor size.  A wrong
+# expert address looks like fluent text, which is why this is a gate and not a
+# comment (plan s4.1).
+tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
+                         src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
@@ -2049,7 +2060,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
