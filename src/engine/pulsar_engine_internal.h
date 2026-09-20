@@ -3458,12 +3458,21 @@ static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ra
  *  score -INF): their state at any even position. */
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank);
 /** L218: make a bank's compressor state describe position `pos` after a
- *  rewind.  At a group boundary that is the empty group.  Inside a group the
- *  pending slots are re-stored from the last verify round's saved projections
- *  when they cover the group's committed positions; otherwise the state is
- *  reset and the bank marked stale (see ms_comp_state_stale).  Returns false
- *  only on a device failure. */
-bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos);
+ *  rewind FROM `prev_pos` (the length the session held before it; the caller
+ *  has already clamped the frontier counters).  At a group boundary that is the
+ *  empty group.  Inside a group the pending slots are rebuilt from the
+ *  PROJECTION RING -- a coff-2 (overlapping) source replays the previous group
+ *  plus the straddled rows -- falling back to the last verify round's saved
+ *  projections when the ring misses the span; a coff-1 source has no ring, so a
+ *  rewind that stays inside the group its lane is already FILLING keeps that
+ *  group's committed slots and clears only the rest (`prev_pos` is what says
+ *  so), and one that crosses a group boundary needs the saves.  Only when a
+ *  needed rebuild has no source is the state reset and the bank marked stale
+ *  (see ms_comp_state_stale).  Returns false on a device failure, and for an
+ *  overlapping boundary that has neither ring coverage nor an armed boundary
+ *  stash. */
+bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos,
+                                       uint32_t prev_pos);
 /** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
  * spec_logits rows [row0, row0+n_rows) and read the compact block into
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to

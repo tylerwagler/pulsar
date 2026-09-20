@@ -1721,6 +1721,12 @@ void pulsar_session::rewind(int pos) {
     auto *s = this;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    /* The length BEFORE this rewind: the compressor-state rebuild needs it to
+     * tell a rewind that stays inside the group a coff-1 lane is already filling
+     * (its committed slots are still valid and must be KEPT) from one that
+     * crosses a group boundary (those slots belong to a newer group and the
+     * group's rows must be rebuilt).  See gpu_graph_compressor_state_rewind. */
+    const uint32_t prev_len = (uint32_t)s->checkpoint.len;
     /* The image blocks above the new end are gone from the live KV: their
      * identity must go with them or a later request could reuse rows that no
      * longer exist (L226). */
@@ -1756,7 +1762,7 @@ void pulsar_session::rewind(int pos) {
      * last verify round's saved projections (the two callers that land here
      * -- the spec trim and the server's ghost rewind -- stay inside that
      * round), else the bank is marked stale and refuses a mid-group store. */
-    if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, (uint32_t)pos)) {
+    if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, (uint32_t)pos, prev_len)) {
         /* L226: the compressor produces its rows on PREFILL, so a rewind into the
          * GENERATED region -- above the last prefill frontier -- has no rows to
          * rebuild from and cannot be re-established.  Invalidating the whole
@@ -1784,7 +1790,7 @@ void pulsar_session::rewind(int pos) {
             if (cand <= 0) break;
             const uint32_t floor = (uint32_t)((cand / (int)PULSAR_RESUME_GRID) * (int)PULSAR_RESUME_GRID);
             if (floor == 0u || floor >= (uint32_t)pos) continue;
-            if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, floor)) continue;
+            if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, floor, prev_len)) continue;
             s->checkpoint.len = (int)floor;
             s->prefill_frontier = (int)floor;
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

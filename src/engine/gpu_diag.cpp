@@ -1117,7 +1117,8 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
  * cold prefill that ends on an even position leaves.  A rewound or forked bank
  * holds whatever its frontier left; reset it so the continuation's state is
  * the cold prefill's byte for byte.  Ratio-1 sources keep no state. */
-static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+static bool compressor_state_reset_layer_from(pulsar_gpu_graph *g, uint32_t il,
+                                              uint32_t bank, uint32_t from_row) {
     {
         pulsar_gpu_tensor *kv, *sc; uint64_t off, lane;
         if (g->banks.n_banks) {
@@ -1129,18 +1130,26 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
             lane = kv ? pulsar_gpu_tensor_bytes(kv) : 0; off = 0;
         }
         if (!kv || !sc || lane == 0) return false;
-        pulsar_gpu_tensor *vk = pulsar_gpu_tensor_view(kv, off, lane);
-        pulsar_gpu_tensor *vs = pulsar_gpu_tensor_view(sc, off, lane);
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        const uint64_t skip = (uint64_t)from_row *
+                              pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM) * sizeof(float);
+        if (skip >= lane) return true;                 /* nothing at or above the target row */
+        pulsar_gpu_tensor *vk = pulsar_gpu_tensor_view(kv, off + skip, lane - skip);
+        pulsar_gpu_tensor *vs = pulsar_gpu_tensor_view(sc, off + skip, lane - skip);
         const bool ok = vk && vs &&
-                        gpu_tensor_fill_f32(vk, 0.0f, lane / sizeof(float)) &&
-                        gpu_tensor_fill_f32(vs, PULSAR_NEG_INF, lane / sizeof(float));
+                        gpu_tensor_fill_f32(vk, 0.0f, (lane - skip) / sizeof(float)) &&
+                        gpu_tensor_fill_f32(vs, PULSAR_NEG_INF, (lane - skip) / sizeof(float));
         pulsar_gpu_tensor_free(vk);
         pulsar_gpu_tensor_free(vs);
         if (!ok) { fprintf(stderr, "pulsar: compressor state reset failed at layer %u\n", il); return false; }
         /* V4: the indexer's own compressor is a SECOND recurrent lane with the
          * same empty group (kv 0 / score -INF).  It lives only on an indexed
          * ratio-4 source, and leaving it unreset would carry a stale slot into
-         * the next bank that uses this one. */
+         * the next bank that uses this one.  NOTE this stays a FULL reset: a
+         * partial reset is asked for only by the coff-1 path (see
+         * compressor_state_reset_layer_from's caller), and the index twin is a
+         * ratio-4 (coff-2) lane, so no coff-1 source has one to keep.  If that
+         * ever stops being true, this needs from_row too. */
         if (g->banks.n_banks) {
             pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, bank);
             pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, bank);
@@ -1161,6 +1170,11 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
         }
     }
     return true;
+}
+
+/* The whole lane: the canonical empty group from row 0. */
+static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return compressor_state_reset_layer_from(g, il, bank, 0u);
 }
 
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
@@ -1257,7 +1271,8 @@ static bool gpu_graph_overlap_rewind_layer(pulsar_gpu_graph *g, uint32_t il,
     return proj_ring_replay_layer(g, il, bank, start, pos);
 }
 
-bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos) {
+bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos,
+                                       uint32_t prev_pos) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return false;
     g->ms_comp_state_stale[bank] = false;
     bool stale = false;
@@ -1271,6 +1286,26 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
      * pre-ring engine did and what the rewind gates encode as correct. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        const uint32_t phase = ratio ? pos % ratio : 0u;
+        /* KEEP what a coff-1 lane already holds for the group it is FILLING.  A
+         * coff-1 lane IS its group's phase-indexed slots, so when the rewind
+         * stays inside that group (`pos` and `prev_pos` share a group) the slots
+         * below the target's phase are the group's own committed rows -- exactly
+         * what the rebuild would have produced -- and only the ones from the
+         * phase up can hold a ghost row (L124), so only those are cleared.
+         *
+         * Resetting the whole lane here was what made a repairable mid-group
+         * rewind unrebuildable: no ring is allocated for a coff-1 source (see
+         * the alloc site's "coff 1 gets none") and the verify saves span one spec
+         * round, so the lane came back EMPTY and the bank was marked stale --
+         * then the next mid-group store refused and the step died mid-sweep
+         * (L120's probe). */
+        if (phase != 0u && pulsar_compress_coff(ratio) == 1u &&
+            pos / ratio == prev_pos / ratio) {
+            if (!compressor_state_reset_layer_from(g, il, bank, phase)) return false;
+            continue;
+        }
         if (!compressor_state_reset_layer(g, il, bank)) return false;
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -1351,21 +1386,13 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
         }
         const uint32_t phase = pos % ratio;
         if (phase == 0u) continue;   /* a group boundary: the empty group IS the state */
-        /* the group's committed positions [pos - phase, pos) */
         const uint32_t first = pos - phase;
-        /* A coff-1 lane holds its group in phase-indexed slots, so the group's
-         * OWN rows rebuild it from the canonical lane PASS 1 left -- the same
-         * replay an overlapping source uses, over [first, pos) instead of the
-         * previous group.  Tried BEFORE the verify saves because it spans the
-         * whole group while the saves span one spec round: this is what repairs a
-         * mid-group rewind that no spec round covers (L120's probe rewinds 606 ->
-         * 603 on a ratio-128 source, whose group [512,640) the ring holds in full
-         * and the saves do not).  Only if the ring misses the span do the saves
-         * get their turn, and only if they miss it too is the lane honestly
-         * stale. */
-        if (first >= g->proj_ring_lo && pos <= g->proj_ring_hi &&
-            proj_ring_replay_layer(g, il, bank, first, pos))
-            continue;
+        /* PASS 1 kept this group's own slots and cleared the rest, because the
+         * rewind stayed inside the group the lane was filling -- so the lane
+         * already describes `pos` and there is nothing to rebuild.  No ring is
+         * allocated for a coff-1 source and the verify saves span one spec round,
+         * which is why this arm, and not a rebuild, is what repairs it. */
+        if (pos / ratio == prev_pos / ratio) continue;
         const uint32_t s0 = g->ms_spec_save_pos0[bank], sn = g->ms_spec_save_rows[bank];
         if (sn == 0u || first < s0 || pos > s0 + sn || !g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) {
             fprintf(stderr, "pulsar: kv source %u: rewind to %u has no verify saves to rebuild the "
