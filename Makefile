@@ -200,7 +200,7 @@ help:
 	@echo "  make cuda-attn-gates     fp16 attention correctness gates: kernel oracle,"
 	@echo "                           banked KV-leak isolation, one-row launch (modelless)"
 	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
-	@echo "                           FRONTIER_MODEL=./ds4flash.gguf by default)"
+	@echo "                           FRONTIER_MODEL=$(FRONTIER_MODEL) by default)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
 	@echo "                           throughput at N=1..3 (needs the model)"
 	@echo "  make cuda-multiseq-gate-nodspark"
@@ -608,7 +608,20 @@ seam-check:
 # on the GB10, not part of `make test`.  Discipline before running: no
 # pulsar-server/pulsar_test process, `sync; echo 3 > /proc/sys/vm/drop_caches`,
 # check `free -g` headroom (the model is ~87 GB).
-FRONTIER_MODEL ?= ./ds4flash.gguf
+#
+# VISION-EXP, not 0731 (2026-09-21, Tyler: "we should NOT be using that as the
+# battery model.  we haven't been using that model in a long time").  The
+# default was `./ds4flash.gguf`, a symlink to the 0731 REAP25 artifact
+# `v5mx4-0731-srcfmt-v1-reapfix-lt.gguf` -- superseded, and overridden with
+# `FRONTIER_MODEL=` on every recent battery anyway, so the default named a model
+# nothing ran.  It was not harmless: the prefill-baseline comment below records a
+# blob dumped through the `ds4flash.gguf` symlink silently comparing two
+# DIFFERENT artifacts' logits whenever the battery named the Vision-Exp one,
+# reporting 129280/129280 differing at every depth -- a FAIL with no information
+# in it.  Naming the served artifact makes the default and the practice one fact.
+# This one variable is the battery's model authority: `unit-test-gate` and
+# `unit-test-gate-server` both pass it as PULSAR_TEST_MODEL.
+FRONTIER_MODEL ?= /srv/models/v5-vexp-full256-iq2-t46.gguf
 # 3 banks, not 2: clause (c) binds the graph's device views to an idle third
 # bank while the two-bank step runs, so a frontier access that resolves
 # through cur_bank has somewhere to land that the step must not touch.
@@ -1046,14 +1059,20 @@ PREFILL_BASELINE_REF ?= f5bea7aa
 #
 # ⚠ A BLOB IS ONLY MEANINGFUL FOR THE ARTIFACT IT WAS DUMPED ON (L218 s124).
 # The header pins the logits width and the prompt FNV -- NOT the weights -- so a
-# blob dumped through the `ds4flash.gguf` symlink (on sparky:
-# /srv/models/v5mx4-0731-srcfmt-v1-reapfix-lt.gguf) silently compared two
-# different 0731 artifacts' logits whenever the battery ran FRONTIER_MODEL=
-# /srv/models/v5-vexp-full256-iq2-t46.gguf, reporting 129280/129280 differing at
-# every depth -- a FAIL with no information in it.  The 684fa8d blob stays in
-# the tree for the ds4flash.gguf artifact it documents; f5bea7aa is the
-# Vision-Exp artifact the battery names, and it was dumped by ~/devref-clean's
-# own binary so the anchor is still the REFERENCE engine, not this branch.
+# blob dumped through a DIFFERENT artifact silently compared two models' logits,
+# reporting 129280/129280 differing at every depth -- a FAIL with no information
+# in it.  Specifically: `ds4flash.gguf` used to symlink to the 0731 REAP25
+# artifact while the battery named the Vision-Exp one.
+#
+# RESOLVED 2026-09-21, and this is now structural rather than a warning.  The
+# 0731 artifact is deleted, `FRONTIER_MODEL` names the Vision-Exp artifact
+# directly (no symlink indirection), and the `ds4flash.gguf` symlink points at
+# that same file -- so the default, the battery's model and the symlink are ONE
+# fact and the trap cannot be re-entered by taking a different route to the
+# default.  The 684fa8d blob documents the deleted 0731 artifact and is kept as
+# history; it is not the baseline for anything this tree runs now.  f5bea7aa is
+# the Vision-Exp blob the battery names, dumped by ~/devref-clean's own binary
+# so the anchor is still the REFERENCE engine, not this branch.
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
 # PLAN 94 phase 1 (L217): the SAME gate on the OTHER artifact, deliberately.
 # The battery's FRONTIER_MODEL (Vision-Exp v5-vexp-full256-iq2-t46) has NO
@@ -1064,7 +1083,16 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 # main-model type-40 layers (47 tensors, 42.23 GiB), and the blob is the
 # committed 684fa8d one -- the same artifact at an OLDER anchor than the
 # battery's, which is the stronger comparison of the two.
-TYPE40_GATE_MODEL       ?= /srv/models/v5mx4-0731-srcfmt-v1-reapfix-lt.gguf
+#
+# DEFAULT REMOVED 2026-09-21: the only artifact that satisfied this was the 0731
+# reapfix, which is superseded and now deleted, so the default named a file that
+# does not exist.  Unset is the HONEST state and the target already handles it --
+# it SKIPs and prints "NO type-40 CUTLASS MXFP4 expert coverage in this run",
+# which is exactly true today: the Vision-Exp battery model has all 43 routed
+# layers at type 44.  Point this at a type-40-bearing artifact when one exists
+# (promoting Vision-Exp layers to CUTLASS_MXFP4 is what will create it, and the
+# blob must then be re-recorded on that artifact's own anchor).
+TYPE40_GATE_MODEL       ?=
 PREFILL_TYPE40_BASELINE ?= tests/test-vectors/prefill_bitexact_baseline-684fa8d.bin
 PREFILL_TYPE40_BASELINE_REF_SHORT := 684fa8d
 # L181: the decode-step twin -- one classic decode after each UNALIGNED prefill
@@ -1149,11 +1177,19 @@ cuda-prefill-gate-type40:
 	@if [ ! -f "$(TYPE40_GATE_MODEL)" ]; then \
 		echo "SKIP cuda-prefill-gate-type40: $(TYPE40_GATE_MODEL) is not on this box --"; \
 		echo "     NO type-40 CUTLASS MXFP4 expert coverage in this run."; \
-		exit 0; \
+	else \
+		set -e; \
+		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
+		./tests/prefill_bitexact_gate $(TYPE40_GATE_MODEL) --check $(PREFILL_TYPE40_BASELINE) \
+			$(PREFILL_TYPE40_BASELINE_REF_SHORT); \
 	fi
-	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
-	./tests/prefill_bitexact_gate $(TYPE40_GATE_MODEL) --check $(PREFILL_TYPE40_BASELINE) \
-		$(PREFILL_TYPE40_BASELINE_REF_SHORT)
+# NOTE the shape above (2026-09-21): the conditional WRAPS the recipe.  It used
+# to be `@if ...; then echo SKIP; exit 0; fi` followed by the build and the run as
+# SEPARATE recipe lines, and that does not skip anything -- `exit 0` ends only
+# that one recipe line's shell, so the next line ran anyway and the gate graded
+# an EMPTY model path.  It never showed because the model always existed, so the
+# branch had never executed; removing the 0731 default is what fired it.  Any
+# future SKIP in this file must wrap, not precede.
 
 # L181: decode-step byte gate (see PREFILL_DECODE_BASELINE above).
 cuda-prefill-decode-gate:
