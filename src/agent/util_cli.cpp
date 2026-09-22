@@ -148,7 +148,7 @@ void usage(FILE *fp, const char *topic) {
 agent_config parse_options(int argc, char **argv) {
     agent_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "model",
             /* agent's per-token DSML/forcing loop can't consume speculative
              * chunks yet; disable the merged drafter until that is wired */
             .dspark_disable = true,

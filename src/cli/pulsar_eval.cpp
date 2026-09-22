@@ -1578,7 +1578,7 @@ static void usage(FILE *fp, const char *topic) {
 
 static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "model",
         .backend = default_backend(),
         .max_tokens = 16000,
         .top_p = PULSAR_DEFAULT_TOP_P,

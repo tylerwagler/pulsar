@@ -303,17 +303,24 @@ static const char *resolve_gguf_at(const char *dir, const char *name) {
     return NULL;
 }
 
-/* Naming convention: gguf/ holds immutable versioned artifacts
- * (ds4flash-<variant>-<mods>-vN.gguf) plus an ACTIVE-POINTER symlink —
- * model.gguf — that selects what a bare `pulsar-server` runs (the drafter
- * ships merged in the artifact, so there is no separate dspark pointer).
- * Deploy = repoint the symlink. */
-static const char *resolve_default_gguf(const char *pointer) {
-    const char *p;
-    if ((p = resolve_gguf_at("gguf", pointer)) != NULL) return p;
-    if (access(pointer, R_OK) == 0) return pointer;
+/* Naming convention: an ACTIVE-POINTER symlink selects what a bare
+ * `pulsar-server` runs (the drafter ships merged in the checkpoint, so there is
+ * no separate dspark pointer).  Deploy = repoint the symlink.
+ *
+ * The pointer used to be `gguf/model.gguf`, and this looked for a GGUF.  The
+ * engine reads a safetensors checkpoint -- a shard directory or a single file --
+ * so the pointer is `model` (or `model.safetensors`) beside the working
+ * directory, then in $PULSAR_MODEL_DIR.  The old name is deliberately NOT kept
+ * as a fallback: resolving a GGUF would only defer the refusal to the engine,
+ * which names the format and what to do about it. */
+static const char *resolve_default_model(void) {
+    static const char *const pointers[] = { "model", "model.safetensors" };
     const char *dir = getenv("PULSAR_MODEL_DIR");
-    if (dir && dir[0] && (p = resolve_gguf_at(dir, pointer)) != NULL) return p;
+    for (size_t i = 0; i < sizeof(pointers) / sizeof(pointers[0]); i++) {
+        const char *p;
+        if (access(pointers[i], R_OK) == 0) return pointers[i];
+        if (dir && dir[0] && (p = resolve_gguf_at(dir, pointers[i])) != NULL) return p;
+    }
     return NULL;
 }
 
@@ -399,7 +406,7 @@ static void server_resolve_kv_disk_dir(server_config *c) {
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "model",
             .backend = default_server_backend(),
         },
         .host = "0.0.0.0",
@@ -418,6 +425,10 @@ static server_config parse_options(int argc, char **argv) {
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    /* Did -m/--model name a path?  The default below is a POINTER name, and
+     * resolving it is skippable only if the user said nothing -- keying that on
+     * a filename literal is what this replaced. */
+    bool defaulted_model_path = true;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -428,6 +439,7 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+            defaulted_model_path = false;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--dspark-draft")) {
@@ -478,12 +490,13 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
-    /* Production defaults: when -m/--dspark are not given, resolve the
-     * canonical ggufs (cwd first, then the model store) so a bare
-     * `pulsar-server` is the full validated launch. */
-    if (!strcmp(c.engine.model_path, "ds4flash.gguf") &&
-        access(c.engine.model_path, R_OK) != 0) {
-        const char *m = resolve_default_gguf("model.gguf");
+    /* Production defaults: when -m is not given, resolve the active-pointer
+     * checkpoint (cwd first, then the model store) so a bare `pulsar-server` is
+     * the full validated launch.  Keyed on the DEFAULT, not on a filename --
+     * this used to compare against the literal "ds4flash.gguf", so passing that
+     * name explicitly silently triggered the default resolution. */
+    if (defaulted_model_path) {
+        const char *m = resolve_default_model();
         if (m) {
             c.engine.model_path = m;
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: default model %s", m);

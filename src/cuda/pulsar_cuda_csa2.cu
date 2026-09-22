@@ -216,14 +216,27 @@ __global__ static void csa2_compressor_store_kernel(
 }
 
 static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64_t norm_offset,
-                              uint32_t norm_type, uint32_t head_dim, const void **norm_w) {
+                              uint32_t norm_type, uint32_t head_dim, const void **norm_w,
+                              const char **why) {
+    const char *w = NULL;
     /* The compressor norm ships F32 or BF16 (the source format). */
-    if (!model_map || (norm_type != PULSAR_TENSOR_F32 && norm_type != PULSAR_TENSOR_BF16) ||
-        head_dim == 0 || head_dim > 1024u) return false;
+    if (!model_map)                 w = "no mapping for the compressor norm";
+    else if (norm_type != PULSAR_TENSOR_F32 && norm_type != PULSAR_TENSOR_BF16)
+                                    w = "compressor norm is neither f32 nor bf16";
+    else if (head_dim == 0)         w = "head_dim is 0";
+    else if (head_dim > 1024u)      w = "head_dim exceeds 1024";
+    if (w) { if (why) *why = w; return false; }
     const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_type == PULSAR_TENSOR_BF16);
-    if (norm_offset > model_size || norm_bytes > model_size - norm_offset) return false;
+    /* The norm must lie INSIDE the mapping it was resolved against: the offset
+     * is relative to that mapping, so a positive difference here means the
+     * tensor and its mapping were paired wrongly, not that the file is short. */
+    if (norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        if (why) *why = "compressor norm lies outside its own mapping";
+        return false;
+    }
     *norm_w = cuda_model_range_ptr(model_map, norm_offset, norm_bytes, "attn_compressor_norm");
-    return *norm_w != NULL;
+    if (!*norm_w) { if (why) *why = "compressor norm could not be resolved to device bytes"; return false; }
+    return true;
 }
 
 static int csa2_pool_norm_launch(float *latent, const float *kv, const float *sc,
@@ -333,10 +346,18 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
         uint32_t                n_tokens,
         float                   rms_eps) {
     const void *norm_w = NULL;
-    if (!latent || !kv || ratio == 0 || n_tokens == 0 ||
-        !csa2_norm_args_ok(model_map, model_size, norm_offset, norm_type, head_dim, &norm_w)) {
-        fprintf(stderr, "pulsar: csa2 compressor prefill: bad arguments (ratio %u, n_tokens %u, norm type %u) -- refusing\n",
-                ratio, n_tokens, norm_type);
+    const char *why = NULL;
+    if (!latent)      why = "no staging buffer for the latent";
+    else if (!kv)     why = "no compressed-KV source buffer";
+    else if (ratio == 0)    why = "compression ratio is 0";
+    else if (n_tokens == 0) why = "no tokens";
+    else csa2_norm_args_ok(model_map, model_size, norm_offset, norm_type, head_dim, &norm_w, &why);
+    if (why) {
+        fprintf(stderr, "pulsar: csa2 compressor prefill: refusing -- %s "
+                        "(ratio %u, n_tokens %u, norm type %u, head_dim %u, "
+                        "norm offset %llu in a %llu-byte mapping)\n",
+                why, ratio, n_tokens, norm_type, head_dim,
+                (unsigned long long)norm_offset, (unsigned long long)model_size);
         return 0;
     }
     if (pos0 % ratio != 0u) {
@@ -441,9 +462,18 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         int                    *emitted) {
     const void *norm_w = NULL;
     if (emitted) *emitted = 0;
-    if (!latent || !kv_cur || !emitted || ratio == 0 ||
-        !csa2_norm_args_ok(model_map, model_size, norm_offset, norm_type, head_dim, &norm_w)) {
-        fprintf(stderr, "pulsar: csa2 compressor update: bad arguments (ratio %u, norm type %u) -- refusing\n", ratio, norm_type);
+    const char *why = NULL;
+    if (!latent)            why = "no latent buffer";
+    else if (!kv_cur)       why = "no compressed-KV source buffer";
+    else if (!emitted)      why = "no emitted flag";
+    else if (ratio == 0)    why = "compression ratio is 0";
+    else csa2_norm_args_ok(model_map, model_size, norm_offset, norm_type, head_dim, &norm_w, &why);
+    if (why) {
+        fprintf(stderr, "pulsar: csa2 compressor update: refusing -- %s "
+                        "(ratio %u, norm type %u, head_dim %u, norm offset %llu "
+                        "in a %llu-byte mapping)\n",
+                why, ratio, norm_type, head_dim,
+                (unsigned long long)norm_offset, (unsigned long long)model_size);
         return 0;
     }
     const uint32_t coff = pulsar_compress_coff(ratio);

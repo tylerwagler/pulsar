@@ -815,16 +815,12 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
             m->max_tensor_bytes = m->tensors[i].bytes;
         }
     }
-    /* The checkpoint's footprint is the shards, not m->size -- m->size is ONE
-     * shard (the primary, for the helpers that take a default mapping), so
-     * reporting it here said "0.88 GiB mapped" for a 92 GB model.  model_summary
-     * already sums them; this line did not. */
-    uint64_t mapped_bytes = 0;
-    for (uint64_t i = 0; i < m->n_shards; i++) mapped_bytes += m->shard_size[i];
+    m->mapped_bytes = 0;
+    for (uint64_t i = 0; i < m->n_shards; i++) m->mapped_bytes += m->shard_size[i];
     fprintf(stderr, "pulsar: safetensors model: %llu shards, %llu tensors, "
                     "%.2f GiB mapped, %llu metadata keys\n",
             (unsigned long long)m->n_shards, (unsigned long long)m->n_tensors,
-            (double)mapped_bytes / 1073741824.0, (unsigned long long)m->n_kv);
+            (double)m->mapped_bytes / 1073741824.0, (unsigned long long)m->n_kv);
 
     /* PULSAR_VERIFY_TENSORS=<name prefix>: hash the bytes the KERNELS will read
      * (tensor_map_base(m,t) + t->abs_offset) for every tensor under that

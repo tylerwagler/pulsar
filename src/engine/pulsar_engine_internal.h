@@ -599,7 +599,17 @@ typedef struct {
 typedef struct {
     int fd;                 ///< open file descriptor backing the mapping
     const uint8_t *map;     ///< base of the read-only mapping
-    uint64_t size;          ///< mapped bytes
+    /** The PRIMARY mapping's length.  This is the whole file for a one-file
+     * model, and ONE SHARD for a safetensors checkpoint -- so it is NOT the
+     * model's footprint.  Anything accounting for the model's memory must use
+     * mapped_bytes; `size` is only for code that has already resolved which
+     * mapping it means (tensor_map_size falls back to it). */
+    uint64_t size;
+    /** Every shard's length summed: the checkpoint's mapped footprint.  This is
+     * what the admission budget, --inspect and the load banner report; before
+     * it existed all three disagreed, and the budget was the one that mattered
+     * (it read one shard, 0.88 GiB, and over-stated the budget by ~85 GiB). */
+    uint64_t mapped_bytes;
 
     uint32_t version;       ///< GGUF format version
     uint64_t n_kv;          ///< metadata key/value pair count

@@ -624,14 +624,21 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
 uint64_t pulsar_engine::weights_resident_bytes() {
     auto *e = this;
     if (!e) return 0;
-    /* The GGUF(s) are mmap'd read-only and shared across every session, so this
-     * is a single resident copy competing with per-session KV for the unified
-     * memory budget.  A merged/embedded drafter lives inside e->model and is
-     * already counted; an external drafter and an expert overlay map their own
-     * files and are added when present. */
-    uint64_t bytes = e->model.size;
-    if (e->dspark_ready && e->dspark_external) bytes += e->dspark_model.size;
-    if (e->overlay_ready) bytes += e->overlay_model.size;
+    /* The checkpoint(s) are mmap'd read-only and shared across every session, so
+     * this is a single resident copy competing with per-session KV for the
+     * unified memory budget.  A merged/embedded drafter lives inside e->model
+     * and is already counted; an external drafter and an expert overlay map
+     * their own files and are added when present.
+     *
+     * mapped_bytes, NOT size: a safetensors model's `size` is ONE SHARD, so the
+     * server's admission budget read 0.88 GiB of weights for a 92 GB checkpoint
+     * and over-stated the budget by ~85 GiB.  The measured min() masked it at
+     * runtime, which is precisely why it had to be fixed here rather than
+     * noticed: the static formula is the bound that is supposed to hold when the
+     * measured one reads inflated. */
+    uint64_t bytes = e->model.mapped_bytes;
+    if (e->dspark_ready && e->dspark_external) bytes += e->dspark_model.mapped_bytes;
+    if (e->overlay_ready) bytes += e->overlay_model.mapped_bytes;
     return bytes;
 }
 

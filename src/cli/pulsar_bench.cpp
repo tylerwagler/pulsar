@@ -105,7 +105,7 @@ static char *read_file(const char *path) {
 
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "model",
         .system = "You are a helpful assistant.",
         .backend = default_backend(),
         .ctx_start = 2048,

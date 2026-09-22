@@ -300,16 +300,11 @@ void model_summary(const pulsar_model *m) {
                n_expert, n_expert_used, n_expert_groups, n_group_used);
     }
     printf("file size: ");
-    if (m->n_shards) {
-        /* m->size is ONE shard on this path; the checkpoint's footprint is the
-         * sum over shards, and reporting a single shard here reads as if the
-         * model were tiny. */
-        uint64_t mapped = 0;
-        for (uint64_t i = 0; i < m->n_shards; i++) mapped += m->shard_size[i];
-        print_size(mapped);
-    } else {
-        print_size(m->size);
-    }
+    /* mapped_bytes, not size: size is ONE shard on this path (the primary), and
+     * reporting a single shard here reads as if the model were tiny.  This was
+     * the third place that re-derived the sum, and the second that got it
+     * wrong -- it is one field now (pulsar_model.mapped_bytes). */
+    print_size(m->mapped_bytes);
     printf("\n");
     printf("tensor bytes described by the directory: ");
     print_size(tensor_bytes);

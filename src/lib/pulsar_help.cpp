@@ -151,7 +151,8 @@ static const char *tool_summary(pulsar_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 pulsar_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model PATH", "Checkpoint to serve: a shard directory or a single");
+    opt(fp, c, "", "file. Default: ./model, else $PULSAR_MODEL_DIR/model");
     if (tool != PULSAR_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
@@ -160,9 +161,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     if (full) {
         if (tool != PULSAR_HELP_BENCH) {
-            opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
+            opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the checkpoint.");
             opt(fp, c, "--dspark-draft N", "STARTING draft depth for the adaptive controller (default 3). Depth then walks 2..5 per session from realized acceptance; 5 is the drafter's trained block.");
-            opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
+            opt(fp, c, "--expert-overlay PATH:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor checkpoint PATH (quant-format measurement).");
         }
     }
     fputc('\n', fp);
@@ -264,7 +265,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "The model endpoint id reflects the loaded GGUF shape: deepseek-v4-flash or deepseek-v4-pro (one at a time).");
+    para(fp, c, "The model endpoint id reflects the loaded model's shape: deepseek-v4-flash or deepseek-v4-pro (one at a time).");
     fputc('\n', fp);
 }
 
@@ -386,15 +387,15 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
     title(fp, c, "Examples");
     if (topic_is(topic, "runtime")) {
         if (tool == PULSAR_HELP_SERVER) {
-            opt(fp, c, "CUDA API", "./pulsar-server -m ds4flash.gguf --ctx 100000");
+            opt(fp, c, "CUDA API", "./pulsar-server -m model --ctx 100000");
         } else if (tool == PULSAR_HELP_AGENT) {
-            opt(fp, c, "agent", "./pulsar-agent -m ds4flash.gguf --ctx 100000");
+            opt(fp, c, "agent", "./pulsar-agent -m model --ctx 100000");
         } else if (tool == PULSAR_HELP_BENCH) {
             opt(fp, c, "bench", "./pulsar-bench --prompt-file long.txt --ctx-max 32768");
         } else if (tool == PULSAR_HELP_EVAL) {
             opt(fp, c, "eval", "./pulsar-eval --questions 10 --ctx 100000");
         } else {
-            opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf -c 100000");
+            opt(fp, c, "CUDA", "./pulsar -m model -c 100000");
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./pulsar -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
