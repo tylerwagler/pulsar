@@ -1486,6 +1486,16 @@ typedef struct {
      * with, or NULL for the text-only path.  Set and cleared by the prefill's
      * owner (pulsar_session::sync); nothing else may leave it set. */
     const pulsar_vision_request *vision_req;
+    /** Borrowed TP transport for the owning session's engine (slice 4b), set
+     * from the engine at graph init; NULL when the pair is not armed.  The
+     * prefill big-gate call sites read this rather than threading the engine
+     * through every prefill entry point. */
+    struct pulsar_tp *tp;
+    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented once
+     * per layer per chunk by tp_prefill_big_gate.  Both ranks advance it in the
+     * same order from the same starting value, so the big-gate seq stays in
+     * lockstep (the transport uses it as a desync guard). */
+    uint64_t tp_prefill_seq;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1671,6 +1681,13 @@ struct pulsar_engine {
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
     float directional_steering_ffn_scale;   ///< steering strength on the FFN stream
     uint32_t prefill_chunk;     ///< tokens per prefill chunk
+    /** Two-rank TP state (slice 4b).  Non-NULL only when the pair was actually
+     * armed (tp_role != 0 with a wired tp_arm).  The slab is the host-pinned,
+     * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
+     * pulsar_tp_attach_slab. */
+    struct pulsar_tp *tp;       ///< transport handle, or NULL when off
+    void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
+    size_t tp_slab_bytes;       ///< slab size in bytes
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's

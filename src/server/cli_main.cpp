@@ -453,6 +453,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.tp_peer = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tp-port")) {
             c.engine.tp_port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-arm")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "prefill")) c.engine.tp_arm = 1;
+            else c.engine.tp_arm = parse_int_arg(v, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--host")) {

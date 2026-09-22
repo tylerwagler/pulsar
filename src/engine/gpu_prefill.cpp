@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "tp/pulsar_tp.h"
 
 
 
@@ -2391,6 +2392,40 @@ bool gpu_graph_encode_layer_attention_batch(
  * graph launches per round lose to eager launches the host already hides at
  * 92% busy. Deleted; the output head keeps capture (1 dense graph/round,
  * +1-2% measured). Full chain: pulsar-notes rows/L119.md. */
+/* Slice 4b: one prefill big-gate exchange for `il` over the whole chunk.  Read
+ * this layer's n_embd-width routed contribution to host, swap it with the peer
+ * via the pair transport, and write the combined (local + peer) value back so
+ * the FFN's HC expansion below carries the fully-summed layer output.  Called
+ * only when g->tp is armed; returns 0 (fail loud) on any tensor/transport
+ * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
+ * can move onto the registerable GB10 slab later. */
+static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+    if (!g->tp) return 1;
+    const uint64_t nelt = (uint64_t)n_tokens * PULSAR_N_EMBD;
+    const uint64_t bytes = nelt * sizeof(float);
+    float *out = (float *)xmalloc(bytes ? bytes : sizeof(float));
+    float *in  = (float *)xmalloc(bytes ? bytes : sizeof(float));
+    if (!out || !in) {
+        free(out);
+        free(in);
+        fprintf(stderr, "pulsar: tp prefill big-gate out of memory (%llu bytes)\n",
+                (unsigned long long)bytes);
+        return 0;
+    }
+    bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
+    if (ok) {
+        ok = pulsar_tp_big_gate_exchange(g->tp, il, ++g->tp_prefill_seq,
+                                         out, in, bytes) != 0;
+    }
+    if (ok) {
+        for (uint64_t i = 0; i < nelt; i++) out[i] += in[i];
+        ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, out, bytes) != 0;
+    }
+    free(out);
+    free(in);
+    return ok;
+}
+
 bool gpu_graph_encode_layer_ffn_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -2743,6 +2778,22 @@ bool gpu_graph_encode_layer_ffn_batch(
                                   g->batch_shared_out,
                                   g->batch_routed_out,
                                   (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;
+    }
+    /* Slice 4b: prefill big-gate.  When the pair is armed, exchange this
+     * layer's routed contribution with the peer and fold the peer's partial in
+     * BEFORE the HC expansion below, so the layer output carried into the next
+     * layer is the fully-combined value.  One big gate per layer for the whole
+     * chunk (amortized, not per token).  The per-rank partial is ownership-
+     * aware only once 4c lands, so an enabled TP run is not yet proof-correct;
+     * the mechanism (transport + wiring) is what this wires. */
+    if (ok && g->tp) {
+        ok = tp_prefill_big_gate(g, il, n_tokens);
+        if (ok && keep_ffn_out) {
+            ok = pulsar_gpu_add_tensor(g->batch_ffn_out,
+                                      g->batch_shared_out,
+                                      g->batch_routed_out,
+                                      (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;
+        }
     }
     if (ok && keep_ffn_out) {
         gpu_graph_debug_dump_tensor("ffn_out", g->batch_ffn_out,

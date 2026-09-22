@@ -125,6 +125,11 @@ PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor
 
 ENGINE_SRCS = $(wildcard src/engine/*.cpp)
 ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o)
+# Two-rank TP transport + host-pinned GPU slab (slice 4b).  Only the pieces the
+# engine calls: pulsar_tp.o (pure host, g++) and pulsar_tp_gpu.o (needs the CUDA
+# runtime, so nvcc).  The gate scheduler / verify modules are wired by the decode
+# and verify slices and stay out until then (no dead code).
+TP_OBJS = src/tp/pulsar_tp.o src/tp/pulsar_tp_gpu.o
 AGENT_SRCS = $(wildcard src/agent/*.cpp)
 AGENT_OBJS = $(AGENT_SRCS:.cpp=.o)
 SERVER_SRCS = $(wildcard src/server/*.cpp)
@@ -151,7 +156,7 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h 
 # scans shard headers and __metadata__ as JSON), so every target that links
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
@@ -1692,6 +1697,12 @@ src/engine/vision.o: src/engine/vision.cpp src/engine/pulsar_engine_internal.h s
 
 src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+
+# pulsar_tp_gpu.cpp is host C++ but includes <cuda_runtime.h>, so nvcc (which
+# brings the CUDA include path and -lcudart) compiles it, not the generic g++
+# rule above.
+src/tp/pulsar_tp_gpu.o: src/tp/pulsar_tp_gpu.cpp src/tp/pulsar_tp_gpu.h
+	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
 
 src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<

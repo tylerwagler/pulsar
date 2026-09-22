@@ -88,8 +88,18 @@ bug, not a design change.
       src/tp/pulsar_tp_gpu.cpp — `cudaHostRegister` verdict).  The `.cu`
       wrapper implementations deliberately ship with their engine callers
       (no dead code) — see the hook-targets inventory note in port.md.
-- 4b. CUDA gate machinery on the engine worker thread — big_gate first
-      (prefill), per-layer gates (decode). GPU-gated; the hard chunk.
+- 4b. **Prefill big-gate arm (engine-wired, compile-verified 2026-09-21).**
+      `pulsar_engine::open` now stands up the pair when `--tp-role` + `--tp-arm
+      prefill`: builds the identity from the resolved shape, `pulsar_tp_create`
+      (leader listens / worker dials), allocates the host-pinned GPU-visible
+      slab and `pulsar_tp_attach_slab`; teardown on `destroy()`.  The prefill
+      path (gpu_prefill.cpp `tp_prefill_big_gate`, called from
+      `gpu_graph_encode_layer_ffn_batch` before the HC expansion) exchanges one
+      big gate per layer per chunk on the layer's routed contribution and folds
+      the peer's partial in.  Compile-only so far (no runtime) — the `.cu`
+      gate kernels for the DECODE per-layer arm are still unwired and
+      `tp_role != 0` with no `--tp-arm` still fails loudly (rule 4).  The
+      per-rank partial is ownership-aware only once 4c lands.
 - 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the
       f32 partial). GPU-gated.
 - 4d. Vocab head split on the logits path (frames ported; engine-side wiring).

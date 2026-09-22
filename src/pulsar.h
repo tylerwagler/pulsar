@@ -123,11 +123,13 @@ typedef struct {
     bool inspect_only;           ///< load and report, then stop: no session/graph allocation
     /** Two-rank tensor parallelism (branch tensor_parallel; docs/tensor-parallel-port.md).
      * tp_role: 1 = leader (listens on tp_port), 2 = worker (dials tp_peer:tp_port);
-     * 0 = off.  pulsar_engine_open fails loudly for a nonzero role until the
-     * CUDA gate machinery (slice 4b) lands. */
+     * 0 = off.  tp_arm selects which TP arm is wired: 0 = none, 1 = prefill big-gate.
+     * A nonzero tp_role with tp_arm==0 fails loudly (rule 4), so a pair is never
+     * silently run with no TP in the frame. */
     int tp_role;
     const char *tp_peer;
     int tp_port;
+    int tp_arm;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
