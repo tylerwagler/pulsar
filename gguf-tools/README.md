@@ -1,17 +1,27 @@
-# DS4 GGUF Tools
+# DS4 Offline Tools
 
 This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash GGUF files for `ds4`.
+V4 Flash checkpoints for `pulsar`.
+
+**The engine reads safetensors and nothing else.** The artifact it serves is
+emitted by `safetensors_lane/`, which copies each payload verbatim under a
+declared layout id and writes one shard per layer. The GGUF plumbing below is
+the QUANTIZATION pipeline's, and it is what the quantizer still reads and writes;
+it is not a container the engine has any more.
 
 The important pieces are:
 
-- `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
+- `safetensors_lane/`: emits the served checkpoint (plan / emit / verify /
+  audit). See its README for the contract and the verification.
+- `quantize/`: the C quantizer and its name tables. It quantizes from an HF
+  source against a GGUF template and writes a GGUF; making it emit shards
+  directly needs one thing, a GGUF-KV -> JSON encoder (see the lane README).
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 scalar quant formats:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
-  importance with `ds4`.
-- `quality-testing/`: prompts and scripts used to compare local GGUF variants
+  importance with `pulsar`.
+- `quality-testing/`: prompts and scripts used to compare local variants
   against official DeepSeek V4 Flash continuations.
 
 ## Build
