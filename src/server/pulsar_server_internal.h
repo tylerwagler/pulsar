@@ -14,6 +14,9 @@
 #include "pulsar_kvstore.h"
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
+/* The JSON scanner is shared with the engine's safetensors reader, so it lives
+ * in src/lib and is declared there. */
+#include "pulsar_json.h"
 
 #include <new>
 #include <string>
@@ -111,8 +114,11 @@
 /* The request parser only understands the API fields we use and skips the
  * rest.  Skipping is recursive because JSON values nest, so keep an explicit
  * ceiling: without it, a useless ignored field like {"x":[[[...]]]} can spend
- * the whole C stack before the request is rejected. */
+ * the whole C stack before the request is rejected.  The ceiling itself is
+ * defined in pulsar_json.h, beside the scanner that enforces it. */
+#ifndef JSON_MAX_NESTING
 #define JSON_MAX_NESTING 256
+#endif
 
 
 /* The DSML tag literals and the syntax table live in src/lib/pulsar_dsml.h
@@ -2520,16 +2526,11 @@ void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...);
 char *buf_take(buf *b);
 void buf_free(buf *b);
-void json_ws(const char **p);
-bool json_lit(const char **p, const char *lit);
-bool json_string(const char **p, char **out);
-bool json_string_n(const char **p, char **out, size_t *out_len);
+/* json_ws / json_lit / json_string[_n] / json_number / json_int / json_bool /
+ * json_skip_value / json_raw_value are declared in pulsar_json.h (included
+ * above) and defined in src/lib/pulsar_json.cpp: ONE scanner, shared with the
+ * engine's safetensors reader rather than a second copy free to drift. */
 size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len);
-bool json_number(const char **p, double *out);
-bool json_int(const char **p, int *out);
-bool json_bool(const char **p, bool *out);
-bool json_skip_value(const char **p);
-bool json_raw_value(const char **p, char **out);
 char *json_minify_raw_value(const char *json);
 /** Re-serialise one JSON value the way Python's json.dumps(value, ensure_ascii=False)
  * prints it after json.loads(): ", " and ": " separators, keys in document order,

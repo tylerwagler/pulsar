@@ -672,6 +672,24 @@ typedef struct {
 
     pulsar_kv *kv;             ///< parsed metadata pairs, n_kv entries
     pulsar_tensor *tensors;    ///< parsed tensor directory, n_tensors entries
+
+    /* ---- safetensors container (n_shards > 0) ------------------------------
+     * A safetensors model is one shard per layer -- several mmapped files --
+     * rather than one mapping, so each tensor selects its own shard through the
+     * existing ext_map/ext_size fields, the same mechanism --expert-overlay
+     * already uses.  The GGUF path leaves all of these zero and keeps using the
+     * single fd/map/size above.
+     *
+     * kv_base is where cursor_at() reads metadata values from.  A GGUF file
+     * keeps them inline in its mapping; a safetensors file carries them as JSON
+     * text, which safetensors_open() re-encodes once into one GGUF-typed blob
+     * so every existing kv consumer is unchanged. */
+    uint64_t n_shards;              ///< number of mmapped shards, 0 for GGUF
+    int *shard_fd;                  ///< one fd per shard
+    const uint8_t **shard_map;      ///< one mapping base per shard
+    uint64_t *shard_size;           ///< one mapping length per shard
+    const uint8_t *kv_base;         ///< metadata value buffer (NULL => map)
+    uint64_t kv_size;               ///< length of that buffer
 } pulsar_model;
 
 /** A GGUF metadata array left UNPARSED: its type, length, and where its
@@ -2644,6 +2662,14 @@ void model_close(pulsar_model *m);
  * mapping instead.
  */
 void model_open(pulsar_model *m, const char *path, bool gpu_mapping);
+
+/** Open a safetensors checkpoint DIRECTORY: mmap every shard, re-encode the
+ * JSON __metadata__ into the one GGUF-typed KV blob the rest of the engine
+ * already reads, and synthesize the same pulsar_tensor directory the GGUF path
+ * builds -- including ONE stacked tensor per routed-expert projection, because
+ * a projection's per-expert tensors are contiguous and gap-free.  That is why
+ * nothing downstream of model_open changes. */
+void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping);
 void model_summary(const pulsar_model *m);
 pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name);
 bool accelerator_cache_model_tensors(pulsar_backend backend,

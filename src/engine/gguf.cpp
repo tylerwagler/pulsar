@@ -201,9 +201,11 @@ void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
 
 
 pulsar_cursor cursor_at(const pulsar_model *m, uint64_t pos) {
+    /* A safetensors model's metadata values live in a synthesized buffer, not
+     * in the mapping; the GGUF path leaves kv_base NULL and is unaffected. */
     pulsar_cursor c = {
-        .base = m->map,
-        .size = m->size,
+        .base = m->kv_base ? m->kv_base : m->map,
+        .size = m->kv_base ? m->kv_size : m->size,
         .pos = pos,
         .error = {0},
     };
@@ -439,6 +441,17 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
+    /* Container dispatch. A GGUF is a single file; a safetensors checkpoint is
+     * a DIRECTORY of per-layer shards. The path is the discriminator, and each
+     * container then refuses anything that is not its own format -- neither
+     * silently falls back to the other. */
+    struct stat pst;
+    if (stat(path, &pst) == -1) pulsar_die_errno("cannot stat model", path);
+    if (S_ISDIR(pst.st_mode)) {
+        safetensors_open(m, path, gpu_mapping);
+        return;
+    }
+
     int fd = open(path, O_RDONLY);
     if (fd == -1) pulsar_die_errno("cannot open model", path);
 
@@ -538,8 +551,16 @@ void model_summary(const pulsar_model *m) {
 
     printf("model: %.*s\n", (int)name.len, name.ptr);
     printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
-    printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
-        m->version, m->n_kv, m->n_tensors);
+    /* Name the container that was actually opened: reporting "gguf v0" for a
+     * safetensors checkpoint would misstate which lane ran. */
+    if (m->n_shards) {
+        printf("container: safetensors, %" PRIu64 " shards, %" PRIu64 " metadata keys, "
+               "%" PRIu64 " tensors\n",
+               m->n_shards, m->n_kv, m->n_tensors);
+    } else {
+        printf("container: gguf v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
+               m->version, m->n_kv, m->n_tensors);
+    }
     if (layers) printf("layers: %u\n", layers);
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
     if (n_head || n_head_kv || head_dim || n_swa) {
@@ -555,9 +576,18 @@ void model_summary(const pulsar_model *m) {
                n_expert, n_expert_used, n_expert_groups, n_group_used);
     }
     printf("file size: ");
-    print_size(m->size);
+    if (m->n_shards) {
+        /* m->size is ONE shard on this path; the checkpoint's footprint is the
+         * sum over shards, and reporting a single shard here reads as if the
+         * model were tiny. */
+        uint64_t mapped = 0;
+        for (uint64_t i = 0; i < m->n_shards; i++) mapped += m->shard_size[i];
+        print_size(mapped);
+    } else {
+        print_size(m->size);
+    }
     printf("\n");
-    printf("tensor bytes described by GGUF: ");
+    printf("tensor bytes described by the directory: ");
     print_size(tensor_bytes);
     printf("\n");
     printf("logical parameters: %.2f B\n", (double)params / 1000000000.0);
