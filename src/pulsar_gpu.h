@@ -650,13 +650,13 @@ int pulsar_gpu_matmul_mxfp8_tensor(
 
 /** Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */
-void pulsar_gpu_register_fp8_weight(uint64_t weight_offset);
+void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offset);
 
 /** Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
-void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
+void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset);
 
 /** Batched-prefill activation quantization cache.
  *

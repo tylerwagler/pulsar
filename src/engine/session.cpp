@@ -301,6 +301,21 @@ int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
 }
 
 
+/* Register every mapping of a model with the staged-fd route -- the only route
+ * onto the GPU here, since cudaHostRegister reports "operation not supported" on
+ * GB10.  A GGUF has one mapping; a safetensors checkpoint has one per layer, and
+ * the route is per-mapping, so registering only the first shard would leave 47
+ * layers unreadable. */
+static void register_model_fds(const pulsar_model *m) {
+    if (m->n_shards) {
+        for (uint64_t i = 0; i < m->n_shards; i++) {
+            (void)pulsar_gpu_set_model_fd_for_map(m->shard_fd[i], m->shard_map[i]);
+        }
+    } else {
+        (void)pulsar_gpu_set_model_fd_for_map(m->fd, m->map);
+    }
+}
+
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -474,7 +489,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        register_model_fds(&e->model);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              NULL, NULL, 0,
                                              e->dspark_ready ? NULL : "dspark.")) {
@@ -485,7 +500,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         if (e->dspark_ready && e->dspark_external) {
-            (void)pulsar_gpu_set_model_fd_for_map(e->dspark_model.fd, e->dspark_model.map);
+            register_model_fds(&e->dspark_model);
             if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
                                                  NULL, NULL, 0, NULL)) {
                 fprintf(stderr, "pulsar: %s failed to prepare optional DSpark model cache\n",
@@ -494,7 +509,9 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 *out = NULL;
                 return 1;
             }
-            (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            /* The main model's fd no longer needs restoring here: the fd route
+             * is a per-mapping table now, so registering the drafter's mapping
+             * leaves the main model's entry alone. */
         }
         if (e->overlay_ready &&
             !accelerator_prepare_expert_overlay(e->backend, &e->model,

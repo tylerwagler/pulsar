@@ -19,19 +19,42 @@ static int g_model_registered;
 
 
 
-static int g_model_fd = -1;
+/* One entry per opened model container.  A GGUF is a single file, but a
+ * safetensors checkpoint is one file per layer, and the staged-fd route -- the
+ * only route onto the GPU here, because cudaHostRegister reports "operation not
+ * supported" on GB10 -- has to serve every one of them.  So what used to be
+ * five single-valued globals is a table keyed by the MAPPING BASE, and every
+ * lookup names the map it wants.  Keying by offset instead would collide: each
+ * shard's offsets restart near zero, so two layers' identical-position tensors
+ * would share a key. */
+typedef struct {
+    const void *map;        /* the mapping this fd backs; the key */
+    int fd;                 /* buffered read fd */
+    int direct_fd;          /* O_DIRECT twin, when the filesystem gave us one */
+    uint64_t direct_align;  /* alignment the direct fd requires */
+    uint64_t file_size;     /* size of that file, for O_DIRECT bounds checks */
+} model_fd_entry;
 
+#define MODEL_FD_MAX 64
+static model_fd_entry g_model_fds[MODEL_FD_MAX];
+static int g_model_fd_count;
 
-static const void *g_model_fd_host_base;
+static const model_fd_entry *model_fd_for(const void *model_map) {
+    for (int i = 0; i < g_model_fd_count; i++) {
+        if (g_model_fds[i].map == model_map) return &g_model_fds[i];
+    }
+    return NULL;
+}
 
-
-static int g_model_direct_fd = -1;
-
-
-static uint64_t g_model_direct_align = 1;
-
-
-static uint64_t g_model_file_size;
+/* The pinned staging pool is process-global and shared by every mapping, so it
+ * must be allocated with the strongest alignment any entry requires. */
+static uint64_t model_fd_max_align(void) {
+    uint64_t a = 1;
+    for (int i = 0; i < g_model_fd_count; i++) {
+        if (g_model_fds[i].direct_align > a) a = g_model_fds[i].direct_align;
+    }
+    return a;
+}
 
 
 static int g_model_cache_full;
@@ -63,7 +86,11 @@ static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 
 
-static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+/* Keyed by (MAPPING, offset), NOT offset alone -- the same defect the FP8
+ * registries had.  Every shard's offsets restart near zero, so an offset-only
+ * key collides across layers: the fast path then fails its host_base check and
+ * the lookup falls through to the O(ranges) scan, once per weight per step. */
+static std::unordered_map<map_offset_key, size_t, map_offset_key_hash> g_model_range_by_offset;
 
 
 
@@ -301,12 +328,86 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     }
     if (bounce) (void)cudaFreeHost(bounce);
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     return (const char *)dev;
 }
 
 
+
+/* PULSAR_VERIFY_RANGES: hash the first 4 KiB of what the KERNELS will read.
+ * The host-side check (PULSAR_VERIFY_TENSORS) proves tensor_map_base+abs_offset
+ * is right, which is a different claim: the kernels read the DEVICE pointer this
+ * function returns, which may be a cached device copy or an fd-route slot.
+ *
+ * PULSAR_VERIFY_RANGES=deep additionally compares the WHOLE range against the
+ * host mapping it was staged from.  The 4 KiB head proves the base pointer; it
+ * says nothing about the staging length or an expert stride, so a range that is
+ * right for one block and wrong afterwards passes the hash check.  Each
+ * distinct (map, offset, bytes) is compared once, so a run costs one pass over
+ * the model. */
+static void verify_resolved_range(const char *dev, const void *model_map,
+                                  uint64_t offset, uint64_t bytes, const char *branch) {
+    static int enabled = -1;
+    static int deep = 0;
+    static int printed = 0;
+    static std::unordered_set<uint64_t> seen;
+    if (enabled < 0) {
+        const char *v = getenv("PULSAR_VERIFY_RANGES");
+        enabled = v ? 1 : 0;
+        deep = (v && strcmp(v, "deep") == 0) ? 1 : 0;
+    }
+    if (!enabled || printed >= 6000) return;
+
+    if (deep) {
+        const uint64_t key = offset ^ (bytes * 0x9e3779b97f4a7c15ull) ^
+                             (uint64_t)(uintptr_t)model_map;
+        if (!seen.insert(key).second) return;
+        printed++;
+        const unsigned char *host = (const unsigned char *)model_map + offset;
+        const uint64_t chunk = 4u << 20;
+        static unsigned char *tmp;
+        if (!tmp) tmp = (unsigned char *)malloc((size_t)chunk);
+        uint64_t bad_chunks = 0, first = 0;
+        for (uint64_t o = 0; o < bytes; o += chunk) {
+            const uint64_t n = (bytes - o < chunk) ? (bytes - o) : chunk;
+            if (cudaMemcpy(tmp, dev + o, (size_t)n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                (void)cudaGetLastError();
+                printf("DEEP %p %llu %llu %s READFAIL at %llu\n", model_map,
+                       (unsigned long long)offset, (unsigned long long)bytes,
+                       branch, (unsigned long long)o);
+                fflush(stdout);
+                return;
+            }
+            if (memcmp(tmp, host + o, (size_t)n) != 0) {
+                if (!bad_chunks) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        if (tmp[i] != host[o + i]) { first = o + i; break; }
+                    }
+                }
+                bad_chunks++;
+            }
+        }
+        printf("DEEP %p %llu %llu %s bad=%llu first=%llu\n", model_map,
+               (unsigned long long)offset, (unsigned long long)bytes, branch,
+               (unsigned long long)bad_chunks, (unsigned long long)first);
+        fflush(stdout);
+        return;
+    }
+
+    const uint64_t n = bytes < 4096 ? bytes : 4096;
+    unsigned char buf[4096];
+    if (cudaMemcpy(buf, dev, (size_t)n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError(); return;
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ull; }
+    printed++;
+    printf("RANGE %p %llu %llu %016llx %s\n", model_map,
+           (unsigned long long)offset, (unsigned long long)bytes,
+           (unsigned long long)h, branch);
+    fflush(stdout);
+}
 
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
@@ -317,13 +418,17 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
      * registered-mapped shortcut below is the cold fallback when an allocation
      * hasn't been pre-populated. */
     const uint64_t end = offset + bytes;
-    auto exact = g_model_range_by_offset.find(offset);
+    auto exact = g_model_range_by_offset.find({model_map, offset});
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) {
+            verify_resolved_range(r.device_ptr, model_map, offset, bytes, "cache-exact");
+            return r.device_ptr;
+        }
     }
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            verify_resolved_range(r.device_ptr + (offset - r.offset), model_map, offset, bytes, "cache-scan");
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -338,7 +443,10 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
     if (g_model_registered) return cuda_model_ptr(model_map, offset);
 
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
-    if (fd_ptr) return fd_ptr;
+    if (fd_ptr) {
+        verify_resolved_range(fd_ptr, model_map, offset, bytes, "fd");
+        return fd_ptr;
+    }
 
     /* The staged fd route is the only SUPPORTED way to get model weights onto
      * the GPU here, so failing it is fatal by design (L028, 2026-08-13).
@@ -360,7 +468,9 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
      * FROM, so a device copy is the right answer here, not a fatal: the L028
      * hard stop is about a REAL model whose staged path failed, which is a
      * different situation and still falls through below. */
-    if (g_model_fd < 0) {
+    if (!model_fd_for(model_map)) {
+        /* No fd backs this mapping -- a synthetic slab built in memory by the
+         * modelless kernel smokes.  There is nothing to stage FROM. */
         const char *copied = cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
         if (copied) return copied;
     }
@@ -538,10 +648,11 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 
 
-static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+static void cuda_model_drop_file_pages(const void *model_map, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || bytes == 0) return;
-    (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+    const model_fd_entry *e = model_fd_for(model_map);
+    if (!e || e->fd < 0 || bytes == 0) return;
+    (void)posix_fadvise(e->fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
     (void)bytes;
@@ -603,7 +714,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             (void)cudaGetLastError();
             return 0;
         }
-        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
+        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], model_fd_max_align());
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
@@ -634,30 +745,33 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 
 
-static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
-                                 uint64_t offset, uint64_t bytes,
-                                 const char **payload) {
+static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
+                                 uint64_t stage_bytes, uint64_t offset,
+                                 uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
-        const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
+    if (e->direct_fd >= 0 && e->direct_align > 1 && e->file_size != 0) {
+        const uint64_t aligned_off = cuda_round_down(offset, e->direct_align);
         const uint64_t delta = offset - aligned_off;
-        uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
-        if (aligned_off <= g_model_file_size &&
+        uint64_t read_size = cuda_round_up(delta + bytes, e->direct_align);
+        if (aligned_off <= e->file_size &&
             read_size <= stage_bytes &&
-            read_size <= g_model_file_size - aligned_off) {
+            read_size <= e->file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            if (cuda_pread_full(e->direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return 1;
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                (void)close(g_model_direct_fd);
-                g_model_direct_fd = -1;
-                g_model_direct_align = 1;
+                (void)close(e->direct_fd);
+                /* The entry is keyed by map and the table is not const here:
+                 * drop the direct fd for THIS shard only. */
+                model_fd_entry *mutable_e = (model_fd_entry *)e;
+                mutable_e->direct_fd = -1;
+                mutable_e->direct_align = 1;
             }
             errno = direct_errno;
         }
@@ -665,7 +779,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 #else
     (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    return cuda_pread_full(e->fd, stage, bytes, offset);
 }
 
 
@@ -757,8 +871,8 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
-    if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    const model_fd_entry *entry = model_fd_for(model_map);
+    if (!entry || entry->fd < 0 || bytes == 0) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         return cuda_model_direct_fallback_ptr(model_map, offset);
@@ -771,7 +885,8 @@ static const char *cuda_model_range_ptr_from_fd(
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    const uint64_t align = model_fd_max_align();
+    const uint64_t stage_bytes = chunk + (align > 1 ? align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     uint64_t copied = 0;
@@ -789,7 +904,7 @@ static const char *cuda_model_range_ptr_from_fd(
             }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+        if (!cuda_model_stage_read(entry, g_model_stage[bi], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
             fprintf(stderr, "pulsar: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
@@ -814,7 +929,7 @@ static const char *cuda_model_range_ptr_from_fd(
             (void)cudaGetLastError();
             return NULL;
         }
-        cuda_model_drop_file_pages(offset + copied, n);
+        cuda_model_drop_file_pages(model_map, offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
@@ -829,7 +944,7 @@ static const char *cuda_model_range_ptr_from_fd(
     }
 
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
     return (const char *)dev;
@@ -961,13 +1076,11 @@ void pulsar_gpu_cleanup(void) {
     g_model_device_base = NULL;
     g_model_registered_size = 0;
     g_model_registered = 0;
-    g_model_fd = -1;
-    if (g_model_direct_fd >= 0) {
-        (void)close(g_model_direct_fd);
-        g_model_direct_fd = -1;
+    for (int i = 0; i < g_model_fd_count; i++) {
+        if (g_model_fds[i].direct_fd >= 0) (void)close(g_model_fds[i].direct_fd);
+        g_model_fds[i].direct_fd = -1;
     }
-    g_model_direct_align = 1;
-    g_model_file_size = 0;
+    g_model_fd_count = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
     if (g_model_prefetch_stream) {
@@ -1653,8 +1766,11 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     }
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
-    if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
-        g_model_fd_host_base = model_map;
+    /* The legacy pulsar_gpu_set_model_fd(fd) registers an fd before the map is
+     * known, so an entry can exist keyed by NULL; bind it to this mapping now.
+     * The safetensors lane never needs this -- it passes the map explicitly. */
+    for (int i = 0; i < g_model_fd_count; i++) {
+        if (g_model_fds[i].map == NULL) g_model_fds[i].map = model_map;
     }
     return 1;
 }
@@ -1718,19 +1834,34 @@ int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, u
 
 
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
-    g_model_fd = fd;
-    g_model_fd_host_base = model_map;
-    g_model_file_size = 0;
-    if (g_model_direct_fd >= 0) {
-        (void)close(g_model_direct_fd);
-        g_model_direct_fd = -1;
+    model_fd_entry *e = NULL;
+    for (int i = 0; i < g_model_fd_count; i++) {
+        if (g_model_fds[i].map == model_map) { e = &g_model_fds[i]; break; }
     }
-    g_model_direct_align = 1;
+    if (!e) {
+        if (g_model_fd_count >= MODEL_FD_MAX) {
+            fprintf(stderr, "pulsar: %d model mappings already registered; raise MODEL_FD_MAX\n",
+                    MODEL_FD_MAX);
+            return 0;
+        }
+        e = &g_model_fds[g_model_fd_count++];
+        memset(e, 0, sizeof(*e));
+        e->map = model_map;
+        e->fd = -1;
+        e->direct_fd = -1;
+        e->direct_align = 1;
+    } else if (e->direct_fd >= 0) {
+        (void)close(e->direct_fd);
+        e->direct_fd = -1;
+    }
+    e->fd = fd;
+    e->file_size = 0;
+    e->direct_align = 1;
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
-            g_model_file_size = (uint64_t)st.st_size;
-            if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+            e->file_size = (uint64_t)st.st_size;
+            if (st.st_blksize > 1) e->direct_align = (uint64_t)st.st_blksize;
         }
 #if defined(__linux__) && defined(O_DIRECT)
         /* O_DIRECT is best-effort: if the filesystem will not give it to us the
@@ -1741,8 +1872,8 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
             snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
             int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
             if (direct_fd >= 0) {
-                g_model_direct_fd = direct_fd;
-                if (g_model_direct_align < 512) g_model_direct_align = 512;
+                e->direct_fd = direct_fd;
+                if (e->direct_align < 512) e->direct_align = 512;
             }
         }
 #endif
@@ -1860,7 +1991,7 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
 
     g_model_ranges.push_back({host_base_key, offset, bytes, (char *)dev,
                               NULL, NULL, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_by_offset[{host_base_key, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     return 1;
 }

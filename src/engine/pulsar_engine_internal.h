@@ -704,8 +704,14 @@ typedef struct {
 /** Half-open byte range [off, end) of the model mapping that an accelerator
  * must have resident. Used to prefetch/pin exactly the spans a step touches. */
 typedef struct {
-    uint64_t off;  ///< first byte, offset into the model mapping
-    uint64_t end;  ///< one past the last byte
+    /** The mapping this span lives in.  A GGUF is one mapping, but a
+     * safetensors checkpoint is one per layer, so a span has to name its own
+     * base and length or the accelerator would cache layer 5's bytes at
+     * layer 6's offset. */
+    const uint8_t *base;
+    uint64_t map_size;  ///< that mapping's length, for the bounds check
+    uint64_t off;       ///< first byte, offset into that mapping
+    uint64_t end;       ///< one past the last byte
 } accelerator_tensor_span;
 
 /** Every weight tensor for ONE transformer layer, resolved from the GGUF at
@@ -2690,11 +2696,17 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
 
 /** Mapping that owns a tensor's payload: the overlay file's map for
  * --expert-overlay swapped tensors, the base model's map otherwise. */
+/* TOTAL on a NULL tensor, deliberately: several call sites pass an OPTIONAL
+ * tensor (the router bias on a hash-routed layer, the image-token bias) whose
+ * offset they likewise guard with a `? : 0`, so a null check here is what keeps
+ * the pair (map, offset) safe to compute unconditionally.  Dereferencing a NULL
+ * `t` here is a segfault on layer 0 of any artifact that omits the bias, which
+ * is every shipped one. */
 static inline const void *tensor_map_base(const pulsar_model *m, const pulsar_tensor *t) {
-    return t->ext_map ? (const void *)t->ext_map : (const void *)m->map;
+    return (t && t->ext_map) ? (const void *)t->ext_map : (const void *)m->map;
 }
 static inline uint64_t tensor_map_size(const pulsar_model *m, const pulsar_tensor *t) {
-    return t->ext_map ? t->ext_size : m->size;
+    return (t && t->ext_map) ? t->ext_size : m->size;
 }
 uint32_t required_u32(const pulsar_model *m, const char *key);
 PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t);

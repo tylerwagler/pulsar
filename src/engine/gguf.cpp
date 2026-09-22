@@ -451,6 +451,21 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         safetensors_open(m, path, gpu_mapping);
         return;
     }
+    /* A regular file is a GGUF or a single-file safetensors model.  Decide on
+     * CONTENT, not on the extension: read the magic and only the GGUF branch
+     * below claims it. */
+    {
+        int probe = open(path, O_RDONLY);
+        if (probe == -1) pulsar_die_errno("cannot open model", path);
+        uint32_t magic = 0;
+        const ssize_t got = read(probe, &magic, sizeof(magic));
+        (void)close(probe);
+        if (got != (ssize_t)sizeof(magic)) pulsar_die("model file is too small");
+        if (magic != PULSAR_GGUF_MAGIC) {
+            safetensors_open(m, path, gpu_mapping);
+            return;
+        }
+    }
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) pulsar_die_errno("cannot open model", path);
@@ -629,6 +644,8 @@ pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name) {
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
     const accelerator_tensor_span *sa = (const accelerator_tensor_span *)a;
     const accelerator_tensor_span *sb = (const accelerator_tensor_span *)b;
+    if (sa->base < sb->base) return -1;
+    if (sa->base > sb->base) return 1;
     if (sa->off < sb->off) return -1;
     if (sa->off > sb->off) return 1;
     if (sa->end < sb->end) return -1;
@@ -689,14 +706,18 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
-        /* --expert-overlay swapped tensors live in the donor file's mapping
-         * (donor-relative offsets that can exceed this model's size); they are
-         * prepared separately by accelerator_prepare_expert_overlay. */
-        if (t->ext_map) continue;
+        /* A GGUF plus --expert-overlay: swapped tensors live in the DONOR's
+         * mapping with donor-relative offsets, and are prepared separately by
+         * accelerator_prepare_expert_overlay.  A safetensors model ALSO sets
+         * ext_map on every tensor -- to its own shard -- so the skip must key
+         * on the container, not on the field being set. */
+        if (m->n_shards == 0 && t->ext_map) continue;
         if (skip_prefix &&
             t->name.len > strlen(skip_prefix) &&
             memcmp(t->name.ptr, skip_prefix, strlen(skip_prefix)) == 0) continue;
-        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
+        const uint8_t *base = t->ext_map ? t->ext_map : m->map;
+        const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+        if (t->abs_offset > map_size || t->bytes > map_size - t->abs_offset) {
             free(spans);
             return false;
         }
@@ -705,6 +726,8 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
+            .base = base,
+            .map_size = map_size,
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
         };
@@ -734,10 +757,13 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     fflush(stderr);
 
     for (uint64_t i = 0; i < nspan;) {
+        const uint8_t *base = spans[i].base;
+        const uint64_t map_size = spans[i].map_size;
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
         while (i < nspan &&
+               spans[i].base == base &&
                spans[i].off <= end + 65536u &&
                spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;
@@ -745,7 +771,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         }
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-        if (pulsar_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
+        if (pulsar_gpu_cache_model_range(base, map_size, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "pulsar: accelerator failed to prepare model tensor span %" PRIu64
@@ -789,7 +815,10 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
                                             uint32_t span_count,
                                      const char *skip_prefix) {
     if (backend != PULSAR_BACKEND_CUDA) return true;
-    if (!m || !m->map || m->size == 0) return false;
+    /* A shard table exists for a safetensors model; m->map/size is only shard 0
+     * there, so it is not the validity test. */
+    if (!m || m->size == 0) return false;
+    if (m->n_shards == 0 && !m->map) return false;
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
      * rejected at dispatch). Runs before the weight-cache early-out so it
@@ -814,8 +843,8 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
         } else if (t->type == PULSAR_TENSOR_MXFP8_LT) {
             /* Same FP8 matmul path, but flag the offset as pre-stored so the
              * resolver points cuBLASLt at the mmap instead of converting. */
-            pulsar_gpu_register_fp8_weight(t->abs_offset);
-            pulsar_gpu_register_fp8_lt_weight(t->abs_offset);
+            pulsar_gpu_register_fp8_weight(tensor_map_base(m, t), t->abs_offset);
+            pulsar_gpu_register_fp8_lt_weight(tensor_map_base(m, t), t->abs_offset);
             n_fp8++;
             n_fp8_lt++;
         }

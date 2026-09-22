@@ -178,7 +178,7 @@ static bool gpu_graph_csa2_emit_rows(
     if (ok && !g_pulsar_shape.indexer_own_compressor) {
         if (ok) ok = gpu_graph_matmul_plain_tensor(idx, model, layer->indexer_k,
                                                    PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, latent, n_rows) != 0;
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(idx, idx, model->map, model->size,
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(idx, idx, tensor_map_base(model, layer->indexer_k_norm), tensor_map_size(model, layer->indexer_k_norm),
                                                             layer->indexer_k_norm->abs_offset,
                                                             PULSAR_N_INDEXER_HEAD_DIM, n_rows, PULSAR_RMS_EPS, NULL,
                                                             layer->indexer_k_norm->type == PULSAR_TENSOR_BF16) != 0;
@@ -279,7 +279,7 @@ static bool gpu_graph_index_comp_prefill(
     const bool ok = lanes &&
               pulsar_gpu_indexer_compressor_prefill_tensor(
                       comp, latent, st_kv, st_sc, sc, kv,
-                      model->map, model->size,
+                      tensor_map_base(model, layer->indexer_compressor_ape), tensor_map_size(model, layer->indexer_compressor_ape),
                       layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
                       layer->indexer_compressor_norm->abs_offset,
                       layer->indexer_compressor_norm->type,
@@ -346,7 +346,7 @@ static bool gpu_graph_index_comp_update(
     const bool ok = lanes &&
               pulsar_gpu_indexer_compressor_update_tensor(
                       comp, latent, st_kv, st_sc, sc, kv,
-                      model->map, model->size,
+                      tensor_map_base(model, layer->indexer_compressor_ape), tensor_map_size(model, layer->indexer_compressor_ape),
                       layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
                       layer->indexer_compressor_norm->abs_offset,
                       layer->indexer_compressor_norm->type,
@@ -388,7 +388,7 @@ static bool gpu_graph_comp_ape_fold(
         fprintf(stderr, "pulsar: the 0731 compressor needs its absolute-position embedding -- refusing\n");
         return false;
     }
-    return pulsar_gpu_csa2_comp_ape_add_tensor(sc, model->map, model->size,
+    return pulsar_gpu_csa2_comp_ape_add_tensor(sc, tensor_map_base(model, ape), tensor_map_size(model, ape),
                                                ape->abs_offset, ape->type,
                                                width, ratio, pos0, n_tokens) != 0;
 }
@@ -495,7 +495,7 @@ static bool gpu_graph_csa2_produce(
         }
         if (ok) ok = gpu_graph_comp_ape_fold(model, layer, g->batch_comp_sc, comp_width, ratio, pos0, n_tokens);
         if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, g->batch_comp_kv, g->batch_comp_sc,
-                                                               st_kv, st_sc, model->map, model->size,
+                                                               st_kv, st_sc, tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                                layer->attn_compressor_norm->abs_offset,
                                                                layer->attn_compressor_norm->type,
                                                                PULSAR_N_HEAD_DIM, ratio, pos0, n_tokens,
@@ -565,7 +565,7 @@ static bool gpu_graph_csa2_produce(
         if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
         ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
              pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
-                                                      model->map, model->size,
+                                                      tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                       layer->attn_compressor_norm->abs_offset,
                                                       layer->attn_compressor_norm->type,
                                                       PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
@@ -637,8 +637,8 @@ bool gpu_graph_upload_prompt_embeddings_hc(
     }
     if (!pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
                                           g->prefill_tokens,
-                                          model->map,
-                                          model->size,
+                                          tensor_map_base(model, weights->token_embd),
+                                          tensor_map_size(model, weights->token_embd),
                                           weights->token_embd->abs_offset,
                                           (uint32_t)weights->token_embd->dim[1],
                                           n_tokens,
@@ -1123,8 +1123,8 @@ static bool gpu_graph_indexed_attention_span(
     }
     if (ok) {
         ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
-                                                                  model->map,
-                                                                  model->size,
+                                                                  tensor_map_base(model, layer->attn_sinks),
+                                                                  tensor_map_size(model, layer->attn_sinks),
                                                                   layer->attn_sinks->abs_offset,
                                                                   sq_view,
                                                                   op->raw_src,
@@ -1393,8 +1393,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  g->batch_hc_pre,
                                                                  hc_mix_view,
                                                                  g->batch_cur_hc,
-                                                                 model->map,
-                                                                 model->size,
+                                                                 tensor_map_base(model, layer->hc_attn_scale),
+                                                                 tensor_map_size(model, layer->hc_attn_scale),
                                                                  layer->hc_attn_scale->abs_offset,
                                                                  layer->hc_attn_base->abs_offset,
                                                                  layer->attn_norm->abs_offset,
@@ -1492,8 +1492,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                  !gpu_graph_f32_store_observed("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
-                                                             model->map,
-                                                             model->size,
+                                                             tensor_map_base(model, layer->attn_q_a_norm),
+                                                             tensor_map_size(model, layer->attn_q_a_norm),
                                                              layer->attn_q_a_norm->abs_offset,
                                                              (uint32_t)q_rank,
                                                              g->batch_kv,
@@ -1689,8 +1689,8 @@ bool gpu_graph_encode_layer_attention_batch(
 
     if (ok && raw_batch_attention) {
         ok = pulsar_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
-                                                          model->map,
-                                                          model->size,
+                                                          tensor_map_base(model, layer->attn_sinks),
+                                                          tensor_map_size(model, layer->attn_sinks),
                                                           layer->attn_sinks->abs_offset,
                                                           g->batch_q,
                                                           g->batch_kv_pack,
@@ -1728,8 +1728,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                  mseq ? nb : 1) != 0;
         if (ok) {
             ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
-                                                                   model->map,
-                                                                   model->size,
+                                                                   tensor_map_base(model, layer->attn_sinks),
+                                                                   tensor_map_size(model, layer->attn_sinks),
                                                                    layer->attn_sinks->abs_offset,
                                                                    g->batch_q,
                                                                    mseq ? gpu_graph_bank_raw_pool(g, il)
@@ -1943,8 +1943,8 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
             } else if (ok) {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
-                                                                         model->map,
-                                                                         model->size,
+                                                                         tensor_map_base(model, layer->attn_sinks),
+                                                                         tensor_map_size(model, layer->attn_sinks),
                                                                          layer->attn_sinks->abs_offset,
                                                                          g->batch_q,
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
@@ -2027,8 +2027,8 @@ bool gpu_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
-                                                                       model->map,
-                                                                       model->size,
+                                                                       tensor_map_base(model, layer->attn_sinks),
+                                                                       tensor_map_size(model, layer->attn_sinks),
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
                                                                        g->batch_kv_pack,
@@ -2091,8 +2091,8 @@ bool gpu_graph_encode_layer_attention_batch(
         }
         if (raw_prefix_tokens != 0) {
             ok = pulsar_gpu_attention_prefill_raw_heads_mx_tensor(g->batch_heads,
-                                                              model->map,
-                                                              model->size,
+                                                              tensor_map_base(model, layer->attn_sinks),
+                                                              tensor_map_size(model, layer->attn_sinks),
                                                               layer->attn_sinks->abs_offset,
                                                               g->batch_q,
                                                               g->batch_kv_pack,
@@ -2209,8 +2209,8 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
                 if (ok && have_topk && n_selected != 0) {
                     ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
-                                                                              model->map,
-                                                                              model->size,
+                                                                              tensor_map_base(model, layer->attn_sinks),
+                                                                              tensor_map_size(model, layer->attn_sinks),
                                                                               layer->attn_sinks->abs_offset,
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
@@ -2243,7 +2243,7 @@ bool gpu_graph_encode_layer_attention_batch(
                      * replaced always ran the f32 kernel and had no q_prep
                      * parameter, L164.) */
                     ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads_view,
-                            model->map, model->size, layer->attn_sinks->abs_offset,
+                            tensor_map_base(model, layer->attn_sinks), tensor_map_size(model, layer->attn_sinks), layer->attn_sinks->abs_offset,
                             q_view, g->layer_raw_cache[il],
                             cur_comp ? g->layer_attn_comp_cache[src] : NULL,
                             1, pos, n_raw, g->raw_cap, raw_start, cur_comp,
@@ -2333,8 +2333,8 @@ bool gpu_graph_encode_layer_attention_batch(
     if (ok) {
         ok = pulsar_gpu_attention_output_batch_tensor(g->batch_attn_out,
                                                    g->batch_attn_low,
-                                                   model->map,
-                                                   model->size,
+                                                   tensor_map_base(model, layer->attn_output_a),
+                                                   tensor_map_size(model, layer->attn_output_a),
                                                    layer->attn_output_a->abs_offset,
                                                    layer->attn_output_b->abs_offset,
                                                    group_dim,
@@ -2511,8 +2511,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  g->batch_hc_pre,
                                                                  hc_mix_view,
                                                                  g->batch_after_attn_hc,
-                                                                 model->map,
-                                                                 model->size,
+                                                                 tensor_map_base(model, layer->hc_ffn_scale),
+                                                                 tensor_map_size(model, layer->hc_ffn_scale),
                                                                  layer->hc_ffn_scale->abs_offset,
                                                                  layer->hc_ffn_base->abs_offset,
                                                                  layer->ffn_norm->abs_offset,
@@ -2546,12 +2546,25 @@ bool gpu_graph_encode_layer_ffn_batch(
                                              g->batch_ffn_norm,
                                              n_tokens) != 0;
 
+    /* All three router offsets below are offsets WITHIN THE LAYER, so the
+     * mapping the kernel resolves them against must be the layer's own.  It
+     * used to be taken from ffn_exp_probs_b, which the hash-routed layers 0..2
+     * do not carry (they carry ffn_gate_tid2eid instead).  tensor_map_base() is
+     * total, so a NULL tensor yields m->map -- the FIRST shard -- while the
+     * offsets still point into the layer's own shard: in a one-file model those
+     * are the same mapping and nothing shows, but a multi-shard checkpoint made
+     * layers 0..2 read their routing table and VL bias out of the wrong file.
+     * ffn_gate_inp is required on every layer, and weights_bind_layer asserts
+     * that a layer's tensors share one mapping, which is what makes it a valid
+     * anchor for the other two tensors' offsets. */
+    const void *router_map = tensor_map_base(model, layer->ffn_gate_inp);
+    const uint64_t router_map_size = tensor_map_size(model, layer->ffn_gate_inp);
     if (ok) ok = pulsar_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       gpu_graph_f32_store_observed("ffn_moe_probs", il, pos0)
                                                           ? g->batch_router_probs : NULL,
-                                                      model->map,
-                                                      model->size,
+                                                      router_map,
+                                                      router_map_size,
                                                       layer->ffn_exp_probs_b
                                                           ? layer->ffn_exp_probs_b->abs_offset : 0,
                                                       layer->ffn_exp_probs_b != NULL,
@@ -2964,7 +2977,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                      * projections was bit-exact (L218 s121). */
                     pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view,
                             g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
-                            model->map, model->size,
+                            tensor_map_base(model, weights->layer[il].attn_compressor_norm), tensor_map_size(model, weights->layer[il].attn_compressor_norm),
                             weights->layer[il].attn_compressor_norm->abs_offset,
                             weights->layer[il].attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
@@ -3007,7 +3020,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                                 g->layer_index_comp_cache[il], idx_latent,
                                 g->layer_index_state_kv[il], g->layer_index_state_score[il],
                                 sc_view, kv_view,
-                                model->map, model->size,
+                                tensor_map_base(model, lw->indexer_compressor_ape), tensor_map_size(model, lw->indexer_compressor_ape),
                                 lw->indexer_compressor_ape->abs_offset, lw->indexer_compressor_ape->type,
                                 lw->indexer_compressor_norm->abs_offset,
                                 lw->indexer_compressor_norm->type,

@@ -644,6 +644,19 @@ static bool spec_row_read_classic(void *ud, uint32_t row, float *out) {
     return gpu_graph_read_spec_logits_row((pulsar_gpu_graph *)ud, row, out);
 }
 
+/* The mapping holding a drafter tensor.  The drafter is NOT one file: its three
+ * MTP layers are three separate shards, so a single `dspark_model.map` (which is
+ * the TARGET's first shard, because the drafter is aliased to the target by
+ * value) resolves every drafter weight against the wrong bytes.  Each tensor
+ * names its own mapping, exactly as in the target. */
+static inline const void *dspark_map(const pulsar_engine *e, const pulsar_tensor *t) {
+    return tensor_map_base(&e->dspark_model, t);
+}
+static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tensor *t) {
+    return tensor_map_size(&e->dspark_model, t);
+}
+
+
 /* inc-6 W5: the redraft block, extracted from the fused loop verbatim
  * (the no-draft guard stays with the caller -- it owns hit_eos/eos_token).
  * Best-effort: any failure returns 0 pendings and the step is still a
@@ -664,8 +677,6 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
-    const void *dmap = e->dspark_model.map;
-    const uint64_t dsize = e->dspark_model.size;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
@@ -755,7 +766,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
             pulsar_gpu_dspark_markov_chain_model(dspark_logits,
                                               g->dspark_refined_ids,
                                               g->spec_logits, spec_row_bytes,
-                                              dmap, dsize,
+                                              dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
                                               w->markov_w1->abs_offset,
                                               w->markov_w2->abs_offset,
                                               n_draft, vocab_size, embed_dim,
@@ -770,7 +781,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
             g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
         draft_ok = base_row &&
             pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
-                                             base_row, dmap, dsize,
+                                             base_row, dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
                                              w->markov_w1->abs_offset,
                                              w->markov_w2->abs_offset,
                                              refined[pos], vocab_size, embed_dim,
@@ -905,7 +916,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                      : pulsar_gpu_tensor_write(tok_dev, 0, refined,
                                                (uint64_t)n_draft * sizeof(int32_t)) != 0) &&
                 pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
-                                                      dmap, dsize,
+                                                      dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
                                                       w->markov_w1->abs_offset,
                                                       w->confidence_proj->abs_offset,
                                                       n_draft, PULSAR_N_EMBD, embed_dim, vocab_size,
@@ -1975,8 +1986,6 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
-    const void *dmap = e->dspark_model.map;
-    const uint64_t dsize = e->dspark_model.size;
     int n_g = 0;
     for (int j = 0; j < n_sel; j++) if (!rounds[order[j]]->redraft.sample_drafts) n_g++;
     const int n_s = n_sel - n_g;
@@ -2052,7 +2061,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
         if (!pulsar_gpu_dspark_markov_chain_banks_model(
                 g->dspark_markov_logits, g->dspark_refined_ids, 17u,
                 g->spec_logits, spec_row_bytes, g->dspark_bank_meta,
-                dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
+                dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1), w->markov_w1->abs_offset, w->markov_w2->abs_offset,
                 (uint32_t)n_g, max_draft_g, vocab_size, embed_dim, w1_bf16, w2_fmt)) {
             snprintf(err, errlen, "redraft batch: markov chain failed");
             return -1;
@@ -2089,7 +2098,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             ok = pulsar_gpu_tensor_write(prev_s, 0, prev, (uint64_t)n_s * sizeof(int32_t)) &&
                  pulsar_gpu_dspark_markov_step_banks_model(
                      refined_s, ids_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
-                     dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
+                     dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1), w->markov_w1->abs_offset, w->markov_w2->abs_offset,
                      (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_fmt);
             if (ok && all_sparse &&
                 !(pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, refined_s, 0,
@@ -2194,7 +2203,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             pulsar_gpu_tensor_bytes(g->dspark_conf_scores) < (uint64_t)n_rows * sizeof(float) ||
             !pulsar_gpu_tensor_write(g->dspark_conf_tokens, 0, toks, (uint64_t)n_rows * sizeof(int32_t)) ||
             !pulsar_gpu_dspark_confidence_score_model(g->dspark_conf_scores, g->batch_ffn_cur,
-                                                     g->dspark_conf_tokens, dmap, dsize,
+                                                     g->dspark_conf_tokens, dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
                                                      w->markov_w1->abs_offset,
                                                      w->confidence_proj->abs_offset,
                                                      n_rows, PULSAR_N_EMBD, embed_dim, vocab_size,

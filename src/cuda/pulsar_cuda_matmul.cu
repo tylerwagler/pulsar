@@ -607,7 +607,7 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const T *X, int n_tokens, 
  * intended fix, but it must be done together with g_mxfp8_lt_offsets below
  * (which decides the pre-stored fast path) so the two do not desync -- not a
  * blind keyword change. Do it as part of the multi-stream work. */
-static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
+static std::unordered_map<map_offset_key, fp8_mx_weight, map_offset_key_hash> g_fp8_mx_by_offset;
 
 /* Offsets whose MXFP8 weight is PRE-STORED in the mmap in the exact device
  * layout (de-interleaved E4M3 data + pulsar_mx_sfoff-swizzled E8M0 scale, contiguous:
@@ -616,7 +616,7 @@ static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
  * (cold path); the resolved fp8_mx_weight is then cached in g_fp8_mx_by_offset
  * exactly like a converted weight, so the per-token hot path never probes this
  * set. */
-static std::unordered_set<uint64_t> g_mxfp8_lt_offsets;
+static std::unordered_set<map_offset_key, map_offset_key_hash> g_mxfp8_lt_offsets;
 
 /* Direct-mapped front cache for cuda_fp8_mx_weight (file-scope so backend
  * cleanup can invalidate it together with g_fp8_mx_by_offset).
@@ -673,7 +673,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
         const fp8_mx_weight *p = fc->ptr.load(std::memory_order_relaxed);
         if (p && p->host_base == model_map && p->in_dim == in_dim && p->out_dim == out_dim) return p;
     }
-    auto it = g_fp8_mx_by_offset.find(offset);
+    auto it = g_fp8_mx_by_offset.find({model_map, offset});
     if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
         it->second.in_dim == in_dim && it->second.out_dim == out_dim) {
         fc->ptr.store(&it->second, std::memory_order_relaxed);
@@ -689,15 +689,15 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
      * +scale]. Skip the cudaMalloc+convert entirely and hand cuBLASLt the
      * device-accessible mmap pointers (g_model_device_base+offset). Byte-for-byte
      * identical to what mxfp8_weight_convert_kernel would have produced. */
-    if (g_mxfp8_lt_offsets.count(offset)) {
+    if (g_mxfp8_lt_offsets.count({model_map, offset})) {
         __nv_fp8_e4m3 *ltdata =
             (__nv_fp8_e4m3 *)cuda_model_range_ptr(model_map, offset, data_bytes, "fp8_mx_lt data");
         unsigned char *ltscale =
             (unsigned char *)cuda_model_range_ptr(model_map, offset + data_bytes, scale_bytes, "fp8_mx_lt scale");
         if (ltdata && ltscale) {
             fp8_mx_weight w = { model_map, offset, in_dim, out_dim, ltdata, ltscale };
-            g_fp8_mx_by_offset[offset] = w;
-            const fp8_mx_weight *wp = &g_fp8_mx_by_offset[offset];
+            g_fp8_mx_by_offset[{model_map, offset}] = w;
+            const fp8_mx_weight *wp = &g_fp8_mx_by_offset[{model_map, offset}];
             fc->ptr.store(wp, std::memory_order_relaxed);
             fc->tag.store(offset, std::memory_order_release);
             (void)label;
@@ -1985,13 +1985,17 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
 /* PER-TENSOR routing: every offset registered at load (the MXFP8 workhorse
  * weights: attn_kv/q_a/q_b, attn_output_a/b, shared experts, output head)
  * takes the FP8 path; anything unregistered is rejected below. */
-std::unordered_set<uint64_t> g_fp8_offsets;
+std::unordered_set<map_offset_key, map_offset_key_hash> g_fp8_offsets;
 
 
-void pulsar_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
+void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offset) {
+    g_fp8_offsets.insert({model_map, weight_offset});
+}
 
 
-void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
+void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset) {
+    g_mxfp8_lt_offsets.insert({model_map, weight_offset});
+}
 
 
 /* Drop every process-global fp8 weight-cache entry. MUST run at backend
@@ -2160,7 +2164,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
             return r1 && r2;
         }
     }
-    if (g_fp8_offsets.count(weight_offset)) {
+    if (g_fp8_offsets.count({model_map, weight_offset})) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes = out_dim * fblocks * 33;
         /* No out->bytes term here: the guard at the top of this function
@@ -2900,7 +2904,8 @@ int pulsar_gpu_attention_output_batch_tensor(
             return r1 && r2;
         }
     }
-    if (!g_fp8_offsets.count(out_a_offset) || !g_fp8_offsets.count(out_b_offset)) return 0;
+    if (!g_fp8_offsets.count({model_map, out_a_offset}) ||
+        !g_fp8_offsets.count({model_map, out_b_offset})) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t blocks_b = (low_dim + 31) / 32;

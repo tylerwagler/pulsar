@@ -562,7 +562,28 @@ struct fp8_mx_weight {
 /* ---- shared host globals ---- */
 
 extern cublasLtHandle_t g_cublaslt;
-extern std::unordered_set<uint64_t> g_fp8_offsets;
+/* Every FP8 registry below is keyed by (MAPPING, offset), never by offset
+ * alone.  A safetensors checkpoint is one file per layer, so each shard's
+ * offsets restart near zero: an offset-only key collides across layers, the
+ * fast path then misses its `host_base` check, and -- worse than a miss --
+ * each miss WROTE the entry back, evicting the other layer's every time.  One
+ * resolve per weight per step, for 43 layers. */
+struct map_offset_key {
+    const void *base;
+    uint64_t offset;
+    bool operator==(const map_offset_key &o) const {
+        return base == o.base && offset == o.offset;
+    }
+};
+struct map_offset_key_hash {
+    size_t operator()(const map_offset_key &k) const {
+        size_t h = std::hash<const void *>()(k.base);
+        h ^= std::hash<uint64_t>()(k.offset) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+extern std::unordered_set<map_offset_key, map_offset_key_hash> g_fp8_offsets;
 
 /* ---- once-per-shape bookkeeping that never goes quiet (L189) ----
  *

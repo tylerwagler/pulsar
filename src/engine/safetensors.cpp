@@ -711,22 +711,33 @@ static bool st_is_shard(const char *n) {
 }
 
 void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
-    DIR *dir = opendir(path);
-    if (!dir) pulsar_die_errno("cannot open model directory", path);
+    /* Two shapes, one loader: a DIRECTORY of shards, or a single file that IS
+     * the whole checkpoint.  The engine does not care which -- the tensor table
+     * records each tensor's mapping either way. */
+    struct stat pst;
+    if (stat(path, &pst) == -1) pulsar_die_errno("cannot stat model", path);
+    const bool single_file = S_ISREG(pst.st_mode);
 
     char **names = NULL;
     uint64_t n = 0, cap = 64;
     names = (char **)st_alloc(cap * sizeof(*names));
-    for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
-        if (!st_is_shard(de->d_name)) continue;
-        if (n == cap) {
-            cap *= 2;
-            names = (char **)realloc(names, (size_t)cap * sizeof(*names));
-            if (!names) st_die("safetensors: out of memory listing shards");
+    if (single_file) {
+        const char *slash = strrchr(path, '/');
+        names[n++] = st_strdup(slash ? slash + 1 : path);
+    } else {
+        DIR *dir = opendir(path);
+        if (!dir) pulsar_die_errno("cannot open model directory", path);
+        for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
+            if (!st_is_shard(de->d_name)) continue;
+            if (n == cap) {
+                cap *= 2;
+                names = (char **)realloc(names, (size_t)cap * sizeof(*names));
+                if (!names) st_die("safetensors: out of memory listing shards");
+            }
+            names[n++] = st_strdup(de->d_name);
         }
-        names[n++] = st_strdup(de->d_name);
+        closedir(dir);
     }
-    closedir(dir);
     if (n == 0) st_die("safetensors: no *.safetensors shards in %s", path);
     qsort(names, (size_t)n, sizeof(*names), st_cmp_name);
 
@@ -739,7 +750,8 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     const int mmap_flags = gpu_mapping ? MAP_SHARED : MAP_PRIVATE;
     for (uint64_t i = 0; i < n; i++) {
         char full[4096];
-        int w = snprintf(full, sizeof(full), "%s/%s", path, names[i]);
+        const int w = single_file ? snprintf(full, sizeof(full), "%s", path)
+                                  : snprintf(full, sizeof(full), "%s/%s", path, names[i]);
         if (w <= 0 || (size_t)w >= sizeof(full)) st_die("safetensors: shard path is too long");
         st_shard *s = &shards[i];
         s->name = names[i];
@@ -756,6 +768,12 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         m->shard_fd[i] = s->fd;
         m->shard_map[i] = s->map;
         m->shard_size[i] = s->size;
+        /* PULSAR_VERIFY_RANGES: name each mapping, so the device-range hashes
+         * printed by the runtime can be attributed to a file. */
+        if (getenv("PULSAR_VERIFY_RANGES")) {
+            printf("SHARD %llu %p %s\n", (unsigned long long)i, (const void *)s->map, full);
+            fflush(stdout);
+        }
     }
 
     /* The primary shard is the one carrying the full KV block; it is also the
@@ -791,4 +809,31 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
                     "%.2f GiB mapped, %llu metadata keys\n",
             (unsigned long long)m->n_shards, (unsigned long long)m->n_tensors,
             (double)m->size / 1073741824.0, (unsigned long long)m->n_kv);
+
+    /* PULSAR_VERIFY_TENSORS=<name prefix>: hash the bytes the KERNELS will read
+     * (tensor_map_base(m,t) + t->abs_offset) for every tensor under that
+     * prefix.  Gate 3 and the reference reader both validated the FILE; this is
+     * the only check of what the engine actually resolves, which is where a
+     * multi-mapping model can go wrong while the file stays perfect.
+     * An EMPTY prefix means every tensor, which is what diffs this container's
+     * whole inventory against the GGUF it replaced. */
+    const char *vfypfx = getenv("PULSAR_VERIFY_TENSORS");
+    if (vfypfx) {
+        const size_t plen = strlen(vfypfx);
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const pulsar_tensor *t = &m->tensors[i];
+            if (t->name.len < plen || memcmp(t->name.ptr, vfypfx, plen) != 0) continue;
+            const uint8_t *base = (const uint8_t *)tensor_map_base(m, t);
+            const uint8_t *p = base + t->abs_offset;
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint64_t b = 0; b < t->bytes; b++) {
+                h ^= (uint64_t)p[b];
+                h *= 0x100000001b3ull;
+            }
+            printf("VERIFY %.*s %016llx %llu\n",
+                   (int)t->name.len, t->name.ptr, (unsigned long long)h,
+                   (unsigned long long)t->bytes);
+        }
+        fflush(stdout);
+    }
 }

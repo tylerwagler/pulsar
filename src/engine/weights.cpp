@@ -1345,6 +1345,29 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+
+    /* A LAYER'S TENSORS MUST ALL LIVE IN ONE MAPPING.  A safetensors checkpoint
+     * is one file per layer, and the kernels resolve a weight as
+     * tensor_map_base(model, t) + t->abs_offset, so any two of a layer's tensors
+     * in different files would resolve against the wrong base and read silently
+     * wrong bytes.  Assert it here across the storage families a layer holds,
+     * including the router's optional bias / token-id tensors: the prefill
+     * router hands the kernel ONE mapping for all three of their offsets, and
+     * that is only sound because they share the layer's mapping.  (That mapping
+     * used to be taken from ffn_exp_probs_b, which the hash-routed layers omit
+     * -- a NULL that fell back to m->map and mis-resolved their tid2eid table
+     * and VL bias against the first shard.) */
+    const void *layer_map = tensor_map_base(m, l->attn_norm);
+    const pulsar_tensor *layer_tensors[] = {
+        l->hc_attn_fn, l->attn_norm, l->attn_kv, l->ffn_down_exps,
+        l->ffn_gate_inp, l->ffn_exp_probs_b, l->ffn_exp_probs_b_vl, l->ffn_gate_tid2eid,
+    };
+    for (size_t li = 0; li < sizeof(layer_tensors) / sizeof(layer_tensors[0]); li++) {
+        if (layer_tensors[li] && tensor_map_base(m, layer_tensors[li]) != layer_map) {
+            pulsar_die("layer tensors span more than one mapping; the kernels address "
+                       "weights as base + offset and cannot span files");
+        }
+    }
 }
 
 
