@@ -152,13 +152,24 @@ def materialize(work, base):
     away from rewriting the base's shard in place -- that happened, and it cost
     a regeneration of the delivered artifact -- and it also pins the work dir to
     the base's filesystem (hard-linking /srv/models into /tmp is a cross-device
-    error).  A symlink is read-only by construction."""
+    error).  A symlink is read-only by construction.
+
+    SELF-HEALING, and it has to be: a swapped shard is a real file in `work`, so
+    a REUSED work dir still carries whichever unit ran last.  Dumping a fresh
+    reference against that would anchor the whole comparison on a promoted
+    checkpoint instead of the base -- silently, since every score would then be
+    against the wrong reference.  Any non-symlink entry is therefore restored."""
     os.makedirs(work, exist_ok=True)
-    if os.path.exists(os.path.join(work, ".composed")):
-        return work
     for f in os.listdir(base):
-        if f.endswith(".safetensors") or f == INDEX:
-            os.symlink(os.path.join(base, f), os.path.join(work, f))
+        if not (f.endswith(".safetensors") or f == INDEX):
+            continue
+        dst = os.path.join(work, f)
+        if os.path.islink(dst):
+            continue
+        if os.path.exists(dst):
+            # a shard left swapped by an earlier unit: restore the anchor
+            os.remove(dst)
+        os.symlink(os.path.join(base, f), dst)
     open(os.path.join(work, ".composed"), "w").close()
     return work
 
@@ -182,6 +193,15 @@ def main():
                     help="all-cheap base CHECKPOINT DIRECTORY (the anchor)")
     ap.add_argument("--donor-root", required=True,
                     help="dir holding L<L>-<parent>/ drop-in donor shards")
+    ap.add_argument("--builder", default=None,
+                    help="build_mxfp4_layer.py: build a unit's donor shard on demand "
+                         "instead of pre-materializing all of them (86 shards is ~232 GB "
+                         "and only one is ever in use at a time)")
+    ap.add_argument("--source", default=None,
+                    help="source checkpoint dir for --builder")
+    ap.add_argument("--cleanup-donors", action="store_true",
+                    help="remove each donor shard once its unit is scored (pair with "
+                         "--builder to hold peak disk to one shard)")
     ap.add_argument("--calib", required=True, help="calibration text file")
     ap.add_argument("--out", required=True, help="kl.json output (resumable)")
     ap.add_argument("--parents", default="all",
@@ -236,9 +256,16 @@ def main():
         donor_dir = os.path.join(a.donor_root, f"L{L}-{p}")
         donor = os.path.join(donor_dir, shard)
         if not os.path.exists(donor):
-            sys.exit(f"error: no donor shard for {key}: expected {donor}\n"
-                     f"       build it with: build_mxfp4_layer.py --layer {L} "
-                     f"--parents {p} --outdir {donor_dir}")
+            if not a.builder or not a.source:
+                sys.exit(f"error: no donor shard for {key}: expected {donor}\n"
+                         f"       build it with: build_mxfp4_layer.py --layer {L} "
+                         f"--parents {p} --outdir {donor_dir}\n"
+                         f"       or pass --builder/--source to build it on demand")
+            print(f"[{key}] building donor shard", flush=True)
+            os.makedirs(donor_dir, exist_ok=True)
+            subprocess.run([sys.executable, a.builder, "--layer", str(L),
+                            "--parents", p, "--ours", a.base, "--source", a.source,
+                            "--outdir", donor_dir], check=True)
         compose(a.work, a.base, shard, donor)
         t0 = time.time()
         out = run_pulsar(a, common + ["--kl-score", ref_dump], f"unit_{L}_{p}.log")
@@ -250,6 +277,8 @@ def main():
         json.dump(results, open(a.out, "w"), indent=1)
         print(f"[{key}] dkl_promote={m.group(1)} stderr={m.group(2)} "
               f"({time.time()-t0:.0f}s, {len(results)}/{len(units)} done)", flush=True)
+        if a.cleanup_donors:
+            shutil.rmtree(donor_dir, ignore_errors=True)
 
     print(f"done: {len(results)} units -> {a.out}")
     return 0
