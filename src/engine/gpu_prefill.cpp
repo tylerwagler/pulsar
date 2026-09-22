@@ -2711,6 +2711,22 @@ bool gpu_graph_encode_layer_ffn_batch(
         } \
     } while (0)
 
+    uint32_t exp_lo = 0u;
+    uint32_t exp_hi = (uint32_t)pulsar_layer_n_expert(il);
+    if (ok && g->tp) {
+        /* Slice 4c: under TP each rank computes ONLY its owned expert slice
+         * (single authority), so the all-reduce at tp_prefill_big_gate sums the
+         * owned partials into the correct full routed sum.  Co-gated with the
+         * combine: a narrowed partial is only ever emitted when the all-reduce
+         * runs, and never summed twice. */
+        if (!pulsar_tp_owned_expert_range(pulsar_tp_rank(g->tp),
+                                          pulsar_tp_n_ranks(g->tp), exp_hi,
+                                          &exp_lo, &exp_hi)) {
+            fprintf(stderr, "pulsar: tp owned-expert range refused (rank=%d n=%u)\n",
+                    pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp));
+            ok = false;
+        }
+    }
     if (ok) {
         ok = pulsar_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_up,
@@ -2737,7 +2753,9 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                PULSAR_SWIGLU_CLAMP_EXP,
                                                g->batch_ffn_norm,
                                                il,
-                                               n_tokens) != 0;
+                                               n_tokens,
+                                               exp_lo,
+                                               exp_hi) != 0;
     }
     if (ok) {
         /* ARM-DEPENDENT: batch_routed_up is only written by the MMQ arms

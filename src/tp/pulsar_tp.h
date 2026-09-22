@@ -164,6 +164,15 @@ void pulsar_tp_free(pulsar_tp *tp);
 int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
 
+/* Owned routed-expert slice for `rank` in a group of `n_ranks`, floor-partitioned
+ * over [0,n_total): lo = rank*n/n_ranks, hi = (rank+1)*n/n_ranks (uint64 mid).
+ * Deterministic; disjoint and complete across ranks (rank r's hi == rank r+1's
+ * lo).  n_ranks<=1 -> [0,n_total) (full path); n_total==0 -> [0,0).  Returns 1 on
+ * success, 0 on bad args.  This is the single authority (rule 4) for which expert
+ * slice a rank owns; the kernel never recomputes it. */
+int pulsar_tp_owned_expert_range(int rank, uint32_t n_ranks, uint32_t n_total,
+                                 uint32_t *lo, uint32_t *hi);
+
 /* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
  * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for
  * all n ranks; opt->rank/opt->n_ranks are explicit.  Returns 1 on success. */

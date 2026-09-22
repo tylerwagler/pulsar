@@ -2018,6 +2018,16 @@ void pulsar_tp_free(pulsar_tp *tp) {
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp) { return tp->n_ranks; }
 
+int pulsar_tp_owned_expert_range(int rank, uint32_t n_ranks, uint32_t n_total,
+                                 uint32_t *lo, uint32_t *hi) {
+    if (!lo || !hi || rank < 0 || (uint32_t)rank >= (n_ranks ? n_ranks : 1u))
+        return 0;
+    if (n_ranks <= 1 || n_total == 0) { *lo = 0; *hi = n_total; return 1; }
+    *lo = (uint32_t)(((uint64_t)rank    * n_total) / n_ranks);
+    *hi = (uint32_t)(((uint64_t)(rank + 1) * n_total) / n_ranks);
+    return 1;
+}
+
 bool pulsar_tp_is_rdma(const pulsar_tp *tp) { return tp->rdma_active; }
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp) { return tp->peer_ctx; }
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp) { return tp->n_layer; }

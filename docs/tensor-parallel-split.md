@@ -109,10 +109,21 @@ bug, not a design change.
       The n=2 legacy `--tp-role`/`--tp-peer` pair path and its RDMA are
       unchanged.  Perimeter of this increment: decode/batch gates and the
       command plane fail loudly for n>2 (rule 9) until their n-way slices;
-      per-peer RDMA is pair-gated; and the sum remains n× the full-model value
-      until 4c ownership makes each rank emit its owned 1/n partial.
-- 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the
-      f32 partial). GPU-gated.
+      per-peer RDMA is pair-gated.
+- **4c. Ownership-aware routed-MoE kernels (2026-09-22, engine + kernel wiring;
+      runtime GPU/pair-gated).** Each rank now computes ONLY its owned expert
+      slice — the single authority `pulsar_tp_owned_expert_range(rank, n_ranks,
+      n_total, &lo, &hi)` (floor partition `[r·n/nr, (r+1)·n/nr)`), threaded as
+      `expert_lo/expert_hi` into `pulsar_gpu_routed_moe_batch_tensor`.  The
+      CUTLASS MXFP4 grouped arm skips peer-owned pairs in the count/scatter
+      (making those groups M=0 in the grouped GEMM — no bytes, no FLOPs) with a
+      sentinel `sorted_pairs` + gather guard; the small-batch GEMV arm extends
+      its `valid` predicate; the MMQ/mixed arms fail loudly (rule 9).  The
+      engine passes the owned range under the same `g->tp` condition that gates
+      `tp_prefill_big_gate`, so the all-reduce sums n owned partials into the
+      correct full routed sum — TP is now numerically correct.  Non-TP
+      (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
+      GPU/pair-gated (the prefill byte gate and the pair all-reduce check).
 - 4d. Vocab head split on the logits path (frames ported; engine-side wiring).
 - 4e. Phase-3 lockstep over our session surface (banks/warm-fork, multiseq,
       mixed, spec rounds).

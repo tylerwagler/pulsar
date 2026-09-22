@@ -219,6 +219,11 @@ __global__ static void moe_padded_gather_kernel(
     uint32_t i = s - offsets[e];
     uint32_t R = padded_off[e] + i;
     uint32_t pair = sorted_pairs[s];
+    /* Slice 4c: under ownership the scatter claims only owned pairs, so the tail
+     * of sorted_pairs is the 0xFF sentinel.  A stale slot would compute a huge
+     * `tok` and read x out of bounds below -- bail here (and leave pair_slot
+     * == -1 so the reduction adds nothing for the token's peer-owned slots). */
+    if (pair >= pair_count) return;
     uint32_t tok = pair / n_expert;
     if (x_gathered) {
         const float *src = x + (uint64_t)tok * in_dim;
@@ -318,7 +323,9 @@ static int routed_moe_launch_cutlass_grouped(
         float clamp,
         const pulsar_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t expert_lo,
+        uint32_t expert_hi) {
     if (!out || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
@@ -433,9 +440,16 @@ static int routed_moe_launch_cutlass_grouped(
      * E4M3 gather zero-fills exactly those (what the pre-zeroed f32 rows gave). */
     if (ok && row_src_tok) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_bytes),
                                         "moe_grouped rsrc clear");
+    /* Sentinel (slice 4c): sorted_pairs is unbounded arena scratch reused across
+     * shapes; under ownership the scatter claims only owned pairs, leaving the
+     * tail stale.  0xFFFFFFFF >= any pair_count, so the gather's `pair >=
+     * pair_count` guard treats stale slots as unclaimed (no double-processing). */
+    if (ok) ok = cuda_ok(cudaMemsetAsync(sorted_pairs, 0xFF, sorted_bytes),
+                         "moe_grouped sorted sentinel clear");
     if (ok) {
         moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
-                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_COUNT));
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_COUNT),
+                expert_lo, expert_hi);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
     }
     if (ok) {
@@ -444,7 +458,8 @@ static int routed_moe_launch_cutlass_grouped(
     }
     if (ok) {
         moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
-                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_SCATTER));
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_SCATTER),
+                expert_lo, expert_hi);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped scatter launch");
     }
     if (ok) {
@@ -488,13 +503,15 @@ static int routed_moe_launch_cutlass_dispatch(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens,
+        uint32_t expert_lo, uint32_t expert_hi) {
     /* The grouped GEMM is the only path for this shape.  A failure here is a
      * failure. */
     const int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+            selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
+            expert_lo, expert_hi);
     if (!rc) {
         static int said = 0;
         if (!said) { said = 1; fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
@@ -561,7 +578,18 @@ static int routed_moe_launch_mixed40(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens,
+        uint32_t expert_lo, uint32_t expert_hi) {
+    /* The mixed arm cannot skip peer-owned experts yet; refuse loudly rather
+     * than compute the full sum under ownership (rule 9). */
+    if (expert_lo != 0u || expert_hi != n_total_expert) {
+        static int said = 0;
+        if (!said) { said = 1;
+            fprintf(stderr, "pulsar: mixed40 routed MoE cannot honor expert ownership "
+                    "(range [%u,%u) of %u) -- no fallback; refusing\n",
+                    expert_lo, expert_hi, n_total_expert); }
+        return 0;
+    }
     const int caseA = (gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4);   /* gate/up MXFP4, down MMQ */
     const int caseB = (down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4);   /* gate/up MMQ, down MXFP4 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
@@ -688,12 +716,14 @@ static int routed_moe_launch_mixed40(
     if (ok && rsrc_b) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_b), "mixed40 rsrc clear");
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
     if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
-              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_COUNT));
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_COUNT),
+              expert_lo, expert_hi);
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
     if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
     if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
-              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_SCATTER));
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_SCATTER),
+              expert_lo, expert_hi);
               ok = cuda_ok(cudaGetLastError(), "mixed40 scatter"); }
     if (ok) { moe_padded_offsets_kernel<<<1, 1>>>(padded_off, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 padded offsets"); }
@@ -791,7 +821,7 @@ static int routed_moe_launch_mixed40(
                     mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
                     gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    gq, gsf, gkbp, ca_q, ca_sf, ca_kbp) != 0) ok = 0;
+                    gq, gsf, gkbp, ca_q, ca_sf, ca_kbp, 0u, n_total_expert) != 0) ok = 0;
         }
         /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
          * layers).  The leaf was emitted as E4M3 by phase 1's own epilogue
@@ -878,7 +908,7 @@ static int routed_moe_launch_mixed40(
                     mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
                     down_expert_bytes, down_row_bytes,
                     (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim,
-                    mq, msf, mkbp) != 0) ok = 0;
+                    mq, msf, mkbp, 0u, n_total_expert) != 0) ok = 0;
         }
     }
     if (!ok) return 0;
@@ -1234,7 +1264,19 @@ static int routed_moe_launch(
         float clamp,
         const pulsar_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t expert_lo,
+        uint32_t expert_hi) {
+    /* The MMQ arm cannot skip peer-owned experts yet; refuse loudly rather
+     * than compute the full sum under ownership (rule 9). */
+    if (expert_lo != 0u || expert_hi != n_total_expert) {
+        static int said = 0;
+        if (!said) { said = 1;
+            fprintf(stderr, "pulsar: MMQ routed MoE cannot honor expert ownership "
+                    "(range [%u,%u) of %u) -- no fallback; refusing\n",
+                    expert_lo, expert_hi, n_total_expert); }
+        return 0;
+    }
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -1419,7 +1461,7 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
-static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_lo, uint32_t expert_hi) {
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
      * is strictly per-row (selected/weights/x/out addressed by token), so a decode
@@ -1450,7 +1492,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                     gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-                    n_total_expert, n_expert, clamp, x, layer_index, n_dec);
+                    n_total_expert, n_expert, clamp, x, layer_index, n_dec,
+                    expert_lo, expert_hi);
             (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
             /* L158 inc 5: the suffix view keys no slot; give it one from the
              * producer's full-width encoding (byte copy + scale re-base).  No
@@ -1465,7 +1508,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                     model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
-                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec);
+                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec,
+                    expert_lo, expert_hi);
             (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
             return (r1 && r2) ? 1 : 0;
         }
@@ -1549,7 +1593,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,
                         (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                        hq, hsf, hkbp) != 0) {
+                        hq, hsf, hkbp, expert_lo, expert_hi) != 0) {
                 fprintf(stderr, "pulsar: routed MoE small-batch FFN (n_tok=%u) failed -- no fallback; refusing\n",
                         n_tokens);
                 return 0;
@@ -1567,7 +1611,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                          down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x,
-                                         layer_index, n_tokens);
+                                         layer_index, n_tokens, expert_lo, expert_hi);
     }
     if ((gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) != (down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4)) {
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
@@ -1575,7 +1619,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+                                         selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
+                                         expert_lo, expert_hi);
     }
     return routed_moe_launch(out, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -1584,10 +1629,10 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens);
+                             layer_index, n_tokens, expert_lo, expert_hi);
 }
 
-int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_lo, uint32_t expert_hi) {
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was
      * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
@@ -1600,10 +1645,29 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
         fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
         return 0;
     }
+    /* Rule 4: the owned-expert range is a single authority (pulsar_tp_owned_expert_range);
+     * a malformed range is a split bug and a wrong sum.  A full range (0, n_total) is the
+     * single-rank/non-TP path. */
+    if (expert_lo > expert_hi || expert_hi > n_total_expert) {
+        fprintf(stderr, "pulsar: routed MoE bad owned range [%u,%u) of %u -- refusing\n",
+                expert_lo, expert_hi, n_total_expert);
+        return 0;
+    }
+    /* Rule 5: announce the ownership lane once per shape when narrowed. */
+    if (expert_lo != 0u || expert_hi != n_total_expert) {
+        static int owned_said = 0;
+        if (!owned_said) {
+            owned_said = 1;
+            fprintf(stderr, "pulsar: routed MoE ownership lane on "
+                            "(experts [%u,%u) of %u)\n",
+                    expert_lo, expert_hi, n_total_expert);
+        }
+    }
     return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_type, down_type,
                 gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-                n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+                n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
+                expert_lo, expert_hi);
 }
 

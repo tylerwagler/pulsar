@@ -742,7 +742,8 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     const float *rw,          // [n_slots] routing weights
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab,
     uint64_t data_bytes, SFL sfl, float clampv,
-    int n_expert, unsigned n_total, unsigned n_slots, int K, int N) {
+    int n_expert, unsigned n_total, unsigned n_slots, int K, int N,
+    unsigned expert_lo, unsigned expert_hi) {
   __shared__ float lut[16];
   __shared__ float vblk[GEMV_DEDUPE_MAX][32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
@@ -752,7 +753,9 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   const int warp = (int)(threadIdx.x >> 5);
   const int n0 = (int)(blockIdx.x * 32u);
   const int e = sel[slot];
-  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  const bool valid = !(e < 0 || (unsigned)e >= n_total)
+                  && (unsigned)e >= expert_lo
+                  && (unsigned)e <  expert_hi;
   int owned[GEMV_DEDUPE_MAX];
   const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
   if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
@@ -843,7 +846,8 @@ __global__ static void expert_gemv_down_kernel(
     const int32_t *sel,       // [n_slots] expert ids
     const uint8_t *const *down_tab,
     uint64_t data_bytes, SFL sfl,
-    unsigned n_total, unsigned n_slots, int K, int N) {
+    unsigned n_total, unsigned n_slots, int K, int N,
+    unsigned expert_lo, unsigned expert_hi) {
   /* L214: the CTA owns GEMV_DOWN_TILE_N outputs (8 per warp) for one expert-owner slot
    * and every slot naming that expert (gemv_dedupe_owned): each owned slot's mid row and
    * its decoded scales are staged in shared memory once, the expert's down rows stream
@@ -859,7 +863,9 @@ __global__ static void expert_gemv_down_kernel(
   const int warp = (int)(threadIdx.x >> 5);
   const int tid  = (int)threadIdx.x;
   const int e = sel[slot];
-  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  const bool valid = !(e < 0 || (unsigned)e >= n_total)
+                  && (unsigned)e >= expert_lo
+                  && (unsigned)e <  expert_hi;
   int owned[GEMV_DEDUPE_MAX];
   const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
   if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
@@ -934,7 +940,8 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     uint64_t down_stride, uint64_t down_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
     int in_dim, int mid_dim, int out_dim,
-    const void *act_q, const void *act_sf, int act_kbp) {
+    const void *act_q, const void *act_sf, int act_kbp,
+    unsigned expert_lo, unsigned expert_hi) {
   if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   if (mid_dim > GEMV_DOWN_MAX_K) return 1;                    /* the down GEMV stages mid rows in shared memory */
@@ -992,14 +999,16 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         nullptr, midq8, midsf, mid_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
         gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
-        n_expert, n_total_expert, n_slots, in_dim, mid_dim);
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi);
   }
   {
     dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
     expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
         down_out, midq8, midsf, mid_kbp, selected,
         down_tab, down_data_bytes, sfl_dn,
-        n_total_expert, n_slots, mid_dim, out_dim);
+        n_total_expert, n_slots, mid_dim, out_dim,
+        expert_lo, expert_hi);
   }
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
@@ -1016,7 +1025,8 @@ int pulsar_cutlass_gemv_gateup(
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab, uint64_t gate_stride, uint64_t gate_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp,
-    void *emit_q, void *emit_sf, int emit_kbp) {
+    void *emit_q, void *emit_sf, int emit_kbp,
+    unsigned expert_lo, unsigned expert_hi) {
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
   const bool emit = emit_q != NULL;
   if (emit && (mid_dim % 32 || !emit_sf || emit_kbp != pulsar_mx_rup(mid_dim / 32, 4))) return 1;
@@ -1042,7 +1052,8 @@ int pulsar_cutlass_gemv_gateup(
         nullptr, (uint8_t *)emit_q, (uint8_t *)emit_sf, emit_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
         selected, rweights, gate_tab, up_tab,
-        gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
+        gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
   }
   dim3 g((unsigned)((mid_dim + 31) / 32), n_slots);
@@ -1050,7 +1061,8 @@ int pulsar_cutlass_gemv_gateup(
       mid, nullptr, nullptr, 0,
       (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
       selected, rweights, gate_tab, up_tab,
-      gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
+      gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+      expert_lo, expert_hi);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
@@ -1058,7 +1070,8 @@ int pulsar_cutlass_gemv_down(
     float *down_out, const int32_t *selected,
     const uint8_t *const *down_tab, uint64_t down_stride, uint64_t down_data_bytes,
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
-    const void *mid_q, const void *mid_sf, int mid_kbp) {
+    const void *mid_q, const void *mid_sf, int mid_kbp,
+    unsigned expert_lo, unsigned expert_hi) {
   if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u) || mid_dim > GEMV_DOWN_MAX_K) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
@@ -1072,7 +1085,8 @@ int pulsar_cutlass_gemv_down(
   dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
   expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
       down_out, (const uint8_t *)mid_q, (const uint8_t *)mid_sf, mid_kbp, selected, down_tab,
-      down_data_bytes, sfl_dn, n_total_expert, n_slots, mid_dim, out_dim);
+      down_data_bytes, sfl_dn, n_total_expert, n_slots, mid_dim, out_dim,
+      expert_lo, expert_hi);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

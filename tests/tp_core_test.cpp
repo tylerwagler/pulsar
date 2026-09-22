@@ -204,16 +204,65 @@ static void test_identity_defaults(void) {
           "identity defaults: self-compat through identity_check");
 }
 
+static void test_owned_range(void) {
+    /* Partition must be exact, complete, deterministic for every (n_total,
+     * n_ranks); and the floor-split must give rank r's hi == rank r+1's lo. */
+    const uint32_t totals[] = { 0u, 1u, 2u, 7u, 128u, 256u };
+    for (uint32_t n : totals) {
+        for (uint32_t nr = 1; nr <= 8u; nr++) {
+            uint32_t prev_hi = 0u, sum = 0u, first_lo = 0u, last_hi = 0u;
+            for (int r = 0; r < (int)nr; r++) {
+                uint32_t lo = 99u, hi = 99u;
+                CHECK(pulsar_tp_owned_expert_range(r, nr, n, &lo, &hi) == 1,
+                      "owned range accepted n=%u nr=%u r=%d", n, nr, r);
+                if (r == 0) first_lo = lo;
+                if (r == (int)nr - 1) last_hi = hi;
+                CHECK(lo <= hi && hi <= n, "range bounds n=%u nr=%u r=%d", n, nr, r);
+                if (r > 0)
+                    CHECK(lo == prev_hi, "gap/overlap n=%u nr=%u r=%d (lo=%u prev_hi=%u)",
+                          n, nr, r, lo, prev_hi);
+                prev_hi = hi;
+                sum += hi - lo;
+            }
+            CHECK(first_lo == 0u && last_hi == n,
+                  "partition not [0,n) n=%u nr=%u", n, nr);
+            CHECK(sum == n, "partition sum %u != n=%u (nr=%u)", sum, n, nr);
+            /* Determinism (use a valid rank; rank 1 is invalid when nr==1). */
+            const int dr = nr > 1 ? 1 : 0;
+            uint32_t a, b, c, d;
+            CHECK(pulsar_tp_owned_expert_range(dr, nr, n, &a, &b) == 1,
+                  "owned range determinism accept n=%u nr=%u", n, nr);
+            pulsar_tp_owned_expert_range(dr, nr, n, &c, &d);
+            CHECK(a == c && b == d, "owned range non-deterministic n=%u nr=%u", n, nr);
+        }
+    }
+    /* No single-rank / n_ranks<=1 -> full range. */
+    for (uint32_t n : totals) {
+        uint32_t lo = 99u, hi = 99u;
+        CHECK(pulsar_tp_owned_expert_range(0, 1, n, &lo, &hi) == 1 &&
+              lo == 0u && hi == n, "n=1 not full range n=%u", n);
+    }
+    /* n=2 over 256 -> the legacy half-split. */
+    uint32_t lo0, hi0, lo1, hi1;
+    pulsar_tp_owned_expert_range(0, 2, 256u, &lo0, &hi0);
+    pulsar_tp_owned_expert_range(1, 2, 256u, &lo1, &hi1);
+    CHECK(lo0 == 0u && hi0 == 128u && lo1 == 128u && hi1 == 256u,
+          "n=2/256 split not [0,128)+[128,256)");
+    CHECK(pulsar_tp_owned_expert_range(-1, 2, 256u, &lo0, &hi0) == 0,
+          "negative rank accepted");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
     test_identity_check();
     test_identity_defaults();
     test_gate_schedule();
+    test_owned_range();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range)\n");
     return 0;
 }

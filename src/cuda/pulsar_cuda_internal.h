@@ -696,12 +696,14 @@ static __host__ __device__ __forceinline__ uint32_t moe_route_oob_code(uint32_t 
 }
 
 __global__ void moe_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected,
-                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code);
+                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code,
+                                              uint32_t expert_lo, uint32_t expert_hi);
 __global__ void moe_prefix_sorted_pairs_kernel(uint32_t *offsets, uint32_t *cursors,
                                                const uint32_t *counts, uint32_t expert_count);
 __global__ void moe_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors,
                                                 const int32_t *selected, uint32_t pair_count,
-                                                uint32_t n_total, uint32_t oob_code);
+                                                uint32_t n_total, uint32_t oob_code,
+                                                uint32_t expert_lo, uint32_t expert_hi);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 
