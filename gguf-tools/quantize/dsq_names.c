@@ -53,6 +53,12 @@ static const name_map top_map[] = {
     { "token_embd.weight",      "embed.weight" },
     { "output_norm.weight",     "norm.weight" },
     { "output.weight",          "head.weight" },
+    /* Vision-Exp's head weights, named output_hc_* at the top level.  They are
+     * matched whole, so they belong HERE: the layer path requires a blk.N.
+     * prefix and would refuse them. */
+    { "output_hc_base.weight",  "hc_head_base" },
+    { "output_hc_fn.weight",    "hc_head_fn" },
+    { "output_hc_scale.weight", "hc_head_scale" },
 };
 
 static const name_map layer_map[] = {
@@ -70,9 +76,17 @@ static const name_map layer_map[] = {
     { "attn_kv_a_norm.weight",            "attn.kv_norm.weight" },
     { "attn_output_a.weight",             "attn.wo_a.weight" },
     { "attn_output_b.weight",             "attn.wo_b.weight" },
-    /* V4.1 CSA2 (L218): the compressor and the index-K projection live on the
-     * KV-source layers, the indexer query/head weights on the index-source
-     * layers; no ape, no separate indexer compressor, no hash table. */
+    /* The compressor and the index-K projection live on the KV-source layers,
+     * the indexer query/head weights on the index-source layers.
+     *
+     * Vision-Exp adds an ape on each compressor AND a whole second compressor
+     * inside the indexer (wq/wk/wgate/wnorm + ape).  Those came from the lane
+     * that actually built the served artifact, because THIS table is the one the
+     * quantizer names tensors with and the served model is Vision-Exp: without
+     * them, 5 families per layer have no HF name and the build cannot emit them.
+     * The two indexer.* entries below are the V4.1 (L218) spelling and are kept
+     * -- they are additive, and a V4.1 artifact still maps. */
+    { "attn_compressor_ape.weight",       "attn.compressor.ape" },
     { "attn_compressor_kv.weight",        "attn.compressor.wkv.weight" },
     { "attn_compressor_gate.weight",      "attn.compressor.wgate.weight" },
     { "attn_compressor_norm.weight",      "attn.compressor.norm.weight" },
@@ -80,6 +94,10 @@ static const name_map layer_map[] = {
     { "indexer.proj.weight",              "attn.indexer.weights_proj.weight" },
     { "indexer.attn_k.weight",            "attn.indexer.wk.weight" },
     { "indexer.k_norm.weight",            "attn.indexer.k_norm.weight" },
+    { "indexer_compressor_ape.weight",    "attn.indexer.compressor.ape" },
+    { "indexer_compressor_kv.weight",     "attn.indexer.compressor.wkv.weight" },
+    { "indexer_compressor_gate.weight",   "attn.indexer.compressor.wgate.weight" },
+    { "indexer_compressor_norm.weight",   "attn.indexer.compressor.norm.weight" },
     { "attn_norm.weight",                 "attn_norm.weight" },
     { "ffn_norm.weight",                  "ffn_norm.weight" },
     { "ffn_gate_shexp.weight",            "ffn.shared_experts.w1.weight" },
@@ -92,13 +110,16 @@ static const name_map layer_map[] = {
     { "hc_head_base.weight",              "hc_head_base" },
     { "hc_head_fn.weight",                "hc_head_fn" },
     { "hc_head_scale.weight",             "hc_head_scale" },
+
     { "main_proj.weight",                 "main_proj.weight" },
     { "main_norm.weight",                 "main_norm.weight" },
     { "norm.weight",                      "norm.weight" },
-    /* The engine's markov_w1/w2 are the checkpoint's DSparkMarkovHead
-     * embed (vocab -> rank) and head (rank -> vocab); V4.1 names them so. */
-    { "markov_head.markov_w1.weight",     "markov_head.embed.weight" },
-    { "markov_head.markov_w2.weight",     "markov_head.head.weight" },
+    /* Vision-Exp names these markov_w1/w2, which is what the served artifact's
+     * own file keys say.  (The V4.1 checkpoint spelled the same two tensors
+     * DSparkMarkovHead embed/head -- embed is w1, vocab -> rank, and head is w2,
+     * rank -> vocab -- so a V4.1 source needs that spelling back.) */
+    { "markov_head.markov_w1.weight",     "markov_head.markov_w1.weight" },
+    { "markov_head.markov_w2.weight",     "markov_head.markov_w2.weight" },
     { "confidence_head.proj.weight",      "confidence_head.proj.weight" },
 };
 
