@@ -79,6 +79,13 @@ highest risk; interacts with MLA, attn-pack KV, indexer.
 4. **Prefill TP (Phase 1)** — write the CUDA `big_gate` path only, split routed
    experts, prove on prefill. First engine-visible TP. **= slice 4b-CUDA; OPEN,
    GPU-gated** (see slice-4 sequencing in docs/tensor-parallel-split.md).
+4b. **N-way transport (2026-09-22)** — the TP transport is generalized from a
+   two-rank pair to an **n-rank full mesh**: `pulsar_tp_create_mesh` (rank-ordered
+   dial/accept, `--tp-rank`/`--tp-nranks`/`--tp-peers`) and
+   `pulsar_tp_allreduce_sum` (all-gather + local sum in canonical ascending-rank
+   order).  The engine is no longer hard-coded to 2 GPUs (1..n).  Perimeter:
+   decode/batch gates and the command plane fail loudly for n>2; per-peer RDMA
+   is pair-gated; n=2 legacy pair (with RDMA) is unchanged.
 5. **Decode gates + vocab head (Phase 2)** — per-layer gates, ownership-aware MoE,
    vocab-split output head. **= slices 4b-CUDA/4c/4d; OPEN, GPU-gated.**
 6. **Session lockstep (Phase 3)** — mirror banks/warm-fork, multiseq, mixed, spec.

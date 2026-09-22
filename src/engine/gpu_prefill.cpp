@@ -2414,11 +2414,10 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
     }
     bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
     if (ok) {
-        ok = pulsar_tp_big_gate_exchange(g->tp, il, ++g->tp_prefill_seq,
-                                         out, in, bytes) != 0;
+        ok = pulsar_tp_allreduce_sum(g->tp, il, ++g->tp_prefill_seq,
+                                     out, in, bytes) != 0;
     }
     if (ok) {
-        for (uint64_t i = 0; i < nelt; i++) out[i] += in[i];
         ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, out, bytes) != 0;
     }
     free(out);

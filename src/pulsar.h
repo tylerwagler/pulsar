@@ -121,15 +121,21 @@ typedef struct {
     float directional_steering_attn;        ///< steering scale on the attention stream
     float directional_steering_ffn;         ///< steering scale on the FFN stream
     bool inspect_only;           ///< load and report, then stop: no session/graph allocation
-    /** Two-rank tensor parallelism (branch tensor_parallel; docs/tensor-parallel-port.md).
-     * tp_role: 1 = leader (listens on tp_port), 2 = worker (dials tp_peer:tp_port);
-     * 0 = off.  tp_arm selects which TP arm is wired: 0 = none, 1 = prefill big-gate.
-     * A nonzero tp_role with tp_arm==0 fails loudly (rule 4), so a pair is never
-     * silently run with no TP in the frame. */
+    /** Tensor parallelism (docs/tensor-parallel-port.md), from 1 GPU up to n.
+     * Two config styles:
+     *  - n-way: tp_rank in [0,tp_nranks) + tp_peers (ordered "host:port,.." for all
+     *    n ranks) + tp_port.  Full-mesh; all ranks are symmetric.
+     *  - legacy 2-rank: tp_role (1 = leader listens on tp_port, 2 = worker dials
+     *    tp_peer:tp_port), tp_peers NULL.  tp_rank/nranks are derived (leader=0).
+     * tp_arm selects which TP arm is wired: 0 = none, 1 = prefill big-gate.
+     * A nonzero tp_role/tp_rank with tp_arm==0 fails loudly (rule 4). */
     int tp_role;
     const char *tp_peer;
     int tp_port;
     int tp_arm;
+    int tp_rank;        /* this rank's index in the group; -1 = unset */
+    int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
+    const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);

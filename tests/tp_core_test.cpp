@@ -93,9 +93,10 @@ static void test_slab_layout(void) {
 }
 
 static void test_hello_wire(void) {
-    /* Fixed size: 4x u32 header + u64 gguf_bytes + 9x u32 identity + pad. */
-    CHECK(sizeof(pulsar_tp_hello_fixed) == 64u,
-          "hello_fixed size=%zu want 64", sizeof(pulsar_tp_hello_fixed));
+    /* Fixed size: 4x u32 header + u64 gguf_bytes + 9x u32 identity + rank/n_ranks.
+     * v8 added rank + n_ranks (2 x u32) where the old pad was. */
+    CHECK(sizeof(pulsar_tp_hello_fixed) == 72u,
+          "hello_fixed size=%zu want 72", sizeof(pulsar_tp_hello_fixed));
 
     pulsar_tp_identity id = {
         87000000000ull, 3u, 43u, 4096u, 129280u, 2u, 1048576u, 0u, 0u, 86u,

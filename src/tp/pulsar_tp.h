@@ -23,7 +23,7 @@
 #include <stdint.h>
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 7u
+#define PULSAR_TP_PROTOCOL_VERSION 8u            /* v8: hello carries rank + n_ranks (n-way) */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 #define PULSAR_TP_BATCH_MAX_ROWS 8u
@@ -35,9 +35,12 @@ typedef enum {
 } pulsar_tp_role;
 
 typedef struct {
-    pulsar_tp_role role;
-    const char *peer;   /* worker: leader's control/RDMA address; NULL on the leader (it listens) */
-    int port;           /* control port */
+    pulsar_tp_role role;    /* legacy 2-rank: LEADER/WORKER; n-way: any (ranks are symmetric) */
+    int rank;               /* this rank's index in the group; -1 = unset */
+    int n_ranks;            /* group size; 0/1 = unset */
+    const char *peer;       /* legacy 2-rank: worker's dial target (NULL on the leader) */
+    const char *peers;      /* n-way: ordered "host:port,..." list for ALL n ranks */
+    int port;               /* this rank's own control/listen port */
 } pulsar_tp_options;
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -73,7 +76,8 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint32_t rank;       /* this rank's index in the TP group (n-way) */
+    uint32_t n_ranks;    /* group size */
 } pulsar_tp_hello_fixed;
 
 /* Registered-slab layout.  S = n_layer * GATES_PER_LAYER slots, all offsets
@@ -158,6 +162,21 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
                      const pulsar_tp_identity *id, char *err, size_t errlen);
 void pulsar_tp_free(pulsar_tp *tp);
 int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
+uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
+
+/* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
+ * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for
+ * all n ranks; opt->rank/opt->n_ranks are explicit.  Returns 1 on success. */
+int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
+                          const pulsar_tp_identity *id, char *err, size_t errlen);
+
+/* All-gather + local sum across the whole group: `out` starts as this rank's
+ * owned partial and returns the combined sum of every rank's partial.  `in` is
+ * caller scratch (clobbered).  n=2 is byte-identical to the old pairwise
+ * exchange + add.  Returns 0 on failure. */
+int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                            void *out, const void *in, uint64_t bytes);
+
 bool pulsar_tp_is_rdma(const pulsar_tp *tp);
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp);
 bool pulsar_tp_failed(const pulsar_tp *tp);

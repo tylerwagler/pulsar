@@ -198,7 +198,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -1998,6 +1998,15 @@ tests/tp_core_test: tests/tp_core_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp
 
 tp-core-test: tests/tp_core_test
 	./tests/tp_core_test
+
+# TP n-way full-mesh test (slice n-way).  Host-only: forks n ranks over TCP
+# loopback and drives create_mesh + allreduce_sum; asserts the all-reduce is
+# the exact sum of every rank's partial, identical across ranks.  n=2 and n=3.
+tests/tp_mesh_test: tests/tp_mesh_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_mesh_test.cpp src/tp/pulsar_tp.cpp
+
+tp-mesh-test: tests/tp_mesh_test
+	./tests/tp_mesh_test
 
 # TP transport loopback test (branch tensor_parallel, slice 3).  Host-only:
 # no CUDA, no RDMA -- a forked leader/worker pair exchanges gate/batch/big

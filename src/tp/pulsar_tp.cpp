@@ -488,9 +488,25 @@ typedef struct {
     pthread_mutex_t post_lock;
 } pulsar_tp_rdma;
 
+/* One peer in the TP mesh.  A full-mesh rank connects to every other rank
+ * (n_ranks-1 peers); each peer has its own control + data sockets.  The
+ * `control_fd`/`data_fd` on pulsar_tp are the primary-link fields (== peers[0]
+ * for a mesh) so the pairwise decode/batch/control-plane paths keep working
+ * unchanged for n=2 and are guarded loudly for n>2. */
+typedef struct {
+    int rank;           /* peer's rank in the group */
+    int control_fd;
+    int data_fd;
+    uint32_t peer_ctx;
+    bool connected;
+} pulsar_tp_peer;
+
 struct pulsar_tp {
     pulsar_tp_options opt;
     int rank;                   /* 0 leader, 1 worker */
+    int n_ranks;                /* ranks in this TP group (2 for the pair) */
+    int n_peers;                /* connected peers (n_ranks-1) */
+    pulsar_tp_peer *peers;      /* array [n_peers], sorted by peer rank */
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
@@ -581,7 +597,7 @@ static void tp_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
 
-static int tp_listen(const char *host, int port, char *err, size_t errlen) {
+static int tp_listen(const char *host, int port, int backlog, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     struct addrinfo hints = {}, *res = NULL;
@@ -599,7 +615,7 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
         if (fd < 0) continue;
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 2) == 0) break;
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, backlog) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -1591,13 +1607,31 @@ static pulsar_tp *tp_alloc(void) {
 static void tp_destroy(pulsar_tp *tp) {
     if (!tp) return;
     tp_rdma_close(tp);
+    /* Primary link (control_fd/data_fd) owns peers[0]; close it once here. */
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
+    if (tp->peers) {
+        /* Peers 1..n_peers-1 are non-primary (mesh); close their own fds. */
+        for (int i = 1; i < tp->n_peers; i++) {
+            if (tp->peers[i].control_fd >= 0) close(tp->peers[i].control_fd);
+            if (tp->peers[i].data_fd >= 0) close(tp->peers[i].data_fd);
+        }
+        free(tp->peers);
+        tp->peers = NULL;
+    }
     tp->~pulsar_tp();
     free(tp);
 }
 
-static int tp_hello_exchange(pulsar_tp *tp, const pulsar_tp_identity *id, int rdma_ok,
+/* Return the peer with the given rank, or NULL. */
+static pulsar_tp_peer *tp_peer_by_rank(pulsar_tp *tp, int rank) {
+    for (int i = 0; i < tp->n_peers; i++)
+        if (tp->peers[i].rank == rank) return &tp->peers[i];
+    return NULL;
+}
+
+static int tp_hello_exchange(pulsar_tp *tp, int fd, int expected_rank,
+                             const pulsar_tp_identity *id, int rdma_ok,
                              char *err, size_t errlen) {
     pulsar_tp_hello_fixed mine = {
         .magic = PULSAR_TP_MAGIC,
@@ -1614,10 +1648,12 @@ static int tp_hello_exchange(pulsar_tp *tp, const pulsar_tp_identity *id, int rd
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+        .rank = (uint32_t)tp->rank,
+        .n_ranks = (uint32_t)tp->n_ranks,
     };
     pulsar_tp_hello_fixed theirs;
-    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+    if (!tp_write_full(fd, &mine, sizeof(mine)) ||
+        !tp_read_full(fd, &theirs, sizeof(theirs))) {
         tp_set_err(err, errlen, "tp hello exchange failed");
         return 0;
     }
@@ -1630,8 +1666,24 @@ static int tp_hello_exchange(pulsar_tp *tp, const pulsar_tp_identity *id, int rd
                    theirs.version, PULSAR_TP_PROTOCOL_VERSION);
         return 0;
     }
-    if (theirs.role == mine.role) {
+    /* Role-differ applies to the legacy leader/worker pair only; an n-way mesh
+     * has symmetric ranks (no leader/worker), so it is keyed by rank. */
+    if (!tp->opt.peers && theirs.role == mine.role) {
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
+        return 0;
+    }
+    if (theirs.rank == mine.rank) {
+        tp_set_err(err, errlen, "tp hello: peer claims this rank %u", mine.rank);
+        return 0;
+    }
+    if (expected_rank >= 0 && (int)theirs.rank != expected_rank) {
+        tp_set_err(err, errlen, "tp hello: peer rank %u != expected %d", theirs.rank,
+                   expected_rank);
+        return 0;
+    }
+    if (theirs.n_ranks != mine.n_ranks) {
+        tp_set_err(err, errlen, "tp hello: group size mismatch (peer n_ranks=%u != %u)",
+                   theirs.n_ranks, mine.n_ranks);
         return 0;
     }
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
@@ -1674,7 +1726,17 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
         return 0;
     }
     tp->opt = *opt;
-    tp->rank = opt->role == PULSAR_TP_ROLE_LEADER ? 0 : 1;
+    /* Legacy 2-rank (no peers list) always derives rank from role; the explicit
+     * rank/n_ranks are honored only in n-way mode, where peers is set. */
+    if (opt->peers) {
+        tp->rank = opt->rank >= 0 ? opt->rank : 0;
+        tp->n_ranks = opt->n_ranks > 1 ? opt->n_ranks : 2;
+    } else {
+        tp->rank = opt->role == PULSAR_TP_ROLE_LEADER ? 0 : 1;
+        tp->n_ranks = 2;
+    }
+    tp->n_peers = 0;
+    tp->peers = NULL;
     tp->control_fd = -1;
     tp->data_fd = -1;
     tp->timeout_sec = PULSAR_TP_DEFAULT_TIMEOUT_SEC;
@@ -1687,7 +1749,7 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
 
     int listener = -1;
     if (tp->rank == 0) {
-        listener = tp_listen(opt->peer, opt->port, err, errlen);
+        listener = tp_listen(opt->peer, opt->port, 2, err, errlen);
         if (listener < 0) goto fail;
         fprintf(stderr, "pulsar-tp: waiting for worker on %s:%d ...\n",
                 opt->peer ? opt->peer : "0.0.0.0", opt->port);
@@ -1703,7 +1765,8 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
     }
     tp_socket_tune(tp->control_fd);
 
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
+    if (!tp_hello_exchange(tp, tp->control_fd, 1 - tp->rank, id, rdma_ok, err, errlen))
+        goto fail;
 
     if (tp->rdma_active) {
         if (!tp_rdma_open(tp, err, errlen)) goto fail;
@@ -1726,12 +1789,214 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
         tp_socket_tune(tp->data_fd);
     }
     if (listener >= 0) close(listener);
-    fprintf(stderr, "pulsar-tp: %s connected, transport=%s\n",
-            tp->rank == 0 ? "worker" : "leader",
+    /* Register the single peer in the mesh array so the n-way primitives (and
+     * the n=2 specialization of the all-reduce) can iterate uniformly. */
+    tp->n_peers = 1;
+    tp->peers = (pulsar_tp_peer *)calloc(1, sizeof(pulsar_tp_peer));
+    if (!tp->peers) {
+        tp_set_err(err, errlen, "tp: out of memory (peer array)");
+        goto fail;
+    }
+    tp->peers[0].rank = 1 - tp->rank;
+    tp->peers[0].control_fd = tp->control_fd;
+    tp->peers[0].data_fd = tp->data_fd;
+    tp->peers[0].peer_ctx = tp->peer_ctx;
+    tp->peers[0].connected = true;
+    fprintf(stderr, "pulsar-tp: rank %d connected (n_ranks=%d, %d peer), transport=%s\n",
+            tp->rank, tp->n_ranks, tp->n_peers,
             tp->rdma_active ? "rdma" : "tcp");
     *out = tp;
     return 1;
 fail:
+    if (listener >= 0) close(listener);
+    tp_destroy(tp);
+    return 0;
+}
+
+/* n-way full-mesh rendezvous.  Each rank R is told its own index, the group
+ * size N, its own listen port, and the ordered "host:port" list of every rank.
+ * Rank-ordered connect: lower index dials, higher index accepts.  Every rank
+ * dials its R lower peers and accepts its N-1-R higher peers; the connect
+ * label (pulsar_tp_connect_hdr) lets an acceptor attribute a raw accepted fd
+ * to the right peer and socket kind.  Backlog >= N-1 so no dialer is made to
+ * wait for the acceptor (the anti-deadlock property of the mesh). */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t rank;   /* dialer's rank */
+    uint32_t kind;   /* 0 = control socket, 1 = data socket */
+} pulsar_tp_connect_hdr;
+
+typedef struct { char host[256]; int port; } tp_endpoint;
+
+static int tp_parse_endpoints(const char *list, int n, tp_endpoint *ep,
+                              char *err, size_t errlen) {
+    if (!list || n <= 0) {
+        tp_set_err(err, errlen, "tp: empty peers list");
+        return 0;
+    }
+    int count = 1;
+    for (const char *s = list; *s; s++) if (*s == ',') count++;
+    if (count != n) {
+        tp_set_err(err, errlen, "tp: peers list has %d entries, want %d", count, n);
+        return 0;
+    }
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", list);
+    char *tok = strtok(buf, ",");
+    for (int i = 0; tok && i < n; i++, tok = strtok(NULL, ",")) {
+        char *colon = strrchr(tok, ':');
+        if (!colon) {
+            tp_set_err(err, errlen, "tp: peer %d '%s' has no :port", i, tok);
+            return 0;
+        }
+        *colon = '\0';
+        snprintf(ep[i].host, sizeof(ep[i].host), "%s", tok);
+        ep[i].port = atoi(colon + 1);
+    }
+    return 1;
+}
+
+int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
+                          const pulsar_tp_identity *id, char *err, size_t errlen) {
+    const int N = opt->n_ranks, R = opt->rank;
+    if (N < 2 || R < 0 || R >= N) {
+        tp_set_err(err, errlen, "tp: mesh needs n_ranks>=2 and 0<=rank<n_ranks (rank=%d n=%d)", R, N);
+        return 0;
+    }
+    tp_endpoint *ep = (tp_endpoint *)calloc((size_t)N, sizeof(tp_endpoint));
+    if (!ep || !tp_parse_endpoints(opt->peers, N, ep, err, errlen)) {
+        free(ep);
+        return 0;
+    }
+    pulsar_tp *tp = tp_alloc();
+    if (!tp) { free(ep); tp_set_err(err, errlen, "tp: out of memory"); return 0; }
+    tp->opt = *opt;
+    tp->rank = R;
+    tp->n_ranks = N;
+    tp->n_peers = N - 1;
+    tp->peers = (pulsar_tp_peer *)calloc((size_t)(N - 1), sizeof(pulsar_tp_peer));
+    tp->control_fd = -1;
+    tp->data_fd = -1;
+    tp->timeout_sec = PULSAR_TP_DEFAULT_TIMEOUT_SEC;
+    const char *tmo = getenv("PULSAR_TP_TIMEOUT_SEC");
+    if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
+    if (!tp->peers) {
+        free(ep); tp_destroy(tp);
+        tp_set_err(err, errlen, "tp: out of memory (peer array)");
+        return 0;
+    }
+    /* Per-peer RDMA is a later increment and is pair-gated; the verifiable mesh
+     * path is full-duplex TCP (the same data, latency-only difference). */
+    tp->rdma_active = false;
+
+    int listener = tp_listen(ep[R].host, ep[R].port, N > 1 ? N : 2, err, errlen);
+    if (listener < 0) { free(ep); tp_destroy(tp); return 0; }
+
+    int slot = 0;
+    for (int p = 0; p < N; p++) {
+        if (p == R) continue;
+        pulsar_tp_peer *pp = &tp->peers[slot++];
+        pp->rank = p;
+        pp->control_fd = -1;
+        pp->data_fd = -1;
+    }
+
+    /* Control sockets: dial lower peers, accept higher peers. */
+    for (int p = 0; p < R; p++) {                       /* R dials lower */
+        pulsar_tp_peer *pp = tp_peer_by_rank(tp, p);
+        pp->control_fd = tp_dial(ep[p].host, ep[p].port, (double)tp->timeout_sec,
+                                 err, errlen);
+        if (pp->control_fd < 0) goto fail;
+        tp_socket_tune(pp->control_fd);
+        pulsar_tp_connect_hdr ch = { PULSAR_TP_MAGIC, PULSAR_TP_PROTOCOL_VERSION,
+                                     (uint32_t)R, 0u };
+        if (!tp_write_full(pp->control_fd, &ch, sizeof(ch))) {
+            tp_set_err(err, errlen, "tp: control label write to peer %d failed", p);
+            goto fail;
+        }
+    }
+    for (int a = 0; a < (N - 1 - R); a++) {             /* R accepts higher */
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) { tp_set_err(err, errlen, "tp: control accept: %s", strerror(errno)); goto fail; }
+        tp_socket_tune(fd);
+        pulsar_tp_connect_hdr ch;
+        if (!tp_read_full(fd, &ch, sizeof(ch)) || ch.magic != PULSAR_TP_MAGIC ||
+            ch.version != PULSAR_TP_PROTOCOL_VERSION || ch.kind != 0u) {
+            close(fd);
+            tp_set_err(err, errlen, "tp: bad control connect label from a higher peer");
+            goto fail;
+        }
+        pulsar_tp_peer *pp = tp_peer_by_rank(tp, (int)ch.rank);
+        if (!pp || pp->control_fd >= 0) {
+            close(fd);
+            tp_set_err(err, errlen, "tp: control accept from unexpected rank %u", ch.rank);
+            goto fail;
+        }
+        pp->control_fd = fd;
+    }
+
+    /* Hello + identity per peer on its control socket. */
+    for (int i = 0; i < tp->n_peers; i++) {
+        pulsar_tp_peer *pp = &tp->peers[i];
+        if (pp->control_fd < 0) {
+            tp_set_err(err, errlen, "tp: peer %d control socket not established", pp->rank);
+            goto fail;
+        }
+        uint32_t saved_ctx = 0;
+        (void)saved_ctx;
+        if (!tp_hello_exchange(tp, pp->control_fd, pp->rank, id, 0, err, errlen))
+            goto fail;
+        pp->peer_ctx = (uint32_t)tp->peer_ctx;
+    }
+
+    /* Data sockets: dial lower peers, accept higher peers. */
+    for (int p = 0; p < R; p++) {
+        pulsar_tp_peer *pp = tp_peer_by_rank(tp, p);
+        pp->data_fd = tp_dial(ep[p].host, ep[p].port, (double)tp->timeout_sec,
+                              err, errlen);
+        if (pp->data_fd < 0) goto fail;
+        tp_socket_tune(pp->data_fd);
+        pulsar_tp_connect_hdr ch = { PULSAR_TP_MAGIC, PULSAR_TP_PROTOCOL_VERSION,
+                                     (uint32_t)R, 1u };
+        if (!tp_write_full(pp->data_fd, &ch, sizeof(ch))) {
+            tp_set_err(err, errlen, "tp: data label write to peer %d failed", p);
+            goto fail;
+        }
+    }
+    for (int a = 0; a < (N - 1 - R); a++) {
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) { tp_set_err(err, errlen, "tp: data accept: %s", strerror(errno)); goto fail; }
+        tp_socket_tune(fd);
+        pulsar_tp_connect_hdr ch;
+        if (!tp_read_full(fd, &ch, sizeof(ch)) || ch.magic != PULSAR_TP_MAGIC ||
+            ch.version != PULSAR_TP_PROTOCOL_VERSION || ch.kind != 1u) {
+            close(fd);
+            tp_set_err(err, errlen, "tp: bad data connect label from a higher peer");
+            goto fail;
+        }
+        pulsar_tp_peer *pp = tp_peer_by_rank(tp, (int)ch.rank);
+        if (!pp || pp->data_fd >= 0) {
+            close(fd);
+            tp_set_err(err, errlen, "tp: data accept from unexpected rank %u", ch.rank);
+            goto fail;
+        }
+        pp->data_fd = fd;
+    }
+
+    /* Primary link (for the pairwise/guarded paths) = lowest-rank peer. */
+    tp->control_fd = tp->peers[0].control_fd;
+    tp->data_fd = tp->peers[0].data_fd;
+    tp->peer_ctx = tp->peers[0].peer_ctx;
+
+    close(listener);
+    free(ep);
+    fprintf(stderr, "pulsar-tp: rank %d/%d mesh connected (%d peers), transport=tcp\n",
+            R, N, tp->n_peers);
+    *out = tp;
+    return 1;
+fail:
+    free(ep);
     if (listener >= 0) close(listener);
     tp_destroy(tp);
     return 0;
@@ -1751,6 +2016,8 @@ void pulsar_tp_free(pulsar_tp *tp) {
 }
 
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
+uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp) { return tp->n_ranks; }
+
 bool pulsar_tp_is_rdma(const pulsar_tp *tp) { return tp->rdma_active; }
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp) { return tp->peer_ctx; }
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp) { return tp->n_layer; }
@@ -1766,7 +2033,17 @@ void pulsar_tp_mark_failed(pulsar_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
+/* n>2 guard: a pairwise or leader->worker path that is not yet n-way refuses
+ * loudly rather than run against only one peer (rule 9). */
+static int tp_refuse_nway(pulsar_tp *tp, const char *what) {
+    fprintf(stderr, "pulsar-tp: %s is not implemented for n>2 (n_ranks=%d); refused\n",
+            what, tp ? tp->n_ranks : 0);
+    if (tp) tp->failed.store(true, std::memory_order_release);
+    return 0;
+}
+
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "decode per-layer gate");
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
     const uint64_t out_off =
         pulsar_tp_slab_out_offset(&tp->layout, layer, gate, tp->vec_bytes);
@@ -1828,6 +2105,7 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
  * TCP remains the symmetric write-then-read fallback. */
 int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
                                   uint64_t seq) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify-block batch gate");
     if (tp->data_fd < 0 || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     const uint64_t batch_out =
@@ -1896,6 +2174,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
 
 int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "pairwise big gate");
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
@@ -1921,6 +2200,87 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
         if (!tp_read_full(tp->data_fd, static_cast<char *>(in) + off, n)) return 0;
         off += n;
     }
+    return 1;
+}
+
+/* Per-peer TCP big-gate exchange over `fd` (the mesh all-reduce drives this on
+ * each peer's data socket, in peer-rank order so both ends of a link meet). */
+static int tp_big_gate_exchange_fd(int fd, uint32_t layer,
+                                   uint64_t seq, const void *out, void *in,
+                                   uint64_t bytes) {
+    if (fd < 0 || !out || !in || bytes == 0) return 0;
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+    if (!tp_write_full(fd, &h, sizeof(h))) return 0;
+    pulsar_tp_gate_header ph;
+    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != 0xB16u || ph.seq != seq) {
+        fprintf(stderr,
+                "pulsar-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                ph.layer, ph.gate, (unsigned long long)ph.seq,
+                layer, (unsigned long long)seq);
+        return 0;
+    }
+    uint64_t off = 0;
+    while (off < bytes) {
+        const uint64_t n = bytes - off > PULSAR_TP_TCP_ROUND ?
+                           PULSAR_TP_TCP_ROUND : bytes - off;
+        if (!tp_write_full(fd, static_cast<const char *>(out) + off, n)) return 0;
+        if (!tp_read_full(fd, static_cast<char *>(in) + off, n)) return 0;
+        off += n;
+    }
+    return 1;
+}
+
+/* All-gather + local sum across the whole mesh.  `out` starts as this rank's
+ * owned partial and returns the combined sum of every rank's partial.  n==2 is
+ * byte-identical to the old pairwise exchange + add (the engine's tp_prefill
+ * big gate).  n>2 accumulates in canonical ascending-rank order so every rank
+ * ends up with the bit-identical full sum (float addition is not associative). */
+int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                            void *out, const void *in, uint64_t bytes) {
+    if (!tp || !out || !in || bytes == 0) return 0;
+    /* Rule 5: announce the lane once per shape (this runs per layer). */
+    static int said = 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "pulsar-tp: n-way all-reduce n=%d lane=%s\n",
+                tp->n_ranks, tp->rdma_active ? "rdma" : "tcp");
+    }
+    const uint64_t nelt = bytes / sizeof(float);
+    if (tp->n_ranks <= 1) return 1;         /* single rank: own partial is the sum */
+    if (tp->n_ranks == 2) {
+        pulsar_tp_peer *pp = tp->n_peers > 0 ? &tp->peers[0] : NULL;
+        if (!pp || pp->data_fd < 0) return 0;
+        if (!tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out, (void *)in, bytes))
+            return 0;
+        float *acc = (float *)out;
+        const float *peer = (const float *)in;
+        for (uint64_t i = 0; i < nelt; i++) acc[i] += peer[i];
+        return 1;
+    }
+    /* n>2: canonical ascending-rank all-gather + sum.  `out` (own partial) is
+     * sent unchanged to every peer; acc sums P0+P1+.. in rank order so every
+     * rank bits the same result. */
+    float *acc = (float *)calloc(bytes ? (size_t)bytes : sizeof(float), 1);
+    if (!acc) return 0;
+    for (int k = 0; k < tp->n_ranks; k++) {
+        if (k == tp->rank) {
+            const float *own = (const float *)out;
+            for (uint64_t i = 0; i < nelt; i++) acc[i] += own[i];
+        } else {
+            pulsar_tp_peer *pp = tp_peer_by_rank(tp, k);
+            float *scratch = (float *)in;
+            if (!pp || !tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out,
+                                                scratch, bytes)) {
+                free(acc);
+                return 0;
+            }
+            for (uint64_t i = 0; i < nelt; i++) acc[i] += scratch[i];
+        }
+    }
+    memcpy(out, acc, bytes);
+    free(acc);
     return 1;
 }
 
@@ -1983,41 +2343,48 @@ static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
 }
 
 int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (session create)");
     pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_session_destroy(pulsar_tp *tp, uint64_t session_id) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (session destroy)");
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_SESSION_DESTROY,
                          &session_id, sizeof(session_id));
 }
 
 int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
                         const int *tokens, uint32_t n_tokens) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (sync)");
     return tp_send_token_command(tp, PULSAR_TP_FRAME_SYNC, session_id,
                                  tokens, n_tokens);
 }
 
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
                         uint64_t seq, int token) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (eval)");
     pulsar_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (rewind)");
     pulsar_tp_value_command msg = { session_id, (int32_t)pos, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (invalidate)");
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
 }
 
 int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
                               uint32_t count) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (eval batch)");
     const uint64_t bytes64 = sizeof(pulsar_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
     if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
@@ -2037,6 +2404,7 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
                                const int *prompt, uint32_t prompt_count,
                                const pulsar_tp_batch_item *items,
                                uint32_t count) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (mixed batch)");
     const uint64_t prompt_bytes = (uint64_t)prompt_count * sizeof(int32_t);
     const uint64_t item_bytes = (uint64_t)count * sizeof(*items);
     const uint64_t bytes64 = sizeof(pulsar_tp_mixed_command_header) +
@@ -2062,6 +2430,7 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
 }
 
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (ack)");
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
                          &ack, sizeof(ack));
@@ -2069,6 +2438,7 @@ int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
 
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation, char *err, size_t errlen) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (wait ack)");
     uint32_t type = 0, bytes = 0;
     pulsar_tp_command_ack ack;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -2090,7 +2460,18 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
 }
 
 int pulsar_tp_send_stop(pulsar_tp *tp) {
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_STOP, NULL, 0);
+    /* Broadcast STOP to every peer so an n-way mesh tears down cleanly (this is
+     * on the engine's live destroy path, session.cpp). */
+    int ok = 1;
+    if (tp->n_peers > 0) {
+        for (int i = 0; i < tp->n_peers; i++)
+            if (tp->peers[i].control_fd >= 0 &&
+                !tp_send_frame(tp->peers[i].control_fd, PULSAR_TP_FRAME_STOP, NULL, 0))
+                ok = 0;
+    } else if (tp->control_fd >= 0) {
+        ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_STOP, NULL, 0);
+    }
+    return ok;
 }
 
 void pulsar_tp_command_free(pulsar_tp_command *command) {
@@ -2125,6 +2506,7 @@ static int tp_command_decode_tokens(pulsar_tp_command *command,
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (recv)");
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
@@ -2238,11 +2620,13 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
 }
 
 int pulsar_tp_send_logits_half(pulsar_tp *tp, const float *half, uint32_t count) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "vocab logits half");
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_LOGITS,
                          half, count * sizeof(float));
 }
 
 int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "vocab logits half");
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != PULSAR_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
@@ -2254,17 +2638,20 @@ int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count) {
 
 int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
                           const int *drafts, uint32_t n) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify");
     return tp_send_token_command(tp, PULSAR_TP_FRAME_VERIFY, session_id,
                                  drafts, n);
 }
 
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept, int32_t replay_n) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify commit");
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *replay_n) {
+    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify commit");
     uint32_t type = 0, bytes = 0;
     struct { int32_t full; int32_t replay; } msg;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||

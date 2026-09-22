@@ -100,6 +100,17 @@ bug, not a design change.
       gate kernels for the DECODE per-layer arm are still unwired and
       `tp_role != 0` with no `--tp-arm` still fails loudly (rule 4).  The
       per-rank partial is ownership-aware only once 4c lands.
+- **N-way transport (2026-09-22).** The transport is no longer two-rank-only:
+      `pulsar_tp_create_mesh` brings up **n** ranks in a full mesh
+      (`--tp-rank`/`--tp-nranks`/`--tp-peers`; every rank connects to every
+      other, rank-ordered dial/accept) and `pulsar_tp_allreduce_sum` combines
+      the routed partial across all n ranks (all-gather + local sum in
+      canonical ascending-rank order so every rank bits the same full value).
+      The n=2 legacy `--tp-role`/`--tp-peer` pair path and its RDMA are
+      unchanged.  Perimeter of this increment: decode/batch gates and the
+      command plane fail loudly for n>2 (rule 9) until their n-way slices;
+      per-peer RDMA is pair-gated; and the sum remains n× the full-model value
+      until 4c ownership makes each rank emit its owned 1/n partial.
 - 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the
       f32 partial). GPU-gated.
 - 4d. Vocab head split on the logits path (frames ported; engine-side wiring).
