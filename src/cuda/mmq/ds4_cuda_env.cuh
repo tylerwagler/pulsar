@@ -33,7 +33,7 @@
 
 #include <array>
 
-#include "ds4_ggml_stubs.h"   // GGML_ASSERT/ABORT/UNUSED, ggml_type, GGML_CUDA_MAX_DEVICES
+#include "ds4_ggml_stubs.h"   // GGML_ASSERT/ABORT/UNUSED, GGML_CUDA_MAX_DEVICES
 #define GGML_COMMON_DECL_CUDA   // selects the CUDA declarations in ggml-common.h
 #define GGML_COMMON_IMPL_CUDA   // ...and EMITS the tables (iq2xxs_grid et al) as
                                 // `static const __device__`.  DECL alone declares

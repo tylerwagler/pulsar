@@ -34,15 +34,15 @@ int ds4_mmq_init(int device);
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
 //   0 otherwise (the caller refuses; there is no second path).
 //
-// Wraps ggml_cuda_should_use_mmq. type_x uses ds4 quant codes which match
-// ggml's enum:
-//   8  = Q8_0
-//   10 = Q2_K
-//   16 = IQ2_XXS
-//
+//   layout:    a PULSAR_TENSOR_* id (src/pulsar_gpu.h) -- the ENGINE's tensor
+//              vocabulary, not ggml's and not a bare number.  This adapter
+//              serves ONE layout, PULSAR_TENSOR_IQ2_XXS_MMQ_K; before
+//              2026-09-21 it took ggml type codes, which meant the callers here
+//              passed a bare `16` while the engine's own id for the same tensor
+//              was something else entirely.
 //   ne11:      batch dimension (number of activation columns / tokens).
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
-int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
+int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts);
 
 // Routed-MoE contract shared by both entries below.  For each (token,
 // slot-within-token's-top-k) pair the kernel computes:

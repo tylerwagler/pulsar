@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: MIT
 // ds4_mmq.cu - host wrapper around llama.cpp's vendored mul_mat_q kernels.
 //
-// Implements the public ds4_mmq_* entry points and explicitly instantiates
-// the mul_mat_q_case<T> template for each quant type the caller needs.
+// Implements the public ds4_mmq_* entry points for the aligned-SoA IQ2_XXS
+// routed-MoE pair.  It used to instantiate mul_mat_q_case<T> per quant type;
+// that family is gone (L066) and the D2R path is now a hard requirement.
 //
-// The module contains dense and routed kernels for Q8_0, Q2_K, Q4_K, and
-// IQ2_XXS, plus the GB10 aligned-SoA D2R and fused MoE epilogues. Numerical
-// parity and long-context coverage live in tests/cuda_long_context_smoke.cpp.
+// What this module still contains is the GB10 aligned-SoA IQ2_XXS routed-MoE
+// pair plus its D2R and fused epilogues.  The dense half (Q8_0 / Q2_K / Q4_K /
+// IQ2_XXS mul_mat_q and the mmvq vector tier) was deleted in L066, which is why
+// the should-use oracle below serves exactly one layout.  Numerical parity and
+// long-context coverage live in tests/cuda_long_context_smoke.cpp.
 
 #include "ds4_mmq.h"
+#include "pulsar_gpu.h"       /* PULSAR_TENSOR_* -- the layout vocabulary */
 
 #include "ds4_cuda_env.cuh"
 #include "../pulsar_cuda_scratch.h"
@@ -165,42 +169,14 @@ extern "C" int ds4_mmq_init(int device) {
 // and ggml_backend internals we don't carry over).
 // ----------------------------------------------------------------------------
 
-static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    GGML_UNUSED(type); GGML_UNUSED(cc); GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
-    return false;
-#endif
-
-    bool mmq_supported;
-    switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_IQ4_NL:
-            mmq_supported = true;
-            break;
-        default:
-            mmq_supported = false;
-            break;
-    }
-    if (!mmq_supported) return false;
+static bool ds4_should_use_mmq_impl(uint32_t layout, int cc, int64_t ne11, int64_t n_experts) {
+    /* Which layouts this adapter can serve -- one.  The list used to be 21 ggml
+     * type codes because it was lifted verbatim from upstream's dense
+     * dispatcher; every one of them became unreachable when L066 deleted that
+     * family, and what remains is the aligned-SoA IQ2_XXS routed-MoE pair.
+     * Serving a layout is a claim about the kernels behind it, so a stale entry
+     * here is worse than a short list. */
+    if (layout != PULSAR_TENSOR_IQ2_XXS_MMQ_K) return false;
 
     if (turing_mma_available(cc)) {
         return true;
@@ -208,11 +184,6 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
         return false;
     }
-#ifdef GGML_CUDA_FORCE_MMQ
-    GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
-    return true;
-#endif
-
     /* The AMD arms are gone (L066 step 3, 2026-08-18).  Upstream branched here
      * on CDNA / CDNA3 / RDNA3 / RDNA3_0 / RDNA3_5 via amd_mfma_available and
      * amd_wmma_available; this engine runs on GB10 and nothing else, and `cc`
@@ -225,11 +196,10 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
     return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
-extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
+extern "C" int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts) {
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    const enum ggml_type t = (enum ggml_type) type_x;
-    return ds4_should_use_mmq_impl(t, cc, ne11, n_experts) ? 1 : 0;
+    return ds4_should_use_mmq_impl(layout, cc, ne11, n_experts) ? 1 : 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -270,12 +240,11 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 //      expert_bounds) - permutations that sort assignments by expert.
 //   2. quantize_mmq_q8_1_cuda with ids_src1 - gathers and quantizes the
 //      activation into the expert-major flat layout.
-//   3. mul_mat_q_case<type> with ids_dst + expert_bounds - the matmul.
+//   3. the D2R expert matmul with ids_dst + expert_bounds.
 // ----------------------------------------------------------------------------
 
 namespace {
 
-template <ggml_type type>
 int ds4_mmq_moe_impl(
         const char    * tag,
         const void    * W,
@@ -415,8 +384,7 @@ int ds4_mmq_moe_impl(
         d2r_iq2s_cc = cc;
         d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr &&
-                          K % 256 == 0 && d2r_iq2s_avail != 0);
+    const bool d2r_iq2 = (x_soa != nullptr && K % 256 == 0 && d2r_iq2s_avail != 0);
 
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
@@ -433,9 +401,8 @@ int ds4_mmq_moe_impl(
     const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
 
     /* d2r_iq2 is a REQUIREMENT here, not a preference.  This function is
-     * instantiated for exactly one type (GGML_TYPE_IQ2_XXS, from
-     * ds4_mmq_iq2_xxs_moe_soa), so "another quant type could arrive and want
-     * q8_1" describes no caller.  Every way d2r_iq2 can be false is a defect:
+     * a plain function that serves ONE layout, so "another quant type could
+     * arrive and want q8_1" describes no caller.  Every way d2r_iq2 can be false is a defect:
      * a null SoA pointer, K not a multiple of 256, or an architecture below
      * Ampere -- none of which a working configuration produces.
      *
@@ -528,9 +495,8 @@ int ds4_mmq_moe_impl(
 // Paired MoE: one helper + one quantize covers both weights.  See the
 // header comment on ds4_mmq_iq2_xxs_moe_pair for motivation.  Internal
 // structure mirrors ds4_mmq_moe_impl above; the only differences are the
-// two W pointers, the two output pointers, and the second mul_mat_q_case
-// launch with a fresh (x, dst) pair.
-template <ggml_type type>
+// two W pointers, the two output pointers, and the second D2R launch with a
+// fresh (x, dst) pair.
 int ds4_mmq_moe_pair_impl(
         const char    * tag,
         const void    * W_a,
@@ -669,7 +635,7 @@ int ds4_mmq_moe_pair_impl(
         d2r_iq2_avail_cc = cc;
         d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr &&
+    const bool d2r_iq2 = (xa_soa != nullptr &&
                           xb_soa != nullptr && K % 256 == 0 &&
                           d2r_iq2_avail != 0);
 
@@ -796,7 +762,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+    return ds4_mmq_moe_pair_impl(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
@@ -844,7 +810,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe_soa", W_soa, ids, out,
+    return ds4_mmq_moe_impl("ds4_mmq_iq2_xxs_moe_soa", W_soa, ids, out,
                                                M, K, n_tokens, n_experts, n_expert_used, stream,
                                                (const char *)W_soa, nblk,
                                                act_q, act_sf, act_kbp);

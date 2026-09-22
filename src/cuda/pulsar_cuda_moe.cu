@@ -1081,10 +1081,13 @@ static int routed_moe_try_mmq_gate_up(
         fprintf(stderr, "pulsar: MMQ routed gate/up %s\n", mmq_ready ? "ready" : "unavailable");
     }
     if (!mmq_ready) return 0;
-    /* should_use takes a GGML type; both 16 and our 43 are IQ2_XXS data, and 43
-     * is not a ggml type at all -- passing it through returned false and
-     * silently declined every pre-aligned layer. */
-    if (!ds4_mmq_should_use(16, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
+    /* should_use takes the ENGINE's layout id.  It used to take a ggml type
+     * code, so this call passed a bare `16` and a comment explaining that the
+     * engine's own id for the same data was not a ggml type at all -- a
+     * vocabulary mismatch that silently declined every pre-aligned layer once
+     * (L207).  One vocabulary, named. */
+    if (!ds4_mmq_should_use((uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K,
+                            (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
     const uint64_t pairs = (uint64_t)n_tokens * n_expert;
     /* Reserve the producer slot BEFORE the gate/up GEMM: if the encoding has
@@ -1191,7 +1194,8 @@ static int routed_moe_try_mmq_down(
         const void *mid_q, const void *mid_sf, int mid_kbp) {
     if (down_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
     if (pairs > (uint64_t)INT32_MAX) return 0;
-    if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    if (!ds4_mmq_should_use((uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K,
+                            (int64_t)pairs, (int64_t)n_total_expert)) return 0;
     /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
      * runtime cache could never afford -- letting down compete for a 22.9 GiB
      * budget just starved late layers of gate/up (measured 566.46 vs 590.77).

@@ -14,23 +14,34 @@
 // replaced the vendored common.cuh on 2026-08-18; ggml_cuda_pool,
 // ggml_cuda_pool_alloc and ggml_backend_cuda_context are gone entirely.
 //
-// ⚠ SOME OF WHAT IS BELOW IS NOW DEAD.  struct ggml_tensor, ggml_nbytes and
-// ggml_glu_op existed for common.cuh's concurrent-event and fusion structs and
-// no live code references them any more -- a grep finds ggml_tensor only in
-// comments.  Not removed in the same commit that deleted common.cuh, so that
-// the deletion stays reviewable; trimming them is the obvious follow-on.
+// What is left here is a MACRO SHIM: the vendored headers spell their
+// assertions, unused-tags and padding the ggml way, and this is where those
+// spellings resolve.  It provides no ggml TYPE VOCABULARY at all -- see below.
 //
 // Things this header DOES provide:
 //   * GGML_ASSERT / GGML_ABORT / GGML_UNUSED / GGML_UNUSED_VARS / GGML_PAD
-//   * GGML_MAX_DIMS / GGML_MAX_SRC / GGML_CUDA_NAME / GGML_CUDA_MAX_DEVICES /
-//     GGML_CUDA_MAX_STREAMS / GGML_LOG_DEBUG
-//   * enum ggml_type (all 21 mmq type codes - we only USE a subset for V4
-//     Flash but the switch in mmq.cu's downstream replacement must compile)
-//   * enum ggml_glu_op (just for the unused mm_fusion_args fields)
-//   * struct ggml_tensor (complete enough for common.cuh's
-//     ggml_cuda_concurrent_event::is_valid() to compile - we never call it)
-//   * int64_t ggml_nbytes(const ggml_tensor *) (stub - never called)
-//   * int64_t ggml_time_us() (used by USE_CUDA_GRAPH paths we disable)
+//   * GGML_CUDA_MAX_DEVICES
+//   * the CUDA-graph #undefs (ds4 manages its own streams)
+//
+// Things it does NOT, and why:
+//   * enum ggml_type -- REMOVED 2026-09-21.  The 43-code enum existed because
+//     the deleted mmq dense dispatcher switched on its case labels; what
+//     survived was ds4_mmq_should_use(), whose only callers pass one layout and
+//     which now takes the ENGINE's id (PULSAR_TENSOR_IQ2_XXS_MMQ_K).  The
+//     engine's own tensor vocabulary had already stopped being ggml's, so
+//     keeping a second, foreign one here was a live trap: the callers passed a
+//     bare `16` (ggml's IQ2 code) with a comment explaining that "our 43" is not
+//     a ggml type at all.
+//   * enum ggml_glu_op, struct ggml_tensor, ggml_nbytes() and ggml_time_us() --
+//     removed earlier; all four existed only for common.cuh, deleted 2026-08-18
+//     (L066).
+//   * the inline size traits (ggml_type_size / ggml_blck_size /
+//     ggml_is_quantized and their lookup tables) -- removed in the 2026-08-22
+//     types sweep (L093).
+//   * GGML_MAX_DIMS / GGML_MAX_SRC / GGML_CUDA_NAME / GGML_CUDA_MAX_STREAMS /
+//     GGML_LOG_DEBUG -- removed 2026-09-21; a grep over src/cuda/mmq found no
+//     reference outside this file.
+
 //   * (the inline size-trait lookups were removed in L093 -- see below)
 //
 // Things ggml-common.h (vendored) owns:
@@ -98,28 +109,8 @@
 #define GGML_PAD(x, n) (((x) + (n) - 1) / (n) * (n))
 #endif
 
-#ifndef GGML_MAX_DIMS
-#define GGML_MAX_DIMS 4
-#endif
-
-#ifndef GGML_MAX_SRC
-#define GGML_MAX_SRC  10
-#endif
-
-#ifndef GGML_CUDA_NAME
-#define GGML_CUDA_NAME "DS4_CUDA"
-#endif
-
 #ifndef GGML_CUDA_MAX_DEVICES
 #define GGML_CUDA_MAX_DEVICES 16
-#endif
-
-#ifndef GGML_CUDA_MAX_STREAMS
-#define GGML_CUDA_MAX_STREAMS 8
-#endif
-
-#ifndef GGML_LOG_DEBUG
-#define GGML_LOG_DEBUG(...) ((void)0)
 #endif
 
 // Cuda-graphs are explicitly disabled - ds4 manages its own streams.
@@ -130,65 +121,3 @@
 // GGML_EXTENSION: ggml-common.h provides the canonical definition. We leave
 // it undefined here so the vendored header's `#define GGML_EXTENSION
 // __extension__` wins.
-
-// ----------------------------------------------------------------------------
-// Quantization type enum.
-//
-// Order matches llama.cpp's enum ggml_type. Values are pinned because the
-// mmq switch uses them as case labels.
-// ----------------------------------------------------------------------------
-
-enum ggml_type {
-    GGML_TYPE_F32     = 0,
-    GGML_TYPE_F16     = 1,
-    GGML_TYPE_Q4_0    = 2,
-    GGML_TYPE_Q4_1    = 3,
-    // GGML_TYPE_Q4_2 / Q4_3 deprecated
-    GGML_TYPE_Q5_0    = 6,
-    GGML_TYPE_Q5_1    = 7,
-    GGML_TYPE_Q8_0    = 8,
-    GGML_TYPE_Q8_1    = 9,
-    GGML_TYPE_Q2_K    = 10,
-    GGML_TYPE_Q3_K    = 11,
-    GGML_TYPE_Q4_K    = 12,
-    GGML_TYPE_Q5_K    = 13,
-    GGML_TYPE_Q6_K    = 14,
-    GGML_TYPE_Q8_K    = 15,
-    GGML_TYPE_IQ2_XXS = 16,
-    GGML_TYPE_IQ2_XS  = 17,
-    GGML_TYPE_IQ3_XXS = 18,
-    GGML_TYPE_IQ1_S   = 19,
-    GGML_TYPE_IQ4_NL  = 20,
-    GGML_TYPE_IQ3_S   = 21,
-    GGML_TYPE_IQ2_S   = 22,
-    GGML_TYPE_IQ4_XS  = 23,
-    GGML_TYPE_I8      = 24,
-    GGML_TYPE_I16     = 25,
-    GGML_TYPE_I32     = 26,
-    GGML_TYPE_I64     = 27,
-    GGML_TYPE_F64     = 28,
-    GGML_TYPE_IQ1_M   = 29,
-    GGML_TYPE_BF16    = 30,
-    GGML_TYPE_MXFP4   = 39,
-    GGML_TYPE_NVFP4   = 40,
-    GGML_TYPE_Q1_0    = 41,
-    GGML_TYPE_Q2_0    = 42,  // added upstream after the 5c0e946 pin (L008)
-    GGML_TYPE_COUNT   = 43,
-};
-
-/* ggml_glu_op, struct ggml_tensor, ggml_nbytes and ggml_time_us stood here.
- *
- * Every one existed to satisfy common.cuh -- the GLU enum for mm_fusion_args,
- * the tensor for ggml_cuda_concurrent_event::is_valid(), ggml_nbytes for the
- * same, ggml_time_us for USE_CUDA_GRAPH paths we disable.  common.cuh was
- * deleted on 2026-08-18 (L066) and nothing replaced those consumers, so all
- * four went from "compiled but never called" to "not referenced at all": a grep
- * across src/cuda/mmq finds ggml_tensor only inside two comments in ds4_mmq.cu
- * describing what we deliberately do NOT vendor. */
-
-// The inline size traits (ggml_type_size / ggml_blck_size / ggml_is_quantized
-// and their q8/K-quant lookup tables) lived here until the 2026-08-22
-// launched-vs-defined sweep (L093).  Their last callers -- two dead
-// `blck = ggml_blck_size(type)` locals -- were removed in the types sweep the
-// same week, leaving the whole cluster reachable from nothing (the mmvq code
-// the L008 comment cited was itself removed in L066).
