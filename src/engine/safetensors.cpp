@@ -1,7 +1,7 @@
 /* safetensors.cpp -- the safetensors container.
  *
  * A safetensors checkpoint is a DIRECTORY of per-layer shards rather than one
- * file, and its metadata is JSON text rather than a GGUF KV block.  This TU
+ * file, and its metadata is JSON text.  This TU
  * bridges both differences so that nothing downstream of model_open changes:
  *
  *   * every shard is mmapped, and each tensor records its shard through the
@@ -9,7 +9,7 @@
  *     already uses, so tensor_data()/tensor_map_base() and the CUDA device-range
  *     cache (keyed on host_base) need no changes at all;
  *
- *   * the metadata is re-encoded ONCE into a GGUF-typed value blob, so every
+ *   * the metadata is re-encoded ONCE into a typed value blob, so every
  *     existing kv consumer keeps reading values through cursor_at();
  *
  *   * the routed experts are re-stacked.  The file stores one tensor per expert
@@ -46,7 +46,7 @@ static void st_die(const char *fmt, ...) {
 }
 
 /** Allocations tied to the model's lifetime: the engine keeps the tensor
- * directory for as long as the model is open, exactly as the GGUF path does. */
+ * directory for as long as the model is open. */
 static void *st_alloc(size_t n) {
     void *p = calloc(1, n ? n : 1);
     if (!p) st_die("safetensors: out of memory (%zu bytes)", n);
@@ -157,8 +157,8 @@ static bool st_u64_array(const char **p, uint64_t *out, uint32_t *n_out, uint32_
 
 /* ------------------------------------------------------------- kv re-encode --- */
 
-/** A growable byte blob holding the GGUF-typed metadata values.  cursor_at()
- * reads metadata through this, so its layout must be the GGUF value encoding
+/** A growable byte blob holding the metadata values, typed by PULSAR_META_*.
+ * cursor_at() reads metadata through this, so its layout must be that encoding
  * the existing consumers already decode. */
 typedef struct {
     uint8_t *p;
@@ -193,20 +193,20 @@ static void blob_str(st_blob *b, const char *s) {
     blob_raw(b, s, n);
 }
 
-static uint32_t gguf_code_for_type_name(const char *t) {
-    if (!strcmp(t, "u8")) return GGUF_VALUE_UINT8;
-    if (!strcmp(t, "i8")) return GGUF_VALUE_INT8;
-    if (!strcmp(t, "u16")) return GGUF_VALUE_UINT16;
-    if (!strcmp(t, "i16")) return GGUF_VALUE_INT16;
-    if (!strcmp(t, "u32")) return GGUF_VALUE_UINT32;
-    if (!strcmp(t, "i32")) return GGUF_VALUE_INT32;
-    if (!strcmp(t, "f32")) return GGUF_VALUE_FLOAT32;
-    if (!strcmp(t, "bool")) return GGUF_VALUE_BOOL;
-    if (!strcmp(t, "string")) return GGUF_VALUE_STRING;
-    if (!strcmp(t, "array")) return GGUF_VALUE_ARRAY;
-    if (!strcmp(t, "u64")) return GGUF_VALUE_UINT64;
-    if (!strcmp(t, "i64")) return GGUF_VALUE_INT64;
-    if (!strcmp(t, "f64")) return GGUF_VALUE_FLOAT64;
+static uint32_t meta_code_for_type_name(const char *t) {
+    if (!strcmp(t, "u8")) return PULSAR_META_UINT8;
+    if (!strcmp(t, "i8")) return PULSAR_META_INT8;
+    if (!strcmp(t, "u16")) return PULSAR_META_UINT16;
+    if (!strcmp(t, "i16")) return PULSAR_META_INT16;
+    if (!strcmp(t, "u32")) return PULSAR_META_UINT32;
+    if (!strcmp(t, "i32")) return PULSAR_META_INT32;
+    if (!strcmp(t, "f32")) return PULSAR_META_FLOAT32;
+    if (!strcmp(t, "bool")) return PULSAR_META_BOOL;
+    if (!strcmp(t, "string")) return PULSAR_META_STRING;
+    if (!strcmp(t, "array")) return PULSAR_META_ARRAY;
+    if (!strcmp(t, "u64")) return PULSAR_META_UINT64;
+    if (!strcmp(t, "i64")) return PULSAR_META_INT64;
+    if (!strcmp(t, "f64")) return PULSAR_META_FLOAT64;
     st_die("safetensors: unknown metadata type name '%s'", t);
     return 0;
 }
@@ -222,7 +222,7 @@ static void blob_array(st_blob *b, const char **p) {
     char *ename = NULL;
     if (!st_obj_key(&q, "__array__")) st_die("safetensors: metadata array has no __array__");
     if (!json_string(&q, &ename)) st_die("safetensors: metadata __array__ is not a string");
-    uint32_t etype = gguf_code_for_type_name(ename);
+    uint32_t etype = meta_code_for_type_name(ename);
     free(ename);
     blob_le(b, etype, 4);
     q = obj;
@@ -257,48 +257,48 @@ static void blob_value(st_blob *b, const char **p, uint32_t type) {
     const char *q = *p;
     json_ws(&q);
     switch (type) {
-    case GGUF_VALUE_STRING: {
+    case PULSAR_META_STRING: {
         char *s = NULL;
         if (!json_string(&q, &s)) st_die("safetensors: metadata string did not parse");
         blob_str(b, s);
         free(s);
         break;
     }
-    case GGUF_VALUE_BOOL: {
+    case PULSAR_META_BOOL: {
         bool v = false;
         if (!json_bool(&q, &v)) st_die("safetensors: metadata bool did not parse");
         uint8_t byte = v ? 1 : 0;
         blob_raw(b, &byte, 1);
         break;
     }
-    case GGUF_VALUE_ARRAY:
+    case PULSAR_META_ARRAY:
         blob_array(b, &q);
         break;
-    case GGUF_VALUE_FLOAT32: {
+    case PULSAR_META_FLOAT32: {
         double v = 0.0;
         if (!json_number(&q, &v)) st_die("safetensors: metadata number did not parse");
         float f = (float)v;
         blob_raw(b, &f, 4);
         break;
     }
-    case GGUF_VALUE_FLOAT64: {
+    case PULSAR_META_FLOAT64: {
         double v = 0.0;
         if (!json_number(&q, &v)) st_die("safetensors: metadata number did not parse");
         blob_raw(b, &v, 8);
         break;
     }
-    case GGUF_VALUE_UINT8:
-    case GGUF_VALUE_INT8:
-    case GGUF_VALUE_UINT16:
-    case GGUF_VALUE_INT16:
-    case GGUF_VALUE_UINT32:
-    case GGUF_VALUE_INT32:
-    case GGUF_VALUE_UINT64: {
+    case PULSAR_META_UINT8:
+    case PULSAR_META_INT8:
+    case PULSAR_META_UINT16:
+    case PULSAR_META_INT16:
+    case PULSAR_META_UINT32:
+    case PULSAR_META_INT32:
+    case PULSAR_META_UINT64: {
         double v = 0.0;
         if (!json_number(&q, &v)) st_die("safetensors: metadata integer did not parse");
-        int w = (type == GGUF_VALUE_UINT8 || type == GGUF_VALUE_INT8) ? 1
-              : (type == GGUF_VALUE_UINT16 || type == GGUF_VALUE_INT16) ? 2
-              : (type == GGUF_VALUE_UINT32 || type == GGUF_VALUE_INT32) ? 4 : 8;
+        int w = (type == PULSAR_META_UINT8 || type == PULSAR_META_INT8) ? 1
+              : (type == PULSAR_META_UINT16 || type == PULSAR_META_INT16) ? 2
+              : (type == PULSAR_META_UINT32 || type == PULSAR_META_INT32) ? 4 : 8;
         blob_le(b, (uint64_t)(int64_t)v, w);
         break;
     }
@@ -420,18 +420,27 @@ static void st_parse_header(st_shard *s) {
 }
 
 static uint32_t st_layout_type(const char *layout, const char *dtype) {
-    if (!strcmp(layout, "iq2_xxs_mmq_k")) return PULSAR_TENSOR_IQ2_XXS_MMQ_K;
-    if (!strcmp(layout, "cutlass_mxfp4")) return PULSAR_TENSOR_CUTLASS_MXFP4;
-    if (!strcmp(layout, "mxfp8_lt")) return PULSAR_TENSOR_MXFP8_LT;
-    if (!strcmp(layout, "fp8_e4m3_soa_k")) return PULSAR_TENSOR_FP8_E4M3_SOA_K;
+    /* "native" is the one layout whose id depends on something other than its
+     * name -- the payload is the file's own dtype, needing no interpretation --
+     * which is why it is handled here rather than in the name table. */
     if (!strcmp(layout, "native")) {
         if (!strcmp(dtype, "F32")) return PULSAR_TENSOR_F32;
         if (!strcmp(dtype, "I32")) return PULSAR_TENSOR_I32;
         if (!strcmp(dtype, "BF16")) return PULSAR_TENSOR_BF16;
         st_die("safetensors: native tensor with unsupported dtype '%s'", dtype);
     }
-    st_die("safetensors: unknown layout id '%s'", layout);
-    return 0;
+    if (!strcmp(layout, "fp8_e4m3")) {
+        /* Legacy interleaved MXFP8.  The runtime used to convert this at first
+         * use into exactly the bytes mxfp8_lt already holds -- a second
+         * resident copy of every such weight beside the mapping -- and that
+         * path is gone, so a checkpoint declaring it is refused by NAME rather
+         * than loaded into a layout nothing reads. */
+        st_die("safetensors: '%s' is the legacy interleaved MXFP8 layout; this "
+               "build serves the pre-stored 'mxfp8_lt' only", layout);
+    }
+    const int id = tensor_type_from_name(layout);
+    if (id < 0) st_die("safetensors: unknown layout id '%s'", layout);
+    return (uint32_t)id;
 }
 
 /** Exact on-disk bytes for a declared tensor.  The declaration must account for
@@ -489,9 +498,10 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
                      const uint64_t *dim, uint32_t nd, const uint8_t *base,
                      uint64_t shard_size, uint64_t abs_offset, uint64_t bytes) {
     pulsar_tensor *t = dir_add(d);
-    /* The name is the GGUF name, borrowed from the declaration text but kept
-     * alive for the model's lifetime: every downstream lookup is by GGUF name,
-     * so nothing after model_open learns that the container changed. */
+    /* The name is the engine's CANONICAL tensor name (blk.N.* / dspark.N.*),
+     * borrowed from the declaration text but kept alive for the model's
+     * lifetime: every downstream lookup is by that name, so nothing after
+     * model_open learns what the container called the tensor. */
     t->name.ptr = gguf_name;
     t->name.len = strlen(gguf_name);
     t->ndim = nd;
@@ -670,7 +680,7 @@ static void st_build_kv(pulsar_model *m, const st_shard *s) {
         if (!st_obj_key(&q, "type") || !json_string(&q, &tname)) st_die("safetensors: kv entry has no type");
         q = p;
         if (!st_obj_key(&q, "value")) st_die("safetensors: kv entry has no value");
-        uint32_t type = gguf_code_for_type_name(tname);
+        uint32_t type = meta_code_for_type_name(tname);
         free(tname);
 
         if (m->n_kv == cap) {
@@ -816,7 +826,7 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
      * the only check of what the engine actually resolves, which is where a
      * multi-mapping model can go wrong while the file stays perfect.
      * An EMPTY prefix means every tensor, which is what diffs this container's
-     * whole inventory against the GGUF it replaced. */
+     * whole inventory against the artifact it replaced. */
     const char *vfypfx = getenv("PULSAR_VERIFY_TENSORS");
     if (vfypfx) {
         const size_t plen = strlen(vfypfx);

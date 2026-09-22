@@ -513,12 +513,12 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     pulsar_array_ref tokens;
     pulsar_array_ref merges;
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
-        tokens.type != GGUF_VALUE_STRING ||
+        tokens.type != PULSAR_META_STRING ||
         tokens.len > INT32_MAX) {
         pulsar_die("GGUF tokenizer token table is missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
+        merges.type != PULSAR_META_STRING) {
         pulsar_die("GGUF tokenizer merge table is missing or invalid");
     }
 

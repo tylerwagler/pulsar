@@ -31,7 +31,11 @@ static pulsar_engine *test_engine;
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("PULSAR_TEST_MODEL");
-    return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
+    /* There is no meaningful default artifact: a pulsar model is a safetensors
+     * checkpoint and the battery always passes FRONTIER_MODEL through as
+     * PULSAR_TEST_MODEL.  The name below is the checkpoint's, not a GGUF's, so a
+     * missing PULSAR_TEST_MODEL fails on a path that could exist. */
+    return (model_path && model_path[0]) ? model_path : "model.safetensors";
 }
 
 static char *test_save_env(const char *name) {
@@ -4287,7 +4291,8 @@ static void test_print_help(const char *prog) {
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  PULSAR_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  PULSAR_TEST_MODEL=PATH        Checkpoint path (a shard directory or a");
+    puts("                                single file). Default: model.safetensors");
     puts("  PULSAR_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  PULSAR_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }

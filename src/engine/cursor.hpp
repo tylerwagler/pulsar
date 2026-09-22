@@ -3,18 +3,17 @@
 
 #include "pulsar_engine_internal.h"
 
-/* Bounds-checked byte cursor over the mmapped GGUF file (C++ port of the
- * pulsar_cursor free functions). The state stays in the C pulsar_cursor struct so
- * the still-C gguf.c can hold and pass cursors; this class is a typed view
- * over one. When gguf.c ports, the struct folds into the class. */
+/* Bounds-checked byte cursor over a metadata VALUE blob.  The state lives in
+ * the pulsar_cursor struct so it can be held and passed as a value; this class
+ * is a typed view over one, and the facade in cursor.cpp is its C entry. */
 
 namespace pulsar {
 
-/** Bounds-checked sequential reader over the mmapped GGUF file.
+/** Bounds-checked sequential reader over a metadata value blob.
  *
- * A typed VIEW over a ::pulsar_cursor, not an owner: the state lives in the C
- * struct so the still-C loader can hold and pass cursors, and a Cursor is
- * constructed around one wherever typed reads are wanted.
+ * A typed VIEW over a ::pulsar_cursor, not an owner: the state lives in the
+ * struct so a loader can hold and pass cursors, and a Cursor is constructed
+ * around one wherever typed reads are wanted.
  *
  * Every accessor bounds-checks first and returns false rather than reading out
  * of range. A failure does NOT disable the cursor -- each call reports its own
@@ -38,7 +37,7 @@ public:
      * Written to be overflow-safe: `pos > size - n` rather than `pos + n > size`. */
     bool has(uint64_t n) {
         if (n > c_.size || c_.pos > c_.size - n) {
-            set_error("truncated GGUF file");
+            set_error("truncated metadata value");
             return false;
         }
         return true;
@@ -53,20 +52,13 @@ public:
         return true;
     }
 
-    /** Advance `n` bytes without reading them. @return false if out of range. */
-    bool skip(uint64_t n) {
-        if (!has(n)) return false;
-        c_.pos += n;
-        return true;
-    }
-
     /** Read a little-endian uint32. */
     bool u32(uint32_t *v) { return read(v, sizeof(*v)); }
     /** Read a little-endian uint64. */
     bool u64(uint64_t *v) { return read(v, sizeof(*v)); }
 
-    /** Read a length-prefixed GGUF string. `s` is left pointing INTO the
-     * mapping -- borrowed, not copied, and valid only while the mapping is. */
+    /** Read a length-prefixed string. `s` is left pointing into the value blob
+     * -- borrowed, not copied, and valid only while the blob is. */
     bool string(pulsar_str *s) {
         uint64_t len;
         if (!u64(&len)) return false;

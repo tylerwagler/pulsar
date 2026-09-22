@@ -15,7 +15,7 @@ static pulsar_layer_attn g_pulsar_attn_layout[PULSAR_MAX_LAYER];
 
 
 
-/* Attention compression is read from GGUF metadata after validating that it
+/* Attention compression is read from the model's metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 uint32_t pulsar_layer_compress_ratio(uint32_t il) {
     if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");

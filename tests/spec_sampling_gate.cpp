@@ -70,9 +70,9 @@
  * position 0 samples the snapshot's logits, positions 1+ sample decode_mixed
  * rows.  The greedy hard gates are unchanged and still run serially.
  *
- * MODEL-DEPENDENT — needs the merged drafter gguf and ~95 GB free. Run:
- *   make cuda-spec-sampling-gate                  (defaults to gguf/model.gguf)
- *   ./tests/spec_sampling_gate <model.gguf> [temp] [filler_tokens] [traj] \
+ * MODEL-DEPENDENT — needs the merged drafter checkpoint and ~95 GB free. Run:
+ *   make cuda-spec-sampling-gate              (defaults to model.safetensors)
+ *   ./tests/spec_sampling_gate <checkpoint> [temp] [filler_tokens] [traj] \
  *                              [top_p] [dump_path] [min_p]
  * Defaults: temp 0.95, filler 0, traj 2500 (clamped to [1,TRAJ]), top_p 0.95,
  * dump off ("-" or "" also = off, so min_p can be given without a dump),
@@ -377,7 +377,7 @@ int GATE_ENTRY(int argc, char **argv) {
     /* progress must be visible in a redirected log: stdout to a file is
      * block-buffered, which makes a long run look like a hang. */
     setvbuf(stdout, NULL, _IOLBF, 0);
-    const char *model = argc > 1 ? argv[1] : "gguf/model.gguf";
+    const char *model = argc > 1 ? argv[1] : "model.safetensors";
     /* 0.95 is the acceptance-sensitive regime: hot enough that the greedy
      * p(mode) acceptance ceiling actually binds. */
     const float TEMP = argc > 2 ? (float)atof(argv[2]) : 0.95f;

@@ -48,7 +48,7 @@
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
  *
- * The GGUF tensor directory is converted into a DS4-specific pointer table.
+ * The model's tensor directory is converted into a DS4-specific pointer table.
  * After this section, the rest of the program addresses tensors by semantic
  * fields such as layer->attn_q_a or layer->ffn_gate_exps rather than by string
  * lookup.  Shape validation is intentionally strict.

@@ -217,9 +217,10 @@ __global__ static void csa2_compressor_store_kernel(
 
 static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64_t norm_offset,
                               uint32_t norm_type, uint32_t head_dim, const void **norm_w) {
-    /* ds4 types: 0 = F32, 30 = BF16 (source format). */
-    if (!model_map || (norm_type != 0u && norm_type != 30u) || head_dim == 0 || head_dim > 1024u) return false;
-    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_type == 30u);
+    /* The compressor norm ships F32 or BF16 (the source format). */
+    if (!model_map || (norm_type != PULSAR_TENSOR_F32 && norm_type != PULSAR_TENSOR_BF16) ||
+        head_dim == 0 || head_dim > 1024u) return false;
+    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_type == PULSAR_TENSOR_BF16);
     if (norm_offset > model_size || norm_bytes > model_size - norm_offset) return false;
     *norm_w = cuda_model_range_ptr(model_map, norm_offset, norm_bytes, "attn_compressor_norm");
     return *norm_w != NULL;
@@ -290,16 +291,16 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
      * weight on this path (the norm, the matmul operands) reaches the kernels as
      * (map, size, offset, type) through cuda_model_range_ptr, and an ape that
      * arrived as a pulsar_gpu_tensor* would have had to be a second copy of the
-     * model.  ds4 types: 0 = F32, 30 = BF16 -- the same pair the compressor's
+     * model.  PULSAR_TENSOR_F32 / PULSAR_TENSOR_BF16 -- the same pair the compressor's
      * norm accepts, and the reference stores the ape in fp32. */
     if (!sc || !model_map || width == 0 || ratio == 0 || n_tokens == 0 ||
-        (ape_type != 0u && ape_type != 30u) ||
+        (ape_type != PULSAR_TENSOR_F32 && ape_type != PULSAR_TENSOR_BF16) ||
         sc->bytes < (uint64_t)n_tokens * width * sizeof(float)) {
         fprintf(stderr, "pulsar: csa2 comp ape add: bad operands (width %u, ratio %u, n_tokens %u, type %u) -- refusing\n",
                 width, ratio, n_tokens, ape_type);
         return 0;
     }
-    const uint64_t ape_bytes = (uint64_t)ratio * width * pulsar_w_elt_bytes(ape_type == 30u);
+    const uint64_t ape_bytes = (uint64_t)ratio * width * pulsar_w_elt_bytes(ape_type == PULSAR_TENSOR_BF16);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
         fprintf(stderr, "pulsar: csa2 comp ape add: ape range is outside the model map -- refusing\n");
         return 0;
@@ -307,7 +308,7 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
     const void *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     const uint64_t n = (uint64_t)n_tokens * width;
-    if (ape_type == 30u)
+    if (ape_type == PULSAR_TENSOR_BF16)
         csa2_comp_ape_add_kernel<true><<<(n + 255) / 256, 256>>>((float *)sc->ptr, ape,
                                                                 width, ratio, pos0, n_tokens);
     else
@@ -377,7 +378,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
              * rows -- so the order here is load-bearing, not stylistic. */
             if (!csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv->ptr, (const float *)sc->ptr,
                                        (const float *)state_kv->ptr, (const float *)state_score->ptr,
-                                       norm_w, norm_type == 30u, head_dim, ratio, coff, n_groups,
+                                       norm_w, norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups,
                                        CSA2_SRC_ROWS, pos0, rms_eps)) return 0;
             /* rows 0..ratio-1: this chunk's LAST FULL GROUP, which is the next
              * call's carry; rows ratio..: the trailing partial group.  Both keep
@@ -420,7 +421,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
     }
     return csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv->ptr,
                                  ratio > 1u ? (const float *)sc->ptr : NULL, NULL, NULL, norm_w,
-                                 norm_type == 30u, head_dim, ratio, coff, n_groups, CSA2_SRC_ROWS, pos0, rms_eps);
+                                 norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups, CSA2_SRC_ROWS, pos0, rms_eps);
 }
 
 int pulsar_gpu_csa2_compressor_update_tensor(
@@ -452,14 +453,14 @@ int pulsar_gpu_csa2_compressor_update_tensor(
     if (ratio == 1u) {
         *emitted = 1;
         return csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv_cur->ptr, NULL, NULL, NULL, norm_w,
-                                     norm_type == 30u, head_dim, 1u, 1u, 1u, CSA2_SRC_ROWS, pos, rms_eps);
+                                     norm_type == PULSAR_TENSOR_BF16, head_dim, 1u, 1u, 1u, CSA2_SRC_ROWS, pos, rms_eps);
     }
     if (!pulsar_gpu_csa2_compressor_store_tensor(kv_cur, sc_cur, state_kv, state_score, head_dim, ratio, pos)) return 0;
     if ((pos + 1u) % ratio != 0u) return 1;   /* the group is still filling */
     *emitted = 1;
     if (!csa2_pool_norm_launch((float *)latent->ptr, NULL, NULL,
                                (const float *)state_kv->ptr, (const float *)state_score->ptr, norm_w,
-                               norm_type == 30u, head_dim, ratio, coff, 1u, CSA2_SRC_STATE,
+                               norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, 1u, CSA2_SRC_STATE,
                                pos + 1u - ratio, rms_eps)) return 0;
     if (coff == 2u) {
         /* the group just pooled becomes the next group's carry -- and that is

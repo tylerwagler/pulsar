@@ -1049,7 +1049,7 @@ int pulsar_gpu_hc_norm_mix_tensor(
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    const uint64_t elt = (w_type == 0u) ? 4u : 2u;      /* F32 : BF16 */
+    const uint64_t elt = (w_type == PULSAR_TENSOR_F32) ? 4u : 2u;   /* F32 : BF16 */
     const uint64_t weight_bytes = out_dim * in_dim * elt;
     if (weight_bytes > model_size - weight_offset) return 0;
     /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
@@ -1060,8 +1060,8 @@ int pulsar_gpu_hc_norm_mix_tensor(
     hc_norm_mix_kernel<256, 8, WT><<<(uint32_t)out_dim, 256>>>(             \
             (float *)out->ptr, (const CAST)wptr, (const pulsar_hc_t *)x->ptr, \
             (uint32_t)in_dim, (uint32_t)out_dim, eps)
-    if (w_type == 30u)      PULSAR_HCMIX(__nv_bfloat16, __nv_bfloat16 *);
-    else if (w_type == 0u)  PULSAR_HCMIX(float, float *);
+    if (w_type == PULSAR_TENSOR_BF16)      PULSAR_HCMIX(__nv_bfloat16, __nv_bfloat16 *);
+    else if (w_type == PULSAR_TENSOR_F32)  PULSAR_HCMIX(float, float *);
     else {
         fprintf(stderr, "pulsar: hc_mix weight type %u is neither BF16 nor F32\n", w_type);
         return 0;

@@ -282,27 +282,47 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  * compressed-attention indexer that chooses visible compressed rows.
  */
 
-/** Routed-expert tensor type tags the CUDA MoE dispatch keys on.  The engine's
- * tensor-type enum (pulsar_engine_internal.h) takes its values from HERE, so
- * a tag can only ever be spelled once: the dispatch in pulsar_cuda_moe.cu
- * chooses a kernel -- and an arithmetic -- by these numbers, and it used to
- * carry them as bare literals at eight sites (L178). */
+/** Pulsar's tensor layouts -- the ONE storage vocabulary, and Pulsar's OWN
+ * numbers.
+ *
+ * A payload's storage is declared BY NAME in the container ("native" plus its
+ * dtype, "mxfp8_lt", "iq2_xxs_mmq_k", "cutlass_mxfp4", "fp8_e4m3_soa_k") and
+ * resolved to one of these ids exactly once, at load (st_layout_type).  The
+ * numbers used to be ggml's, which meant the engine's storage vocabulary came
+ * from a project it no longer speaks to -- and types it can only REFUSE (q8_0,
+ * q2_k, iq2_xxs, f16, fp4_e2m1, iq2_xxs_soa) sat in the same id space, so
+ * "supported" was an accident of arithmetic on a dead numbering.
+ *
+ * A tag is spelled once and the CUDA MoE dispatch chooses a kernel -- and an
+ * arithmetic -- by these numbers (pulsar_cuda_moe.cu). */
 enum {
-    PULSAR_GPU_TENSOR_CUTLASS_MXFP4 = 40,   /* MXFP4 experts: grouped CUTLASS / fp4 GEMV */
-    /* IQ2_XXS experts, k-major (L202).  Type 43 was the same bytes ordered
-     * (expert, row, k); 44 orders them (expert, k, code-word, row) so the D2R
-     * GEMM reads a warp's 16 rows as 128 contiguous bytes and needs no shared
-     * transpose.  There is no reader for 43 any more: an artifact that still
-     * carries it fails the routed-expert type check at load, and
-     * gguf-tools/repack_iq2_mmq.py --to mmq-k converts one. */
-    PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K = 44,
-    /* MXFP8 SoA, k-major (L213 step 2b): type 38's exact E4M3 + E8M0-per-32 content
-     * split into two planes -- E8M0 scales [rows][cols/32], then E4M3 payload
-     * [rows][cols] -- so a lane's payload load is one aligned 4-byte word where
-     * 38's 33-byte blocks forced five byte loads.  Same bytes, same count
-     * (33 per 32), a pure permutation, exactly as IQ2_XXS_SOA (42) is to 16.
-     * The drafter's markov_w2 is the consumer; stock 38 has no reader. */
-    PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K = 46,
+    PULSAR_TENSOR_F32 = 0,
+    PULSAR_TENSOR_I32 = 1,
+    PULSAR_TENSOR_BF16 = 2,
+    /* The PRE-STORED MXFP8: E4M3 weights and E8M0 scales in the exact
+     * device-side layout the runtime otherwise builds at first use --
+     * de-interleaved [in,out] col-major E4M3 followed by the
+     * mx_sfoff()-swizzled E8M0 scale.  The FP8 matmul points cuBLASLt straight
+     * at the mapping instead of materialising a second resident copy.  This is
+     * the ONLY MXFP8 storage: the legacy interleaved form is refused by name at
+     * load, so there is no plain-MXFP8 id to carry. */
+    PULSAR_TENSOR_MXFP8_LT = 3,
+    /* IQ2_XXS routed experts, k-major: (expert, k, code-word, row) order, so the
+     * D2R GEMM reads a warp's 16 rows as 128 contiguous bytes and needs no
+     * shared transpose. */
+    PULSAR_TENSOR_IQ2_XXS_MMQ_K = 4,
+    /* MXFP4 routed experts in the CUTLASS block-scaled grouped-GEMM layout:
+     * expert-major ColumnMajor E2M1 data blob followed by a swizzled E8M0
+     * scale-factor blob, per expert.  NOT a uniform per-element byte rate (see
+     * cutlass_mxfp4_expert_layout()). */
+    PULSAR_TENSOR_CUTLASS_MXFP4 = 5,
+    /* MXFP8 SoA, k-major: E4M3 + E8M0-per-32 content split into two planes --
+     * E8M0 scales [rows][cols/32], then E4M3 payload [rows][cols] -- so a
+     * lane's payload load is one aligned 4-byte word where an interleaved
+     * 33-byte block forced five byte loads.  The drafter's markov_w2 is the
+     * consumer. */
+    PULSAR_TENSOR_FP8_E4M3_SOA_K = 6,
+    PULSAR_TENSOR_TYPE_COUNT
 };
 
 /** Storage of the drafter's markov_w2 table (one spelling; the engine derives
@@ -1459,7 +1479,7 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
         const void              *model_map,    /* the model's mapped weights */
         uint64_t                 model_size,
         uint64_t                 ape_offset,   /* the ape table inside that map */
-        uint32_t                 ape_type,     /* ds4 type: 0 = F32, 30 = BF16 */
+        uint32_t                 ape_type,     /* PULSAR_TENSOR_F32 or _BF16 */
         uint32_t                 width,
         uint32_t                 ratio,
         uint32_t                 pos0,

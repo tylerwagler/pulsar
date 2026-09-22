@@ -491,106 +491,45 @@ typedef struct {
 
 
 /** =========================================================================
- * GGUF Parsing and Model Mapping.
+ * Model Mapping and Metadata Values.
  * =========================================================================
  *
- * The loader maps the model once, records metadata/tensor descriptors, and
+ * The loader maps every shard once, records metadata/tensor descriptors, and
  * leaves tensor bytes in place.  Inference code accesses weights by adding
- * tensor offsets to the mapping instead of copying the GGUF into private
+ * tensor offsets to the mapping instead of copying the payloads into private
  * structures.
+ *
+ * The metadata VALUE codes below are Pulsar's own.  They used to be ggml's,
+ * which was the last place a dead project's numbering survived: a safetensors
+ * checkpoint stores its values with a TYPE NAME (a pulsar.kv entry is
+ * {"key":..,"type":"u32","value":..}), so that name is the only authority and
+ * these numbers never leave this process.  They are payload-agnostic -- the
+ * tensor LAYOUTS are a separate vocabulary entirely (PULSAR_TENSOR_* in
+ * pulsar_gpu.h).
  */
 
 enum {
-    GGUF_VALUE_UINT8   = 0,
-    GGUF_VALUE_INT8    = 1,
-    GGUF_VALUE_UINT16  = 2,
-    GGUF_VALUE_INT16   = 3,
-    GGUF_VALUE_UINT32  = 4,
-    GGUF_VALUE_INT32   = 5,
-    GGUF_VALUE_FLOAT32 = 6,
-    GGUF_VALUE_BOOL    = 7,
-    GGUF_VALUE_STRING  = 8,
-    GGUF_VALUE_ARRAY   = 9,
-    GGUF_VALUE_UINT64  = 10,
-    GGUF_VALUE_INT64   = 11,
-    GGUF_VALUE_FLOAT64 = 12,
+    PULSAR_META_UINT8   = 0,
+    PULSAR_META_INT8    = 1,
+    PULSAR_META_UINT16  = 2,
+    PULSAR_META_INT16   = 3,
+    PULSAR_META_UINT32  = 4,
+    PULSAR_META_INT32   = 5,
+    PULSAR_META_FLOAT32 = 6,
+    PULSAR_META_BOOL    = 7,
+    PULSAR_META_STRING  = 8,
+    PULSAR_META_ARRAY   = 9,
+    PULSAR_META_UINT64  = 10,
+    PULSAR_META_INT64   = 11,
+    PULSAR_META_FLOAT64 = 12,
 };
 
-/** One row of the GGUF tensor-type table: how a type is named and how its
- * bytes divide into blocks. Everything that sizes or strides a tensor goes
- * through this rather than restating the arithmetic. */
-typedef struct {
-    const char *name;      ///< type name as written in the file
-    uint32_t block_elems;  ///< elements per quantisation block
-    uint32_t block_bytes;  ///< bytes per block; the two give bytes-per-element
-} gguf_type_info;
+/* The tensor layout vocabulary is ONE spelling, in pulsar_gpu.h: the CUDA MoE
+ * dispatch keys on the same numbers, and the engine's tensor `type` field
+ * holds one of them.  Each layout's byte model lives with the container
+ * declaration that must account for it exactly (st_bytes_for / 
+ * cutlass_mxfp4_expert_layout), not in a table indexed by a foreign id. */
 
-enum {
-    PULSAR_TENSOR_F32      = 0,
-    PULSAR_TENSOR_F16      = 1,
-    PULSAR_TENSOR_Q8_0     = 8,
-    PULSAR_TENSOR_Q2_K     = 10,
-    PULSAR_TENSOR_IQ2_XXS  = 16,
-    PULSAR_TENSOR_I32      = 26,
-    PULSAR_TENSOR_BF16     = 30,
-    PULSAR_TENSOR_FP8_E4M3 = 38,
-    PULSAR_TENSOR_FP4_E2M1 = 39,
-    /* CUTLASS block-scaled MXFP4: expert-major ColumnMajor E2M1 data blob
-     * followed by a swizzled E8M0 SF blob, per expert. Byte size is NOT a
-     * uniform per-element rate (see cutlass_mxfp4_expert_bytes()) -- the
-     * gguf_types[] table entry for this type exists only so tensor_type()
-     * recognizes it; real per-expert offsets come from that helper, not
-     * from the table's block_elems/block_bytes. */
-    PULSAR_TENSOR_CUTLASS_MXFP4 = PULSAR_GPU_TENSOR_CUTLASS_MXFP4,   /* one spelling: pulsar_gpu.h */
-    /* MXFP8_LT: the pre-store of PULSAR_TENSOR_FP8_E4M3 (type 38). Identical E4M3
-     * weights and E8M0 block scales, but stored in the EXACT device-side layout
-     * the runtime otherwise builds at first use: de-interleaved [in,out]
-     * col-major E4M3 data immediately followed by the mx_sfoff()-swizzled E8M0
-     * scale. On detection the FP8 matmul skips the per-weight cudaMalloc+convert
-     * and points cuBLASLt straight at the mmap (g_model_device_base+offset),
-     * freeing the ~6.4 GiB double-store. For 128-aligned shapes (out%128==0,
-     * (in/32)%4==0 -- true for every shipped weight) the total byte size equals
-     * the type-38 size exactly, so it shares the {32,33} table entry. */
-    PULSAR_TENSOR_MXFP8_LT = 41,
-    /* Pre-stored SoA twin of IQ2_XXS (16): identical 66 B/block content with
-     * the q and d planes split so the code stream is load-aligned (block_iq2_xxs
-     * puts qs[] at offset 2, forcing 2-byte LDG.E.U16 loads).  Byte size, dims
-     * and row size are UNCHANGED -- a pure permutation, exactly as MXFP8_LT (41)
-     * is to FP8_E4M3 (38).  Layout spec: ds4q_iq2_xxs_soa_repack() in
-     * gguf-tools/quants_common.c; device reader: dev_iq2_soa_planes(). */
-    PULSAR_TENSOR_IQ2_XXS_SOA = 42,
-    /* Pre-stored MMQ *aligned-SoA* twin of IQ2_XXS (16).  Same 66 B/block
-     * content as type 16 and type 42, but permuted into the layout the
-     * vendored llama.cpp MMQ adapter's kernels read directly:
-     *
-     *   [ __half d[nblk] ][ pad to 64B ][ uint2 qs[nblk*8] ]
-     *
-     * i.e. the d plane FIRST and the code plane 64B-aligned.  This is NOT the
-     * same permutation as PULSAR_TENSOR_IQ2_XXS_SOA (42), which puts the q
-     * plane first with no padding -- the two layouts are not interchangeable
-     * and each has its own readers.  Byte size, dims and row size are
-     * UNCHANGED (align_up(nblk*2,64) + nblk*64 == nblk*66 whenever
-     * nblk % 32 == 0, which holds for every shipped expert stack), so it
-     * shares type 16's {256, 66} accounting and mmaps through the generic
-     * path, exactly as 42 and MXFP8_LT (41) do.
-     *
-     * Producer: gguf-tools/repack_iq2_mmq.py builds this aligned layout OFFLINE
-     * (the weight server's --repack-iq2-aligned). There is no on-device repack
-     * twin any more -- the old ds4_repack_iq2_aligned_device()/ds4_repack.cu was
-     * removed; the device side reads the stored artifact DIRECTLY through the
-     * MMQ SoA consumers below, so the layout invariant is now repack_iq2_mmq.py
-     * <-> those SoA loaders. The size rule is in src/cuda/mmq/ds4_mmq.h (its
-     * ds4_mmq_iq2_xxs_aligned_bytes oracle was removed unused, L066 step 2).
-     * Consumers: ds4_mmq_iq2_xxs_moe_pair_soa (gate/up) and
-     * ds4_mmq_iq2_xxs_moe_soa (down).
-     *
-     * Storing this layout in the GGUF replaces the runtime repack cache: that
-     * cache is capacity-bound (~22.9 GiB budget vs ~35 GB to hold all 90+ IQ2
-     * stacks), so it covered only part of the model and made the first prefill
-     * frontier absorb the repack.  Pre-storing costs zero model growth. */
-    PULSAR_TENSOR_IQ2_XXS_MMQ_K = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K,
-    PULSAR_TENSOR_FP8_E4M3_SOA_K = PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K, /* one spelling: pulsar_gpu.h */       /* one spelling: pulsar_gpu.h */
-};
 
 /** The drafter markov_w2 table's storage, derived from its GGUF type -- the one
  * place the type -> kernel-arm mapping is spelled (L213).  Any other type is a
@@ -611,7 +550,7 @@ static inline int pulsar_markov_w2_fmt(uint32_t type) {
  * is deferred to whoever actually asks for the key. */
 typedef struct {
     pulsar_str key;     ///< metadata key, borrowed from the mapping
-    uint32_t type;      ///< GGUF type code of the value
+    uint32_t type;      ///< PULSAR_META_* code of the value
     uint64_t value_pos; ///< byte offset of the value within the file
 } pulsar_kv;
 
@@ -631,14 +570,13 @@ typedef struct {
 static inline bool pulsar_weight_is_plain_or_mxfp8(uint32_t type) {
     return type == PULSAR_TENSOR_BF16 ||
            type == PULSAR_TENSOR_F32 ||
-           type == PULSAR_TENSOR_FP8_E4M3 ||
            type == PULSAR_TENSOR_MXFP8_LT;
 }
 
-/** One entry of the GGUF tensor directory: where a tensor lives and how to
- * read it. Describes bytes inside the model mapping; owns nothing. */
+/** One entry of the tensor directory: where a tensor lives and how to read
+ * it. Describes bytes inside a mapped shard; owns nothing. */
 typedef struct {
-    pulsar_str name;      ///< tensor name as it appears in the GGUF
+    pulsar_str name;      ///< the engine's canonical tensor name
     uint32_t ndim;        ///< number of used entries in dim[]
     uint64_t dim[PULSAR_MAX_DIMS];  ///< extents, fastest-varying first
     uint32_t type;        ///< storage type (see the PULSAR_TENSOR_* family)
@@ -2644,15 +2582,18 @@ void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
 bool read_f32_binary_file(const char *path, float *data, uint64_t n);
-void cursor_error(pulsar_cursor *c, const char *msg);
 bool cursor_read(pulsar_cursor *c, void *dst, uint64_t n);
-bool cursor_skip(pulsar_cursor *c, uint64_t n);
 bool cursor_u32(pulsar_cursor *c, uint32_t *v);
 bool cursor_u64(pulsar_cursor *c, uint64_t *v);
 bool cursor_string(pulsar_cursor *c, pulsar_str *s);
 uint64_t align_up(uint64_t value, uint64_t alignment);
-const gguf_type_info *tensor_type(uint32_t type);
+/** The name of a tensor LAYOUT (PULSAR_TENSOR_*), for messages.  It is the same
+ * string a container declares, so a diagnostic and a declaration cannot drift. */
 const char *tensor_type_name(uint32_t type);
+/** The layout id a container's declared name denotes, or -1 if the name is not
+ * a layout this engine reads.  The ONE name -> id authority: the safetensors
+ * reader resolves every declaration through this rather than restating it. */
+int tensor_type_from_name(const char *name);
 void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
                                   uint64_t *data_bytes, uint64_t *sf_bytes,
                                   uint64_t *stride);

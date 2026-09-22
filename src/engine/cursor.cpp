@@ -1,21 +1,10 @@
 #include "cursor.hpp"
 
-/* C facade over pulsar::Cursor for the still-C GGUF loader. */
-
-void cursor_error(pulsar_cursor *c, const char *msg) {
-    pulsar::Cursor(*c).set_error(msg);
-}
-
-
+/* C facade over pulsar::Cursor.  The cursor reads the metadata VALUES the
+ * container declared, from the value blob the loader built. */
 
 bool cursor_read(pulsar_cursor *c, void *dst, uint64_t n) {
     return pulsar::Cursor(*c).read(dst, n);
-}
-
-
-
-bool cursor_skip(pulsar_cursor *c, uint64_t n) {
-    return pulsar::Cursor(*c).skip(n);
 }
 
 

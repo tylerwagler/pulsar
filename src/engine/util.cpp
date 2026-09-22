@@ -4,7 +4,7 @@
 /* Small leaf helpers with no state: string views, hashing, alignment,
  * wall-clock, and f32 blob file I/O. Everything with a real concern of its
  * own moved to its own TU in the C++ port (log.cpp, alloc.cpp,
- * thread_pool.cpp, gguf_cursor.cpp, model_layout.cpp). */
+ * thread_pool.cpp, cursor.cpp, model_layout.cpp). */
 
 bool pulsar_streq(pulsar_str s, const char *z) {
     size_t n = strlen(z);

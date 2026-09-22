@@ -130,9 +130,10 @@ static void tensor_expect_optional(
 
 
 
-/* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
- * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
- * accounting; the FP8 matmul resolver dispatches on the registered offset. */
+/* MXFP8 workhorse weight, stored in its pre-stored device layout (mxfp8_lt).
+ * The legacy interleaved form is refused by NAME when the checkpoint is read
+ * (st_layout_type), so there is no second storage to accept here; the FP8
+ * matmul resolver dispatches on the registered offset. */
 static void tensor_expect_mxfp8(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -140,12 +141,10 @@ static void tensor_expect_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_FP8_E4M3)
-        tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_MXFP8_LT)
+    if (t->type == PULSAR_TENSOR_MXFP8_LT)
         tensor_expect_layout(t, PULSAR_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
     else
-        pulsar_die("tensor has unsupported weight type; expected FP8_E4M3 or MXFP8_LT");
+        pulsar_die("tensor has unsupported weight type; expected mxfp8_lt");
 }
 static void tensor_expect_plain_or_mxfp8(
         const pulsar_tensor *t,
@@ -225,7 +224,7 @@ static void tensor_expect_plain_layout(
 /* The two routed-expert types the engine still reads.  IQ2_XXS (16),
  * IQ2_XXS_SOA (42), Q2_K (10) and FP4_E2M1 (39) were dropped: a scan of the
  * shipped artifact found only types 0/1/26/38/40/41/44 in the file, none of the
- * four is ever synthesised at load (they can only arrive FROM a gguf), and the
+ * four is ever synthesised at load -- a legacy layout is refused by name at
  * kernels behind them are gone.  Refusing here is what keeps that honest -- an
  * old artifact now fails to load with a clear message instead of dispatching
  * into a reader that no longer exists. */
@@ -496,7 +495,7 @@ static void weights_validate_layout(
 
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) pulsar_die("required output head tensors are missing");
-    if (weights_have_partial_output_head(w) && !have_output) pulsar_die("partial output head in GGUF");
+    if (weights_have_partial_output_head(w) && !have_output) pulsar_die("partial output head in the checkpoint");
     if (have_output) {
         tensor_expect_f32_or_bf16(w->output_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Output head is BF16 (source format, kept lossless by a dedicated BF16
@@ -717,7 +716,7 @@ static void pulsar_select_shape_from_metadata(
 static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
         fprintf(stderr, "pulsar: required int32/uint32 array metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -728,7 +727,7 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
     }
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint64_t i = 0; i < arr.len; i++) {
-        if (arr.type == GGUF_VALUE_UINT32) {
+        if (arr.type == PULSAR_META_UINT32) {
             if (!cursor_u32(&c, &out[i])) pulsar_die(c.error);
         } else {
             int32_t v = 0;
@@ -819,7 +818,7 @@ static void validate_reap_metadata(const pulsar_model *m) {
     const char *key = "reap.layer.keep_count";
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
         pulsar_die("reap.enabled is set but reap.layer.keep_count is missing or not an int32/uint32 array");
     }
     if (arr.len < PULSAR_N_LAYER) {
@@ -829,7 +828,7 @@ static void validate_reap_metadata(const pulsar_model *m) {
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t got = 0;
-        if (arr.type == GGUF_VALUE_UINT32) {
+        if (arr.type == PULSAR_META_UINT32) {
             if (!cursor_u32(&c, &got)) pulsar_die(c.error);
         } else {
             int32_t v = 0;
@@ -853,7 +852,7 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     const char *key = "deepseek4.swiglu_clamp_exp";
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_FLOAT32 && arr.type != GGUF_VALUE_FLOAT64)) {
+        (arr.type != PULSAR_META_FLOAT32 && arr.type != PULSAR_META_FLOAT64)) {
         fprintf(stderr, "pulsar: required float array metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -864,7 +863,7 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t i = 0; i < PULSAR_N_LAYER; i++) {
         float got = 0.0f;
-        if (arr.type == GGUF_VALUE_FLOAT32) {
+        if (arr.type == PULSAR_META_FLOAT32) {
             if (!cursor_read(&c, &got, sizeof(got))) pulsar_die(c.error);
         } else {
             double v = 0.0;
@@ -1076,7 +1075,6 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_F32:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
-    case PULSAR_TENSOR_FP8_E4M3:
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
     case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
@@ -1193,9 +1191,6 @@ static void weights_reject_bad_e8m0(const pulsar_model *m) {
             if (t->elements > t->bytes) break;
             e8m0_scan_blocks(m, t, t->elements, t->bytes - t->elements, 0, 1, "MXFP8");
             break;
-        case PULSAR_TENSOR_FP8_E4M3:
-            e8m0_scan_blocks(m, t, 0, 1, 33u, t->bytes / 33u, "FP8");
-            break;
         case PULSAR_TENSOR_CUTLASS_MXFP4: {
             uint64_t data = 0, sf = 0, stride = 0;
             if (t->ndim < 3) break;
@@ -1237,7 +1232,7 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool r
     w->output_norm      = model_find_tensor(m, "output_norm.weight");
     w->output           = model_find_tensor(m, "output.weight");
     if (weights_have_partial_output_head(w) && !weights_have_output_head(w)) {
-        pulsar_die("partial output head in GGUF");
+        pulsar_die("partial output head in the checkpoint");
     }
 }
 
@@ -1373,7 +1368,7 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
 
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
- * where stringly GGUF metadata becomes direct model-specific pointers. */
+ * where stringly metadata becomes direct model-specific pointers. */
 void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
@@ -1402,7 +1397,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint32_t V = w->vocab_size;
     /*
      * The tensor-layout checks below are self-referential: they validate every
-     * DSpark tensor against E/V read from the support GGUF's own metadata.  But
+     * DSpark tensor against E/V read from the support model's own metadata.  But
      * the runtime drives DSpark with the target model's compiled constants
      * (PULSAR_N_EMBD embed buffers, PULSAR_N_VOCAB logits stride), so a support model
      * built for a different base would pass this validation and then produce

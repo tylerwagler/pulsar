@@ -1,7 +1,7 @@
 # Agent Notes
 
 Pulsar (`pulsar`) is a DeepSeek V4 Flash specific inference engine, not a
-generic GGUF runner. This tree is the **CUDA-only fork** of antirez's upstream
+generic model runner. This tree is the **CUDA-only fork** of antirez's upstream
 project, targeting the NVIDIA DGX Spark (GB10, `sm_121`, ~121 GB usable
 unified memory). The Metal, ROCm, and CPU inference backends were fully
 removed; `cuda` is the only backend. The engine still contains shared
@@ -11,9 +11,9 @@ host-side math (`attention.cpp`, `hc.cpp`, `layers.cpp`, `moe.cpp`,
 ## Goals
 
 - Keep the production path as whole-model CUDA graph inference on GB10.
-- Keep model loading mmap-backed; do not eagerly copy the full GGUF. The model
-  must be fully resident: a GGUF that does not fit is rejected at load, never
-  partially streamed.
+- Keep model loading mmap-backed; do not eagerly copy the weights. The model
+  must be fully resident: a checkpoint that does not fit is rejected at load,
+  never partially streamed.
 - Preserve correctness before speed. Do not keep a faster path with
   unexplained attention, KV cache, or logits drift.
 - Make long local agent sessions practical through live KV reuse and disk KV
@@ -40,7 +40,9 @@ host-side math (`attention.cpp`, `hc.cpp`, `layers.cpp`, `moe.cpp`,
 
 Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph API).
 
-- `src/engine/` — 30 TUs + `pulsar_engine_internal.h`: GGUF parsing, tokenizer,
+- `src/engine/` — 30 TUs + `pulsar_engine_internal.h`: the model layer and the
+  safetensors container reader (`model.cpp`, `safetensors.cpp`, `cursor.cpp`),
+  tokenizer,
   weight binder (`weights.cpp`), quant format/kernel tables, GPU graph
   orchestration (`gpu_graph_alloc.cpp`, `gpu_graph_state.cpp`,
   `gpu_prefill.cpp`, `gpu_decode.cpp`, `gpu_diag.cpp`), sessions + KV payload
@@ -64,8 +66,9 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
 - `cutlass/` — EXTERNAL header-only dependency, **required** for the MXFP4
   expert path. Deliberately **not** a git submodule (see `cutlass.pin` for the
   rationale and the pinned sha); `CUTLASS_DIR` may point anywhere.
-- `gguf-tools/` — offline quantization/imatrix tooling that produces the GGUFs
-  this fork loads.
+- `gguf-tools/` — offline quantization/imatrix tooling. It still carries the
+  GGUF plumbing the quantization pipeline was built around; the artifact this
+  fork SERVES is the declared-layout safetensors checkpoint.
 
 Internal-header convention: a symbol is de-static'd and declared in the
 module's `pulsar_*_internal.h` only when another TU of the same module needs it.
@@ -90,7 +93,8 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 ## Testing
 
 - `make test` runs `./pulsar_test` and the seam check. `pulsar_test` loads a
-  model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`). The eval extractor
+  model (`PULSAR_TEST_MODEL`; the battery passes `FRONTIER_MODEL` through). The
+  eval extractor
   self-test (`./pulsar-eval --self-test-extractors`) and `./pulsar_agent_test`
   are separate targets; see `docs/QA_BEFORE_RELEASES.md`.
 - `pulsar_test` distinguishes **gating** internal-correctness tests (any failure
@@ -120,13 +124,17 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 
 | Tensor group | Accepted formats |
 | --- | --- |
-| Attention projections, shared experts | MXFP8 (`FP8_E4M3` 38 or pre-stored `MXFP8_LT` 41) |
-| Routed experts gate/up/down | gate and up must match; each of gate/up and down is independently `IQ2_XXS_MMQ_K` (44) or `CUTLASS_MXFP4` (40), and the combo may differ per layer |
+| Attention projections, shared experts | pre-stored MXFP8 (`mxfp8_lt`) |
+| Routed experts gate/up/down | gate and up must match; each of gate/up and down is independently `iq2_xxs_mmq_k` or `cutlass_mxfp4`, and the combo may differ per layer |
 | Output head | `BF16` (the shipped format) or MXFP8 |
 | Norms, embeddings, HC, misc | `F32`/`BF16`/`I32` |
 
-Legacy `Q4_K`/`Q8_0` weights are rejected at load with one clear error
-(`weights_reject_unsupported_types` in `src/engine/weights.cpp`).
+A checkpoint declares each tensor's storage by NAME (`native` plus its dtype,
+`mxfp8_lt`, `iq2_xxs_mmq_k`, `cutlass_mxfp4`, `fp8_e4m3_soa_k`); an unknown or
+retired name is refused at load by name, once (`st_layout_type` in
+`src/engine/safetensors.cpp`). The legacy interleaved MXFP8 layout is refused
+there with the repack named, and unsupported types are refused again by
+`weights_reject_unsupported_types` in `src/engine/weights.cpp`.
 
 ## Compute Paths
 

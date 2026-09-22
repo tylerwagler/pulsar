@@ -1231,23 +1231,13 @@ bool gpu_graph_matmul_plain_tensor(
         return pulsar_gpu_matmul_bf16_tensor(out, tensor_map_base(model, w), tensor_map_size(model, w),
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
-    /* FP8_E4M3 and MXFP8_LT are the same numbers in two layouts, and
-     * pulsar_gpu_matmul_mxfp8_tensor already tells them apart: an offset
-     * registered as LT (gguf.cpp) resolves straight to the mmap, a plain one is
-     * de-interleaved once into a device buffer. Both land on the same kernels.
-     *
-     * MXFP8_LT was absent here until 2026-08-17, and that absence was load-bearing
-     * -- it is why the 21 indexer.attn_q_b tensors ship as plain type 38 and pay a
-     * second resident copy. tensor_expect_plain_or_mxfp8 rejected type 41 on
-     * purpose so the gap failed at load rather than dispatching into nothing,
-     * which is exactly what it did when a repacked artifact was tried. Adding the
-     * arm is what makes that repack legal. */
-    /* MXFP8_LT ONLY.  The FP8_E4M3 (type-38) disjunct that used to sit here was
-     * provably dead: gguf.cpp's loader calls pulsar_die("plain MXFP8 weight in
-     * artifact") on type 38 since L060, so no such weight can reach any
-     * dispatcher.  Its membership in the accept set is deliberate sequencing --
-     * pass validation, then die at cache time with the actionable repack
-     * message -- but the dispatch branch itself served nothing (L083 C6). */
+    /* MXFP8_LT is the only MXFP8 storage: a checkpoint declaring the legacy
+     * interleaved layout is refused by name while it is being read, so no such
+     * weight can reach a dispatcher.  pulsar_gpu_matmul_mxfp8_tensor resolves a
+     * registered LT offset straight to the mapping.  (This arm was absent until
+     * 2026-08-17, and its absence failed a repacked artifact at LOAD rather than
+     * dispatching into nothing -- which is why tensor_expect_plain_or_mxfp8
+     * takes its membership from the same predicate this dispatch uses.) */
     if (w->type == PULSAR_TENSOR_MXFP8_LT) {
         return pulsar_gpu_matmul_mxfp8_tensor(out, tensor_map_base(model, w), tensor_map_size(model, w),
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
