@@ -108,7 +108,9 @@ REF_KH_STORY=${PULSAR_TP_REF_KNOWN_HIGH_STORY:-}
 REF_KF_STORY=${PULSAR_TP_REF_KNOWN_FLIP_STORY:-}
 REF_KH_CODE=${PULSAR_TP_REF_KNOWN_HIGH_CODE:-}
 REF_KF_CODE=${PULSAR_TP_REF_KNOWN_FLIP_CODE:-}
-WORKDIR=${PULSAR_TP_WORKDIR:-tp-pair-grade}
+# Absolute on the remote (expanded there): run_rank_cmd's own `cd` and the
+# launcher's `cd` both hit it, and a relative default made the second fail.
+WORKDIR=${PULSAR_TP_WORKDIR:-'$HOME/tp-pair-grade'}
 WANT_SHA=${PULSAR_TP_SHA:-}
 MIN_AVAIL=${PULSAR_TP_MIN_AVAIL_GIB:-100}
 DRYRUN=${PULSAR_TP_DRYRUN:-0}
@@ -216,8 +218,14 @@ run_round() {
             || die "rank $r host $h unreachable / cannot stage $WORKDIR"
         # Per-rank lock file: the instance lock is per MACHINE, so a same-host dry
         # run needs its own, and it is harmless when the ranks are on real boxes.
+        # The subshell must not inherit the ssh channel (stdin/stdout/stderr):
+        # ssh returns only when every fd on the channel closes, so an attached
+        # background engine held the launch until the ENGINE exited -- rank 0 sat
+        # in accept() for its whole run and rank 1 was never launched (first
+        # pair run, 2026-09-23).  Detach all three; the engine's own output is
+        # already in $prefix$r.{out,err}.
         ssh $SSH_ARGS -o BatchMode=yes "$h" \
-            "cd $WORKDIR && ($($gen "$r") > $prefix$r.out 2> $prefix$r.err; echo \$? > $prefix$r.rc) &" \
+            "cd $WORKDIR && ($($gen "$r") > $prefix$r.out 2> $prefix$r.err; echo \$? > $prefix$r.rc) </dev/null >/dev/null 2>&1 &" \
             || die "rank $r launch failed"
         echo "  launched rank $r on $h"
         [ "$r" -lt $((N - 1)) ] && sleep "$STAGGER"
@@ -263,9 +271,13 @@ echo "--- refusal / desync scan ---"
 for r in $(seq 0 $((N - 1))); do
     h=${RANKS[$r]}
     bad=$(ssh $SSH_ARGS -o BatchMode=yes "$h" \
-          "grep -icE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|cannot honor expert ownership|owned-expert range refused|vocab range refused' $WORKDIR/rank$r.err" \
+          "[ -f $WORKDIR/rank$r.err ] || { echo missing; exit 0; }; \
+           grep -icE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|cannot honor expert ownership|owned-expert range refused|vocab range refused' $WORKDIR/rank$r.err" \
           | tr -d '[:space:]')
-    if [ "${bad:-0}" != "0" ]; then
+    if [ "${bad:-missing}" = "missing" ]; then
+        echo "  rank $r: no stderr file -- the rank never launched (fail closed)"
+        fail=1
+    elif [ "$bad" != "0" ]; then
         echo "  rank $r: $bad refusal/desync line(s):"
         ssh $SSH_ARGS -o BatchMode=yes "$h" \
             "grep -iE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|cannot honor expert ownership|owned-expert range refused|vocab range refused' $WORKDIR/rank$r.err | head -5"

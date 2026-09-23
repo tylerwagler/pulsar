@@ -1530,7 +1530,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--tp-port")) {
             c.engine.tp_port = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--tp-rank")) {
-            c.engine.tp_rank = parse_int(need_arg(&i, argc, argv, arg), arg);
+            /* A rank index: 0 is the leader, so the strictly-positive parse_int
+             * cannot be used here; the engine checks 0 <= R < N at open. */
+            c.engine.tp_rank = parse_int_range(need_arg(&i, argc, argv, arg), arg, 0, INT_MAX);
         } else if (!strcmp(arg, "--tp-nranks")) {
             c.engine.tp_nranks = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--tp-peers")) {

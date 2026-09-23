@@ -138,6 +138,18 @@ static int parse_int_arg(const char *s, const char *opt) {
 
 
 
+/* Non-negative int: a rank index (0 is the leader), which parse_int_arg's
+ * strictly-positive rule would refuse; the engine checks 0 <= R < N at open. */
+static int parse_index_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!s[0] || *end || v < 0 || v > INT_MAX) {
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: invalid value for %s: %s", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -454,7 +466,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--tp-port")) {
             c.engine.tp_port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--tp-rank")) {
-            c.engine.tp_rank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp_rank = parse_index_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--tp-nranks")) {
             c.engine.tp_nranks = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--tp-peers")) {
