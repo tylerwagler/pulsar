@@ -1,4 +1,6 @@
 #include "pulsar_engine_internal.h"
+#include "tp/pulsar_tp.h"
+#include "tp/pulsar_tp_gpu.h"
 
 
 int pulsar_engine::routed_quant_bits() {
@@ -322,11 +324,10 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->prefill_chunk = opt->prefill_chunk;
-    if (opt->tp_role != 0) {
-        fprintf(stderr, "pulsar: tensor parallelism (tp_role=%d): identity "
-                        "groundwork (4a) is in, but the CUDA gate machinery (4b) "
-                        "is not, so the pair cannot be armed yet; see "
-                        "docs/tensor-parallel-split.md\n",
+    if ((opt->tp_role != 0 || opt->tp_peers) && opt->tp_arm == 0) {
+        fprintf(stderr, "pulsar: tensor parallelism (tp_role=%d) with no TP "
+                        "arm selected; pass --tp-arm prefill (slice 4b) to wire the "
+                        "prefill big-gate; see docs/tensor-parallel-split.md\n",
                 opt->tp_role);
         free(e);
         *out = NULL;
@@ -569,6 +570,79 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
     }
 
+    /* Two-rank TP (slice 4b, prefill big-gate arm).  Built here, after the
+     * model/weights are bound and the GPU is up, because the identity needs the
+     * resolved shape and the slab needs the CUDA runtime.  Only the graph
+     * backend can host a TP pair; requesting TP on the CPU backend is a loud
+     * refusal, not a quiet single-box fallback (rule 4). */
+    if (opt->tp_role != 0 || opt->tp_peers) {
+        if (!graph_backend) {
+            fprintf(stderr, "pulsar: tensor parallelism requires the CUDA/graph "
+                            "backend, not %s\n", pulsar_backend_name(e->backend));
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        char tperr[512];
+        pulsar_tp_options tp_opt;
+        memset(&tp_opt, 0, sizeof(tp_opt));
+        tp_opt.role = opt->tp_role == 2 ? PULSAR_TP_ROLE_WORKER
+                                        : PULSAR_TP_ROLE_LEADER;
+        tp_opt.port = opt->tp_port > 0 ? opt->tp_port : 5588;
+        /* n-way (full mesh) vs legacy 2-rank.  n-way: tp_peers carries every
+         * rank's "host:port" and tp_rank/tp_nranks are explicit; legacy pair
+         * derives rank from tp_role (leader=0, worker=1), n_ranks=2. */
+        if (opt->tp_peers) {
+            tp_opt.rank = opt->tp_rank;
+            tp_opt.n_ranks = opt->tp_nranks;
+            tp_opt.peers = opt->tp_peers;
+            if (opt->tp_rank < 0 || opt->tp_nranks < 2 || opt->tp_rank >= opt->tp_nranks) {
+                fprintf(stderr, "pulsar: n-way TP needs --tp-rank R and --tp-nranks N "
+                                "with 0 <= R < N (got rank=%d nranks=%d)\n",
+                        opt->tp_rank, opt->tp_nranks);
+                e->destroy();
+                *out = NULL;
+                return 1;
+            }
+        } else {
+            tp_opt.rank = (opt->tp_role == 2) ? 1 : 0;
+            tp_opt.n_ranks = 2;
+            tp_opt.peer = opt->tp_peer;
+        }
+        pulsar_tp_identity id;
+        pulsar_tp_identity_init_defaults(&id,
+                                         (uint64_t)e->model.size,
+                                         (uint32_t)e->model_id(),
+                                         PULSAR_N_LAYER,
+                                         PULSAR_N_EMBD,
+                                         PULSAR_N_VOCAB,
+                                         (uint32_t)e->routed_quant_bits(),
+                                         0);
+        int tp_ok = opt->tp_peers
+                        ? pulsar_tp_create_mesh(&e->tp, &tp_opt, &id, tperr, sizeof(tperr))
+                        : pulsar_tp_create(&e->tp, &tp_opt, &id, tperr, sizeof(tperr));
+        if (!tp_ok) {
+            fprintf(stderr, "pulsar: tensor parallelism bring-up failed: %s\n",
+                    tperr);
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
+        if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_slab_bytes,
+                                              &e->tp_slab_base,
+                                              tperr, sizeof(tperr)) ||
+            !pulsar_tp_attach_slab(e->tp, e->tp_slab_base, tperr, sizeof(tperr))) {
+            fprintf(stderr, "pulsar: tensor parallelism slab setup failed: %s\n",
+                    tperr);
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes\n",
+                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes);
+    }
+
     *out = e;
     return 0;
 }
@@ -653,6 +727,18 @@ int pulsar_engine::model_id() {
 void pulsar_engine::destroy() {
     auto *e = this;
     if (!e) return;
+    /* Tear down the TP pair before releasing the GPU/model (stop the peer, drop
+     * the transport and its registered MR, then free the host-pinned slab). */
+    if (e->tp) {
+        (void)pulsar_tp_send_stop(e->tp);
+        pulsar_tp_free(e->tp);
+        e->tp = NULL;
+    }
+    if (e->tp_slab_base) {
+        pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);
+        e->tp_slab_base = NULL;
+        e->tp_slab_bytes = 0;
+    }
     weights_free(&e->weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
@@ -703,6 +789,14 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
         free(s);
         return 1;
     }
+    /* Borrow the engine's TP transport into the graph so the prefill big-gate
+     * call sites can reach it without threading the engine through every
+     * gpu_graph entry point (slice 4b).  NULL when the pair is not armed. */
+    s->graph.tp = e->tp;
+    /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
+     * here, at the one place a session begins, from the engine's ordinal; a
+     * session created with no pair armed keeps 0 and stays out of the mirror. */
+    if (e->tp) s->tp_session_id = ++e->tp_session_seq;
     s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {

@@ -93,9 +93,10 @@ static void test_slab_layout(void) {
 }
 
 static void test_hello_wire(void) {
-    /* Fixed size: 4x u32 header + u64 gguf_bytes + 9x u32 identity + pad. */
-    CHECK(sizeof(pulsar_tp_hello_fixed) == 64u,
-          "hello_fixed size=%zu want 64", sizeof(pulsar_tp_hello_fixed));
+    /* Fixed size: 4x u32 header + u64 gguf_bytes + 9x u32 identity + rank/n_ranks.
+     * v8 added rank + n_ranks (2 x u32) where the old pad was. */
+    CHECK(sizeof(pulsar_tp_hello_fixed) == 72u,
+          "hello_fixed size=%zu want 72", sizeof(pulsar_tp_hello_fixed));
 
     pulsar_tp_identity id = {
         87000000000ull, 3u, 43u, 4096u, 129280u, 2u, 1048576u, 0u, 0u, 86u,
@@ -203,16 +204,65 @@ static void test_identity_defaults(void) {
           "identity defaults: self-compat through identity_check");
 }
 
+static void test_owned_range(void) {
+    /* Partition must be exact, complete, deterministic for every (n_total,
+     * n_ranks); and the floor-split must give rank r's hi == rank r+1's lo. */
+    const uint32_t totals[] = { 0u, 1u, 2u, 7u, 128u, 256u };
+    for (uint32_t n : totals) {
+        for (uint32_t nr = 1; nr <= 8u; nr++) {
+            uint32_t prev_hi = 0u, sum = 0u, first_lo = 0u, last_hi = 0u;
+            for (int r = 0; r < (int)nr; r++) {
+                uint32_t lo = 99u, hi = 99u;
+                CHECK(pulsar_tp_owned_range(r, nr, n, &lo, &hi) == 1,
+                      "owned range accepted n=%u nr=%u r=%d", n, nr, r);
+                if (r == 0) first_lo = lo;
+                if (r == (int)nr - 1) last_hi = hi;
+                CHECK(lo <= hi && hi <= n, "range bounds n=%u nr=%u r=%d", n, nr, r);
+                if (r > 0)
+                    CHECK(lo == prev_hi, "gap/overlap n=%u nr=%u r=%d (lo=%u prev_hi=%u)",
+                          n, nr, r, lo, prev_hi);
+                prev_hi = hi;
+                sum += hi - lo;
+            }
+            CHECK(first_lo == 0u && last_hi == n,
+                  "partition not [0,n) n=%u nr=%u", n, nr);
+            CHECK(sum == n, "partition sum %u != n=%u (nr=%u)", sum, n, nr);
+            /* Determinism (use a valid rank; rank 1 is invalid when nr==1). */
+            const int dr = nr > 1 ? 1 : 0;
+            uint32_t a, b, c, d;
+            CHECK(pulsar_tp_owned_range(dr, nr, n, &a, &b) == 1,
+                  "owned range determinism accept n=%u nr=%u", n, nr);
+            pulsar_tp_owned_range(dr, nr, n, &c, &d);
+            CHECK(a == c && b == d, "owned range non-deterministic n=%u nr=%u", n, nr);
+        }
+    }
+    /* No single-rank / n_ranks<=1 -> full range. */
+    for (uint32_t n : totals) {
+        uint32_t lo = 99u, hi = 99u;
+        CHECK(pulsar_tp_owned_range(0, 1, n, &lo, &hi) == 1 &&
+              lo == 0u && hi == n, "n=1 not full range n=%u", n);
+    }
+    /* n=2 over 256 -> the legacy half-split. */
+    uint32_t lo0, hi0, lo1, hi1;
+    pulsar_tp_owned_range(0, 2, 256u, &lo0, &hi0);
+    pulsar_tp_owned_range(1, 2, 256u, &lo1, &hi1);
+    CHECK(lo0 == 0u && hi0 == 128u && lo1 == 128u && hi1 == 256u,
+          "n=2/256 split not [0,128)+[128,256)");
+    CHECK(pulsar_tp_owned_range(-1, 2, 256u, &lo0, &hi0) == 0,
+          "negative rank accepted");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
     test_identity_check();
     test_identity_defaults();
     test_gate_schedule();
+    test_owned_range();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range)\n");
     return 0;
 }

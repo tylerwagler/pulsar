@@ -88,13 +88,84 @@ bug, not a design change.
       src/tp/pulsar_tp_gpu.cpp — `cudaHostRegister` verdict).  The `.cu`
       wrapper implementations deliberately ship with their engine callers
       (no dead code) — see the hook-targets inventory note in port.md.
-- 4b. CUDA gate machinery on the engine worker thread — big_gate first
-      (prefill), per-layer gates (decode). GPU-gated; the hard chunk.
-- 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the
-      f32 partial). GPU-gated.
-- 4d. Vocab head split on the logits path (frames ported; engine-side wiring).
-- 4e. Phase-3 lockstep over our session surface (banks/warm-fork, multiseq,
-      mixed, spec rounds).
+- 4b. **Prefill big-gate arm (engine-wired, compile-verified 2026-09-21).**
+      `pulsar_engine::open` now stands up the pair when `--tp-role` + `--tp-arm
+      prefill`: builds the identity from the resolved shape, `pulsar_tp_create`
+      (leader listens / worker dials), allocates the host-pinned GPU-visible
+      slab and `pulsar_tp_attach_slab`; teardown on `destroy()`.  The prefill
+      path (gpu_prefill.cpp `tp_prefill_big_gate`, called from
+      `gpu_graph_encode_layer_ffn_batch` before the HC expansion) exchanges one
+      big gate per layer per chunk on the layer's routed contribution and folds
+      the peer's partial in.  Compile-only so far (no runtime) — the `.cu`
+      gate kernels for the DECODE per-layer arm are still unwired and
+      `tp_role != 0` with no `--tp-arm` still fails loudly (rule 4).  The
+      per-rank partial is ownership-aware only once 4c lands.
+- **N-way transport (2026-09-22).** The transport is no longer two-rank-only:
+      `pulsar_tp_create_mesh` brings up **n** ranks in a full mesh
+      (`--tp-rank`/`--tp-nranks`/`--tp-peers`; every rank connects to every
+      other, rank-ordered dial/accept) and `pulsar_tp_allreduce_sum` combines
+      the routed partial across all n ranks (all-gather + local sum in
+      canonical ascending-rank order so every rank bits the same full value).
+      The n=2 legacy `--tp-role`/`--tp-peer` pair path and its RDMA are
+      unchanged.  Perimeter of this increment: decode/batch gates and the
+      command plane fail loudly for n>2 (rule 9) until their n-way slices;
+      per-peer RDMA is pair-gated.
+- **4c. Ownership-aware routed-MoE kernels (2026-09-22, engine + kernel wiring;
+      runtime GPU/pair-gated).** Each rank now computes ONLY its owned expert
+      slice — the single authority `pulsar_tp_owned_range(rank, n_ranks,
+      n_total, &lo, &hi)` (floor partition `[r·n/nr, (r+1)·n/nr)`), threaded as
+      `expert_lo/expert_hi` into `pulsar_gpu_routed_moe_batch_tensor`.  The
+      CUTLASS MXFP4 grouped arm skips peer-owned pairs in the count/scatter
+      (making those groups M=0 in the grouped GEMM — no bytes, no FLOPs) with a
+      sentinel `sorted_pairs` + gather guard; the small-batch GEMV arm extends
+      its `valid` predicate; the MMQ/mixed arms fail loudly (rule 9).  The
+      engine passes the owned range under the same `g->tp` condition that gates
+      `tp_prefill_big_gate`, so the all-reduce sums n owned partials into the
+      correct full routed sum — numerically correct **on the CUTLASS MXFP4
+      arms**.  The MMQ (IQ2 type 44) and mixed arms REFUSE ownership, so the
+      served all-IQ2 artifact cannot run TP until the same predicate is ported
+      to them (open item, port.md).  The range is the LAYER's own present
+      expert count (2026-09-23 fix: it read the target table by index, which
+      the drafter's own layer index and any REAP'd/V4.1 layout disagree with).
+      Non-TP (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
+      GPU/pair-gated (the prefill byte gate and the pair all-reduce check).
+- 4d. **Vocab head split on the logits path.  n-GENERAL, not two-rank**
+      (Tyler 2026-09-22: the target is n parallel Sparks).  Split = one vocab
+      RANGE per rank, `[r*V/n, (r+1)*V/n)` — the same floor partition as the
+      routed experts, and the same single authority pattern
+      (`pulsar_tp_owned_range`, the SAME authority the experts use).
+      Each rank computes only its range, then the group ALL-GATHERS (concatenate,
+      NOT the sum `pulsar_tp_allreduce_sum` performs) so every rank holds the
+      full logits and can sample independently — no leader broadcast needed.
+      - **4d inc 1 LANDED 2026-09-22** (`tp-vision-exp` 6267908b): the range is
+        expressible.  The deciding fact is the head's STORED orientation —
+        `head.weight` is HF `[129280, 4096]` / `dims_ne [4096, 129280]`, i.e.
+        `[vocab, in_dim]` row-major (why the cuBLASLt arm sets `TRANSA=OP_T`), so
+        a vocab range IS a contiguous ROW range and the existing packed-block
+        GEMM needs no kernel change.  `gpu_graph_encode_output_head[_batch]`
+        take `(vocab_lo, vocab_dim, out)`; single-box passes
+        `(0, N_VOCAB, g->logits|spec_logits)` → byte-identical.  The MXFP8_LT arm
+        REFUSES a slice (its scale plane is not row-addressable); the target head
+        is bf16, so the drafter's MXFP8 head stays full-range.  The L119 segment
+        bracket is now taken only for the full-vocab range: a gate recv is a host
+        wait and cannot live in a captured graph, and the recorded body binds its
+        destination.
+      - **4d inc 2 LANDED 2026-09-22** (`pulsar_tp_allgather_vocab` + the eval
+        path wiring): one authority for the range (`pulsar_tp_owned_range`),
+        an n-way all-gather that CONCATENATES in rank order, slices padded to
+        `ceil(V/n)` so every exchange round carries one byte count (129280 does
+        not divide by 3 or 5).  **Fixed 2026-09-23:** the head writes its slice
+        PACKED (pitch = range width) and the engine copied it at the padded
+        pitch, mis-placing every row after the first on an uneven split with
+        more than one head row; the rows are now re-pitched after the read.
+        The pair (n=2, even split) never showed it, and the mesh test builds
+        its slice at stride pitch, which is why neither caught it.
+- 4e. Phase-3 lockstep over our session surface — **IN PROGRESS**, tracked in
+      docs/tensor-parallel-port.md: create, sync, eval, batched decode, the
+      mixed step, rewind and invalidate are mirrored, and speculation shares
+      one rng (both the CLI's `generate_speculative` and `spec_next_base` sync
+      it before drawing).  Open: warm-fork, the bank agreement question, the
+      server driver model, images (refused under TP until they ride the frame).
 
 ## Open items for bring-up
 - **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**

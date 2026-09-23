@@ -23,9 +23,14 @@
 #include <stdint.h>
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 7u
+#define PULSAR_TP_PROTOCOL_VERSION 9u            /* v9: row payload on EVAL_BATCH/MIXED_BATCH, RNG_STATE frame; v8: hello carries rank + n_ranks */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
+/** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
+ *  Deliberately outside any real layer index so a lane that ran a vocab gather
+ *  where its peer ran a per-layer MoE gate is caught as a desync by name rather
+ *  than passing because the (layer, seq) pair happened to coincide. */
+#define PULSAR_TP_NON_LAYER_TAG UINT32_C(0xFFF0)
 #define PULSAR_TP_BATCH_MAX_ROWS 8u
 
 typedef enum {
@@ -35,9 +40,12 @@ typedef enum {
 } pulsar_tp_role;
 
 typedef struct {
-    pulsar_tp_role role;
-    const char *peer;   /* worker: leader's control/RDMA address; NULL on the leader (it listens) */
-    int port;           /* control port */
+    pulsar_tp_role role;    /* legacy 2-rank: LEADER/WORKER; n-way: any (ranks are symmetric) */
+    int rank;               /* this rank's index in the group; -1 = unset */
+    int n_ranks;            /* group size; 0/1 = unset */
+    const char *peer;       /* legacy 2-rank: worker's dial target (NULL on the leader) */
+    const char *peers;      /* n-way: ordered "host:port,..." list for ALL n ranks */
+    int port;               /* this rank's own control/listen port */
 } pulsar_tp_options;
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -73,7 +81,8 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint32_t rank;       /* this rank's index in the TP group (n-way) */
+    uint32_t n_ranks;    /* group size */
 } pulsar_tp_hello_fixed;
 
 /* Registered-slab layout.  S = n_layer * GATES_PER_LAYER slots, all offsets
@@ -158,12 +167,79 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
                      const pulsar_tp_identity *id, char *err, size_t errlen);
 void pulsar_tp_free(pulsar_tp *tp);
 int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
+uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
+
+/* Owned slice of a dimension for `rank` in a group of `n_ranks`, floor-
+ * partitioned over [0,n_total): lo = rank*n/n_ranks, hi = (rank+1)*n/n_ranks
+ * (uint64 mid).  Deterministic; disjoint and complete across ranks (rank r's hi
+ * == rank r+1's lo).  n_ranks<=1 -> [0,n_total) (full path); n_total==0 ->
+ * [0,0).  Returns 1 on success, 0 on bad args.
+ *
+ * This is the single authority (rule 4) for "which slice does a rank own", and
+ * it is deliberately generic: the routed-EXPERT split (256 experts over the
+ * group) and the 4d vocab split (n_vocab over the group) are the SAME rule, so
+ * they share one implementation and cannot drift.  Callers never recompute it. */
+int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
+                          uint32_t *lo, uint32_t *hi);
+
+/* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
+ * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for
+ * all n ranks; opt->rank/opt->n_ranks are explicit.  Returns 1 on success. */
+int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
+                          const pulsar_tp_identity *id, char *err, size_t errlen);
+
+/* All-gather + local sum across the whole group: `out` starts as this rank's
+ * owned partial and returns the combined sum of every rank's partial.  `in` is
+ * caller scratch (clobbered).  n=2 is byte-identical to the old pairwise
+ * exchange + add.  Returns 0 on failure. */
+int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                            void *out, const void *in, uint64_t bytes);
+
+/* n-way VOCAB ALL-GATHER (slice 4d).  Rank r contributes the vocab range
+ * [r*V/n, (r+1)*V/n) of `n_rows` rows; every rank ends with the full
+ * [n_rows, n_total] block in `full_out`.  This CONCATENATES in rank order -- it
+ * is NOT the sum pulsar_tp_allreduce_sum performs, and the two must never be
+ * confused (a sum here would multiply the logits by the group size).
+ *
+ * Shapes: `full_out` is [n_rows, n_total] with row pitch n_total.  `own_slice`
+ * and `scratch` are [n_rows, stride] PACKED, stride = ceil(n_total/n_ranks):
+ * the ranges are PADDED to a uniform stride because the group exchange carries
+ * ONE byte count per round and n_total need not divide by n_ranks (129280 does
+ * not divide by 3 or 5).  Everything past a rank's real range is never sent on
+ * the wire as data -- it pads the transfer only -- and the caller must leave
+ * those tail elements ZEROED, since a short last range is never written by the
+ * head.  `scratch` is clobbered.  Returns 0 on failure.
+ *
+ * The gather runs the same ascending-rank loop on every rank, one exchange per
+ * peer per round, so `seq` must be identical on all ranks for a given round and
+ * distinct between rounds (the transport's desync guard keys on it). */
+int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                              float *full_out, const float *own_slice,
+                              float *scratch, uint32_t n_rows, uint32_t n_total);
+
 bool pulsar_tp_is_rdma(const pulsar_tp *tp);
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp);
 bool pulsar_tp_failed(const pulsar_tp *tp);
 void pulsar_tp_mark_failed(pulsar_tp *tp);
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp);     /* decoded from the hello */
 uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials) */
+
+/* The registered slab's per-layer BATCH regions (n_layer blocks, each
+ * PULSAR_TP_BATCH_MAX_ROWS vectors).  A caller whose payload fits that many
+ * rows should stage HERE rather than in its own buffer: the RDMA big gate rides
+ * DIRECT when its out/in pointers already lie inside the slab, instead of
+ * copying the payload through these very regions to reach registered memory.
+ * NULL when no slab is attached or `layer` is out of range. */
+void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer);
+void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer);
+
+/* Is [ptr, ptr+bytes) wholly inside the registered slab?  This is the RDMA big
+ * gate's DIRECT test: when both payloads answer yes they are already registered
+ * and ride the QP with no copy through the staging regions; when either says no
+ * the payload is staged through those regions first.  ONE authority for that
+ * rule.  Exposed so the decision can be asserted on a single box (a real
+ * transport plus a real slab is enough) even though engaging it needs a pair. */
+bool pulsar_tp_in_slab(const pulsar_tp *tp, const void *ptr, uint64_t bytes);
 
 /* Register the slab base with the transport.  The engine allocates one
  * contiguous (GPU-visible on GB10) block and hands its base VA here; the
@@ -186,11 +262,28 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
 int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes);
 
-/* Lockstep mirroring (leader side) and worker loop primitives. */
+/* Lockstep mirroring (leader side) and worker loop primitives.
+ *
+ * RETURN CONVENTION FOR THIS WHOLE FILE: nonzero (1) means SUCCESS and zero
+ * means failure -- the inverse of the usual C shape, and it holds for every
+ * pulsar_tp_send_*, for pulsar_tp_recv_command, and for
+ * pulsar_tp_wait_command_ack.  The engine's first mirroring pass read it
+ * backwards at seven call sites, which made every successful send look like a
+ * refusal, so it is stated once here rather than inferred per call site.  A
+ * refusal that carries a reason puts it in `err`; the allgather/allreduce and
+ * gate exchanges above follow the same rule. */
+/** One row of a mirrored batched decode: the engine's own row contract
+ * (pulsar_multiseq_req) plus the session the row belongs to.  The layout was
+ * fixed HERE, while FRAME_EVAL_BATCH/FRAME_MIXED_BATCH still had no user -- it
+ * used to be {session_id, token, reserved}, which cannot carry a row's bank and
+ * position, so no caller could have been written against it.  Frame NUMBERS are
+ * still never reused; only this payload changed, once, before first use. */
 typedef struct {
-    uint64_t session_id;
-    int32_t token;
-    uint32_t reserved;
+    uint64_t session_id;  ///< the mirrored session this row belongs to
+    int32_t  bank;        ///< true bank id in that session's pool
+    int32_t  pos;         ///< absolute position of `token`
+    int32_t  token;       ///< input token id decoded at `pos`
+    uint32_t reserved;    ///< pad to 24 bytes: keeps every field naturally aligned
 } pulsar_tp_batch_item;
 
 int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id,
@@ -204,10 +297,26 @@ int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos);
 int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id);
 int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
                               uint32_t count);
-int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
-                               const int *prompt, uint32_t prompt_count,
+/** The SAME row payload as pulsar_tp_send_eval_batch, on a distinct frame type.
+ * The two frames exist so the worker can prove which engine operation the leader
+ * is in: `decode_mixed` and `decode_multiseq` are byte-identical for a
+ * decode-only batch, so a driver that diverged between them would otherwise
+ * decode the same rows through a different contract in silence.  The payload
+ * was redefined to rows-only along with the batch item: it used to carry a
+ * separate prefill prompt (`prefill_session_id` + token array), which came from
+ * upstream's mixed step -- OUR decode_mixed takes its prompt as rows in the same
+ * `pulsar_multiseq_req` list (a K-row run for one bank), so there is nothing
+ * else to send.  The header's shape was fixed while it still had no user. */
+int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count);
+/** Ship this rank's rng state.  Speculation's accept walk draws from the
+ * CALLER's rng, so two ranks seeded independently would accept different tokens
+ * and commit different session state; the leader's state is the pair's stream.
+ * Fire-and-forget, like the void operations: a `void`-shaped draw site has
+ * nowhere to put a peer's refusal, and the worker's frame check reports a
+ * divergence through the next acked operation instead of hanging on it. */
+int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation,
@@ -229,6 +338,9 @@ typedef enum {
     PULSAR_TP_FRAME_RDMA_INFO = 7,
     PULSAR_TP_FRAME_SYNC_ACK = 8,
     PULSAR_TP_FRAME_RDMA_READY = 9,
+    /* RETIRED 2026-09-22: the leader-collect vocab half that slice 4d's
+     * all-gather replaced.  The NUMBER is never reused -- these are wire
+     * values, and a future frame must take a fresh one. */
     PULSAR_TP_FRAME_LOGITS = 10,
     PULSAR_TP_FRAME_VERIFY = 11,
     PULSAR_TP_FRAME_VERIFY_COMMIT = 12,
@@ -242,6 +354,9 @@ typedef enum {
      * sends before the peer's window is armed silently loses the first N
      * messages under UC, shifting the whole pairing by +1). */
     PULSAR_TP_FRAME_RDMA_GATE_ARMED = 18,
+    /* Slice 4e: one rank's rng state, so a pair can share ONE speculation
+     * stream.  Fresh number (18 is taken, 10 is retired and never reused). */
+    PULSAR_TP_FRAME_RNG_STATE = 19,
 } pulsar_tp_frame_type;
 
 typedef struct {
@@ -258,12 +373,6 @@ typedef struct {
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen);
 void pulsar_tp_command_free(pulsar_tp_command *command);
-
-/* Vocab-split output head: the worker ships its logits half to the leader
- * after every eval (and after a sync) on the control socket. */
-int pulsar_tp_send_logits_half(pulsar_tp *tp, const float *half,
-                               uint32_t count);
-int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

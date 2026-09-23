@@ -1529,6 +1529,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.tp_peer = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tp-port")) {
             c.engine.tp_port = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-arm")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "prefill")) c.engine.tp_arm = 1;
+            else c.engine.tp_arm = parse_int(v, arg);
+        } else if (!strcmp(arg, "--tp-rank")) {
+            c.engine.tp_rank = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-nranks")) {
+            c.engine.tp_nranks = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-peers")) {
+            c.engine.tp_peers = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

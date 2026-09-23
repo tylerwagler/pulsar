@@ -103,7 +103,8 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
            a->directional_steering_ffn == b->directional_steering_ffn &&
            a->inspect_only == b->inspect_only &&
            a->tp_role == b->tp_role && a->tp_port == b->tp_port &&
-           same_str(a->tp_peer, b->tp_peer);
+           a->tp_rank == b->tp_rank && a->tp_nranks == b->tp_nranks &&
+           same_str(a->tp_peer, b->tp_peer) && same_str(a->tp_peers, b->tp_peers);
 }
 
 int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *opt) {

@@ -1486,6 +1486,22 @@ typedef struct {
      * with, or NULL for the text-only path.  Set and cleared by the prefill's
      * owner (pulsar_session::sync); nothing else may leave it set. */
     const pulsar_vision_request *vision_req;
+    /** Borrowed TP transport for the owning session's engine (slice 4b), set
+     * from the engine at graph init; NULL when the pair is not armed.  The
+     * prefill big-gate call sites read this rather than threading the engine
+     * through every prefill entry point. */
+    struct pulsar_tp *tp;
+    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented once
+     * per layer per chunk by tp_prefill_big_gate.  Both ranks advance it in the
+     * same order from the same starting value, so the big-gate seq stays in
+     * lockstep (the transport uses it as a desync guard). */
+    uint64_t tp_prefill_seq;
+    /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
+     * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
+     * the same number of times in the same order, so the gather's seq stays in
+     * lockstep -- the transport's desync guard keys on it, which is also what
+     * catches a lane that ran a different number of heads on the two ranks. */
+    uint64_t tp_vocab_seq;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1671,6 +1687,21 @@ struct pulsar_engine {
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
     float directional_steering_ffn_scale;   ///< steering strength on the FFN stream
     uint32_t prefill_chunk;     ///< tokens per prefill chunk
+    /** Two-rank TP state (slice 4b).  Non-NULL only when the pair was actually
+     * armed (tp_role != 0 with a wired tp_arm).  The slab is the host-pinned,
+     * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
+     * pulsar_tp_attach_slab. */
+    struct pulsar_tp *tp;       ///< transport handle, or NULL when off
+    void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
+    size_t tp_slab_bytes;       ///< slab size in bytes
+    /** Slice 4e: the next session ordinal, handed out by pulsar_session::create
+     * as the session's mirror id.  It is an ordinal rather than a random or
+     * leader-assigned id because the SAME driver opens the same sessions in the
+     * same order on every rank, so both ranks agree without a wire round trip
+     * on the create path (which is not itself mirrored).  A frame whose id does
+     * not match the receiving session therefore means the drivers diverged, and
+     * the receiver fails loud instead of mirroring into the wrong session. */
+    uint64_t tp_session_seq;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
@@ -2044,8 +2075,37 @@ typedef struct pulsar_bank_carry {
  * KV rows the graph holds for the CURRENT bank. Every operation that can break
  * that -- sync, rewind, a multiseq step, a bank switch -- either restores it or
  * sets a flag that makes the next classic call fail loud. */
+/* Slice 4e: the one condition "this session is mirrored onto a TP pair".
+ * Defined in engine_api.cpp beside the mirror itself and declared here because
+ * the refusals for operations that are NOT mirrored yet live in other files
+ * (session_spec.cpp); the condition has a single definition so it cannot drift
+ * between them. */
+bool pulsar_session_is_mirrored(const pulsar_session *s);
+
+/** Slice 4e: give the pair ONE rng stream.  The leader ships its state and the
+ * worker takes it, so every draw the speculation round makes afterwards --
+ * pulsar_session_spec_next_base's fresh base, the accept tests, the carry, the
+ * redraft -- is identical on every rank by construction.  Called from
+ * pulsar_session_spec_next_base, the first rng consumer of a round; returns 0
+ * when the caller may draw and -1 when the pair could not agree, in which case
+ * it must NOT draw.  Nothing crosses the wire when the pair is off. */
+int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng);
+
+
 struct pulsar_session {
     pulsar_engine *engine;    ///< borrowed; the engine outlives every session
+    /** Slice 4e: this session's mirror id, or 0 when the pair is not armed (or
+     * the engine handed this session out before the transport existed).  Every
+     * mirrored frame carries it; see tp_session_seq above for why it is the
+     * create ordinal and why a mismatch is refused. */
+    uint64_t tp_session_id;
+    /** Slice 4e: true once this session's speculation rng has been taken from
+     * the leader -- one flag, because there is no live-bank accessor to key it
+     * by, and the documented round flow syncs each bank's stream by calling
+     * pulsar_session_spec_next_base with THAT bank's rng.  Speculation refuses
+     * a pair whose rng was never synchronized, so a driver that skips
+     * next_base cannot walk a round on a stream the pair does not share. */
+    bool spec_rng_synced;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
@@ -3171,22 +3231,51 @@ uint32_t gpu_graph_prefill_slice(void);
 /** Comp-cache row stride in bytes for the active storage format (pack-aware). */
 /** The output head for ONE row of the sweep-final stream: batch_cur_hc row
  * `row` collapsed with batch_hc_pre row `row` (the last FFN's pre), normed,
- * projected into g->logits. */
+ * projected into `out`.  Slice 4d: the projection covers the vocab RANGE
+ * [vocab_lo, vocab_lo + vocab_dim); the single-box caller passes
+ * (0, N_VOCAB, g->logits), which is the whole head. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row,
-        uint64_t               vocab_dim);
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
 /** The output head for rows [row0, row0 + n_tokens) of the sweep-final stream
- * into g->spec_logits rows [0, n_tokens). */
+ * into `out` rows [0, n_tokens), covering the vocab range
+ * [vocab_lo, vocab_lo + vocab_dim).  The single-box caller passes
+ * (0, N_VOCAB, g->spec_logits). */
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim);
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
+/** THE one place the output head knows about TP (slice 4d).  With the group off
+ * each is exactly the call above with the whole range -- same bytes, same
+ * captures.  With the group armed this rank projects only ITS vocab range into
+ * a slice, stages it to host, all-gathers every rank's range (concatenation in
+ * rank order) and writes the assembled full logits back into `out`, so every
+ * rank holds the same full vector and samples independently: no leader-only
+ * decision and no token broadcast.  `out` must be the full [rows, N_VOCAB]
+ * destination; the slice reuses its head as scratch. */
+bool gpu_graph_encode_output_head_row_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row,
+        pulsar_gpu_tensor      *out);
+bool gpu_graph_encode_output_head_batch_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
+        pulsar_gpu_tensor      *out);
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,
         const pulsar_model          *dspark_model,

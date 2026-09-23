@@ -125,6 +125,11 @@ PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor
 
 ENGINE_SRCS = $(wildcard src/engine/*.cpp)
 ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o)
+# Two-rank TP transport + host-pinned GPU slab (slice 4b).  Only the pieces the
+# engine calls: pulsar_tp.o (pure host, g++) and pulsar_tp_gpu.o (needs the CUDA
+# runtime, so nvcc).  The gate scheduler / verify modules are wired by the decode
+# and verify slices and stay out until then (no dead code).
+TP_OBJS = src/tp/pulsar_tp.o src/tp/pulsar_tp_gpu.o
 AGENT_SRCS = $(wildcard src/agent/*.cpp)
 AGENT_OBJS = $(AGENT_SRCS:.cpp=.o)
 SERVER_SRCS = $(wildcard src/server/*.cpp)
@@ -151,7 +156,7 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h 
 # scans shard headers and __metadata__ as JSON), so every target that links
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
@@ -193,7 +198,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -577,7 +582,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 # cannot race the runner's build.  pulsar-eval is a prerequisite of `gates` for
 # the same reason: the background sub-make may only RUN it.
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
-             indexer-score-check attn-pack-fixture-check
+             indexer-score-check attn-pack-fixture-check tp-core-test
 	./pulsar-eval --self-test-extractors
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
@@ -1693,6 +1698,12 @@ src/engine/vision.o: src/engine/vision.cpp src/engine/pulsar_engine_internal.h s
 src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
+# pulsar_tp_gpu.cpp is host C++ but includes <cuda_runtime.h>, so nvcc (which
+# brings the CUDA include path and -lcudart) compiles it, not the generic g++
+# rule above.
+src/tp/pulsar_tp_gpu.o: src/tp/pulsar_tp_gpu.cpp src/tp/pulsar_tp_gpu.h
+	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
+
 src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
@@ -1987,6 +1998,30 @@ tests/tp_core_test: tests/tp_core_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp
 
 tp-core-test: tests/tp_core_test
 	./tests/tp_core_test
+
+# TP n-way full-mesh test (slice n-way).  Host-only: forks n ranks over TCP
+# loopback and drives create_mesh + allreduce_sum; asserts the all-reduce is
+# the exact sum of every rank's partial, identical across ranks.  n=2 and n=3.
+tests/tp_mesh_test: tests/tp_mesh_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_mesh_test.cpp src/tp/pulsar_tp.cpp
+
+tp-mesh-test: tests/tp_mesh_test
+	./tests/tp_mesh_test
+
+# TP engine-mirror test (slice 4e).  Host-runnable but links the engine: it
+# fabricates a session (no model, no weights) whose mirror id does not match
+# the leader's frame, and asserts the wrappers refuse loudly, ACK the refusal,
+# and that the leader reports it -- the plumbing the mesh test cannot reach and
+# the single-Spark gates do not cover.  `timeout` matters: a missing ack HANGS
+# the leader in wait_command_ack, and a hang is not a test result.
+tests/tp_mirror_test.o: tests/tp_mirror_test.cpp src/tp/pulsar_tp.h src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/tp_mirror_test.cpp
+
+tests/tp_mirror_test: tests/tp_mirror_test.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tp-mirror-test: tests/tp_mirror_test
+	PULSAR_TP_TIMEOUT_SEC=1 timeout 60 ./tests/tp_mirror_test
 
 # TP transport loopback test (branch tensor_parallel, slice 3).  Host-only:
 # no CUDA, no RDMA -- a forked leader/worker pair exchanges gate/batch/big

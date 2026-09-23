@@ -208,15 +208,16 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)),
               "leader sync ack: %s", err);
 
-        pulsar_tp_batch_item items[2] = { {1001, 61, 0}, {1002, 62, 0} };
+        pulsar_tp_batch_item items[2] = { {1001, 3, 40, 61, 0}, {1002, 4, 41, 62, 0} };
         CHECK(pulsar_tp_send_eval_batch(tp, items, 2) == 1,
               "leader send_eval_batch");
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "eval_batch", err, sizeof(err)),
               "leader eval_batch ack: %s", err);
 
-        const int prompt[2] = { 11, 12 };
-        pulsar_tp_batch_item m = { 2001, 71, 0 };
-        CHECK(pulsar_tp_send_mixed_batch(tp, 9999, prompt, 2, &m, 1) == 1,
+        /* The mixed step rides the SAME row payload on its own frame type
+         * (4e increment 5): rows only, no separate prefill prompt. */
+        pulsar_tp_batch_item m = { 2001, 5, 90, 71, 0 };
+        CHECK(pulsar_tp_send_mixed_batch(tp, &m, 1) == 1,
               "leader send_mixed_batch");
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed_batch", err, sizeof(err)),
               "leader mixed_batch ack: %s", err);
@@ -230,9 +231,6 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_send_verify_commit(tp, 1, 0) == 1,
               "leader send_verify_commit");
 
-        const float half[4] = { 0.5f, 1.5f, 2.5f, 3.5f };
-        CHECK(pulsar_tp_send_logits_half(tp, half, 4) == 1,
-              "leader send_logits_half");
     } else {
         pulsar_tp_command cmd;
 
@@ -251,7 +249,9 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(cmd.type == PULSAR_TP_FRAME_EVAL_BATCH && cmd.n_items == 2,
               "worker eval_batch type/items");
         CHECK(cmd.items && cmd.items[0].session_id == 1001 &&
-              cmd.items[0].token == 61 && cmd.items[1].token == 62,
+              cmd.items[0].bank == 3 && cmd.items[0].pos == 40 &&
+              cmd.items[0].token == 61 && cmd.items[1].bank == 4 &&
+              cmd.items[1].pos == 41 && cmd.items[1].token == 62,
               "worker eval_batch items");
         pulsar_tp_command_free(&cmd);
         CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
@@ -261,10 +261,11 @@ static void frames_phase(pulsar_tp *tp, int rank) {
               "worker recv mixed_batch: %s", err);
         CHECK(cmd.type == PULSAR_TP_FRAME_MIXED_BATCH,
               "worker mixed_batch type %d", (int)cmd.type);
-        CHECK(cmd.session_id == 9999 && cmd.n_tokens == 2 && cmd.n_items == 1,
-              "worker mixed_batch header");
-        CHECK(cmd.tokens[0] == 11 && cmd.tokens[1] == 12 &&
-              cmd.items[0].token == 71, "worker mixed_batch payload");
+        CHECK(cmd.n_items == 1 && cmd.n_tokens == 0,
+              "worker mixed_batch header (rows only)");
+        CHECK(cmd.items && cmd.items[0].session_id == 2001 && cmd.items[0].bank == 5 &&
+              cmd.items[0].pos == 90 && cmd.items[0].token == 71,
+              "worker mixed_batch payload");
         pulsar_tp_command_free(&cmd);
         CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
               "worker mixed_batch ack");
@@ -282,10 +283,6 @@ static void frames_phase(pulsar_tp *tp, int rank) {
               "worker recv_verify_commit");
         CHECK(full == 1 && replay == 0, "worker verify_commit values");
 
-        float half[4];
-        CHECK(pulsar_tp_recv_logits_half(tp, half, 4) == 1,
-              "worker recv_logits_half");
-        CHECK(half[0] == 0.5f && half[3] == 3.5f, "worker logits values");
     }
 }
 

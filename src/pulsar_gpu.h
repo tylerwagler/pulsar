@@ -1842,7 +1842,9 @@ int pulsar_gpu_routed_moe_batch_tensor(
         float                   clamp,
         const pulsar_gpu_tensor *x,
         uint32_t                layer_index,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint32_t                expert_lo,
+        uint32_t                expert_hi);
 
 
 /** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS MXFP4 weights:
@@ -1876,7 +1878,9 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         int             out_dim,
         const void     *act_q,
         const void     *act_sf,
-        int             act_kbp);
+        int             act_kbp,
+        unsigned        expert_lo,
+        unsigned        expert_hi);
 
 /** Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
  * blockscaled grouped GEMM launch each -- replacing the per-expert host loop + blocking offsets
@@ -1975,14 +1979,16 @@ int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float 
         uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp,
-    void *emit_q, void *emit_sf, int emit_kbp);
+    void *emit_q, void *emit_sf, int emit_kbp,
+    unsigned expert_lo, unsigned expert_hi);
 /** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
  * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
 int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
         const uint8_t *const *down_tab,   /* PLAN 94 phase 1 */
         uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
-        const void *mid_q, const void *mid_sf, int mid_kbp);
+        const void *mid_q, const void *mid_sf, int mid_kbp,
+        unsigned expert_lo, unsigned expert_hi);
 
 
 /** =========================================================================

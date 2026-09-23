@@ -376,6 +376,9 @@ static void craft_hello(pulsar_tp_hello_fixed *h, int corrupt) {
     h->magic = PULSAR_TP_MAGIC;
     h->version = PULSAR_TP_PROTOCOL_VERSION;
     h->role = PULSAR_TP_ROLE_WORKER; /* differs from the real leader's role */
+    h->rank = 1;    /* distinct from the leader's rank 0 so the rank/n_ranks
+                     * checks pass and only the mutated field triggers an error */
+    h->n_ranks = 2;
     h->rdma_ok = 0;
     h->gguf_bytes = BASE_GGUF;
     h->model_id = BASE_MODEL;
