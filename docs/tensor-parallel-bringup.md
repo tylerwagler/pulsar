@@ -16,15 +16,16 @@ a spare pair OR the work pair during an approved window.**
 2026-09-22).** Both ranks stand up fine over TCP loopback — `PULSAR_LOCK_FILE`
 scopes the instance lock per rank — but with the served 85.90 GiB container the
 box dies in MODEL LOAD on both sides (`rc=137`, no TP line ever printed):
-earlyoom killed the leader with `shmem-rss 94087056 kB`. The model is opened
-`MAP_SHARED`, so each process's rss accounts the whole mapping even though the
-pages are physically shared, and a userspace OOM daemon that sums rss across
-processes sees ~2x the model and fires. Two consequences: (a) a loopback pair
-proves nothing about TP and must not be read as a TP failure, and (b) a
-loopback pair needs a checkpoint roughly HALF this size (the four other
-artifacts on sparky are all ~87 GiB, so none of them work either). The
-transport ITSELF is exercised on one box by `tests/tp_mesh_test` (n=2 and n=3
-over TCP loopback, no model).**
+earlyoom killed the leader with `shmem-rss 94087056 kB` while `file-rss` was
+only 22 MB. So the model pages are SHARED (one physical copy) and the kill was
+earlyoom's heuristic summing rss across processes — **not** a proven physical
+shortfall, and not evidence that a smaller checkpoint is required. What makes it
+fire is that the engine marks itself `oom_score_adj=1000`
+(`engine_api.cpp`), i.e. first in line; two such processes on a 121 GB box is a
+fight with an OOM daemon we do not own, so do not run it there. A loopback pair
+proves nothing about TP and must not be read as a TP failure; the transport
+ITSELF is exercised on one box by `tests/tp_mesh_test` (n=2 and n=3 over TCP
+loopback, no model).**
 
 ## 0. Baseline — build + host tests (any box, ~2 min)
 
@@ -136,10 +137,34 @@ later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
 ## 6. (After 4c) first live engine pair — prefill-TP before decode-TP
 
 Per `docs/tensor-parallel-split.md` §Slice-4 sequencing: build `make cuda-spark`
-with TP wired (4c), start leader `pulsar-server --tp-role leader --tp-port 5590`
-and worker `... --tp-role worker --tp-peer <leader> --tp-port 5590` on the pair,
-then run the prefill big-gate path first (plan §2.4: gates amortize per chunk),
-grade reference-fidelity per the port rules.
+with TP wired (4c), then stand the group up. **Use the n-way mesh flags, not the
+legacy two-rank pair** — the target is n Sparks:
+
+```sh
+# rank r of n, on each host (h0..hn-1 are the hosts' addresses in rank order):
+pulsar -m <checkpoint> --tp-rank r --tp-nranks n \
+       --tp-peers "h0:5590,h1:5590,..." --tp-port 5590 --tp-arm prefill \
+       -p "<prompt>" --temp 0 --nothink -n 32 --dump-logprobs rank$r.lp.json
+```
+
+`tools/tp-pair-engine-grade.sh` runs exactly that over ssh, in rank order, and
+grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-pair-engine-grade.sh`;
+`PULSAR_TP_DRYRUN=1` prints the plan). Its two legs:
+
+- **LEG A — the one that matters, and it needs NO reference.** Every rank must
+  produce BYTE-IDENTICAL logprobs. That IS slice 4d's contract: each rank
+  computes only its own vocab range, the group all-gathers, and every rank
+  assembles the full vector — so all ranks must agree. A wrong range partition,
+  a wrong gather or a wrong assembly shows up here as ranks disagreeing, by
+  name. This is the instrument that proves the vocab split ran the lane.
+- **LEG B — optional, tolerance only.** Set `PULSAR_TP_BASELINE=<single-box
+  logprobs.json>` to grade rank 0 against a single-box run. TP is NOT
+  byte-exact (partials are summed in a new order), so this is a report
+  (`greedy-token disagreements`, `worst |logprob delta|`), never an equality
+  assert — rule 3.
+
+Grade reference-fidelity per the port rules as well (`PULSAR_REF_DIR`; rule 3:
+`cuda-reference-gate` must never be graded while it prints SKIP).
 
 ## Rollback
 
