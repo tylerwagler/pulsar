@@ -352,6 +352,11 @@ typedef struct {
  * REDRAFT_BATCH's arrays (count entries each) and NULL elsewhere. */
 int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
                         const uint32_t *banks, const uint64_t *rngs);
+/* Increment 6.  free/alloc physical ride the value payload; save/load carry
+ * the snapshot key. */
+int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_t bank, const char *key);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 /* Collect one ack per peer and return the VERDICT they agree on in *status
  * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
@@ -432,6 +437,15 @@ typedef enum {
     PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH = 33,    /* verdict: 0 ok, 1 failed */
     PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT = 34,   /* void */
     PULSAR_TP_FRAME_GENERATE_SPECULATIVE = 35,  /* verdict: tokens generated + 1 */
+    /* Increment 6: the eviction guard's spill path.  KV is replicated per
+     * rank, so each rank spills its own bank to its own disk; the frames name
+     * the snapshot by the KEY of the file the leader wrote (its basename with
+     * any ".tmp.<pid>" stripped) and the worker mirrors it under its own spill
+     * directory.  All four are verdicts (0 ok, 1 failed). */
+    PULSAR_TP_FRAME_BANK_FREE_PHYSICAL = 36,
+    PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL = 37,
+    PULSAR_TP_FRAME_BANK_KV_SAVE = 38,
+    PULSAR_TP_FRAME_BANK_KV_LOAD = 39,
 } pulsar_tp_frame_type;
 
 
@@ -458,6 +472,9 @@ typedef struct {
     pulsar_tp_spec_command spec;
     uint32_t *spec_banks;
     uint64_t *spec_rngs;
+    /* BANK_KV_SAVE / BANK_KV_LOAD: the snapshot key (malloc'd, NUL-terminated);
+     * the bank rides `value`. */
+    char *spill_key;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,

@@ -657,6 +657,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (opt->tp_spill_dir && opt->tp_spill_dir[0]) e->tp_spill_dir = pulsar_strdup(opt->tp_spill_dir);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
         if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_slab_bytes,
                                               &e->tp_slab_base,
@@ -780,6 +781,8 @@ void pulsar_engine::destroy() {
         pulsar_tp_free(e->tp);
         e->tp = NULL;
     }
+    free(e->tp_spill_dir);
+    e->tp_spill_dir = NULL;
     if (e->tp_slab_base) {
         pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);
         e->tp_slab_base = NULL;

@@ -136,6 +136,13 @@ typedef struct {
     int tp_rank;        /* this rank's index in the group; -1 = unset */
     int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
     const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */
+    /** Slice 4e increment 6 (L238): where a WORKER rank keeps its own bank
+     * KV disk snapshots.  KV is replicated per rank, so a spill is per rank
+     * to its own disk; the leader's frames name the snapshot by the key of
+     * the file the leader wrote and the worker mirrors it under this
+     * directory.  NULL (the CLI, or a server without a KV disk cache) refuses
+     * the spill frames on a worker. */
+    const char *tp_spill_dir;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);

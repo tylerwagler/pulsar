@@ -1702,6 +1702,7 @@ struct pulsar_engine {
      * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
+    char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     size_t tp_slab_bytes;       ///< slab size in bytes
     /** Slice 4e: the next session ordinal, handed out by pulsar_session::create

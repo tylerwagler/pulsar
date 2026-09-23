@@ -139,7 +139,15 @@ round frame; (5) LANDED with (1): `set_cancel` is never polled inside a
 mirrored operation -- the hook fires at prefill chunk boundaries, and a leader
 stopping after k chunks would leave its workers at a big gate it never joins,
 so under TP cancellation is between operations only (the driver issues no
-further frame).
+further frame); (6) LANDED with (1): the eviction guard's spill path --
+`bank_free_physical`, `bank_alloc_physical`, `bank_kv_save`, `bank_kv_load`.
+KV is replicated per rank, so each rank spills its own bank to its own disk:
+the leader names the snapshot by the KEY of the file it was handed (basename,
+the server's `.tmp.<pid>` stripped, read back from the descriptor), and the
+worker mirrors it as `<tp_spill_dir>/tp-<key>`, the server handing the engine
+its KV-disk directory as `pulsar_engine_options.tp_spill_dir`.  A worker with
+no spill directory answers a split verdict, never a quiet success.  With this
+the server's whole mutating session surface is mirrored.
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a

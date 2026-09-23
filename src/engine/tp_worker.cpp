@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
+#include <unistd.h>
 
 /* ---------------------------------------------------------------------------
  * Slice 4e, the WORKER RECEIVE LOOP (L238).
@@ -102,6 +103,15 @@ static int *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
         slot->accepted_cap = cap;
     }
     return slot->accepted;
+}
+
+/* The worker's own file for a snapshot the leader named: <spill_dir>/tp-<key>.
+ * A worker with no spill directory cannot mirror a spill and refuses it. */
+static int worker_spill_path(pulsar_engine *e, const char *key, char *out, size_t outlen) {
+    if (!e->tp_spill_dir || !key || !key[0]) return 0;
+    for (const char *p = key; *p; p++) if (*p == '/' || *p == '\\') return 0;   /* a key, not a path */
+    const int w = snprintf(out, outlen, "%s/tp-%s", e->tp_spill_dir, key);
+    return w > 0 && (size_t)w < outlen;
 }
 
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
@@ -445,6 +455,69 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             if (status < 0) status = 0;
             if (n < 0) fprintf(stderr, "pulsar: tp worker: generate_speculative failed: %s\n", ferr);
         } else fprintf(stderr, "pulsar: tp worker: generate_speculative refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    /* ---- the eviction guard's spill path (increment 6) ---- */
+    case PULSAR_TP_FRAME_BANK_FREE_PHYSICAL:
+    case PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL: {
+        const bool freeing = c->type == PULSAR_TP_FRAME_BANK_FREE_PHYSICAL;
+        const char *op = freeing ? "bank free physical" : "bank alloc physical";
+        int status = -1;
+        if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
+            const bool okb = freeing ? slot->s->bank_free_physical((uint32_t)c->value)
+                                     : slot->s->bank_alloc_physical((uint32_t)c->value);
+            status = okb ? 0 : 1;
+        } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_BANK_KV_SAVE:
+    case PULSAR_TP_FRAME_BANK_KV_LOAD: {
+        const bool load = c->type == PULSAR_TP_FRAME_BANK_KV_LOAD;
+        const char *op = load ? "bank kv load" : "bank kv save";
+        int status = -1;
+        char path[4600];
+        if (worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+        } else if (!worker_spill_path(e, c->spill_key, path, sizeof(path))) {
+            /* No spill directory on this rank, or a key that is not a key:
+             * the leader's own save succeeded, so this MUST read as a split
+             * verdict, not a quiet success. */
+            fprintf(stderr, "pulsar: tp worker: %s refused: no spill directory on this rank "
+                            "(pulsar_engine_options.tp_spill_dir) for key '%s'\n", op, c->spill_key);
+            status = 1;
+        } else if (load) {
+            FILE *fp = fopen(path, "rb");
+            if (!fp) {
+                fprintf(stderr, "pulsar: tp worker: %s: cannot open %s\n", op, path);
+                status = 1;
+            } else {
+                status = slot->s->bank_kv_load((uint32_t)c->value, fp, ferr, sizeof(ferr)) == 0 ? 0 : 1;
+                fclose(fp);
+                if (status) fprintf(stderr, "pulsar: tp worker: %s failed: %s\n", op, ferr);
+            }
+        } else {
+            /* The server's own recipe: write a temp beside the target, fsync,
+             * rename, so a crash never leaves a torn snapshot under the key. */
+            char tmp[4700];
+            snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+            FILE *fp = fopen(tmp, "wb");
+            if (!fp) {
+                fprintf(stderr, "pulsar: tp worker: %s: cannot create %s\n", op, tmp);
+                status = 1;
+            } else {
+                const int rc = slot->s->bank_kv_save((uint32_t)c->value, fp, ferr, sizeof(ferr));
+                const bool synced = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+                const int fc = fclose(fp);
+                if (!synced || fc != 0 || rename(tmp, path) != 0) {
+                    remove(tmp);
+                    fprintf(stderr, "pulsar: tp worker: %s failed: %s\n", op, rc ? ferr : "flush/rename");
+                    status = 1;
+                } else {
+                    status = 0;
+                }
+            }
+        }
         return worker_ack(e, c->session_id, status, err, errlen);
     }
 

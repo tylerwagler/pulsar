@@ -530,6 +530,9 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
     server_resolve_kv_disk_dir(&cfg);
+    /* A TP worker spills bank KV to ITS OWN disk under the same directory
+     * policy the leader uses (slice 4e increment 6). */
+    cfg.engine.tp_spill_dir = cfg.kv_disk_dir;
 
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;

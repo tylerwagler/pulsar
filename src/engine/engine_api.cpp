@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "../tp/pulsar_tp.h"
+#include <unistd.h>
 
 
 
@@ -249,12 +250,8 @@ void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn f
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) { return s ? s->touched_kv_bytes() : 0; }
-bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) { return s ? s->bank_free_physical(bank) : false; }
-bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) { return s ? s->bank_alloc_physical(bank) : false; }
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { return s ? s->bank_is_evicted(bank) : false; }
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { return s ? s->bank_touched_kv_bytes(bank) : 0; }
-int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) { return s ? s->bank_kv_save(bank, fp, err, errlen) : 1; }
-int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) { return s ? s->bank_kv_load(bank, fp, err, errlen) : 1; }
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { return s->quantum_growth_bytes_per_bank(q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
@@ -731,6 +728,87 @@ static int tp_mirror_bank_fork(pulsar_session *s, int partial, uint32_t src, uin
 }
 int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
     return s ? tp_mirror_bank_fork(s, 0, src, dst, tokens, n_tokens, n_cached) : 1;
+}
+/* ---- The eviction guard's spill path (increment 6).  KV is replicated per
+ * rank, so a spill is per rank to its own disk.  The snapshot's identity is
+ * the KEY of the file the leader was handed: its basename with the server's
+ * ".tmp.<pid>" suffix stripped, read back from the descriptor, because the
+ * public API takes a FILE* and the server renames the temp into place after
+ * the save.  The worker mirrors the snapshot under its own spill directory
+ * by that key, so a later load names the same snapshot on every rank. */
+static int tp_spill_key(FILE *fp, char *out, size_t outlen) {
+    if (!fp) return 0;
+    char link[64], target[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fileno(fp));
+    const ssize_t n = readlink(link, target, sizeof(target) - 1u);
+    if (n <= 0) return 0;
+    target[n] = '\0';
+    const char *base = strrchr(target, '/');
+    base = base ? base + 1 : target;
+    if (!base[0]) return 0;
+    /* strip a trailing ".tmp.<digits>" */
+    size_t len = strlen(base);
+    const char *t = strstr(base, ".tmp.");
+    while (t) {
+        const char *d = t + 5;
+        size_t k = 0;
+        while (d[k] >= '0' && d[k] <= '9') k++;
+        if (k > 0 && d[k] == '\0') { len = (size_t)(t - base); break; }
+        t = strstr(t + 1, ".tmp.");
+    }
+    if (len == 0 || len >= outlen) return 0;
+    memcpy(out, base, len);
+    out[len] = '\0';
+    return 1;
+}
+static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t bank) {
+    const char *operation = freeing ? "bank free physical" : "bank alloc physical";
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return freeing ? s->bank_free_physical(bank) : s->bank_alloc_physical(bank);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, operation, err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return false;
+    }
+    const int sent = freeing ? pulsar_tp_send_bank_free_physical(tp, s->tp_session_id, bank)
+                             : pulsar_tp_send_bank_alloc_physical(tp, s->tp_session_id, bank);
+    if (sent == 0) {
+        pulsar_tp_mirror_fail_void(tp, operation, "the frame could not be shipped");
+        return false;
+    }
+    const int own = (freeing ? s->bank_free_physical(bank) : s->bank_alloc_physical(bank)) ? 0 : 1;
+    return tp_mirror_bank_verdict(s, tp, operation, own, 1) == 0;
+}
+bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
+    return s ? tp_mirror_bank_physical(s, 1, bank) : false;
+}
+bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
+    return s ? tp_mirror_bank_physical(s, 0, bank) : false;
+}
+static int tp_mirror_bank_kv(pulsar_session *s, int load, uint32_t bank, FILE *fp, char *err, size_t errlen) {
+    const char *operation = load ? "bank kv load" : "bank kv save";
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return load ? s->bank_kv_load(bank, fp, err, errlen) : s->bank_kv_save(bank, fp, err, errlen);
+    if (tp_mirror_worker_drives_nothing(tp, operation, err, errlen) ||
+        tp_mirror_dead(tp, err, errlen)) return 1;
+    char key[256];
+    if (!tp_spill_key(fp, key, sizeof(key))) {
+        if (err) snprintf(err, errlen, "tp: %s: the snapshot file has no usable key (not a named file?)", operation);
+        return 1;
+    }
+    if (pulsar_tp_send_bank_kv(tp, load, s->tp_session_id, bank, key) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the %s to the workers", operation);
+        return 1;
+    }
+    const int own = (load ? s->bank_kv_load(bank, fp, err, errlen) : s->bank_kv_save(bank, fp, err, errlen)) == 0 ? 0 : 1;
+    return tp_mirror_bank_verdict(s, tp, operation, own, 1);
+}
+int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
+    return s ? tp_mirror_bank_kv(s, 0, bank, fp, err, errlen) : 1;
+}
+int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
+    return s ? tp_mirror_bank_kv(s, 1, bank, fp, err, errlen) : 1;
 }
 int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
     return s ? tp_mirror_bank_fork(s, 1, src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL;

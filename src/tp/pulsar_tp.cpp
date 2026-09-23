@@ -2920,6 +2920,35 @@ int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec
     return ok;
 }
 
+int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
+}
+int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, bank);
+}
+
+typedef struct {
+    uint64_t session_id;
+    int32_t bank;
+    uint32_t key_len;    /* bytes of key following, without a terminator */
+} pulsar_tp_spill_command_header;
+
+int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_t bank, const char *key) {
+    if (!tp || !key || !key[0]) return 0;
+    const size_t kl = strlen(key);
+    if (kl > 4096) return 0;
+    const uint32_t bytes = (uint32_t)(sizeof(pulsar_tp_spill_command_header) + kl);
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    pulsar_tp_spill_command_header h = { session_id, (int32_t)bank, (uint32_t)kl };
+    memcpy(payload, &h, sizeof(h));
+    memcpy(payload + sizeof(h), key, kl);
+    const int ok = tp_send_frame_to_peers(tp, load ? PULSAR_TP_FRAME_BANK_KV_LOAD : PULSAR_TP_FRAME_BANK_KV_SAVE,
+                                          payload, bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -2999,6 +3028,8 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     free(command->spec_rngs);
     command->spec_banks = NULL;
     command->spec_rngs = NULL;
+    free(command->spill_key);
+    command->spill_key = NULL;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -3120,6 +3151,22 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->n_tokens = h.count;
         break;
     }
+    case PULSAR_TP_FRAME_BANK_KV_SAVE:
+    case PULSAR_TP_FRAME_BANK_KV_LOAD: {
+        pulsar_tp_spill_command_header h;
+        if (bytes < sizeof(h)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        if (h.key_len == 0 || h.key_len > 4096 || sizeof(h) + h.key_len != bytes) { ok = 0; break; }
+        command->spill_key = static_cast<char *>(malloc((size_t)h.key_len + 1u));
+        if (!command->spill_key) { ok = -1; break; }
+        memcpy(command->spill_key, payload + sizeof(h), h.key_len);
+        command->spill_key[h.key_len] = '\0';
+        command->session_id = h.session_id;
+        command->value = h.bank;
+        break;
+    }
+    case PULSAR_TP_FRAME_BANK_FREE_PHYSICAL:
+    case PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL:
     case PULSAR_TP_FRAME_BANK_STATE_SAVE:
     case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
     case PULSAR_TP_FRAME_BANK_REPOINT:

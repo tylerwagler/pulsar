@@ -843,6 +843,40 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Increment 6: the spill frames -- the key survives the wire, the bank
+     * rides beside it, the verdicts collect. */
+    {
+        const uint64_t sid = 0xC0DEA000ULL;
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            int status = -99;
+            CHECK(pulsar_tp_send_bank_kv(tp, 0, sid, 5u, "kv-abc123.bin") != 0, "rank 0 kv-save send failed");
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "bank kv save", &status, cerr, sizeof(cerr)) && status == 0,
+                  "rank 0 kv-save verdict: want 0, got %d (%s)", status, cerr);
+            CHECK(pulsar_tp_send_bank_free_physical(tp, sid, 5u) != 0, "rank 0 free-physical send failed");
+            status = -99;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "bank free physical", &status, cerr, sizeof(cerr)) && status == 0,
+                  "rank 0 free-physical verdict: want 0, got %d (%s)", status, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d kv-save recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_KV_SAVE && cmd.session_id == sid && cmd.value == 5 &&
+                      cmd.spill_key && std::strcmp(cmd.spill_key, "kv-abc123.bin") == 0,
+                      "rank %d kv-save frame: bank %d key '%s'", rank, cmd.value, cmd.spill_key ? cmd.spill_key : "(null)");
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d kv-save ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d free-physical recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_FREE_PHYSICAL && cmd.value == 5, "rank %d free-physical frame", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d free-physical ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
@@ -899,7 +933,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec verdicts, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec/spill verdicts, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;
