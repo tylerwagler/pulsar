@@ -2381,10 +2381,38 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
  * socket-buffer clamp (the former 2 MiB rounds deadlocked on the pair hosts
  * where net.core.wmem_max ~212K; see pulsar_tp_batch_gate_exchange). */
 
+/* Defined below with the n-way all-reduce, which also loops peers with it. */
+static int tp_big_gate_exchange_peer(pulsar_tp *tp, pulsar_tp_peer *pp,
+                                     uint32_t layer, uint64_t seq,
+                                     const void *out, void *in, uint64_t bytes);
+
 int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "pairwise big gate");
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (!tp || !out || !in || bytes == 0) return 0;
+    if (tp->n_ranks > 2) {
+        /* n>2, same contract as the slab gates: `out` keeps this rank's partial
+         * and `in` ACCUMULATES THE SUM of every peer's, so a caller that adds the
+         * in-buffer gets the full sum -- the pair's "in is the peer's partial"
+         * read at n ranks.  One per-peer exchange each, over that peer's own RDMA
+         * link when the group decided RDMA (tp_big_gate_exchange_peer), else its
+         * data socket. */
+        const uint64_t nelt = bytes / sizeof(float);
+        float *acc = (float *)calloc((size_t)nelt, sizeof(float));
+        if (!acc) return 0;
+        for (int i = 0; i < tp->n_peers; i++) {
+            if (!tp_big_gate_exchange_peer(tp, &tp->peers[i], layer, seq,
+                                           out, in, bytes)) {
+                free(acc);
+                return 0;
+            }
+            const float *src = (const float *)in;
+            for (uint64_t q = 0; q < nelt; q++) acc[q] += src[q];
+        }
+        memcpy(in, acc, bytes);
+        free(acc);
+        return 1;
+    }
+    if (tp->data_fd < 0) return 0;
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;

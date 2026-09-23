@@ -297,6 +297,29 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The n-way BIG gate (the prefill-chunk shape) over CALLER buffers, same
+     * contract: `out` keeps this rank's partial, `in` accumulates the peers'. */
+    if (n >= 3) {
+        float *bo = (float *)std::malloc((size_t)bytes);
+        float *bi = (float *)std::malloc((size_t)bytes);
+        const uint64_t nelt_bg = bytes / sizeof(float);
+        for (uint64_t k = 0; k < nelt_bg; k++) bo[k] = (float)(1000 * rank + (int)(k % 3));
+        memset(bi, 0, (size_t)bytes);
+        if (!pulsar_tp_big_gate_exchange(tp, 0, 13, bo, bi, bytes)) {
+            CHECK(0, "rank %d n-way big gate failed", rank);
+        } else {
+            const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
+            int gb2 = 0;
+            for (uint64_t k = 0; k < nelt_bg; k++) {
+                if (bi[k] != base + (float)(n - 1) * (float)(int)(k % 3)) gb2++;
+                if (bo[k] != (float)(1000 * rank + (int)(k % 3))) gb2++;
+            }
+            CHECK(gb2 == 0, "rank %d n-way big gate: %d wrong elements", rank, gb2);
+        }
+        std::free(bo);
+        std::free(bi);
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it
