@@ -330,7 +330,7 @@ pair, because its own arguments are never read.
     shape: the IQ2 artifact IS the one-GB10 compromise, and a pair exists to
     serve the full-fidelity MXFP4 weights that do not fit one box -- which the
     CUTLASS arms already split.  "If we've got more than one GB10, we won't
-    need TP2" (Tyler).  Bring-up therefore uses an MXFP4 artifact; the refusal
+    need IQ2" (Tyler).  Bring-up therefore uses an MXFP4 artifact; the refusal
     on IQ2 stays loud and stays;
   - **images** are not mirrored; `pulsar_session_sync_mm` refuses a non-zero
     image count under TP on every rank, before any frame moves;
