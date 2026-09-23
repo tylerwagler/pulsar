@@ -224,6 +224,15 @@ void pulsar_tp_mark_failed(pulsar_tp *tp);
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp);     /* decoded from the hello */
 uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials) */
 
+/* The registered slab's per-layer BATCH regions (n_layer blocks, each
+ * PULSAR_TP_BATCH_MAX_ROWS vectors).  A caller whose payload fits that many
+ * rows should stage HERE rather than in its own buffer: the RDMA big gate rides
+ * DIRECT when its out/in pointers already lie inside the slab, instead of
+ * copying the payload through these very regions to reach registered memory.
+ * NULL when no slab is attached or `layer` is out of range. */
+void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer);
+void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer);
+
 /* Register the slab base with the transport.  The engine allocates one
  * contiguous (GPU-visible on GB10) block and hands its base VA here; the
  * transport registers it with the NIC (RDMA) and exchanges remote keys, or

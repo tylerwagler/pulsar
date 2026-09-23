@@ -2032,6 +2032,17 @@ bool pulsar_tp_is_rdma(const pulsar_tp *tp) { return tp->rdma_active; }
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp) { return tp->peer_ctx; }
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp) { return tp->n_layer; }
 uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp) { return tp->vec_bytes; }
+
+/* The per-layer batch regions, through the layout arithmetic's ONE authority.
+ * A layer >= n_layer would address past the reservation, so it refuses. */
+void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer) {
+    if (!tp || !tp->slab || layer >= tp->n_layer) return NULL;
+    return tp->slab + pulsar_tp_slab_batch_out_offset(&tp->layout, layer, tp->vec_bytes);
+}
+void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer) {
+    if (!tp || !tp->slab || layer >= tp->n_layer) return NULL;
+    return tp->slab + pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+}
 bool pulsar_tp_failed(const pulsar_tp *tp) {
     return tp && tp->failed.load(std::memory_order_acquire);
 }
@@ -2260,10 +2271,17 @@ int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     const uint64_t nelt = bytes / sizeof(float);
     if (tp->n_ranks <= 1) return 1;         /* single rank: own partial is the sum */
     if (tp->n_ranks == 2) {
-        pulsar_tp_peer *pp = tp->n_peers > 0 ? &tp->peers[0] : NULL;
-        if (!pp || pp->data_fd < 0) return 0;
-        if (!tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out, (void *)in, bytes))
-            return 0;
+        /* The RDMA-capable entry, NOT the raw fd.  It takes the verbs path when
+         * RDMA is up -- and the DIRECT branch when out/in already lie inside the
+         * registered slab, which is exactly what the engine's
+         * <=PULSAR_TP_BATCH_MAX_ROWS staging is for -- and otherwise falls back
+         * to the same chunked fd exchange.  Calling tp_big_gate_exchange_fd here
+         * left every pair gate exchange on TCP even with a live 200G RoCE link,
+         * which the plan calls load-bearing. */
+        /* `in` is caller SCRATCH here (the peer's payload lands in it), so the
+         * const in this function's signature is dropped -- as it was when this
+         * leg called tp_big_gate_exchange_fd directly. */
+        if (!pulsar_tp_big_gate_exchange(tp, layer, seq, out, (void *)in, bytes)) return 0;
         float *acc = (float *)out;
         const float *peer = (const float *)in;
         for (uint64_t i = 0; i < nelt; i++) acc[i] += peer[i];
@@ -2320,9 +2338,16 @@ int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                 fprintf(stderr, "pulsar-tp: vocab all-gather has no channel to rank %u\n", k);
                 return 0;
             }
-            if (!tp_big_gate_exchange_fd(pp->data_fd, layer, seq, own_slice, scratch,
-                                         (uint64_t)n_rows * stride * sizeof(float)))
-                return 0;
+            /* Same rule as allreduce_sum: the pair rides the RDMA-capable entry
+             * (which stages through the registered slab itself, and rides DIRECT
+             * when the caller's buffers are already in it); the n>2 mesh keeps
+             * the plain fd, per-peer RDMA being pair-gated. */
+            const bool xok = tp->n_ranks == 2
+                ? pulsar_tp_big_gate_exchange(tp, layer, seq, own_slice, scratch,
+                                              (uint64_t)n_rows * stride * sizeof(float)) != 0
+                : tp_big_gate_exchange_fd(pp->data_fd, layer, seq, own_slice, scratch,
+                                          (uint64_t)n_rows * stride * sizeof(float)) != 0;
+            if (!xok) return 0;
             src = scratch;
         }
         /* Place this rank's range into every row.  The own-rank case copies from

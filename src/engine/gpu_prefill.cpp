@@ -2403,14 +2403,39 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
     if (!g->tp) return 1;
     const uint64_t nelt = (uint64_t)n_tokens * PULSAR_N_EMBD;
     const uint64_t bytes = nelt * sizeof(float);
-    float *out = (float *)xmalloc(bytes ? bytes : sizeof(float));
-    float *in  = (float *)xmalloc(bytes ? bytes : sizeof(float));
-    if (!out || !in) {
-        free(out);
-        free(in);
-        fprintf(stderr, "pulsar: tp prefill big-gate out of memory (%llu bytes)\n",
-                (unsigned long long)bytes);
-        return 0;
+    /* Two staging shapes, chosen by ROW COUNT because that is the slab's sizing
+     * boundary rather than a semantic variant (so nothing selects it by flag):
+     *
+     *  - <= PULSAR_TP_BATCH_MAX_ROWS (a decode/verify step) stages in the
+     *    registered slab's OWN batch region, so the transport rides DIRECT over
+     *    RDMA -- its out/in pointers are already inside the slab -- instead of
+     *    copying the payload through those same regions to reach registered
+     *    memory.
+     *  - a bigger prefill chunk does not fit there at all (a 2048-row chunk is
+     *    ~33 MB against a batch region of 8 rows) and keeps its own buffer,
+     *    which the transport stages through the slab in message-sized pieces. */
+    float *out = NULL;
+    float *in = NULL;
+    bool heap = false;
+    if (n_tokens <= PULSAR_TP_BATCH_MAX_ROWS) {
+        out = (float *)pulsar_tp_slab_batch_out(g->tp, il);
+        in  = (float *)pulsar_tp_slab_batch_in(g->tp, il);
+        if (!out || !in) {
+            fprintf(stderr, "pulsar: tp gate: no slab batch region for layer %u "
+                            "(%u rows) -- refusing\n", il, n_tokens);
+            return false;
+        }
+    } else {
+        out = (float *)xmalloc(bytes ? bytes : sizeof(float));
+        in  = (float *)xmalloc(bytes ? bytes : sizeof(float));
+        if (!out || !in) {
+            free(out);
+            free(in);
+            fprintf(stderr, "pulsar: tp prefill big-gate out of memory (%llu bytes)\n",
+                    (unsigned long long)bytes);
+            return false;
+        }
+        heap = true;
     }
     bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
     if (ok) {
@@ -2420,8 +2445,10 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
     if (ok) {
         ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, out, bytes) != 0;
     }
-    free(out);
-    free(in);
+    if (heap) {
+        free(out);
+        free(in);
+    }
     return ok;
 }
 
