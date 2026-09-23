@@ -337,10 +337,13 @@ static int tp_mirror_worker_frame(pulsar_session *s, const pulsar_tp_command *co
 }
 
 /** Reports this worker's half back to the leader.  Sent even on a refusal: a
- * rank that dies without answering hangs the leader instead of failing it. */
-static int tp_mirror_worker_ack(pulsar_session *s, pulsar_tp *tp, int rc,
+ * rank that dies without answering hangs the leader instead of failing it.
+ * The id is the one the COMMAND carried, not this rank's own: on a session
+ * divergence the leader must read back its own id with the refusal status, not
+ * a stranger's id that would send it looking for the wrong session. */
+static int tp_mirror_worker_ack(pulsar_tp *tp, uint64_t command_session_id, int rc,
                                 char *err, size_t errlen) {
-    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) != 0) return 0;
+    if (pulsar_tp_send_command_ack(tp, command_session_id, rc) != 0) return 0;
     if (err) snprintf(err, errlen, "tp: could not ack the mirrored command to the leader");
     return 1;
 }
@@ -480,7 +483,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
         }
         rc = s->sync(&borrowed, images, n_images, err, errlen);
     }
-    if (tp_mirror_worker_ack(s, tp, rc, err, errlen) != 0 && rc == 0) rc = 1;
+    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
     pulsar_tp_command_free(&command);
     return rc;
 }
@@ -604,11 +607,72 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
             rc = s->eval(command.value, err, errlen);
         }
     }
-    if (tp_mirror_worker_ack(s, tp, rc, err, errlen) != 0 && rc == 0) rc = 1;
+    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
     pulsar_tp_command_free(&command);
     return rc;
 }
-int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) { return s ? s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen) : 1; }
+int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) {
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen);
+    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
+    if (pulsar_tp_rank(tp) == 0) {
+        if (!reqs || n == 0) {
+            if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
+            return 1;
+        }
+        pulsar_tp_batch_item *items =
+            (pulsar_tp_batch_item *)xmalloc((size_t)n * sizeof(*items));
+        for (uint32_t i = 0; i < n; i++) {
+            items[i].session_id = s->tp_session_id;
+            items[i].bank       = (int32_t)reqs[i].bank;
+            items[i].pos        = reqs[i].pos;
+            items[i].token      = reqs[i].token;
+            items[i].reserved   = 0;
+        }
+        const int sent = pulsar_tp_send_eval_batch(tp, items, n);
+        free(items);
+        if (sent == 0) {
+            if (err) snprintf(err, errlen, "tp: could not mirror the batch to the workers");
+            return 1;
+        }
+        return tp_mirror_leader_ack(s, tp, "batch decode",
+                                    s->decode_multiseq(reqs, n, logits, logits_cap,
+                                                       err, errlen),
+                                    err, errlen);
+    }
+    /* Worker: the leader's rows ARE the batch, and this rank's own `reqs` are
+     * never read.  The row count is checked rather than warned about (unlike a
+     * single token, whose value cannot resize anything): the caller sized
+     * `logits` for ITS OWN n, so decoding the leader's different count would be
+     * decoding into a buffer shaped for someone else's batch. */
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
+    int rc = 1;
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_EVAL_BATCH, "batch decode",
+                               err, errlen) == 0) {
+        if (command.n_items != n) {
+            if (err) snprintf(err, errlen,
+                              "tp: the leader mirrored %u rows but this rank is decoding %u; "
+                              "the ranks' drivers diverged on the batch shape",
+                              command.n_items, n);
+        } else {
+            pulsar_multiseq_req *rows =
+                (pulsar_multiseq_req *)xmalloc((size_t)n * sizeof(*rows));
+            for (uint32_t i = 0; i < n; i++) {
+                rows[i].bank  = (uint32_t)command.items[i].bank;
+                rows[i].pos   = command.items[i].pos;
+                rows[i].token = command.items[i].token;
+            }
+            rc = s->decode_multiseq(rows, n, logits, logits_cap, err, errlen);
+            free(rows);
+        }
+    }
+    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
+    pulsar_tp_command_free(&command);
+    return rc;
+}
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) { return s ? s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows, max_head_runs, err, errlen) : 1; }
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
 int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) { return s ? s->bank_repoint(bank) : 1; }

@@ -531,6 +531,63 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The batched-decode row.  FRAME_EVAL_BATCH carried a payload that could not
+     * express a row's bank and position until slice 4e defined it (it was
+     * {session_id, token, reserved} and had no users), so this round is the
+     * first time the item ever crossed a wire.  Distinct bank/pos/token per row
+     * catches a field-order or padding mistake that a single-value round would
+     * hide, and the row count is odd on purpose: a count that survives 8-byte
+     * padding by accident is not a count that survived. */
+    {
+        const uint64_t sid = 0xC0DE4000ULL;
+        enum { BATCH_ROWS = 3 };
+        pulsar_tp_batch_item items[BATCH_ROWS];
+        for (int i = 0; i < BATCH_ROWS; i++) {
+            items[i].session_id = sid;
+            items[i].bank = (int32_t)(2 + i);
+            items[i].pos = (int32_t)(500 + 7 * i);
+            items[i].token = 70000 + i;
+            items[i].reserved = 0;
+        }
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_eval_batch(tp, items, BATCH_ROWS) != 0,
+                  "rank 0 mirrored batch send must report success as nonzero");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "batch decode", cerr, sizeof(cerr)),
+                  "rank 0 mirrored batch ack over %d peers: %s", n - 1, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored batch recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_EVAL_BATCH,
+                      "rank %d got frame type %d, expected EVAL_BATCH (%d)",
+                      rank, (int)cmd.type, (int)PULSAR_TP_FRAME_EVAL_BATCH);
+                CHECK(cmd.n_items == (uint32_t)BATCH_ROWS,
+                      "rank %d mirrored batch carried %u rows, expected %d",
+                      rank, cmd.n_items, (int)BATCH_ROWS);
+                int row_bad = 0;
+                if (cmd.items) {
+                    for (int i = 0; i < BATCH_ROWS; i++) {
+                        if (cmd.items[i].session_id != sid ||
+                            cmd.items[i].bank != items[i].bank ||
+                            cmd.items[i].pos != items[i].pos ||
+                            cmd.items[i].token != items[i].token) {
+                            row_bad++;
+                        }
+                    }
+                }
+                CHECK(cmd.items && row_bad == 0,
+                      "rank %d mirrored batch rows differ (%d of %d)",
+                      rank, row_bad, (int)BATCH_ROWS);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
+                      "rank %d mirrored batch ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

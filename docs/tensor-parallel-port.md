@@ -173,7 +173,28 @@ pair, because its own arguments are never read.
   HANGS the leader, and a hang is not a test result).
   It still does not cover the wrappers' SUCCESS path, which calls `sync`/`eval`
   on the real graph; that needs two Sparks.
-- **Still open:** banks, warm-fork, multiseq, mixed, spec.
+- Increment 4 (round 6) mirrors **`pulsar_session_decode_multiseq`** -- the
+  decode path the production server actually uses (plain `eval` is the CLI
+  path), so before this a server pair was not mirroring its real workload.
+  It rides `FRAME_EVAL_BATCH`, whose payload had to be defined first: the item
+  was `{session_id, token, reserved}` and could not carry a row's **bank** and
+  **position**, which is why nothing had ever been written against it.  It is
+  now `{session_id, bank, pos, token, reserved}` -- the engine's own row
+  contract plus the session.  Frame *numbers* are still never reused; only that
+  payload changed, once, while it had no users.
+  The worker checks the row COUNT and refuses on a mismatch instead of warning
+  (unlike a single token, whose value cannot resize anything): the caller sized
+  `logits` for ITS OWN n, so decoding the leader's different count would decode
+  into a buffer shaped for someone else's batch.  Both ranks still assemble full
+  logits from the 4d vocab all-gather, so no logits cross the wire.
+  Coverage: `tp_mesh_test` now rides a 3-row batch with distinct bank/pos/token
+  at n=2..5 (mutating one field's expectation fails it), and `tp_mirror_test`
+  adds the wrapper's batch refusal.
+  **Not covered:** the wrapper's row *reconstruction* runs only after the frame
+  checks pass, which on a fabricated session would reach the graph -- so it
+  needs two Sparks like the rest of the success path.
+- **Still open:** `decode_mixed` (its `FRAME_MIXED_BATCH` is now the only
+  remaining frame with no user), banks, warm-fork, spec.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

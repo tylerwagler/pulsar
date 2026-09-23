@@ -147,7 +147,29 @@ static int run_leader(pulsar_tp *tp) {
     CHECK(std::strstr(err, "eval failed") != NULL,
           "the refusal must name the operation: %s", err);
 
-    /* C. A leader whose transport is already dead refuses before it sends
+    /* C. The batched decode.  The worker is on session 8 again, so the frame's
+     * id (7) must stop it before it builds a single row -- and this is the only
+     * place the EVAL_BATCH payload's encode/decode is driven by the engine's own
+     * sender. */
+    {
+        pulsar_tp_batch_item items[2];
+        for (int i = 0; i < 2; i++) {
+            items[i].session_id = LEADER_SID;
+            items[i].bank = 1;
+            items[i].pos = 10 + i;
+            items[i].token = 1000 + i;
+            items[i].reserved = 0;
+        }
+        CHECK(pulsar_tp_send_eval_batch(tp, items, 2) != 0,
+              "send_eval_batch must report success as nonzero");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "batch decode", err, sizeof(err)),
+              "the leader must see the worker's batch refusal");
+        CHECK(std::strstr(err, "batch decode failed") != NULL,
+              "the batch refusal must name the operation: %s", err);
+    }
+
+    /* D. A leader whose transport is already dead refuses before it sends
      * anything -- no frame, no graph, no half-mirrored operation.  Last,
      * because marking the pair failed poisons the transport for good. */
     pulsar_tp_mark_failed(tp);
@@ -187,6 +209,25 @@ static int run_worker(pulsar_tp *tp) {
     CHECK(rc == 1, "the worker must refuse an unexpected frame type, got rc=%d", rc);
     CHECK(std::strstr(err, "expected a mirrored sync") != NULL,
           "the refusal must name the frame it expected: %s", err);
+
+    /* D. The batched decode, same divergence: the wrapper must refuse on the
+     * frame's session id before it builds a row, and ack.  A fresh session on
+     * the MISMATCHED id, because the id is what has to stop it -- with a
+     * matching id the wrapper would go on to decode into the fabricated
+     * session's graph. */
+    free_session(s);
+    s = fabricate_session(tp, WORKER_SID);
+    {
+        pulsar_multiseq_req rows[2];
+        rows[0].bank = 1; rows[0].pos = 10; rows[0].token = 1000;
+        rows[1].bank = 1; rows[1].pos = 11; rows[1].token = 1001;
+        float logits[8] = { 0 };
+        err[0] = 0;
+        rc = pulsar_session_decode_multiseq(s, rows, 2, logits, 8, err, sizeof(err));
+        CHECK(rc == 1, "the worker must refuse a batch for another session, got rc=%d", rc);
+        CHECK(std::strstr(err, "diverged") != NULL,
+              "the batch refusal must name the divergence: %s", err);
+    }
     free_session(s);
     return g_failures;
 }

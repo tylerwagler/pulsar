@@ -272,10 +272,18 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
  * refusal, so it is stated once here rather than inferred per call site.  A
  * refusal that carries a reason puts it in `err`; the allgather/allreduce and
  * gate exchanges above follow the same rule. */
+/** One row of a mirrored batched decode: the engine's own row contract
+ * (pulsar_multiseq_req) plus the session the row belongs to.  The layout was
+ * fixed HERE, while FRAME_EVAL_BATCH/FRAME_MIXED_BATCH still had no user -- it
+ * used to be {session_id, token, reserved}, which cannot carry a row's bank and
+ * position, so no caller could have been written against it.  Frame NUMBERS are
+ * still never reused; only this payload changed, once, before first use. */
 typedef struct {
-    uint64_t session_id;
-    int32_t token;
-    uint32_t reserved;
+    uint64_t session_id;  ///< the mirrored session this row belongs to
+    int32_t  bank;        ///< true bank id in that session's pool
+    int32_t  pos;         ///< absolute position of `token`
+    int32_t  token;       ///< input token id decoded at `pos`
+    uint32_t reserved;    ///< pad to 24 bytes: keeps every field naturally aligned
 } pulsar_tp_batch_item;
 
 int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id,
