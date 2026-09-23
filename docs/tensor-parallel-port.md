@@ -118,6 +118,26 @@ pair, because its own arguments are never read.
   would be consumed by the *next* operation, shifting every later frame by one.
 - `pulsar_tp_wait_command_ack` returns **1 on success, 0 on failure** (failure
   leaves the message in `err`), the inverse of the `tp_send_*` convention.
+- Increment 2 (2026-09-23) mirrors **eval**.  The frame's `seq` is the session's
+  decode position (`checkpoint.len`, the number of tokens whose KV the graph
+  holds), so the worker does more than trust the leader's token: it refuses when
+  the two ranks are not at the same position.  That is the one corruption the
+  mirror alone cannot catch -- the right token decoded at the wrong place.
+- **Session create is deliberately not mirrored.**  A worker cannot check the
+  leader's create frame until it reaches the same create, and blocking there
+  would turn a driver divergence -- the case the create ordinal exists to catch
+  -- into a hang instead of the clean refusal the first mirrored operation
+  already gives.
+- `tests/tp_mesh_test.cpp` now rides the two frames a mirrored session actually
+  uses (a 16-token SYNC array, then an EVAL position+token), with one ack per
+  frame per peer, at n=2..5 over real RDMA.  Its gating is mutation-proven: a
+  wrong expected position exits nonzero instead of printing and passing.
+- **Still open:** rewind/invalidate, banks, warm-fork, multiseq, mixed, spec.
+  `pulsar_session_rewind`/`_invalidate` return `void` (49 call sites), so they
+  have no error channel -- mirroring them means reporting a transport failure by
+  marking the pair failed and printing, with the caller learning on the next
+  operation.  That API decision is its own increment, not a silent edge of this
+  one.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

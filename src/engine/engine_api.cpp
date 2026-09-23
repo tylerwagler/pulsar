@@ -295,6 +295,56 @@ static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
+/** The collector every mirrored operation ends with on the leader: one ack per
+ * peer.  It is read even when `body_rc` failed locally, because an unread ack
+ * would be consumed by the NEXT operation, shifting every later frame by one. */
+static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *operation,
+                                int body_rc, char *err, size_t errlen) {
+    char peer_err[256];
+    peer_err[0] = '\0';
+    const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, operation,
+                                                   peer_err, sizeof(peer_err));
+    if (body_rc != 0) return body_rc;
+    if (!peer_ok) {
+        if (err) snprintf(err, errlen, "tp: a worker failed the mirrored %s: %s",
+                          operation, peer_err);
+        return 1;
+    }
+    return 0;
+}
+
+/** The checks every worker-side frame passes before its body runs.  A frame for
+ * another session means the ranks' drivers diverged; without this it would
+ * mirror a stranger's command into this session -- wrong output, silently. */
+static int tp_mirror_worker_frame(pulsar_session *s, const pulsar_tp_command *command,
+                                  pulsar_tp_frame_type expected, const char *operation,
+                                  char *err, size_t errlen) {
+    if (command->type != expected) {
+        if (err) snprintf(err, errlen,
+                          "tp: expected a mirrored %s but the leader sent frame type %d",
+                          operation, (int)command->type);
+        return 1;
+    }
+    if (command->session_id != s->tp_session_id) {
+        if (err) snprintf(err, errlen,
+                          "tp: the leader mirrored session %llu but this is session %llu; "
+                          "the ranks' drivers diverged, refusing to mirror into the wrong session",
+                          (unsigned long long)command->session_id,
+                          (unsigned long long)s->tp_session_id);
+        return 1;
+    }
+    return 0;
+}
+
+/** Reports this worker's half back to the leader.  Sent even on a refusal: a
+ * rank that dies without answering hangs the leader instead of failing it. */
+static int tp_mirror_worker_ack(pulsar_session *s, pulsar_tp *tp, int rc,
+                                char *err, size_t errlen) {
+    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) == 0) return 0;
+    if (err) snprintf(err, errlen, "tp: could not ack the mirrored command to the leader");
+    return 1;
+}
+
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }
@@ -321,19 +371,9 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
             if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
             return 1;
         }
-        const int rc = s->sync(prompt, images, n_images, err, errlen);
-        /* Collected even after a local failure: the worker ran its own sync on
-         * the mirrored prompt and its ack would otherwise be read by the NEXT
-         * operation, shifting every later frame by one. */
-        char peer_err[256];
-        const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, "sync",
-                                                       peer_err, sizeof(peer_err));
-        if (rc != 0) return rc;
-        if (!peer_ok) {
-            if (err) snprintf(err, errlen, "tp: a worker failed the mirrored sync: %s", peer_err);
-            return 1;
-        }
-        return 0;
+        return tp_mirror_leader_ack(s, tp, "sync",
+                                    s->sync(prompt, images, n_images, err, errlen),
+                                    err, errlen);
     }
     /* Worker: the leader's frame is the input, and this rank's own prompt is
      * never even looked at.  `borrowed` is a view of the frame's buffer -- the
@@ -346,17 +386,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     borrowed.v = command.tokens;
     borrowed.len = (int)command.n_tokens;
     borrowed.cap = (int)command.n_tokens;
-    if (command.type != PULSAR_TP_FRAME_SYNC) {
-        if (err) snprintf(err, errlen,
-                          "tp: expected a mirrored sync but the leader sent frame type %d",
-                          (int)command.type);
-    } else if (command.session_id != s->tp_session_id) {
-        if (err) snprintf(err, errlen,
-                          "tp: the leader mirrored session %llu but this is session %llu; "
-                          "the ranks' drivers diverged, refusing to mirror into the wrong session",
-                          (unsigned long long)command.session_id,
-                          (unsigned long long)s->tp_session_id);
-    } else {
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_SYNC, "sync", err, errlen) == 0) {
         /* The loud form of "this rank's own arguments were not the leader's" --
          * the exact condition this slice exists to make harmless.  Not an
          * error: the leader's prompt is the one that runs. */
@@ -366,12 +396,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
         }
         rc = s->sync(&borrowed, images, n_images, err, errlen);
     }
-    /* Ack even on refusal: the leader is waiting, and a rank that dies without
-     * answering would hang it rather than fail it. */
-    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) != 0 && rc == 0) {
-        rc = 1;
-        if (err) snprintf(err, errlen, "tp: could not ack the mirrored sync to the leader");
-    }
+    if (tp_mirror_worker_ack(s, tp, rc, err, errlen) != 0 && rc == 0) rc = 1;
     pulsar_tp_command_free(&command);
     return rc;
 }
@@ -451,7 +476,50 @@ int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int 
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s ? s->token_logprob(token, out) : 0; }
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s ? s->copy_logits(out, cap) : 0; }
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) { return s ? s->set_logits(logits, n) : 1; }
-int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) { return s ? s->eval(token, err, errlen) : 1; }
+int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->eval(token, err, errlen);
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    /* The frame's seq is this session's decode position -- the number of tokens
+     * whose KV the graph holds -- so the worker can do more than trust the
+     * leader's token: it can check that both ranks are at the same place before
+     * decoding it.  Without that check a rank that fell behind would decode the
+     * right token at the wrong position and produce confident nonsense. */
+    const uint64_t pos = (uint64_t)s->checkpoint.len;
+    if (pulsar_tp_rank(tp) == 0) {
+        if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) != 0) {
+            if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
+            return 1;
+        }
+        return tp_mirror_leader_ack(s, tp, "eval", s->eval(token, err, errlen), err, errlen);
+    }
+    /* Worker: the leader's token is the one that runs, and this rank's `token`
+     * argument is never read. */
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) != 0) return 1;
+    int rc = 1;
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_EVAL, "eval", err, errlen) == 0) {
+        if (command.seq != pos) {
+            if (err) snprintf(err, errlen,
+                              "tp: the leader evaluated at position %llu but this rank is at %llu; "
+                              "the ranks are out of lockstep, refusing to decode",
+                              (unsigned long long)command.seq, (unsigned long long)pos);
+        } else {
+            /* Same harmless-drift condition as sync's prompt length: the leader's
+             * token is authoritative, and the disagreement is worth a line. */
+            if (token != command.value) {
+                fprintf(stderr, "pulsar: tp: worker token %d differs from the leader's %d; "
+                                "mirroring the leader's\n", token, command.value);
+            }
+            rc = s->eval(command.value, err, errlen);
+        }
+    }
+    if (tp_mirror_worker_ack(s, tp, rc, err, errlen) != 0 && rc == 0) rc = 1;
+    pulsar_tp_command_free(&command);
+    return rc;
+}
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) { return s ? s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen) : 1; }
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) { return s ? s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows, max_head_runs, err, errlen) : 1; }
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }

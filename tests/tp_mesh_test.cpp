@@ -397,6 +397,77 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The two frames a mirrored session actually rides: SYNC (a token array)
+     * and EVAL (decode position + token).  The round above proves the
+     * broadcast/collect shape with a value frame; these are the encodings the
+     * engine's sync/eval emit, so a mis-serialized token count or a position
+     * that does not survive the wire shows up here instead of as a silently
+     * wrong decode on a pair.  The worker's ack is sent after EACH frame: the
+     * leader reads one ack per peer per frame, and an extra or missing ack
+     * would shift every later frame by one. */
+    {
+        const uint64_t sid = 0xC0DE2000ULL;
+        enum { MIRROR_TOKENS = 16 };
+        int tokens[MIRROR_TOKENS];
+        for (int i = 0; i < MIRROR_TOKENS; i++) tokens[i] = 1000 + i;
+        const uint64_t seq = 4242;
+        const int eval_token = 987654;
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_sync(tp, sid, tokens, (uint32_t)MIRROR_TOKENS),
+                  "rank 0 mirrored sync send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", cerr, sizeof(cerr)),
+                  "rank 0 mirrored sync ack over %d peers: %s", n - 1, cerr);
+            CHECK(pulsar_tp_send_eval(tp, sid, seq, eval_token),
+                  "rank 0 mirrored eval send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "eval", cerr, sizeof(cerr)),
+                  "rank 0 mirrored eval ack over %d peers: %s", n - 1, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored sync recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC && cmd.session_id == sid,
+                      "rank %d got frame type %d session %llu, expected SYNC (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_SYNC, (unsigned long long)sid);
+                CHECK(cmd.n_tokens == (uint32_t)MIRROR_TOKENS,
+                      "rank %d mirrored sync carried %u tokens, expected %d",
+                      rank, cmd.n_tokens, (int)MIRROR_TOKENS);
+                int tok_bad = 0;
+                if (cmd.tokens) {
+                    for (int i = 0; i < MIRROR_TOKENS; i++) {
+                        if (cmd.tokens[i] != tokens[i]) tok_bad++;
+                    }
+                }
+                CHECK(cmd.tokens && tok_bad == 0,
+                      "rank %d mirrored sync token array differs (%d of %d)",
+                      rank, tok_bad, (int)MIRROR_TOKENS);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
+                      "rank %d mirrored sync ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored eval recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_EVAL && cmd.session_id == sid,
+                      "rank %d got frame type %d session %llu, expected EVAL (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_EVAL, (unsigned long long)sid);
+                CHECK(cmd.seq == seq,
+                      "rank %d mirrored eval position %llu, expected %llu",
+                      rank, (unsigned long long)cmd.seq, (unsigned long long)seq);
+                CHECK(cmd.value == eval_token,
+                      "rank %d mirrored eval token %d, expected %d",
+                      rank, cmd.value, eval_token);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
+                      "rank %d mirrored eval ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
