@@ -588,6 +588,62 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The mixed step rides the SAME row payload on a different frame type.  The
+     * point of asserting the type here is that the type is the operation's
+     * identity: decode_mixed and decode_multiseq are byte-identical for a
+     * decode-only batch, so if this frame arrived as EVAL_BATCH the worker would
+     * have no way to know the leader was in a different operation. */
+    {
+        const uint64_t sid = 0xC0DE5000ULL;
+        enum { MIXED_ROWS = 2 };
+        pulsar_tp_batch_item items[MIXED_ROWS];
+        for (int i = 0; i < MIXED_ROWS; i++) {
+            items[i].session_id = sid;
+            items[i].bank = 4;
+            items[i].pos = (int32_t)(900 + i);
+            items[i].token = 80000 + i;
+            items[i].reserved = 0;
+        }
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_mixed_batch(tp, items, MIXED_ROWS) != 0,
+                  "rank 0 mirrored mixed send must report success as nonzero");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed batch", cerr, sizeof(cerr)),
+                  "rank 0 mirrored mixed ack over %d peers: %s", n - 1, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored mixed recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_MIXED_BATCH,
+                      "rank %d got frame type %d, expected MIXED_BATCH (%d) -- the frame "
+                      "type IS the operation's identity",
+                      rank, (int)cmd.type, (int)PULSAR_TP_FRAME_MIXED_BATCH);
+                CHECK(cmd.n_items == (uint32_t)MIXED_ROWS,
+                      "rank %d mirrored mixed carried %u rows, expected %d",
+                      rank, cmd.n_items, (int)MIXED_ROWS);
+                int row_bad = 0;
+                if (cmd.items) {
+                    for (int i = 0; i < MIXED_ROWS; i++) {
+                        if (cmd.items[i].session_id != sid ||
+                            cmd.items[i].bank != items[i].bank ||
+                            cmd.items[i].pos != items[i].pos ||
+                            cmd.items[i].token != items[i].token) {
+                            row_bad++;
+                        }
+                    }
+                }
+                CHECK(cmd.items && row_bad == 0,
+                      "rank %d mirrored mixed rows differ (%d of %d)",
+                      rank, row_bad, (int)MIXED_ROWS);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
+                      "rank %d mirrored mixed ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

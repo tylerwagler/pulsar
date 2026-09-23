@@ -193,8 +193,21 @@ pair, because its own arguments are never read.
   **Not covered:** the wrapper's row *reconstruction* runs only after the frame
   checks pass, which on a fabricated session would reach the graph -- so it
   needs two Sparks like the rest of the success path.
-- **Still open:** `decode_mixed` (its `FRAME_MIXED_BATCH` is now the only
-  remaining frame with no user), banks, warm-fork, spec.
+- Increment 5 (round 7) mirrors **`pulsar_session_decode_mixed`** on
+  `FRAME_MIXED_BATCH`, which leaves no frame without a user.  It rides the SAME
+  row payload as the batch frame on a DIFFERENT frame type, and the type is the
+  point: `decode_mixed` and `decode_multiseq` are byte-identical for a
+  decode-only batch, so the type is the only thing that tells the worker which
+  contract the leader is in -- mutating the sender to use the batch type fails
+  the mesh round with "the frame type IS the operation's identity".
+  Its payload was redefined to rows-only in the same pass: upstream's mixed
+  frame carried a separate prefill prompt (`prefill_session_id` + token array),
+  but OUR `decode_mixed` takes its prompt as rows in the same
+  `pulsar_multiseq_req` list (a K-row run for one bank), so there was nothing
+  else to send.  `out_n_rows` and `max_head_runs` stay local: both are the
+  caller's own output and head policy, and both ranks run the same kernel over
+  the same rows, so the run count agrees by construction.
+- **Still open:** banks, warm-fork, spec.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

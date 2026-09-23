@@ -297,8 +297,17 @@ int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos);
 int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id);
 int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
                               uint32_t count);
-int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
-                               const int *prompt, uint32_t prompt_count,
+/** The SAME row payload as pulsar_tp_send_eval_batch, on a distinct frame type.
+ * The two frames exist so the worker can prove which engine operation the leader
+ * is in: `decode_mixed` and `decode_multiseq` are byte-identical for a
+ * decode-only batch, so a driver that diverged between them would otherwise
+ * decode the same rows through a different contract in silence.  The payload
+ * was redefined to rows-only along with the batch item: it used to carry a
+ * separate prefill prompt (`prefill_session_id` + token array), which came from
+ * upstream's mixed step -- OUR decode_mixed takes its prompt as rows in the same
+ * `pulsar_multiseq_req` list (a K-row run for one bank), so there is nothing
+ * else to send.  The header's shape was fixed while it still had no user. */
+int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);

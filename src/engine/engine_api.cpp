@@ -673,7 +673,70 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
     pulsar_tp_command_free(&command);
     return rc;
 }
-int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) { return s ? s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows, max_head_runs, err, errlen) : 1; }
+int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) {
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows,
+                                    max_head_runs, err, errlen);
+    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
+    if (pulsar_tp_rank(tp) == 0) {
+        if (!reqs || n_rows == 0) {
+            if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
+            return 1;
+        }
+        pulsar_tp_batch_item *items =
+            (pulsar_tp_batch_item *)xmalloc((size_t)n_rows * sizeof(*items));
+        for (uint32_t i = 0; i < n_rows; i++) {
+            items[i].session_id = s->tp_session_id;
+            items[i].bank       = (int32_t)reqs[i].bank;
+            items[i].pos        = reqs[i].pos;
+            items[i].token      = reqs[i].token;
+            items[i].reserved   = 0;
+        }
+        const int sent = pulsar_tp_send_mixed_batch(tp, items, n_rows);
+        free(items);
+        if (sent == 0) {
+            if (err) snprintf(err, errlen, "tp: could not mirror the mixed batch to the workers");
+            return 1;
+        }
+        return tp_mirror_leader_ack(s, tp, "mixed batch",
+                                    s->decode_mixed(reqs, n_rows, logits, logits_cap,
+                                                    out_n_rows, max_head_runs,
+                                                    err, errlen),
+                                    err, errlen);
+    }
+    /* Worker: the leader's rows are the batch.  `out_n_rows` and
+     * `max_head_runs` stay LOCAL -- they are this caller's own output and its
+     * own head policy, and both ranks run the same kernel over the same rows,
+     * so the run count agrees by construction.  Only the rows cross the wire. */
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
+    int rc = 1;
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_MIXED_BATCH, "mixed batch",
+                               err, errlen) == 0) {
+        if (command.n_items != n_rows) {
+            if (err) snprintf(err, errlen,
+                              "tp: the leader mirrored %u rows but this rank is decoding %u; "
+                              "the ranks' drivers diverged on the batch shape",
+                              command.n_items, n_rows);
+        } else {
+            pulsar_multiseq_req *rows =
+                (pulsar_multiseq_req *)xmalloc((size_t)n_rows * sizeof(*rows));
+            for (uint32_t i = 0; i < n_rows; i++) {
+                rows[i].bank  = (uint32_t)command.items[i].bank;
+                rows[i].pos   = command.items[i].pos;
+                rows[i].token = command.items[i].token;
+            }
+            rc = s->decode_mixed(rows, n_rows, logits, logits_cap, out_n_rows,
+                                 max_head_runs, err, errlen);
+            free(rows);
+        }
+    }
+    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
+    pulsar_tp_command_free(&command);
+    return rc;
+}
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
 int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) { return s ? s->bank_repoint(bank) : 1; }
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) { if (s) s->bank_state_save(bank); }

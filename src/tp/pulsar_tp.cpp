@@ -2640,12 +2640,6 @@ typedef struct {
 } pulsar_tp_batch_command_header;
 
 typedef struct {
-    uint64_t prefill_session_id;
-    uint32_t prompt_count;
-    uint32_t item_count;
-} pulsar_tp_mixed_command_header;
-
-typedef struct {
     uint64_t session_id;
     int32_t status;
     uint32_t reserved;
@@ -2719,8 +2713,12 @@ int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id) {
                          &session_id, sizeof(session_id));
 }
 
-int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
-                              uint32_t count) {
+/** One row-batch frame, two operations.  The frame TYPE is what tells the
+ * worker which engine operation the leader is in (decode_multiseq vs
+ * decode_mixed); without it a driver that diverged between the two would
+ * decode the same rows through a different contract and say nothing. */
+static int tp_send_batch(pulsar_tp *tp, uint32_t frame_type,
+                         const pulsar_tp_batch_item *items, uint32_t count) {
     const uint64_t bytes64 = sizeof(pulsar_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
     if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
@@ -2730,38 +2728,20 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
     pulsar_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL_BATCH,
-                                 payload, bytes);
+    const int ok = tp_send_frame_to_peers(tp, frame_type, payload, bytes);
     free(payload);
     return ok;
 }
 
-int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
-                               const int *prompt, uint32_t prompt_count,
+int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
+                              uint32_t count) {
+    return tp_send_batch(tp, PULSAR_TP_FRAME_EVAL_BATCH, items, count);
+}
+
+int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count) {
-    const uint64_t prompt_bytes = (uint64_t)prompt_count * sizeof(int32_t);
-    const uint64_t item_bytes = (uint64_t)count * sizeof(*items);
-    const uint64_t bytes64 = sizeof(pulsar_tp_mixed_command_header) +
-                             prompt_bytes + item_bytes;
-    if (!tp || !prompt || prompt_count == 0 || !items || count == 0 ||
-        bytes64 > UINT32_MAX) return 0;
-    const uint32_t bytes = (uint32_t)bytes64;
-    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
-    if (!payload) return 0;
-    pulsar_tp_mixed_command_header h = {
-        prefill_session_id, prompt_count, count
-    };
-    memcpy(payload, &h, sizeof(h));
-    int32_t *wire_tokens = reinterpret_cast<int32_t *>(payload + sizeof(h));
-    for (uint32_t i = 0; i < prompt_count; i++) {
-        wire_tokens[i] = (int32_t)prompt[i];
-    }
-    memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_MIXED_BATCH,
-                                 payload, bytes);
-    free(payload);
-    return ok;
+    return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count);
 }
 
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
@@ -2890,7 +2870,8 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->value = msg.token;
         break;
     }
-    case PULSAR_TP_FRAME_EVAL_BATCH: {
+    case PULSAR_TP_FRAME_EVAL_BATCH:
+    case PULSAR_TP_FRAME_MIXED_BATCH: {
         pulsar_tp_batch_command_header h;
         if (bytes < sizeof(h)) { ok = 0; break; }
         memcpy(&h, payload, sizeof(h));
@@ -2903,36 +2884,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         memcpy(command->items, payload + sizeof(h),
                (size_t)h.count * sizeof(*command->items));
         command->n_items = h.count;
-        break;
-    }
-    case PULSAR_TP_FRAME_MIXED_BATCH: {
-        pulsar_tp_mixed_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        const uint64_t token_bytes =
-            (uint64_t)h.prompt_count * sizeof(int32_t);
-        const uint64_t item_bytes =
-            (uint64_t)h.item_count * sizeof(pulsar_tp_batch_item);
-        const uint64_t want = sizeof(h) + token_bytes + item_bytes;
-        if (h.prompt_count == 0 || h.item_count == 0 || want != bytes) {
-            ok = 0;
-            break;
-        }
-        command->tokens = static_cast<int *>(malloc(
-            (size_t)h.prompt_count * sizeof(*command->tokens)));
-        command->items = static_cast<pulsar_tp_batch_item *>(malloc(
-            (size_t)h.item_count * sizeof(*command->items)));
-        if (!command->tokens || !command->items) { ok = -1; break; }
-        const int32_t *wire_tokens =
-            reinterpret_cast<const int32_t *>(payload + sizeof(h));
-        for (uint32_t i = 0; i < h.prompt_count; i++) {
-            command->tokens[i] = wire_tokens[i];
-        }
-        memcpy(command->items, payload + sizeof(h) + token_bytes,
-               (size_t)item_bytes);
-        command->session_id = h.prefill_session_id;
-        command->n_tokens = h.prompt_count;
-        command->n_items = h.item_count;
         break;
     }
     case PULSAR_TP_FRAME_STOP:

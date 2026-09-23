@@ -169,7 +169,29 @@ static int run_leader(pulsar_tp *tp) {
               "the batch refusal must name the operation: %s", err);
     }
 
-    /* D. A leader whose transport is already dead refuses before it sends
+    /* E. The mixed step, on its own frame type.  Same divergence, but this also
+     * pins WHICH frame the wrapper expects: decode_mixed and decode_multiseq
+     * take identical rows, so the type is the only thing that says which
+     * contract the leader is in. */
+    {
+        pulsar_tp_batch_item items[2];
+        for (int i = 0; i < 2; i++) {
+            items[i].session_id = LEADER_SID;
+            items[i].bank = 4;
+            items[i].pos = 900 + i;
+            items[i].token = 80000 + i;
+            items[i].reserved = 0;
+        }
+        CHECK(pulsar_tp_send_mixed_batch(tp, items, 2) != 0,
+              "send_mixed_batch must report success as nonzero");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "mixed batch", err, sizeof(err)),
+              "the leader must see the worker's mixed-batch refusal");
+        CHECK(std::strstr(err, "mixed batch failed") != NULL,
+              "the mixed refusal must name the operation: %s", err);
+    }
+
+    /* F. A leader whose transport is already dead refuses before it sends
      * anything -- no frame, no graph, no half-mirrored operation.  Last,
      * because marking the pair failed poisons the transport for good. */
     pulsar_tp_mark_failed(tp);
@@ -227,6 +249,24 @@ static int run_worker(pulsar_tp *tp) {
         CHECK(rc == 1, "the worker must refuse a batch for another session, got rc=%d", rc);
         CHECK(std::strstr(err, "diverged") != NULL,
               "the batch refusal must name the divergence: %s", err);
+    }
+    free_session(s);
+
+    /* E. The mixed step: a fresh session on the mismatched id again, so the
+     * frame's session id is what stops it. */
+    s = fabricate_session(tp, WORKER_SID);
+    {
+        pulsar_multiseq_req rows[2];
+        rows[0].bank = 4; rows[0].pos = 900; rows[0].token = 80000;
+        rows[1].bank = 4; rows[1].pos = 901; rows[1].token = 80001;
+        float logits[8] = { 0 };
+        uint32_t out_rows = 0;
+        err[0] = 0;
+        rc = pulsar_session_decode_mixed(s, rows, 2, logits, 8, &out_rows,
+                                         PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
+        CHECK(rc == 1, "the worker must refuse a mixed batch for another session, got rc=%d", rc);
+        CHECK(std::strstr(err, "diverged") != NULL,
+              "the mixed refusal must name the divergence: %s", err);
     }
     free_session(s);
     return g_failures;
