@@ -123,11 +123,25 @@ pair, because its own arguments are never read.
   holds), so the worker does more than trust the leader's token: it refuses when
   the two ranks are not at the same position.  That is the one corruption the
   mirror alone cannot catch -- the right token decoded at the wrong place.
-- **Session create is deliberately not mirrored.**  A worker cannot check the
-  leader's create frame until it reaches the same create, and blocking there
-  would turn a driver divergence -- the case the create ordinal exists to catch
-  -- into a hang instead of the clean refusal the first mirrored operation
-  already gives.
+- **Session create IS mirrored (round 12), and that closes the objective's
+  five.**  It was refused for three rounds: a worker blocking in create-recv
+  would, so the argument went, turn a driver divergence into a hang.  The
+  control-plane deadline (below) removed the premise -- the divergence is now a
+  bounded refusal -- so the operational argument for the deviation was gone and
+  the deviation went with it.
+  The design is the ordinal plus a check: both ranks already agree on the id by
+  construction, and the frame makes the leader ANNOUNCE the id and context size
+  it actually created, so a worker whose create produced something else refuses
+  at the earliest possible point instead of at the first mirrored operation.  A
+  different context size is a refusal, not a warning: the raw cap, every scratch
+  buffer and the KV layout are sized from it.  The worker acks its refusal
+  immediately rather than letting the leader wait out its deadline, and a
+  refused create frees the session on BOTH ranks and leaves `*out` NULL -- a
+  session the pair did not agree on must not reach a caller.
+  **Coverage:** the transport half is the mesh test's two SESSION_CREATE+ack
+  rounds.  The engine half is not testable on one box: it needs a real engine to
+  reach `pulsar_session::create`, so the refusal branches and the announce/ack
+  wiring are compile- and review-verified only, like the other success paths.
 - `tests/tp_mesh_test.cpp` now rides the two frames a mirrored session actually
   uses (a 16-token SYNC array, then an EVAL position+token), with one ack per
   frame per peer, at n=2..5 over real RDMA.  Its gating is mutation-proven: a

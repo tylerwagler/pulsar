@@ -245,7 +245,6 @@ void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { 
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
 
-int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) { return pulsar_session::create(out, e, ctx_size); }
 void pulsar_session_free(pulsar_session *s) { if (s) s->destroy(); }
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
@@ -467,6 +466,92 @@ int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng) {
     pulsar_tp_command_free(&command);
     return rc;
 }
+int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    const int rc = pulsar_session::create(out, e, ctx_size);
+    if (rc != 0 || !out || !*out) return rc;
+    pulsar_session *s = *out;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return 0;
+    /* Slice 4e: session create IS mirrored -- the last of the objective's five
+     * operations, and the one that was refused for three rounds on the grounds
+     * that a worker blocking here would deadlock a pair whose admission
+     * decisions differ.  The control-plane deadline removed that objection: the
+     * same divergence is now a bounded refusal instead of a hang.
+     *
+     * The session's mirror id is its create ordinal, so both ranks already agree
+     * on it by construction; what the frame adds is the CHECK -- the leader
+     * announces the id and the context size it actually created, and a worker
+     * whose own create produced something else refuses HERE, at the earliest
+     * point, instead of at the first mirrored operation.  This function has no
+     * error buffer, so the reason goes to stderr and the return code carries it,
+     * the same shape as the engine failures it sits beside.
+     *
+     * A refused create frees the session on BOTH ranks and leaves *out NULL:
+     * a session the pair did not agree on must not reach a caller, and each rank
+     * can only clean up its own. */
+    char err[256];
+    err[0] = '\0';
+    if (pulsar_tp_rank(tp) == 0) {
+        if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size) == 0) {
+            tp_mirror_fail_void(tp, "session create", "the frame could not be shipped");
+            fprintf(stderr, "pulsar: tp: could not mirror the session create\n");
+            pulsar_session_free(s);
+            *out = NULL;
+            return 1;
+        }
+        if (!pulsar_tp_wait_command_ack(tp, s->tp_session_id, "session create",
+                                        err, sizeof(err))) {
+            fprintf(stderr, "pulsar: tp: %s\n", err);
+            pulsar_session_free(s);
+            *out = NULL;
+            return 1;
+        }
+        return 0;
+    }
+    /* Worker: the leader's id and context size are the authority. */
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
+        tp_mirror_fail_void(tp, "session create", err);
+        fprintf(stderr, "pulsar: tp: %s\n", err);
+        pulsar_session_free(s);
+        *out = NULL;
+        return 1;
+    }
+    int refused = 1;
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_SESSION_CREATE,
+                               "session create", err, sizeof(err)) == 0) {
+        if (command.value != ctx_size) {
+            /* A different context size is not a cosmetic disagreement: the raw
+             * cap, every scratch buffer and the KV layout are sized from it. */
+            snprintf(err, sizeof(err),
+                     "tp: the leader created this session with ctx %d but this rank "
+                     "created ctx %d; the ranks' drivers diverged",
+                     command.value, ctx_size);
+            tp_mirror_fail_void(tp, "session create", err);
+            fprintf(stderr, "pulsar: %s\n", err);
+        } else {
+            refused = 0;
+        }
+    } else {
+        tp_mirror_fail_void(tp, "session create", err);
+        fprintf(stderr, "pulsar: %s\n", err);
+    }
+    /* Ack either way: a refusal that sat out the leader's deadline would cost the
+     * pair seconds to learn what it could learn at once. */
+    if (tp_mirror_worker_ack(tp, command.session_id, refused, err, sizeof(err)) != 0 &&
+        refused == 0) {
+        refused = 1;
+    }
+    pulsar_tp_command_free(&command);
+    if (refused != 0) {
+        pulsar_session_free(s);
+        *out = NULL;
+        return 1;
+    }
+    return 0;
+}
+
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }
