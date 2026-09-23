@@ -828,7 +828,9 @@ bool gpu_graph_encode_output_head(
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row,
-        uint64_t               vocab_dim) {
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     pulsar_decode_rows_scope rows(1u);
     if (!rows.ok()) return false;
@@ -836,7 +838,7 @@ bool gpu_graph_encode_output_head(
     pulsar_gpu_tensor *row_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
                                                         (uint64_t)row * PULSAR_N_HC * sizeof(float),
                                                         (uint64_t)PULSAR_N_HC * sizeof(float));
-    bool ok = row_hc && row_pre;
+    bool ok = row_hc && row_pre && out;
     /* The collapse is SHARED; only the coefficient source differs.  0731 binds
      * output_hc_* and computes its own; V4.1 binds none and collapses with the
      * pre its last FFN handed on.  The bind is the fact -- a 0731 artifact
@@ -906,22 +908,38 @@ bool gpu_graph_encode_output_head(
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
     if (ok && hn_b) pulsar_gpu_bf16_act_note(g->output_norm, 1, PULSAR_N_EMBD);
+    /* Slice 4d: a vocab RANGE [vocab_lo, vocab_lo+vocab_dim) of the head.  The
+     * weight is stored [vocab, in_dim] row-major (the container's dims_ne is
+     * [4096, 129280], HF [129280, 4096]), so a vocab range IS a contiguous ROW
+     * range: the offset advances by whole rows and the block stays packed --
+     * exactly what pulsar_gpu_matmul_bf16_tensor's out_dim*in_dim byte check
+     * expects.  Only the bf16 head slices this way: the MXFP8_LT layout keeps
+     * its swizzled E8M0 scale plane beside the payload, so a row slice would
+     * mis-address the scales.  That arm refuses until its own slice lands. */
+    const uint64_t head_esz = head_mx ? 1u : sizeof(uint16_t);
+    if (ok && head_mx && vocab_lo != 0) {
+        fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
+                        "(vocab_lo=%u) -- refusing\n", vocab_lo);
+        ok = false;
+    }
+    const uint64_t head_off = weights->output->abs_offset +
+                              (uint64_t)vocab_lo * PULSAR_N_EMBD * head_esz;
     if (ok) {
         if (!head_mx) {
-            ok = pulsar_gpu_matmul_bf16_tensor(g->logits, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
+            ok = pulsar_gpu_matmul_bf16_tensor(out, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
+                                            head_off, PULSAR_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
         } else {
             pulsar_gpu_mxfp8_act_cache_arm(g->output_norm, 1, PULSAR_N_EMBD);
             pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-            ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
+            ok = pulsar_gpu_matmul_mxfp8_tensor(out, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
+                                            head_off, PULSAR_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
             pulsar_gpu_mxfp8_act_cache_disarm();
         }
     }
     if (ok) {
-        gpu_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, PULSAR_N_LAYER, 0);
+        gpu_graph_debug_dump_tensor("result_output", out, vocab_dim, PULSAR_N_LAYER, 0);
     }
     return ok;
 }
@@ -942,21 +960,32 @@ static bool gpu_graph_encode_output_head_batch_impl(
         const pulsar_weights     *weights,
         uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim);
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
 
 /* L119 segment bracket: the output head is round-invariant at fixed n_tokens
  * (2026-08-27 audit — norm/mix/weights/vocab GEMM take only n_tokens and
  * vocab_dim; no position, no frontier, no readback), so at decode widths it
  * is captured once per n_tokens and replayed. Distinct head row counts
- * (mixed-lane head_cap modes) key separately. */
+ * (mixed-lane head_cap modes) key separately.
+ *
+ * Slice 4d: the bracket is taken only for the FULL-vocab range.  A gate recv is
+ * a host-side wait (design rule 1) and cannot live inside a captured graph, and
+ * the recorded body also writes to whichever destination the capture ran with,
+ * so a sliced/TP head must run eager.  `vocab_lo == 0 && vocab_dim == N_VOCAB`
+ * is exactly the single-box range, so the capture key needs no new dimension. */
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim) {
-    if (row0 == 0u && n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
+    const bool full_range = vocab_lo == 0u && vocab_dim == (uint64_t)PULSAR_N_VOCAB;
+    if (full_range && row0 == 0u && n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
         /* L119: parity-keyed like the FFN bracket — the head reads the
          * sweep-final hidden buffer, whose identity alternates per sweep
          * (odd layer count x per-layer pointer swap). */
@@ -969,17 +998,18 @@ bool gpu_graph_encode_output_head_batch(
         if (st == 2) return true;
         if (st == 1) {
             const bool ok = gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, 0u, n_tokens, vocab_dim);
+                    g, model, weights, 0u, n_tokens, vocab_lo, vocab_dim, out);
             if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
             /* Capture failed (key now poisoned): the recorded work never ran,
              * and a mid-capture violation can fail an otherwise-good body —
              * run the body for real regardless of ok; a REAL body failure
              * simply fails again here and propagates. */
             return gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, 0u, n_tokens, vocab_dim);
+                    g, model, weights, 0u, n_tokens, vocab_lo, vocab_dim, out);
         }
     }
-    return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens, vocab_dim);
+    return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens,
+                                                   vocab_lo, vocab_dim, out);
 }
 
 static bool gpu_graph_encode_output_head_batch_impl(
@@ -988,8 +1018,10 @@ static bool gpu_graph_encode_output_head_batch_impl(
         const pulsar_weights     *weights,
         uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim) {
-    if (n_tokens == 0 || row0 > g->prefill_cap || n_tokens > g->prefill_cap - row0 ||
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
+    if (!out || n_tokens == 0 || row0 > g->prefill_cap || n_tokens > g->prefill_cap - row0 ||
         n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
@@ -1019,7 +1051,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
      * activations.  The FFN encode disarms at its exit; this is the second lock
      * on the same door, and it is free. */
     pulsar_gpu_mxfp8_act_cache_disarm();
-    logits = pulsar_gpu_tensor_view(g->spec_logits,
+    logits = pulsar_gpu_tensor_view(out,
                                    0,
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = rows_hc && rows_pre && output_embd && output_norm && logits;
@@ -1096,14 +1128,27 @@ static bool gpu_graph_encode_output_head_batch_impl(
         on_b,
         weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok && on_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
+    /* Slice 4d: same vocab-range rule as the single-row head -- the head weight
+     * is [vocab, in_dim] row-major, so a vocab range is a contiguous row range
+     * and the packed-block check still holds.  The MXFP8_LT arm refuses a slice
+     * (its scale plane is not row-addressable). */
+    const bool bh_mx = weights->output->type != PULSAR_TENSOR_BF16;
+    const uint64_t bh_esz = bh_mx ? 1u : sizeof(uint16_t);
+    if (ok && bh_mx && vocab_lo != 0) {
+        fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
+                        "(vocab_lo=%u) -- refusing\n", vocab_lo);
+        ok = false;
+    }
+    const uint64_t bh_off = weights->output->abs_offset +
+                            (uint64_t)vocab_lo * PULSAR_N_EMBD * bh_esz;
     if (ok) {
         if (weights->output->type == PULSAR_TENSOR_BF16)
             ok = pulsar_gpu_matmul_bf16_tensor(logits, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
+                                            bh_off, PULSAR_N_EMBD,
                                             vocab_dim, output_norm, n_tokens) != 0;
         else
             ok = pulsar_gpu_matmul_mxfp8_tensor(logits, tensor_map_base(model, weights->output), tensor_map_size(model, weights->output),
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
+                                            bh_off, PULSAR_N_EMBD,
                                             vocab_dim, output_norm, n_tokens) != 0;
     }
 

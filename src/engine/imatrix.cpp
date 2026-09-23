@@ -484,7 +484,7 @@ static bool gpu_graph_prefill_layer_major_inner(
          * its last FFN handed on, both by row */
         if (ok && logits) {
             ok = gpu_graph_encode_output_head(g, model, weights, (uint32_t)n_tokens - 1u,
-                                              weights->output->dim[1]);
+                                              0u, weights->output->dim[1], g->logits);
         }
 
         if (ok) ok = pulsar_gpu_end_commands() != 0;
@@ -584,7 +584,8 @@ static bool gpu_graph_prefill_layer_major_inner(
         for (uint32_t r0 = 0; ok && r0 < n_tokens; r0 += 16u) {
             const uint32_t nr = n_tokens - r0 < 16u ? n_tokens - r0 : 16u;
             ok = pulsar_gpu_begin_commands() != 0;
-            if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights, r0, nr, vocab_dim);
+            if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights, r0, nr,
+                                                            0u, vocab_dim, g->spec_logits);
             if (ok) ok = pulsar_gpu_distill_top64_tensor(g->spec_logits, nr,
                             (uint32_t)vocab_dim, g->distill_top_ids,
                             g->distill_top_vals, g->distill_tail_lse,
@@ -596,7 +597,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     if (ok && logits) ok = pulsar_gpu_begin_commands() != 0;
     if (ok && logits) ok = gpu_graph_encode_output_head(g, model, weights, (uint32_t)n_tokens - 1u,
-                                                        weights->output->dim[1]);
+                                                        0u, weights->output->dim[1], g->logits);
     if (ok && logits) ok = pulsar_gpu_end_commands() != 0;
     if (!ok) return false;
 
@@ -910,7 +911,9 @@ bool gpu_graph_verify_suffix_tops(
                                                       weights,
                                                       0u,
                                                       n_tokens,
-                                                      weights->output->dim[1]);
+                                                      0u,
+                                                      weights->output->dim[1],
+                                                      g->spec_logits);
     if (ok) {
         if (top_rows == 1) {
             /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
@@ -1128,7 +1131,8 @@ int gpu_graph_decode_multiseq_batch(
          * intermediate fused step (head_runs == n_dec < n_active) heads only the
          * decode banks and skips the whole prefill-head two-block. */
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        0u, head_runs, weights->output->dim[1]);
+                                                        0u, head_runs,
+                                                        0u, weights->output->dim[1], g->spec_logits);
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     } else {
         /* Prefill/mixed final: close the layer block so batch_cur_hc is final,
@@ -1152,7 +1156,8 @@ int gpu_graph_decode_multiseq_batch(
         }
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        0u, head_runs, weights->output->dim[1]);
+                                                        0u, head_runs,
+                                                        0u, weights->output->dim[1], g->spec_logits);
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     }
     /* Disarm + per-bank frontier self-check even when the sweep failed. The

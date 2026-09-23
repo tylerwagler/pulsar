@@ -3188,22 +3188,30 @@ uint32_t gpu_graph_prefill_slice(void);
 /** Comp-cache row stride in bytes for the active storage format (pack-aware). */
 /** The output head for ONE row of the sweep-final stream: batch_cur_hc row
  * `row` collapsed with batch_hc_pre row `row` (the last FFN's pre), normed,
- * projected into g->logits. */
+ * projected into `out`.  Slice 4d: the projection covers the vocab RANGE
+ * [vocab_lo, vocab_lo + vocab_dim); the single-box caller passes
+ * (0, N_VOCAB, g->logits), which is the whole head. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row,
-        uint64_t               vocab_dim);
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
 /** The output head for rows [row0, row0 + n_tokens) of the sweep-final stream
- * into g->spec_logits rows [0, n_tokens). */
+ * into `out` rows [0, n_tokens), covering the vocab range
+ * [vocab_lo, vocab_lo + vocab_dim).  The single-box caller passes
+ * (0, N_VOCAB, g->spec_logits). */
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim);
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,
         const pulsar_model          *dspark_model,
