@@ -233,6 +233,14 @@ uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials
 void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer);
 void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer);
 
+/* Is [ptr, ptr+bytes) wholly inside the registered slab?  This is the RDMA big
+ * gate's DIRECT test: when both payloads answer yes they are already registered
+ * and ride the QP with no copy through the staging regions; when either says no
+ * the payload is staged through those regions first.  ONE authority for that
+ * rule.  Exposed so the decision can be asserted on a single box (a real
+ * transport plus a real slab is enough) even though engaging it needs a pair. */
+bool pulsar_tp_in_slab(const pulsar_tp *tp, const void *ptr, uint64_t bytes);
+
 /* Register the slab base with the transport.  The engine allocates one
  * contiguous (GPU-visible on GB10) block and hands its base VA here; the
  * transport registers it with the NIC (RDMA) and exchanges remote keys, or

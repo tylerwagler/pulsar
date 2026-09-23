@@ -197,6 +197,52 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }   /* totals */
     }
 
+    /* Slice 4b-CUDA: the engine stages a <= PULSAR_TP_BATCH_MAX_ROWS gate
+     * payload in the slab's OWN batch region so the RDMA big gate rides DIRECT
+     * (no copy through the staging regions); a bigger prefill chunk keeps its
+     * own buffer and is staged instead.  WHICH branch is taken is pure pointer
+     * arithmetic, so it is assertable here on one box even though engaging the
+     * QP needs a pair -- this is the half of the claim hardware cannot hide
+     * behind.
+     *
+     * Note the predicate is SLAB-wide, not region-exact: it answers "is this
+     * registered", so a payload longer than one layer's region would still read
+     * as direct-able while overrunning into its neighbour's.  The engine's
+     * `n_tokens <= PULSAR_TP_BATCH_MAX_ROWS` guard is what keeps that safe, so
+     * the size the engine may pass is pinned here too. */
+    {
+        const uint64_t vec = pulsar_tp_vec_bytes(tp);
+        const uint64_t slab_sz =
+            pulsar_tp_slab_bytes(pulsar_tp_n_layer(tp), (uint32_t)(vec / sizeof(float)));
+        int missing = 0, outside = 0;
+        for (uint32_t il = 0; il < pulsar_tp_n_layer(tp); il++) {
+            const void *bo = pulsar_tp_slab_batch_out(tp, il);
+            const void *bi = pulsar_tp_slab_batch_in(tp, il);
+            if (!bo || !bi) { missing++; continue; }
+            if (!pulsar_tp_in_slab(tp, bo, PULSAR_TP_BATCH_MAX_ROWS * vec) ||
+                !pulsar_tp_in_slab(tp, bi, PULSAR_TP_BATCH_MAX_ROWS * vec))
+                outside++;
+        }
+        CHECK(missing == 0, "rank %d: slab batch region missing for %d layer(s)", rank, missing);
+        CHECK(outside == 0,
+              "rank %d: %d layer(s) stage OUTSIDE the slab -- they would NOT ride direct",
+              rank, outside);
+        /* A heap payload is what a prefill chunk passes: it must NOT read as
+         * in-slab, or the transport would hand the NIC an unregistered address. */
+        CHECK(!pulsar_tp_in_slab(tp, out, bytes),
+              "rank %d: a heap payload read as in-slab (prefill must stage)", rank);
+        CHECK(!pulsar_tp_in_slab(tp, (const void *)(uintptr_t)0x1000, 64),
+              "rank %d: an unrelated address read as in-slab", rank);
+        CHECK(!pulsar_tp_in_slab(tp, NULL, 0), "rank %d: NULL read as in-slab", rank);
+        /* Longer than the whole slab: the bound must hold, not just the base. */
+        CHECK(!pulsar_tp_in_slab(tp, pulsar_tp_slab_batch_out(tp, 0), slab_sz + 1),
+              "rank %d: a payload longer than the slab read as in-slab", rank);
+        /* A layer past n_layer has no region at all. */
+        CHECK(pulsar_tp_slab_batch_out(tp, pulsar_tp_n_layer(tp)) == NULL &&
+              pulsar_tp_slab_batch_in(tp, pulsar_tp_n_layer(tp)) == NULL,
+              "rank %d: a layer past n_layer returned a batch region", rank);
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

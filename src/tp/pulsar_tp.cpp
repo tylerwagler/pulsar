@@ -1360,16 +1360,13 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
     pulsar_tp_rdma *r = &tp->rdma;
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
 
-    /* Payloads already inside the registered slab (verify batches) can ride
-     * directly; ordinary prefill tensors use the idle verify regions as
-     * registered staging. */
-    const uintptr_t slab_lo = (uintptr_t)tp->slab;
-    const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+    /* Payloads already inside the registered slab (the engine's <=
+     * PULSAR_TP_BATCH_MAX_ROWS gate rows) ride DIRECT; ordinary prefill tensors
+     * use the idle verify regions as registered staging. */
     const uintptr_t out_lo = (uintptr_t)out;
     const uintptr_t in_lo = (uintptr_t)in;
-    const bool direct =
-        out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
-        in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
+    const bool direct = pulsar_tp_in_slab(tp, out, bytes) &&
+                        pulsar_tp_in_slab(tp, in, bytes);
     uint8_t *stage_send = tp->slab + tp->layout.batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->layout.batch_in_off;
     uint64_t off = 0;
@@ -2042,6 +2039,17 @@ void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer) {
 void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer) {
     if (!tp || !tp->slab || layer >= tp->n_layer) return NULL;
     return tp->slab + pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+}
+
+/* The RDMA big gate's DIRECT rule -- see pulsar_tp.h.  Boundary matches the
+ * arithmetic it replaced exactly: a pointer AT slab_hi is "inside" only for a
+ * zero-length payload. */
+bool pulsar_tp_in_slab(const pulsar_tp *tp, const void *ptr, uint64_t bytes) {
+    if (!tp || !tp->slab || !ptr) return false;
+    const uintptr_t lo = (uintptr_t)tp->slab;
+    const uintptr_t hi = lo + tp->slab_bytes;
+    const uintptr_t p = (uintptr_t)ptr;
+    return p >= lo && p <= hi && bytes <= (uint64_t)(hi - p);
 }
 bool pulsar_tp_failed(const pulsar_tp *tp) {
     return tp && tp->failed.load(std::memory_order_acquire);
