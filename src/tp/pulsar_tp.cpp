@@ -2784,6 +2784,95 @@ int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state)
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_RNG_STATE, &msg, sizeof(msg));
 }
 
+static int tp_send_bank_value(pulsar_tp *tp, uint32_t type, uint64_t session_id, uint32_t bank) {
+    pulsar_tp_value_command msg = { session_id, (int32_t)bank, 0 };
+    return tp_send_frame_to_peers(tp, type, &msg, sizeof(msg));
+}
+int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_SAVE, session_id, bank);
+}
+int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_RESTORE, session_id, bank);
+}
+int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, bank);
+}
+
+typedef struct {
+    uint64_t session_id;
+    int32_t src;
+    int32_t dst;
+    int32_t n_cached;
+    uint32_t count;      /* request tokens following the header */
+} pulsar_tp_fork_command_header;
+
+int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
+                             uint32_t src, uint32_t dst,
+                             const int *tokens, uint32_t n_tokens, int n_cached) {
+    const uint64_t bytes64 = sizeof(pulsar_tp_fork_command_header) + (uint64_t)n_tokens * sizeof(int32_t);
+    if (!tp || (n_tokens && !tokens) || bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    pulsar_tp_fork_command_header h = { session_id, (int32_t)src, (int32_t)dst, (int32_t)n_cached, n_tokens };
+    memcpy(payload, &h, sizeof(h));
+    int32_t *wire = reinterpret_cast<int32_t *>(payload + sizeof(h));
+    for (uint32_t i = 0; i < n_tokens; i++) wire[i] = (int32_t)tokens[i];
+    const int ok = tp_send_frame_to_peers(tp,
+            partial ? PULSAR_TP_FRAME_BANK_FORK_PARTIAL : PULSAR_TP_FRAME_BANK_FORK, payload, bytes);
+    free(payload);
+    return ok;
+}
+
+int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
+                                  const char *operation, int *status,
+                                  char *err, size_t errlen) {
+    if (!tp || tp->n_peers < 1 || !status) return 0;
+    const double deadline = tp_control_deadline(tp);
+    int agreed = 0, have = 0, bad = 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        const int pfd = tp->peers[i].control_fd;
+        uint32_t type = 0, bytes = 0;
+        pulsar_tp_command_ack ack;
+        if (pfd < 0 || (deadline > 0.0 && !tp_wait_readable(pfd, deadline))) {
+            pulsar_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: rank %d did not answer %s within %llu s -- the ranks are not in "
+                       "lockstep or the peer is wedged",
+                       tp->peers[i].rank, operation ? operation : "the command",
+                       (unsigned long long)tp->timeout_sec);
+            return 0;
+        }
+        if (!tp_read_frame_header(pfd, &type, &bytes) ||
+            type != PULSAR_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+            !tp_read_full(pfd, &ack, sizeof(ack))) {
+            pulsar_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: rank %d failed during %s",
+                       tp->peers[i].rank, operation ? operation : "command");
+            return 0;
+        }
+        /* Every peer's ack is read even after a refusal or a disagreement, so
+         * no ack is left in a socket to shift the next frame. */
+        if (bad) continue;
+        if (ack.session_id != session_id || ack.status < 0) {
+            bad = 1;
+            tp_set_err(err, errlen, "tp: rank %d refused %s (session %llu, status %d)",
+                       tp->peers[i].rank, operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+        } else if (have && ack.status != agreed) {
+            bad = 1;
+            tp_set_err(err, errlen, "tp: %s verdict SPLIT: an earlier rank said %d, rank %d says %d",
+                       operation ? operation : "command", agreed, tp->peers[i].rank, (int)ack.status);
+        } else {
+            agreed = ack.status;
+            have = 1;
+        }
+    }
+    if (bad) return 0;
+    *status = agreed;
+    return 1;
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -2916,6 +3005,29 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     case PULSAR_TP_FRAME_VERIFY:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
         break;
+    case PULSAR_TP_FRAME_BANK_FORK:
+    case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
+        pulsar_tp_fork_command_header h;
+        if (bytes < sizeof(h)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        const uint64_t want = sizeof(h) + (uint64_t)h.count * sizeof(int32_t);
+        if (want != bytes) { ok = 0; break; }
+        command->session_id = h.session_id;
+        command->bank_src = h.src;
+        command->bank_dst = h.dst;
+        command->n_cached = h.n_cached;
+        if (h.count) {
+            command->tokens = static_cast<int *>(malloc((size_t)h.count * sizeof(int)));
+            if (!command->tokens) { ok = -1; break; }
+            const int32_t *wire = reinterpret_cast<const int32_t *>(payload + sizeof(h));
+            for (uint32_t i = 0; i < h.count; i++) command->tokens[i] = wire[i];
+        }
+        command->n_tokens = h.count;
+        break;
+    }
+    case PULSAR_TP_FRAME_BANK_STATE_SAVE:
+    case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
+    case PULSAR_TP_FRAME_BANK_REPOINT:
     case PULSAR_TP_FRAME_SESSION_CREATE:
     case PULSAR_TP_FRAME_REWIND: {
         pulsar_tp_value_command msg;

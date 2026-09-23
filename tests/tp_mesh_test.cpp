@@ -697,6 +697,106 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Increment 2: the bank frames and the VERDICT collector.  Four rounds:
+     * a void save followed by an acked restore (a stray ack from the save
+     * would be read by the restore's collect and fail it); a partial fork
+     * whose workers all answer the same nonzero verdict (a fork refusal code
+     * is a result, not a failure); a SPLIT verdict at n>=3 that the collector
+     * must refuse while still draining every peer's ack; and a negative
+     * status, which is a worker's refusal, never a verdict. */
+    {
+        const uint64_t sid = 0xC0DE7000ULL;
+        char cerr[256];
+        cerr[0] = 0;
+        int status = -99;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_bank_state_save(tp, sid, 2u) != 0, "rank 0 bank save send failed");
+            CHECK(pulsar_tp_send_bank_state_restore(tp, sid, 2u) != 0, "rank 0 bank restore send failed");
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "bank state restore", &status, cerr, sizeof(cerr)) &&
+                  status == 0,
+                  "rank 0 restore verdict: want agreed 0, got rc/status %d (%s)", status, cerr);
+            const int toks[6] = { 5, 6, 7, 8, 9, 10 };
+            CHECK(pulsar_tp_send_bank_fork(tp, 1, sid, 3u, 4u, toks, 6u, 5) != 0, "rank 0 fork send failed");
+            status = -99;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "partial bank fork", &status, cerr, sizeof(cerr)) &&
+                  status == 3,
+                  "rank 0 fork verdict: want agreed 3, got %d (%s)", status, cerr);
+            /* split verdict (n>=3 only: with one worker there is nobody to disagree) */
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, 1u) != 0, "rank 0 repoint send failed");
+            status = -99;
+            cerr[0] = 0;
+            const int rc = pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr));
+            if (n >= 3) {
+                CHECK(rc == 0 && std::strstr(cerr, "SPLIT") != NULL,
+                      "rank 0: a split repoint verdict must be refused by name, got rc=%d status=%d (%s)",
+                      rc, status, cerr);
+            } else {
+                CHECK(rc == 1 && status == 0, "rank 0: n=2 repoint verdict 0, got rc=%d status=%d (%s)", rc, status, cerr);
+            }
+            /* a negative status is a refusal */
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, 9u) != 0, "rank 0 repoint(9) send failed");
+            status = -99;
+            cerr[0] = 0;
+            CHECK(!pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr)) &&
+                  std::strstr(cerr, "refused") != NULL,
+                  "rank 0: a negative status must read as a refusal (%s)", cerr);
+            /* every ack was drained: an ordinary acked round still lines up */
+            const int t2[2] = { 1, 2 };
+            CHECK(pulsar_tp_send_sync(tp, sid + 1, t2, 2) != 0, "rank 0 post-bank sync send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid + 1, "post-bank sync", cerr, sizeof(cerr)),
+                  "rank 0: acks were left in a socket after the bank rounds: %s", cerr);
+        } else {
+            pulsar_tp_command cmd;
+            /* save: void, apply silently */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d bank save recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_STATE_SAVE && cmd.session_id == sid && cmd.value == 2,
+                      "rank %d save frame: type %d session %llu bank %d", rank, (int)cmd.type,
+                      (unsigned long long)cmd.session_id, cmd.value);
+                pulsar_tp_command_free(&cmd);
+            }
+            /* restore: verdict 0 */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d restore recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_STATE_RESTORE && cmd.value == 2, "rank %d restore frame", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d restore ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            /* partial fork: fields + tokens survive the wire; verdict 3 */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d fork recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_FORK_PARTIAL && cmd.session_id == sid &&
+                      cmd.bank_src == 3 && cmd.bank_dst == 4 && cmd.n_cached == 5 && cmd.n_tokens == 6 &&
+                      cmd.tokens && cmd.tokens[0] == 5 && cmd.tokens[5] == 10,
+                      "rank %d fork frame fields: src %d dst %d n_cached %d n_tokens %u",
+                      rank, cmd.bank_src, cmd.bank_dst, cmd.n_cached, cmd.n_tokens);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 3), "rank %d fork ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            /* repoint(1): rank 1 says 0, every other worker says 1 -> split at n>=3 */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d repoint recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_REPOINT && cmd.value == 1, "rank %d repoint frame", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, rank == 1 ? 0 : 1), "rank %d repoint ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            /* repoint(9): a refusal (negative) from every worker */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d repoint(9) recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_REPOINT && cmd.value == 9, "rank %d repoint(9) frame", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, -1), "rank %d repoint(9) ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            /* the ordinary acked round after them */
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d post-bank sync recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC && cmd.session_id == sid + 1, "rank %d post-bank sync frame", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid + 1, 0), "rank %d post-bank sync ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
@@ -753,7 +853,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank verdicts, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

@@ -256,9 +256,9 @@ uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) 
 int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) { return s ? s->bank_kv_save(bank, fp, err, errlen) : 1; }
 int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) { return s ? s->bank_kv_load(bank, fp, err, errlen) : 1; }
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { return s->quantum_growth_bytes_per_bank(q); }
-int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) { return s ? s->bank_fork(src, dst, tokens, n_tokens, n_cached) : 1; }
+/* The bank wrappers are defined with the mirror below (increment 2). */
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
-int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) { return s ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL; }
+
 int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
 
 /* ---------------------------------------------------------------------------
@@ -609,9 +609,106 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
                                 err, errlen);
 }
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
-int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) { return s ? s->bank_repoint(bank) : 1; }
-void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) { if (s) s->bank_state_save(bank); }
-bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) { return s ? s->bank_state_restore(bank) : false; }
+/* ---- The bank surface (increment 2).  Bank SELECTION already rode the
+ * decode rows; these mirror the leader scheduler's bank DECISIONS -- save,
+ * restore, repoint, fork, partial fork -- so both ranks' pools hold the same
+ * state.  The leader's decision is the authority and the ordinal names the
+ * target.  save is void and fire-and-forget; the others return a verdict the
+ * ranks must AGREE on: the same inputs on the same state give the same
+ * result, so a split verdict is a divergence (marked failed, refused), not a
+ * vote. */
+static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *operation,
+                                  int own, int divergence_rc) {
+    char err[256];
+    err[0] = '\0';
+    int peers = 0;
+    if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, operation, &peers, err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, operation, err);
+        return divergence_rc;
+    }
+    if (peers != own) {
+        snprintf(err, sizeof(err), "this rank's verdict is %d but the workers agree on %d", own, peers);
+        pulsar_tp_mirror_fail_void(tp, operation, err);
+        return divergence_rc;
+    }
+    return own;
+}
+int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->bank_repoint(bank);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "bank repoint", err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return 1;
+    }
+    if (pulsar_tp_send_bank_repoint(tp, s->tp_session_id, bank) == 0) {
+        pulsar_tp_mirror_fail_void(tp, "bank repoint", "the frame could not be shipped");
+        return 1;
+    }
+    return tp_mirror_bank_verdict(s, tp, "bank repoint", s->bank_repoint(bank), 1);
+}
+void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
+    if (!s) return;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) { s->bank_state_save(bank); return; }
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "bank state save", err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, "bank state save", err);
+        return;
+    }
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "bank state save",
+                             pulsar_tp_send_bank_state_save(tp, s->tp_session_id, bank))) return;
+    s->bank_state_save(bank);
+}
+bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
+    if (!s) return false;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->bank_state_restore(bank);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "bank state restore", err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return false;
+    }
+    if (pulsar_tp_send_bank_state_restore(tp, s->tp_session_id, bank) == 0) {
+        pulsar_tp_mirror_fail_void(tp, "bank state restore", "the frame could not be shipped");
+        return false;
+    }
+    const int own = s->bank_state_restore(bank) ? 0 : 1;
+    return tp_mirror_bank_verdict(s, tp, "bank state restore", own, 1) == 0;
+}
+static int tp_mirror_bank_fork(pulsar_session *s, int partial, uint32_t src, uint32_t dst,
+                               const int *tokens, int n_tokens, int n_cached) {
+    const char *operation = partial ? "partial bank fork" : "bank fork";
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) {
+        return partial ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached)
+                       : s->bank_fork(src, dst, tokens, n_tokens, n_cached);
+    }
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, operation, err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return PULSAR_FORK_EINVAL;
+    }
+    if (n_tokens < 0 || (n_tokens > 0 && !tokens)) return PULSAR_FORK_EINVAL;
+    if (pulsar_tp_send_bank_fork(tp, partial, s->tp_session_id, src, dst,
+                                 tokens, (uint32_t)n_tokens, n_cached) == 0) {
+        pulsar_tp_mirror_fail_void(tp, operation, "the frame could not be shipped");
+        return PULSAR_FORK_EINVAL;
+    }
+    const int own = partial ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached)
+                            : s->bank_fork(src, dst, tokens, n_tokens, n_cached);
+    return tp_mirror_bank_verdict(s, tp, operation, own, PULSAR_FORK_EINVAL);
+}
+int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
+    return s ? tp_mirror_bank_fork(s, 0, src, dst, tokens, n_tokens, n_cached) : 1;
+}
+int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
+    return s ? tp_mirror_bank_fork(s, 1, src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL;
+}
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }

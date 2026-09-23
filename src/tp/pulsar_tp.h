@@ -327,7 +327,24 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
  * nowhere to put a peer's refusal, and the worker's frame check reports a
  * divergence through the next acked operation instead of hanging on it. */
 int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state);
+/* The bank frames (increment 2).  Leader -> workers. */
+int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+/* `partial` selects BANK_FORK_PARTIAL over BANK_FORK; the payload is the same. */
+int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
+                             uint32_t src, uint32_t dst,
+                             const int *tokens, uint32_t n_tokens, int n_cached);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
+/* Collect one ack per peer and return the VERDICT they agree on in *status
+ * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
+ * a failure here -- a fork refusal code is a legitimate result -- but the
+ * peers must all report the SAME status, and a NEGATIVE status is a worker
+ * refusal (unknown session, failed pair), never a verdict.  Returns 0 on a
+ * dead link, a disagreement between peers, or a refusal (err says which). */
+int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
+                                  const char *operation, int *status,
+                                  char *err, size_t errlen);
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation,
                                char *err, size_t errlen);
@@ -367,6 +384,16 @@ typedef enum {
     /* Slice 4e: one rank's rng state, so a pair can share ONE speculation
      * stream.  Fresh number (18 is taken, 10 is retired and never reused). */
     PULSAR_TP_FRAME_RNG_STATE = 19,
+    /* Slice 4e increment 2 (L238): the bank surface.  save is void
+     * (fire-and-forget); restore, repoint and the two forks return a VERDICT
+     * the ranks must AGREE on (a fork legitimately refuses with a code that
+     * routes the caller to a cold prefill), collected with
+     * pulsar_tp_wait_command_status. */
+    PULSAR_TP_FRAME_BANK_STATE_SAVE = 20,
+    PULSAR_TP_FRAME_BANK_STATE_RESTORE = 21,
+    PULSAR_TP_FRAME_BANK_REPOINT = 22,
+    PULSAR_TP_FRAME_BANK_FORK = 23,
+    PULSAR_TP_FRAME_BANK_FORK_PARTIAL = 24,
 } pulsar_tp_frame_type;
 
 typedef struct {
@@ -378,6 +405,12 @@ typedef struct {
     uint32_t n_tokens;
     pulsar_tp_batch_item *items;  /* malloc'd for EVAL_BATCH/MIXED_BATCH */
     uint32_t n_items;
+    /* BANK_FORK / BANK_FORK_PARTIAL: the banks and the shared-prefix length;
+     * the request tokens ride `tokens`/`n_tokens`.  The bank of a save /
+     * restore / repoint rides `value`. */
+    int32_t bank_src;
+    int32_t bank_dst;
+    int32_t n_cached;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,

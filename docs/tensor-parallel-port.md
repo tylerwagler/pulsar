@@ -113,9 +113,17 @@ driven that way at all (census in `pulsar-notes/rows/L238.md`). The loop is the
 only version that serves production. Increments: (1) registry + loop for the
 frames that exist — create, destroy, sync, eval, batched and mixed decode,
 rewind, invalidate, rng state, stop — with the mixed step's `max_head_runs`
-riding the batch header and `pulsar_session_free` gaining the destroy frame;
-(2) banks: state save/restore, fork, partial fork (the leader's scheduler
-decides, the frame carries the decision, the ordinal names the target);
+riding the batch header and `pulsar_session_free` gaining the destroy frame
+— LANDED; (2) banks — LANDED with (1): state save (void, fire-and-forget),
+restore, repoint, fork and partial fork.  The last four return a VERDICT the
+ranks must AGREE on (`pulsar_tp_wait_command_status`): a fork legitimately
+refuses with a code that routes the caller to a cold prefill, so a nonzero
+result is not a failure, but the same inputs on the same pool state give the
+same code on every rank, and a split verdict is a divergence (pair marked
+failed, the caller told `PULSAR_FORK_EINVAL` / false / 1), never a vote.  A
+negative status is a worker's refusal, never a verdict.  The leader's
+scheduler decides, the frame carries the decision, the ordinal names the
+target;
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a

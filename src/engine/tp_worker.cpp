@@ -15,7 +15,8 @@
  * (pulsar_session::create, ++tp_session_seq); a frame naming a session this
  * rank never created is a divergence and is refused by name.
  *
- * Acked frames (create, sync, eval, batched and mixed decode) always answer,
+ * Acked frames (create, sync, eval, batched and mixed decode, bank restore /
+ * repoint / fork) always answer,
  * even with a refusal: a rank that stays silent hangs the leader into its
  * deadline instead of failing it at once.  Void frames (destroy, rewind,
  * invalidate, rng state) cannot answer; a refusal there marks the pair failed
@@ -221,6 +222,50 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->rewind(c->value);
         else                                   slot->s->invalidate();
         return 1;
+    }
+
+    case PULSAR_TP_FRAME_BANK_STATE_SAVE:
+        if (worker_refused(e, c, "bank state save", &slot, ferr, sizeof(ferr))) {
+            pulsar_tp_mirror_fail_void(tp, "bank state save", ferr);
+            return 1;
+        }
+        slot->s->bank_state_save((uint32_t)c->value);
+        return 1;
+
+    case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
+    case PULSAR_TP_FRAME_BANK_REPOINT: {
+        /* A VERDICT frame: the ack carries this rank's result and the leader
+         * requires every rank's to agree with its own.  A negative status is
+         * this rank's refusal, never a verdict. */
+        const bool restore = c->type == PULSAR_TP_FRAME_BANK_STATE_RESTORE;
+        const char *op = restore ? "bank state restore" : "bank repoint";
+        int status = -1;
+        if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
+            status = restore ? (slot->s->bank_state_restore((uint32_t)c->value) ? 0 : 1)
+                             : slot->s->bank_repoint((uint32_t)c->value);
+            if (status < 0) status = 1;
+        } else {
+            fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_BANK_FORK:
+    case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
+        const bool partial = c->type == PULSAR_TP_FRAME_BANK_FORK_PARTIAL;
+        const char *op = partial ? "partial bank fork" : "bank fork";
+        int status = -1;
+        if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
+            status = partial
+                ? slot->s->bank_fork_partial((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
+                                             c->tokens, (int)c->n_tokens, c->n_cached)
+                : slot->s->bank_fork((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
+                                     c->tokens, (int)c->n_tokens, c->n_cached);
+            if (status < 0) status = PULSAR_FORK_EINVAL;   /* a verdict is never negative */
+        } else {
+            fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
     }
 
     case PULSAR_TP_FRAME_RNG_STATE:

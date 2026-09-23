@@ -21,7 +21,9 @@
  * plumbing that matters:
  *
  *   A. sync / eval / batched decode / mixed step for an unknown session
- *      -> refused by name, and the refusal ACKED so the leader reads it at once
+ *      -> refused by name, and the refusal ACKED so the leader reads it at once;
+ *      the verdict frames (bank restore, fork) answer a NEGATIVE status that
+ *      the verdict collector reads as a refusal, never as a result
  *   B. a void frame (rewind) for an unknown session -> the worker marks the
  *      pair failed with NO ack; the NEXT acked frame carries the refusal back
  *      as a failed ack, not as a deadline ("did not answer")
@@ -159,6 +161,23 @@ static int run_leader(pulsar_tp *tp) {
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "mixed batch", err, sizeof(err)) &&
           std::strstr(err, "mixed batch failed") != NULL,
           "the leader must read the worker's mixed refusal: %s", err);
+
+    /* A'. The verdict frames for an unknown session: the worker answers a
+     * NEGATIVE status and the verdict collector reads it as a refusal. */
+    {
+        int status = -99;
+        CHECK(pulsar_tp_send_bank_state_restore(tp, SID, 1u) != 0, "send_bank_state_restore must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank state restore", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session restore must come back as a refusal, not a verdict: %s", err);
+        const int t3[3] = { 1, 2, 3 };
+        CHECK(pulsar_tp_send_bank_fork(tp, 1, SID, 0u, 1u, t3, 3u, 2) != 0, "send_bank_fork must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "partial bank fork", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session fork must come back as a refusal: %s", err);
+    }
 
     /* B. A void frame for an unknown session marks the worker's pair failed
      * silently; the next acked frame must carry that back AT ONCE. */

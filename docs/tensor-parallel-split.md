@@ -165,9 +165,10 @@ bug, not a design change.
       worker rank runs the receive loop `pulsar_tp_worker_run` over a session
       registry keyed by the create ordinal; the leader's wrappers ship frames.
       Mirrored: create, destroy, sync, eval, batched decode, the mixed step
-      (head policy on the wire), rewind, invalidate, the speculation rng.
-      Next: banks (save/restore/fork/partial fork), rewrite_from_common,
-      note_committed_tokens, set_logits, the speculative round family.
+      (head policy on the wire), rewind, invalidate, the speculation rng, and
+      the bank surface (save; restore / repoint / fork / partial fork as
+      agreed verdicts).  Next: rewrite_from_common, note_committed_tokens,
+      set_logits, the speculative round family.
 - **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
       ownership but every rank still staged every expert: on GB10 host
       registration is unsupported, so the supported load path stages each
