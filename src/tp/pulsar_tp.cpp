@@ -1044,13 +1044,10 @@ static uint32_t tp_gate_slot(const pulsar_tp *tp, uint64_t seq) {
 
 static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq);
 
-static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
-                                         size_t errlen) {
-    pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    /* The peer's QP comes up here, not in the HCA open, because peers exist by
-     * now (attach_slab runs after the links are up).  The mesh does this once
-     * per peer. */
-    if (!tp_rdma_qp_create(tp, r, err, errlen)) return 0;
+/* Register the slab with the HCA -- ONCE, shared by every peer's QP (rule 2).
+ * Split out of the per-connection bring-up below because an n-rank mesh runs
+ * n_ranks-1 QPs over this one MR: register once, connect many. */
+static int tp_rdma_register_slab(pulsar_tp *tp, char *err, size_t errlen) {
     tp->rdma.mr = tp->rdma.api.reg_mr(tp->rdma.pd, tp->slab, (size_t)tp->slab_bytes,
                           TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
                           TP_IBV_ACCESS_REMOTE_WRITE);
@@ -1059,26 +1056,51 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
                    (unsigned long long)tp->slab_bytes, strerror(errno));
         return 0;
     }
+    if (tp->vec_bytes > 2ull * PULSAR_TP_RDMA_MAX_MSG) {
+        tp_set_err(err, errlen,
+                   "tp rdma: gate vector %llu bytes exceeds twice the driver's "
+                   "%u message limit",
+                   (unsigned long long)tp->vec_bytes, PULSAR_TP_RDMA_MAX_MSG);
+        return 0;
+    }
+    if (tp->vec_bytes > PULSAR_TP_RDMA_MAX_MSG)
+        fprintf(stderr,
+                "pulsar-tp: rdma gate vectors ride as 2 chunked messages "
+                "(%llu bytes > %u limit)\n",
+                (unsigned long long)tp->vec_bytes, PULSAR_TP_RDMA_MAX_MSG);
+    return 1;
+}
+
+/* Bring up ONE peer's QP: create it over the shared PD/CQ, exchange this rank's
+ * registered-slab address and QP identity with THAT peer over its own control
+ * socket, then INIT -> RTR -> RTS.  The MR is already registered above, so
+ * every peer sees the same slab at the same rkey.  This is the function the
+ * pair calls once and the mesh calls n_ranks-1 times. */
+static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
+                                char *err, size_t errlen) {
+    pulsar_tp_rdma_link *r = &pp->rdma;
+    if (!tp_rdma_qp_create(tp, r, err, errlen)) return 0;
     pulsar_tp_rdma_info mine;
     (void)memset(&mine, 0, sizeof(mine));
     mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
     mine.rkey = TP_RKEY(tp->rdma.mr);
     mine.qpn = TP_QPN(r->qp);
-    mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
+    /* PSND must differ per peer, so mix the peer in. */
+    mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp ^ (uintptr_t)pp) & 0xffffff;
     mine.mtu = (uint32_t)tp->rdma.port.active_mtu;
     mine.lid = tp->rdma.port.lid;
     memcpy(mine.gid, tp->rdma.gid.raw, 16);
     mine.link_layer = tp->rdma.port.link_layer;
-    if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_INFO,
+    if (!tp_send_frame(pp->control_fd, PULSAR_TP_FRAME_RDMA_INFO,
                        &mine, sizeof(mine))) {
-        tp_set_err(err, errlen, "tp rdma: info send failed");
+        tp_set_err(err, errlen, "tp rdma: info send to rank %d failed", pp->rank);
         return 0;
     }
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_read_frame_header(pp->control_fd, &type, &bytes) ||
         type != PULSAR_TP_FRAME_RDMA_INFO || bytes != sizeof(r->peer) ||
-        !tp_read_full(tp->control_fd, &r->peer, sizeof(r->peer))) {
-        tp_set_err(err, errlen, "tp rdma: info recv failed");
+        !tp_read_full(pp->control_fd, &r->peer, sizeof(r->peer))) {
+        tp_set_err(err, errlen, "tp rdma: info recv from rank %d failed", pp->rank);
         return 0;
     }
 
@@ -1093,7 +1115,7 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     if (tp->rdma.api.modify_qp(r->qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
             TP_IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT: %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", pp->rank, strerror(errno));
         return 0;
     }
     (void)memset(&a, 0, sizeof(a));
@@ -1118,40 +1140,30 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     if (tp->rdma.api.modify_qp(r->qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
             TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", pp->rank, strerror(errno));
         return 0;
     }
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTS;
     a.sq_psn = mine.psn;
     if (tp->rdma.api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", pp->rank, strerror(errno));
         return 0;
     }
-    if (tp->vec_bytes > 2ull * PULSAR_TP_RDMA_MAX_MSG) {
-        tp_set_err(err, errlen,
-                   "tp rdma: gate vector %llu bytes exceeds twice the driver's "
-                   "%u message limit",
-                   (unsigned long long)tp->vec_bytes, PULSAR_TP_RDMA_MAX_MSG);
-        return 0;
-    }
-    if (tp->vec_bytes > PULSAR_TP_RDMA_MAX_MSG)
-        fprintf(stderr,
-                "pulsar-tp: rdma gate vectors ride as 2 chunked messages "
-                "(%llu bytes > %u limit)\n",
-                (unsigned long long)tp->vec_bytes, PULSAR_TP_RDMA_MAX_MSG);
     /* Leave the receive queue empty for an initial bulk prefill; the first
      * decode gate arms the normal lookahead window. */
-    if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_READY, NULL, 0)) {
-        tp_set_err(err, errlen, "tp rdma: ready send failed");
+    if (!tp_send_frame(pp->control_fd, PULSAR_TP_FRAME_RDMA_READY, NULL, 0)) {
+        tp_set_err(err, errlen, "tp rdma: ready send to rank %d failed", pp->rank);
         return 0;
     }
     uint32_t rtype = 0, rbytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
+    if (!tp_read_frame_header(pp->control_fd, &rtype, &rbytes) ||
         rtype != PULSAR_TP_FRAME_RDMA_READY || rbytes != 0) {
-        tp_set_err(err, errlen, "tp rdma: ready barrier failed");
+        tp_set_err(err, errlen, "tp rdma: ready barrier with rank %d failed", pp->rank);
         return 0;
     }
+    fprintf(stderr, "pulsar-tp: rdma link up to rank %d (remote qpn %u)\n",
+            pp->rank, (unsigned)r->peer.qpn);
     return 1;
 }
 
@@ -1304,13 +1316,12 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
     return ok;
 }
 
-static int tp_rdma_big_gate_capable(const pulsar_tp *tp) {
+static int tp_rdma_big_gate_capable(const pulsar_tp *tp, const pulsar_tp_rdma_link *l) {
     const uint64_t stage_bytes =
         (uint64_t)PULSAR_TP_RDMA_BULK_SLOTS * PULSAR_TP_RDMA_MAX_MSG;
     const uint64_t batch_region_bytes =
         (uint64_t)tp->n_layer * PULSAR_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    return tp->n_peers > 0 && tp->peers[0].rdma.qp && tp->rdma.mr &&
-           batch_region_bytes >= stage_bytes;
+    return l && l->qp && tp->rdma.mr && batch_region_bytes >= stage_bytes;
 }
 
 /* Decode keeps a lookahead window of receives on the latency QP.  Before a
@@ -1408,10 +1419,10 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
  * are queued, so each round can post its 1 MiB receive window before sending
  * the matching 16 KiB messages.  Verify scratch provides already-registered
  * staging memory and is idle during normal prefill. */
-static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
-                                     uint64_t bytes) {
-    pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
+                                     const void *out, void *in, uint64_t bytes) {
+    pulsar_tp_rdma_link *r = link;
+    if (!tp_rdma_big_gate_capable(tp, r) || r->recv_window_active) return 0;
 
     /* Payloads already inside the registered slab (the engine's <=
      * PULSAR_TP_BATCH_MAX_ROWS gate rows) ride DIRECT; ordinary prefill tensors
@@ -1942,7 +1953,22 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
     }
     /* Per-peer RDMA is a later increment and is pair-gated; the verifiable mesh
      * path is full-duplex TCP (the same data, latency-only difference). */
-    tp->rdma_active = false;
+    /* The probe is an INPUT to the transport decision, not the decision:
+     * tp_hello_exchange assigns `rdma_active = rdma_ok && theirs.rdma_ok`, so
+     * both sides must report.  This call used to pass a literal 0, which made
+     * that assignment a constant false however capable the hardware was -- the
+     * reason an n-rank mesh never rode RoCE. */
+    const int mesh_rdma_ok = tp_rdma_probe(&tp->rdma.api) != 0;
+    tp->rdma_active = mesh_rdma_ok;
+    if (tp->rdma_active) {
+        char oerr[256];
+        if (!tp_rdma_open(tp, oerr, sizeof(oerr))) {
+            /* Degrade loudly rather than refuse the whole group: the mesh is
+             * still correct over TCP, just slower. */
+            fprintf(stderr, "pulsar-tp: mesh rdma open failed (%s) -- mesh rides TCP\n", oerr);
+            tp->rdma_active = false;
+        }
+    }
 
     int listener = tp_listen(ep[R].host, ep[R].port, N > 1 ? N : 2, err, errlen);
     if (listener < 0) { free(ep); tp_destroy(tp); return 0; }
@@ -1990,7 +2016,15 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
         pp->control_fd = fd;
     }
 
-    /* Hello + identity per peer on its control socket. */
+    /* Hello + identity per peer on its control socket.  The transport decision
+     * must be GROUP-consistent: tp_hello_exchange assigns
+     * `rdma_active = mesh_rdma_ok && theirs.rdma_ok` for THIS peer, so AND every
+     * peer's answer -- a last-write-wins flag would let two ranks disagree about
+     * the payload transport and desync on the wire. */
+    /* Declared then assigned: initialising here would be crossed by the
+     * `goto fail` below, which C++ rejects. */
+    int all_rdma;
+    all_rdma = mesh_rdma_ok;
     for (int i = 0; i < tp->n_peers; i++) {
         pulsar_tp_peer *pp = &tp->peers[i];
         if (pp->control_fd < 0) {
@@ -1999,10 +2033,12 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
         }
         uint32_t saved_ctx = 0;
         (void)saved_ctx;
-        if (!tp_hello_exchange(tp, pp->control_fd, pp->rank, id, 0, err, errlen))
+        if (!tp_hello_exchange(tp, pp->control_fd, pp->rank, id, mesh_rdma_ok, err, errlen))
             goto fail;
+        all_rdma = all_rdma && tp->rdma_active;
         pp->peer_ctx = (uint32_t)tp->peer_ctx;
     }
+    tp->rdma_active = all_rdma;
 
     /* Data sockets: dial lower peers, accept higher peers. */
     for (int p = 0; p < R; p++) {
@@ -2045,8 +2081,8 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
 
     close(listener);
     free(ep);
-    fprintf(stderr, "pulsar-tp: rank %d/%d mesh connected (%d peers), transport=tcp\n",
-            R, N, tp->n_peers);
+    fprintf(stderr, "pulsar-tp: rank %d/%d mesh connected (%d peers), transport=%s\n",
+            R, N, tp->n_peers, tp->rdma_active ? "rdma" : "tcp");
     *out = tp;
     return 1;
 fail:
@@ -2060,7 +2096,15 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = static_cast<uint8_t *>(base);
     memset(tp->slab + tp->layout.in_flags_off, 0, (uint64_t)tp->n_slots * 8);
     memset(tp->slab + tp->layout.token_off, 0, 16);
-    if (tp->rdma_active) return tp_rdma_register_and_exchange(tp, err, errlen);
+    if (tp->rdma_active) {
+        /* Register the slab ONCE against the HCA, then bring up one QP per peer
+         * -- the pair has one, the mesh n_ranks-1, and every peer sees the same
+         * slab address/rkey. */
+        if (!tp_rdma_register_slab(tp, err, errlen)) return 0;
+        for (int i = 0; i < tp->n_peers; i++)
+            if (!tp_rdma_link_bringup(tp, &tp->peers[i], err, errlen)) return 0;
+        return 1;
+    }
     (void)err; (void)errlen;
     return 1;
 }
@@ -2200,7 +2244,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
         pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer,
                                 (uint16_t)rows, seq };
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
+    if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) {
             return 0;
         }
@@ -2219,7 +2263,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
         }
         if (!tp_rdma_drain_decode_window(tp)) return 0;
         return tp_rdma_big_gate_exchange(
-                tp,
+                tp, tp_pair_link(tp),
                 tp->slab + batch_out,
                 tp->slab + batch_in,
                 bytes);
@@ -2274,9 +2318,9 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
+    if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, out, in, bytes);
+        return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp), out, in, bytes);
     }
     uint64_t off = 0;
     while (off < bytes) {
@@ -2323,6 +2367,40 @@ static int tp_big_gate_exchange_fd(int fd, uint32_t layer,
  * byte-identical to the old pairwise exchange + add (the engine's tp_prefill
  * big gate).  n>2 accumulates in canonical ascending-rank order so every rank
  * ends up with the bit-identical full sum (float addition is not associative). */
+/* n-general per-peer gate payload: header over THIS peer's data socket, then the
+ * payload over its OWN QP when the group decided RDMA and this peer's link can
+ * carry it.  The pair's pulsar_tp_big_gate_exchange is the same shape on the
+ * primary link; this is the entry the mesh's peer loops call. */
+static int tp_big_gate_exchange_peer(pulsar_tp *tp, pulsar_tp_peer *pp,
+                                     uint32_t layer, uint64_t seq,
+                                     const void *out, void *in, uint64_t bytes) {
+    if (!pp || pp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    /* One branch for the WHOLE group, so both ends of a link agree: the decision
+     * is group-consistent by construction (see create_mesh's all_rdma). */
+    if (!(tp->rdma_active && tp_rdma_big_gate_capable(tp, &pp->rdma)))
+        return tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out, in, bytes);
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+    if (!tp_write_full(pp->data_fd, &h, sizeof(h))) return 0;
+    pulsar_tp_gate_header ph;
+    if (!tp_read_full(pp->data_fd, &ph, sizeof(ph))) return 0;
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != 0xB16u || ph.seq != seq) {
+        fprintf(stderr, "pulsar-tp: peer big gate desync with rank %d: got l=%u tag=%x "
+                        "seq=%llu, want l=%u seq=%llu\n",
+                pp->rank, ph.layer, ph.gate, (unsigned long long)ph.seq,
+                layer, (unsigned long long)seq);
+        return 0;
+    }
+    /* A per-peer decode window would need its own drain; the mesh data plane
+     * never arms one, and refusing beats silently leaving receives queued. */
+    if (pp->rdma.recv_window_active) {
+        fprintf(stderr, "pulsar-tp: rank %d has an armed decode window and per-peer "
+                        "drain is not implemented -- refusing\n", pp->rank);
+        return 0;
+    }
+    return tp_rdma_big_gate_exchange(tp, &pp->rdma, out, in, bytes);
+}
+
 int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                             void *out, const void *in, uint64_t bytes) {
     if (!tp || !out || !in || bytes == 0) return 0;
@@ -2364,8 +2442,8 @@ int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
         } else {
             pulsar_tp_peer *pp = tp_peer_by_rank(tp, k);
             float *scratch = (float *)in;
-            if (!pp || !tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out,
-                                                scratch, bytes)) {
+            if (!pp || !tp_big_gate_exchange_peer(tp, pp, layer, seq, out,
+                                                  scratch, bytes)) {
                 free(acc);
                 return 0;
             }
@@ -2410,8 +2488,8 @@ int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
             const bool xok = tp->n_ranks == 2
                 ? pulsar_tp_big_gate_exchange(tp, layer, seq, own_slice, scratch,
                                               (uint64_t)n_rows * stride * sizeof(float)) != 0
-                : tp_big_gate_exchange_fd(pp->data_fd, layer, seq, own_slice, scratch,
-                                          (uint64_t)n_rows * stride * sizeof(float)) != 0;
+                : tp_big_gate_exchange_peer(tp, pp, layer, seq, own_slice, scratch,
+                                            (uint64_t)n_rows * stride * sizeof(float)) != 0;
             if (!xok) return 0;
             src = scratch;
         }
