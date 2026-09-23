@@ -112,3 +112,14 @@ tests/dspark_batch_gate
 /tests/csa2_compressor_kernel_test
 /tests/indexer_score_test
 /tests/minp_prefilter_gate
+# gate binaries the battery builds in-tree (2026-09-23: a clean run left these untracked)
+/tests/expert_table_gate
+/tests/moe_route_bounds_gate
+/tests/vision_codec_gate
+/tests/vision_hc_gate
+/tests/vision_layout_gate
+/tests/vision_pixel_gate
+/tests/vision_placeholder_gate
+/tests/vision_router_gate
+/tests/vision_span_gate
+/tests/vision_visible_gate
