@@ -340,7 +340,7 @@ static int tp_mirror_worker_frame(pulsar_session *s, const pulsar_tp_command *co
  * rank that dies without answering hangs the leader instead of failing it. */
 static int tp_mirror_worker_ack(pulsar_session *s, pulsar_tp *tp, int rc,
                                 char *err, size_t errlen) {
-    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) == 0) return 0;
+    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) != 0) return 0;
     if (err) snprintf(err, errlen, "tp: could not ack the mirrored command to the leader");
     return 1;
 }
@@ -396,7 +396,7 @@ static void pulsar_tp_mirror_void(pulsar_session *s, pulsar_tp *tp,
                                   tp_mirror_void_op op, int value) {
     const char *name = tp_mirror_void_name(op);
     if (pulsar_tp_rank(tp) == 0) {
-        if (tp_mirror_void_send(tp, s->tp_session_id, op, value) != 0) {
+        if (tp_mirror_void_send(tp, s->tp_session_id, op, value) == 0) {
             tp_mirror_fail_void(tp, name, "the frame could not be shipped");
             return;
         }
@@ -407,7 +407,7 @@ static void pulsar_tp_mirror_void(pulsar_session *s, pulsar_tp *tp,
     err[0] = '\0';
     pulsar_tp_command command;
     memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) != 0) {
+    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
         tp_mirror_fail_void(tp, name, err);
         return;
     }
@@ -451,7 +451,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
          * unblocks as soon as the frame lands, so both ranks prefill together
          * instead of the worker waiting out the leader's whole sync. */
         if (pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v,
-                                (uint32_t)prompt->len) != 0) {
+                                (uint32_t)prompt->len) == 0) {
             if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
             return 1;
         }
@@ -464,7 +464,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
      * sync must not free it, and it stays valid until the ack below. */
     pulsar_tp_command command;
     memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) != 0) return 1;
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
     int rc = 1;
     pulsar_tokens borrowed;
     borrowed.v = command.tokens;
@@ -576,7 +576,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
      * right token at the wrong position and produce confident nonsense. */
     const uint64_t pos = (uint64_t)s->checkpoint.len;
     if (pulsar_tp_rank(tp) == 0) {
-        if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) != 0) {
+        if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) == 0) {
             if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
             return 1;
         }
@@ -586,7 +586,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
      * argument is never read. */
     pulsar_tp_command command;
     memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) != 0) return 1;
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
     int rc = 1;
     if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_EVAL, "eval", err, errlen) == 0) {
         if (command.seq != pos) {

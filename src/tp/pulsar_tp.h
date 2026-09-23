@@ -262,7 +262,16 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
 int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes);
 
-/* Lockstep mirroring (leader side) and worker loop primitives. */
+/* Lockstep mirroring (leader side) and worker loop primitives.
+ *
+ * RETURN CONVENTION FOR THIS WHOLE FILE: nonzero (1) means SUCCESS and zero
+ * means failure -- the inverse of the usual C shape, and it holds for every
+ * pulsar_tp_send_*, for pulsar_tp_recv_command, and for
+ * pulsar_tp_wait_command_ack.  The engine's first mirroring pass read it
+ * backwards at seven call sites, which made every successful send look like a
+ * refusal, so it is stated once here rather than inferred per call site.  A
+ * refusal that carries a reason puts it in `err`; the allgather/allreduce and
+ * gate exchanges above follow the same rule. */
 typedef struct {
     uint64_t session_id;
     int32_t token;
