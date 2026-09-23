@@ -17,7 +17,7 @@
  *     death).  A follow-up 1 MiB big_gate on the separate data socket must
  *     also return 0.
  *  B. peer dies before acking a control command: the leader's
- *     pulsar_tp_wait_command_ack must return 0 with "worker failed" and must
+ *     pulsar_tp_wait_command_ack must return 0 with "rank 1 failed during eval" and must
  *     set the pulsar_tp_mark_failed latch (pulsar_tp_failed() == true) --
  *     the only auto-latch in the transport.
  *
@@ -154,8 +154,8 @@ static void run_leader(int port, int mode) {
         const int rc = pulsar_tp_wait_command_ack(tp, 4242u, "eval", e2, sizeof(e2));
         CHECK(rc == 0, "wait_command_ack rc=%d (want 0)", rc);
         CHECK(pulsar_tp_failed(tp), "failed() not latched on ack failure");
-        CHECK(e2[0] != '\0' && strstr(e2, "worker failed") != NULL,
-              "ack err=%s (want worker-failed reason)", e2);
+        CHECK(e2[0] != '\0' && strstr(e2, "rank 1 failed during eval") != NULL,
+              "ack err=%s (want the dead rank named, with the operation)", e2);
         return;
     }
 
@@ -271,8 +271,8 @@ int main(void) {
     setenv("PULSAR_TP_TIMEOUT_SEC", "5", 1);
     /* mode 1: the gate pump runs into a dead peer (worker dies after two
      * exchanges; leader's exchanges must fail, never hang).  mode 2: control-
-     * path latch (worker dies before acking; wait_command_ack must return the
-     * "worker failed" error and set failed()). */
+     * path latch (worker dies before acking; wait_command_ack must return an
+     * error naming the dead rank and the operation, and set failed()). */
     int rc = 0;
     rc |= run_mode(1);
     rc |= run_mode(2);

@@ -143,6 +143,19 @@ static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t 
     return -1;
 }
 
+/* The ack of a logits-producing operation (eval, batch decode, mixed batch):
+ * on success it carries the digest of THIS rank's assembled logits, which the
+ * leader compares against its own (the cross-rank identity check, L243).  A
+ * failure acks its status the plain way -- there are no logits to digest. */
+static int worker_ack_logits(pulsar_engine *e, uint64_t sid, int rc, const float *logits,
+                             uint32_t n_rows, char *err, size_t errlen) {
+    if (rc != 0) return worker_ack(e, sid, rc, err, errlen);
+    const uint64_t digest = pulsar_tp_logits_digest(logits, n_rows, (uint32_t)e->logits_width());
+    if (pulsar_tp_send_command_ack_digest(e->tp, sid, 0, digest) != 0) return 1;
+    snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
+    return -1;
+}
+
 static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
     for (uint32_t i = 0; i < c->n_items; i++) {
         rows[i].bank  = (uint32_t)c->items[i].bank;
@@ -230,7 +243,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             }
         }
         if (rc != 0) fprintf(stderr, "pulsar: tp worker: eval refused: %s\n", ferr);
-        return worker_ack(e, c->session_id, rc, err, errlen);
+        return worker_ack_logits(e, c->session_id, rc, rc == 0 ? slot->s->logits : NULL, 1u,
+                                 err, errlen);
     }
 
     case PULSAR_TP_FRAME_EVAL_BATCH:
@@ -238,22 +252,24 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         const bool mixed = c->type == PULSAR_TP_FRAME_MIXED_BATCH;
         const char *op = mixed ? "mixed batch" : "batch decode";
         int rc = 1;
+        float *logits = NULL;
+        uint32_t out_rows = 0;   /* the rows the step headed: n_items, or the mixed step's count */
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             pulsar_multiseq_req *rows = (pulsar_multiseq_req *)xmalloc((size_t)c->n_items * sizeof(*rows));
             worker_rows(c, rows);
             int cap = 0;
-            float *logits = worker_logits(e, slot, c->n_items, &cap);
+            logits = worker_logits(e, slot, c->n_items, &cap);
             if (mixed) {
-                uint32_t out_rows = 0;
                 rc = slot->s->decode_mixed(rows, c->n_items, logits, cap, &out_rows,
                                            (uint32_t)c->value, ferr, sizeof(ferr));
             } else {
                 rc = slot->s->decode_multiseq(rows, c->n_items, logits, cap, ferr, sizeof(ferr));
+                out_rows = c->n_items;
             }
             free(rows);
         }
         if (rc != 0) fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
-        return worker_ack(e, c->session_id, rc, err, errlen);
+        return worker_ack_logits(e, c->session_id, rc, logits, out_rows, err, errlen);
     }
 
     case PULSAR_TP_FRAME_REWIND:
@@ -457,6 +473,16 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             status = n + 1;
             if (status < 0) status = 0;
             if (n < 0) fprintf(stderr, "pulsar: tp worker: generate_speculative failed: %s\n", ferr);
+            else {
+                /* The run's last row is this rank's assembled logits after the
+                 * whole loop; the positive verdict carries its digest (L243). */
+                const uint64_t digest = pulsar_tp_logits_digest(slot->s->logits, 1u,
+                                                                (uint32_t)e->logits_width());
+                if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, status, digest) != 0)
+                    return 1;
+                snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
+                return -1;
+            }
         } else fprintf(stderr, "pulsar: tp worker: generate_speculative refused: %s\n", ferr);
         return worker_ack(e, c->session_id, status, err, errlen);
     }

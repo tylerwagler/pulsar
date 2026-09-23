@@ -828,6 +828,16 @@ void pulsar_engine::destroy() {
     /* Tear down the TP pair before releasing the GPU/model (stop the peer, drop
      * the transport and its registered MR, then free the host-pinned slab). */
     if (e->tp) {
+        if (pulsar_tp_rank(e->tp) == 0) {
+            /* The cross-rank logits identity tally (L243): every logits-producing
+             * frame the leader collected, and how many peer acks agreed.  The
+             * pair grading tool reads this line as LEG A; a mismatch already
+             * refused by name when it happened. */
+            uint64_t frames = 0, matched = 0;
+            pulsar_tp_identity_stats(e->tp, &frames, &matched);
+            fprintf(stderr, "pulsar: tp: cross-rank logits identity: %llu/%llu worker frames matched\n",
+                    (unsigned long long)matched, (unsigned long long)frames);
+        }
         (void)pulsar_tp_send_stop(e->tp);
         pulsar_tp_free(e->tp);
         e->tp = NULL;

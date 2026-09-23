@@ -204,10 +204,12 @@ static void worker_run(pulsar_tp *tp) {
             break;
         }
         case PULSAR_TP_FRAME_MIXED_BATCH: {
-            CHECK(cmd.tokens && cmd.n_tokens >= 1 && cmd.n_tokens <= 16 &&
+            /* Rows only (4e increment 5): no prompt rides the mixed frame; the
+             * head policy does, and it is never zero. */
+            CHECK(cmd.n_tokens == 0 && cmd.value >= 1 && cmd.value <= 4 &&
                       cmd.items && cmd.n_items >= 1 && cmd.n_items <= 4,
-                  "worker mixed prompt=%u items=%u", cmd.n_tokens,
-                  cmd.n_items);
+                  "worker mixed prompt=%u head_runs=%d items=%u", cmd.n_tokens,
+                  cmd.value, cmd.n_items);
             int all_live = pool_is_live(cmd.session_id);
             for (uint32_t i = 0; i < cmd.n_items; i++)
                 if (!pool_is_live(cmd.items[i].session_id)) all_live = 0;
@@ -303,20 +305,21 @@ static int leader_step(pulsar_tp *tp, gen *g, char *err, size_t errlen) {
                                           err, errlen);
     }
     if (op == 9) { /* mixed_batch */
-        const uint32_t np = 1u + (uint32_t)(gen_next(g) % 12);
+        /* Rows only, plus the head policy (4e increment 5): the mixed step
+         * rides the batch row payload, there is no separate prompt. */
         const uint32_t ni = 1u + (uint32_t)(gen_next(g) % 4);
-        int prompt[16];
-        for (uint32_t i = 0; i < np; i++) prompt[i] = 5000 + (int)i;
+        const uint32_t head_runs = 1u + (uint32_t)(gen_next(g) % 4);
         pulsar_tp_batch_item items[4];
         for (uint32_t i = 0; i < ni; i++) {
             const int s = pool_pick_live(g);
             if (s < 0) return 0;
             items[i].session_id = ID_BASE + s;
+            items[i].bank = 0;
+            items[i].pos = (uint32_t)i;
             items[i].token = 6000 + s * 16 + (int)i;
             items[i].reserved = 0;
         }
-        if (!pulsar_tp_send_mixed_batch(tp, items[0].session_id, prompt, np,
-                                        items, ni))
+        if (!pulsar_tp_send_mixed_batch(tp, items, ni, head_runs))
             return 0;
         return pulsar_tp_wait_command_ack(tp, items[0].session_id, "mixed",
                                           err, errlen);

@@ -286,6 +286,134 @@ static void frames_phase(pulsar_tp *tp, int rank) {
     }
 }
 
+/* The cross-rank logits identity ack (L243, protocol v11).  Both ranks build
+ * the same synthetic logits; the worker answers an eval with the digest ack;
+ * the leader's digest collect must accept an equal digest and count it, refuse
+ * a different one by name (marking the group failed), and refuse a shape
+ * confusion in both directions: a digest on a plain collect and a plain ack on
+ * a digest collect.  The refusals latch failed(), so this phase runs last. */
+static void identity_phase(pulsar_tp *tp, int rank) {
+    char err[512];
+    const uint64_t sid = 6161u;
+    const uint32_t width = 4096u, rows = 3u;
+    float *logits = (float *)std::malloc((size_t)rows * width * sizeof(float));
+    CHECK(logits != NULL, "identity logits alloc");
+    if (!logits) return;
+    for (uint32_t i = 0; i < rows * width; i++) logits[i] = pat(3, 77, i);
+    const uint64_t digest = pulsar_tp_logits_digest(logits, rows, width);
+    std::free(logits);
+
+    if (rank == 0) {
+        uint64_t frames = 0, matched = 0;
+        /* 1. Agreement. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 5, 42) == 1, "identity: leader send_eval #1");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 1,
+              "identity: an equal digest must be accepted: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 1 && matched == 1, "identity tally after agreement: %llu/%llu want 1/1",
+              (unsigned long long)matched, (unsigned long long)frames);
+        CHECK(!pulsar_tp_failed(tp), "identity: agreement must not mark the group failed");
+        /* 1b. A positive verdict carrying an equal digest (generate_speculative's
+         * shape): the verdict comes back and the tally counts it. */
+        pulsar_tp_spec_command sc;
+        std::memset(&sc, 0, sizeof(sc));
+        sc.session_id = sid;
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #1");
+        int verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 1 && verdict == 33,
+              "identity: a positive verdict with an equal digest must come back (verdict %d): %s",
+              verdict, err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 2 && matched == 2, "identity tally after the verdict: %llu/%llu want 2/2",
+              (unsigned long long)matched, (unsigned long long)frames);
+        /* 1c. A zero verdict (the run failed on the peer) is plain and still a
+         * verdict, not a shape refusal. */
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #2");
+        verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 1 && verdict == 0,
+              "identity: a plain zero verdict must come back as 0 (verdict %d): %s", verdict, err);
+        CHECK(!pulsar_tp_failed(tp), "identity: a zero verdict must not mark the group failed");
+        /* 1d. A positive verdict with a different digest refuses by name. */
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #3");
+        verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 0 &&
+              std::strstr(err, "logits differ from the leader's on generate_speculative") != NULL,
+              "identity: a verdict with a different digest must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 3 && matched == 2, "identity tally after the verdict mismatch: %llu/%llu want 2/3",
+              (unsigned long long)matched, (unsigned long long)frames);
+        CHECK(pulsar_tp_failed(tp), "identity: a verdict digest mismatch must mark the group failed");
+        /* 2. A plain ack where a digest is due. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 6, 43) == 1, "identity: leader send_eval #2");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
+              std::strstr(err, "with no logits digest") != NULL,
+              "identity: a plain ack on a digest collect must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 3 && matched == 2, "identity: a shape refusal is not a frame: %llu/%llu",
+              (unsigned long long)matched, (unsigned long long)frames);
+        /* 3. A digest where a plain ack is due. */
+        const int toks[2] = { 1, 2 };
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 0 &&
+              std::strstr(err, "an unexpected logits digest") != NULL,
+              "identity: a digest ack on a plain collect must refuse by name: %s", err);
+        /* 4. Disagreement: the refusal names both digests and latches failed. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 7, 44) == 1, "identity: leader send_eval #3");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
+              std::strstr(err, "logits differ from the leader's on eval") != NULL,
+              "identity: a different digest must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 4 && matched == 2, "identity tally after disagreement: %llu/%llu want 2/4",
+              (unsigned long long)matched, (unsigned long long)frames);
+        CHECK(pulsar_tp_failed(tp), "identity: a disagreement must mark the group failed");
+        /* 5. The drain reads an ack of either shape and keeps the stream aligned:
+         * the next collect sees the next frame's ack, not a stale one. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 8, 45) == 1, "identity: leader send_eval #4");
+        pulsar_tp_drain_command_acks(tp);
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync #2");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 1,
+              "identity: after a drain the next plain collect must line up: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 4 && matched == 2, "identity: a drain counts nothing: %llu/%llu",
+              (unsigned long long)matched, (unsigned long long)frames);
+    } else {
+        pulsar_tp_command cmd;
+        for (int step = 0; step < 9; step++) {
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "identity: worker recv step %d: %s", step, err);
+            pulsar_tp_command_free(&cmd);
+            int ok = 0;
+            switch (step) {
+            case 0: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* agree */
+            case 1: ok = pulsar_tp_send_command_ack_digest(tp, sid, 33, digest); break;       /* verdict 33, agree */
+            case 2: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* verdict 0: the run failed here, plain */
+            case 3: ok = pulsar_tp_send_command_ack_digest(tp, sid, 33, digest ^ 2ull); break; /* verdict 33, disagree */
+            case 4: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* plain where digest due */
+            case 5: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* digest where plain due */
+            case 6: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest ^ 1ull); break; /* disagree */
+            case 7: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* drained */
+            case 8: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* the aligned sync */
+            }
+            CHECK(ok == 1, "identity: worker ack step %d", step);
+        }
+    }
+}
+
 static int run_rank(pulsar_tp *tp, int rank) {
     static const char *rname[2] = { "leader", "worker" };
     CHECK(pulsar_tp_rank(tp) == rank, "rank %d: pulsar_tp_rank()=%d", rank,
@@ -336,6 +464,7 @@ static int run_rank(pulsar_tp *tp, int rank) {
 
     lockstep_phase(tp, rank);
     frames_phase(tp, rank);
+    identity_phase(tp, rank);   /* last: its refusals latch failed() by design */
 
     /* Clean shutdown: leader stops, worker sees the STOP frame. */
     if (rank == 0) {

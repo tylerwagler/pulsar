@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 10u           /* v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 11u           /* v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -369,6 +369,55 @@ int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_
 int pulsar_tp_send_sync_mm(pulsar_tp *tp, uint64_t session_id, const int *tokens, uint32_t n_tokens,
                            const pulsar_image_ref *images, uint32_t n_images);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
+
+/* ---- The cross-rank logits identity check (L243, protocol v11) --------------
+ * Every mirrored operation that PRODUCES logits (eval, batch decode, mixed
+ * batch) ends with each rank holding the full vocab vector (slice 4d's
+ * all-gather + assembly).  Those must be the same bytes on every rank -- a wrong
+ * range partition, a wrong gather or a wrong assembly makes them differ.  The
+ * worker folds its assembled logits into a 64-bit digest and rides it on the
+ * ack; the leader digests its own and REFUSES the operation (and marks the
+ * group failed -- the ranks no longer agree on the model's output) when any
+ * peer's differs.  The instrument runs the production lane on every frame; the
+ * leader prints the tally at close (`cross-rank logits identity: N/N worker
+ * frames matched`) and the pair grading tool reads that line as LEG A.
+ *
+ * The digest is word-wise (uint64 lanes, four independent chains so the
+ * multiply latency does not serialise it), seeded with the row count so a
+ * missing or extra row differs even when the bytes present agree.  It is a
+ * structural identity check, not a cryptographic one. */
+#define PULSAR_TP_ACK_HAS_DIGEST 1u
+uint64_t pulsar_tp_logits_digest(const float *logits, uint32_t n_rows, uint32_t width);
+/* The ack a logits-producing operation answers with on SUCCESS: `status` is 0
+ * for the acked operations (eval, batch decode, mixed batch) and the POSITIVE
+ * verdict for a verdict operation that ran (generate_speculative: tokens + 1).
+ * A failed one answers pulsar_tp_send_command_ack (the status is the verdict;
+ * there are no logits to digest). */
+int pulsar_tp_send_command_ack_digest(pulsar_tp *tp, uint64_t session_id, int status,
+                                      uint64_t digest);
+/* The leader's collect for a logits-producing operation: like
+ * pulsar_tp_wait_command_ack, plus every peer's ack must CARRY a digest equal
+ * to `own_digest`.  A peer ack without a digest, or with a different one, is a
+ * refusal that also marks the group failed.  Counted in
+ * pulsar_tp_identity_stats. */
+int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
+                                      const char *operation, uint64_t own_digest,
+                                      char *err, size_t errlen);
+/* The verdict collect for a verdict operation that also produces logits
+ * (generate_speculative: the CLI's whole loop as one frame, every rank ending
+ * on the same last row).  Like pulsar_tp_wait_command_status, plus every
+ * POSITIVE verdict (the operation ran) must carry a digest equal to
+ * `own_digest`; a zero verdict (the run failed on that rank) is plain, and is
+ * read as a split against the leader's positive one by the caller. */
+int pulsar_tp_wait_command_status_digest(pulsar_tp *tp, uint64_t session_id,
+                                         const char *operation, int *status,
+                                         uint64_t own_digest, char *err, size_t errlen);
+/* The leader's drain for a logits-producing operation whose OWN body failed:
+ * the peers' acks are read (an unread ack would shift every later frame) in
+ * either shape and their verdicts ignored -- the local failure is the result. */
+void pulsar_tp_drain_command_acks(pulsar_tp *tp);
+/* frames = peer acks checked for identity so far, matched = how many agreed. */
+void pulsar_tp_identity_stats(const pulsar_tp *tp, uint64_t *frames, uint64_t *matched);
 /* Collect one ack per peer and return the VERDICT they agree on in *status
  * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
  * a failure here -- a fork refusal code is a legitimate result -- but the

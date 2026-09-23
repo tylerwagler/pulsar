@@ -175,8 +175,13 @@ bug, not a design change.
       and the speculative round family (rng on every drawing frame; the CLI's
       generate_speculative as one frame); set_cancel is not polled inside a
       mirrored operation; the spill path (free/alloc physical, kv save/load,
-      each rank to its own disk) and images on the sync frame.  Remaining:
-      the pair run, then the attention head split.
+      each rank to its own disk) and images on the sync frame.  First live
+      pair run 2026-09-23 (runbook step 6).  The ack of every logits-producing
+      frame (eval, batch decode, mixed batch, the CLI's one-frame
+      generate_speculative verdict) carries the worker's digest of
+      its assembled logits and the leader refuses a mismatch by name -- the
+      cross-rank identity check, protocol v11 (L243); the tally prints at
+      close and is the grading tool's LEG A.
 - **4g-1. Attention head split, v1 -- the bit-exact split (L241, 2026-09-23).**
       The partition unit is the attention OUTPUT GROUP (`PULSAR_N_OUT_GROUP`,
       8 heads and one LoRA-down block each), from the same range authority as

@@ -540,6 +540,9 @@ struct pulsar_tp {
     pulsar_tp_slab layout;
     uint64_t timeout_sec;
     std::atomic<bool> failed{false};
+    /* The cross-rank logits identity tally (leader only; L243). */
+    uint64_t identity_frames;
+    uint64_t identity_matched;
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
 };
 
@@ -2679,7 +2682,8 @@ typedef struct {
 typedef struct {
     uint64_t session_id;
     int32_t status;
-    uint32_t reserved;
+    uint32_t flags;      /* PULSAR_TP_ACK_HAS_DIGEST: `digest` is the sender's assembled logits (v11) */
+    uint64_t digest;
 } pulsar_tp_command_ack;
 
 /* Broadcast ONE frame to every peer's control socket.  The command plane is
@@ -2823,9 +2827,11 @@ int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
     return ok;
 }
 
-int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
-                                  const char *operation, int *status,
-                                  char *err, size_t errlen) {
+/* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
+ * and pulsar_tp_wait_command_status_digest (want_digest 1). */
+static int tp_collect_status(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                             int *status, int want_digest, uint64_t own_digest,
+                             char *err, size_t errlen) {
     if (!tp || tp->n_peers < 1 || !status) return 0;
     const double deadline = tp_control_deadline(tp);
     int agreed = 0, have = 0, bad = 0;
@@ -2853,11 +2859,23 @@ int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
         /* Every peer's ack is read even after a refusal or a disagreement, so
          * no ack is left in a socket to shift the next frame. */
         if (bad) continue;
+        const int has_digest = (ack.flags & PULSAR_TP_ACK_HAS_DIGEST) != 0;
         if (ack.session_id != session_id || ack.status < 0) {
             bad = 1;
             tp_set_err(err, errlen, "tp: rank %d refused %s (session %llu, status %d)",
                        tp->peers[i].rank, operation ? operation : "command",
                        (unsigned long long)ack.session_id, (int)ack.status);
+        } else if (has_digest != (want_digest && ack.status > 0)) {
+            /* A digest rides a POSITIVE verdict of a logits-producing verdict
+             * operation and nothing else; any other shape means the peer
+             * answered a different command than the leader sent. */
+            bad = 1;
+            pulsar_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: rank %d answered %s (status %d) with %s logits digest -- the ranks "
+                       "are not running the same operation",
+                       tp->peers[i].rank, operation ? operation : "the command", (int)ack.status,
+                       has_digest ? "an unexpected" : "no");
         } else if (have && ack.status != agreed) {
             bad = 1;
             tp_set_err(err, errlen, "tp: %s verdict SPLIT: an earlier rank said %d, rank %d says %d",
@@ -2865,11 +2883,38 @@ int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
         } else {
             agreed = ack.status;
             have = 1;
+            if (has_digest) {
+                tp->identity_frames++;
+                if (ack.digest == own_digest) {
+                    tp->identity_matched++;
+                } else {
+                    bad = 1;
+                    pulsar_tp_mark_failed(tp);
+                    tp_set_err(err, errlen,
+                               "tp: rank %d's logits differ from the leader's on %s (digest "
+                               "%016llx vs %016llx) -- the ranks did not assemble the same vector; "
+                               "refusing, the group is marked failed",
+                               tp->peers[i].rank, operation ? operation : "the command",
+                               (unsigned long long)ack.digest, (unsigned long long)own_digest);
+                }
+            }
         }
     }
     if (bad) return 0;
     *status = agreed;
     return 1;
+}
+
+int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
+                                  const char *operation, int *status,
+                                  char *err, size_t errlen) {
+    return tp_collect_status(tp, session_id, operation, status, 0, 0ull, err, errlen);
+}
+
+int pulsar_tp_wait_command_status_digest(pulsar_tp *tp, uint64_t session_id,
+                                         const char *operation, int *status,
+                                         uint64_t own_digest, char *err, size_t errlen) {
+    return tp_collect_status(tp, session_id, operation, status, 1, own_digest, err, errlen);
 }
 
 int pulsar_tp_send_rewrite_from_common(pulsar_tp *tp, uint64_t session_id,
@@ -2991,21 +3036,70 @@ int pulsar_tp_send_sync_mm(pulsar_tp *tp, uint64_t session_id, const int *tokens
 }
 
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
-    pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
+    pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0u, 0ull };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
                          &ack, sizeof(ack));
 }
 
-int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
-                               const char *operation, char *err, size_t errlen) {
+int pulsar_tp_send_command_ack_digest(pulsar_tp *tp, uint64_t session_id, int status,
+                                      uint64_t digest) {
+    pulsar_tp_command_ack ack = { session_id, (int32_t)status, PULSAR_TP_ACK_HAS_DIGEST, digest };
+    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
+                         &ack, sizeof(ack));
+}
+
+uint64_t pulsar_tp_logits_digest(const float *logits, uint32_t n_rows, uint32_t width) {
+    /* Four independent multiply-xor chains over uint64 words, folded at the
+     * end; the row count and width seed the chains so a short or long vector
+     * cannot collide with a full one by matching bytes.  Word-wise because a
+     * byte-wise hash costs a served batch (tens of MB per step) milliseconds;
+     * this one runs near memory speed. */
+    const uint64_t K = 0x9E3779B97F4A7C15ull;
+    uint64_t h0 = K ^ ((uint64_t)n_rows << 32 | width), h1 = h0 * 3, h2 = h0 * 5, h3 = h0 * 7;
+    const size_t n_bytes = (size_t)n_rows * width * sizeof(float);
+    const unsigned char *b = (const unsigned char *)logits;
+    size_t i = 0;
+    for (; i + 32 <= n_bytes; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, b + i, 8); memcpy(&w1, b + i + 8, 8);
+        memcpy(&w2, b + i + 16, 8); memcpy(&w3, b + i + 24, 8);
+        h0 = (h0 ^ w0) * K; h1 = (h1 ^ w1) * K; h2 = (h2 ^ w2) * K; h3 = (h3 ^ w3) * K;
+    }
+    for (; i + 8 <= n_bytes; i += 8) {
+        uint64_t w; memcpy(&w, b + i, 8);
+        h0 = (h0 ^ w) * K;
+    }
+    if (i < n_bytes) {
+        uint64_t w = 0; memcpy(&w, b + i, n_bytes - i);
+        h0 = (h0 ^ w) * K;
+    }
+    uint64_t h = (h0 ^ (h1 >> 29)) * K ^ (h2 * 3 + (h3 >> 17));
+    h ^= h >> 32; h *= K; h ^= h >> 29;
+    return h;
+}
+
+void pulsar_tp_identity_stats(const pulsar_tp *tp, uint64_t *frames, uint64_t *matched) {
+    if (frames) *frames = tp ? tp->identity_frames : 0;
+    if (matched) *matched = tp ? tp->identity_matched : 0;
+}
+
+/* The one collector behind the three ack waits.  `mode`: PLAIN = one ack per
+ * peer, a digest-bearing ack is a protocol confusion and refuses; DIGEST =
+ * every peer's ack must carry a digest equal to `own_digest`; DRAIN = read the
+ * acks in any shape and ignore their verdicts (the caller's own body already
+ * failed). */
+enum { TP_ACK_PLAIN = 0, TP_ACK_DIGEST = 1, TP_ACK_DRAIN = 2 };
+
+static int tp_collect_acks(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                           int mode, uint64_t own_digest, char *err, size_t errlen) {
     /* One ack per PEER: every worker must have applied the command, and all
      * must succeed.  The first failure names the rank that refused -- but a
-     * refusal (an ack that arrived with a nonzero status or a foreign session
-     * id) does NOT stop the collect: the remaining peers' acks are still read,
-     * because an ack left in a socket would be consumed by the NEXT operation
-     * and shift every later frame on that link by one.  Only a dead link
-     * (timeout, closed channel, malformed frame) returns at once, since nothing
-     * more can be trusted from it. */
+     * refusal (an ack that arrived with a nonzero status, a foreign session
+     * id, or a digest that does not match) does NOT stop the collect: the
+     * remaining peers' acks are still read, because an ack left in a socket
+     * would be consumed by the NEXT operation and shift every later frame on
+     * that link by one.  Only a dead link (timeout, closed channel, malformed
+     * frame) returns at once, since nothing more can be trusted from it. */
     if (!tp || tp->n_peers < 1) return 0;
     const double deadline = tp_control_deadline(tp);
     int refused = 0;
@@ -3030,15 +3124,66 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                        tp->peers[i].rank, operation ? operation : "command");
             return 0;
         }
-        if ((ack.session_id != session_id || ack.status != 0) && !refused) {
-            refused = 1;
-            tp_set_err(err, errlen,
-                       "tp: rank %d %s failed (session %llu, status %d)",
-                       tp->peers[i].rank, operation ? operation : "command",
-                       (unsigned long long)ack.session_id, (int)ack.status);
+        if (mode == TP_ACK_DRAIN) continue;
+        const int has_digest = (ack.flags & PULSAR_TP_ACK_HAS_DIGEST) != 0;
+        if (ack.session_id != session_id || ack.status != 0) {
+            if (!refused) {
+                refused = 1;
+                tp_set_err(err, errlen,
+                           "tp: rank %d %s failed (session %llu, status %d)",
+                           tp->peers[i].rank, operation ? operation : "command",
+                           (unsigned long long)ack.session_id, (int)ack.status);
+            }
+            continue;
+        }
+        if (has_digest != (mode == TP_ACK_DIGEST)) {
+            /* The peer answered a different kind of command than the leader
+             * sent: the two are not running the same operation. */
+            pulsar_tp_mark_failed(tp);
+            if (!refused) {
+                refused = 1;
+                tp_set_err(err, errlen,
+                           "tp: rank %d answered %s with %s logits digest -- the ranks are not "
+                           "running the same operation",
+                           tp->peers[i].rank, operation ? operation : "the command",
+                           has_digest ? "an unexpected" : "no");
+            }
+            continue;
+        }
+        if (mode == TP_ACK_DIGEST) {
+            tp->identity_frames++;
+            if (ack.digest == own_digest) {
+                tp->identity_matched++;
+            } else {
+                pulsar_tp_mark_failed(tp);
+                if (!refused) {
+                    refused = 1;
+                    tp_set_err(err, errlen,
+                               "tp: rank %d's logits differ from the leader's on %s (digest "
+                               "%016llx vs %016llx) -- the ranks did not assemble the same vector; "
+                               "refusing, the group is marked failed",
+                               tp->peers[i].rank, operation ? operation : "the command",
+                               (unsigned long long)ack.digest, (unsigned long long)own_digest);
+                }
+            }
         }
     }
     return refused ? 0 : 1;
+}
+
+int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
+                               const char *operation, char *err, size_t errlen) {
+    return tp_collect_acks(tp, session_id, operation, TP_ACK_PLAIN, 0ull, err, errlen);
+}
+
+int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
+                                      const char *operation, uint64_t own_digest,
+                                      char *err, size_t errlen) {
+    return tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
+}
+
+void pulsar_tp_drain_command_acks(pulsar_tp *tp) {
+    (void)tp_collect_acks(tp, 0ull, "drain", TP_ACK_DRAIN, 0ull, NULL, 0);
 }
 
 int pulsar_tp_send_stop(pulsar_tp *tp) {

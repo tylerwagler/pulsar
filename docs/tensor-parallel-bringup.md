@@ -184,11 +184,21 @@ ssh, in rank order, and grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-
 `PULSAR_TP_DRYRUN=1` prints the plan). Its two legs:
 
 - **LEG A — the one that matters, and it needs NO reference.** Every rank must
-  produce BYTE-IDENTICAL logprobs. That IS slice 4d's contract: each rank
-  computes only its own vocab range, the group all-gathers, and every rank
-  assembles the full vector — so all ranks must agree. A wrong range partition,
-  a wrong gather or a wrong assembly shows up here as ranks disagreeing, by
-  name. This is the instrument that proves the vocab split ran the lane.
+  assemble BYTE-IDENTICAL logits on every frame. That IS slice 4d's contract:
+  each rank computes only its own vocab range, the group all-gathers, and every
+  rank assembles the full vector — so all ranks must agree. Since 4e a worker
+  never writes logprobs, so the check is in the engine (L243, protocol v11):
+  the ack of every logits-producing frame (eval, batch decode, mixed batch,
+  and the positive verdict of the CLI's one-frame `generate_speculative`)
+  carries the worker's 64-bit digest of its assembled vector; the leader
+  digests its own, refuses the frame by name on a mismatch (and marks the
+  group failed), and prints the tally at close:
+  `pulsar: tp: cross-rank logits identity: M/N worker frames matched`. The
+  grading tool reads that line from rank 0's stderr and passes only when the
+  line exists, N > 0 and M = N. A wrong range partition, a wrong gather or a
+  wrong assembly shows up as a refusal naming the rank and the frame. This is
+  the instrument that proves the vocab split ran the lane — the production
+  lane, on every frame, not a side file.
 - **DSpark stays ON in this run.**  Speculation on a pair is lockstep because
   the CLI's `generate_speculative` synchronizes the rng with the leader before
   its first draw (4e, 2026-09-23); every accept test and carry then follows the
@@ -240,14 +250,24 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 > only when the engine exited — rank 0 sat in `accept()` and rank 1 was never
 > launched. A missing rank stderr is now a scan failure, not "clean".
 >
-> **Open for Tyler — LEG A is stale against slice 4e.** LEG A asserts every
-> rank's `rank<r>.lp.json` is byte-identical, but a worker rank now runs the
-> receive loop and is stopped by the leader before any head, so it never writes
-> the file and the leg can only FAIL (`logprobs missing … which is itself a
-> failure`). Either the worker loop honors `--dump-logprobs` (the true 4d
-> vocab-gather proof: every rank assembles the full vector) or the pair's
-> fidelity instrument is LEG C alone. Until decided, a pair run is judged by:
-> every rank rc=0, scan clean, rank 0 logprobs present and cross-run identical.
+> **LEG A under slice 4e (resolved 2026-09-23 evening, L243).** The first live
+> run's LEG A compared `rank<r>.lp.json` files, which a worker rank no longer
+> writes (it runs the receive loop and is stopped by the leader before any
+> head), so the leg could only fail. The check now lives in the engine: every
+> logits-producing frame's ack carries the worker's digest of its assembled
+> logits, the leader compares it with its own on every frame, refuses by name
+> on a mismatch, and prints `cross-rank logits identity: M/N worker frames
+> matched` at close; the grading tool reads that line. Protocol v11 — both
+> ranks must run the same binary (the hello refuses a version mismatch). Not
+> yet run on the pair: the next pair session (2026-09-24) is the first to
+> exercise it. What N will read: the CLI with DSpark on (the default, and the
+> grading tool's run) issues its whole generation as ONE
+> `generate_speculative` frame, whose positive verdict carries the digest of
+> the run's last row — so expect `1/1`; with `--no-dspark` every token is an
+> eval frame and N is the token count; the served lane's mixed-batch steps are
+> checked one frame per step. The speculative ROUND frames the server uses
+> (round begin/end, redraft) do not carry a digest yet — that is the next
+> slice of this instrument.
 
 ## Rollback
 

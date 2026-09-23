@@ -5,13 +5,22 @@
 # bringup.md step 6), runs the SAME greedy prompt on every rank, and grades the
 # result.  It splits into two legs:
 #
-#   LEG A (the strong one, needs no reference): every rank must produce
-#   BYTE-IDENTICAL logprobs.  The vocab split's contract is that each rank
-#   computes only its own vocab range, all-gathers the group's ranges and
-#   assembles the FULL vector -- so every rank must end with the same logits.
-#   If the gather, the range partition or the assembly is wrong, the ranks
-#   disagree and this leg fails by name.  This is the "instrument proves it ran
-#   the lane" check for slice 4d.
+#   LEG A (the strong one, needs no reference): every rank must assemble
+#   BYTE-IDENTICAL logits on every frame.  The vocab split's contract is that
+#   each rank computes only its own vocab range, all-gathers the group's ranges
+#   and assembles the FULL vector -- so every rank must end with the same
+#   logits.  Since slice 4e a worker rank runs the receive loop and never
+#   writes logprobs, so the check lives IN THE ENGINE (L243, protocol v11):
+#   every logits-producing frame's ack (eval, batch decode, mixed batch, the
+#   CLI's one-frame generate_speculative) carries the worker's digest of its
+#   assembled vector, the leader compares it with its own and refuses the
+#   frame by name on a mismatch, and prints the tally at close --
+#   `tp: cross-rank logits identity: M/N worker frames matched`.  This leg
+#   reads that line from rank 0's stderr: it must exist, N must be > 0 and
+#   M must equal N.  If the gather, the range partition or the assembly is
+#   wrong, the ranks disagree and the engine refuses; a missing line means
+#   rank 0 never closed its transport cleanly.  This is the "instrument proves
+#   it ran the lane" check for slice 4d, on the production lane, every frame.
 #
 #   LEG B (optional): grade one rank against a SINGLE-BOX baseline.  TP is NOT
 #   byte-exact (partials are summed in a new order), so this leg is a tolerance
@@ -83,7 +92,8 @@
 # check.
 #
 # Exit: 0 only if the preflight passed, every rank exited 0, no rank
-# refused/desynced, and LEG A (all ranks byte-identical) passed.
+# refused/desynced, and LEG A (every frame's logits identical across ranks,
+# from the engine's own tally) passed.
 
 set -u
 
@@ -290,25 +300,34 @@ for r in $(seq 0 $((N - 1))); do
     fi
 done
 
-# ---- LEG A: every rank must agree byte-for-byte -----------------------------
-echo "--- LEG A: cross-rank logprobs identity (the vocab gather's contract) ---"
-for r in $(seq 1 $((N - 1))); do
-    if ssh $SSH_ARGS -o BatchMode=yes "${RANKS[0]}" "cat $WORKDIR/rank0.lp.json" > /tmp/.tp-grade-r0.json 2>/dev/null \
-       && ssh $SSH_ARGS -o BatchMode=yes "${RANKS[$r]}" "cat $WORKDIR/rank$r.lp.json" > /tmp/.tp-grade-rr.json 2>/dev/null \
-       && [ -s /tmp/.tp-grade-r0.json ] && [ -s /tmp/.tp-grade-rr.json ]; then
-        if cmp -s /tmp/.tp-grade-r0.json /tmp/.tp-grade-rr.json; then
-            echo "  rank 0 == rank $r: BYTE-IDENTICAL ($(wc -c < /tmp/.tp-grade-r0.json) bytes)"
-        else
-            echo "  rank 0 != rank $r: DIFFER -- the assembly disagreed across ranks"
-            diff <(head -c 400 /tmp/.tp-grade-r0.json) <(head -c 400 /tmp/.tp-grade-rr.json) | head -6
-            fail=1
-        fi
+# ---- LEG A: every rank must agree byte-for-byte, on every frame -------------
+# The engine's own tally (L243): the leader compared every worker's logits
+# digest with its own on every eval / batch / mixed frame and prints the count
+# at close.  A mismatch also refused the frame by name, which the scan above
+# catches; this leg fails closed on a missing line or an incomplete tally.
+echo "--- LEG A: cross-rank logits identity (the vocab gather's contract, every frame) ---"
+tally=$(ssh $SSH_ARGS -o BatchMode=yes "${RANKS[0]}" \
+        "grep -oE 'cross-rank logits identity: [0-9]+/[0-9]+ worker frames matched' $WORKDIR/rank0.err 2>/dev/null | tail -1")
+if [ -z "$tally" ]; then
+    echo "  rank 0 printed no identity tally -- the leader never closed its transport"
+    echo "  cleanly (or ran a binary older than L243); nothing proves the ranks agreed"
+    fail=1
+else
+    m=${tally#*identity: }; m=${m%%/*}
+    n=${tally#*/}; n=${n%% *}
+    if [ "$n" -gt 0 ] 2>/dev/null && [ "$m" = "$n" ]; then
+        echo "  rank 0: $m/$n worker frames matched -- every frame's logits were BYTE-IDENTICAL"
+        echo "          across all $N ranks (each frame = one peer ack per worker; the CLI with"
+        echo "          DSpark on is ONE generate_speculative frame, digested on its last row)"
+    elif [ "${n:-0}" -eq 0 ] 2>/dev/null; then
+        echo "  rank 0: $tally -- no logits-producing frame ran; nothing was checked"
+        fail=1
     else
-        echo "  rank $r: logprobs missing or empty -- cannot grade (a rank that never"
-        echo "           reached the head produces no file, which is itself a failure)"
+        echo "  rank 0: $tally -- $((n - m)) frame(s) DIFFERED across ranks; the engine"
+        echo "          refused the first by name (see the scan above)"
         fail=1
     fi
-done
+fi
 
 # ---- LEG B (optional, tolerance only): grade against a single-box baseline ---
 if [ -n "$BASELINE" ]; then
