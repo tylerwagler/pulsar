@@ -243,6 +243,45 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
               "rank %d: a layer past n_layer returned a batch region", rank);
     }
 
+    /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
+     * command and collects one ack PER PEER; every other rank receives it and
+     * acks.  This is the control path an n-rank session mirror rides, so it
+     * only works if both the broadcast and the per-peer collect are n-general
+     * -- which is precisely what the pair-only version could not do. */
+    for (int round = 0; round < 2; round++) {
+        /* TWO rounds with distinct session ids: a collect that read only the
+         * FIRST peer's ack would leave the other peers' acks queued, and round
+         * two would then read a stale ack whose session id does not match --
+         * so this catches a partial collect, which a single round would not. */
+        const uint64_t sid = 0xC0DE1234ULL + (uint64_t)round;
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            if (!pulsar_tp_send_session_create(tp, sid, 4096)) {
+                CHECK(0, "rank 0 command broadcast failed");
+            } else {
+                CHECK(pulsar_tp_wait_command_ack(tp, sid, "session create",
+                                                 cerr, sizeof(cerr)),
+                      "rank 0 wait_command_ack over %d peers: %s", n - 1, cerr);
+            }
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SESSION_CREATE,
+                      "rank %d received frame type %d, expected SESSION_CREATE (%d)",
+                      rank, (int)cmd.type, (int)PULSAR_TP_FRAME_SESSION_CREATE);
+                CHECK(cmd.session_id == sid,
+                      "rank %d received session %llu, expected %llu", rank,
+                      (unsigned long long)cmd.session_id, (unsigned long long)sid);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
+                      "rank %d ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
