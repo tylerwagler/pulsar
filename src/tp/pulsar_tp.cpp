@@ -2544,6 +2544,22 @@ typedef struct {
     uint32_t reserved;
 } pulsar_tp_command_ack;
 
+/* Broadcast ONE frame to every peer's control socket.  The command plane is
+ * leader -> workers, so an n-rank group must reach all n_ranks-1 of them; for
+ * the pair this is exactly the old single send, because control_fd IS
+ * peers[0].  Worker -> leader frames (ack, logits half, verify) do NOT come
+ * through here: a worker has one peer, the leader, so its control_fd is already
+ * that link. */
+static int tp_send_frame_to_peers(pulsar_tp *tp, uint32_t type,
+                                  const void *payload, uint32_t bytes) {
+    if (!tp || tp->n_peers < 1) return 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        if (tp->peers[i].control_fd < 0) return 0;
+        if (!tp_send_frame(tp->peers[i].control_fd, type, payload, bytes)) return 0;
+    }
+    return 1;
+}
+
 static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
                                  uint64_t session_id, const int *tokens,
                                  uint32_t count) {
@@ -2557,54 +2573,47 @@ static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = reinterpret_cast<int32_t *>(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_send_frame_to_peers(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
 int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (session create)");
     pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_SESSION_CREATE,
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_session_destroy(pulsar_tp *tp, uint64_t session_id) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (session destroy)");
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_SESSION_DESTROY,
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SESSION_DESTROY,
                          &session_id, sizeof(session_id));
 }
 
 int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
                         const int *tokens, uint32_t n_tokens) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (sync)");
     return tp_send_token_command(tp, PULSAR_TP_FRAME_SYNC, session_id,
                                  tokens, n_tokens);
 }
 
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
                         uint64_t seq, int token) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (eval)");
     pulsar_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (rewind)");
     pulsar_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_REWIND,
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (invalidate)");
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_INVALIDATE,
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
 }
 
 int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
                               uint32_t count) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (eval batch)");
     const uint64_t bytes64 = sizeof(pulsar_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
     if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
@@ -2614,7 +2623,7 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
     pulsar_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_EVAL_BATCH,
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2624,7 +2633,6 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
                                const int *prompt, uint32_t prompt_count,
                                const pulsar_tp_batch_item *items,
                                uint32_t count) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (mixed batch)");
     const uint64_t prompt_bytes = (uint64_t)prompt_count * sizeof(int32_t);
     const uint64_t item_bytes = (uint64_t)count * sizeof(*items);
     const uint64_t bytes64 = sizeof(pulsar_tp_mixed_command_header) +
@@ -2643,14 +2651,13 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_MIXED_BATCH,
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_MIXED_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
 }
 
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (ack)");
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
                          &ack, sizeof(ack));
@@ -2658,23 +2665,28 @@ int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
 
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation, char *err, size_t errlen) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (wait ack)");
-    uint32_t type = 0, bytes = 0;
-    pulsar_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != PULSAR_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
-        pulsar_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp: worker failed during %s",
-                   operation ? operation : "command");
-        return 0;
-    }
-    if (ack.session_id != session_id || ack.status != 0) {
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
-        return 0;
+    /* One ack per PEER: every worker must have applied the command, and all
+     * must succeed.  The first failure names the rank that refused. */
+    if (!tp || tp->n_peers < 1) return 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        const int pfd = tp->peers[i].control_fd;
+        uint32_t type = 0, bytes = 0;
+        pulsar_tp_command_ack ack;
+        if (pfd < 0 || !tp_read_frame_header(pfd, &type, &bytes) ||
+            type != PULSAR_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+            !tp_read_full(pfd, &ack, sizeof(ack))) {
+            pulsar_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: rank %d failed during %s",
+                       tp->peers[i].rank, operation ? operation : "command");
+            return 0;
+        }
+        if (ack.session_id != session_id || ack.status != 0) {
+            tp_set_err(err, errlen,
+                       "tp: rank %d %s failed (session %llu, status %d)",
+                       tp->peers[i].rank, operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+            return 0;
+        }
     }
     return 1;
 }
@@ -2689,7 +2701,7 @@ int pulsar_tp_send_stop(pulsar_tp *tp) {
                 !tp_send_frame(tp->peers[i].control_fd, PULSAR_TP_FRAME_STOP, NULL, 0))
                 ok = 0;
     } else if (tp->control_fd >= 0) {
-        ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_STOP, NULL, 0);
+        ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_STOP, NULL, 0);
     }
     return ok;
 }
@@ -2726,7 +2738,6 @@ static int tp_command_decode_tokens(pulsar_tp_command *command,
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "command plane (recv)");
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
