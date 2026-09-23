@@ -30,7 +30,13 @@ struct pulsar_tp_worker_slot {
     pulsar_session *s;
     float *logits;          /* this rank's decode output; sized on first use */
     uint32_t logits_rows;
-    uint64_t rng;           /* the leader's speculation stream, once shipped */
+    /* Increment 4: one speculative round per bank, created on first use.  The
+     * leader keys its rounds by scheduler slot and names the BANK in every
+     * round frame; the bank is the identity this rank keys by. */
+    pulsar_spec_round **rounds;
+    uint32_t n_rounds;
+    int *accepted;          /* the accept walk's output, unread here */
+    int accepted_cap;
 };
 
 static pulsar_tp_worker_slot *worker_find(pulsar_engine *e, uint64_t id) {
@@ -53,6 +59,9 @@ static pulsar_tp_worker_slot *worker_add(pulsar_engine *e, pulsar_session *s) {
 }
 
 static void worker_drop(pulsar_engine *e, pulsar_tp_worker_slot *slot) {
+    for (uint32_t b = 0; b < slot->n_rounds; b++) pulsar_spec_round_free(slot->rounds[b]);
+    free(slot->rounds);
+    free(slot->accepted);
     slot->s->destroy();
     free(slot->logits);
     *slot = e->tp_worker_slots[e->tp_worker_n - 1u];
@@ -71,6 +80,28 @@ static float *worker_logits(pulsar_engine *e, pulsar_tp_worker_slot *slot, uint3
     }
     *cap_floats = (int)(slot->logits_rows * width);
     return slot->logits;
+}
+
+/* The round for `bank` on this rank, created on first use. */
+static pulsar_spec_round *worker_round(pulsar_tp_worker_slot *slot, int bank) {
+    if (bank < 0) return NULL;
+    if ((uint32_t)bank >= slot->n_rounds) {
+        const uint32_t want = (uint32_t)bank + 1u;
+        slot->rounds = (pulsar_spec_round **)xrealloc(slot->rounds, (size_t)want * sizeof(*slot->rounds));
+        for (uint32_t b = slot->n_rounds; b < want; b++) slot->rounds[b] = NULL;
+        slot->n_rounds = want;
+    }
+    if (!slot->rounds[bank]) slot->rounds[bank] = pulsar_spec_round_new();
+    return slot->rounds[bank];
+}
+
+static int *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
+    if (cap < 1) cap = 1;
+    if (cap > slot->accepted_cap) {
+        slot->accepted = (int *)xrealloc(slot->accepted, (size_t)cap * sizeof(int));
+        slot->accepted_cap = cap;
+    }
+    return slot->accepted;
 }
 
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
@@ -305,16 +336,117 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         return worker_ack(e, c->session_id, status, err, errlen);
     }
 
-    case PULSAR_TP_FRAME_RNG_STATE:
-        if (worker_refused(e, c, "rng sync", &slot, ferr, sizeof(ferr))) {
-            pulsar_tp_mirror_fail_void(tp, "rng sync", ferr);
+    /* ---- the speculative round family (increment 4).  The rng each call
+     * consumes arrived on the frame; the logits block is this rank's own from
+     * the mirrored forward (identical after the vocab all-gather). ---- */
+    case PULSAR_TP_FRAME_SPEC_NEXT_BASE: {
+        int status = -1;
+        if (!worker_refused(e, c, "spec_next_base", &slot, ferr, sizeof(ferr))) {
+            uint64_t rng = c->spec.rng;
+            const int first = pulsar_session_spec_next_base_local(slot->s, c->spec.temperature, c->spec.top_k,
+                                                                  c->spec.top_p, c->spec.min_p, &rng);
+            status = first + 1;
+            if (status < 0) status = 0;
+        } else fprintf(stderr, "pulsar: tp worker: spec_next_base refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SPEC_ROUND_BEGIN: {
+        int status = -1;
+        if (!worker_refused(e, c, "spec_round_begin", &slot, ferr, sizeof(ferr))) {
+            pulsar_spec_round *r = worker_round(slot, c->spec.bank);
+            const int rc = r ? pulsar_session_spec_round_begin_local(slot->s, r, c->spec.i0, c->spec.i1, c->spec.i2,
+                                                                     c->spec.temperature, c->spec.top_k, c->spec.top_p,
+                                                                     c->spec.min_p, ferr, sizeof(ferr)) : -1;
+            status = rc == 0 ? 0 : 1;
+            if (rc != 0) fprintf(stderr, "pulsar: tp worker: spec_round_begin failed: %s\n", ferr);
+        } else fprintf(stderr, "pulsar: tp worker: spec_round_begin refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SPEC_ARM_CAPTURE:
+        if (worker_refused(e, c, "spec_arm_capture", &slot, ferr, sizeof(ferr))) {
+            pulsar_tp_mirror_fail_void(tp, "spec_arm_capture", ferr);
             return 1;
         }
-        /* The leader's stream becomes this rank's for the next speculative
-         * round; the round frames (a later increment) draw from it. */
-        slot->rng = c->seq;
-        slot->s->spec_rng_synced = true;
+        pulsar_session_spec_arm_capture_local(slot->s, (uint32_t)c->spec.i0);
         return 1;
+    case PULSAR_TP_FRAME_SPEC_ROUND_END: {
+        int status = -1;
+        if (!worker_refused(e, c, "spec_round_end", &slot, ferr, sizeof(ferr))) {
+            pulsar_spec_round *r = worker_round(slot, c->spec.bank);
+            const uint32_t width = (uint32_t)e->logits_width();
+            if (!r || !slot->logits || (uint64_t)(c->spec.i3 + 1) * width > (uint64_t)slot->logits_rows * width) {
+                snprintf(ferr, sizeof(ferr), "tp: spec_round_end for bank %d has no round or no forward block on this rank", c->spec.bank);
+                fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
+            } else {
+                uint64_t rng = c->spec.rng;
+                int *acc = worker_accepted(slot, c->spec.i2);
+                const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0, c->spec.i1,
+                                                                   c->spec.temperature, c->spec.top_k, c->spec.top_p,
+                                                                   c->spec.min_p, &rng, slot->logits, (uint32_t)c->spec.i3,
+                                                                   acc, c->spec.i2, ferr, sizeof(ferr));
+                status = na + 1;
+                if (status < 0) status = 0;
+                if (na < 0) fprintf(stderr, "pulsar: tp worker: spec_round_end failed: %s\n", ferr);
+            }
+        } else fprintf(stderr, "pulsar: tp worker: spec_round_end refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SPEC_ROUND_ABORT: {
+        if (worker_refused(e, c, "spec_round_abort", &slot, ferr, sizeof(ferr))) {
+            pulsar_tp_mirror_fail_void(tp, "spec_round_abort", ferr);
+            return 1;
+        }
+        pulsar_spec_round *r = worker_round(slot, c->spec.bank);
+        if (r) pulsar_session_spec_round_abort_local(slot->s, r);
+        return 1;
+    }
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH: {
+        int status = -1;
+        if (!worker_refused(e, c, "spec_redraft_batch", &slot, ferr, sizeof(ferr))) {
+            const uint32_t n = c->spec.count;
+            pulsar_spec_round **rounds = (pulsar_spec_round **)xmalloc((n ? n : 1u) * sizeof(*rounds));
+            uint64_t *states = (uint64_t *)xmalloc((n ? n : 1u) * sizeof(*states));
+            uint64_t **rngs = (uint64_t **)xmalloc((n ? n : 1u) * sizeof(*rngs));
+            int ok = 1;
+            for (uint32_t i = 0; i < n; i++) {
+                rounds[i] = worker_round(slot, (int)c->spec_banks[i]);
+                states[i] = c->spec_rngs[i];
+                rngs[i] = &states[i];
+                if (!rounds[i]) ok = 0;
+            }
+            const int rc = ok ? pulsar_session_spec_redraft_batch_local(slot->s, rounds, c->spec_banks, rngs, (int)n,
+                                                                        ferr, sizeof(ferr)) : -1;
+            free(rounds); free(states); free(rngs);
+            status = rc == 0 ? 0 : 1;
+            if (rc != 0) fprintf(stderr, "pulsar: tp worker: spec_redraft_batch failed: %s\n", ferr);
+        } else fprintf(stderr, "pulsar: tp worker: spec_redraft_batch refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT: {
+        if (worker_refused(e, c, "spec_redraft_commit", &slot, ferr, sizeof(ferr))) {
+            pulsar_tp_mirror_fail_void(tp, "spec_redraft_commit", ferr);
+            return 1;
+        }
+        pulsar_spec_round *r = worker_round(slot, c->spec.bank);
+        if (r) pulsar_session_spec_redraft_commit_local(slot->s, r);
+        return 1;
+    }
+    case PULSAR_TP_FRAME_GENERATE_SPECULATIVE: {
+        /* The CLI's whole loop as ONE frame: with the leader's rng and the
+         * same state the member's accept walk is deterministic, so the
+         * verdict is the token count. */
+        int status = -1;
+        if (!worker_refused(e, c, "generate_speculative", &slot, ferr, sizeof(ferr))) {
+            uint64_t rng = c->spec.rng;
+            int *acc = worker_accepted(slot, c->spec.i2);
+            const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
+                                                        &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
+            status = n + 1;
+            if (status < 0) status = 0;
+            if (n < 0) fprintf(stderr, "pulsar: tp worker: generate_speculative failed: %s\n", ferr);
+        } else fprintf(stderr, "pulsar: tp worker: generate_speculative refused: %s\n", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
 
     default:
         snprintf(err, errlen, "tp: the leader sent frame type %d, which a worker does not apply", (int)c->type);

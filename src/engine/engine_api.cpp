@@ -356,20 +356,6 @@ static int tp_mirror_void_send(pulsar_tp *tp, uint64_t session_id, const char *n
     return 0;
 }
 
-int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng) {
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp || !rng) return 0;   /* pair off: the caller's stream is its own */
-    char err[256];
-    if (tp_mirror_worker_drives_nothing(tp, "the speculation rng", err, sizeof(err))) {
-        pulsar_tp_mirror_fail_void(tp, "rng sync", err);
-        return -1;
-    }
-    if (!tp_mirror_void_send(tp, s->tp_session_id, "rng sync",
-                             pulsar_tp_send_rng_state(tp, s->tp_session_id, *rng))) return -1;
-    s->spec_rng_synced = true;
-    return 0;
-}
-
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     /* A worker rank creates sessions only from the leader's frames (the loop
      * calls the member directly); a driver creating one here is refused before
@@ -768,7 +754,164 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
                              pulsar_tp_send_note_committed(tp, s->tp_session_id, toks, (uint32_t)n))) return;
     s->note_committed_tokens(toks, n);
 }
-int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
+/* ---- The speculative round family (increment 4).  Each public entry point
+ * ships a frame carrying every input the call reads INCLUDING the rng state
+ * as it stands before the call, runs the local implementation, and requires
+ * the workers' agreed verdict to equal its own.  With identical inputs on
+ * identical state -- same logits after the vocab all-gather, same drafts,
+ * same rng -- the walk is a deterministic function, so a split verdict is a
+ * divergence.  Verdicts that can be -1 ride the wire as value + 1. */
+static pulsar_tp_spec_command tp_spec_cmd(const pulsar_session *s, int bank) {
+    pulsar_tp_spec_command c;
+    memset(&c, 0, sizeof(c));
+    c.session_id = s->tp_session_id;
+    c.bank = bank;
+    return c;
+}
+static int tp_spec_live_bank(const pulsar_session *s) {
+    return (int)gpu_graph_cur_bank(&s->graph);
+}
+/* Returns 1 when the operation may run locally without mirroring (pair off),
+ * 0 when it was refused (err filled), 2 when it must be mirrored. */
+static int tp_spec_route(pulsar_session *s, const char *operation, pulsar_tp **tp_out,
+                         char *err, size_t errlen) {
+    *tp_out = tp_mirror_target(s);
+    if (!*tp_out) return 1;
+    if (tp_mirror_worker_drives_nothing(*tp_out, operation, err, errlen)) return 0;
+    if (tp_mirror_dead(*tp_out, err, errlen)) return 0;
+    return 2;
+}
+
+int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    if (!s) return 0;
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "generate_speculative", &tp, err, errlen);
+    if (route == 0) return -1;
+    if (route == 1) return s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen);
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.i0 = max_tokens; c.i1 = eos_token; c.i2 = accepted_cap;
+    c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
+    c.rng = rng ? *rng : 0;
+    if (pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &c, NULL, NULL) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror generate_speculative to the workers");
+        return -1;
+    }
+    const int own = s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen);
+    const int agreed = tp_mirror_bank_verdict(s, tp, "generate_speculative", own + 1, -1);
+    return agreed < 0 ? -1 : own;
+}
+int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!s) return -1;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_next_base", &tp, err, sizeof(err));
+    if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return -1; }
+    if (route == 1) return pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, rng);
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
+    c.rng = rng ? *rng : 0;
+    if (pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_NEXT_BASE, &c, NULL, NULL) == 0) {
+        pulsar_tp_mirror_fail_void(tp, "spec_next_base", "the frame could not be shipped");
+        return -1;
+    }
+    const int own = pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, rng);
+    const int agreed = tp_mirror_bank_verdict(s, tp, "spec_next_base", own + 1, -1);
+    return agreed < 0 ? -1 : own;
+}
+int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, int first_token, int max_tokens, int accepted_cap, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
+    if (!s) return -1;
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_round_begin", &tp, err, errlen);
+    if (route == 0) return -1;
+    if (route == 1) return pulsar_session_spec_round_begin_local(s, r, first_token, max_tokens, accepted_cap, temperature, top_k, top_p, min_p, err, errlen);
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.i0 = first_token; c.i1 = max_tokens; c.i2 = accepted_cap;
+    c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
+    if (pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_BEGIN, &c, NULL, NULL) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror spec_round_begin to the workers");
+        return -1;
+    }
+    const int own = pulsar_session_spec_round_begin_local(s, r, first_token, max_tokens, accepted_cap, temperature, top_k, top_p, min_p, err, errlen);
+    return tp_mirror_bank_verdict(s, tp, "spec_round_begin", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
+}
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int first_token, int eos_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, const float *rows, uint32_t row0, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    if (!s) return -1;
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_round_end", &tp, err, errlen);
+    if (route == 0) return -1;
+    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, eos_token, temperature, top_k, top_p, min_p, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    /* The logits block is NOT shipped: every rank holds the same block from
+     * its own mirrored forward (the vocab all-gather made them identical), so
+     * only row0 crosses. */
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.i0 = first_token; c.i1 = eos_token; c.i2 = accepted_cap; c.i3 = (int32_t)row0;
+    c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
+    c.rng = rng ? *rng : 0;
+    if (pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_END, &c, NULL, NULL) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror spec_round_end to the workers");
+        return -1;
+    }
+    const int own = pulsar_session_spec_round_end_local(s, r, first_token, eos_token, temperature, top_k, top_p, min_p, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    const int agreed = tp_mirror_bank_verdict(s, tp, "spec_round_end", own + 1, -1);
+    return agreed < 0 ? -1 : own;
+}
+void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
+    if (!s) return;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_round_abort", &tp, err, sizeof(err));
+    if (route == 0) { pulsar_tp_mirror_fail_void(tp, "spec_round_abort", err); return; }
+    if (route == 1) { pulsar_session_spec_round_abort_local(s, r); return; }
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "spec_round_abort",
+                             pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_ABORT, &c, NULL, NULL))) return;
+    pulsar_session_spec_round_abort_local(s, r);
+}
+void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
+    if (!s) return;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_arm_capture", &tp, err, sizeof(err));
+    if (route == 0) { pulsar_tp_mirror_fail_void(tp, "spec_arm_capture", err); return; }
+    if (route == 1) { pulsar_session_spec_arm_capture_local(s, n_rows); return; }
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.i0 = (int32_t)n_rows;
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "spec_arm_capture",
+                             pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ARM_CAPTURE, &c, NULL, NULL))) return;
+    pulsar_session_spec_arm_capture_local(s, n_rows);
+}
+int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n, char *err, size_t errlen) {
+    if (!s) return -1;
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_redraft_batch", &tp, err, errlen);
+    if (route == 0) return -1;
+    if (route == 1) return pulsar_session_spec_redraft_batch_local(s, rounds, banks, rngs, n, err, errlen);
+    if (n < 0 || (n > 0 && (!banks || !rngs))) return -1;
+    uint64_t *states = (uint64_t *)xmalloc(((size_t)n ? (size_t)n : 1u) * sizeof(uint64_t));
+    for (int i = 0; i < n; i++) states[i] = rngs[i] ? *rngs[i] : 0;
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.count = (uint32_t)n;
+    const int sent = pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH, &c, banks, states);
+    free(states);
+    if (sent == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror spec_redraft_batch to the workers");
+        return -1;
+    }
+    const int own = pulsar_session_spec_redraft_batch_local(s, rounds, banks, rngs, n, err, errlen);
+    return tp_mirror_bank_verdict(s, tp, "spec_redraft_batch", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
+}
+void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {
+    if (!s) return;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "spec_redraft_commit", &tp, err, sizeof(err));
+    if (route == 0) { pulsar_tp_mirror_fail_void(tp, "spec_redraft_commit", err); return; }
+    if (route == 1) { pulsar_session_spec_redraft_commit_local(s, r); return; }
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "spec_redraft_commit",
+                             pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT, &c, NULL, NULL))) return;
+    pulsar_session_spec_redraft_commit_local(s, r);
+}
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) {
     /* The pair-off shape is untouched: one call, no TP code on the live path. */

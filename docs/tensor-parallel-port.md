@@ -125,7 +125,17 @@ negative status is a worker's refusal, never a verdict.  The leader's
 scheduler decides, the frame carries the decision, the ordinal names the
 target; (3) LANDED with (1): `rewrite_from_common` (verdict, wire status =
 result + 1 because ERROR is -1), `note_committed_tokens` (void) and
-`set_logits` (the vector rides the frame; verdict);
+`set_logits` (the vector rides the frame; verdict); (4) LANDED with (1): the
+speculative round family -- `spec_next_base`, `round_begin`, `arm_capture`,
+`round_end`, `round_abort`, `redraft_batch`, `redraft_commit` and the CLI's
+`generate_speculative` as one frame.  Every frame that draws carries the rng
+state it consumes (the earlier per-session rng-state frame could not follow
+the server, which interleaves banks between the base draw and the accept
+walk; it is retired, number never reused).  The logits block is never
+shipped: each rank's own mirrored forward left it identical, so only `row0`
+crosses.  Verdicts that can be -1 ride the wire as value + 1.  The worker
+keeps one round per bank per session; the leader names the live bank on every
+round frame;
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a

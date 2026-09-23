@@ -646,57 +646,6 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
-    /* The rng-state frame: the pair's ONE speculation stream.  Fire-and-forget
-     * like the void operations -- a draw site has nowhere to put a refusal and a
-     * leader that waited would hang on the first round a peer did not make -- so
-     * what this round proves is that the state survives the wire EXACTLY (a
-     * truncated or reordered 64-bit value would silently desync the walk) and
-     * that no ack is emitted: the round after it is acked under a different
-     * session id, and a stray ack would be read by that collect and fail it. */
-    {
-        const uint64_t void_sid = 0xC0DE6000ULL;
-        const uint64_t ack_sid  = 0xC0DE6001ULL;
-        const uint64_t state = 0x0123456789ABCDEFull;
-        int tokens[3] = { 11, 12, 13 };
-        char cerr[256];
-        cerr[0] = 0;
-        if (rank == 0) {
-            CHECK(pulsar_tp_send_rng_state(tp, void_sid, state) != 0,
-                  "rank 0 rng-state send must report success as nonzero");
-            CHECK(pulsar_tp_send_sync(tp, ack_sid, tokens, 3) != 0,
-                  "rank 0 post-rng sync send failed");
-            CHECK(pulsar_tp_wait_command_ack(tp, ack_sid, "post-rng sync",
-                                             cerr, sizeof(cerr)),
-                  "rank 0 collected a stray or missing ack after the rng frame: %s", cerr);
-        } else {
-            pulsar_tp_command cmd;
-            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
-                CHECK(0, "rank %d rng-state recv_command: %s", rank, cerr);
-            } else {
-                CHECK(cmd.type == PULSAR_TP_FRAME_RNG_STATE && cmd.session_id == void_sid,
-                      "rank %d got frame type %d session %llu, expected RNG_STATE (%d) session %llu",
-                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
-                      (int)PULSAR_TP_FRAME_RNG_STATE, (unsigned long long)void_sid);
-                CHECK(cmd.seq == state,
-                      "rank %d rng state %llu, expected %llu -- a bit-exact value or the "
-                      "walk desyncs",
-                      rank, (unsigned long long)cmd.seq, (unsigned long long)state);
-                pulsar_tp_command_free(&cmd);
-            }
-            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
-                CHECK(0, "rank %d post-rng sync recv_command: %s", rank, cerr);
-            } else {
-                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC && cmd.session_id == ack_sid,
-                      "rank %d got frame type %d session %llu, expected SYNC (%d) session %llu",
-                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
-                      (int)PULSAR_TP_FRAME_SYNC, (unsigned long long)ack_sid);
-                CHECK(pulsar_tp_send_command_ack(tp, ack_sid, 0),
-                      "rank %d post-rng sync ack failed", rank);
-                pulsar_tp_command_free(&cmd);
-            }
-        }
-    }
-
     /* Increment 2: the bank frames and the VERDICT collector.  Four rounds:
      * a void save followed by an acked restore (a stray ack from the save
      * would be read by the restore's collect and fail it); a partial fork
@@ -845,6 +794,55 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Increment 4: the speculative payload -- every field and the 64-bit rng
+     * must survive the wire exactly (a truncated rng silently desyncs the accept
+     * walk), REDRAFT_BATCH's arrays must arrive in order, and the verdict rides
+     * the ordinary collector. */
+    {
+        const uint64_t sid = 0xC0DE9000ULL;
+        char cerr[256];
+        cerr[0] = 0;
+        pulsar_tp_spec_command c;
+        std::memset(&c, 0, sizeof(c));
+        c.session_id = sid; c.bank = 3; c.i0 = 777; c.i1 = 2; c.i2 = 17; c.i3 = 5;
+        c.temperature = 0.7f; c.top_p = 0.95f; c.min_p = 0.05f; c.top_k = 40;
+        c.rng = 0xFEDCBA9876543210ull;
+        const uint32_t banks[3] = { 1, 4, 6 };
+        const uint64_t rngs[3] = { 11ull, 0x1122334455667788ull, 33ull };
+        if (rank == 0) {
+            int status = -99;
+            CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_END, &c, NULL, NULL) != 0, "rank 0 round-end send failed");
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "spec_round_end", &status, cerr, sizeof(cerr)) && status == 4,
+                  "rank 0 round-end verdict: want 4 (3 accepted + 1), got %d (%s)", status, cerr);
+            c.count = 3;
+            CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH, &c, banks, rngs) != 0, "rank 0 redraft send failed");
+            status = -99;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "spec_redraft_batch", &status, cerr, sizeof(cerr)) && status == 0,
+                  "rank 0 redraft verdict: want 0, got %d (%s)", status, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d round-end recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SPEC_ROUND_END && cmd.session_id == sid && cmd.spec.bank == 3 &&
+                      cmd.spec.i0 == 777 && cmd.spec.i1 == 2 && cmd.spec.i2 == 17 && cmd.spec.i3 == 5 &&
+                      cmd.spec.temperature == 0.7f && cmd.spec.top_p == 0.95f && cmd.spec.min_p == 0.05f &&
+                      cmd.spec.top_k == 40 && cmd.spec.rng == 0xFEDCBA9876543210ull,
+                      "rank %d round-end payload differs (rng %016llx)", rank, (unsigned long long)cmd.spec.rng);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 4), "rank %d round-end ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d redraft recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH && cmd.spec.count == 3 && cmd.spec_banks && cmd.spec_rngs &&
+                      cmd.spec_banks[0] == 1 && cmd.spec_banks[2] == 6 && cmd.spec_rngs[1] == 0x1122334455667788ull &&
+                      cmd.spec_rngs[2] == 33ull,
+                      "rank %d redraft arrays differ", rank);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d redraft ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
@@ -901,7 +899,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits verdicts, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec verdicts, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

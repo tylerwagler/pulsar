@@ -2779,10 +2779,6 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
     return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count, max_head_runs);
 }
 
-int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state) {
-    pulsar_tp_eval_command msg = { session_id, state, 0, 0 };
-    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_RNG_STATE, &msg, sizeof(msg));
-}
 
 static int tp_send_bank_value(pulsar_tp *tp, uint32_t type, uint64_t session_id, uint32_t bank) {
     pulsar_tp_value_command msg = { session_id, (int32_t)bank, 0 };
@@ -2904,6 +2900,26 @@ int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
     return ok;
 }
 
+int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
+                        const uint32_t *banks, const uint64_t *rngs) {
+    if (!tp || !cmd) return 0;
+    const uint32_t n = frame_type == PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH ? cmd->count : 0u;
+    if (n && (!banks || !rngs)) return 0;
+    const uint64_t bytes64 = sizeof(*cmd) + (uint64_t)n * (sizeof(uint32_t) + sizeof(uint64_t));
+    if (bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    memcpy(payload, cmd, sizeof(*cmd));
+    if (n) {
+        memcpy(payload + sizeof(*cmd), banks, (size_t)n * sizeof(uint32_t));
+        memcpy(payload + sizeof(*cmd) + (size_t)n * sizeof(uint32_t), rngs, (size_t)n * sizeof(uint64_t));
+    }
+    const int ok = tp_send_frame_to_peers(tp, frame_type, payload, bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -2979,6 +2995,10 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     free(command->logits);
     command->logits = NULL;
     command->n_logits = 0;
+    free(command->spec_banks);
+    free(command->spec_rngs);
+    command->spec_banks = NULL;
+    command->spec_rngs = NULL;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -3042,6 +3062,31 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     case PULSAR_TP_FRAME_NOTE_COMMITTED:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
         break;
+    case PULSAR_TP_FRAME_SPEC_NEXT_BASE:
+    case PULSAR_TP_FRAME_SPEC_ROUND_BEGIN:
+    case PULSAR_TP_FRAME_SPEC_ARM_CAPTURE:
+    case PULSAR_TP_FRAME_SPEC_ROUND_END:
+    case PULSAR_TP_FRAME_SPEC_ROUND_ABORT:
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH:
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT:
+    case PULSAR_TP_FRAME_GENERATE_SPECULATIVE: {
+        if (bytes < sizeof(command->spec)) { ok = 0; break; }
+        memcpy(&command->spec, payload, sizeof(command->spec));
+        command->session_id = command->spec.session_id;
+        command->value = command->spec.bank;
+        const uint32_t n = ftype == PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH ? command->spec.count : 0u;
+        const uint64_t want = sizeof(command->spec) + (uint64_t)n * (sizeof(uint32_t) + sizeof(uint64_t));
+        if (want != bytes) { ok = 0; break; }
+        if (n) {
+            command->spec_banks = static_cast<uint32_t *>(malloc((size_t)n * sizeof(uint32_t)));
+            command->spec_rngs = static_cast<uint64_t *>(malloc((size_t)n * sizeof(uint64_t)));
+            if (!command->spec_banks || !command->spec_rngs) { ok = -1; break; }
+            memcpy(command->spec_banks, payload + sizeof(command->spec), (size_t)n * sizeof(uint32_t));
+            memcpy(command->spec_rngs, payload + sizeof(command->spec) + (size_t)n * sizeof(uint32_t),
+                   (size_t)n * sizeof(uint64_t));
+        }
+        break;
+    }
     case PULSAR_TP_FRAME_SET_LOGITS: {
         pulsar_tp_logits_command_header h;
         if (bytes < sizeof(h)) { ok = 0; break; }
@@ -3092,7 +3137,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
-    case PULSAR_TP_FRAME_RNG_STATE:
     case PULSAR_TP_FRAME_EVAL: {
         pulsar_tp_eval_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }

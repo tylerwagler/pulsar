@@ -2098,14 +2098,26 @@ typedef struct pulsar_bank_carry {
  * between them. */
 bool pulsar_session_is_mirrored(const pulsar_session *s);
 
-/** Slice 4e: give the pair ONE rng stream.  The leader ships its state and the
- * worker takes it, so every draw the speculation round makes afterwards --
- * pulsar_session_spec_next_base's fresh base, the accept tests, the carry, the
- * redraft -- is identical on every rank by construction.  Called from
- * pulsar_session_spec_next_base, the first rng consumer of a round; returns 0
- * when the caller may draw and -1 when the pair could not agree, in which case
- * it must NOT draw.  Nothing crosses the wire when the pair is off. */
-int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng);
+/** Slice 4e (L238 increment 4): the speculative round family's LOCAL
+ * implementations (session_spec.cpp).  The public pulsar_session_spec_*
+ * entry points (engine_api.cpp) mirror onto the pair and call these; the
+ * worker loop calls these directly.  Every rng a call consumes rides its
+ * frame, so the two ranks draw from the same state by construction. */
+int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature, int top_k,
+                                        float top_p, float min_p, uint64_t *rng);
+int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
+                                          int max_tokens, int accepted_cap, float temperature,
+                                          int top_k, float top_p, float min_p, char *err, size_t errlen);
+int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
+                                        int eos_token, float temperature, int top_k, float top_p,
+                                        float min_p, uint64_t *rng, const float *rows, uint32_t row0,
+                                        int *accepted, int accepted_cap, char *err, size_t errlen);
+void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
+void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows);
+int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
+                                            const uint32_t *banks, uint64_t **rngs, int n,
+                                            char *err, size_t errlen);
+void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_round *r);
 
 /** Slice 4e (L238): the failure report a void mirrored operation can make --
  * marks the pair failed and prints the reason once.  Defined in engine_api.cpp,
@@ -2125,13 +2137,6 @@ struct pulsar_session {
      * mirrored frame carries it; see tp_session_seq above for why it is the
      * create ordinal and why a mismatch is refused. */
     uint64_t tp_session_id;
-    /** Slice 4e: true once this session's speculation rng has been taken from
-     * the leader -- one flag, because there is no live-bank accessor to key it
-     * by, and the documented round flow syncs each bank's stream by calling
-     * pulsar_session_spec_next_base with THAT bank's rng.  Speculation refuses
-     * a pair whose rng was never synchronized, so a driver that skips
-     * next_base cannot walk a round on a stream the pair does not share. */
-    bool spec_rng_synced;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats

@@ -188,6 +188,14 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "set logits", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session set-logits must come back as a refusal: %s", err);
+        pulsar_tp_spec_command sc;
+        std::memset(&sc, 0, sizeof(sc));
+        sc.session_id = SID; sc.rng = 42;
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_NEXT_BASE, &sc, NULL, NULL) != 0, "send_spec must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "spec_next_base", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session spec_next_base must come back as a refusal: %s", err);
     }
 
     /* B. A void frame for an unknown session marks the worker's pair failed

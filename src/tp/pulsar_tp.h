@@ -320,13 +320,6 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
 int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count, uint32_t max_head_runs);
-/** Ship this rank's rng state.  Speculation's accept walk draws from the
- * CALLER's rng, so two ranks seeded independently would accept different tokens
- * and commit different session state; the leader's state is the pair's stream.
- * Fire-and-forget, like the void operations: a `void`-shaped draw site has
- * nowhere to put a peer's refusal, and the worker's frame check reports a
- * divergence through the next acked operation instead of hanging on it. */
-int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state);
 /* The bank frames (increment 2).  Leader -> workers. */
 int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
@@ -342,6 +335,23 @@ int pulsar_tp_send_note_committed(pulsar_tp *tp, uint64_t session_id,
                                   const int *tokens, uint32_t n_tokens);
 int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
                               const float *logits, uint32_t n);
+/* The one payload every speculative frame shares.  Which of i0..i3 a frame
+ * uses is documented on its sender; unused fields are 0. */
+typedef struct {
+    uint64_t session_id;
+    int32_t  bank;        /* the round's bank (the live bank when the leader sent it) */
+    int32_t  i0, i1, i2, i3;
+    float    temperature, top_p, min_p;
+    int32_t  top_k;
+    uint64_t rng;         /* the rng state the call consumes, as it was BEFORE the call */
+    uint32_t count;       /* REDRAFT_BATCH: rounds; banks[count] then rngs[count] follow */
+    uint32_t reserved;
+} pulsar_tp_spec_command;
+
+/* Increment 4: one sender for every speculative frame; `banks`/`rngs` are
+ * REDRAFT_BATCH's arrays (count entries each) and NULL elsewhere. */
+int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
+                        const uint32_t *banks, const uint64_t *rngs);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 /* Collect one ack per peer and return the VERDICT they agree on in *status
  * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
@@ -388,8 +398,10 @@ typedef enum {
      * sends before the peer's window is armed silently loses the first N
      * messages under UC, shifting the whole pairing by +1). */
     PULSAR_TP_FRAME_RDMA_GATE_ARMED = 18,
-    /* Slice 4e: one rank's rng state, so a pair can share ONE speculation
-     * stream.  Fresh number (18 is taken, 10 is retired and never reused). */
+    /* RETIRED 2026-09-23 (increment 4): the rng-state frame.  A single
+     * per-session rng could not follow the server, which interleaves banks
+     * between the base draw and the accept walk; every speculative frame now
+     * carries the rng it consumes.  The number is never reused. */
     PULSAR_TP_FRAME_RNG_STATE = 19,
     /* Slice 4e increment 2 (L238): the bank surface.  save is void
      * (fire-and-forget); restore, repoint and the two forks return a VERDICT
@@ -408,7 +420,20 @@ typedef enum {
     PULSAR_TP_FRAME_REWRITE_FROM_COMMON = 25,
     PULSAR_TP_FRAME_NOTE_COMMITTED = 26,
     PULSAR_TP_FRAME_SET_LOGITS = 27,
+    /* Increment 4: the speculative round family.  Every frame that draws
+     * carries the rng it consumes (a single per-session state cannot follow
+     * the server, which interleaves banks between the base draw and the
+     * accept walk).  Verdicts that can be -1 ride the wire as value + 1. */
+    PULSAR_TP_FRAME_SPEC_NEXT_BASE = 28,        /* verdict: first token + 1 */
+    PULSAR_TP_FRAME_SPEC_ROUND_BEGIN = 29,      /* verdict: 0 ok, 1 failed */
+    PULSAR_TP_FRAME_SPEC_ARM_CAPTURE = 30,      /* void */
+    PULSAR_TP_FRAME_SPEC_ROUND_END = 31,        /* verdict: accepted count + 1 */
+    PULSAR_TP_FRAME_SPEC_ROUND_ABORT = 32,      /* void */
+    PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH = 33,    /* verdict: 0 ok, 1 failed */
+    PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT = 34,   /* void */
+    PULSAR_TP_FRAME_GENERATE_SPECULATIVE = 35,  /* verdict: tokens generated + 1 */
 } pulsar_tp_frame_type;
+
 
 typedef struct {
     pulsar_tp_frame_type type;
@@ -428,6 +453,11 @@ typedef struct {
     /* SET_LOGITS: the leader's live logits row (malloc'd, n_logits floats). */
     float *logits;
     uint32_t n_logits;
+    /* The speculative frames: the shared payload, plus REDRAFT_BATCH's arrays
+     * (malloc'd, spec.count each). */
+    pulsar_tp_spec_command spec;
+    uint32_t *spec_banks;
+    uint64_t *spec_rngs;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
