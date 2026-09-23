@@ -240,12 +240,38 @@ pair, because its own arguments are never read.
   is no live-bank accessor to key it by.  The batched lane keeps one stream per
   bank and syncs each when it calls `next_base` with that bank's rng, so in
   practice every bank is synced -- but the flag itself only proves one was.
-  **Follow-up:** `FRAME_VERIFY` / `FRAME_VERIFY_COMMIT` were the spec's frames
-  under the "ship the decision" design; with the rng mirrored the decision is
-  derived identically instead of shipped, so their senders and decode cases are
-  now orphaned (only the mesh test still drives them).  Retire the code, keep the
-  numbers with a note, as `FRAME_LOGITS` was.
-- **Still open:** banks, warm-fork, and the frame retirement above.
+  **Not a follow-up after all (round 10 correction).**  Last round's note said to
+  retire `FRAME_VERIFY` / `FRAME_VERIFY_COMMIT` because the engine no longer
+  ships a decision.  That was wrong, and the check is worth recording: those
+  frames have TWO users, not zero -- `src/tp/pulsar_tp_verify.cpp` (test support
+  for `make tp-verify-test`, deliberately out of `TP_OBJS` until the verify slice
+  wires it) and the mesh test's broadcast round.  Retiring them would have
+  deleted a working test's protocol.  They stay, labelled for what they are: a
+  transport capability with a test, NOT the engine's spec path, which derives its
+  decision from the shared rng instead of shipping it.  The general lesson is the
+  one this port keeps teaching -- "no user" has to mean *no user anywhere*,
+  including tests, before anything is deleted.
+- **Banks are a LIVENESS gap, not a safety gap (round 10).**  Bank *selection*
+  for decodes is already mirrored: the rows carry bank ids, and the worker
+  decodes into the leader's banks.  Bank *contents* are not -- `bank_fork`,
+  `bank_fork_partial`, `bank_state_save`/`_restore` and eviction are the server
+  scheduler's own decisions (`server_sched.cpp`), made against LOCAL memory
+  state, so a pair whose schedulers diverge would decode a leader-chosen bank
+  whose KV does not match on the worker.
+  That fails closed rather than silently, and the authority is the engine's own
+  row contract, not anything 4e added: a batched bank's compressor frontier must
+  be position-true on entry, "the driver rejects the step otherwise rather than
+  corrupting KV" (`src/pulsar.h:633`), and a rejection is recoverable with NO
+  STATE MUTATED (`src/pulsar.h:628`).  The mirrored decode turns that into a
+  nonzero ack the leader reports.
+  So a diverged pair REFUSES; it does not corrupt.  What a pair cannot do is make
+  progress through bank surgery the two ranks disagree about, which is an
+  agreement problem (whose scheduler wins) rather than a mirroring one --
+  the same shape as session create, where the answer was "the leader's decision
+  wins and the ordinal proves it".  Nobody should wire bank frames before that
+  question is answered, because mirroring a local scheduler's decisions is how
+  the invalidate round would have deadlocked.
+- **Still open:** warm-fork, and the bank agreement question above.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the
