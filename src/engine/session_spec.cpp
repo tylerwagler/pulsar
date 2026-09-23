@@ -1087,6 +1087,29 @@ static int spec_round_begin(pulsar_session *s, int first_token,
                             float temperature, int top_k, float top_p, float min_p,
                             pulsar_spec_round *r,
                             char *err, size_t errlen) {
+    /* Slice 4e: SPECULATION IS NOT MIRRORED, and this is the one gate every
+     * speculation path passes through -- the member generate_speculative calls
+     * this same static -- so a single refusal here covers them all, including
+     * paths that would otherwise reach a round with no check at all.
+     *
+     * What makes it unsafe is not the drafts (those reach every rank as rows in
+     * the mirrored batched decode) but the WALK: spec_round_end accepts with
+     * pulsar_sample_dist_accept and draws its carry with
+     * pulsar_sample_dist_draw_excluding, both from the CALLER's rng.  Two ranks
+     * whose rngs were seeded independently -- which is what an ordinary server
+     * does -- would accept different tokens and trim their KV to different
+     * frontiers.  The next mirrored eval would CATCH it (its seq is the decode
+     * position, and that is exactly what diverged), but catching is not
+     * preventing: the round would already have committed a different session
+     * state.  Fail closed until the pair has an RNG authority; see the spec
+     * section of docs/tensor-parallel-port.md. */
+    if (pulsar_session_is_mirrored(s)) {
+        if (err) snprintf(err, errlen,
+                          "tp: speculation is not mirrored onto the pair yet -- the accept "
+                          "walk draws from this rank's own rng, so two ranks would commit "
+                          "different session state; run the pair with the drafter off");
+        return -1;
+    }
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;

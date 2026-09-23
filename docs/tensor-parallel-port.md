@@ -207,7 +207,32 @@ pair, because its own arguments are never read.
   else to send.  `out_n_rows` and `max_head_runs` stay local: both are the
   caller's own output and head policy, and both ranks run the same kernel over
   the same rows, so the run count agrees by construction.
-- **Still open:** banks, warm-fork, spec.
+- **Speculation fails closed on a pair (round 8), and the reason is the RNG.**
+  `spec_round_begin` is the one gate every speculation path passes through -- the
+  member `generate_speculative` calls the same static -- and it now refuses when
+  the session is mirrored.  What makes speculation unsafe is not the drafts
+  (those reach every rank as rows in the mirrored batched decode) but the WALK:
+  `spec_round_end` accepts with `pulsar_sample_dist_accept` and draws its carry
+  with `pulsar_sample_dist_draw_excluding`, both from the CALLER's rng
+  (session_spec.cpp:596-632).  Two ranks whose rngs were seeded independently --
+  which is what an ordinary server does -- would accept different tokens and trim
+  their KV to different frontiers.  The next mirrored eval catches it (its `seq`
+  is the decode position, and that is exactly what diverged), but catching is not
+  preventing: the round has already committed a different session state.
+
+  Two ways to lift the refusal, needing different frames:
+  1. **Mirror the rng** (smaller): ship the leader's rng state at the START of a
+     speculation sequence, before `spec_next_base` and the drafter's draws.  Every
+     draw in the round is then identical by construction and `accepted[]` needs no
+     frame at all.  It requires that the drafter's draws come from that same rng
+     (`spec_redraft_batch` takes `rngs[]`, so this looks true) and it puts the rng
+     in the mirrored-input category, which is a deliberate design statement.
+  2. **Ship the decision** (bigger): the leader walks and ships `accepted[]`.  The
+     existing commit frame carries only `{full_accept, replay_n}`, which cannot
+     express the accepted tokens, and the trim/checkpoint/redraft are fused with
+     the walk inside `spec_round_end` -- so this needs both a new payload and a
+     split of the walk from the state application.
+- **Still open:** banks, warm-fork, spec (above).
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

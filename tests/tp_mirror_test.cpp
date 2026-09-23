@@ -267,6 +267,23 @@ static int run_worker(pulsar_tp *tp) {
         CHECK(rc == 1, "the worker must refuse a mixed batch for another session, got rc=%d", rc);
         CHECK(std::strstr(err, "diverged") != NULL,
               "the mixed refusal must name the divergence: %s", err);
+
+        /* F. Speculation FAILS CLOSED on a pair: its accept walk draws from the
+         * caller's rng, so it is not mirrored yet -- and the refusal comes from
+         * the round gate before anything reads the graph, which is what makes it
+         * assertable on a fabricated session. */
+        pulsar_spec_round *round = pulsar_spec_round_new();
+        CHECK(round != NULL, "pulsar_spec_round_new failed");
+        if (round) {
+            err[0] = 0;
+            const int brc = pulsar_session_spec_round_begin(s, round, 12345, 8, 8,
+                                                            0.0f, 0, 1.0f, 0.0f,
+                                                            err, sizeof(err));
+            CHECK(brc != 0, "a pair must refuse to begin a spec round, got rc=%d", brc);
+            CHECK(std::strstr(err, "speculation is not mirrored") != NULL,
+                  "the refusal must say why: %s", err);
+            pulsar_spec_round_free(round);
+        }
     }
     free_session(s);
     return g_failures;

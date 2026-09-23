@@ -279,11 +279,14 @@ int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, i
  * of an operation the peer is not expecting.
  * ------------------------------------------------------------------------ */
 
+bool pulsar_session_is_mirrored(const pulsar_session *s) {
+    return s && s->engine && s->engine->tp && s->tp_session_id != 0;
+}
+
 /** The pair this session mirrors onto, or NULL when nothing should be mirrored
  * (pair off, or a session the engine handed out before the transport existed). */
 static pulsar_tp *tp_mirror_target(pulsar_session *s) {
-    if (!s || !s->engine || !s->engine->tp || s->tp_session_id == 0) return NULL;
-    return s->engine->tp;
+    return pulsar_session_is_mirrored(s) ? s->engine->tp : NULL;
 }
 
 /** Refusal shared by the mirrored operations: the pair is armed but its

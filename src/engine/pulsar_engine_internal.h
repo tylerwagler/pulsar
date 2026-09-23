@@ -2075,6 +2075,13 @@ typedef struct pulsar_bank_carry {
  * KV rows the graph holds for the CURRENT bank. Every operation that can break
  * that -- sync, rewind, a multiseq step, a bank switch -- either restores it or
  * sets a flag that makes the next classic call fail loud. */
+/* Slice 4e: the one condition "this session is mirrored onto a TP pair".
+ * Defined in engine_api.cpp beside the mirror itself and declared here because
+ * the refusals for operations that are NOT mirrored yet live in other files
+ * (session_spec.cpp); the condition has a single definition so it cannot drift
+ * between them. */
+bool pulsar_session_is_mirrored(const pulsar_session *s);
+
 struct pulsar_session {
     pulsar_engine *engine;    ///< borrowed; the engine outlives every session
     /** Slice 4e: this session's mirror id, or 0 when the pair is not armed (or
