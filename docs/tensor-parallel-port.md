@@ -116,6 +116,18 @@ pair, because its own arguments are never read.
   tokens into this one.
 - The leader collects the ack even when its own half failed: an ack left unread
   would be consumed by the *next* operation, shifting every later frame by one.
+- **Correction (round 12):** the propagation claim above ("an unexpected frame
+  marks the pair failed, so the next acked operation carries the refusal back")
+  was not true as written.  The failed-pair check was **leader-only**, so a
+  WORKER that had marked the pair broken went on consuming and APPLYING frames
+  and acked them as successes -- the leader learned nothing.  The check now lives
+  in the shared worker frame-check: such a rank consumes the frame, refuses it
+  and ACKS the refusal, so the leader reads a failed ack at once instead of
+  waiting out its deadline, and no further state is committed on a stream the
+  rank has already found inconsistent.  The leader side still refuses BEFORE
+  sending, because a leader that skipped a frame would misalign its own stream.
+  `tp-mirror-test` round H asserts the difference by name: the error must be the
+  failed ack and must NOT be "did not answer".
 - `pulsar_tp_wait_command_ack` returns **1 on success, 0 on failure** (failure
   leaves the message in `err`), the inverse of the `tp_send_*` convention.
 - Increment 2 (2026-09-23) mirrors **eval**.  The frame's `seq` is the session's
