@@ -151,6 +151,18 @@ pair, because its own arguments are never read.
   early-return is therefore **leader-only**: a worker that returned there would
   leave the leader blocked in `wait_command_ack` forever, and a dead transport
   failing its `recv` is the right ending while a hang is the wrong one.
+- **The engine mirror layer has no on-box test, and it cost a real bug.**  All
+  seven `pulsar_tp_send_*`/`recv_command` calls in the first three increments had
+  the transport's convention backwards (nonzero is SUCCESS), so the leader
+  reported "could not mirror the prompt" on every successful send and gave up,
+  and the worker read a failed ack as delivered.  The mesh test could not catch
+  it -- it drives the transport directly and never enters the engine wrappers --
+  and a two-process engine pair on one box is impossible (earlyoom; see the
+  bringup doc).  The earlier slices are what identified it: gpu_prefill's
+  allreduce and gpu_decode's vocab all-gather both test `... != 0` for success.
+  Closing the gap means a test that *fabricates* a session (engine + tp + a
+  mismatched `tp_session_id`) and calls the wrapper: its refusal paths return
+  before touching the graph, so it needs no model and no second GPU.
 - **Still open:** banks, warm-fork, multiseq, mixed, spec.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
