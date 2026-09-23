@@ -1694,6 +1694,14 @@ struct pulsar_engine {
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     size_t tp_slab_bytes;       ///< slab size in bytes
+    /** Slice 4e: the next session ordinal, handed out by pulsar_session::create
+     * as the session's mirror id.  It is an ordinal rather than a random or
+     * leader-assigned id because the SAME driver opens the same sessions in the
+     * same order on every rank, so both ranks agree without a wire round trip
+     * on the create path (which is not itself mirrored).  A frame whose id does
+     * not match the receiving session therefore means the drivers diverged, and
+     * the receiver fails loud instead of mirroring into the wrong session. */
+    uint64_t tp_session_seq;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
@@ -2069,6 +2077,11 @@ typedef struct pulsar_bank_carry {
  * sets a flag that makes the next classic call fail loud. */
 struct pulsar_session {
     pulsar_engine *engine;    ///< borrowed; the engine outlives every session
+    /** Slice 4e: this session's mirror id, or 0 when the pair is not armed (or
+     * the engine handed this session out before the transport existed).  Every
+     * mirrored frame carries it; see tp_session_seq above for why it is the
+     * create ordinal and why a mismatch is refused. */
+    uint64_t tp_session_id;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats

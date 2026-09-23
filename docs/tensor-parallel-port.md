@@ -89,7 +89,35 @@ highest risk; interacts with MLA, attn-pack KV, indexer.
 5. **Decode gates + vocab head (Phase 2)** — per-layer gates, ownership-aware MoE,
    vocab-split output head. **= slices 4b-CUDA/4c/4d; OPEN, GPU-gated.**
 6. **Session lockstep (Phase 3)** — mirror banks/warm-fork, multiseq, mixed, spec.
-   **= slice 4e; OPEN, GPU-gated.**
+   **= slice 4e; IN PROGRESS.** Increment 1 (the prompt mirror on sync) landed
+   2026-09-23; see the section below for the model it fixes.
+
+### 4e: how the worker is driven (decided 2026-09-23)
+
+Both ranks run the **same driver with the same arguments** (the CLI/server, told
+apart by `--tp-role`); there is no worker-side receive loop and no session
+registry. Only the **leader's arguments are authoritative**: the leader ships the
+operation on the command plane and then waits for one ack per peer, and the worker
+blocks for that frame and runs on what it received. A worker whose own driver
+disagreed — a stale prompt, a truncated request — therefore cannot desync the
+pair, because its own arguments are never read.
+
+- The mirror lives at the **public API boundary** (`pulsar_session_sync_mm` and
+  `pulsar_session_eval` in `engine_api.cpp`), *not* on the member
+  `pulsar_session::sync`/`eval`. Those members are re-entered from inside a
+  running operation (the image stitch on sync's resume path, `rewrite_from_common`,
+  the speculative walk); a mirrored frame there would be a second, unbalanced half
+  of an operation the peer is not expecting.
+- The id every frame carries is the **create ordinal** (`pulsar_session::tp_session_id`,
+  handed out by `pulsar_session::create` as `++tp_session_seq`). Both ranks agree
+  on it by construction, with no wire round trip on the (unmirrored) create path.
+  A frame whose id does not match the receiving session means the ranks' drivers
+  diverged, and the worker refuses loudly rather than mirroring another session's
+  tokens into this one.
+- The leader collects the ack even when its own half failed: an ack left unread
+  would be consumed by the *next* operation, shifting every later frame by one.
+- `pulsar_tp_wait_command_ack` returns **1 on success, 0 on failure** (failure
+  leaves the message in `err`), the inverse of the `tp_send_*` convention.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

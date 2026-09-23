@@ -793,6 +793,10 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
      * call sites can reach it without threading the engine through every
      * gpu_graph entry point (slice 4b).  NULL when the pair is not armed. */
     s->graph.tp = e->tp;
+    /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
+     * here, at the one place a session begins, from the engine's ordinal; a
+     * session created with no pair armed keeps 0 and stays out of the mirror. */
+    if (e->tp) s->tp_session_id = ++e->tp_session_seq;
     s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {

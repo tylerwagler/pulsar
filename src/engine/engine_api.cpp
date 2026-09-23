@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "../tp/pulsar_tp.h"
 
 
 
@@ -261,12 +262,118 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, cons
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
 int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) { return s ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL; }
 int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
+/* ---------------------------------------------------------------------------
+ * Slice 4e: lockstep mirroring of the session's input.
+ *
+ * Both ranks run the same driver with the same arguments, but only the LEADER's
+ * arguments are authoritative.  The leader ships the operation and then waits
+ * for the worker's ack; the worker blocks for that frame and runs on what it
+ * received.  A worker whose own driver disagreed -- a stale prompt, a truncated
+ * request, a session opened out of order -- therefore cannot desync the pair,
+ * because its arguments are never read.
+ *
+ * The mirror lives at this, the public API boundary, and not on the member
+ * sync()/eval(): those are re-entered from inside a running operation (the
+ * image stitch at sync's resume path, rewrite_from_common, the speculative
+ * walk), and a second mirrored frame there would be a second, unbalanced half
+ * of an operation the peer is not expecting.
+ * ------------------------------------------------------------------------ */
+
+/** The pair this session mirrors onto, or NULL when nothing should be mirrored
+ * (pair off, or a session the engine handed out before the transport existed). */
+static pulsar_tp *tp_mirror_target(pulsar_session *s) {
+    if (!s || !s->engine || !s->engine->tp || s->tp_session_id == 0) return NULL;
+    return s->engine->tp;
+}
+
+/** Refusal shared by the mirrored operations: the pair is armed but its
+ * transport is already dead, so no frame can be trusted in either direction. */
+static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
+    if (!pulsar_tp_failed(tp)) return 0;
+    if (err) snprintf(err, errlen,
+                      "tp: the pair's transport failed earlier in this run; refusing to mirror this session");
+    return 1;
+}
+
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
-    return s ? s->sync(prompt, images, n_images, err, errlen) : 1;
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->sync(prompt, images, n_images, err, errlen);
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    const int is_leader = pulsar_tp_rank(tp) == 0;
+    if (is_leader) {
+        /* The leader's arguments ARE the operation, so an empty prompt here is
+         * a caller bug.  A worker's empty prompt is not: its driver may have
+         * had nothing to say, and the frame below is the real input. */
+        if (!prompt || prompt->len <= 0) {
+            if (err) snprintf(err, errlen, "tp: the prompt is empty; refusing to mirror it");
+            return 1;
+        }
+        /* Ship first, run second: the worker is blocked in its own open() and
+         * unblocks as soon as the frame lands, so both ranks prefill together
+         * instead of the worker waiting out the leader's whole sync. */
+        if (pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v,
+                                (uint32_t)prompt->len) != 0) {
+            if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
+            return 1;
+        }
+        const int rc = s->sync(prompt, images, n_images, err, errlen);
+        /* Collected even after a local failure: the worker ran its own sync on
+         * the mirrored prompt and its ack would otherwise be read by the NEXT
+         * operation, shifting every later frame by one. */
+        char peer_err[256];
+        const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, "sync",
+                                                       peer_err, sizeof(peer_err));
+        if (rc != 0) return rc;
+        if (!peer_ok) {
+            if (err) snprintf(err, errlen, "tp: a worker failed the mirrored sync: %s", peer_err);
+            return 1;
+        }
+        return 0;
+    }
+    /* Worker: the leader's frame is the input, and this rank's own prompt is
+     * never even looked at.  `borrowed` is a view of the frame's buffer -- the
+     * sync must not free it, and it stays valid until the ack below. */
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, errlen) != 0) return 1;
+    int rc = 1;
+    pulsar_tokens borrowed;
+    borrowed.v = command.tokens;
+    borrowed.len = (int)command.n_tokens;
+    borrowed.cap = (int)command.n_tokens;
+    if (command.type != PULSAR_TP_FRAME_SYNC) {
+        if (err) snprintf(err, errlen,
+                          "tp: expected a mirrored sync but the leader sent frame type %d",
+                          (int)command.type);
+    } else if (command.session_id != s->tp_session_id) {
+        if (err) snprintf(err, errlen,
+                          "tp: the leader mirrored session %llu but this is session %llu; "
+                          "the ranks' drivers diverged, refusing to mirror into the wrong session",
+                          (unsigned long long)command.session_id,
+                          (unsigned long long)s->tp_session_id);
+    } else {
+        /* The loud form of "this rank's own arguments were not the leader's" --
+         * the exact condition this slice exists to make harmless.  Not an
+         * error: the leader's prompt is the one that runs. */
+        if (prompt && prompt->len != borrowed.len) {
+            fprintf(stderr, "pulsar: tp: worker prompt (%d tokens) differs from the leader's "
+                            "(%d); mirroring the leader's\n", prompt->len, borrowed.len);
+        }
+        rc = s->sync(&borrowed, images, n_images, err, errlen);
+    }
+    /* Ack even on refusal: the leader is waiting, and a rank that dies without
+     * answering would hang it rather than fail it. */
+    if (pulsar_tp_send_command_ack(tp, s->tp_session_id, rc) != 0 && rc == 0) {
+        rc = 1;
+        if (err) snprintf(err, errlen, "tp: could not ack the mirrored sync to the leader");
+    }
+    pulsar_tp_command_free(&command);
+    return rc;
 }
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
