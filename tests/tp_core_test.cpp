@@ -213,7 +213,7 @@ static void test_owned_range(void) {
             uint32_t prev_hi = 0u, sum = 0u, first_lo = 0u, last_hi = 0u;
             for (int r = 0; r < (int)nr; r++) {
                 uint32_t lo = 99u, hi = 99u;
-                CHECK(pulsar_tp_owned_expert_range(r, nr, n, &lo, &hi) == 1,
+                CHECK(pulsar_tp_owned_range(r, nr, n, &lo, &hi) == 1,
                       "owned range accepted n=%u nr=%u r=%d", n, nr, r);
                 if (r == 0) first_lo = lo;
                 if (r == (int)nr - 1) last_hi = hi;
@@ -230,25 +230,25 @@ static void test_owned_range(void) {
             /* Determinism (use a valid rank; rank 1 is invalid when nr==1). */
             const int dr = nr > 1 ? 1 : 0;
             uint32_t a, b, c, d;
-            CHECK(pulsar_tp_owned_expert_range(dr, nr, n, &a, &b) == 1,
+            CHECK(pulsar_tp_owned_range(dr, nr, n, &a, &b) == 1,
                   "owned range determinism accept n=%u nr=%u", n, nr);
-            pulsar_tp_owned_expert_range(dr, nr, n, &c, &d);
+            pulsar_tp_owned_range(dr, nr, n, &c, &d);
             CHECK(a == c && b == d, "owned range non-deterministic n=%u nr=%u", n, nr);
         }
     }
     /* No single-rank / n_ranks<=1 -> full range. */
     for (uint32_t n : totals) {
         uint32_t lo = 99u, hi = 99u;
-        CHECK(pulsar_tp_owned_expert_range(0, 1, n, &lo, &hi) == 1 &&
+        CHECK(pulsar_tp_owned_range(0, 1, n, &lo, &hi) == 1 &&
               lo == 0u && hi == n, "n=1 not full range n=%u", n);
     }
     /* n=2 over 256 -> the legacy half-split. */
     uint32_t lo0, hi0, lo1, hi1;
-    pulsar_tp_owned_expert_range(0, 2, 256u, &lo0, &hi0);
-    pulsar_tp_owned_expert_range(1, 2, 256u, &lo1, &hi1);
+    pulsar_tp_owned_range(0, 2, 256u, &lo0, &hi0);
+    pulsar_tp_owned_range(1, 2, 256u, &lo1, &hi1);
     CHECK(lo0 == 0u && hi0 == 128u && lo1 == 128u && hi1 == 256u,
           "n=2/256 split not [0,128)+[128,256)");
-    CHECK(pulsar_tp_owned_expert_range(-1, 2, 256u, &lo0, &hi0) == 0,
+    CHECK(pulsar_tp_owned_range(-1, 2, 256u, &lo0, &hi0) == 0,
           "negative rank accepted");
 }
 

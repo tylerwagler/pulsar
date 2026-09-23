@@ -112,7 +112,7 @@ bug, not a design change.
       per-peer RDMA is pair-gated.
 - **4c. Ownership-aware routed-MoE kernels (2026-09-22, engine + kernel wiring;
       runtime GPU/pair-gated).** Each rank now computes ONLY its owned expert
-      slice — the single authority `pulsar_tp_owned_expert_range(rank, n_ranks,
+      slice — the single authority `pulsar_tp_owned_range(rank, n_ranks,
       n_total, &lo, &hi)` (floor partition `[r·n/nr, (r+1)·n/nr)`), threaded as
       `expert_lo/expert_hi` into `pulsar_gpu_routed_moe_batch_tensor`.  The
       CUTLASS MXFP4 grouped arm skips peer-owned pairs in the count/scatter
@@ -128,7 +128,7 @@ bug, not a design change.
       (Tyler 2026-09-22: the target is n parallel Sparks).  Split = one vocab
       RANGE per rank, `[r*V/n, (r+1)*V/n)` — the same floor partition as the
       routed experts, and the same single authority pattern
-      (`pulsar_tp_owned_vocab_range`, mirroring `pulsar_tp_owned_expert_range`).
+      (`pulsar_tp_owned_range`, the SAME authority the experts use).
       Each rank computes only its range, then the group ALL-GATHERS (concatenate,
       NOT the sum `pulsar_tp_allreduce_sum` performs) so every rank holds the
       full logits and can sample independently — no leader broadcast needed.

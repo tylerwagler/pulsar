@@ -68,7 +68,7 @@ __device__ static __forceinline__ void moe_clamp_expert_id(int32_t &expert_i, ui
  *
  *  The full range [0, n_total) is the single-rank path: every pair is owned
  *  and the predicate is inert.  The bound comes from the ONE authority,
- *  `pulsar_tp_owned_expert_range` (src/tp) -- the kernel never recomputes it.
+ *  `pulsar_tp_owned_range` (src/tp) -- the kernel never recomputes it.
  *
  *  BOTH builders call this with the same arguments, and it runs AFTER
  *  `moe_clamp_expert_id`: an out-of-range id is folded to 0 and flagged first,

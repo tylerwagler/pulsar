@@ -1645,7 +1645,7 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
         fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
         return 0;
     }
-    /* Rule 4: the owned-expert range is a single authority (pulsar_tp_owned_expert_range);
+    /* Rule 4: the owned-expert range is a single authority (pulsar_tp_owned_range);
      * a malformed range is a split bug and a wrong sum.  A full range (0, n_total) is the
      * single-rank/non-TP path. */
     if (expert_lo > expert_hi || expert_hi > n_total_expert) {

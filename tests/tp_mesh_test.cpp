@@ -141,6 +141,56 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
     }
     CHECK(bad == 0, "rank %d allreduce had %d mismatched elements", rank, bad);
 
+    /* Slice 4d: the vocab all-gather must CONCATENATE the ranks' ranges, not sum
+     * them.  V = 1000 over n=3 gives 334/333/333, so the padded uniform stride
+     * (the group exchange carries one byte count per round) is exercised, and a
+     * row count > 1 exercises the per-row placement.  A mistaken allreduce here
+     * would read 1000*sum(ranks) instead of 1000*owner, so the pattern makes the
+     * two impossible to confuse. */
+    {
+        const uint32_t V = 1000u;
+        const uint32_t rows = 2u;
+        const uint32_t stride = (V + (uint32_t)n - 1u) / (uint32_t)n;
+        float *full = (float *)std::calloc((size_t)rows * V, sizeof(float));
+        float *own = (float *)std::calloc((size_t)rows * stride, sizeof(float));
+        float *scr = (float *)std::calloc((size_t)rows * stride, sizeof(float));
+        uint32_t lo = 0, hi = 0;
+        pulsar_tp_owned_range(rank, (uint32_t)n, V, &lo, &hi);
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t i = lo; i < hi; i++)
+                own[(size_t)r * stride + (i - lo)] =
+                    (float)(1000 * rank + (int)(i % 7) + 10000 * (int)r);
+        if (!pulsar_tp_allgather_vocab(tp, 0, 2, full, own, scr, rows, V)) {
+            CHECK(0, "rank %d vocab all-gather failed", rank);
+        } else {
+            int vbad = 0;
+            for (uint32_t r = 0; r < rows; r++) {
+                for (uint32_t i = 0; i < V; i++) {
+                    uint32_t owner = 0;
+                    for (uint32_t k = 0; k < (uint32_t)n; k++) {
+                        uint32_t a = 0, b = 0;
+                        pulsar_tp_owned_range((int)k, (uint32_t)n, V, &a, &b);
+                        if (i >= a && i < b) { owner = k; break; }
+                    }
+                    const float want =
+                        (float)(1000 * (int)owner + (int)(i % 7) + 10000 * (int)r);
+                    if (full[(size_t)r * V + i] != want) {
+                        if (vbad == 0)
+                            std::fprintf(stderr,
+                                         "tp_mesh_test: rank %d vocab gather r=%u i=%u "
+                                         "got %f want %f\n",
+                                         rank, r, i, full[(size_t)r * V + i], want);
+                        vbad++;
+                    }
+                }
+            }
+            CHECK(vbad == 0, "rank %d vocab all-gather had %d wrong elements", rank, vbad);
+        }
+        std::free(full);
+        std::free(own);
+        std::free(scr);
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

@@ -164,14 +164,18 @@ void pulsar_tp_free(pulsar_tp *tp);
 int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
 
-/* Owned routed-expert slice for `rank` in a group of `n_ranks`, floor-partitioned
- * over [0,n_total): lo = rank*n/n_ranks, hi = (rank+1)*n/n_ranks (uint64 mid).
- * Deterministic; disjoint and complete across ranks (rank r's hi == rank r+1's
- * lo).  n_ranks<=1 -> [0,n_total) (full path); n_total==0 -> [0,0).  Returns 1 on
- * success, 0 on bad args.  This is the single authority (rule 4) for which expert
- * slice a rank owns; the kernel never recomputes it. */
-int pulsar_tp_owned_expert_range(int rank, uint32_t n_ranks, uint32_t n_total,
-                                 uint32_t *lo, uint32_t *hi);
+/* Owned slice of a dimension for `rank` in a group of `n_ranks`, floor-
+ * partitioned over [0,n_total): lo = rank*n/n_ranks, hi = (rank+1)*n/n_ranks
+ * (uint64 mid).  Deterministic; disjoint and complete across ranks (rank r's hi
+ * == rank r+1's lo).  n_ranks<=1 -> [0,n_total) (full path); n_total==0 ->
+ * [0,0).  Returns 1 on success, 0 on bad args.
+ *
+ * This is the single authority (rule 4) for "which slice does a rank own", and
+ * it is deliberately generic: the routed-EXPERT split (256 experts over the
+ * group) and the 4d vocab split (n_vocab over the group) are the SAME rule, so
+ * they share one implementation and cannot drift.  Callers never recompute it. */
+int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
+                          uint32_t *lo, uint32_t *hi);
 
 /* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
  * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for
@@ -185,6 +189,28 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
  * exchange + add.  Returns 0 on failure. */
 int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                             void *out, const void *in, uint64_t bytes);
+
+/* n-way VOCAB ALL-GATHER (slice 4d).  Rank r contributes the vocab range
+ * [r*V/n, (r+1)*V/n) of `n_rows` rows; every rank ends with the full
+ * [n_rows, n_total] block in `full_out`.  This CONCATENATES in rank order -- it
+ * is NOT the sum pulsar_tp_allreduce_sum performs, and the two must never be
+ * confused (a sum here would multiply the logits by the group size).
+ *
+ * Shapes: `full_out` is [n_rows, n_total] with row pitch n_total.  `own_slice`
+ * and `scratch` are [n_rows, stride] PACKED, stride = ceil(n_total/n_ranks):
+ * the ranges are PADDED to a uniform stride because the group exchange carries
+ * ONE byte count per round and n_total need not divide by n_ranks (129280 does
+ * not divide by 3 or 5).  Everything past a rank's real range is never sent on
+ * the wire as data -- it pads the transfer only -- and the caller must leave
+ * those tail elements ZEROED, since a short last range is never written by the
+ * head.  `scratch` is clobbered.  Returns 0 on failure.
+ *
+ * The gather runs the same ascending-rank loop on every rank, one exchange per
+ * peer per round, so `seq` must be identical on all ranks for a given round and
+ * distinct between rounds (the transport's desync guard keys on it). */
+int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                              float *full_out, const float *own_slice,
+                              float *scratch, uint32_t n_rows, uint32_t n_total);
 
 bool pulsar_tp_is_rdma(const pulsar_tp *tp);
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp);

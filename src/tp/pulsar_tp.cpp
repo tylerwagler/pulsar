@@ -2018,7 +2018,7 @@ void pulsar_tp_free(pulsar_tp *tp) {
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp) { return tp->n_ranks; }
 
-int pulsar_tp_owned_expert_range(int rank, uint32_t n_ranks, uint32_t n_total,
+int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
                                  uint32_t *lo, uint32_t *hi) {
     if (!lo || !hi || rank < 0 || (uint32_t)rank >= (n_ranks ? n_ranks : 1u))
         return 0;
@@ -2291,6 +2291,48 @@ int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     }
     memcpy(out, acc, bytes);
     free(acc);
+    return 1;
+}
+
+/* n-way VOCAB all-gather (slice 4d) -- see pulsar_tp.h for the contract.
+ * Concatenation, NOT the sum above: a mistaken allreduce here would multiply
+ * every rank's logits by the group size.
+ *
+ * Loop shape: every rank walks k = 0..n-1 in ascending rank order, so the pair
+ * (r,k) reaches its exchange in the same round on both sides and the existing
+ * symmetric write-then-read exchange cannot deadlock.  The stride is padded to
+ * ceil(n_total/n_ranks) so both directions of every exchange carry the same
+ * byte count even when the partition is uneven. */
+int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                              float *full_out, const float *own_slice,
+                              float *scratch, uint32_t n_rows, uint32_t n_total) {
+    if (!tp || !full_out || !own_slice || !scratch || n_rows == 0 || n_total == 0) return 0;
+    const uint32_t n_ranks = (uint32_t)(tp->n_ranks > 0 ? tp->n_ranks : 1);
+    const uint32_t stride = (n_total + n_ranks - 1u) / n_ranks;   /* padded slice */
+    for (uint32_t k = 0; k < n_ranks; k++) {
+        uint32_t lo = 0, hi = 0;
+        if (!pulsar_tp_owned_range((int)k, n_ranks, n_total, &lo, &hi)) return 0;
+        const uint64_t elems = (uint64_t)(hi - lo);
+        const float *src = own_slice;
+        if (k != (uint32_t)tp->rank) {
+            pulsar_tp_peer *pp = tp_peer_by_rank(tp, (int)k);
+            if (!pp || pp->data_fd < 0) {
+                fprintf(stderr, "pulsar-tp: vocab all-gather has no channel to rank %u\n", k);
+                return 0;
+            }
+            if (!tp_big_gate_exchange_fd(pp->data_fd, layer, seq, own_slice, scratch,
+                                         (uint64_t)n_rows * stride * sizeof(float)))
+                return 0;
+            src = scratch;
+        }
+        /* Place this rank's range into every row.  The own-rank case copies from
+         * own_slice, so an n_ranks==1 group still ends with a complete block. */
+        for (uint32_t r = 0; r < n_rows; r++) {
+            memcpy(full_out + (uint64_t)r * n_total + lo,
+                   src + (uint64_t)r * stride,
+                   elems * sizeof(float));
+        }
+    }
     return 1;
 }
 
