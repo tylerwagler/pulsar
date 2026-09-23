@@ -19,9 +19,12 @@
 # WARNS if the clone's HEAD != this sha (that check found the dev box and
 # sparky on different revisions the day it was written).
 #
-# This sha is v4.7.0, the LATEST release as of 2026-08-23.  (sparky was already
-# on it; the dev box was a release behind on v4.6.1 and AGENTS.md claimed
-# v4.5.2 -- three machines, three answers, which is why the pin now exists.)
+# This sha is v4.8.0 (released 2026-09-22), bumped from v4.7.0 dcf215af on
+# 2026-09-23 (L244; Tyler: "it may have some improvements for us" -- the notes
+# name GeForce/sm_120 blockscaled GEMM, block-32 scale factors and grouped
+# blockscaled GEMM).  The pin was created on 2026-08-23 at v4.7.0 because
+# three machines gave three answers (sparky v4.7.0, the dev box v4.6.1,
+# AGENTS.md claiming v4.5.2).
 #
 # POLICY: track the latest CUTLASS *release tag*, not main.  main carries
 # untagged daily churn through the MXFP4 expert GEMM we depend on, and a
@@ -31,4 +34,4 @@
 #
 # Point CUTLASS_DIR at a clone of this sha, or run `make cutlass`.
 url=https://github.com/NVIDIA/cutlass.git
-sha=dcf215af68a2d08d305076c152a06f201728cd53
+sha=098de2a652cf8f00fd70b2df54051c7eccbb855a
