@@ -502,10 +502,10 @@ attn-pack-fixture-check: tests/attn_pack_fixture_test
 # compiled beside log.cpp because pulsar_die() lives there and the gate checks
 # the refusals, not just the arithmetic.
 tests/engram_hash_test: tests/engram_hash_test.cpp tests/engram_hash_fixture.h \
-                        src/engine/engram.cpp src/engine/log.cpp Makefile \
+                        src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
                         src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/engram_hash_test.cpp \
-	    src/engine/engram.cpp src/engine/log.cpp
+	    src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp
 
 .PHONY: engram-hash-check
 engram-hash-check: tests/engram_hash_test
