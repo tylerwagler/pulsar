@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "tp/pulsar_tp.h"
 
 
 /* Read an HC residual CARRIER (BF16 storage under task #62) into an f32 host
@@ -1010,6 +1011,106 @@ bool gpu_graph_encode_output_head_batch(
     }
     return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens,
                                                    vocab_lo, vocab_dim, out);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Slice 4d: the ONE place the output head knows about TP.
+ *
+ * With the group off the two entry points below are exactly the calls they
+ * replace (whole range, same destination, same captures) -- the single-box path
+ * is byte-identical by construction.  With the group armed this rank projects
+ * only ITS vocab range into a slice at the head of `out`, stages it to host,
+ * all-gathers every rank's range (concatenation in rank order) and writes the
+ * assembled full logits back over `out`.  Every rank therefore ends with the
+ * same full vector and samples independently: no leader-only decision, no token
+ * broadcast.
+ *
+ * Host staging is per call and transient, exactly like the prefill big gate's:
+ * the gather takes host pointers today, so an eval costs one D2H of the slice
+ * and one H2D of the assembled vector.  Moving both onto the registered GB10
+ * slab is the same later optimization the big gate carries.
+ *
+ * The padded tail of each rank's slice is ZEROED after the read: the head only
+ * writes [0, hi-lo) of a stride-wide row, and the stride is rounded up so the
+ * group exchange can carry one byte count per round.
+ * ------------------------------------------------------------------------- */
+static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
+                           uint32_t row0, uint32_t n_rows,
+                           const pulsar_model *model, const pulsar_weights *weights,
+                           pulsar_gpu_tensor *out) {
+    const uint32_t n_vocab = (uint32_t)PULSAR_N_VOCAB;
+    const uint32_t n_ranks = pulsar_tp_n_ranks(g->tp);
+    const uint32_t stride = (n_vocab + n_ranks - 1u) / n_ranks;
+    uint32_t lo = 0, hi = 0;
+    if (!pulsar_tp_owned_range(pulsar_tp_rank(g->tp), n_ranks, n_vocab, &lo, &hi)) {
+        fprintf(stderr, "pulsar: tp vocab range refused (rank=%d n_ranks=%u n_vocab=%u)\n",
+                pulsar_tp_rank(g->tp), n_ranks, n_vocab);
+        return false;
+    }
+    const uint64_t slice_bytes = (uint64_t)n_rows * stride * sizeof(float);
+    const uint64_t full_bytes  = (uint64_t)n_rows * n_vocab * sizeof(float);
+    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, 0, slice_bytes);
+    if (!slice) {
+        fprintf(stderr, "pulsar: tp vocab slice view refused (rows=%u stride=%u)\n",
+                n_rows, stride);
+        return false;
+    }
+    float *own     = (float *)xmalloc(slice_bytes);
+    float *scratch = (float *)xmalloc(slice_bytes);
+    float *full    = (float *)xmalloc(full_bytes);
+    bool ok = own && scratch && full;
+    if (!ok) fprintf(stderr, "pulsar: tp vocab staging out of memory (%llu + %llu bytes)\n",
+                      (unsigned long long)slice_bytes, (unsigned long long)full_bytes);
+    /* This rank's range only.  slice 4d inc 1 made the range expressible: the
+     * head weight is [vocab, in_dim] row-major, so it is a contiguous row range. */
+    if (ok) {
+        ok = single_row
+                 ? gpu_graph_encode_output_head(g, model, weights, row0, lo, hi - lo, slice)
+                 : gpu_graph_encode_output_head_batch(g, model, weights, row0, n_rows,
+                                                      lo, hi - lo, slice);
+    }
+    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, own, slice_bytes) != 0;
+    if (ok) {
+        for (uint32_t r = 0; r < n_rows; r++)
+            memset(own + (uint64_t)r * stride + (hi - lo), 0,
+                   (uint64_t)(stride - (hi - lo)) * sizeof(float));
+    }
+    if (ok) {
+        ok = pulsar_tp_allgather_vocab(g->tp, PULSAR_TP_NON_LAYER_TAG,
+                                       ++g->tp_vocab_seq, full, own, scratch,
+                                       n_rows, n_vocab) != 0;
+    }
+    if (ok) ok = pulsar_gpu_tensor_write(out, 0, full, full_bytes) != 0;
+    pulsar_gpu_tensor_free(slice);
+    free(own);
+    free(scratch);
+    free(full);
+    return ok;
+}
+
+bool gpu_graph_encode_output_head_row_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row,
+        pulsar_gpu_tensor      *out) {
+    if (!g->tp)
+        return gpu_graph_encode_output_head(g, model, weights, row, 0u,
+                                            (uint64_t)PULSAR_N_VOCAB, out);
+    return tp_vocab_split(g, true, row, 1u, model, weights, out);
+}
+
+bool gpu_graph_encode_output_head_batch_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
+        pulsar_gpu_tensor      *out) {
+    if (!g->tp)
+        return gpu_graph_encode_output_head_batch(g, model, weights, row0, n_tokens,
+                                                  0u, (uint64_t)PULSAR_N_VOCAB, out);
+    return tp_vocab_split(g, false, row0, n_tokens, model, weights, out);
 }
 
 static bool gpu_graph_encode_output_head_batch_impl(

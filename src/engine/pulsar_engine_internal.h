@@ -1496,6 +1496,12 @@ typedef struct {
      * same order from the same starting value, so the big-gate seq stays in
      * lockstep (the transport uses it as a desync guard). */
     uint64_t tp_prefill_seq;
+    /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
+     * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
+     * the same number of times in the same order, so the gather's seq stays in
+     * lockstep -- the transport's desync guard keys on it, which is also what
+     * catches a lane that ran a different number of heads on the two ranks. */
+    uint64_t tp_vocab_seq;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -3211,6 +3217,27 @@ bool gpu_graph_encode_output_head_batch(
         uint32_t               n_tokens,
         uint32_t               vocab_lo,
         uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
+/** THE one place the output head knows about TP (slice 4d).  With the group off
+ * each is exactly the call above with the whole range -- same bytes, same
+ * captures.  With the group armed this rank projects only ITS vocab range into
+ * a slice, stages it to host, all-gathers every rank's range (concatenation in
+ * rank order) and writes the assembled full logits back into `out`, so every
+ * rank holds the same full vector and samples independently: no leader-only
+ * decision and no token broadcast.  `out` must be the full [rows, N_VOCAB]
+ * destination; the slice reuses its head as scratch. */
+bool gpu_graph_encode_output_head_row_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row,
+        pulsar_gpu_tensor      *out);
+bool gpu_graph_encode_output_head_batch_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
         pulsar_gpu_tensor      *out);
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,

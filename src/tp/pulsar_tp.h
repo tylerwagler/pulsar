@@ -26,6 +26,11 @@
 #define PULSAR_TP_PROTOCOL_VERSION 8u            /* v8: hello carries rank + n_ranks (n-way) */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
+/** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
+ *  Deliberately outside any real layer index so a lane that ran a vocab gather
+ *  where its peer ran a per-layer MoE gate is caught as a desync by name rather
+ *  than passing because the (layer, seq) pair happened to coincide. */
+#define PULSAR_TP_NON_LAYER_TAG UINT32_C(0xFFF0)
 #define PULSAR_TP_BATCH_MAX_ROWS 8u
 
 typedef enum {
