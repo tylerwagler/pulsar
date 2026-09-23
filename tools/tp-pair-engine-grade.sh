@@ -20,7 +20,9 @@
 # No positional args.  Environment:
 #   PULSAR_TP_HOSTS    REQUIRED. ssh targets in RANK ORDER, rank 0 first, at
 #                      least two.  e.g. "sparky workrig"
-#   PULSAR_TP_MODEL    checkpoint dir (default /srv/models/vexp-safetensors)
+#   PULSAR_TP_MODEL    checkpoint dir (default /mnt/pve1-models/DeepSeek-v4-Flash, the
+#                      full-fidelity MXFP4 build -- the artifact a pair exists for; the
+#                      one-box IQ2 build refuses TP at layer 0 by design)
 #   PULSAR_TP_BIN      engine binary on each host, relative to $HOME or
 #                      absolute (default ~/pulsar)
 #   PULSAR_TP_PORT     TP control port (default 5590)
@@ -43,7 +45,7 @@
 set -u
 
 HOSTS=${PULSAR_TP_HOSTS:-}
-MODEL=${PULSAR_TP_MODEL:-/srv/models/vexp-safetensors}
+MODEL=${PULSAR_TP_MODEL:-/mnt/pve1-models/DeepSeek-v4-Flash}
 BIN=${PULSAR_TP_BIN:-'$HOME/pulsar'}
 PORT=${PULSAR_TP_PORT:-5590}
 PROMPT=${PULSAR_TP_PROMPT:-"Explain how a C pointer differs from an array in one paragraph."}

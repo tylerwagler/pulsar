@@ -147,8 +147,12 @@ pulsar -m <checkpoint> --tp-rank r --tp-nranks n \
        -p "<prompt>" --temp 0 --nothink -n 32 --dump-logprobs rank$r.lp.json
 ```
 
-`tools/tp-pair-engine-grade.sh` runs exactly that over ssh, in rank order, and
-grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-pair-engine-grade.sh`;
+The checkpoint is the full-fidelity MXFP4 build (`ElytronAI/DeepSeek-v4-Flash`,
+168 GB; ~83 GiB per rank at n=2 with slice 4f) -- the one-box IQ2 build refuses
+TP at layer 0 by design.  A worker rank needs no prompt: it runs the receive
+loop (slice 4e, L238) and exits when the leader stops it, so its exit code is
+the loop's verdict.  `tools/tp-pair-engine-grade.sh` runs exactly that over
+ssh, in rank order, and grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-pair-engine-grade.sh`;
 `PULSAR_TP_DRYRUN=1` prints the plan). Its two legs:
 
 - **LEG A — the one that matters, and it needs NO reference.** Every rank must
