@@ -195,7 +195,12 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
     std::free(slab);
     std::free(out);
     std::free(in);
-    return bad == 0 ? 0 : 1;
+    /* CHECK failures must fail the rank, not just print: the vocab all-gather
+     * block below asserts through CHECK, and returning only the all-reduce
+     * counter made every CHECK in this file reportable but not gating (caught
+     * by mutation: forcing the gather's placement offset to 0 printed 2000
+     * wrong elements per rank and still exited 0). */
+    return (bad == 0 && g_failures == 0) ? 0 : 1;
 }
 
 static int run_mesh(int n) {
