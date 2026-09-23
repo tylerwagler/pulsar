@@ -324,10 +324,14 @@ pair, because its own arguments are never read.
     issues no operations, so a server pair cannot be driven this way; either
     the worker grows a receive loop (the design this slice rejected) or
     production TP stays CLI-shaped.  Decide before wiring bank frames;
-  - **MMQ ownership.**  Only the CUTLASS MXFP4 arms honor the owned range; the
-    IQ2 (type 44) MMQ and mixed arms refuse it, and the served artifact's
-    experts are IQ2, so TP refuses at layer 0 on it today.  Port the predicate
-    (it is the same filter on `selected`) or bring up on an MXFP4 build;
+  - **MMQ ownership -- WON'T DO (Tyler, 2026-09-23).**  Only the CUTLASS MXFP4
+    arms honor the owned range; the IQ2 (type 44) MMQ and mixed arms refuse it,
+    so the single-box IQ2 artifact refuses TP at layer 0.  That is the intended
+    shape: the IQ2 artifact IS the one-GB10 compromise, and a pair exists to
+    serve the full-fidelity MXFP4 weights that do not fit one box -- which the
+    CUTLASS arms already split.  "If we've got more than one GB10, we won't
+    need TP2" (Tyler).  Bring-up therefore uses an MXFP4 artifact; the refusal
+    on IQ2 stays loud and stays;
   - **images** are not mirrored; `pulsar_session_sync_mm` refuses a non-zero
     image count under TP on every rank, before any frame moves;
   - `--tp-arm prefill` is a misnomer: decode and verify rows (<= 8) also gate
