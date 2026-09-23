@@ -2021,7 +2021,7 @@ tests/tp_mirror_test: tests/tp_mirror_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tp-mirror-test: tests/tp_mirror_test
-	timeout 60 ./tests/tp_mirror_test
+	PULSAR_TP_TIMEOUT_SEC=1 timeout 60 ./tests/tp_mirror_test
 
 # TP transport loopback test (branch tensor_parallel, slice 3).  Host-only:
 # no CUDA, no RDMA -- a forked leader/worker pair exchanges gate/batch/big

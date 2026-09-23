@@ -191,6 +191,21 @@ static int run_leader(pulsar_tp *tp) {
               "the mixed refusal must name the operation: %s", err);
     }
 
+    /* G. A peer that stays ALIVE but SILENT must produce a refusal, not a hang.
+     * This is the failure mode that made every blocking mirror in this slice
+     * look dangerous, and it is why this target used to need `timeout`: with no
+     * control-plane deadline the leader sat in wait_command_ack forever.  The
+     * worker is at its own tail here, holding the connection open and saying
+     * nothing. */
+    {
+        char terr[256];
+        terr[0] = 0;
+        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "silent peer", terr, sizeof(terr)),
+              "a silent peer must fail the collect, not satisfy it");
+        CHECK(std::strstr(terr, "did not answer") != NULL,
+              "the refusal must name the timeout rather than a closed channel: %s", terr);
+    }
+
     /* F. A leader whose transport is already dead refuses before it sends
      * anything -- no frame, no graph, no half-mirrored operation.  Last,
      * because marking the pair failed poisons the transport for good. */
@@ -288,6 +303,13 @@ static int run_worker(pulsar_tp *tp) {
         }
     }
     free_session(s);
+    /* Stay ALIVE and SILENT past the leader's control-plane deadline, so its
+     * last round tests a timeout rather than a closed channel.  The target sets
+     * PULSAR_TP_TIMEOUT_SEC=1; this sleeps longer than that and shorter than the
+     * target's `timeout`. */
+    std::fflush(stdout);
+    std::fflush(stderr);
+    sleep(3);
     return g_failures;
 }
 

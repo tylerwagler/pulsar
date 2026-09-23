@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -682,6 +683,36 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     if (bytes && !tp_write_full(fd, payload, bytes)) return 0;
     return 1;
+}
+
+/** Block until `fd` is readable or the deadline passes.  Returns 1 readable,
+ * 0 on timeout.  The control plane had NO deadline: a peer that stopped talking
+ * left the other side blocked in pulsar_tp_recv_command/wait_command_ack
+ * forever, which is why every blocking mirror in slice 4e was avoided and why
+ * the tests wrap themselves in `timeout`.  A deadline turns that hang into the
+ * refusal it should always have been. */
+static int tp_wait_readable(int fd, double deadline) {
+    for (;;) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0.0) return 0;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ms = (int)(remaining * 1000.0);
+        if (ms < 1) ms = 1;
+        const int rc = poll(&pfd, 1, ms);
+        if (rc > 0) return 1;
+        if (rc == 0) return 0;
+        if (errno == EINTR) continue;
+        return 0;
+    }
+}
+
+/** The control-plane deadline for one wait, or 0 (never expires) when the
+ * transport was built with no timeout. */
+static double tp_control_deadline(const pulsar_tp *tp) {
+    return tp->timeout_sec ? tp_now_sec() + (double)tp->timeout_sec : 0.0;
 }
 
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
@@ -2760,11 +2791,21 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
     /* One ack per PEER: every worker must have applied the command, and all
      * must succeed.  The first failure names the rank that refused. */
     if (!tp || tp->n_peers < 1) return 0;
+    const double deadline = tp_control_deadline(tp);
     for (int i = 0; i < tp->n_peers; i++) {
         const int pfd = tp->peers[i].control_fd;
         uint32_t type = 0, bytes = 0;
         pulsar_tp_command_ack ack;
-        if (pfd < 0 || !tp_read_frame_header(pfd, &type, &bytes) ||
+        if (pfd < 0 || (deadline > 0.0 && !tp_wait_readable(pfd, deadline))) {
+            pulsar_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: rank %d did not answer %s within %llu s -- the ranks are not in "
+                       "lockstep or the peer is wedged",
+                       tp->peers[i].rank, operation ? operation : "the command",
+                       (unsigned long long)tp->timeout_sec);
+            return 0;
+        }
+        if (!tp_read_frame_header(pfd, &type, &bytes) ||
             type != PULSAR_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
             !tp_read_full(pfd, &ack, sizeof(ack))) {
             pulsar_tp_mark_failed(tp);
@@ -2833,6 +2874,18 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
+    const double deadline = tp_control_deadline(tp);
+    if (deadline > 0.0 && !tp_wait_readable(tp->control_fd, deadline)) {
+        /* A silent peer is NOT the same failure as a closed one, and telling
+         * them apart is the whole point of the deadline: the pair is out of
+         * lockstep (or the peer is wedged), which is a refusal, not a hang. */
+        pulsar_tp_mark_failed(tp);
+        tp_set_err(err, errlen,
+                   "tp: no command from the leader within %llu s -- the ranks are not in "
+                   "lockstep or the peer is wedged",
+                   (unsigned long long)tp->timeout_sec);
+        return 0;
+    }
     if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
         tp_set_err(err, errlen, "tp: control channel closed");
         return 0;

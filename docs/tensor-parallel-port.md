@@ -251,6 +251,25 @@ pair, because its own arguments are never read.
   decision from the shared rng instead of shipping it.  The general lesson is the
   one this port keeps teaching -- "no user" has to mean *no user anywhere*,
   including tests, before anything is deleted.
+- **The control plane has a deadline now (round 11), and that changes what is
+  safe to mirror.**  Every wait in the data path already had one
+  (`timeout_sec`, from `PULSAR_TP_TIMEOUT_SEC`), but `pulsar_tp_recv_command` and
+  `pulsar_tp_wait_command_ack` had NONE: a peer that stopped talking left the
+  other side blocked forever.  That single missing deadline is why every
+  blocking mirror in this slice was avoided, and why `tp-mirror-test` used to
+  wrap itself in `timeout`.  Both now wait on `poll` against the same deadline
+  and refuse with a message that names the difference -- "did not answer X within
+  N s" (the pair is out of lockstep, or the peer is wedged) versus "control
+  channel closed" (the peer is gone).  `tp-mirror-test` asserts the former with a
+  peer that stays alive and silent, the target sets `PULSAR_TP_TIMEOUT_SEC=1`,
+  and removing the deadline turns that round into a measured hang (the harness
+  kills it: exit 124 after 20 s) rather than a passing test.
+  **Consequence for CREATE:** the objection to mirroring session create was that
+  a worker blocking in create-recv would deadlock a real pair when the two ranks'
+  admission decisions differ.  With a deadline that failure mode is a clean,
+  bounded refusal instead of a deadlock, so the blocking variant is now
+  implementable -- which is the next increment, and it retires the one place this
+  slice deviates from its objective on safety grounds rather than preference.
 - **Banks are a LIVENESS gap, not a safety gap (round 10).**  Bank *selection*
   for decodes is already mirrored: the rows carry bank ids, and the worker
   decodes into the leader's banks.  Bank *contents* are not -- `bank_fork`,
