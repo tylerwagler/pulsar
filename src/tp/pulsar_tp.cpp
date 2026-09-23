@@ -484,7 +484,6 @@ typedef struct {
     struct tp_ibv_port_attr port;
     union tp_ibv_gid gid;
     int gid_index;
-    uint32_t max_inline;
 } pulsar_tp_rdma;
 
 /* PER-PEER RDMA state: one QP connected to one peer, that peer's exchanged
@@ -987,17 +986,6 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
     }
-    struct tp_ibv_qp_init_attr qia;
-    (void)memset(&qia, 0, sizeof(qia));
-    qia.send_cq = (decltype(qia.send_cq))tp->rdma.cq;
-    qia.recv_cq = (decltype(qia.recv_cq))tp->rdma.cq;
-    qia.qp_type = TP_IBV_QPT_UC;   /* the RC bring-up A/B knob is gone (L159): UC is the transport */
-    qia.cap.max_send_wr = 256;
-    qia.cap.max_recv_wr = 64;
-    qia.cap.max_send_sge = 1;
-    qia.cap.max_recv_sge = 1;
-    qia.cap.max_inline_data = 0;
-    tp->rdma.max_inline = qia.cap.max_inline_data;
     /* The QP itself is per PEER and is created later, once the peers exist --
      * the HCA open runs before they do.  See tp_rdma_qp_create. */
     return 1;
@@ -1703,14 +1691,19 @@ static pulsar_tp *tp_alloc(void) {
 static void tp_destroy(pulsar_tp *tp) {
     if (!tp) return;
     tp_rdma_close(tp);
-    /* Primary link (control_fd/data_fd) owns peers[0]; close it once here. */
+    /* The primary link's fds are ALSO peers[0]'s once bring-up completed, so
+     * each descriptor is closed once: the primary here, and below every peer
+     * descriptor that is not the primary.  On a bring-up that failed before
+     * the primary was assigned (control_fd still -1) the peers' own fds are
+     * the only handles, and the comparison closes them too. */
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
     if (tp->peers) {
-        /* Peers 1..n_peers-1 are non-primary (mesh); close their own fds. */
-        for (int i = 1; i < tp->n_peers; i++) {
-            if (tp->peers[i].control_fd >= 0) close(tp->peers[i].control_fd);
-            if (tp->peers[i].data_fd >= 0) close(tp->peers[i].data_fd);
+        for (int i = 0; i < tp->n_peers; i++) {
+            if (tp->peers[i].control_fd >= 0 && tp->peers[i].control_fd != tp->control_fd)
+                close(tp->peers[i].control_fd);
+            if (tp->peers[i].data_fd >= 0 && tp->peers[i].data_fd != tp->data_fd)
+                close(tp->peers[i].data_fd);
         }
         free(tp->peers);
         tp->peers = NULL;
@@ -1965,6 +1958,17 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
         free(ep);
         return 0;
     }
+    /* ONE authority for this rank's listen port: its own entry in the peers
+     * list (that is what every other rank dials).  A separate --tp-port that
+     * disagrees is a configuration error, not a second opinion. */
+    if (opt->port > 0 && opt->port != ep[R].port) {
+        tp_set_err(err, errlen,
+                   "tp: --tp-port %d disagrees with this rank's peers entry %s:%d; "
+                   "the peers list is the authority",
+                   opt->port, ep[R].host, ep[R].port);
+        free(ep);
+        return 0;
+    }
     pulsar_tp *tp = tp_alloc();
     if (!tp) { free(ep); tp_set_err(err, errlen, "tp: out of memory"); return 0; }
     tp->opt = *opt;
@@ -1982,23 +1986,23 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
         tp_set_err(err, errlen, "tp: out of memory (peer array)");
         return 0;
     }
-    /* Per-peer RDMA is a later increment and is pair-gated; the verifiable mesh
-     * path is full-duplex TCP (the same data, latency-only difference). */
     /* The probe is an INPUT to the transport decision, not the decision:
      * tp_hello_exchange assigns `rdma_active = rdma_ok && theirs.rdma_ok`, so
      * both sides must report.  This call used to pass a literal 0, which made
      * that assignment a constant false however capable the hardware was -- the
-     * reason an n-rank mesh never rode RoCE. */
+     * reason an n-rank mesh never rode RoCE.
+     *
+     * A probe that says yes and an HCA open that then fails is a REFUSAL, not a
+     * fall-back to TCP (rule 1): the hello below advertises the probe result to
+     * every peer, so a rank that quietly dropped to TCP after a failed open
+     * would still be believed to speak RDMA by the whole group -- the pair path
+     * (pulsar_tp_create) refuses the same way. */
     const int mesh_rdma_ok = tp_rdma_probe(&tp->rdma.api) != 0;
     tp->rdma_active = mesh_rdma_ok;
-    if (tp->rdma_active) {
-        char oerr[256];
-        if (!tp_rdma_open(tp, oerr, sizeof(oerr))) {
-            /* Degrade loudly rather than refuse the whole group: the mesh is
-             * still correct over TCP, just slower. */
-            fprintf(stderr, "pulsar-tp: mesh rdma open failed (%s) -- mesh rides TCP\n", oerr);
-            tp->rdma_active = false;
-        }
+    if (tp->rdma_active && !tp_rdma_open(tp, err, errlen)) {
+        free(ep);
+        tp_destroy(tp);
+        return 0;
     }
 
     int listener = tp_listen(ep[R].host, ep[R].port, N > 1 ? N : 2, err, errlen);
@@ -2062,8 +2066,6 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
             tp_set_err(err, errlen, "tp: peer %d control socket not established", pp->rank);
             goto fail;
         }
-        uint32_t saved_ctx = 0;
-        (void)saved_ctx;
         if (!tp_hello_exchange(tp, pp->control_fd, pp->rank, id, mesh_rdma_ok, err, errlen))
             goto fail;
         all_rdma = all_rdma && tp->rdma_active;
@@ -2193,15 +2195,6 @@ void pulsar_tp_mark_failed(pulsar_tp *tp) {
 /* ------------------------------------------------------------------------
  * Gate exchange.
  * --------------------------------------------------------------------- */
-
-/* n>2 guard: a pairwise or leader->worker path that is not yet n-way refuses
- * loudly rather than run against only one peer (rule 9). */
-static int tp_refuse_nway(pulsar_tp *tp, const char *what) {
-    fprintf(stderr, "pulsar-tp: %s is not implemented for n>2 (n_ranks=%d); refused\n",
-            what, tp ? tp->n_ranks : 0);
-    if (tp) tp->failed.store(true, std::memory_order_release);
-    return 0;
-}
 
 /* One pairwise slab-slot gate over `fd`: send our out-slot, receive the
  * peer's payload into the in-slot.  Both ranks run it symmetrically (a 16 KB
@@ -2789,9 +2782,16 @@ int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation, char *err, size_t errlen) {
     /* One ack per PEER: every worker must have applied the command, and all
-     * must succeed.  The first failure names the rank that refused. */
+     * must succeed.  The first failure names the rank that refused -- but a
+     * refusal (an ack that arrived with a nonzero status or a foreign session
+     * id) does NOT stop the collect: the remaining peers' acks are still read,
+     * because an ack left in a socket would be consumed by the NEXT operation
+     * and shift every later frame on that link by one.  Only a dead link
+     * (timeout, closed channel, malformed frame) returns at once, since nothing
+     * more can be trusted from it. */
     if (!tp || tp->n_peers < 1) return 0;
     const double deadline = tp_control_deadline(tp);
+    int refused = 0;
     for (int i = 0; i < tp->n_peers; i++) {
         const int pfd = tp->peers[i].control_fd;
         uint32_t type = 0, bytes = 0;
@@ -2813,15 +2813,15 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                        tp->peers[i].rank, operation ? operation : "command");
             return 0;
         }
-        if (ack.session_id != session_id || ack.status != 0) {
+        if ((ack.session_id != session_id || ack.status != 0) && !refused) {
+            refused = 1;
             tp_set_err(err, errlen,
                        "tp: rank %d %s failed (session %llu, status %d)",
                        tp->peers[i].rank, operation ? operation : "command",
                        (unsigned long long)ack.session_id, (int)ack.status);
-            return 0;
         }
     }
-    return 1;
+    return refused ? 0 : 1;
 }
 
 int pulsar_tp_send_stop(pulsar_tp *tp) {

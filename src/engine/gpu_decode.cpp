@@ -918,9 +918,10 @@ bool gpu_graph_encode_output_head(
      * its swizzled E8M0 scale plane beside the payload, so a row slice would
      * mis-address the scales.  That arm refuses until its own slice lands. */
     const uint64_t head_esz = head_mx ? 1u : sizeof(uint16_t);
-    if (ok && head_mx && vocab_lo != 0) {
+    if (ok && head_mx && (vocab_lo != 0 || vocab_dim != (uint64_t)PULSAR_N_VOCAB)) {
         fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
-                        "(vocab_lo=%u) -- refusing\n", vocab_lo);
+                        "(range [%u, %u)) -- refusing\n", vocab_lo,
+                (unsigned)(vocab_lo + vocab_dim));
         ok = false;
     }
     const uint64_t head_off = weights->output->abs_offset +
@@ -1069,11 +1070,24 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
                  : gpu_graph_encode_output_head_batch(g, model, weights, row0, n_rows,
                                                       lo, hi - lo, slice);
     }
-    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, own, slice_bytes) != 0;
+    /* The head wrote the slice PACKED: row r of the GEMM output starts at
+     * r * (hi - lo), because the GEMM's out_dim IS the range width.  The gather
+     * wants rows at the padded pitch `stride` (one byte count per exchange
+     * round), so the packed rows are read into scratch and RE-PITCHED here --
+     * reading them straight into a stride-pitched buffer mis-placed every row
+     * after the first on any rank whose range is shorter than the stride (every
+     * uneven split), and the tail zero-fill then overwrote the next row's head.
+     * n=2 over 129280 is even, which is why the pair never showed it. */
+    const uint64_t packed_bytes = (uint64_t)n_rows * (hi - lo) * sizeof(float);
+    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0;
     if (ok) {
-        for (uint32_t r = 0; r < n_rows; r++)
+        for (uint32_t r = 0; r < n_rows; r++) {
+            memcpy(own + (uint64_t)r * stride,
+                   scratch + (uint64_t)r * (hi - lo),
+                   (uint64_t)(hi - lo) * sizeof(float));
             memset(own + (uint64_t)r * stride + (hi - lo), 0,
                    (uint64_t)(stride - (hi - lo)) * sizeof(float));
+        }
     }
     if (ok) {
         ok = pulsar_tp_allgather_vocab(g->tp, PULSAR_TP_NON_LAYER_TAG,
@@ -1235,9 +1249,10 @@ static bool gpu_graph_encode_output_head_batch_impl(
      * (its scale plane is not row-addressable). */
     const bool bh_mx = weights->output->type != PULSAR_TENSOR_BF16;
     const uint64_t bh_esz = bh_mx ? 1u : sizeof(uint16_t);
-    if (ok && bh_mx && vocab_lo != 0) {
+    if (ok && bh_mx && (vocab_lo != 0 || vocab_dim != (uint64_t)PULSAR_N_VOCAB)) {
         fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
-                        "(vocab_lo=%u) -- refusing\n", vocab_lo);
+                        "(range [%u, %u)) -- refusing\n", vocab_lo,
+                (unsigned)(vocab_lo + vocab_dim));
         ok = false;
     }
     const uint64_t bh_off = weights->output->abs_offset +

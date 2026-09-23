@@ -23,7 +23,7 @@
 #include <stdint.h>
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 8u            /* v8: hello carries rank + n_ranks (n-way) */
+#define PULSAR_TP_PROTOCOL_VERSION 9u            /* v9: row payload on EVAL_BATCH/MIXED_BATCH, RNG_STATE frame; v8: hello carries rank + n_ranks */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).

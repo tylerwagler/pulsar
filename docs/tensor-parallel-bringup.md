@@ -157,6 +157,11 @@ grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-pair-engine-grade.sh`;
   assembles the full vector — so all ranks must agree. A wrong range partition,
   a wrong gather or a wrong assembly shows up here as ranks disagreeing, by
   name. This is the instrument that proves the vocab split ran the lane.
+- **DSpark stays ON in this run.**  Speculation on a pair is lockstep because
+  the CLI's `generate_speculative` synchronizes the rng with the leader before
+  its first draw (4e, 2026-09-23); every accept test and carry then follows the
+  leader's by construction.  Byte-identical logprobs across ranks with the
+  drafter live is therefore part of what LEG A proves.
 - **LEG B — optional, tolerance only.** Set `PULSAR_TP_BASELINE=<single-box
   logprobs.json>` to grade rank 0 against a single-box run. TP is NOT
   byte-exact (partials are summed in a new order), so this is a report

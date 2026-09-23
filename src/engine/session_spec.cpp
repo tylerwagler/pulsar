@@ -1736,6 +1736,15 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
                  "per-bank state is stale; re-sync the session first");
         return 0;
     }
+    /* Slice 4e: this is the CLI's speculation entry and it draws from `rng`
+     * itself (the fresh base below, then every round's walk) without passing
+     * through pulsar_session_spec_next_base, so it establishes the pair's one
+     * stream here, before the first draw.  Nothing crosses the wire when the
+     * pair is off, and the round gate below refuses a pair that skipped it. */
+    if (pulsar_session_mirror_rng(s, rng) != 0) {
+        snprintf(err, errlen, "tp: the pair could not synchronize its speculation rng");
+        return -1;
+    }
     int first;
     const bool carry_params_match =
         s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&

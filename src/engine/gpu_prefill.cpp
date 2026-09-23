@@ -2738,8 +2738,14 @@ bool gpu_graph_encode_layer_ffn_batch(
         } \
     } while (0)
 
+    /* The range is over THIS layer's routed experts -- the count the kernel is
+     * handed below (n_expert_present), not the target table's entry for `il`.
+     * The drafter reaches this encoder with ITS OWN layer index, and a REAP'd
+     * or V4.1 layout gives the two tables different numbers; a range wider
+     * than the kernel's total is a refusal there, and one narrower silently
+     * drops experts. */
     uint32_t exp_lo = 0u;
-    uint32_t exp_hi = (uint32_t)pulsar_layer_n_expert(il);
+    uint32_t exp_hi = layer->n_expert_present;
     if (ok && g->tp) {
         /* Slice 4c: under TP each rank computes ONLY its owned expert slice
          * (single authority), so the all-reduce at tp_prefill_big_gate sums the
@@ -2816,24 +2822,24 @@ bool gpu_graph_encode_layer_ffn_batch(
     PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT();
 #undef PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
 
-    if (ok && keep_ffn_out) {
+    /* Slice 4b: with the group armed, exchange this layer's owned routed
+     * partial and fold the peers' in BEFORE the HC expansion below, so the layer
+     * output carried into the next layer is the full routed sum.  One big gate
+     * per layer for the whole chunk (amortized, not per token).  The ffn_out
+     * sum is formed ONCE, from the combined routed value, so the single-box
+     * branch and the TP branch never both write it. */
+    if (ok && keep_ffn_out && !g->tp) {
         ok = gpu_graph_ensure_batch_ffn_out(g) &&
              pulsar_gpu_add_tensor(g->batch_ffn_out,
                                   g->batch_shared_out,
                                   g->batch_routed_out,
                                   (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;
     }
-    /* Slice 4b: prefill big-gate.  When the pair is armed, exchange this
-     * layer's routed contribution with the peer and fold the peer's partial in
-     * BEFORE the HC expansion below, so the layer output carried into the next
-     * layer is the fully-combined value.  One big gate per layer for the whole
-     * chunk (amortized, not per token).  The per-rank partial is ownership-
-     * aware only once 4c lands, so an enabled TP run is not yet proof-correct;
-     * the mechanism (transport + wiring) is what this wires. */
     if (ok && g->tp) {
         ok = tp_prefill_big_gate(g, il, n_tokens);
         if (ok && keep_ffn_out) {
-            ok = pulsar_gpu_add_tensor(g->batch_ffn_out,
+            ok = gpu_graph_ensure_batch_ffn_out(g) &&
+                 pulsar_gpu_add_tensor(g->batch_ffn_out,
                                       g->batch_shared_out,
                                       g->batch_routed_out,
                                       (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;

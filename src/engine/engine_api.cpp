@@ -578,6 +578,17 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
      * forever.  A dead transport makes its recv fail, which fails loudly --
      * that is the right ending, and the wrong one is a hang. */
     if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
+    /* Images do not ride the frame yet: the worker would run the leader's
+     * tokens against ITS OWN images, and the mirror's whole claim is that a
+     * worker's arguments are never read.  Refused on EVERY rank before any
+     * frame moves, so the same driver refuses the same request on both sides
+     * (rule 9). */
+    if (n_images > 0) {
+        if (err) snprintf(err, errlen,
+                          "tp: images are not mirrored onto the pair yet (%d supplied); refusing",
+                          n_images);
+        return 1;
+    }
     const int is_leader = pulsar_tp_rank(tp) == 0;
     if (is_leader) {
         /* The leader's arguments ARE the operation, so an empty prompt here is

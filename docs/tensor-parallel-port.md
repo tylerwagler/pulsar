@@ -316,7 +316,25 @@ pair, because its own arguments are never read.
   wins and the ordinal proves it".  Nobody should wire bank frames before that
   question is answered, because mirroring a local scheduler's decisions is how
   the invalidate round would have deadlocked.
-- **Still open:** warm-fork, and the bank agreement question above.
+- **Still open (2026-09-23 review, L236):**
+  - warm-fork, and the bank agreement question above;
+  - **the server driver model.**  Everything in 4e assumes both ranks run the
+    same driver with the same arguments.  That holds for the CLI.  A
+    `pulsar-server` worker receives no HTTP requests, creates no sessions and
+    issues no operations, so a server pair cannot be driven this way; either
+    the worker grows a receive loop (the design this slice rejected) or
+    production TP stays CLI-shaped.  Decide before wiring bank frames;
+  - **MMQ ownership.**  Only the CUTLASS MXFP4 arms honor the owned range; the
+    IQ2 (type 44) MMQ and mixed arms refuse it, and the served artifact's
+    experts are IQ2, so TP refuses at layer 0 on it today.  Port the predicate
+    (it is the same filter on `selected`) or bring up on an MXFP4 build;
+  - **images** are not mirrored; `pulsar_session_sync_mm` refuses a non-zero
+    image count under TP on every rank, before any frame moves;
+  - `--tp-arm prefill` is a misnomer: decode and verify rows (<= 8) also gate
+    through the slab big-gate path, so the arm is "all lanes, one mechanism";
+  - the control-plane deadline on the worker's `recv_command` presumes the
+    same-driver model above (a worker only waits for a frame once its own
+    driver issued the operation); it is not an idle timeout.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

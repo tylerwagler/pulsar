@@ -582,7 +582,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 # cannot race the runner's build.  pulsar-eval is a prerequisite of `gates` for
 # the same reason: the background sub-make may only RUN it.
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
-             indexer-score-check attn-pack-fixture-check
+             indexer-score-check attn-pack-fixture-check tp-core-test
 	./pulsar-eval --self-test-extractors
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS

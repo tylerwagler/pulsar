@@ -121,8 +121,13 @@ bug, not a design change.
       its `valid` predicate; the MMQ/mixed arms fail loudly (rule 9).  The
       engine passes the owned range under the same `g->tp` condition that gates
       `tp_prefill_big_gate`, so the all-reduce sums n owned partials into the
-      correct full routed sum — TP is now numerically correct.  Non-TP
-      (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
+      correct full routed sum — numerically correct **on the CUTLASS MXFP4
+      arms**.  The MMQ (IQ2 type 44) and mixed arms REFUSE ownership, so the
+      served all-IQ2 artifact cannot run TP until the same predicate is ported
+      to them (open item, port.md).  The range is the LAYER's own present
+      expert count (2026-09-23 fix: it read the target table by index, which
+      the drafter's own layer index and any REAP'd/V4.1 layout disagree with).
+      Non-TP (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
       GPU/pair-gated (the prefill byte gate and the pair all-reduce check).
 - 4d. **Vocab head split on the logits path.  n-GENERAL, not two-rank**
       (Tyler 2026-09-22: the target is n parallel Sparks).  Split = one vocab
@@ -145,13 +150,22 @@ bug, not a design change.
         bracket is now taken only for the full-vocab range: a gate recv is a host
         wait and cannot live in a captured graph, and the recorded body binds its
         destination.
-      - **4d inc 2 (next):** `pulsar_tp_owned_vocab_range` + an n-way all-gather
-        primitive + the assembly.  Sized exchanges: pad each rank's slice to
-        `ceil(V/n)` so every rank sends the SAME byte count (the group exchange
-        has one size per round; 129280 does not divide by 3 or 5), with the last
-        rank's tail zero-padded.
-- 4e. Phase-3 lockstep over our session surface (banks/warm-fork, multiseq,
-      mixed, spec rounds).
+      - **4d inc 2 LANDED 2026-09-22** (`pulsar_tp_allgather_vocab` + the eval
+        path wiring): one authority for the range (`pulsar_tp_owned_range`),
+        an n-way all-gather that CONCATENATES in rank order, slices padded to
+        `ceil(V/n)` so every exchange round carries one byte count (129280 does
+        not divide by 3 or 5).  **Fixed 2026-09-23:** the head writes its slice
+        PACKED (pitch = range width) and the engine copied it at the padded
+        pitch, mis-placing every row after the first on an uneven split with
+        more than one head row; the rows are now re-pitched after the read.
+        The pair (n=2, even split) never showed it, and the mesh test builds
+        its slice at stride pitch, which is why neither caught it.
+- 4e. Phase-3 lockstep over our session surface — **IN PROGRESS**, tracked in
+      docs/tensor-parallel-port.md: create, sync, eval, batched decode, the
+      mixed step, rewind and invalidate are mirrored, and speculation shares
+      one rng (both the CLI's `generate_speculative` and `spec_next_base` sync
+      it before drawing).  Open: warm-fork, the bank agreement question, the
+      server driver model, images (refused under TP until they ride the frame).
 
 ## Open items for bring-up
 - **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**
