@@ -296,6 +296,18 @@ static const char *const g_env_keep[] = {
     /* Infrastructure: the lock PATH, not any numeric.  Read by
      * src/engine/engine_api.c, which this binary does link. */
     "PULSAR_LOCK_FILE",
+    /* Topology, not numerics (L240): the TP group a gate joins, read ONCE by
+     * tests/gate_entry.h at gate_engine_open (compiled into this binary).  A
+     * group changes WHERE partials are summed, which is exactly what the
+     * reference mode grades against the SOURCE on a pair; the byte modes
+     * (--check, --check-decode) compare against single-box blobs and would
+     * fail honestly under a group, which is the right answer.  Scrubbing these
+     * would silently turn a pair run into a single-box run on rank 0 and a
+     * refusal-free hang on every worker. */
+    "PULSAR_TP_RANK",
+    "PULSAR_TP_NRANKS",
+    "PULSAR_TP_PEERS",
+    "PULSAR_TP_PORT",
 };
 
 /* Numerics knobs OUTSIDE the PULSAR_ namespace.  The scrub below sweeps PULSAR_* by

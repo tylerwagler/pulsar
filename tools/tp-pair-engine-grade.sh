@@ -15,7 +15,16 @@
 #
 #   LEG B (optional): grade one rank against a SINGLE-BOX baseline.  TP is NOT
 #   byte-exact (partials are summed in a new order), so this leg is a tolerance
-#   report, never an equality assert -- rule 3.
+#   report, never an equality assert -- rule 3.  For the artifact a pair exists
+#   for (the 168 GB MXFP4 build) no single GB10 can produce that baseline, so
+#   LEG B is for the one-box artifacts only.
+#
+#   LEG C (optional, the pair's fidelity instrument): the reference gate
+#   (`tests/prefill_bitexact_gate --check-reference`, rule 7) run THROUGH the
+#   group -- rank 0 grades its prefill logits against the B300 vLLM capture at
+#   every recorded depth, ranks > 0 run the receive loop.  The gate binary has
+#   no TP flags: it joins the group through PULSAR_TP_RANK/NRANKS/PEERS/PORT in
+#   its environment (tests/gate_entry.h, L240).  Story and code blobs, in turn.
 #
 # No positional args.  Environment:
 #   PULSAR_TP_HOSTS    REQUIRED. ssh targets in RANK ORDER, rank 0 first, at
@@ -39,6 +48,15 @@
 #                      downward and accepts upward, so rank order is the safe
 #                      start order)
 #   PULSAR_TP_BASELINE single-box logprobs JSON to grade against (LEG B)
+#   PULSAR_TP_REF_DIR  reference-capture dir with {story,code}.{ref,tokens}.bin
+#                      (LEG C); the dir must exist on rank 0's host
+#   PULSAR_TP_REF_BIN  the gate binary on each host (default ~/prefill_bitexact_gate)
+#   PULSAR_TP_REF_TOL  KL tolerance for the confident depths (default 1e-4)
+#   PULSAR_TP_REF_KNOWN_HIGH_STORY / _CODE, PULSAR_TP_REF_KNOWN_FLIP_STORY / _CODE
+#                      the capture's documented outlier depths.  No defaults
+#                      here: their one home is the battery's runner spec
+#                      (tests/gates_runner.cpp, `ref_story` / `ref_code`); copy
+#                      them from there for the capture you grade against
 #   PULSAR_TP_WORKDIR  staging dir on each host (default ~/tp-pair-grade)
 #   PULSAR_TP_SHA      when set, every rank's binary must carry this build sha
 #                      (the engine prints it at startup; asserted after the run
@@ -76,6 +94,13 @@ SSH_ARGS=${PULSAR_TP_SSH:-}
 TIMEOUT=${PULSAR_TP_TIMEOUT:-900}
 STAGGER=${PULSAR_TP_STAGGER:-5}
 BASELINE=${PULSAR_TP_BASELINE:-}
+REF_DIR=${PULSAR_TP_REF_DIR:-}
+REF_BIN=${PULSAR_TP_REF_BIN:-'$HOME/prefill_bitexact_gate'}
+REF_TOL=${PULSAR_TP_REF_TOL:-1e-4}
+REF_KH_STORY=${PULSAR_TP_REF_KNOWN_HIGH_STORY:-}
+REF_KF_STORY=${PULSAR_TP_REF_KNOWN_FLIP_STORY:-}
+REF_KH_CODE=${PULSAR_TP_REF_KNOWN_HIGH_CODE:-}
+REF_KF_CODE=${PULSAR_TP_REF_KNOWN_FLIP_CODE:-}
 WORKDIR=${PULSAR_TP_WORKDIR:-tp-pair-grade}
 WANT_SHA=${PULSAR_TP_SHA:-}
 MIN_AVAIL=${PULSAR_TP_MIN_AVAIL_GIB:-100}
@@ -105,8 +130,8 @@ echo "  model: $MODEL   ctx: $CTX   tokens: $TOKENS"
 # ---- plan -------------------------------------------------------------------
 run_rank_cmd() {   # $1 = rank index
     local r=$1
-    printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d PULSAR_TP_RANK=%d %s -m %s ' \
-           "$WORKDIR" "$r" "$r" "$BIN" "$MODEL"
+    printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d %s -m %s ' \
+           "$WORKDIR" "$r" "$BIN" "$MODEL"
     printf -- '--tp-rank %d --tp-nranks %d --tp-peers %s --tp-port %d ' \
            "$r" "$N" "$PEERS" "$PORT"
     printf -- '-c %d --nothink --temp 0 -n %d --dump-logprobs rank%d.lp.json -p %q' \
@@ -172,39 +197,44 @@ fi
 echo "  preflight: every host ok"
 [ "$PREFLIGHT_ONLY" = 0 ] || exit 0
 
-# ---- launch -----------------------------------------------------------------
-pids=()
-for r in $(seq 0 $((N - 1))); do
-    h=${RANKS[$r]}
-    ssh $SSH_ARGS -o BatchMode=yes "$h" "mkdir -p $WORKDIR && rm -f $WORKDIR/rank$r.*" \
-        || die "rank $r host $h unreachable / cannot stage $WORKDIR"
-    # Per-rank lock file: the instance lock is per MACHINE, so a same-host dry
-    # run needs its own, and it is harmless when the ranks are on real boxes.
-    ssh $SSH_ARGS -o BatchMode=yes "$h" \
-        "cd $WORKDIR && ($(run_rank_cmd "$r") > rank$r.out 2> rank$r.err; echo \$? > rank$r.rc) &" \
-        || die "rank $r launch failed"
-    echo "  launched rank $r on $h"
-    [ "$r" -lt $((N - 1)) ] && sleep "$STAGGER"
-done
+# ---- one round: launch every rank in rank order, wait, read the rc files ----
+# $1 = file prefix (rank | ref-story | ref-code), $2 = the per-rank command
+# generator (a function taking the rank index).  Sets round_fail.
+run_round() {
+    local prefix=$1 gen=$2 r h rc
+    for r in $(seq 0 $((N - 1))); do
+        h=${RANKS[$r]}
+        ssh $SSH_ARGS -o BatchMode=yes "$h" "mkdir -p $WORKDIR && rm -f $WORKDIR/$prefix$r.*" \
+            || die "rank $r host $h unreachable / cannot stage $WORKDIR"
+        # Per-rank lock file: the instance lock is per MACHINE, so a same-host dry
+        # run needs its own, and it is harmless when the ranks are on real boxes.
+        ssh $SSH_ARGS -o BatchMode=yes "$h" \
+            "cd $WORKDIR && ($($gen "$r") > $prefix$r.out 2> $prefix$r.err; echo \$? > $prefix$r.rc) &" \
+            || die "rank $r launch failed"
+        echo "  launched rank $r on $h"
+        [ "$r" -lt $((N - 1)) ] && sleep "$STAGGER"
+    done
+    echo "tp-pair-engine-grade: waiting up to ${TIMEOUT}s per rank"
+    for r in $(seq 0 $((N - 1))); do
+        h=${RANKS[$r]}
+        ssh $SSH_ARGS -o BatchMode=yes "$h" \
+            "for i in \$(seq 1 $TIMEOUT); do [ -f $WORKDIR/$prefix$r.rc ] && break; sleep 1; done; \
+             [ -f $WORKDIR/$prefix$r.rc ] || echo TIMEOUT > $WORKDIR/$prefix$r.rc" \
+            || true   # an unreachable host leaves no rc file, which the read below fails on
+    done
+    round_fail=0
+    echo "--- per-rank rc ($prefix) ---"
+    for r in $(seq 0 $((N - 1))); do
+        h=${RANKS[$r]}
+        rc=$(ssh $SSH_ARGS -o BatchMode=yes "$h" "cat $WORKDIR/$prefix$r.rc 2>/dev/null" | tr -d '[:space:]')
+        echo "  rank $r ($h): rc=${rc:-?}"
+        [ "${rc:-}" = "0" ] || round_fail=1
+    done
+}
 
-# ---- wait + collect ---------------------------------------------------------
-echo "tp-pair-engine-grade: waiting up to ${TIMEOUT}s per rank"
-for r in $(seq 0 $((N - 1))); do
-    h=${RANKS[$r]}
-    ssh $SSH_ARGS -o BatchMode=yes "$h" \
-        "for i in \$(seq 1 $TIMEOUT); do [ -f $WORKDIR/rank$r.rc ] && break; sleep 1; done; \
-         [ -f $WORKDIR/rank$r.rc ] || echo TIMEOUT > $WORKDIR/rank$r.rc" \
-        || true   # an unreachable host leaves no rc file, which the read below fails on
-done
-
-fail=0
-echo "--- per-rank rc ---"
-for r in $(seq 0 $((N - 1))); do
-    h=${RANKS[$r]}
-    rc=$(ssh $SSH_ARGS -o BatchMode=yes "$h" "cat $WORKDIR/rank$r.rc 2>/dev/null" | tr -d '[:space:]')
-    echo "  rank $r ($h): rc=${rc:-?}"
-    [ "${rc:-}" = "0" ] || fail=1
-done
+# ---- the greedy run (LEG A's input) -----------------------------------------
+run_round rank run_rank_cmd
+fail=$round_fail
 
 # ---- provenance: the binary that ran, not the tree that was checked out -----
 if [ -n "$WANT_SHA" ]; then
@@ -292,9 +322,41 @@ PY
     fi
 fi
 
+# ---- LEG C (optional): the reference gate through the group -----------------
+if [ -n "$REF_DIR" ]; then
+    echo "--- LEG C: reference gate (rule 7) through the group, rank 0 grades ---"
+    ref_blob=""; ref_kh=""; ref_kf=""
+    ref_rank_cmd() {   # $1 = rank index; the gate joins the group by environment
+        printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d PULSAR_TP_RANK=%d PULSAR_TP_NRANKS=%d PULSAR_TP_PEERS=%s PULSAR_TP_PORT=%d ' \
+               "$WORKDIR" "$1" "$1" "$N" "$PEERS" "$PORT"
+        printf '%s %s --check-reference %s/%s.ref.bin %s/%s.tokens.bin %s' \
+               "$REF_BIN" "$MODEL" "$REF_DIR" "$ref_blob" "$REF_DIR" "$ref_blob" "$REF_TOL"
+        [ -n "$ref_kh" ] && printf ' --known-high %s' "$ref_kh"
+        [ -n "$ref_kf" ] && printf ' --known-flip %s' "$ref_kf"
+    }
+    for ref_blob in story code; do
+        if [ "$ref_blob" = story ]; then ref_kh=$REF_KH_STORY; ref_kf=$REF_KF_STORY; else ref_kh=$REF_KH_CODE; ref_kf=$REF_KF_CODE; fi
+        if ! ssh $SSH_ARGS -o BatchMode=yes "${RANKS[0]}" "[ -r $REF_DIR/$ref_blob.ref.bin ] && [ -r $REF_DIR/$ref_blob.tokens.bin ]"; then
+            echo "  $ref_blob: $REF_DIR has no readable $ref_blob.{ref,tokens}.bin on rank 0 -- a configured-but-missing blob is a FAIL, not a skip"
+            fail=1; continue
+        fi
+        echo "  blob $ref_blob: known-high '${ref_kh:-none}', known-flip '${ref_kf:-none}'"
+        run_round "ref-$ref_blob-" ref_rank_cmd
+        [ "$round_fail" = 0 ] || fail=1
+        # the grade is rank 0's report; workers only have to have exited 0
+        ssh $SSH_ARGS -o BatchMode=yes "${RANKS[0]}" \
+            "grep -E 'depth +[0-9]+:|NET over|REFERENCE GATE' $WORKDIR/ref-$ref_blob-0.out" | sed 's/^/    /'
+        ssh $SSH_ARGS -o BatchMode=yes "${RANKS[0]}" "grep -q 'REFERENCE GATE: PASS' $WORKDIR/ref-$ref_blob-0.out" \
+            || { echo "  $ref_blob: rank 0 did not report REFERENCE GATE: PASS"; fail=1; }
+        for r in $(seq 1 $((N - 1))); do
+            ssh $SSH_ARGS -o BatchMode=yes "${RANKS[$r]}" "grep -m1 'TP worker loop ended' $WORKDIR/ref-$ref_blob-$r.err" | sed "s/^/    rank $r: /"
+        done
+    done
+fi
+
 echo "===================== tp-pair-engine-grade ====================="
 if [ "$fail" = 0 ]; then
-    echo "  PASS: all ranks exited 0, no refusal/desync, all ranks byte-identical"
+    echo "  PASS: all ranks exited 0, no refusal/desync, all ranks byte-identical${REF_DIR:+, reference gate PASS through the group}"
     exit 0
 fi
 echo "  FAIL: see the legs above"

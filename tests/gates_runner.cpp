@@ -107,8 +107,14 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
            same_str(a->tp_peer, b->tp_peer) && same_str(a->tp_peers, b->tp_peers);
 }
 
-int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *opt) {
-    if (!e || !opt || !opt->model_path) return 1;
+int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *want) {
+    if (!e || !want || !want->model_path) return 1;
+    /* The group, if any, joins the gate's options here (gate_entry.h): the
+     * broker compares and opens the configuration the process will actually
+     * run, so two gates asking for the same engine on the same group share it. */
+    pulsar_engine_options o = *want;
+    if (gate_tp_options_from_env(&o)) return 1;
+    const pulsar_engine_options *opt = &o;
     if (g_live && same_config(&g_live_opt, opt)) {
         *e = g_live;
         return 0;
@@ -121,6 +127,7 @@ int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *opt) {
     pulsar_engine *fresh = NULL;
     const int rc = pulsar_engine_open(&fresh, opt);
     if (rc != 0) return rc;
+    gate_tp_worker_or_continue(fresh);   /* a worker rank never returns from here */
     g_engine_opens++;
     g_live = fresh;
     g_live_opt = *opt;
@@ -460,12 +467,17 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
     RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality);
     if (have_ref) {
-        /* --known-flip and --kl-baseline are appended per blob: the story blob
-         * carries a documented argmax flip at 512; the KL budgets grade
+        /* --known-flip and --kl-baseline are appended per blob.  The anchors
+         * are the SERVED model's (Vision-Exp, L240, 2026-09-23): the story
+         * blob's documented argmax flip is the file-end row 30464 (ours 6712
+         * at 24.06 over 915 at 23.54; the source had them 0.125 apart at a
+         * 2.4-nat position) -- the 0731 artifact flipped at 512 instead, and
+         * that row MATCHES for Vision-Exp.  The gate says "drop it" by name
+         * when an exemption stops being needed.  The KL budgets grade
          * direction and are passed only when present. */
         gate_spec s = ref_story;
         int n = 6;
-        s.args[n++] = "--known-flip"; s.args[n++] = "512";
+        s.args[n++] = "--known-flip"; s.args[n++] = "30464";
         if (kl_story_ok) { s.args[n++] = "--kl-baseline"; s.args[n++] = kl_story; }
         s.args[n] = NULL;
         RUN(s);

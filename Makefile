@@ -1246,34 +1246,38 @@ PULSAR_REF_TOL ?= 1e-4
 # Per-depth KL budgets: the gate grades DIRECTION against these (closer to the
 # source = pass).  Absent, it falls back to the absolute-ceiling check only,
 # which cannot see direction -- see the 2026-08-24 note in
-# pulsar-notes/bit-exact-vs-source-2026-08-24.md.
+# pulsar-notes/bit-exact-vs-source-2026-08-24.md.  RECORDED FROM THE SERVED
+# MODEL (Vision-Exp, dev 4499f93d, L240, 2026-09-23, `--dump-kl`); the 0731
+# budgets they replaced graded a different model's numbers.
 KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-story.txt
 KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
+# The reference capture the battery grades against BY DEFAULT (L240): the
+# Vision-Exp B300 capture staged on the Spark (blobs + token files, 4.7 MB;
+# source: ~/reference-capture-archive-2026-09-23/vexp/out + the shared
+# *.tokens.bin, same prompt fnv).  Every battery from the Vision-Exp switch to
+# 2026-09-23 printed "SKIP cuda-reference-gate" because nothing set this;
+# rule 7 was not being exercised.  A configured dir with no readable blob is a
+# FAIL in the runner, never a skip -- stage the capture or override with an
+# empty value to skip deliberately (PULSAR_REF_DIR=).
+PULSAR_REF_DIR ?= /home/claude/ref-vexp
 # ⚠ ONE SHELL, DELIBERATELY.  Each make recipe LINE gets its own shell, so an
 # `exit 0` in a guard on the first line exits only that line and make runs the
 # rest anyway -- which is exactly how the first version of this target failed
 # `make gates` with "cannot read reference blob /story.ref.bin" whenever
 # PULSAR_REF_DIR was unset (i.e. by default).  The guard and the work must sit
 # in the same shell for the skip to be a skip.
-cuda-reference-gate:
-	@if [ -z "$(PULSAR_REF_DIR)" ]; then \
-		echo "  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir"; \
-		echo "        (blobs live outside the repo; without them this gate grades nothing)"; \
-	elif [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
-		echo "REFUSING: PULSAR_REF_DIR=$(PULSAR_REF_DIR) has no readable story.ref.bin"; \
-		echo "          (a configured-but-missing dir must not pass silently)"; exit 1; \
-	else \
-		set -e; \
-		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
-		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
-			$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-			$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512 \
-			$(if $(wildcard $(KL_BUDGET_STORY)),--kl-baseline $(KL_BUDGET_STORY),); \
-		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
-			$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
-			$(PULSAR_REF_TOL) --known-high 3840 \
-			$(if $(wildcard $(KL_BUDGET_CODE)),--kl-baseline $(KL_BUDGET_CODE),); \
-	fi
+# The manual form runs the same two sub-gates the battery runs, through the
+# runner, so the documented outlier depths and the skip/refuse rule have ONE
+# home (tests/gates_runner.cpp).  The standalone tests/prefill_bitexact_gate
+# binary still builds (LEG C of tools/tp-pair-engine-grade.sh runs it on every
+# rank of a pair, and it takes --dump-kl to record a budget).
+cuda-reference-gate: tests/gates_runner
+	@./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
+		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
+		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
+		--ref-dir "$(PULSAR_REF_DIR)" --ref-tol $(PULSAR_REF_TOL) \
+		--kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
+		--only=cuda-reference-gate-story,cuda-reference-gate-code
 
 # Re-record the KL budgets from the CURRENT tree.  Same discipline as
 # PREFILL_BASELINE_REF: do this only when a change has been GRADED CLOSER to the
@@ -1289,14 +1293,17 @@ cuda-reference-gate:
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
 		echo "REFUSING: set PULSAR_REF_DIR to the reference-capture dir"; exit 1; fi
+#
+# Report-only on purpose (no KL_TOL, no outlier anchors): a record run measures,
+# it does not grade, so the documented outlier depths keep their ONE home in
+# tests/gates_runner.cpp and a row that would fail the grade still gets recorded.
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-		$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512 \
 		--dump-kl $(KL_BUDGET_STORY)
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
-		$(PULSAR_REF_TOL) --known-high 3840 --dump-kl $(KL_BUDGET_CODE)
+		--dump-kl $(KL_BUDGET_CODE)
 	@echo "KL budgets re-recorded -- COMMIT THEM with the reason"
 
 # NOTE: CUTLASS is an external header-only include path (never a submodule, and

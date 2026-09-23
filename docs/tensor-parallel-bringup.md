@@ -172,8 +172,20 @@ ssh, in rank order, and grades it (`PULSAR_TP_HOSTS="h0 h1 [h2 ...]" ./tools/tp-
   (`greedy-token disagreements`, `worst |logprob delta|`), never an equality
   assert — rule 3.
 
-Grade reference-fidelity per the port rules as well (`PULSAR_REF_DIR`; rule 3:
-`cuda-reference-gate` must never be graded while it prints SKIP).
+- **LEG C -- the pair's fidelity instrument (L240).**  For the MXFP4 artifact no
+  single GB10 can produce LEG B's baseline, so the B300 reference is the grade:
+  `PULSAR_TP_REF_DIR=<capture dir>` runs `tests/prefill_bitexact_gate
+  --check-reference` THROUGH the group (rank 0 grades the story and code blobs
+  at every recorded depth, ranks > 0 run the receive loop).  A gate joins a
+  group through its environment -- `PULSAR_TP_RANK/NRANKS/PEERS/PORT`, read
+  once at `gate_engine_open` (tests/gate_entry.h) -- so every gate is
+  TP-capable without per-gate flags.  Pass the capture's documented outlier
+  depths (`PULSAR_TP_REF_KNOWN_HIGH_STORY` etc.) as the battery's runner spec
+  has them; the gate binary lives at `PULSAR_TP_REF_BIN` on each host.
+
+Rule 3 still holds on one box: `cuda-reference-gate` must never be graded while
+it prints SKIP -- since L240 the battery points `PULSAR_REF_DIR` at the staged
+Vision-Exp capture by default, so a SKIP now means the override was set empty.
 
 ## Rollback
 
