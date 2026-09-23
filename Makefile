@@ -474,6 +474,22 @@ tests/attn_pack_gate: tests/attn_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $
 cuda-attn-pack-gate: tests/attn_pack_gate
 	./tests/attn_pack_gate
 
+# L242 (Engram, V4.1): rows -> MXFP8 slot -> `wkv` GEMM -> gate -> gated add, on one
+# GPU, against a fixture computed from the checkpoint's own rows and weights
+# (tools/engram/gen_engram_fixture.py).  Tight thresholds by construction: every
+# GEMM product is the reference's product, only the accumulation order and one
+# bf16 rounding differ.  Host reference math -fno-fast-math.  Needs the layer aux
+# files (engram_rows build) under ENGRAM_DIR; not the 189 GiB row files.
+ENGRAM_DIR ?= /mnt/pve1-models/engram-v41
+tests/engram_gate.o: tests/engram_gate.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/engram_gate.cpp
+tests/engram_gate: tests/engram_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: cuda-engram-gate
+cuda-engram-gate: tests/engram_gate
+	./tests/engram_gate tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
+	./tests/engram_gate tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
+
 .PHONY: attn-pack-fixture-check
 attn-pack-fixture-check: tests/attn_pack_fixture_test
 	./tests/attn_pack_fixture_test
@@ -494,6 +510,19 @@ tests/engram_hash_test: tests/engram_hash_test.cpp tests/engram_hash_fixture.h \
 .PHONY: engram-hash-check
 engram-hash-check: tests/engram_hash_test
 	./tests/engram_hash_test
+
+# L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
+# against the device-path fixture's rows (read from the checkpoint by the generator):
+# a gather of the fixture's ids from the row file must return the fixture's bytes.
+# Reads ENGRAM_DIR/engram-l<L>.rows (over NFS is fine: a few thousand rows).
+tests/engram_table_test: tests/engram_table_test.cpp src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
+                         src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/engram_table_test.cpp \
+		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
+.PHONY: engram-table-check
+engram-table-check: tests/engram_table_test
+	./tests/engram_table_test tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
+	./tests/engram_table_test tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'

@@ -686,6 +686,14 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi);
+/* L242: a pre-stored MXFP8_LT weight already resident in device buffers (data
+ * plane, then the swizzled scale plane as separate tensors) enters the resolved
+ * cache under (map_key, offset); the GEMMs then find it by offset.  For gates
+ * that carry a weight outside any model map. @return 1 on success. */
+int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t offset,
+                                               uint64_t in_dim, uint64_t out_dim,
+                                               const pulsar_gpu_tensor *data,
+                                               const pulsar_gpu_tensor *scale);
 /* The producer step for an f32 activation that an MXFP8 GEMM will read: emit
  * its E4M3 encoding into the activation cache slot and arm it (the pure
  * per-block quantiser, bit-identical however it is invoked).  This is what the
@@ -843,6 +851,24 @@ int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_
 
 /** Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
+
+/* ---- Engram (L242, V4.1) ------------------------------------------------------
+ * The gathered table rows -- [n_tok][24][264 B]: 256 E4M3 values then their 8
+ * E8M0 block scales, the row file's record -- become the `wkv` GEMM's activation
+ * AS THEY ARE: emitted into the MXFP8 slot of `x_key` (an f32 [n_tok][6144]
+ * tensor that is the slot's KEY and is never written), armed, noted current and
+ * f32-skipped.  The `wkv` GEMM is the ordinary pulsar_gpu_matmul_mxfp8_tensor on
+ * `x_key`.  @return 1 on success. */
+int pulsar_gpu_engram_rows_emit(const pulsar_gpu_tensor *x_key, const pulsar_gpu_tensor *rows,
+                                uint32_t n_tok);
+/* The gate and the gated add on the bf16 hyper-connection copies
+ * hc[n_tok][n_hc][dim]: kv is the `wkv` output [n_tok][(n_hc+1)*dim] f32 (n_hc
+ * keys then one value), qk_weight the f32 [n_hc][dim] product q_weight*k_weight,
+ * dead an optional [n_tok] byte mask (1 = image span, copies untouched), eps the
+ * model's norm eps.  Math in f32, one bf16 rounding on the store. */
+int pulsar_gpu_engram_gate_add(pulsar_gpu_tensor *hc, const pulsar_gpu_tensor *kv,
+                               const pulsar_gpu_tensor *qk_weight, const pulsar_gpu_tensor *dead,
+                               uint32_t n_tok, uint32_t n_hc, uint32_t dim, float eps);
 
 /* Record that the producer ALSO skipped this buffer's f32 store, so the f32
  * bytes are stale.  Call only after note_mxfp8(), and only from a producer that

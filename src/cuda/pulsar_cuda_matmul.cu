@@ -2095,6 +2095,32 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
     g_mxfp8_lt_offsets.insert({model_map, weight_offset});
 }
 
+/* A pre-stored MXFP8_LT weight that is ALREADY RESIDENT in device memory (L242: a
+ * gate that carries a weight in its own buffers rather than in a model map).
+ * Enters the resolved-weight cache directly under (map_key, offset), so every
+ * GEMM arm finds it by offset exactly like a staged model tensor.  map_key is
+ * any pointer unique to the caller's weight set; the caller passes the same key
+ * and a model_size covering [offset, offset + data + scale) to the GEMM. */
+int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t offset,
+                                               uint64_t in_dim, uint64_t out_dim,
+                                               const pulsar_gpu_tensor *data,
+                                               const pulsar_gpu_tensor *scale) {
+    if (!map_key || !data || !scale || in_dim == 0 || in_dim % 32 != 0 || out_dim == 0) return 0;
+    const int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
+    const size_t data_bytes = in_dim * out_dim;
+    const size_t scale_bytes = (size_t)mx_rup((int)out_dim, 128) * KBp;
+    if (data->bytes < data_bytes || scale->bytes < scale_bytes) {
+        fprintf(stderr, "pulsar: resident MXFP8_LT weight %llu x %llu needs %zu + %zu bytes, has %llu + %llu -- refusing\n",
+                (unsigned long long)in_dim, (unsigned long long)out_dim, data_bytes, scale_bytes,
+                (unsigned long long)data->bytes, (unsigned long long)scale->bytes);
+        return 0;
+    }
+    fp8_mx_weight w = { map_key, offset, in_dim, out_dim, (__nv_fp8_e4m3 *)data->ptr, (unsigned char *)scale->ptr };
+    g_fp8_mx_by_offset[{map_key, offset}] = w;
+    g_fp8_offsets.insert({map_key, offset});
+    return 1;
+}
+
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi) {

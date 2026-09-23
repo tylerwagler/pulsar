@@ -451,6 +451,53 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
                             const int32_t *ids, uint32_t n_ids, uint32_t pos,
                             uint32_t *cols);
 
+/** ---- Engram TABLE (L242): the disk-resident rows and how they are fetched -----
+ *
+ * One table per Engram layer, a row file written by tools/engram/engram_rows.c:
+ * a 64-byte header ("PENGRAM1", layer, n_rows, 264 / 256 / 8) then n_rows
+ * records of 264 bytes -- the checkpoint's 256 E4M3 values followed by their 8
+ * E8M0 block scales, interleaved so one read fetches a row whole.  The record
+ * IS the device path's input (pulsar_gpu_engram_rows_emit), byte for byte.
+ *
+ * The file lives on the serving box's NVMe (189 GiB for both layers) and is
+ * READ, never mapped: a token needs 24 rows of 264 bytes at addresses the hash
+ * knows before the forward, and 48 random reads per token are what an NVMe
+ * does well and what a 94 GiB mapping under page-cache pressure does badly.
+ * A pool of pread threads (the box has no liburing) serves gathers; a gather
+ * is issued ahead of the layer that needs it and waited on there, which is the
+ * whole point of hashing on the host.  Open asserts the header against the
+ * layout's row count; a mismatch is a wrong table, refused. */
+#define PULSAR_ENGRAM_ROW_BYTES 264u
+#define PULSAR_ENGRAM_HDR_BYTES 64u
+#define PULSAR_ENGRAM_IO_THREADS 16u
+
+typedef struct pulsar_engram_table {
+    int fd;                 ///< the row file, or -1 when closed
+    uint32_t layer;         ///< the model layer this table serves
+    uint64_t n_rows;        ///< rows in the file, == layout num_embeddings[hash index]
+    char *path;             ///< owned copy, for messages
+} pulsar_engram_table;
+
+/** A gather in flight: `rows` row ids -> `dst` (n_rows x 264 bytes, caller-owned,
+ * must outlive the wait).  Completion is observed with pulsar_engram_gather_wait,
+ * which returns 1 when every row landed and 0 with the failure printed. */
+typedef struct pulsar_engram_gather pulsar_engram_gather;
+
+/** The pool.  One per engine; every table's gathers go through it. */
+typedef struct pulsar_engram_io pulsar_engram_io;
+
+int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t layer,
+                              uint64_t n_rows_expected);
+void pulsar_engram_table_close(pulsar_engram_table *t);
+pulsar_engram_io *pulsar_engram_io_create(uint32_t n_threads);
+void pulsar_engram_io_destroy(pulsar_engram_io *io);
+/** Issue: the pool starts reading immediately; returns NULL only on a bad argument. */
+pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
+                                                 const uint64_t *rows, uint32_t n_rows,
+                                                 unsigned char *dst);
+/** Block until the gather is complete; frees the handle.  1 = every row read. */
+int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
+
 /** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
  *
  * `qs` is not raw quants -- it packs indices INTO a fixed grid of 8-value
