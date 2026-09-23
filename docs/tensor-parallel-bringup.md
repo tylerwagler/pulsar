@@ -35,6 +35,15 @@ make tests/tp_slab_gpu_probe                          # compile-check at sm_120f
 ```
 If a session needs a full engine build first: `make cuda-spark`.
 
+> **Native probe build on the pair (verified 2026-09-23):** `tests/tp_slab_gpu_probe`
+> links with the engine-generic `CUDA_LDLIBS` (`-lcublas -lcublasLt -lpng -ljpeg`)
+> though it needs only `-lcudart`. A stock Spark image has no `libpng`/`libjpeg`
+> dev packages, so `tools/tp-pair-bringup.sh`'s native build fails at link with
+> `cannot find -lpng`. Fix: `sudo apt-get install -y libpng-dev libjpeg-dev` on
+> both ranks (Ubuntu 24.04). The pair's nvcc is `/usr/local/cuda/bin/nvcc`
+> (CUDA 13.3, sbsa) — not on the ssh PATH, but the Makefile's absolute
+> `CUDA_HOME` default finds it.
+
 ## 1. Interconnect sanity (read-only, ~1 min) — both boxes
 
 ```sh
@@ -108,6 +117,21 @@ capture the `cudaGetErrorString`/`strerror` now — it changes the slab design.
 > change that anyway. Host-pinned is therefore the final slab design; rerun
 > `tests/tp_dmabuf_probe` after any nvidia driver update to recheck attr 110.
 
+> **Re-verified 2026-09-23 on the current n-rank transport (`work/tp-owned-moe`,
+> 1c22835d):** both ranks `slab attached, GPU-visible (14091976 bytes,
+> host-pinned (pulsar_tp_gpu)), mr=registered` and `tp_slab_probe: rank N ok
+> (GPU slab: gates, batch, big; RDMA)` over `mlx5_3` / 192.168.9.x, gid index 5.
+>
+> **Co-tenant with vLLM is a hard block for this step, not a "go light" caution.**
+> With the production vLLM worker resident (~101 GiB of the 121.6 GiB GB10
+> unified pool), a fresh process cannot initialize a CUDA context at all:
+> `cudaSetDevice(0)` returns `out of memory`, `cudaMemGetInfo` reports 0/0, and
+> a 64 KiB `cudaHostRegister` (plain or Mapped), `cudaMalloc(1 MiB)` and
+> `cudaMallocManaged(1 MiB)` all fail — independent of slab size. `free -g`
+> showing ~10-13 GiB "available" is host-side accounting and does not mean
+> GPU-allocatable memory. Steps 1/2/3/5 are verbs-only and run fine co-tenant
+> on the 9.x wire; step 4 and everything after it require vLLM stopped.
+
 ## 5. RDMA link bench — 1-link vs 2-link (supports the two-cable note) — ~5 min
 
 Run the PLAN 102 probe's RDMA halves (not on production without a window):
@@ -133,6 +157,10 @@ later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
 > ("Failed to exchange negotiation parameters") until B was aligned up to the
 > Mellanox DOCA 26.01.5-1 build (repo + key: `doca.list` signed-by
 > `/etc/apt/trusted.gpg.d/GPG-KEY-Mellanox.pub`).
+
+> **Re-run 2026-09-23** (same perftest 6.28 both sides, `-d mlx5_3 -s 16384
+> -n 5000 -F`, 9.x wire, gid index 5): avg **4.75 µs**, typical 4.69, min 4.44,
+> stdev 0.04-0.06, p99 5.17, p99.9 5.51-5.66. Matches 2026-09-02 within noise.
 
 ## 6. (After 4c) first live engine pair — prefill-TP before decode-TP
 

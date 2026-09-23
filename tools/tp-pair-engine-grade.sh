@@ -39,6 +39,11 @@
 #   PULSAR_TP_BIN      engine binary on each host, relative to $HOME or
 #                      absolute (default ~/pulsar)
 #   PULSAR_TP_PORT     TP control port (default 5590)
+#   PULSAR_TP_RDMA_DEV HCA name pinned IDENTICALLY on every rank (e.g. mlx5_3).
+#                      The n=2 mesh rides RoCE; on a multi-HCA Spark an unpinned
+#                      rank auto-picks the first ACTIVE device by name, which is
+#                      the IP-less port and fails at RTR (runbook F1).  Threaded
+#                      into every rank launch exactly as tp-pair-bringup.sh does
 #   PULSAR_TP_PROMPT   prompt (default: a short deterministic one)
 #   PULSAR_TP_TOKENS   generated tokens (default 32)
 #   PULSAR_TP_CTX      context (default 4096)
@@ -87,6 +92,8 @@ ADDRS=${PULSAR_TP_ADDRS:-$HOSTS}
 MODEL=${PULSAR_TP_MODEL:-/mnt/pve1-models/DeepSeek-v4-Flash}
 BIN=${PULSAR_TP_BIN:-'$HOME/pulsar'}
 PORT=${PULSAR_TP_PORT:-5590}
+RDMA_DEV=${PULSAR_TP_RDMA_DEV:-}
+RDMA_ENV=${RDMA_DEV:+PULSAR_TP_RDMA_DEV=$RDMA_DEV }
 PROMPT=${PULSAR_TP_PROMPT:-"Explain how a C pointer differs from an array in one paragraph."}
 TOKENS=${PULSAR_TP_TOKENS:-32}
 CTX=${PULSAR_TP_CTX:-4096}
@@ -126,12 +133,13 @@ echo "tp-pair-engine-grade: n=$N ranks"
 for i in "${!RANKS[@]}"; do echo "  rank $i -> ssh ${RANKS[$i]}, dials as ${RANK_ADDRS[$i]}"; done
 echo "  peers: $PEERS"
 echo "  model: $MODEL   ctx: $CTX   tokens: $TOKENS"
+echo "  rdma device: ${RDMA_DEV:-UNPINNED -- auto-pick by name; set PULSAR_TP_RDMA_DEV on a multi-HCA host}"
 
 # ---- plan -------------------------------------------------------------------
 run_rank_cmd() {   # $1 = rank index
     local r=$1
-    printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d %s -m %s ' \
-           "$WORKDIR" "$r" "$BIN" "$MODEL"
+    printf 'cd %s && %sPULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d %s -m %s ' \
+           "$WORKDIR" "$RDMA_ENV" "$r" "$BIN" "$MODEL"
     printf -- '--tp-rank %d --tp-nranks %d --tp-peers %s --tp-port %d ' \
            "$r" "$N" "$PEERS" "$PORT"
     printf -- '-c %d --nothink --temp 0 -n %d --dump-logprobs rank%d.lp.json -p %q' \
@@ -327,8 +335,8 @@ if [ -n "$REF_DIR" ]; then
     echo "--- LEG C: reference gate (rule 7) through the group, rank 0 grades ---"
     ref_blob=""; ref_kh=""; ref_kf=""
     ref_rank_cmd() {   # $1 = rank index; the gate joins the group by environment
-        printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d PULSAR_TP_RANK=%d PULSAR_TP_NRANKS=%d PULSAR_TP_PEERS=%s PULSAR_TP_PORT=%d ' \
-               "$WORKDIR" "$1" "$1" "$N" "$PEERS" "$PORT"
+        printf 'cd %s && %sPULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d PULSAR_TP_RANK=%d PULSAR_TP_NRANKS=%d PULSAR_TP_PEERS=%s PULSAR_TP_PORT=%d ' \
+               "$WORKDIR" "$RDMA_ENV" "$1" "$1" "$N" "$PEERS" "$PORT"
         printf '%s %s --check-reference %s/%s.ref.bin %s/%s.tokens.bin %s' \
                "$REF_BIN" "$MODEL" "$REF_DIR" "$ref_blob" "$REF_DIR" "$ref_blob" "$REF_TOL"
         [ -n "$ref_kh" ] && printf ' --known-high %s' "$ref_kh"
