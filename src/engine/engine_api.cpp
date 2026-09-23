@@ -262,6 +262,7 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, cons
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
 int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) { return s ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL; }
 int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
+
 /* ---------------------------------------------------------------------------
  * Slice 4e: lockstep mirroring of the session's input.
  *
@@ -431,6 +432,41 @@ static void pulsar_tp_mirror_void(pulsar_session *s, pulsar_tp *tp,
     pulsar_tp_command_free(&command);
 }
 
+int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng) {
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp || !rng) return 0;   /* pair off: the caller's stream is its own */
+    if (pulsar_tp_rank(tp) == 0) {
+        if (pulsar_tp_send_rng_state(tp, s->tp_session_id, *rng) == 0) {
+            tp_mirror_fail_void(tp, "rng sync", "the frame could not be shipped");
+            return -1;
+        }
+        s->spec_rng_synced = true;
+        return 0;
+    }
+    char err[256];
+    err[0] = '\0';
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
+        tp_mirror_fail_void(tp, "rng sync", err);
+        return -1;
+    }
+    int rc = -1;
+    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_RNG_STATE, "rng sync",
+                               err, sizeof(err)) == 0) {
+        /* The leader's stream BECOMES this rank's.  Every draw the round makes
+         * from here -- the fresh base, each accept test, the carry, the redraft
+         * -- then follows the leader's, which is what keeps the two ranks'
+         * accepted sets and KV frontiers identical. */
+        *rng = command.seq;
+        s->spec_rng_synced = true;
+        rc = 0;
+    } else {
+        tp_mirror_fail_void(tp, "rng sync", err);
+    }
+    pulsar_tp_command_free(&command);
+    return rc;
+}
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }

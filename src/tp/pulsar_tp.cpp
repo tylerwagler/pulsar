@@ -2744,6 +2744,11 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
     return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count);
 }
 
+int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state) {
+    pulsar_tp_eval_command msg = { session_id, state, 0, 0 };
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_RNG_STATE, &msg, sizeof(msg));
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -2861,6 +2866,7 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
+    case PULSAR_TP_FRAME_RNG_STATE:
     case PULSAR_TP_FRAME_EVAL: {
         pulsar_tp_eval_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }

@@ -310,6 +310,13 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
 int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count);
+/** Ship this rank's rng state.  Speculation's accept walk draws from the
+ * CALLER's rng, so two ranks seeded independently would accept different tokens
+ * and commit different session state; the leader's state is the pair's stream.
+ * Fire-and-forget, like the void operations: a `void`-shaped draw site has
+ * nowhere to put a peer's refusal, and the worker's frame check reports a
+ * divergence through the next acked operation instead of hanging on it. */
+int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation,
@@ -347,6 +354,9 @@ typedef enum {
      * sends before the peer's window is armed silently loses the first N
      * messages under UC, shifting the whole pairing by +1). */
     PULSAR_TP_FRAME_RDMA_GATE_ARMED = 18,
+    /* Slice 4e: one rank's rng state, so a pair can share ONE speculation
+     * stream.  Fresh number (18 is taken, 10 is retired and never reused). */
+    PULSAR_TP_FRAME_RNG_STATE = 19,
 } pulsar_tp_frame_type;
 
 typedef struct {

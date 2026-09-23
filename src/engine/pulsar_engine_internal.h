@@ -2082,6 +2082,16 @@ typedef struct pulsar_bank_carry {
  * between them. */
 bool pulsar_session_is_mirrored(const pulsar_session *s);
 
+/** Slice 4e: give the pair ONE rng stream.  The leader ships its state and the
+ * worker takes it, so every draw the speculation round makes afterwards --
+ * pulsar_session_spec_next_base's fresh base, the accept tests, the carry, the
+ * redraft -- is identical on every rank by construction.  Called from
+ * pulsar_session_spec_next_base, the first rng consumer of a round; returns 0
+ * when the caller may draw and -1 when the pair could not agree, in which case
+ * it must NOT draw.  Nothing crosses the wire when the pair is off. */
+int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng);
+
+
 struct pulsar_session {
     pulsar_engine *engine;    ///< borrowed; the engine outlives every session
     /** Slice 4e: this session's mirror id, or 0 when the pair is not armed (or
@@ -2089,6 +2099,13 @@ struct pulsar_session {
      * mirrored frame carries it; see tp_session_seq above for why it is the
      * create ordinal and why a mismatch is refused. */
     uint64_t tp_session_id;
+    /** Slice 4e: true once this session's speculation rng has been taken from
+     * the leader -- one flag, because there is no live-bank accessor to key it
+     * by, and the documented round flow syncs each bank's stream by calling
+     * pulsar_session_spec_next_base with THAT bank's rng.  Speculation refuses
+     * a pair whose rng was never synchronized, so a driver that skips
+     * next_base cannot walk a round on a stream the pair does not share. */
+    bool spec_rng_synced;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats

@@ -644,6 +644,57 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The rng-state frame: the pair's ONE speculation stream.  Fire-and-forget
+     * like the void operations -- a draw site has nowhere to put a refusal and a
+     * leader that waited would hang on the first round a peer did not make -- so
+     * what this round proves is that the state survives the wire EXACTLY (a
+     * truncated or reordered 64-bit value would silently desync the walk) and
+     * that no ack is emitted: the round after it is acked under a different
+     * session id, and a stray ack would be read by that collect and fail it. */
+    {
+        const uint64_t void_sid = 0xC0DE6000ULL;
+        const uint64_t ack_sid  = 0xC0DE6001ULL;
+        const uint64_t state = 0x0123456789ABCDEFull;
+        int tokens[3] = { 11, 12, 13 };
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_rng_state(tp, void_sid, state) != 0,
+                  "rank 0 rng-state send must report success as nonzero");
+            CHECK(pulsar_tp_send_sync(tp, ack_sid, tokens, 3) != 0,
+                  "rank 0 post-rng sync send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, ack_sid, "post-rng sync",
+                                             cerr, sizeof(cerr)),
+                  "rank 0 collected a stray or missing ack after the rng frame: %s", cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d rng-state recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_RNG_STATE && cmd.session_id == void_sid,
+                      "rank %d got frame type %d session %llu, expected RNG_STATE (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_RNG_STATE, (unsigned long long)void_sid);
+                CHECK(cmd.seq == state,
+                      "rank %d rng state %llu, expected %llu -- a bit-exact value or the "
+                      "walk desyncs",
+                      rank, (unsigned long long)cmd.seq, (unsigned long long)state);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d post-rng sync recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC && cmd.session_id == ack_sid,
+                      "rank %d got frame type %d session %llu, expected SYNC (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_SYNC, (unsigned long long)ack_sid);
+                CHECK(pulsar_tp_send_command_ack(tp, ack_sid, 0),
+                      "rank %d post-rng sync ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

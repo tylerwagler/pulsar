@@ -220,19 +220,32 @@ pair, because its own arguments are never read.
   is the decode position, and that is exactly what diverged), but catching is not
   preventing: the round has already committed a different session state.
 
-  Two ways to lift the refusal, needing different frames:
-  1. **Mirror the rng** (smaller): ship the leader's rng state at the START of a
-     speculation sequence, before `spec_next_base` and the drafter's draws.  Every
-     draw in the round is then identical by construction and `accepted[]` needs no
-     frame at all.  It requires that the drafter's draws come from that same rng
-     (`spec_redraft_batch` takes `rngs[]`, so this looks true) and it puts the rng
-     in the mirrored-input category, which is a deliberate design statement.
-  2. **Ship the decision** (bigger): the leader walks and ships `accepted[]`.  The
-     existing commit frame carries only `{full_accept, replay_n}`, which cannot
-     express the accepted tokens, and the trim/checkpoint/redraft are fused with
-     the walk inside `spec_round_end` -- so this needs both a new payload and a
-     split of the walk from the state application.
-- **Still open:** banks, warm-fork, spec (above).
+  **Resolved (round 9): option 1, the mirrored rng.**  The audit first: a round's
+  only entropy sources are `spec_next_base`'s fresh base draw and the walk in
+  `spec_round_end` -- both from the caller's `rng` -- because the round gate
+  itself (`spec_round_begin`'s static) takes no rng at all, so the drafter's
+  proposals are deterministic and need no stream of their own.
+  `pulsar_session_spec_next_base` therefore calls `pulsar_session_mirror_rng`
+  before anything draws: the leader ships its state on `FRAME_RNG_STATE` and the
+  worker's stream BECOMES the leader's, so the fresh base, every accept test, the
+  carry and the redraft all follow the leader's by construction and `accepted[]`
+  needs no frame.  The frame is fire-and-forget (a draw site has nowhere to put a
+  peer's refusal), and the state must survive the wire bit-exactly -- the mesh
+  test asserts a 64-bit value round-trips, and mutating the expectation fails it.
+  The round gate now refuses a mirrored session whose rng was never synchronized
+  (`spec_rng_synced`), which is what keeps this fail-CLOSED: a driver that skips
+  `next_base` gets a refusal rather than a round on a stream the pair does not
+  share.
+  **Limit, stated plainly:** the flag is per SESSION, not per bank, because there
+  is no live-bank accessor to key it by.  The batched lane keeps one stream per
+  bank and syncs each when it calls `next_base` with that bank's rng, so in
+  practice every bank is synced -- but the flag itself only proves one was.
+  **Follow-up:** `FRAME_VERIFY` / `FRAME_VERIFY_COMMIT` were the spec's frames
+  under the "ship the decision" design; with the rng mirrored the decision is
+  derived identically instead of shipped, so their senders and decode cases are
+  now orphaned (only the mesh test still drives them).  Retire the code, keep the
+  numbers with a note, as `FRAME_LOGITS` was.
+- **Still open:** banks, warm-fork, and the frame retirement above.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the

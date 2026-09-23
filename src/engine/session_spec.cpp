@@ -1087,27 +1087,31 @@ static int spec_round_begin(pulsar_session *s, int first_token,
                             float temperature, int top_k, float top_p, float min_p,
                             pulsar_spec_round *r,
                             char *err, size_t errlen) {
-    /* Slice 4e: SPECULATION IS NOT MIRRORED, and this is the one gate every
-     * speculation path passes through -- the member generate_speculative calls
-     * this same static -- so a single refusal here covers them all, including
-     * paths that would otherwise reach a round with no check at all.
+    /* Slice 4e: a pair may only walk a round on a stream it SHARES.  This is the
+     * one gate every speculation path passes through -- the member
+     * generate_speculative calls this same static -- so a single check covers
+     * them all, including paths that would otherwise reach a round with no check
+     * at all.
      *
-     * What makes it unsafe is not the drafts (those reach every rank as rows in
-     * the mirrored batched decode) but the WALK: spec_round_end accepts with
-     * pulsar_sample_dist_accept and draws its carry with
+     * What makes an unshared stream unsafe is not the drafts (those reach every
+     * rank as rows in the mirrored batched decode) but the WALK: spec_round_end
+     * accepts with pulsar_sample_dist_accept and draws its carry with
      * pulsar_sample_dist_draw_excluding, both from the CALLER's rng.  Two ranks
-     * whose rngs were seeded independently -- which is what an ordinary server
-     * does -- would accept different tokens and trim their KV to different
-     * frontiers.  The next mirrored eval would CATCH it (its seq is the decode
-     * position, and that is exactly what diverged), but catching is not
-     * preventing: the round would already have committed a different session
-     * state.  Fail closed until the pair has an RNG authority; see the spec
-     * section of docs/tensor-parallel-port.md. */
-    if (pulsar_session_is_mirrored(s)) {
+     * seeded independently -- which is what an ordinary server does -- would
+     * accept different tokens and trim their KV to different frontiers.  The next
+     * mirrored eval would CATCH that (its seq is the decode position, and that is
+     * exactly what diverged), but catching is not preventing.
+     *
+     * pulsar_session_spec_next_base therefore mirrors the leader's rng state
+     * before the round's first draw and sets spec_rng_synced.  Requiring the
+     * flag here is what keeps this fail-CLOSED: a driver that skips next_base
+     * gets a refusal, not a round on a stream the pair does not share. */
+    if (pulsar_session_is_mirrored(s) && !s->spec_rng_synced) {
         if (err) snprintf(err, errlen,
-                          "tp: speculation is not mirrored onto the pair yet -- the accept "
-                          "walk draws from this rank's own rng, so two ranks would commit "
-                          "different session state; run the pair with the drafter off");
+                          "tp: this pair has not synchronized its speculation rng -- the "
+                          "accept walk draws from the caller's rng, so two ranks would commit "
+                          "different session state; call pulsar_session_spec_next_base first "
+                          "(it is what establishes the shared stream)");
         return -1;
     }
     pulsar_engine *e = s->engine;
@@ -1826,6 +1830,11 @@ void pulsar_spec_round_free(pulsar_spec_round *r) {
 int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
                                int top_k, float top_p, float min_p,
                                uint64_t *rng) {
+    /* Slice 4e: the pair's ONE stream is established here, at the first rng
+     * consumer of a round, BEFORE anything draws.  A round that skips this call
+     * cannot begin (see the gate below), so a driver cannot walk a round on a
+     * stream the pair does not share. */
+    if (pulsar_session_mirror_rng(s, rng) != 0) return -1;
     int first;
     const bool carry_params_match =
         s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
