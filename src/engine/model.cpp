@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "tp/pulsar_tp.h"
 
 
 
@@ -385,6 +386,46 @@ static bool accelerator_span_filter_contains(uint64_t off,
 
 
 
+/* Slice 4f (L237): the routed-expert stacks are the tensors residency splits.
+ * The container presents each projection's experts as ONE contiguous run
+ * (safetensors: st_add_expert_stacks asserts off(e) == off(0) + e*expert_bytes;
+ * GGUF: the 3-D tensor is stored that way), so a rank's owned experts are one
+ * byte sub-span and the peer-owned experts two holes that are never staged and
+ * never read. */
+static bool model_tensor_is_expert_stack(const pulsar_tensor *t) {
+    static const char suffix[] = "_exps.weight";
+    const size_t sl = sizeof(suffix) - 1;
+    if (t->ndim != 3 || t->dim[2] == 0 || t->bytes == 0) return false;
+    if (t->name.len < sl || memcmp(t->name.ptr + t->name.len - sl, suffix, sl) != 0) return false;
+    return t->bytes % t->dim[2] == 0;
+}
+
+bool pulsar_model_expert_stack_owned_span(const pulsar_model *m, const pulsar_tensor *t,
+                                          uint64_t *off, uint64_t *bytes) {
+    *off = 0;
+    *bytes = t->bytes;
+    if (!model_tensor_is_expert_stack(t)) return false;
+    if (m->tp_n_ranks <= 1) return true;
+    const uint64_t n = t->dim[2];
+    const uint64_t expert_bytes = t->bytes / n;
+    if (n > UINT32_MAX ||
+        !pulsar_tp_owned_byte_span(m->tp_rank, m->tp_n_ranks, (uint32_t)n, expert_bytes, off, bytes)) {
+        pulsar_die("routed-expert stack: the owned byte span was refused (rank/group mismatch)");
+    }
+    return true;
+}
+
+uint64_t pulsar_model_peer_expert_bytes(const pulsar_model *m) {
+    if (!m || m->tp_n_ranks <= 1) return 0;
+    uint64_t peer = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor *t = &m->tensors[i];
+        uint64_t off = 0, bytes = 0;
+        if (pulsar_model_expert_stack_owned_span(m, t, &off, &bytes)) peer += t->bytes - bytes;
+    }
+    return peer;
+}
+
 static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
@@ -429,11 +470,18 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
+        /* Slice 4f: a routed-expert stack is staged over the OWNED experts
+         * only.  Peer-owned experts are two holes of whole experts (MBs), far
+         * wider than the 64 KiB merge slack below, so no merged span can
+         * bridge into them. */
+        uint64_t sub_off = 0, sub_bytes = t->bytes;
+        (void)pulsar_model_expert_stack_owned_span(m, t, &sub_off, &sub_bytes);
+        if (sub_bytes == 0) continue;
         spans[nspan++] = (accelerator_tensor_span){
             .base = base,
             .map_size = map_size,
-            .off = t->abs_offset,
-            .end = t->abs_offset + t->bytes,
+            .off = t->abs_offset + sub_off,
+            .end = t->abs_offset + sub_off + sub_bytes,
         };
     }
     if (nspan == 0) {
@@ -505,6 +553,11 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     }
 
     if (tty) fputc('\n', stderr);
+    /* The total, once: the progress lines above are ticks every 16 GiB (or 2 s
+     * on a tty), so a log's last tick under-reads the sum -- and under TP the
+     * sum is the residency claim itself (L237). */
+    fprintf(stderr, "pulsar: %s staged %.2f GiB of model tensors in %" PRIu64 " span(s)\n",
+            accelerator_name, (double)prepared / 1073741824.0, merged);
     free(spans);
     if (prepared_out) *prepared_out = prepared;
     return true;
@@ -523,6 +576,14 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
      * there, so it is not the validity test. */
     if (!m || m->size == 0) return false;
     if (m->n_shards == 0 && !m->map) return false;
+    /* Slice 4f: announce the residency lane (rule 5) with the bytes it
+     * withholds, so a load log states which experts this rank holds. */
+    if (m->tp_n_ranks > 1) {
+        fprintf(stderr, "pulsar: TP residency: rank %d/%u stages only its owned experts of every "
+                        "stack; %.2f GiB of peer-owned expert bytes are never staged or read\n",
+                m->tp_rank, m->tp_n_ranks,
+                (double)pulsar_model_peer_expert_bytes(m) / 1073741824.0);
+    }
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
      * rejected at dispatch). Runs before the weight-cache early-out so it

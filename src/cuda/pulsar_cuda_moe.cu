@@ -301,6 +301,29 @@ __global__ static void moe_padded_scatter_kernel(
     }
 }
 
+/* Slice 4f (L237): the device pointer for an expert stack's OWNED slice,
+ * REBASED to where expert 0 would sit.  Under TP a rank stages only experts
+ * [lo,hi) of every stack (model.cpp, through the same pulsar_tp_owned_byte_span
+ * authority), so the whole-stack range does not exist on the device; asking
+ * for the owned span and rebasing keeps every consumer's `base + e*stride`
+ * arithmetic unchanged for the experts this rank computes.  With lo=0 and
+ * hi=n_total the request is byte for byte the old whole-stack request (same
+ * offset, same length, same cache key), so the single-box path is untouched.
+ * Peer-owned experts are never dereferenced (the ownership predicate), and the
+ * owned expert table clamps their entries to the owned base so no device
+ * array holds an address outside the staged bytes. */
+static const char *routed_expert_stack_ptr(const void *model_map, uint64_t stack_offset,
+                                           uint64_t expert_bytes, uint32_t n_total,
+                                           uint32_t expert_lo, uint32_t expert_hi,
+                                           const char *what) {
+    if (expert_bytes == 0 || expert_lo >= expert_hi || expert_hi > n_total) return NULL;
+    const uint64_t off = (uint64_t)expert_lo * expert_bytes;
+    const uint64_t bytes = (uint64_t)(expert_hi - expert_lo) * expert_bytes;
+    const char *p = cuda_model_range_ptr(model_map, stack_offset + off, bytes, what);
+    if (!p) return NULL;
+    return (const char *)((uintptr_t)p - (uintptr_t)off);
+}
+
 static int routed_moe_launch_cutlass_grouped(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *down,
@@ -344,16 +367,19 @@ static int routed_moe_launch_cutlass_grouped(
         down_total_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total_bytes, "moe_grouped_gate");
-    const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total_bytes, "moe_grouped_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total_bytes, "moe_grouped_down");
+    const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_stride, n_total_expert,
+                                                 expert_lo, expert_hi, "moe_grouped_gate");
+    const char *up_w   = routed_expert_stack_ptr(model_map, up_offset, gate_stride, n_total_expert,
+                                                 expert_lo, expert_hi, "moe_grouped_up");
+    const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_stride, n_total_expert,
+                                                 expert_lo, expert_hi, "moe_grouped_down");
     if (!gate_w || !up_w || !down_w) return 0;
     /* PLAN 94 phase 1: the expert ADDRESSES become data (mxfp4_expert_table).
      * Built from the same arithmetic the grouped setup used to perform, so this
      * is bit-identical; phase 2 changes only what fills the tables. */
-    const uint8_t *const *gate_tab = mxfp4_expert_table(gate_w, gate_stride, n_total_expert);
-    const uint8_t *const *up_tab   = mxfp4_expert_table(up_w,   gate_stride, n_total_expert);
-    const uint8_t *const *down_tab = mxfp4_expert_table(down_w, down_stride, n_total_expert);
+    const uint8_t *const *gate_tab = mxfp4_expert_table_owned(gate_w, gate_stride, n_total_expert, expert_lo, expert_hi);
+    const uint8_t *const *up_tab   = mxfp4_expert_table_owned(up_w,   gate_stride, n_total_expert, expert_lo, expert_hi);
+    const uint8_t *const *down_tab = mxfp4_expert_table_owned(down_w, down_stride, n_total_expert, expert_lo, expert_hi);
     if (!gate_tab || !up_tab || !down_tab) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
@@ -1553,11 +1579,12 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                 "buffer is missing or too small -- refusing\n", n_tokens);
                 return 0;
             }
-            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
-            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
-            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
-            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
-            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
+            const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_expert_bytes, n_total_expert,
+                                                         expert_lo, expert_hi, "moe_fp4_gemv_gate");
+            const char *up_w   = routed_expert_stack_ptr(model_map, up_offset, gate_expert_bytes, n_total_expert,
+                                                         expert_lo, expert_hi, "moe_fp4_gemv_up");
+            const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_expert_bytes, n_total_expert,
+                                                         expert_lo, expert_hi, "moe_fp4_gemv_down");
             /* Handover first (L089): when the producing norm already emitted
              * this x as E4M3, gemv_small reads THOSE bytes and never
              * dereferences the f32 -- which REMOVES the sixth reader instead of
@@ -1586,9 +1613,9 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             if (pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                        mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
-                        mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
-                        mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
+                        mxfp4_expert_table_owned(gate_w, gate_expert_bytes, n_total_expert, expert_lo, expert_hi),
+                        mxfp4_expert_table_owned(up_w, gate_expert_bytes, n_total_expert, expert_lo, expert_hi),
+                        mxfp4_expert_table_owned(down_w, down_expert_bytes, n_total_expert, expert_lo, expert_hi),
                         gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,

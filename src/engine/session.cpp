@@ -333,6 +333,38 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    /* Slice 4f (L237): the rank this process loads the model FOR, decided from
+     * the options before any weight is staged -- the transport is created
+     * after the load, and on GB10 staging IS residency (a rank stages only its
+     * owned experts).  Rank 0 of 1 when the pair is off.  The transport's rank
+     * is asserted equal once it exists, so the two readers of this fact cannot
+     * disagree.  An expert overlay swaps expert stacks from a donor file and
+     * is staged by its own path, which has no ownership notion: refused under
+     * TP rather than staged whole on every rank (rule 9). */
+    int tp_rank_at_load = 0;
+    uint32_t tp_n_ranks_at_load = 1;
+    if (opt->tp_peers) {
+        if (opt->tp_rank < 0 || opt->tp_nranks < 2 || opt->tp_rank >= opt->tp_nranks) {
+            fprintf(stderr, "pulsar: n-way TP needs --tp-rank R and --tp-nranks N "
+                            "with 0 <= R < N (got rank=%d nranks=%d)\n",
+                    opt->tp_rank, opt->tp_nranks);
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        tp_rank_at_load = opt->tp_rank;
+        tp_n_ranks_at_load = (uint32_t)opt->tp_nranks;
+    } else if (opt->tp_role != 0) {
+        tp_rank_at_load = opt->tp_role == 2 ? 1 : 0;
+        tp_n_ranks_at_load = 2;
+    }
+    if (tp_n_ranks_at_load > 1 && opt->expert_overlay) {
+        fprintf(stderr, "pulsar: --expert-overlay is not supported under tensor parallelism "
+                        "(the overlay's experts have no owner) -- refusing\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
      * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
      * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
@@ -364,6 +396,10 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend);
+    /* Slice 4f: the model knows the rank it is loaded for from here on; the
+     * merged drafter aliases e->model by value below and inherits it. */
+    e->model.tp_rank = tp_rank_at_load;
+    e->model.tp_n_ranks = tp_n_ranks_at_load;
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
     config_validate_model(&e->model);
     if (opt->expert_overlay && opt->expert_overlay[0]) {
@@ -501,6 +537,10 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         if (e->dspark_ready && e->dspark_external) {
+            /* An external drafter is its own model: it stages its own expert
+             * stacks, for the same rank. */
+            e->dspark_model.tp_rank = tp_rank_at_load;
+            e->dspark_model.tp_n_ranks = tp_n_ranks_at_load;
             register_model_fds(&e->dspark_model);
             if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
                                                  NULL, NULL, 0, NULL)) {
@@ -592,23 +632,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         /* n-way (full mesh) vs legacy 2-rank.  n-way: tp_peers carries every
          * rank's "host:port" and tp_rank/tp_nranks are explicit; legacy pair
          * derives rank from tp_role (leader=0, worker=1), n_ranks=2. */
-        if (opt->tp_peers) {
-            tp_opt.rank = opt->tp_rank;
-            tp_opt.n_ranks = opt->tp_nranks;
-            tp_opt.peers = opt->tp_peers;
-            if (opt->tp_rank < 0 || opt->tp_nranks < 2 || opt->tp_rank >= opt->tp_nranks) {
-                fprintf(stderr, "pulsar: n-way TP needs --tp-rank R and --tp-nranks N "
-                                "with 0 <= R < N (got rank=%d nranks=%d)\n",
-                        opt->tp_rank, opt->tp_nranks);
-                e->destroy();
-                *out = NULL;
-                return 1;
-            }
-        } else {
-            tp_opt.rank = (opt->tp_role == 2) ? 1 : 0;
-            tp_opt.n_ranks = 2;
-            tp_opt.peer = opt->tp_peer;
-        }
+        if (opt->tp_peers) tp_opt.peers = opt->tp_peers;
+        else               tp_opt.peer = opt->tp_peer;
+        /* The rank and group size were decided ONCE, before staging (slice 4f);
+         * the transport is built for that same identity. */
+        tp_opt.rank = tp_rank_at_load;
+        tp_opt.n_ranks = (int)tp_n_ranks_at_load;
         pulsar_tp_identity id;
         pulsar_tp_identity_init_defaults(&id,
                                          (uint64_t)e->model.size,
@@ -639,8 +668,23 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes\n",
-                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes);
+        /* Slice 4f: the weights were staged for one identity and the transport
+         * came up as another only if the two derivations drifted -- a bug, and
+         * one that would compute the wrong experts on both ranks in silence. */
+        if (pulsar_tp_rank(e->tp) != e->model.tp_rank ||
+            pulsar_tp_n_ranks(e->tp) != e->model.tp_n_ranks) {
+            fprintf(stderr, "pulsar: TP identity drift: the model was staged for rank %d/%u but "
+                            "the transport came up as rank %d/%u -- refusing\n",
+                    e->model.tp_rank, e->model.tp_n_ranks,
+                    pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, "
+                        "%.2f GiB of peer-owned experts not resident\n",
+                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
+                (double)pulsar_model_peer_expert_bytes(&e->model) / 1073741824.0);
     }
 
     *out = e;
@@ -710,8 +754,10 @@ uint64_t pulsar_engine::weights_resident_bytes() {
      * runtime, which is precisely why it had to be fixed here rather than
      * noticed: the static formula is the bound that is supposed to hold when the
      * measured one reads inflated. */
-    uint64_t bytes = e->model.mapped_bytes;
-    if (e->dspark_ready && e->dspark_external) bytes += e->dspark_model.mapped_bytes;
+    uint64_t bytes = e->model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->model);
+    if (e->dspark_ready && e->dspark_external) {
+        bytes += e->dspark_model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->dspark_model);
+    }
     if (e->overlay_ready) bytes += e->overlay_model.mapped_bytes;
     return bytes;
 }

@@ -610,6 +610,15 @@ typedef struct {
      * it existed all three disagreed, and the budget was the one that mattered
      * (it read one shard, 0.88 GiB, and over-stated the budget by ~85 GiB). */
     uint64_t mapped_bytes;
+    /** Slice 4f (L237): the rank this process loads the model FOR and the TP
+     * group size (rank 0 of 1 when the pair is off).  Set by the engine from
+     * its options BEFORE the tensor staging pass, because staging IS
+     * residency on GB10: a routed-expert stack is staged only over the rank's
+     * owned expert range (pulsar_tp_owned_byte_span) and the admission budget
+     * charges the same bytes.  The transport, created after the load, is
+     * asserted to come up as this same rank. */
+    int tp_rank;
+    uint32_t tp_n_ranks;
 
     uint32_t version;       ///< GGUF format version
     uint64_t n_kv;          ///< metadata key/value pair count
@@ -2695,6 +2704,16 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count,
                                             const char *skip_prefix);
+/** Slice 4f (L237): is `t` a routed-expert STACK -- gate/up/down experts stored
+ * back-to-back, `dim[2]` experts of `bytes/dim[2]` each (blk.N and dspark.N
+ * `*_exps.weight`)?  When it is, `*off` and `*bytes` receive the sub-span this
+ * model's rank owns (relative to the tensor payload; the whole tensor when the
+ * pair is off).  When it is not, the whole tensor.  Returns true for a stack. */
+bool pulsar_model_expert_stack_owned_span(const pulsar_model *m, const pulsar_tensor *t,
+                                          uint64_t *off, uint64_t *bytes);
+/** Slice 4f: bytes of routed-expert payload this rank does NOT stage (peer-owned);
+ * 0 when the pair is off.  The admission budget subtracts it from mapped_bytes. */
+uint64_t pulsar_model_peer_expert_bytes(const pulsar_model *m);
 /** Return the in-place tensor payload inside the mapped GGUF (or inside the
  * overlay file's mapping for --expert-overlay swapped tensors).
  */

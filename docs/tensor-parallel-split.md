@@ -166,6 +166,25 @@ bug, not a design change.
       one rng (both the CLI's `generate_speculative` and `spec_next_base` sync
       it before drawing).  Open: warm-fork, the bank agreement question, the
       server driver model, images (refused under TP until they ride the frame).
+- **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
+      ownership but every rank still staged every expert: on GB10 host
+      registration is unsupported, so the supported load path stages each
+      tensor from its fd into device memory under a 96 GiB cap
+      (`accelerator_prepare_model_tensor_spans` -> `cuda_model_range_ptr_from_fd`),
+      and staging IS residency.  The full-fidelity artifact
+      (`ElytronAI/DeepSeek-v4-Flash`, 157.4 GB of MXFP4 experts) therefore could
+      not open on a 121 GB Spark, pair or no pair.  Now: the model carries the
+      rank it is loaded for (`pulsar_model.tp_rank/tp_n_ranks`, set from the
+      options BEFORE staging), a routed-expert stack is staged only over the
+      rank's owned byte span (`pulsar_tp_owned_byte_span`, the range authority
+      in bytes), the MoE dispatch requests that span and REBASES the pointer so
+      `base + e*stride` is unchanged (`routed_expert_stack_ptr`), the expert
+      table clamps peer-owned entries to the owned base
+      (`mxfp4_expert_table_owned`), the admission budget subtracts the
+      peer-owned bytes, and the transport's rank is asserted equal to the
+      staged rank.  `--expert-overlay` is refused under TP.  Per rank on the
+      full artifact: ~10.5 GB replicated + 157.4/n GB of experts -> ~89 GB at
+      n=2 (derived from the build record, to be measured).
 
 ## Open items for bring-up
 - **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**

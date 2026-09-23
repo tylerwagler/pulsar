@@ -41,6 +41,7 @@ struct expert_table {
     uint64_t    off1;                 /* plane 1's offset from base (planes == 2 only) */
     uint64_t    stride1;              /* plane 1's per-expert stride, in bytes */
     uint32_t    n_total;
+    uint32_t    lo, hi;               /* slice 4f: experts this rank holds; others clamp to lo */
     uint32_t    planes;               /* 1 = type 40 (data; SF at +data_bytes), 2 = type 44 (d,q) */
     const void **entries;             /* device array [planes * n_total] */
     struct expert_table *next;
@@ -48,26 +49,36 @@ struct expert_table {
 
 static struct expert_table *g_expert_tables = NULL;
 
+/* Slice 4f (L237): under TP `base` is the stack REBASED to where expert 0 would
+ * sit, and only experts [lo,hi) are staged behind it.  A peer-owned entry is
+ * CLAMPED to expert lo's address rather than computed: the ownership predicate
+ * guarantees it is never read, and clamping guarantees that no device array
+ * ever holds an address outside the staged bytes.  lo=0,hi=n_total (the pair
+ * off) is the unchanged `base + e*stride` fill, bit for bit. */
 __global__ static void expert_table_fill_kernel(
         const void **entries, const uint8_t *base,
-        uint64_t stride0, uint64_t off1, uint64_t stride1, uint32_t n_total, uint32_t planes) {
+        uint64_t stride0, uint64_t off1, uint64_t stride1, uint32_t n_total, uint32_t planes,
+        uint32_t lo, uint32_t hi) {
     uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (e >= n_total) return;
-    entries[(size_t)e * planes] = base + (size_t)e * stride0;
-    if (planes > 1) entries[(size_t)e * planes + 1] = base + off1 + (size_t)e * stride1;
+    const uint32_t src = (e >= lo && e < hi) ? e : lo;
+    entries[(size_t)e * planes] = base + (size_t)src * stride0;
+    if (planes > 1) entries[(size_t)e * planes + 1] = base + off1 + (size_t)src * stride1;
 }
 
 static const void *const *expert_table_get(const void *base, uint32_t n_total, uint32_t planes,
-                                           uint64_t stride0, uint64_t off1, uint64_t stride1) {
+                                           uint64_t stride0, uint64_t off1, uint64_t stride1,
+                                           uint32_t lo, uint32_t hi) {
     if (!base || !n_total || !stride0) return NULL;
+    if (lo >= hi || hi > n_total) return NULL;
     for (struct expert_table *t = g_expert_tables; t; t = t->next)
         if (t->base == base && t->stride0 == stride0 && t->off1 == off1 && t->stride1 == stride1 &&
-            t->n_total == n_total && t->planes == planes) return t->entries;
+            t->n_total == n_total && t->planes == planes && t->lo == lo && t->hi == hi) return t->entries;
     const void **entries = NULL;
     const size_t bytes = (size_t)n_total * planes * sizeof(*entries);
     if (!cuda_ok(cudaMalloc((void **)&entries, bytes), "expert table alloc")) return NULL;
     expert_table_fill_kernel<<<(n_total + 255u) / 256u, 256>>>(
-        entries, (const uint8_t *)base, stride0, off1, stride1, n_total, planes);
+        entries, (const uint8_t *)base, stride0, off1, stride1, n_total, planes, lo, hi);
     if (!cuda_ok(cudaGetLastError(), "expert table fill launch")) {
         (void)cudaFree((void *)entries);
         return NULL;
@@ -79,13 +90,19 @@ static const void *const *expert_table_get(const void *base, uint32_t n_total, u
     }
     t->base = base; t->stride0 = stride0; t->off1 = off1; t->stride1 = stride1;
     t->n_total = n_total; t->planes = planes; t->entries = entries;
+    t->lo = lo; t->hi = hi;
     t->next = g_expert_tables;
     g_expert_tables = t;
     return entries;
 }
 
 const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total) {
-    return (const uint8_t *const *)expert_table_get(base, n_total, 1, stride, 0, 0);
+    return (const uint8_t *const *)expert_table_get(base, n_total, 1, stride, 0, 0, 0, n_total);
+}
+
+const uint8_t *const *mxfp4_expert_table_owned(const void *base, uint64_t stride, uint32_t n_total,
+                                               uint32_t lo, uint32_t hi) {
+    return (const uint8_t *const *)expert_table_get(base, n_total, 1, stride, 0, 0, lo, hi);
 }
 
 /* The TYPE 44 arm: IQ2_XXS_MMQ_K is two planes per expert, at
@@ -97,7 +114,7 @@ const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t
     const uint64_t stride0 = (uint64_t)nb * M * 2ull;                    /* half per element   */
     const uint64_t off1    = (stride0 * n_total + 63ull) & ~63ull;       /* q plane base       */
     const uint64_t stride1 = (uint64_t)nb * M * 8ull * sizeof(uint2);    /* uint2 per element  */
-    return expert_table_get(base, n_total, 2, stride0, off1, stride1);
+    return expert_table_get(base, n_total, 2, stride0, off1, stride1, 0, n_total);
 }
 
 void mxfp4_expert_tables_clear(void) {

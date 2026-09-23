@@ -667,6 +667,11 @@ int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm
  * the same process would otherwise be served the first model's addresses (the
  * fp8 pointer cache's hazard, same contract). */
 const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total);
+/** Slice 4f (L237): the same table for a stack whose experts [lo,hi) are the
+ *  only ones staged behind `base` (which is REBASED to where expert 0 would
+ *  sit).  Peer-owned entries clamp to expert lo; they are never read. */
+const uint8_t *const *mxfp4_expert_table_owned(const void *base, uint64_t stride, uint32_t n_total,
+                                               uint32_t lo, uint32_t hi);
 /** PLAN 94 phase 1: the same table for a TYPE 44 (IQ2_XXS_MMQ_K) stack, whose
  *  expert is TWO planes (d and q).  Returns an interleaved device array of
  *  [d,q] pointer pairs -- one eviction unit -- laid out exactly as

@@ -2159,6 +2159,16 @@ int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
     return 1;
 }
 
+int pulsar_tp_owned_byte_span(int rank, uint32_t n_ranks, uint32_t n_total,
+                              uint64_t expert_bytes, uint64_t *off, uint64_t *bytes) {
+    uint32_t lo = 0, hi = 0;
+    if (!off || !bytes || expert_bytes == 0) return 0;
+    if (!pulsar_tp_owned_range(rank, n_ranks, n_total, &lo, &hi)) return 0;
+    *off = (uint64_t)lo * expert_bytes;
+    *bytes = (uint64_t)(hi - lo) * expert_bytes;
+    return 1;
+}
+
 bool pulsar_tp_is_rdma(const pulsar_tp *tp) { return tp->rdma_active; }
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp) { return tp->peer_ctx; }
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp) { return tp->n_layer; }

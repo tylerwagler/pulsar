@@ -182,6 +182,16 @@ uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
 int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
                           uint32_t *lo, uint32_t *hi);
 
+/* Slice 4f (L237): the BYTE span of a rank's owned slice of an expert stack
+ * whose experts are stored back-to-back at `expert_bytes` each:
+ * off = lo*expert_bytes, bytes = (hi-lo)*expert_bytes, from the range authority
+ * above.  The loader stages ONLY these bytes, the admission budget charges ONLY
+ * these bytes and the MoE dispatch resolves ONLY these bytes, so the three
+ * cannot drift.  n_ranks<=1 -> the whole stack.  Returns 1 on success, 0 on
+ * bad args. */
+int pulsar_tp_owned_byte_span(int rank, uint32_t n_ranks, uint32_t n_total,
+                              uint64_t expert_bytes, uint64_t *off, uint64_t *bytes);
+
 /* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
  * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for
  * all n ranks; opt->rank/opt->n_ranks are explicit.  Returns 1 on success. */

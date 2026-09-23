@@ -339,6 +339,9 @@ pair, because its own arguments are never read.
   - the control-plane deadline on the worker's `recv_command` presumes the
     same-driver model above (a worker only waits for a frame once its own
     driver issued the operation); it is not an idle timeout.
+6f. **Owned-expert residency (slice 4f, L237, 2026-09-23)** — a rank stages
+   only its owned experts (see split.md 4f).  Without it the pair could not
+   open the artifact it exists to serve.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the
