@@ -243,6 +243,35 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
               "rank %d: a layer past n_layer returned a batch region", rank);
     }
 
+    /* n-way per-layer gate (n>=3): `out` keeps THIS rank's partial and `in`
+     * accumulates the SUM of every peer's -- the pair's contract generalised
+     * from "the peer's partial" to "every peer's".  Integer partials so the sum
+     * is exact.  Skipped at n=2, where the pair takes its RDMA path and needs an
+     * armed decode window; that path is covered by tp_sched_test. */
+    if (n >= 3) {
+        pulsar_tp_slab lay;
+        pulsar_tp_slab_layout_init(MESH_N_LAYER, MESH_N_EMBD, &lay);
+        const uint64_t vec = pulsar_tp_vec_bytes(tp);
+        const uint64_t nelt = vec / sizeof(float);
+        float *op = (float *)((uint8_t *)slab + pulsar_tp_slab_out_offset(&lay, 0, 0, vec));
+        float *ip = (float *)((uint8_t *)slab + pulsar_tp_slab_in_offset(&lay, 0, 0, vec));
+        for (uint64_t k = 0; k < nelt; k++) op[k] = (float)(1000 * rank + (int)(k % 7));
+        memset(ip, 0, (size_t)vec);
+        if (!pulsar_tp_gate_exchange(tp, 0, 0, 7)) {
+            CHECK(0, "rank %d n-way gate_exchange failed", rank);
+        } else {
+            const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
+            int gbad = 0;
+            for (uint64_t k = 0; k < nelt; k++) {
+                if (ip[k] != base + (float)(n - 1) * (float)(int)(k % 7)) gbad++;
+                if (op[k] != (float)(1000 * rank + (int)(k % 7))) gbad++;   /* out stays local */
+            }
+            CHECK(gbad == 0,
+                  "rank %d n-way gate: %d wrong elements (in must be the peers' sum, "
+                  "out must still be local)", rank, gbad);
+        }
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it

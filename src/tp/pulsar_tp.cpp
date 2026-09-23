@@ -2172,13 +2172,13 @@ static int tp_refuse_nway(pulsar_tp *tp, const char *what) {
     return 0;
 }
 
-int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "decode per-layer gate");
-    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
-    const uint64_t out_off =
-        pulsar_tp_slab_out_offset(&tp->layout, layer, gate, tp->vec_bytes);
-    const uint64_t in_off =
-        pulsar_tp_slab_in_offset(&tp->layout, layer, gate, tp->vec_bytes);
+/* One pairwise slab-slot gate over `fd`: send our out-slot, receive the
+ * peer's payload into the in-slot.  Both ranks run it symmetrically (a 16 KB
+ * write-then-read cannot deadlock), so the n-way loop below calls it once per
+ * peer unchanged. */
+static int tp_gate_exchange_fd(int fd, uint32_t layer, uint32_t gate, uint64_t seq,
+                               uint8_t *slab, uint64_t out_off, uint64_t in_off,
+                               uint64_t vec_bytes) {
     /* TCP: both sides write their partial then read the peer's.  16KB per
      * direction fits comfortably in the socket buffers, so the symmetric
      * write-then-read cannot deadlock.  Header and payload go out in one
@@ -2186,9 +2186,9 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
     pulsar_tp_gate_header h = { PULSAR_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
     struct iovec iov[2] = {
         { &h, sizeof(h) },
-        { tp->slab + out_off, tp->vec_bytes },
+        { slab + out_off, vec_bytes },
     };
-    size_t want = sizeof(h) + tp->vec_bytes;
+    size_t want = sizeof(h) + vec_bytes;
     /* sendmsg(MSG_NOSIGNAL) not writev(): if the peer dies mid-exchange the
      * survivor must get a gate failure (0), not be killed by SIGPIPE --
      * SO_NOSIGPIPE is BSD-only and a no-op on Linux, so an unprotected writev
@@ -2197,27 +2197,27 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
     mh.msg_iov = iov;
     mh.msg_iovlen = 2;
 #ifdef MSG_NOSIGNAL
-    ssize_t w = sendmsg(tp->data_fd, &mh, MSG_NOSIGNAL);
+    ssize_t w = sendmsg(fd, &mh, MSG_NOSIGNAL);
 #else
-    ssize_t w = writev(tp->data_fd, iov, 2);
+    ssize_t w = writev(fd, iov, 2);
 #endif
     if (w < 0 || (size_t)w != want) {
         /* Short writev: finish with the plain path. */
         if (w < 0) return 0;
         size_t done = (size_t)w;
         if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, reinterpret_cast<char *>(&h) + done,
+            if (!tp_write_full(fd, reinterpret_cast<char *>(&h) + done,
                                sizeof(h) - done)) return 0;
             done = sizeof(h);
         }
         uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + out_off + payload_done,
-                           tp->vec_bytes - payload_done))
+        if (!tp_write_full(fd,
+                           slab + out_off + payload_done,
+                           vec_bytes - payload_done))
             return 0;
     }
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != PULSAR_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
         fprintf(stderr,
                 "pulsar-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
@@ -2225,8 +2225,51 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    if (!tp_read_full(tp->data_fd, tp->slab + in_off, tp->vec_bytes))
+    if (!tp_read_full(fd, slab + in_off, vec_bytes))
         return 0;
+    return 1;
+}
+
+int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    const uint64_t out_off =
+        pulsar_tp_slab_out_offset(&tp->layout, layer, gate, tp->vec_bytes);
+    const uint64_t in_off =
+        pulsar_tp_slab_in_offset(&tp->layout, layer, gate, tp->vec_bytes);
+    if (tp->n_ranks <= 2) {
+        /* The pair is UNCHANGED: RDMA when both can, else the fd swap. */
+        if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
+        return tp_gate_exchange_fd(tp->data_fd, layer, gate, seq, tp->slab,
+                                   out_off, in_off, tp->vec_bytes);
+    }
+    /* n>2: ONE pairwise exchange per peer, accumulating every peer's partial
+     * into the in-slot.  That preserves the PAIR'S CONTRACT -- `out` holds the
+     * local partial, `in` holds what the caller adds -- generalised from "the
+     * peer's partial" to "the SUM of every peer's": no caller changes shape, and
+     * a one-peer loop would be bit-identical to the pair.  TCP here, because the
+     * per-peer RDMA gate exchange is not implemented and the engine does not
+     * drive this lane yet; announced once so the transport is never a guess. */
+    static int said_nway_gate = 0;
+    if (!said_nway_gate) {
+        said_nway_gate = 1;
+        fprintf(stderr, "pulsar-tp: n-way per-layer gate over TCP (n=%d); per-peer "
+                        "RDMA gate exchange is not implemented\n", tp->n_ranks);
+    }
+    const uint64_t nelt = tp->vec_bytes / sizeof(float);
+    float *acc = (float *)calloc((size_t)nelt, sizeof(float));
+    if (!acc) return 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        pulsar_tp_peer *pp = &tp->peers[i];
+        if (!pp || pp->data_fd < 0 ||
+            !tp_gate_exchange_fd(pp->data_fd, layer, gate, seq, tp->slab,
+                                 out_off, in_off, tp->vec_bytes)) {
+            free(acc);
+            return 0;
+        }
+        const float *src = (const float *)(tp->slab + in_off);
+        for (uint64_t q = 0; q < nelt; q++) acc[q] += src[q];
+    }
+    memcpy(tp->slab + in_off, acc, tp->vec_bytes);
+    free(acc);
     return 1;
 }
 
