@@ -272,6 +272,31 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Same contract for the VERIFY-BATCH gate (rows<=8): every peer's ROWS
+     * accumulate into the batch-in region while batch-out keeps this rank's. */
+    if (n >= 3) {
+        pulsar_tp_slab lay;
+        pulsar_tp_slab_layout_init(MESH_N_LAYER, MESH_N_EMBD, &lay);
+        const uint64_t vec = pulsar_tp_vec_bytes(tp);
+        const uint32_t rws = 2u;
+        const uint64_t nelt = (uint64_t)rws * vec / sizeof(float);
+        float *bo = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_out_offset(&lay, 0, vec));
+        float *bi = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_in_offset(&lay, 0, vec));
+        for (uint64_t k = 0; k < nelt; k++) bo[k] = (float)(1000 * rank + (int)(k % 5));
+        memset(bi, 0, (size_t)((uint64_t)rws * vec));
+        if (!pulsar_tp_batch_gate_exchange(tp, 0, rws, 11)) {
+            CHECK(0, "rank %d n-way batch gate failed", rank);
+        } else {
+            const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
+            int bbad = 0;
+            for (uint64_t k = 0; k < nelt; k++) {
+                if (bi[k] != base + (float)(n - 1) * (float)(int)(k % 5)) bbad++;
+                if (bo[k] != (float)(1000 * rank + (int)(k % 5))) bbad++;
+            }
+            CHECK(bbad == 0, "rank %d n-way batch gate: %d wrong elements", rank, bbad);
+        }
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it

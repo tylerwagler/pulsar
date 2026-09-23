@@ -2276,49 +2276,23 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
 /* Verify-block batch gate: one exchange per layer moving all block rows at
  * once.  The payload lives in the registered slab, so RDMA sends it directly;
  * TCP remains the symmetric write-then-read fallback. */
-int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
-                                  uint64_t seq) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify-block batch gate");
-    if (tp->data_fd < 0 || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) return 0;
-    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
-    const uint64_t batch_out =
-        pulsar_tp_slab_batch_out_offset(&tp->layout, layer, tp->vec_bytes);
-    const uint64_t batch_in =
-        pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+/* The batch gate's fd exchange factored out: header (BATCH_MAGIC, rows tag),
+ * then alternating write/read rounds.  See the clamp note below. */
+static int tp_batch_gate_exchange_fd(int fd, uint32_t layer, uint32_t rows,
+                                     uint64_t seq, uint8_t *slab,
+                                     uint64_t batch_out, uint64_t batch_in,
+                                     uint64_t vec_bytes) {
+    const uint64_t bytes = (uint64_t)rows * vec_bytes;
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer,
                                 (uint16_t)rows, seq };
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) {
-            return 0;
-        }
-        pulsar_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) {
-            return 0;
-        }
-        if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "pulsar-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
-            return 0;
-        }
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(
-                tp, tp_pair_link(tp),
-                tp->slab + batch_out,
-                tp->slab + batch_in,
-                bytes);
-    }
     /* TCP fallback: header first, then alternate small write/read rounds.  A
      * single 2 MiB writev round deadlocked on the pair hosts: the kernel clamps
      * SO_SNDBUF to net.core.wmem_max (~212K there), so both sides filled their
      * send buffers before either side drained (recv-queue ~457K stuck both
      * ways).  Rounds of PULSAR_TP_TCP_ROUND are safe under any sane clamp. */
-    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -2332,10 +2306,72 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
     while (off < bytes) {
         const uint64_t n = bytes - off > PULSAR_TP_TCP_ROUND ?
                            PULSAR_TP_TCP_ROUND : bytes - off;
-        if (!tp_write_full(tp->data_fd, tp->slab + batch_out + off, n)) return 0;
-        if (!tp_read_full(tp->data_fd, tp->slab + batch_in + off, n)) return 0;
+        if (!tp_write_full(fd, slab + batch_out + off, n)) return 0;
+        if (!tp_read_full(fd, slab + batch_in + off, n)) return 0;
         off += n;
     }
+    return 1;
+}
+
+int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
+                                  uint64_t seq) {
+    if (tp->data_fd < 0 || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) return 0;
+    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+    const uint64_t batch_out =
+        pulsar_tp_slab_batch_out_offset(&tp->layout, layer, tp->vec_bytes);
+    const uint64_t batch_in =
+        pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+    if (tp->n_ranks <= 2) {
+        /* The pair is UNCHANGED. */
+        pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer,
+                                    (uint16_t)rows, seq };
+        if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
+            if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+            pulsar_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+            if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
+                ph.gate != rows || ph.seq != seq) {
+                fprintf(stderr,
+                        "pulsar-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
+                        "want l=%u rows=%u seq=%llu\n",
+                        ph.layer, ph.gate, (unsigned long long)ph.seq,
+                        layer, rows, (unsigned long long)seq);
+                return 0;
+            }
+            if (!tp_rdma_drain_decode_window(tp)) return 0;
+            return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp),
+                                             tp->slab + batch_out,
+                                             tp->slab + batch_in, bytes);
+        }
+        return tp_batch_gate_exchange_fd(tp->data_fd, layer, rows, seq, tp->slab,
+                                         batch_out, batch_in, tp->vec_bytes);
+    }
+    /* n>2: same contract as the per-layer gate -- every peer's rows accumulate
+     * into the IN region while the OUT region keeps this rank's rows.  TCP: the
+     * per-peer RDMA batch path is not implemented and this lane is not driven by
+     * the engine yet.  Announced once. */
+    static int said_nway_batch = 0;
+    if (!said_nway_batch) {
+        said_nway_batch = 1;
+        fprintf(stderr, "pulsar-tp: n-way verify-batch gate over TCP (n=%d); per-peer "
+                        "RDMA batch gate is not implemented\n", tp->n_ranks);
+    }
+    const uint64_t nelt = bytes / sizeof(float);
+    float *acc = (float *)calloc((size_t)nelt, sizeof(float));
+    if (!acc) return 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        pulsar_tp_peer *pp = &tp->peers[i];
+        if (!pp || pp->data_fd < 0 ||
+            !tp_batch_gate_exchange_fd(pp->data_fd, layer, rows, seq, tp->slab,
+                                       batch_out, batch_in, tp->vec_bytes)) {
+            free(acc);
+            return 0;
+        }
+        const float *src = (const float *)(tp->slab + batch_in);
+        for (uint64_t q = 0; q < nelt; q++) acc[q] += src[q];
+    }
+    memcpy(tp->slab + batch_in, acc, bytes);
+    free(acc);
     return 1;
 }
 
