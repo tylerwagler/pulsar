@@ -336,6 +336,19 @@ static int tp_mirror_worker_frame(pulsar_session *s, const pulsar_tp_command *co
                           (unsigned long long)s->tp_session_id);
         return 1;
     }
+    /* A rank that has ALREADY found the pair broken must stop applying frames.
+     * It still consumes this one and acks the refusal, which is what makes the
+     * documented propagation true: the leader reads a failed ack at once instead
+     * of waiting out its control-plane deadline, and this rank commits no
+     * further state on a stream it has already found inconsistent.  (The
+     * leader-side tp_mirror_dead check refuses BEFORE sending, because a leader
+     * that skipped a frame would leave its own stream misaligned.) */
+    if (pulsar_tp_failed(s->engine->tp)) {
+        if (err) snprintf(err, errlen,
+                          "tp: this rank marked the pair failed earlier; refusing to apply %s",
+                          operation);
+        return 1;
+    }
     return 0;
 }
 

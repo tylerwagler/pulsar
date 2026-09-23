@@ -191,6 +191,25 @@ static int run_leader(pulsar_tp *tp) {
               "the mixed refusal must name the operation: %s", err);
     }
 
+    /* H. A worker that has already found the pair broken must not go on
+     * applying frames -- and the refusal must reach the leader at ONCE, not
+     * through the deadline.  The assertion distinguishes the two: the error has
+     * to be the worker's failed ack, not "did not answer". */
+    {
+        int toks2[2] = { 21, 22 };
+        pulsar_tokens prompt2;
+        fill_prompt(&prompt2, toks2, 2);
+        CHECK(pulsar_tp_send_sync(tp, LEADER_SID, prompt2.v, 2) != 0,
+              "post-failure sync send failed");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "sync", err, sizeof(err)),
+              "the leader must see the worker's refusal");
+        CHECK(std::strstr(err, "sync failed") != NULL,
+              "the refusal must arrive as a failed ACK, not a deadline: %s", err);
+        CHECK(std::strstr(err, "did not answer") == NULL,
+              "propagation must be immediate, not by timeout: %s", err);
+    }
+
     /* G. A peer that stays ALIVE but SILENT must produce a refusal, not a hang.
      * This is the failure mode that made every blocking mirror in this slice
      * look dangerous, and it is why this target used to need `timeout`: with no
@@ -303,6 +322,23 @@ static int run_worker(pulsar_tp *tp) {
         }
     }
     free_session(s);
+
+    /* H. Mark this rank's pair failed, then take one more acked frame through
+     * the wrapper: it must be consumed, refused and ACKED -- never applied. */
+    s = fabricate_session(tp, LEADER_SID);
+    pulsar_tp_mark_failed(tp);
+    {
+        int toks2[2] = { 21, 22 };
+        pulsar_tokens prompt2;
+        fill_prompt(&prompt2, toks2, 2);
+        err[0] = 0;
+        const int mrc = pulsar_session_sync_mm(s, &prompt2, NULL, 0, err, sizeof(err));
+        CHECK(mrc == 1, "a failed pair must refuse a further sync, got rc=%d", mrc);
+        CHECK(std::strstr(err, "marked the pair failed") != NULL,
+              "the refusal must say the pair was already failed: %s", err);
+    }
+    free_session(s);
+
     /* Stay ALIVE and SILENT past the leader's control-plane deadline, so its
      * last round tests a timeout rather than a closed channel.  The target sets
      * PULSAR_TP_TIMEOUT_SEC=1; this sleeps longer than that and shorter than the
