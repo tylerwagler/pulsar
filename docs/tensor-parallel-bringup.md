@@ -12,6 +12,20 @@ or traffic-generating on it without an approved maintenance window, and do not
 build/run our engine next to the live vLLM (~10 GB free). This runbook targets
 a spare pair OR the work pair during an approved window.**
 
+⚠ **A single-box two-process loopback is NOT a substitute (measured
+2026-09-22).** Both ranks stand up fine over TCP loopback — `PULSAR_LOCK_FILE`
+scopes the instance lock per rank — but with the served 85.90 GiB container the
+box dies in MODEL LOAD on both sides (`rc=137`, no TP line ever printed):
+earlyoom killed the leader with `shmem-rss 94087056 kB`. The model is opened
+`MAP_SHARED`, so each process's rss accounts the whole mapping even though the
+pages are physically shared, and a userspace OOM daemon that sums rss across
+processes sees ~2x the model and fires. Two consequences: (a) a loopback pair
+proves nothing about TP and must not be read as a TP failure, and (b) a
+loopback pair needs a checkpoint roughly HALF this size (the four other
+artifacts on sparky are all ~87 GiB, so none of them work either). The
+transport ITSELF is exercised on one box by `tests/tp_mesh_test` (n=2 and n=3
+over TCP loopback, no model).**
+
 ## 0. Baseline — build + host tests (any box, ~2 min)
 
 ```sh
