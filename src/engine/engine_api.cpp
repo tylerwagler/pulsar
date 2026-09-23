@@ -345,6 +345,86 @@ static int tp_mirror_worker_ack(pulsar_session *s, pulsar_tp *tp, int rc,
     return 1;
 }
 
+/** The failure report a `void` operation can make: it has no error channel, so
+ * the pair is marked failed -- every later mirrored operation then refuses
+ * through tp_mirror_dead -- and the reason is printed here, named, while it is
+ * still the newest line on stderr. */
+static void tp_mirror_fail_void(pulsar_tp *tp, const char *operation, const char *why) {
+    pulsar_tp_mark_failed(tp);
+    fprintf(stderr, "pulsar: tp: the mirrored %s failed (%s); the pair is marked failed\n",
+            operation, why ? why : "no reason given");
+}
+
+/* The two operations that return void.  Which entry point a caller is in is the
+ * only thing that varies between them, so the mirror below is written once
+ * against this tag. */
+typedef enum {
+    TP_MIRROR_REWIND,
+    TP_MIRROR_INVALIDATE,
+} tp_mirror_void_op;
+
+static const char *tp_mirror_void_name(tp_mirror_void_op op) {
+    return op == TP_MIRROR_REWIND ? "rewind" : "invalidate";
+}
+
+static pulsar_tp_frame_type tp_mirror_void_frame(tp_mirror_void_op op) {
+    return op == TP_MIRROR_REWIND ? PULSAR_TP_FRAME_REWIND : PULSAR_TP_FRAME_INVALIDATE;
+}
+
+static int tp_mirror_void_send(pulsar_tp *tp, uint64_t session_id,
+                               tp_mirror_void_op op, int value) {
+    return op == TP_MIRROR_REWIND ? pulsar_tp_send_rewind(tp, session_id, value)
+                                  : pulsar_tp_send_invalidate(tp, session_id);
+}
+
+static void tp_mirror_void_apply(pulsar_session *s, tp_mirror_void_op op, int value) {
+    if (op == TP_MIRROR_REWIND) s->rewind(value);
+    else                         s->invalidate();
+}
+
+/** Rewind and invalidate, mirrored.  These are the one pair of mirrored
+ * operations that collects NO ack, for two reasons that agree: a `void` caller
+ * has nowhere to put a peer's refusal, and a leader that waited would hang on
+ * the first operation the peer's driver did not happen to make -- which is a
+ * live risk here, because several callers are the server's cache and scheduler
+ * (`kv_cache.cpp`, `server_sched.cpp`), whose timing follows LOCAL memory state
+ * rather than the request stream.  The frame is fire-and-forget, and the
+ * worker's frame-type check is the divergence alarm: an unexpected frame marks
+ * the pair failed and prints, so the next ACKED operation carries the refusal
+ * back to the leader instead of the pair hanging on it. */
+static void pulsar_tp_mirror_void(pulsar_session *s, pulsar_tp *tp,
+                                  tp_mirror_void_op op, int value) {
+    const char *name = tp_mirror_void_name(op);
+    if (pulsar_tp_rank(tp) == 0) {
+        if (tp_mirror_void_send(tp, s->tp_session_id, op, value) != 0) {
+            tp_mirror_fail_void(tp, name, "the frame could not be shipped");
+            return;
+        }
+        tp_mirror_void_apply(s, op, value);
+        return;
+    }
+    char err[256];
+    err[0] = '\0';
+    pulsar_tp_command command;
+    memset(&command, 0, sizeof(command));
+    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) != 0) {
+        tp_mirror_fail_void(tp, name, err);
+        return;
+    }
+    if (tp_mirror_worker_frame(s, &command, tp_mirror_void_frame(op), name,
+                               err, sizeof(err)) != 0) {
+        tp_mirror_fail_void(tp, name, err);
+        pulsar_tp_command_free(&command);
+        return;
+    }
+    if (op == TP_MIRROR_REWIND && command.value != value) {
+        fprintf(stderr, "pulsar: tp: worker rewind %d differs from the leader's %d; "
+                        "mirroring the leader's\n", value, command.value);
+    }
+    tp_mirror_void_apply(s, op, command.value);
+    pulsar_tp_command_free(&command);
+}
+
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }
@@ -353,7 +433,11 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->sync(prompt, images, n_images, err, errlen);
-    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    /* Leader only: the worker must still RECEIVE the frame, because a worker
+     * that returned here would leave the leader blocked in wait_command_ack
+     * forever.  A dead transport makes its recv fail, which fails loudly --
+     * that is the right ending, and the wrong one is a hang. */
+    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
     const int is_leader = pulsar_tp_rank(tp) == 0;
     if (is_leader) {
         /* The leader's arguments ARE the operation, so an empty prompt here is
@@ -480,7 +564,11 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->eval(token, err, errlen);
-    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    /* Leader only: the worker must still RECEIVE the frame, because a worker
+     * that returned here would leave the leader blocked in wait_command_ack
+     * forever.  A dead transport makes its recv fail, which fails loudly --
+     * that is the right ending, and the wrong one is a hang. */
+    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
     /* The frame's seq is this session's decode position -- the number of tokens
      * whose KV the graph holds -- so the worker can do more than trust the
      * leader's token: it can check that both ranks are at the same place before
@@ -534,8 +622,17 @@ void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pu
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) { if (s) s->note_committed_tokens(toks, n); }
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
-void pulsar_session_invalidate(pulsar_session *s) { s->invalidate(); }
-void pulsar_session_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
+void pulsar_session_invalidate(pulsar_session *s) {
+    /* The pair-off shape is untouched: one call, no TP code on the live path. */
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) { s->invalidate(); return; }
+    pulsar_tp_mirror_void(s, tp, TP_MIRROR_INVALIDATE, 0);
+}
+void pulsar_session_rewind(pulsar_session *s, int pos) {
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) { s->rewind(pos); return; }
+    pulsar_tp_mirror_void(s, tp, TP_MIRROR_REWIND, pos);
+}
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { return s ? s->prefill_quantum_min_suffix() : 0; }

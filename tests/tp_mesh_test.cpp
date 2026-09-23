@@ -468,6 +468,69 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Rewind and invalidate: the fire-and-forget pair.  The engine sends these
+     * WITHOUT an ack (a void caller has nowhere to put a peer's refusal, and a
+     * leader that waited would hang on the first operation the peer's driver
+     * did not happen to make), so the test's job is the opposite of the rounds
+     * above: the worker must apply the frame and stay SILENT.  To prove the
+     * silence, the rewind/invalidate round runs under one session id and is
+     * followed by an acked sync under a DIFFERENT one: a stray ack from either
+     * void frame would be read by the leader's collect below, whose session id
+     * would not match, and the failure would name that mismatch. */
+    {
+        const uint64_t void_sid = 0xC0DE3000ULL;
+        const uint64_t ack_sid  = 0xC0DE3001ULL;
+        const int rewind_pos = 1234;
+        int tokens[4] = { 7, 8, 9, 10 };
+        char cerr[256];
+        cerr[0] = 0;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_rewind(tp, void_sid, rewind_pos),
+                  "rank 0 mirrored rewind send failed");
+            CHECK(pulsar_tp_send_invalidate(tp, void_sid),
+                  "rank 0 mirrored invalidate send failed");
+            CHECK(pulsar_tp_send_sync(tp, ack_sid, tokens, 4),
+                  "rank 0 post-void sync send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, ack_sid, "post-void sync",
+                                             cerr, sizeof(cerr)),
+                  "rank 0 collected a stray or missing ack after the void pair: %s", cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored rewind recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_REWIND && cmd.session_id == void_sid,
+                      "rank %d got frame type %d session %llu, expected REWIND (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_REWIND, (unsigned long long)void_sid);
+                CHECK(cmd.value == rewind_pos,
+                      "rank %d mirrored rewind position %d, expected %d",
+                      rank, cmd.value, rewind_pos);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d mirrored invalidate recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_INVALIDATE && cmd.session_id == void_sid,
+                      "rank %d got frame type %d session %llu, expected INVALIDATE (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_INVALIDATE, (unsigned long long)void_sid);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) {
+                CHECK(0, "rank %d post-void sync recv_command: %s", rank, cerr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC && cmd.session_id == ack_sid,
+                      "rank %d got frame type %d session %llu, expected SYNC (%d) session %llu",
+                      rank, (int)cmd.type, (unsigned long long)cmd.session_id,
+                      (int)PULSAR_TP_FRAME_SYNC, (unsigned long long)ack_sid);
+                CHECK(pulsar_tp_send_command_ack(tp, ack_sid, 0),
+                      "rank %d post-void sync ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);

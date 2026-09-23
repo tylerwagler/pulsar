@@ -132,12 +132,26 @@ pair, because its own arguments are never read.
   uses (a 16-token SYNC array, then an EVAL position+token), with one ack per
   frame per peer, at n=2..5 over real RDMA.  Its gating is mutation-proven: a
   wrong expected position exits nonzero instead of printing and passing.
-- **Still open:** rewind/invalidate, banks, warm-fork, multiseq, mixed, spec.
-  `pulsar_session_rewind`/`_invalidate` return `void` (49 call sites), so they
-  have no error channel -- mirroring them means reporting a transport failure by
-  marking the pair failed and printing, with the caller learning on the next
-  operation.  That API decision is its own increment, not a silent edge of this
-  one.
+- Increment 3 (2026-09-23) mirrors **rewind and invalidate** -- and they are the
+  one pair of mirrored operations that collects **no ack**, for two reasons that
+  agree.  A `void` caller has nowhere to put a peer's refusal, and a leader that
+  waited would hang on the first operation the peer's driver did not happen to
+  make -- a live risk, because of the 49 `pulsar_session_rewind`/`_invalidate`
+  call sites only 8 can run with a pair armed (src/server and src/cli; the
+  kvstore and agent tools never arm TP), and several of those 8 are the server's
+  cache and scheduler (`kv_cache.cpp:664`, `server_sched.cpp:318/2375`), whose
+  timing follows LOCAL memory state rather than the request stream.  The frame
+  is therefore fire-and-forget, and the worker's frame-type check is the
+  divergence alarm: an unexpected frame marks the pair failed and prints, so the
+  next *acked* operation carries the refusal to the leader instead of the pair
+  hanging on it.  `tp_mesh_test` rides the REWIND+INVALIDATE pair and then an
+  acked sync under a different session id, which proves the silence (a stray ack
+  is read by that collect and fails it; verified by mutation).
+- A worker must never skip a frame it was sent.  The `tp_mirror_dead`
+  early-return is therefore **leader-only**: a worker that returned there would
+  leave the leader blocked in `wait_command_ack` forever, and a dead transport
+  failing its `recv` is the right ending while a hang is the wrong one.
+- **Still open:** banks, warm-fork, multiseq, mixed, spec.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the
