@@ -160,9 +160,19 @@ pair, because its own arguments are never read.
   and a two-process engine pair on one box is impossible (earlyoom; see the
   bringup doc).  The earlier slices are what identified it: gpu_prefill's
   allreduce and gpu_decode's vocab all-gather both test `... != 0` for success.
-  Closing the gap means a test that *fabricates* a session (engine + tp + a
-  mismatched `tp_session_id`) and calls the wrapper: its refusal paths return
-  before touching the graph, so it needs no model and no second GPU.
+- **The engine mirror layer now has its own on-box test** (`make tp-mirror-test`,
+  `tests/tp_mirror_test.cpp`), which is what the convention bug above showed was
+  missing.  It fabricates a session -- a zeroed `pulsar_engine` carrying a real
+  mesh transport, and a zeroed `pulsar_session` whose `tp_session_id` is NOT the
+  id the leader mirrors under -- and asserts the three refusal paths that return
+  *before* the wrapper reaches the graph: worker session-id mismatch, worker
+  frame-type mismatch, and a leader on a dead transport.  No model, no weights.
+  Mutating the worker's recv check back to the broken convention fails it (empty
+  error, then the leader hangs and the target's `timeout` turns that into a
+  nonzero exit -- which is why the target is wrapped in `timeout`: a missing ack
+  HANGS the leader, and a hang is not a test result).
+  It still does not cover the wrappers' SUCCESS path, which calls `sync`/`eval`
+  on the real graph; that needs two Sparks.
 - **Still open:** banks, warm-fork, multiseq, mixed, spec.
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 

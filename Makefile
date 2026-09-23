@@ -2008,6 +2008,21 @@ tests/tp_mesh_test: tests/tp_mesh_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp
 tp-mesh-test: tests/tp_mesh_test
 	./tests/tp_mesh_test
 
+# TP engine-mirror test (slice 4e).  Host-runnable but links the engine: it
+# fabricates a session (no model, no weights) whose mirror id does not match
+# the leader's frame, and asserts the wrappers refuse loudly, ACK the refusal,
+# and that the leader reports it -- the plumbing the mesh test cannot reach and
+# the single-Spark gates do not cover.  `timeout` matters: a missing ack HANGS
+# the leader in wait_command_ack, and a hang is not a test result.
+tests/tp_mirror_test.o: tests/tp_mirror_test.cpp src/tp/pulsar_tp.h src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/tp_mirror_test.cpp
+
+tests/tp_mirror_test: tests/tp_mirror_test.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tp-mirror-test: tests/tp_mirror_test
+	timeout 60 ./tests/tp_mirror_test
+
 # TP transport loopback test (branch tensor_parallel, slice 3).  Host-only:
 # no CUDA, no RDMA -- a forked leader/worker pair exchanges gate/batch/big
 # partials and one eval<->ack lockstep round over TCP 127.0.0.1 loopback,
