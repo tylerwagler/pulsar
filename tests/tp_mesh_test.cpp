@@ -320,6 +320,44 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         std::free(bi);
     }
 
+    /* The VERIFY family across the mesh: rank 0 BROADCASTS the drafts, every
+     * worker receives them and commits its verdict, and rank 0 collects one
+     * commit PER PEER and requires them to agree.  All workers commit the same
+     * verdict here, which is what a correct group does (they verify against the
+     * same assembled logits). */
+    if (n >= 3) {
+        const int drafts[3] = { 11, 22, 33 };
+        char verr[256];
+        verr[0] = 0;
+        if (rank == 0) {
+            if (!pulsar_tp_send_verify(tp, 0xFEED1234ULL, drafts, 3)) {
+                CHECK(0, "rank 0 send_verify (broadcast) failed");
+            } else {
+                int32_t fa = -1, rn = -1;
+                if (!pulsar_tp_recv_verify_commit(tp, &fa, &rn)) {
+                    CHECK(0, "rank 0 recv_verify_commit over %d peers failed: %s",
+                          n - 1, verr);
+                } else {
+                    CHECK(fa == 0 && rn == 3,
+                          "rank 0 collected commit (%d,%d), expected (0,3)",
+                          (int)fa, (int)rn);
+                }
+            }
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, verr, sizeof(verr))) {
+                CHECK(0, "rank %d verify recv_command: %s", rank, verr);
+            } else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_VERIFY,
+                      "rank %d received frame %d, expected VERIFY (%d)",
+                      rank, (int)cmd.type, (int)PULSAR_TP_FRAME_VERIFY);
+                pulsar_tp_command_free(&cmd);
+                CHECK(pulsar_tp_send_verify_commit(tp, 0, 3),
+                      "rank %d send_verify_commit failed", rank);
+            }
+        }
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it

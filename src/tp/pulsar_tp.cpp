@@ -2976,30 +2976,51 @@ int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count) {
 
 int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
                           const int *drafts, uint32_t n) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify");
     return tp_send_token_command(tp, PULSAR_TP_FRAME_VERIFY, session_id,
                                  drafts, n);
 }
 
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept, int32_t replay_n) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify commit");
+    /* Worker -> leader: a worker has ONE peer (the leader), so its control_fd is
+     * that link at any n -- nothing to loop. */
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 
 int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *replay_n) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "verify commit");
-    uint32_t type = 0, bytes = 0;
-    struct { int32_t full; int32_t replay; } msg;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != PULSAR_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
-        !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
-        fprintf(stderr, "pulsar-tp: bad verify-commit frame (type %u bytes %u)\n",
-                type, bytes);
-        return 0;
+    /* One commit per PEER, and every one must AGREE.  Every rank verifies
+     * against the same assembled logits (the vocab split all-gathers them), so a
+     * split verdict means the ranks disagree about the same computation -- a
+     * real bug, and this REFUSES rather than silently taking one worker's word.
+     * n=2 is the one-peer case and behaves exactly as before. */
+    if (!tp || tp->n_peers < 1 || !full_accept || !replay_n) return 0;
+    int32_t first_full = 0, first_replay = 0;
+    for (int i = 0; i < tp->n_peers; i++) {
+        const int pfd = tp->peers[i].control_fd;
+        uint32_t type = 0, bytes = 0;
+        struct { int32_t full; int32_t replay; } msg;
+        if (pfd < 0 || !tp_read_frame_header(pfd, &type, &bytes) ||
+            type != PULSAR_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
+            !tp_read_full(pfd, &msg, sizeof(msg))) {
+            fprintf(stderr,
+                    "pulsar-tp: bad verify-commit frame from rank %d (type %u bytes %u)\n",
+                    tp->peers[i].rank, type, bytes);
+            return 0;
+        }
+        if (i == 0) {
+            first_full = msg.full;
+            first_replay = msg.replay;
+        } else if (msg.full != first_full || msg.replay != first_replay) {
+            fprintf(stderr,
+                    "pulsar-tp: verify-commit SPLIT: rank %d says (%d,%d), rank %d says "
+                    "(%d,%d) -- refusing\n",
+                    tp->peers[0].rank, first_full, first_replay,
+                    tp->peers[i].rank, msg.full, msg.replay);
+            return 0;
+        }
     }
-    *full_accept = msg.full;
-    *replay_n = msg.replay;
+    *full_accept = first_full;
+    *replay_n = first_replay;
     return 1;
 }
