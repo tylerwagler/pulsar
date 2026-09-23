@@ -135,7 +135,11 @@ walk; it is retired, number never reused).  The logits block is never
 shipped: each rank's own mirrored forward left it identical, so only `row0`
 crosses.  Verdicts that can be -1 ride the wire as value + 1.  The worker
 keeps one round per bank per session; the leader names the live bank on every
-round frame;
+round frame; (5) LANDED with (1): `set_cancel` is never polled inside a
+mirrored operation -- the hook fires at prefill chunk boundaries, and a leader
+stopping after k chunks would leave its workers at a big gate it never joins,
+so under TP cancellation is between operations only (the driver issues no
+further frame).
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a
