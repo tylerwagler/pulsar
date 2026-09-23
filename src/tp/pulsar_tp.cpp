@@ -2652,7 +2652,7 @@ int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
 typedef struct {
     uint64_t session_id;
     uint32_t count;
-    uint32_t reserved;
+    int32_t value;        /* REWRITE_FROM_COMMON: the common-prefix length; 0 elsewhere */
 } pulsar_tp_token_command_header;
 
 typedef struct {
@@ -2697,14 +2697,14 @@ static int tp_send_frame_to_peers(pulsar_tp *tp, uint32_t type,
 
 static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
                                  uint64_t session_id, const int *tokens,
-                                 uint32_t count) {
+                                 uint32_t count, int32_t value = 0) {
     const uint64_t bytes64 = sizeof(pulsar_tp_token_command_header) +
                              (uint64_t)count * sizeof(int32_t);
     if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = static_cast<uint8_t *>(malloc(bytes ? bytes : 1u));
     if (!payload) return 0;
-    pulsar_tp_token_command_header h = { session_id, count, 0 };
+    pulsar_tp_token_command_header h = { session_id, count, value };
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = reinterpret_cast<int32_t *>(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
@@ -2873,6 +2873,37 @@ int pulsar_tp_wait_command_status(pulsar_tp *tp, uint64_t session_id,
     return 1;
 }
 
+int pulsar_tp_send_rewrite_from_common(pulsar_tp *tp, uint64_t session_id,
+                                       const int *tokens, uint32_t n_tokens, int common) {
+    return tp_send_token_command(tp, PULSAR_TP_FRAME_REWRITE_FROM_COMMON, session_id,
+                                 tokens, n_tokens, (int32_t)common);
+}
+int pulsar_tp_send_note_committed(pulsar_tp *tp, uint64_t session_id,
+                                  const int *tokens, uint32_t n_tokens) {
+    return tp_send_token_command(tp, PULSAR_TP_FRAME_NOTE_COMMITTED, session_id, tokens, n_tokens);
+}
+
+typedef struct {
+    uint64_t session_id;
+    uint32_t count;
+    uint32_t reserved;
+} pulsar_tp_logits_command_header;
+
+int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
+                              const float *logits, uint32_t n) {
+    const uint64_t bytes64 = sizeof(pulsar_tp_logits_command_header) + (uint64_t)n * sizeof(float);
+    if (!tp || !logits || n == 0 || bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    pulsar_tp_logits_command_header h = { session_id, n, 0 };
+    memcpy(payload, &h, sizeof(h));
+    memcpy(payload + sizeof(h), logits, (size_t)n * sizeof(float));
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SET_LOGITS, payload, bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -2945,6 +2976,9 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     free(command->items);
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
+    free(command->logits);
+    command->logits = NULL;
+    command->n_logits = 0;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -2966,6 +3000,7 @@ static int tp_command_decode_tokens(pulsar_tp_command *command,
     command->session_id = h.session_id;
     command->tokens = tokens;
     command->n_tokens = h.count;
+    command->value = h.value;
     return 1;
 }
 
@@ -3003,8 +3038,23 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     switch (ftype) {
     case PULSAR_TP_FRAME_SYNC:
     case PULSAR_TP_FRAME_VERIFY:
+    case PULSAR_TP_FRAME_REWRITE_FROM_COMMON:
+    case PULSAR_TP_FRAME_NOTE_COMMITTED:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
         break;
+    case PULSAR_TP_FRAME_SET_LOGITS: {
+        pulsar_tp_logits_command_header h;
+        if (bytes < sizeof(h)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        const uint64_t want = sizeof(h) + (uint64_t)h.count * sizeof(float);
+        if (h.count == 0 || want != bytes) { ok = 0; break; }
+        command->logits = static_cast<float *>(malloc((size_t)h.count * sizeof(float)));
+        if (!command->logits) { ok = -1; break; }
+        memcpy(command->logits, payload + sizeof(h), (size_t)h.count * sizeof(float));
+        command->n_logits = h.count;
+        command->session_id = h.session_id;
+        break;
+    }
     case PULSAR_TP_FRAME_BANK_FORK:
     case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
         pulsar_tp_fork_command_header h;

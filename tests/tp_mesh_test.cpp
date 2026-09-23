@@ -797,6 +797,54 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Increment 3: rewrite (common rides the token header; verdict result+1),
+     * note-committed (void), set-logits (the float vector, bit-exact). */
+    {
+        const uint64_t sid = 0xC0DE8000ULL;
+        char cerr[256];
+        cerr[0] = 0;
+        const int toks[5] = { 31, 32, 33, 34, 35 };
+        float lg[9];
+        for (int i = 0; i < 9; i++) lg[i] = -1.5f * (float)i + 0.125f;
+        if (rank == 0) {
+            int status = -99;
+            CHECK(pulsar_tp_send_rewrite_from_common(tp, sid, toks, 5u, 3) != 0, "rank 0 rewrite send failed");
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "rewrite from common", &status, cerr, sizeof(cerr)) &&
+                  status == 2, "rank 0 rewrite verdict: want 2 (REBUILD_NEEDED+1), got %d (%s)", status, cerr);
+            CHECK(pulsar_tp_send_note_committed(tp, sid, toks, 2u) != 0, "rank 0 note send failed");
+            CHECK(pulsar_tp_send_set_logits(tp, sid, lg, 9u) != 0, "rank 0 set-logits send failed");
+            status = -99;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "set logits", &status, cerr, sizeof(cerr)) &&
+                  status == 0, "rank 0 set-logits verdict: want 0, got %d (%s)", status, cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d rewrite recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_REWRITE_FROM_COMMON && cmd.session_id == sid &&
+                      cmd.value == 3 && cmd.n_tokens == 5 && cmd.tokens && cmd.tokens[4] == 35,
+                      "rank %d rewrite frame: value %d n_tokens %u", rank, cmd.value, cmd.n_tokens);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 2), "rank %d rewrite ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d note recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_NOTE_COMMITTED && cmd.n_tokens == 2 && cmd.tokens[1] == 32,
+                      "rank %d note frame", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d set-logits recv: %s", rank, cerr);
+            else {
+                int lbad = 0;
+                if (cmd.logits) for (int i = 0; i < 9; i++) if (cmd.logits[i] != lg[i]) lbad++;
+                CHECK(cmd.type == PULSAR_TP_FRAME_SET_LOGITS && cmd.session_id == sid && cmd.n_logits == 9 &&
+                      cmd.logits && lbad == 0,
+                      "rank %d set-logits frame: n %u, %d values differ", rank, cmd.n_logits, lbad);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d set-logits ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
@@ -853,7 +901,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank verdicts, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits verdicts, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

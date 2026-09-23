@@ -177,6 +177,17 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "partial bank fork", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session fork must come back as a refusal: %s", err);
+        CHECK(pulsar_tp_send_rewrite_from_common(tp, SID, t3, 3u, 1) != 0, "send_rewrite must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "rewrite from common", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session rewrite must come back as a refusal: %s", err);
+        const float lg[4] = { 0.f, 1.f, 2.f, 3.f };
+        CHECK(pulsar_tp_send_set_logits(tp, SID, lg, 4u) != 0, "send_set_logits must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "set logits", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session set-logits must come back as a refusal: %s", err);
     }
 
     /* B. A void frame for an unknown session marks the worker's pair failed

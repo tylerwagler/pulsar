@@ -123,7 +123,9 @@ same code on every rank, and a split verdict is a divergence (pair marked
 failed, the caller told `PULSAR_FORK_EINVAL` / false / 1), never a vote.  A
 negative status is a worker's refusal, never a verdict.  The leader's
 scheduler decides, the frame carries the decision, the ordinal names the
-target;
+target; (3) LANDED with (1): `rewrite_from_common` (verdict, wire status =
+result + 1 because ERROR is -1), `note_committed_tokens` (void) and
+`set_logits` (the vector rides the frame; verdict);
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a

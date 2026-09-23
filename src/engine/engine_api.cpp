@@ -302,6 +302,10 @@ static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
  * by the leader's frames through pulsar_tp_worker_run.  A driver that calls a
  * session operation on a worker is the same-driver model this slice retired,
  * and it is refused before any frame moves. */
+/* Defined with the bank wrappers below; shared by every verdict operation. */
+static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *operation,
+                                  int own, int divergence_rc);
+
 static int tp_mirror_worker_drives_nothing(pulsar_tp *tp, const char *operation,
                                            char *err, size_t errlen) {
     if (pulsar_tp_rank(tp) == 0) return 0;
@@ -533,7 +537,24 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
     if (!ok) pulsar_tokens_free(out);
     return ok;
 }
-pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) { return s ? s->rewrite_from_common(prompt, common, err, errlen) : PULSAR_SESSION_REWRITE_ERROR; }
+pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) {
+    if (!s) return PULSAR_SESSION_REWRITE_ERROR;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->rewrite_from_common(prompt, common, err, errlen);
+    if (tp_mirror_worker_drives_nothing(tp, "rewrite from common", err, errlen) ||
+        tp_mirror_dead(tp, err, errlen)) return PULSAR_SESSION_REWRITE_ERROR;
+    if (!prompt || prompt->len < 0 || (prompt->len > 0 && !prompt->v)) return PULSAR_SESSION_REWRITE_ERROR;
+    if (pulsar_tp_send_rewrite_from_common(tp, s->tp_session_id, prompt->v,
+                                           (uint32_t)prompt->len, common) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the rewrite to the workers");
+        return PULSAR_SESSION_REWRITE_ERROR;
+    }
+    /* The verdict rides the wire as result + 1 (ERROR is -1 and a negative
+     * wire status is a worker refusal). */
+    const pulsar_session_rewrite_result own = s->rewrite_from_common(prompt, common, err, errlen);
+    const int agreed = tp_mirror_bank_verdict(s, tp, "rewrite from common", (int)own + 1, -1);
+    return agreed < 0 ? PULSAR_SESSION_REWRITE_ERROR : (pulsar_session_rewrite_result)(agreed - 1);
+}
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return s->common_prefix(prompt); }
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
@@ -542,7 +563,26 @@ int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s ? s->top_logprobs(out, k) : 0; }
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s ? s->token_logprob(token, out) : 0; }
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s ? s->copy_logits(out, cap) : 0; }
-int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) { return s ? s->set_logits(logits, n) : 1; }
+int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->set_logits(logits, n);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "set logits", err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return 1;
+    }
+    if (!logits || n <= 0) return 1;
+    /* The vector itself rides the frame: every rank already holds the same
+     * full logits after the vocab all-gather, but the worker's copy lives in
+     * its loop's scratch, not in the session, and exactness is the contract. */
+    if (pulsar_tp_send_set_logits(tp, s->tp_session_id, logits, (uint32_t)n) == 0) {
+        pulsar_tp_mirror_fail_void(tp, "set logits", "the frame could not be shipped");
+        return 1;
+    }
+    return tp_mirror_bank_verdict(s, tp, "set logits", s->set_logits(logits, n) != 0 ? 1 : 0, 1);
+}
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
@@ -714,7 +754,20 @@ int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s-
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->bank_prefix_match(bank, prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }
-void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) { if (s) s->note_committed_tokens(toks, n); }
+void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) {
+    if (!s) return;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) { s->note_committed_tokens(toks, n); return; }
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "note committed tokens", err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, "note committed tokens", err);
+        return;
+    }
+    if (n < 0 || (n > 0 && !toks)) return;
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "note committed tokens",
+                             pulsar_tp_send_note_committed(tp, s->tp_session_id, toks, (uint32_t)n))) return;
+    s->note_committed_tokens(toks, n);
+}
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) {

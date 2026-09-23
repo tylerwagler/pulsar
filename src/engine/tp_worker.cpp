@@ -268,6 +268,43 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         return worker_ack(e, c->session_id, status, err, errlen);
     }
 
+    case PULSAR_TP_FRAME_REWRITE_FROM_COMMON: {
+        /* A verdict frame whose enum includes -1: the wire status is result + 1
+         * so that a negative wire status stays this rank's refusal. */
+        int status = -1;
+        if (!worker_refused(e, c, "rewrite from common", &slot, ferr, sizeof(ferr))) {
+            pulsar_tokens borrowed;
+            borrowed.v = c->tokens;
+            borrowed.len = (int)c->n_tokens;
+            borrowed.cap = (int)c->n_tokens;
+            const pulsar_session_rewrite_result rr =
+                slot->s->rewrite_from_common(&borrowed, c->value, ferr, sizeof(ferr));
+            status = (int)rr + 1;
+            if (status < 0) status = 0;   /* an unknown negative result reads as ERROR */
+        } else {
+            fprintf(stderr, "pulsar: tp worker: rewrite from common refused: %s\n", ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_NOTE_COMMITTED:
+        if (worker_refused(e, c, "note committed tokens", &slot, ferr, sizeof(ferr))) {
+            pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
+            return 1;
+        }
+        slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
+        return 1;
+
+    case PULSAR_TP_FRAME_SET_LOGITS: {
+        int status = -1;
+        if (!worker_refused(e, c, "set logits", &slot, ferr, sizeof(ferr))) {
+            status = slot->s->set_logits(c->logits, (int)c->n_logits) != 0 ? 1 : 0;
+        } else {
+            fprintf(stderr, "pulsar: tp worker: set logits refused: %s\n", ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
     case PULSAR_TP_FRAME_RNG_STATE:
         if (worker_refused(e, c, "rng sync", &slot, ferr, sizeof(ferr))) {
             pulsar_tp_mirror_fail_void(tp, "rng sync", ferr);

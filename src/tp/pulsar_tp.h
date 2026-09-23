@@ -335,6 +335,13 @@ int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t ban
 int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
                              uint32_t src, uint32_t dst,
                              const int *tokens, uint32_t n_tokens, int n_cached);
+/* Increment 3.  `common` rides the token header beside the tokens. */
+int pulsar_tp_send_rewrite_from_common(pulsar_tp *tp, uint64_t session_id,
+                                       const int *tokens, uint32_t n_tokens, int common);
+int pulsar_tp_send_note_committed(pulsar_tp *tp, uint64_t session_id,
+                                  const int *tokens, uint32_t n_tokens);
+int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
+                              const float *logits, uint32_t n);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 /* Collect one ack per peer and return the VERDICT they agree on in *status
  * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
@@ -394,6 +401,13 @@ typedef enum {
     PULSAR_TP_FRAME_BANK_REPOINT = 22,
     PULSAR_TP_FRAME_BANK_FORK = 23,
     PULSAR_TP_FRAME_BANK_FORK_PARTIAL = 24,
+    /* Increment 3: the rest of the server's mutating surface.  REWRITE is a
+     * verdict frame whose result enum includes -1 (ERROR), so the wire status
+     * is result + 1 (a negative wire status stays a worker refusal).
+     * NOTE_COMMITTED is void.  SET_LOGITS carries the vector itself. */
+    PULSAR_TP_FRAME_REWRITE_FROM_COMMON = 25,
+    PULSAR_TP_FRAME_NOTE_COMMITTED = 26,
+    PULSAR_TP_FRAME_SET_LOGITS = 27,
 } pulsar_tp_frame_type;
 
 typedef struct {
@@ -411,6 +425,9 @@ typedef struct {
     int32_t bank_src;
     int32_t bank_dst;
     int32_t n_cached;
+    /* SET_LOGITS: the leader's live logits row (malloc'd, n_logits floats). */
+    float *logits;
+    uint32_t n_logits;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
