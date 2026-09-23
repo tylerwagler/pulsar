@@ -223,9 +223,12 @@ run_round() {
         # background engine held the launch until the ENGINE exited -- rank 0 sat
         # in accept() for its whole run and rank 1 was never launched (first
         # pair run, 2026-09-23).  Detach all three; the engine's own output is
-        # already in $prefix$r.{out,err}.
+        # already in $prefix$r.{out,err}.  The braces matter: a bare
+        # `cd X && ( ... ) ... &` backgrounds the WHOLE and-list in an outer
+        # subshell that keeps the channel open while it waits on the inner one,
+        # so the `&` must bind to the redirected subshell alone.
         ssh $SSH_ARGS -o BatchMode=yes "$h" \
-            "cd $WORKDIR && ($($gen "$r") > $prefix$r.out 2> $prefix$r.err; echo \$? > $prefix$r.rc) </dev/null >/dev/null 2>&1 &" \
+            "cd $WORKDIR && { ($($gen "$r") > $prefix$r.out 2> $prefix$r.err; echo \$? > $prefix$r.rc) </dev/null >/dev/null 2>&1 & }" \
             || die "rank $r launch failed"
         echo "  launched rank $r on $h"
         [ "$r" -lt $((N - 1)) ] && sleep "$STAGGER"

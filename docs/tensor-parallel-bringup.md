@@ -215,6 +215,40 @@ Rule 3 still holds on one box: `cuda-reference-gate` must never be graded while
 it prints SKIP -- since L240 the battery points `PULSAR_REF_DIR` at the staged
 Vision-Exp capture by default, so a SKIP now means the override was set empty.
 
+> **FIRST LIVE PAIR — VERDICT (2026-09-23, ca1070wk30007 = rank 0 / 30008 = rank 1,
+> dev `70c02339` + the fixes on `work/tp-pair-live`, artifact
+> `ElytronAI/DeepSeek-v4-Flash` rev `fc589c1a`, 48 shards = 167,979,453,688 B
+> staged on both ranks; vLLM stopped):** the engine loads across both Sparks.
+> Each rank staged **83.12 GiB** of owned tensors in 187 spans (~17.9 s;
+> 73.31 GiB of peer-owned experts not resident), 43/43 layers grouped-CUTLASS
+> MXFP4, `rank r/2 mesh connected (1 peers), transport=rdma` on `mlx5_3`
+> (gid 5, 9.x wire), `TP rank r/2 armed (prefill big-gate)`, attention output
+> groups [0,4)/[4,8) = heads [0,32)/[32,64) registered. Rank 0 generated 32
+> greedy tokens for the script's default prompt — *"A pointer is a variable
+> that stores a memory address, and it can be reassigned to point to different
+> locations, whereas an array is a fixed-size block of"* (mean top-1 logprob
+> −0.128); rank 1 ran the receive loop and reported `stopped by the leader`;
+> both rc=0, zero warnings. Two runs produced byte-identical `rank0.lp.json`
+> (75,015 B, sha256 `5d20a7b9…`). `tools/tp-pair-engine-grade.sh` now launches
+> and grades this unattended (`PULSAR_TP_RDMA_DEV=mlx5_3`,
+> `PULSAR_TP_ADDRS="192.168.9.12 192.168.9.13"`).
+>
+> Three defects stood between the runbook and this result, all fixed on the
+> branch: `--tp-rank 0` was refused by both binaries (strictly-positive int
+> parse); the grading script's relative workdir default broke its own second
+> `cd`; and its rank launch stayed attached to the ssh channel, so ssh returned
+> only when the engine exited — rank 0 sat in `accept()` and rank 1 was never
+> launched. A missing rank stderr is now a scan failure, not "clean".
+>
+> **Open for Tyler — LEG A is stale against slice 4e.** LEG A asserts every
+> rank's `rank<r>.lp.json` is byte-identical, but a worker rank now runs the
+> receive loop and is stopped by the leader before any head, so it never writes
+> the file and the leg can only FAIL (`logprobs missing … which is itself a
+> failure`). Either the worker loop honors `--dump-logprobs` (the true 4d
+> vocab-gather proof: every rank assembles the full vector) or the pair's
+> fidelity instrument is LEG C alone. Until decided, a pair run is judged by:
+> every rank rc=0, scan clean, rank 0 logprobs present and cross-run identical.
+
 ## Rollback
 
 Single-box behavior is untouched by design (`tp_role` defaults 0; the guard is
