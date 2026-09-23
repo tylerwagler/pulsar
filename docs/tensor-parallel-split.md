@@ -177,6 +177,32 @@ bug, not a design change.
       mirrored operation; the spill path (free/alloc physical, kv save/load,
       each rank to its own disk) and images on the sync frame.  Remaining:
       the pair run, then the attention head split.
+- **4g-1. Attention head split, v1 -- the bit-exact split (L241, 2026-09-23).**
+      The partition unit is the attention OUTPUT GROUP (`PULSAR_N_OUT_GROUP`,
+      8 heads and one LoRA-down block each), from the same range authority as
+      the experts and the vocab (`pulsar_tp_owned_range`), so n <= 8 and every
+      rank's heads are whole groups.  Per layer a rank runs `attn_q_b` over its
+      heads' rows, the attention core / inverse rope / grouped E4M3 emit on
+      those heads (compact `[tokens][owned heads][head_dim]` q and heads, sinks
+      from the first owned head), `attn_output_a` over its groups' rows, then
+      the group ALL-GATHERS `low` (`pulsar_tp_allgather_rows`, unit = the LoRA
+      rank, one exchange per layer on the big-gate seq) and every rank runs
+      `attn_output_b` whole on the identical block.  Every value a rank
+      computes is a head- or group-independent piece of the single-box
+      computation, so **v1 is bit-exact against one box and across ranks**.
+      Mechanism: the pre-stored MXFP8_LT layout is row-major per output row
+      with a 128-row-tiled scale plane, so an owned row range is two contiguous
+      spans; the engine registers each layer's two slices at open
+      (`pulsar_gpu_register_fp8_lt_row_slice`, keyed by the slice's own data
+      offset) and every GEMM arm resolves them by offset unchanged.  The latent
+      side (`wq_a`, `wkv`, norms), the KV cache, the indexer and the shared
+      expert stay replicated; the drafter blocks are not split yet (4g-1b).
+      Gate: `cuda-tp-head-split-gate` (runner) -- every rank's slice of n = 2,
+      3, 4 equals the whole projection's columns byte for byte on both GEMM
+      arms, plus the two refusals.  v2 (row-parallel `attn_output_b` on the
+      decode arm, an all-reduce instead of the gather, not bit-exact) and the
+      owned-span residency wait for the pair's measured collective latency
+      (rows/L241.md).
 - **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
       ownership but every rank still staged every expert: on GB10 host
       registration is unsupported, so the supported load path stages each

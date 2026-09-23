@@ -401,7 +401,9 @@ worker "blocks in the wrapper", read "the loop applies the frame".
 6f. **Owned-expert residency (slice 4f, L237, 2026-09-23)** — a rank stages
    only its owned experts (see split.md 4f).  Without it the pair could not
    open the artifact it exists to serve.
-7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
+7. **Attention head split (Phase 4)** — v1 landed 2026-09-23 (split.md 4g-1,
+   L241): owned OUTPUT GROUPS, bit-exact, one `low` all-gather per layer.
+   v2 (row-parallel `wo_b`, all-reduce) after the pair measures collectives.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the
 summation order changes. Single-box behavior must remain bit-identical (options

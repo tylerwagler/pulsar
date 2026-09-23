@@ -973,6 +973,8 @@ static bool gpu_graph_indexed_attention_span(
         uint32_t                    sn,
         uint32_t                    spos0,
         uint64_t                    q_dim,
+        uint32_t                    n_head,      ///< the OWNED heads (slice 4g)
+        uint64_t                    sinks_off,   ///< the first owned head's sink
         uint32_t                    n_comp,
         uint32_t                    ratio,
         float                       index_scale,
@@ -1126,7 +1128,7 @@ static bool gpu_graph_indexed_attention_span(
         ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
                                                                   tensor_map_base(model, layer->attn_sinks),
                                                                   tensor_map_size(model, layer->attn_sinks),
-                                                                  layer->attn_sinks->abs_offset,
+                                                                  sinks_off,
                                                                   sq_view,
                                                                   op->raw_src,
                                                                   op->comp_src,
@@ -1140,7 +1142,7 @@ static bool gpu_graph_indexed_attention_span(
                                                                   PULSAR_N_INDEXER_TOP_K,
                                                                   g->raw_window,
                                                                   ratio,
-                                                                  PULSAR_N_HEAD,
+                                                                  n_head,
                                                                   PULSAR_N_HEAD_DIM,
                                                                   sp_view, ss_view,
                                                                   op->comp_bases,
@@ -1162,6 +1164,51 @@ static bool gpu_graph_indexed_attention_span(
 }
 
 
+/* Slice 4g (L241): gather the owned output groups' `low` rows into the full
+ * [tokens][n_groups_total * rank] block on every rank, between the attention
+ * output's stage 'a' (owned groups) and stage 'b' (whole).  Stage 'a' wrote
+ * `low` PACKED at the owned width; this re-pitches it to the gather's padded
+ * per-rank stride (a whole number of groups, see pulsar_tp_allgather_rows),
+ * exchanges in rank order -- rank order IS group order -- and writes the full
+ * block back over the same buffer.  Concatenation, never a sum: every rank's
+ * groups are distinct pieces of one row.  Rides the same monotonic seq as the
+ * FFN big gate, so the two exchanges of a layer stay in lockstep across ranks. */
+static bool tp_attn_gather_low(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+                               uint32_t rank, uint32_t n_groups_total) {
+    if (!g->tp) {
+        fprintf(stderr, "pulsar: layer %u attention owns output groups [%u,%u) of %u but has no "
+                        "TP transport to gather the rest -- refusing\n",
+                il, g->tp_group_lo, g->tp_group_hi, n_groups_total);
+        return false;
+    }
+    const uint32_t n_ranks = pulsar_tp_n_ranks(g->tp);
+    const uint64_t own_dim  = (uint64_t)(g->tp_group_hi - g->tp_group_lo) * rank;
+    const uint64_t stride   = (uint64_t)((n_groups_total + n_ranks - 1u) / n_ranks) * rank;
+    const uint64_t full_dim = (uint64_t)n_groups_total * rank;
+    float *packed  = (float *)xmalloc((size_t)n_tokens * own_dim * sizeof(float));
+    float *own     = (float *)calloc((size_t)n_tokens * stride, sizeof(float));   /* padded tail stays zero */
+    float *scratch = (float *)calloc((size_t)n_tokens * stride, sizeof(float));
+    float *full    = (float *)xmalloc((size_t)n_tokens * full_dim * sizeof(float));
+    bool ok = packed && own && scratch && full;
+    if (!ok) fprintf(stderr, "pulsar: tp attention gather out of memory (layer %u, %u rows)\n", il, n_tokens);
+    if (ok) ok = pulsar_gpu_tensor_read(g->batch_attn_low, 0, packed,
+                                        (uint64_t)n_tokens * own_dim * sizeof(float)) != 0;
+    if (ok) {
+        for (uint32_t r = 0; r < n_tokens; r++)
+            memcpy(own + (uint64_t)r * stride, packed + (uint64_t)r * own_dim, own_dim * sizeof(float));
+        ok = pulsar_tp_allgather_rows(g->tp, il, ++g->tp_prefill_seq, full, own, scratch,
+                                      n_tokens, n_groups_total, rank) != 0;
+        if (!ok) fprintf(stderr, "pulsar: tp attention gather failed (layer %u, %u rows)\n", il, n_tokens);
+    }
+    if (ok) ok = pulsar_gpu_tensor_write(g->batch_attn_low, 0, full,
+                                         (uint64_t)n_tokens * full_dim * sizeof(float)) != 0;
+    free(packed);
+    free(own);
+    free(scratch);
+    free(full);
+    return ok;
+}
+
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -1174,11 +1221,33 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
-    const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
-    const uint32_t n_groups = PULSAR_N_OUT_GROUP;
-    const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
+    /* Slice 4g (L241): this rank computes the attention heads of the OUTPUT
+     * GROUPS it owns, [g->tp_group_lo, g->tp_group_hi) of n_groups_total --
+     * whole heads, whole groups.  `n_head`, `q_dim` and `n_groups` below are
+     * the OWNED counts and every kernel in this block runs on them: q is the
+     * compact [tokens][n_head][head_dim] the sliced attn_q_b writes, the sinks
+     * start at the first owned head, the grouped 'a' projection covers the
+     * owned groups, and `low` is gathered across the group before 'b' (which
+     * every rank runs whole, on identical input).  Every value a rank computes
+     * is a head- or group-independent piece of the single-box computation, so
+     * the split is bit-exact against one box and across ranks.  On one box the
+     * owned range is the whole layer and nothing here changes. */
+    const uint32_t n_groups_total = PULSAR_N_OUT_GROUP;
+    const uint32_t group_heads = PULSAR_N_HEAD / n_groups_total;
     const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = PULSAR_N_LORA_O;
+    const uint32_t g_lo = g->tp_group_lo, g_hi = g->tp_group_hi;
+    if (g_hi <= g_lo || g_hi > n_groups_total) {
+        fprintf(stderr, "pulsar: layer %u attention: this graph owns output groups [%u,%u) of %u "
+                        "-- refusing\n", il, g_lo, g_hi, n_groups_total);
+        return false;
+    }
+    const uint32_t n_groups = g_hi - g_lo;
+    const uint32_t n_head = n_groups * group_heads;
+    const uint32_t h_lo = g_lo * group_heads;
+    const uint64_t q_dim = (uint64_t)n_head * PULSAR_N_HEAD_DIM;
+    const uint64_t q_dim_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
+    const uint64_t sinks_off = layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float);
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     /* CSA2 (L218): the pools this layer attends over live at its kv source. */
@@ -1521,16 +1590,18 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
     {
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_b",
-                                                          il,
-                                                          pos0,
-                                                          g->batch_q,
-                                                          model,
-                                                          layer->attn_q_b,
-                                                          q_rank,
-                                                          q_dim,
-                                                          g->batch_qr_norm,
-                                                          n_tokens);
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("attn_q_b",
+                                                               il,
+                                                               pos0,
+                                                               g->batch_q,
+                                                               model,
+                                                               layer->attn_q_b,
+                                                               q_rank,
+                                                               q_dim_full,
+                                                               (uint64_t)h_lo * PULSAR_N_HEAD_DIM,
+                                                               (uint64_t)(h_lo + n_head) * PULSAR_N_HEAD_DIM,
+                                                               g->batch_qr_norm,
+                                                               n_tokens);
         if (ok) {
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
@@ -1567,7 +1638,7 @@ bool gpu_graph_encode_layer_attention_batch(
             prefill_q_norm_rope_fused = (PULSAR_Q_HEAD_NORM
                 ? pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
                                             n_tokens,
-                                            PULSAR_N_HEAD,
+                                            n_head,
                                             PULSAR_N_HEAD_DIM,
                                             PULSAR_N_ROT,
                                             pos0,
@@ -1583,7 +1654,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                             mseq ? g->batch_positions : NULL)
                 : pulsar_gpu_rope_tail_tensor(g->batch_q,
                                             n_tokens,
-                                            PULSAR_N_HEAD,
+                                            n_head,
                                             PULSAR_N_HEAD_DIM,
                                             PULSAR_N_ROT,
                                             pos0,
@@ -1692,12 +1763,12 @@ bool gpu_graph_encode_layer_attention_batch(
         ok = pulsar_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
                                                           tensor_map_base(model, layer->attn_sinks),
                                                           tensor_map_size(model, layer->attn_sinks),
-                                                          layer->attn_sinks->abs_offset,
+                                                          sinks_off,
                                                           g->batch_q,
                                                           g->batch_kv_pack,
                                                           n_tokens,
                                                           g->raw_window,
-                                                          PULSAR_N_HEAD,
+                                                          n_head,
                                                           PULSAR_N_HEAD_DIM,
                                                           mseq ? g->batch_positions : NULL,
                                                           g->q_prep_active ? &g->q_prep : NULL,
@@ -1731,7 +1802,7 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    tensor_map_base(model, layer->attn_sinks),
                                                                    tensor_map_size(model, layer->attn_sinks),
-                                                                   layer->attn_sinks->abs_offset,
+                                                                   sinks_off,
                                                                    g->batch_q,
                                                                    mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                         : g->layer_raw_cache[il],
@@ -1741,7 +1812,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                    g->raw_cap,
                                                                    mseq ? 0 : raw_start,
                                                                     g->raw_window,
-                                                                    PULSAR_N_HEAD,
+                                                                    n_head,
                                                                     PULSAR_N_HEAD_DIM,
                                                                     0,
                                                                     mseq ? g->batch_positions : NULL,
@@ -1938,7 +2009,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                 spos0 + sn - 1u,
                                                                                 s_n_raw);
                     ok = gpu_graph_indexed_attention_span(g, model, layer, il, attn,
-                            s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
+                            s0, sn, spos0, q_dim, n_head, sinks_off, n_comp, ratio, index_scale,
                             mseq ? 0u : s_n_raw, mseq ? 0u : s_raw_start,
                             &sop);
                 }
@@ -1946,7 +2017,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
                                                                          tensor_map_base(model, layer->attn_sinks),
                                                                          tensor_map_size(model, layer->attn_sinks),
-                                                                         layer->attn_sinks->abs_offset,
+                                                                         sinks_off,
                                                                          g->batch_q,
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                               : g->layer_raw_cache[il],
@@ -1960,7 +2031,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          n_comp,
                                                                           g->raw_window,
                                                                           ratio,
-                                                                          PULSAR_N_HEAD,
+                                                                          n_head,
                                                                           PULSAR_N_HEAD_DIM,
                                                                           0,
                                                                           mseq ? g->batch_positions : NULL,
@@ -2002,7 +2073,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
                 ok = gpu_graph_indexed_attention_span(g, model, layer, il, attn,
-                        s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
+                        s0, sn, spos0, q_dim, n_head, sinks_off, n_comp, ratio, index_scale,
                         s0 + sn, 0u,
                         &zsop);
             }
@@ -2030,7 +2101,7 @@ bool gpu_graph_encode_layer_attention_batch(
             if (ok) ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        tensor_map_base(model, layer->attn_sinks),
                                                                        tensor_map_size(model, layer->attn_sinks),
-                                                                       layer->attn_sinks->abs_offset,
+                                                                       sinks_off,
                                                                        g->batch_q,
                                                                        g->batch_kv_pack,
                                                                        /* Packed pool straight in.  This called
@@ -2051,7 +2122,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        n_comp,
                                                                        g->raw_window,
                                                                        ratio,
-                                                                       PULSAR_N_HEAD,
+                                                                       n_head,
                                                                        PULSAR_N_HEAD_DIM,
                                           g->q_prep_active ? &g->q_prep : NULL,
                                           vis_left_view, vis_right_view) != 0;
@@ -2094,12 +2165,12 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = pulsar_gpu_attention_prefill_raw_heads_mx_tensor(g->batch_heads,
                                                               tensor_map_base(model, layer->attn_sinks),
                                                               tensor_map_size(model, layer->attn_sinks),
-                                                              layer->attn_sinks->abs_offset,
+                                                              sinks_off,
                                                               g->batch_q,
                                                               g->batch_kv_pack,
                                                               raw_prefix_tokens,
                                                               g->raw_window,
-                                                              PULSAR_N_HEAD,
+                                                              n_head,
                                                               PULSAR_N_HEAD_DIM,
                                                               gact_data, gact_scale, gact_kbp,
                                                               (uint32_t)gact_slab, n_groups,
@@ -2212,7 +2283,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
                                                                               tensor_map_base(model, layer->attn_sinks),
                                                                               tensor_map_size(model, layer->attn_sinks),
-                                                                              layer->attn_sinks->abs_offset,
+                                                                              sinks_off,
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
                                                                               /* Native packed read: this sits in a PER-TOKEN loop and
@@ -2229,7 +2300,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               n_selected,
                                                                               g->raw_window,
                                                                               ratio,
-                                                                              PULSAR_N_HEAD,
+                                                                              n_head,
                                                                               PULSAR_N_HEAD_DIM,
                                                                               NULL, NULL, NULL, 0, 1,
                                           g->q_prep_active ? &g->q_prep : NULL,
@@ -2244,11 +2315,11 @@ bool gpu_graph_encode_layer_attention_batch(
                      * replaced always ran the f32 kernel and had no q_prep
                      * parameter, L164.) */
                     ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads_view,
-                            tensor_map_base(model, layer->attn_sinks), tensor_map_size(model, layer->attn_sinks), layer->attn_sinks->abs_offset,
+                            tensor_map_base(model, layer->attn_sinks), tensor_map_size(model, layer->attn_sinks), sinks_off,
                             q_view, g->layer_raw_cache[il],
                             cur_comp ? g->layer_attn_comp_cache[src] : NULL,
                             1, pos, n_raw, g->raw_cap, raw_start, cur_comp,
-                            g->raw_window, ratio, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
+                            g->raw_window, ratio, n_head, PULSAR_N_HEAD_DIM,
                             0, NULL, NULL, NULL, 0, 1,
                             g->q_prep_active ? &g->q_prep : NULL) != 0;
                 }
@@ -2298,7 +2369,7 @@ bool gpu_graph_encode_layer_attention_batch(
         ok = heads_rows && (!mseq || pos_rows) &&
              pulsar_gpu_rope_tail_mx_tensor(heads_rows,
                                             rope_rows,
-                                            PULSAR_N_HEAD,
+                                            n_head,
                                             PULSAR_N_HEAD_DIM,
                                             PULSAR_N_ROT,
                                             pos0 + rope_row0,
@@ -2331,23 +2402,35 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
+    /* Stage 'a' over the owned groups (the registered row slice of attn_output_a
+     * on a TP rank; the whole tensor on one box), the gather of `low` across
+     * the group, then stage 'b' whole on every rank. */
     if (ok) {
-        ok = pulsar_gpu_attention_output_batch_tensor(g->batch_attn_out,
-                                                   g->batch_attn_low,
-                                                   tensor_map_base(model, layer->attn_output_a),
-                                                   tensor_map_size(model, layer->attn_output_a),
-                                                   layer->attn_output_a->abs_offset,
-                                                   layer->attn_output_b->abs_offset,
-                                                   group_dim,
-                                                   rank,
-                                                   n_groups,
-                                                   PULSAR_N_EMBD,
-                                                   g->batch_heads,
-                                                   n_tokens) != 0;
+        ok = pulsar_gpu_attention_output_a_tensor(g->batch_attn_low,
+                                                  tensor_map_base(model, layer->attn_output_a),
+                                                  tensor_map_size(model, layer->attn_output_a),
+                                                  layer->attn_output_a->abs_offset +
+                                                      (uint64_t)g_lo * rank * group_dim,
+                                                  group_dim,
+                                                  rank,
+                                                  n_groups,
+                                                  g->batch_heads,
+                                                  n_tokens) != 0;
+    }
+    if (ok && n_groups != n_groups_total) ok = tp_attn_gather_low(g, il, n_tokens, rank, n_groups_total);
+    if (ok) {
+        ok = pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
+                                                  tensor_map_base(model, layer->attn_output_a),
+                                                  tensor_map_size(model, layer->attn_output_a),
+                                                  layer->attn_output_b->abs_offset,
+                                                  (uint64_t)n_groups_total * rank,
+                                                  PULSAR_N_EMBD,
+                                                  g->batch_attn_low,
+                                                  n_tokens) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
-                                      (uint64_t)n_tokens * n_groups * rank,
+                                      (uint64_t)n_tokens * n_groups_total * rank,
                                       il,
                                       pos0);
     }

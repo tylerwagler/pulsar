@@ -157,13 +157,30 @@ battery reports.
 
 ## 10. Landing discipline.
 
-Every landing: battery 25/25 on sparky at an asserted sha and clean tree,
-zero build warnings, doxygen zero warnings, the unit suite (in the battery
-since L158), and the ledger row updated in the same session.  Byte-exact or
-graded (rule 7).  Production A/B when the change touches a served kernel.
-Squash to one commit whose message says what was deleted as clearly as what
-was added.  Delete the topic branch when it lands; park a branch only with
-a row that says why and for how long.
+Every landing: the gate tier its paths call for (below) on sparky at an
+asserted sha and clean tree, zero build warnings, doxygen zero warnings, the
+unit suite (in the battery since L158), and the ledger row updated in the same
+session.  Byte-exact or graded (rule 7).  Production A/B when the change
+touches a served kernel.  Squash to one commit whose message says what was
+deleted as clearly as what was added.  Delete the topic branch when it lands;
+park a branch only with a row that says why and for how long.
+
+**The tier follows the paths (2026-09-23, Tyler: "we spend way too much time
+on batteries").**  ONE full battery per landing SERIES, on the last sha whose
+numeric paths changed -- not one per increment, and not again for a delta
+that cannot move a number:
+
+- `src/engine`, `src/cuda`, `src/server`, `src/tp` changed on a path a token
+  takes: the full `make gates` at that sha.
+- After that battery, a delta of refusal paths, announces, tests, tools,
+  docs or Makefile recipes: the gate that covers it plus `make gates-dev`
+  for the touched paths, at the sha that lands.  The battery already proved
+  the numerics; re-running it proves nothing the dev tier does not.
+- `tools/`, `docs/`, test helpers, Makefile recipes only: a build plus
+  `make gates-dev`.
+
+A measurement (the perf A/B, a census) goes AHEAD of a battery in the GPU
+queue when someone is waiting on the number; the battery runs behind it.
 
 ## Named exceptions to rule 1
 

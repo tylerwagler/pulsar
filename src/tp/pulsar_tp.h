@@ -206,27 +206,34 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
 int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                             void *out, const void *in, uint64_t bytes);
 
-/* n-way VOCAB ALL-GATHER (slice 4d).  Rank r contributes the vocab range
- * [r*V/n, (r+1)*V/n) of `n_rows` rows; every rank ends with the full
- * [n_rows, n_total] block in `full_out`.  This CONCATENATES in rank order -- it
- * is NOT the sum pulsar_tp_allreduce_sum performs, and the two must never be
- * confused (a sum here would multiply the logits by the group size).
+/* n-way ROW ALL-GATHER (slice 4d for the vocab, 4g for the attention `low`).
+ * A row of `n_units * unit` floats is partitioned over the group in UNITS by
+ * the range authority above: rank r owns units [lo, hi) = owned_range(r, n,
+ * n_units), i.e. elements [lo*unit, hi*unit).  Every rank ends with the full
+ * [n_rows, n_units*unit] block in `full_out`.  This CONCATENATES in rank order
+ * -- it is NOT the sum pulsar_tp_allreduce_sum performs, and the two must never
+ * be confused (a sum here would multiply the logits by the group size).
  *
- * Shapes: `full_out` is [n_rows, n_total] with row pitch n_total.  `own_slice`
- * and `scratch` are [n_rows, stride] PACKED, stride = ceil(n_total/n_ranks):
- * the ranges are PADDED to a uniform stride because the group exchange carries
- * ONE byte count per round and n_total need not divide by n_ranks (129280 does
- * not divide by 3 or 5).  Everything past a rank's real range is never sent on
+ * `unit` is the indivisible element run: 1 for the vocab (129280 tokens over
+ * n), the LoRA rank for the attention output groups (8 groups x 1024, so the
+ * split follows the groups the kernels compute, never a bare element count).
+ *
+ * Shapes: `full_out` is [n_rows, n_units*unit] with that row pitch.
+ * `own_slice` and `scratch` are [n_rows, stride] PACKED, stride =
+ * ceil(n_units/n_ranks) * unit: the ranges are PADDED to a uniform stride
+ * because the group exchange carries ONE byte count per round and n_units need
+ * not divide by n_ranks.  Everything past a rank's real range is never sent on
  * the wire as data -- it pads the transfer only -- and the caller must leave
  * those tail elements ZEROED, since a short last range is never written by the
- * head.  `scratch` is clobbered.  Returns 0 on failure.
+ * producer.  `scratch` is clobbered.  Returns 0 on failure.
  *
  * The gather runs the same ascending-rank loop on every rank, one exchange per
  * peer per round, so `seq` must be identical on all ranks for a given round and
  * distinct between rounds (the transport's desync guard keys on it). */
-int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
-                              float *full_out, const float *own_slice,
-                              float *scratch, uint32_t n_rows, uint32_t n_total);
+int pulsar_tp_allgather_rows(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                             float *full_out, const float *own_slice,
+                             float *scratch, uint32_t n_rows,
+                             uint32_t n_units, uint32_t unit);
 
 bool pulsar_tp_is_rdma(const pulsar_tp *tp);
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp);

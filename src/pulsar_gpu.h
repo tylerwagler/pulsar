@@ -677,6 +677,22 @@ void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offse
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
 void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset);
+/* Slice 4g (L241): register the OUTPUT-ROW slice [row_lo, row_hi) of a
+ * pre-stored MXFP8_LT weight as a weight of its own, addressed by its data
+ * offset `parent_offset + row_lo * in_dim` with out_dim = row_hi - row_lo.
+ * row_lo must sit on a 128-row scale band.  Every arm that resolves weights by
+ * offset then consumes the slice unchanged.  Returns 1, or 0 with the reason
+ * printed. */
+int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
+                                         uint64_t in_dim, uint64_t out_full,
+                                         uint64_t row_lo, uint64_t row_hi);
+/* The producer step for an f32 activation that an MXFP8 GEMM will read: emit
+ * its E4M3 encoding into the activation cache slot and arm it (the pure
+ * per-block quantiser, bit-identical however it is invoked).  This is what the
+ * attention-out stage does for `low` before stage 'b'; a gate that fabricates
+ * an input does the same rather than asking the GEMM for a quantise pass it no
+ * longer has (L158).  dim must be a multiple of 256.  @return 1 on success. */
+int pulsar_gpu_mxfp8_act_emit_f32(pulsar_gpu_tensor *x, uint32_t n_tokens, uint64_t dim);
 
 /** Batched-prefill activation quantization cache.
  *
@@ -1734,18 +1750,26 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         const pulsar_gpu_tensor *vis_right);
 
 
-int pulsar_gpu_attention_output_batch_tensor(
-        pulsar_gpu_tensor       *out,
+int pulsar_gpu_attention_output_a_tensor(
         pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        uint64_t                out_dim,
         const pulsar_gpu_tensor *heads,
+        uint32_t                n_tokens);
+/* Stage "b" over the FULL low_dim; on a TP rank the caller gathers `low`
+ * across the group between the two stages (slice 4g). */
+int pulsar_gpu_attention_output_b_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_b_offset,
+        uint64_t                low_dim,
+        uint64_t                out_dim,
+        pulsar_gpu_tensor       *low,
         uint32_t                n_tokens);
 
 /* =========================================================================

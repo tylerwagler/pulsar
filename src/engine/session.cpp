@@ -679,6 +679,66 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 (double)pulsar_model_peer_expert_bytes(&e->model) / 1073741824.0);
     }
 
+    /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
+     * range authority every split shares.  The unit is the group (8 heads and
+     * one LoRA-down block each), never the head: a rank's heads are whole
+     * groups, so its attn_q_b rows and its attn_output_a rows are contiguous
+     * and 128-row aligned.  On a group each layer's two owned row slices are
+     * registered with the backend here, once; the attention block then
+     * addresses them by offset like any other weight.  One box: [0, n). */
+    if (graph_backend) {
+        const int tp_rk = e->tp ? pulsar_tp_rank(e->tp) : 0;
+        const uint32_t tp_nr = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
+        if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
+            e->tp_group_hi <= e->tp_group_lo) {
+            fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
+                            "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
+                    tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        if (tp_nr > 1) {
+            const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
+            const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
+            const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
+            const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
+            const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
+            const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
+            const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
+            const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
+            uint32_t registered = 0;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                const pulsar_layer_weights *L = &e->weights.layer[il];
+                if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
+                    fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                const uint64_t q_rank = L->attn_q_a->dim[1];
+                if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
+                                                          L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
+                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
+                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi)) {
+                    fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
+                                    "registered -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 2;
+            }
+            fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
+                            "[%u,%u): %u row slices registered (attn_q_b rows [%llu,%llu), "
+                            "attn_output_a rows [%llu,%llu))\n",
+                    tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
+                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads, registered,
+                    (unsigned long long)q_lo, (unsigned long long)q_hi,
+                    (unsigned long long)a_lo, (unsigned long long)a_hi);
+        }
+    }
+
     *out = e;
     return 0;
 }
@@ -833,6 +893,8 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
      * call sites can reach it without threading the engine through every
      * gpu_graph entry point (slice 4b).  NULL when the pair is not armed. */
     s->graph.tp = e->tp;
+    s->graph.tp_group_lo = e->tp_group_lo;
+    s->graph.tp_group_hi = e->tp_group_hi;
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
      * session created with no pair armed keeps 0 and stays out of the mirror. */

@@ -1502,8 +1502,9 @@ typedef struct {
      * through every prefill entry point. */
     struct pulsar_tp *tp;
     /** Monotonic prefill big-gate exchange counter (slice 4b), incremented once
-     * per layer per chunk by tp_prefill_big_gate.  Both ranks advance it in the
-     * same order from the same starting value, so the big-gate seq stays in
+     * per layer per chunk by tp_prefill_big_gate and once per layer per chunk by
+     * the attention `low` gather (slice 4g).  Every rank advances it in the same
+     * order from the same starting value, so the exchange seq stays in
      * lockstep (the transport uses it as a desync guard). */
     uint64_t tp_prefill_seq;
     /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
@@ -1512,6 +1513,10 @@ typedef struct {
      * lockstep -- the transport's desync guard keys on it, which is also what
      * catches a lane that ran a different number of heads on the two ranks. */
     uint64_t tp_vocab_seq;
+    /** Slice 4g: the engine's owned output-group range, borrowed at graph init
+     * beside `tp` (see pulsar_engine::tp_group_lo).  The attention block runs
+     * its heads, its grouped 'a' projection and its `low` gather on it. */
+    uint32_t tp_group_lo, tp_group_hi;
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1705,6 +1710,13 @@ struct pulsar_engine {
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     size_t tp_slab_bytes;       ///< slab size in bytes
+    /** Slice 4g (L241): the attention OUTPUT GROUPS this rank owns,
+     * [tp_group_lo, tp_group_hi) of PULSAR_N_OUT_GROUP, from the range
+     * authority (pulsar_tp_owned_range) at open -- the same rule as the
+     * routed experts and the vocab.  The heads a rank computes are exactly
+     * these groups' heads; the attn_q_b / attn_output_a row slices it
+     * registered at open are exactly these rows.  [0, n_out_group) on one box. */
+    uint32_t tp_group_lo, tp_group_hi;
     /** Slice 4e: the next session ordinal, handed out by pulsar_session::create
      * as the session's mirror id.  It is an ordinal rather than a random or
      * leader-assigned id because the SAME driver opens the same sessions in the
@@ -3378,6 +3390,23 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         const pulsar_tensor       *w,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const pulsar_gpu_tensor *x,
+        uint64_t                n_tok);
+/* The same GEMM over the OUTPUT-ROW range [row_lo, row_hi) of `w` (slice 4g):
+ * the whole tensor when the range is [0, out_full), otherwise the row slice the
+ * engine registered at open (pulsar_gpu_register_fp8_lt_row_slice), which the
+ * backend resolves by its own offset.  Writes row_hi - row_lo columns per row. */
+bool gpu_graph_matmul_mxfp8_rows_named_tensor(
+        const char             *module,
+        uint32_t                il,
+        uint32_t                pos0,
+        pulsar_gpu_tensor       *out,
+        const pulsar_model        *model,
+        const pulsar_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_full,
+        uint64_t                row_lo,
+        uint64_t                row_hi,
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(

@@ -1380,7 +1380,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
                bank_evict_restore_gate bank_fork_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
-               comp_state_gate chunk_neutrality_gate session_payload_gate
+               comp_state_gate chunk_neutrality_gate session_payload_gate tp_head_split_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h
 	@mkdir -p tests/runner
@@ -1708,7 +1708,7 @@ gates-dev:
 	      --only=$$(echo $$sel | tr ' ' ',') || rc=1; \
 	fi; \
 	printf '\n  gates-dev total: %s s\n' "$$(( $$(date +%s) - t0 ))"; \
-	if [ $$rc -eq 0 ]; then printf '\nDEV TIER PASS -- run `make gates` before merging\n'; \
+	if [ $$rc -eq 0 ]; then printf '\nDEV TIER PASS -- the landing tier for a delta that cannot move a number; a numeric-path change gets ONE `make gates` per landing series (ENGINEERING-RULES section 10)\n'; \
 	else printf '\nDEV TIER FAILED\n'; fi; \
 	exit $$rc
 

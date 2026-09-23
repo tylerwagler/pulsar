@@ -165,7 +165,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             for (uint32_t i = lo; i < hi; i++)
                 own[(size_t)r * stride + (i - lo)] =
                     (float)(1000 * rank + (int)(i % 7) + 10000 * (int)r);
-        if (!pulsar_tp_allgather_vocab(tp, 0, 2 + (uint64_t)ci, full, own, scr, rows, V)) {
+        if (!pulsar_tp_allgather_rows(tp, 0, 2 + (uint64_t)ci, full, own, scr, rows, V, 1u)) {
             CHECK(0, "rank %d vocab all-gather failed (V=%u)", rank, V);
         } else {
             int vbad = 0;
@@ -195,6 +195,52 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         std::free(own);
         std::free(scr);
         }   /* totals */
+    }
+
+    /* Slice 4g: the SAME gather with a unit larger than one element -- the
+     * attention output's `low` is partitioned in output GROUPS of `rank`
+     * floats, never in bare elements, so a rank's range is a whole number of
+     * groups and the padded stride is ceil(groups/n) * unit.  8 groups over
+     * n = 3 gives 3/3/2 groups, uneven, so the padded tail is exercised. */
+    {
+        const uint32_t units = 8u, unit = 16u, rows = 3u;
+        const uint32_t V = units * unit;
+        const uint32_t stride = ((units + (uint32_t)n - 1u) / (uint32_t)n) * unit;
+        float *full = (float *)std::calloc((size_t)rows * V, sizeof(float));
+        float *own = (float *)std::calloc((size_t)rows * stride, sizeof(float));
+        float *scr = (float *)std::calloc((size_t)rows * stride, sizeof(float));
+        uint32_t ulo = 0, uhi = 0;
+        pulsar_tp_owned_range(rank, (uint32_t)n, units, &ulo, &uhi);
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t i = ulo * unit; i < uhi * unit; i++)
+                own[(size_t)r * stride + (i - ulo * unit)] =
+                    (float)(1000 * rank + (int)(i % 11) + 10000 * (int)r);
+        if (!pulsar_tp_allgather_rows(tp, 0, 4u, full, own, scr, rows, units, unit)) {
+            CHECK(0, "rank %d grouped all-gather failed (units=%u unit=%u)", rank, units, unit);
+        } else {
+            int gbad = 0;
+            for (uint32_t r = 0; r < rows; r++) {
+                for (uint32_t i = 0; i < V; i++) {
+                    uint32_t owner = 0;
+                    for (uint32_t k = 0; k < (uint32_t)n; k++) {
+                        uint32_t a = 0, b = 0;
+                        pulsar_tp_owned_range((int)k, (uint32_t)n, units, &a, &b);
+                        if (i >= a * unit && i < b * unit) { owner = k; break; }
+                    }
+                    const float want = (float)(1000 * (int)owner + (int)(i % 11) + 10000 * (int)r);
+                    if (full[(size_t)r * V + i] != want) {
+                        if (gbad == 0)
+                            std::fprintf(stderr, "tp_mesh_test: rank %d grouped gather r=%u i=%u got %f want %f\n",
+                                         rank, r, i, full[(size_t)r * V + i], want);
+                        gbad++;
+                    }
+                }
+            }
+            CHECK(gbad == 0, "rank %d grouped all-gather had %d wrong elements", rank, gbad);
+        }
+        std::free(full);
+        std::free(own);
+        std::free(scr);
     }
 
     /* Slice 4b-CUDA: the engine stages a <= PULSAR_TP_BATCH_MAX_ROWS gate
@@ -963,7 +1009,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec/spill verdicts + images, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab + grouped all-gather + command plane + bank/rewrite/logits/spec/spill verdicts + images, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

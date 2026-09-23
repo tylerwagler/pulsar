@@ -618,6 +618,57 @@ static std::unordered_map<map_offset_key, fp8_mx_weight, map_offset_key_hash> g_
  * set. */
 static std::unordered_set<map_offset_key, map_offset_key_hash> g_mxfp8_lt_offsets;
 
+/* ---- MXFP8_LT ROW SLICES (slice 4g, L241) --------------------------------
+ *
+ * A TP rank owns a contiguous range of a weight's OUTPUT rows (its attention
+ * heads' rows of attn_q_b, its output groups' rows of attn_output_a).  In the
+ * pre-stored layout an output-row range is two contiguous spans: the rows in
+ * the data plane, and a band of 128-row tiles in the scale plane (see
+ * pulsar_mx_sfoff: tiles are ordered band-major, (row/128) * (KBp/4) + kb/4).
+ * So a slice is a legitimate fp8_mx_weight of its own -- data pointer at the
+ * first owned row, scale pointer at the first owned band, out_dim = owned
+ * rows -- and every arm that resolves weights BY OFFSET (the GEMV, the
+ * cuBLASLt GEMM, the mixed window, the grouped attn-out 'a') consumes it
+ * unchanged.  The engine registers each owned slice once at open under the
+ * slice's own data offset (parent + row_lo * in_dim) and then passes that
+ * offset with out_dim = rows; on one box nothing is registered and every
+ * offset is a whole tensor, byte for byte the path before this table.
+ * The scale band needs the PARENT's geometry, which is what this table keeps. */
+typedef struct {
+    uint64_t parent_offset;   ///< the whole tensor's offset (registered MXFP8_LT)
+    uint64_t in_dim;          ///< K
+    uint64_t out_full;        ///< the whole tensor's output rows
+    uint64_t row_lo;          ///< first owned row (multiple of 128)
+    uint64_t out_rows;        ///< owned rows
+} mxfp8_lt_slice;
+/* Keyed by (map, data offset, ROW COUNT): a slice that starts at row 0 has the
+ * parent's own data offset, and two partitions (n=2 and n=4 in the gate, or
+ * n=3's 3-3-2 and n=4's 2-2-2-2 groups) start slices at the same row with
+ * different lengths.  The resolver asks with the out_dim it was handed, so a
+ * whole-tensor resolve at a slice's offset finds no slice and takes the
+ * pre-stored branch, exactly as before this table existed. */
+struct map_slice_key {
+    const void *map;
+    uint64_t offset;
+    uint64_t rows;
+    bool operator==(const map_slice_key &o) const { return map == o.map && offset == o.offset && rows == o.rows; }
+};
+struct map_slice_key_hash {
+    size_t operator()(const map_slice_key &k) const {
+        return std::hash<const void *>()(k.map) ^ (std::hash<uint64_t>()(k.offset) * 1099511628211ull) ^
+               (std::hash<uint64_t>()(k.rows) * 0x9E3779B97F4A7C15ull);
+    }
+};
+static std::unordered_map<map_slice_key, mxfp8_lt_slice, map_slice_key_hash> g_mxfp8_lt_slices;
+/* Every tensor that has a slice registered, with its TRUE output-row count.  A
+ * slice starting at row 0 shares the parent's data offset, so a resolve at that
+ * offset with a row count nobody registered would otherwise fall through to the
+ * pre-stored branch, which trusts the caller's dims -- and place the scale
+ * pointer at in*rows past the data start, inside the parent's data plane.  The
+ * head-split gate's negative control found exactly that.  With the parent's
+ * rows on record the pre-stored branch refuses any other count. */
+static std::unordered_map<map_offset_key, uint64_t, map_offset_key_hash> g_mxfp8_lt_parent_rows;
+
 /* Direct-mapped front cache for cuda_fp8_mx_weight (file-scope so backend
  * cleanup can invalidate it together with g_fp8_mx_by_offset).
  *
@@ -689,7 +740,54 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
      * +scale]. Skip the cudaMalloc+convert entirely and hand cuBLASLt the
      * device-accessible mmap pointers (g_model_device_base+offset). Byte-for-byte
      * identical to what mxfp8_weight_convert_kernel would have produced. */
+    /* A registered ROW SLICE (4g): the data rows start at this offset, the scale
+     * band sits inside the PARENT's scale plane.  Dims are asserted against the
+     * registration -- a caller asking a slice offset for other dims is a bug. */
+    auto sl = g_mxfp8_lt_slices.find({model_map, offset, out_dim});
+    if (sl != g_mxfp8_lt_slices.end()) {
+        const mxfp8_lt_slice &s = sl->second;
+        if (s.in_dim != in_dim) {
+            fprintf(stderr, "pulsar: MXFP8_LT row slice at offset %llu (%llu rows) was registered with "
+                            "in_dim %llu but is being resolved with %llu -- refusing\n",
+                    (unsigned long long)offset, (unsigned long long)out_dim,
+                    (unsigned long long)s.in_dim, (unsigned long long)in_dim);
+            return NULL;
+        }
+        const size_t band_off = (size_t)(s.row_lo / 128) * (size_t)(KBp / 4) * 512u;
+        const uint64_t parent_data = s.in_dim * s.out_full;
+        __nv_fp8_e4m3 *ltdata =
+            (__nv_fp8_e4m3 *)cuda_model_range_ptr(model_map, offset, data_bytes, "fp8_mx_lt slice data");
+        unsigned char *ltscale =
+            (unsigned char *)cuda_model_range_ptr(model_map, s.parent_offset + parent_data + band_off,
+                                                  scale_bytes, "fp8_mx_lt slice scale");
+        if (!ltdata || !ltscale) {
+            fprintf(stderr, "pulsar: MXFP8_LT row slice at offset %llu did not resolve to "
+                            "device-accessible pointers\n", (unsigned long long)offset);
+            return NULL;
+        }
+        /* The resolved-weight cache keys by offset and every hit is validated
+         * by dims (fc above, the map find above), so a slice starting at row 0
+         * and its parent -- same offset, different out_dim -- take turns in one
+         * entry: correct on every hit, re-resolved on every switch.  A rank
+         * resolves one geometry per offset in production; only the head-split
+         * gate alternates. */
+        fp8_mx_weight w = { model_map, offset, in_dim, out_dim, ltdata, ltscale };
+        g_fp8_mx_by_offset[{model_map, offset}] = w;
+        const fp8_mx_weight *wp = &g_fp8_mx_by_offset[{model_map, offset}];
+        fc->ptr.store(wp, std::memory_order_relaxed);
+        fc->tag.store(offset, std::memory_order_release);
+        (void)label;
+        return wp;
+    }
     if (g_mxfp8_lt_offsets.count({model_map, offset})) {
+        auto pr = g_mxfp8_lt_parent_rows.find({model_map, offset});
+        if (pr != g_mxfp8_lt_parent_rows.end() && pr->second != out_dim) {
+            fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu has %llu output rows and row slices "
+                            "registered; a resolve with %llu rows names no slice and is not the whole "
+                            "tensor -- refusing\n", (unsigned long long)offset,
+                    (unsigned long long)pr->second, (unsigned long long)out_dim);
+            return NULL;
+        }
         __nv_fp8_e4m3 *ltdata =
             (__nv_fp8_e4m3 *)cuda_model_range_ptr(model_map, offset, data_bytes, "fp8_mx_lt data");
         unsigned char *ltscale =
@@ -1997,6 +2095,55 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
     g_mxfp8_lt_offsets.insert({model_map, weight_offset});
 }
 
+int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
+                                         uint64_t in_dim, uint64_t out_full,
+                                         uint64_t row_lo, uint64_t row_hi) {
+    if (!model_map || in_dim == 0 || in_dim % 32 != 0 || row_hi <= row_lo || row_hi > out_full) {
+        fprintf(stderr, "pulsar: MXFP8_LT row slice refused: rows [%llu,%llu) of %llu, in_dim %llu\n",
+                (unsigned long long)row_lo, (unsigned long long)row_hi,
+                (unsigned long long)out_full, (unsigned long long)in_dim);
+        return 0;
+    }
+    if (!g_mxfp8_lt_offsets.count({model_map, parent_offset})) {
+        fprintf(stderr, "pulsar: MXFP8_LT row slice refused: parent offset %llu is not a registered "
+                        "pre-stored MXFP8_LT weight\n", (unsigned long long)parent_offset);
+        return 0;
+    }
+    /* The scale plane is tiled in 128-row bands; a slice that starts inside a
+     * band has no contiguous scale span.  (row_hi may be short: the band is
+     * padded, exactly as a whole tensor's last band is.) */
+    if (row_lo % 128 != 0) {
+        fprintf(stderr, "pulsar: MXFP8_LT row slice refused: row_lo %llu is not a multiple of the "
+                        "128-row scale band\n", (unsigned long long)row_lo);
+        return 0;
+    }
+    auto pr = g_mxfp8_lt_parent_rows.find({model_map, parent_offset});
+    if (pr != g_mxfp8_lt_parent_rows.end() && pr->second != out_full) {
+        fprintf(stderr, "pulsar: MXFP8_LT row slice refused: parent offset %llu was sliced as %llu rows "
+                        "before and %llu now -- one geometry per tensor\n",
+                (unsigned long long)parent_offset, (unsigned long long)pr->second,
+                (unsigned long long)out_full);
+        return 0;
+    }
+    const uint64_t slice_offset = parent_offset + row_lo * in_dim;
+    mxfp8_lt_slice s = { parent_offset, in_dim, out_full, row_lo, row_hi - row_lo };
+    const map_slice_key key = { model_map, slice_offset, row_hi - row_lo };
+    auto it = g_mxfp8_lt_slices.find(key);
+    if (it != g_mxfp8_lt_slices.end()) {
+        if (memcmp(&it->second, &s, sizeof s) != 0) {
+            fprintf(stderr, "pulsar: MXFP8_LT row slice at offset %llu (%llu rows) already registered "
+                            "with other geometry -- refusing\n",
+                    (unsigned long long)slice_offset, (unsigned long long)(row_hi - row_lo));
+            return 0;
+        }
+        return 1;
+    }
+    g_mxfp8_lt_slices[key] = s;
+    g_mxfp8_lt_parent_rows[{model_map, parent_offset}] = out_full;
+    g_fp8_offsets.insert({model_map, slice_offset});   /* every arm gates on this set */
+    return 1;
+}
+
 
 /* Drop every process-global fp8 weight-cache entry. MUST run at backend
  * cleanup (pulsar_gpu_cleanup): pre-stored MXFP8_LT entries point straight into
@@ -2019,6 +2166,8 @@ void cuda_fp8_weight_cache_clear(void) {
     /* per-load registrations; the next engine open re-registers its own set */
     g_fp8_offsets.clear();
     g_mxfp8_lt_offsets.clear();
+    g_mxfp8_lt_slices.clear();
+    g_mxfp8_lt_parent_rows.clear();
     /* L191: the F32-source -> bf16 copies were never cleared -- a second engine
      * open in one process served the first model's converted weights. */
     for (auto &kv : g_f32w_bf16) (void)cudaFree(kv.second);
@@ -2827,107 +2976,88 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
  * a pass after "a" rather than in "a"'s epilogue because the warp that reduces
  * a row does not hold that row's block neighbours.  A slot failure is an ERROR
  * now (L158): "b" has no f32 arm to fall back to. */
-static int emit_low_e4m3(pulsar_gpu_tensor *low, uint32_t n_tokens, uint64_t low_dim) {
-    if (low_dim % 256 != 0) {
-        fprintf(stderr, "pulsar: attn-out low_dim=%llu cannot carry an E4M3 encoding (needs a multiple of 256) -- refusing\n",
-                (unsigned long long)low_dim);
+int pulsar_gpu_mxfp8_act_emit_f32(pulsar_gpu_tensor *x, uint32_t n_tokens, uint64_t dim) {
+    if (!x || n_tokens == 0 || dim % 256 != 0) {
+        fprintf(stderr, "pulsar: an f32 activation of dim %llu cannot carry an E4M3 encoding (needs a "
+                        "multiple of 256) -- refusing\n", (unsigned long long)dim);
         return 0;
     }
     void *lq = NULL, *lsf = NULL; int lkbp = 0;
-    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, n_tokens, low_dim, &lq, &lsf, &lkbp)) return 0;
-    const int lwarps = (int)n_tokens * (int)(low_dim / 32);
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(x, n_tokens, dim, &lq, &lsf, &lkbp)) return 0;
+    const int lwarps = (int)n_tokens * (int)(dim / 32);
     mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
-            (const float *)low->ptr, (int)n_tokens, (int)low_dim, lkbp,
+            (const float *)x->ptr, (int)n_tokens, (int)dim, lkbp,
             (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
-    if (!cuda_ok(cudaGetLastError(), "attn-out low e4m3 emit")) return 0;
-    pulsar_gpu_mxfp8_act_cache_arm(low, n_tokens, low_dim);
+    if (!cuda_ok(cudaGetLastError(), "f32 activation e4m3 emit")) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(x, n_tokens, dim);
     pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     return 1;
 }
 
-int pulsar_gpu_attention_output_batch_tensor(
-        pulsar_gpu_tensor       *out,
+static int emit_low_e4m3(pulsar_gpu_tensor *low, uint32_t n_tokens, uint64_t low_dim) {
+    return pulsar_gpu_mxfp8_act_emit_f32(low, n_tokens, low_dim);
+}
+
+/* Attention output, stage "a" (slice 4g split the old single entry in two):
+ * the grouped LoRA down-projection of the heads, `low = heads x out_a`, over
+ * `n_groups` groups whose weight rows start at `out_a_offset`.  On a TP rank
+ * `out_a_offset` is the registered ROW SLICE of the rank's owned groups and
+ * `n_groups` the owned count; the caller gathers `low` across the group before
+ * stage "b".  On one box it is the whole tensor.  Arms by row kind exactly as
+ * before the split: decode rows take the warp8/nt A8 GEMV (one launch for all
+ * groups, each row bit-identical to the n == 1 kernel), prefill rows the
+ * tensor-core MX GEMMs; a mixed batch runs each range in its pure regime. */
+int pulsar_gpu_attention_output_a_tensor(
         pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        uint64_t                out_dim,
         const pulsar_gpu_tensor *heads,
         uint32_t                n_tokens) {
-    if (!out || !low || !heads || !model_map ||
-        group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
+    if (!low || !heads || !model_map ||
+        group_dim == 0 || rank == 0 || n_groups == 0 || n_tokens == 0) {
         return 0;
     }
-    /* inc 4 prefix-split: recurse the whole attn-output stage (a-proj + b-proj)
-     * over the decode prefix [0,n_dec) in the M-independent regime and the prefill
-     * suffix [n_dec,n_tokens) in the tensor-core regime. Both the warp8/nt 'a' path
-     * and the mxfp8 'b' path then run their PURE code for each range (the 'b' proj
-     * recurses no further: its sub-range already has n_dec in {n_tok',0}). */
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    /* inc 4 prefix-split: the decode prefix [0,n_dec) in the M-independent
+     * regime, the prefill suffix [n_dec,n_tokens) in the tensor-core regime. */
     {
         const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < (uint64_t)n_tokens) {
-            const uint64_t low_dim = (uint64_t)n_groups * rank;
-            const uint64_t headb = (uint64_t)n_groups * group_dim * PULSAR_HEADS_ELT_SIZE;
-            const uint64_t lowb  = low_dim * sizeof(float);
-            const uint64_t outb  = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
             pulsar_gpu_tensor low_pre = pulsar_tensor_subview(low, 0, low->bytes);
             pulsar_gpu_tensor hd_pre  = pulsar_tensor_subview(heads, 0, heads->bytes);
-            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb, out->bytes - n_dec * outb);
+            const uint64_t lowb = low_dim * sizeof(float);
             pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
-            pulsar_gpu_tensor hd_suf  = pulsar_tensor_subview(heads, n_dec * headb,
-                                                             heads->bytes - n_dec * headb);
             const int saved = g_batch_decode_rows;
             g_batch_decode_rows = (int)n_dec;
-            int r1 = pulsar_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,
-                    model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
-                    out_dim, &hd_pre, (uint32_t)n_dec);
+            int r1 = pulsar_gpu_attention_output_a_tensor(&low_pre, model_map, model_size, out_a_offset,
+                                                          group_dim, rank, n_groups, &hd_pre, (uint32_t)n_dec);
             g_batch_decode_rows = 0;
             /* The suffix is a prefill run inside a step wider than the cap:
-             * its 'a' takes the tensor-core arm at any width, reading the
-             * producer's full-width grouped encoding through a row window
-             * (L158 inc 4); its `low` is then emitted and consumed as its own
-             * producer/consumer pair.  An offset heads view keyed no encoding
-             * and used to be quantised -- that path is gone. */
-            (void)hd_suf;
+             * the tensor-core arm at any width, reading the producer's
+             * full-width grouped encoding through a row window (L158 inc 4). */
             const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
             int r2 = cuda_attention_output_a_mx_gemm(&low_suf, model_map, model_size, out_a_offset,
                                                      group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec);
-            if (r2) r2 = emit_low_e4m3(&low_suf, n_suf, low_dim);
-            if (r2) r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size, out_b_offset,
-                                                          low_dim, out_dim, &low_suf, n_suf, "attn_output_b");
             g_batch_decode_rows = saved;
             return r1 && r2;
         }
     }
-    if (!g_fp8_offsets.count({model_map, out_a_offset}) ||
-        !g_fp8_offsets.count({model_map, out_b_offset})) return 0;
-    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (!g_fp8_offsets.count({model_map, out_a_offset})) return 0;
     const uint64_t blocks_a = (group_dim + 31) / 32;
-    const uint64_t blocks_b = (low_dim + 31) / 32;
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 33u;
-    const uint64_t out_b_bytes = out_dim * blocks_b * 33u;
-    if (out_a_offset > model_size || out_b_offset > model_size ||
+    if (out_a_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
-        out_b_bytes > model_size - out_b_offset ||
         heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * PULSAR_HEADS_ELT_SIZE ||
-        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float)) {
         return 0;
     }
-
     /* "a" projection by row kind (see the header at g_batch_decode_rows; the
-     * split above leaves n_dec at 0 or >= n_tokens): prefill rows take the
-     * block-scaled MXFP8xMXFP8 tensor-core GEMMs at any n_tokens, one
-     * included; decode rows take launch_grouped_fp8mx_a -- the warp8/nt A8
-     * kernels, one launch for all groups, each row bit-identical to the
-     * n == 1 kernel, so a row's attn-output bytes do not depend on its
-     * batchmates.  Either arm runs or the call refuses; the tensor-core arm's
-     * failure used to fall to the GEMV. */
+     * split above leaves n_dec at 0 or >= n_tokens).  Either arm runs or the
+     * call refuses; the tensor-core arm's failure used to fall to the GEMV. */
     if (g_batch_decode_rows == 0) {
         if (!cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                              group_dim, rank, n_groups, heads, n_tokens, 0)) {
@@ -2936,28 +3066,63 @@ int pulsar_gpu_attention_output_batch_tensor(
                     n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
             return 0;
         }
-    } else {
-        if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
-                                    group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
-                                    (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;
+        return 1;
     }
-    /* Emit `low` here, as the split-step suffix arm above does after its own
-     * "a" GEMM: the "b" GEMM consumes it next.  This entry is what the SERVER
-     * actually takes -- with the drafter live, verify batches come through
-     * here -- and an emission that once lived only on a since-deleted
-     * single-row entry converted the benchmark and left production on f32.
-     * The bench has no drafter, so it could not have shown that. */
-    if (!emit_low_e4m3(low, n_tokens, low_dim)) return 0;
+    return launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
+                                  group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
+                                  (const pulsar_heads_t *)heads->ptr, "attn_out_a");
+}
 
-    return cuda_matmul_mxfp8_tensor_labeled(out,
-                                           model_map,
-                                           model_size,
-                                           out_b_offset,
-                                           low_dim,
-                                           out_dim,
-                                           low,
-                                           n_tokens,
-                                           "attn_output_b");
+/* Attention output, stage "b": `out = low x out_b` over the FULL low_dim
+ * (every group's rows -- on a TP rank the caller has gathered them).  Emits
+ * `low`'s E4M3 encoding first, as the producer stage for "b" (a pass after
+ * "a" rather than in its epilogue: the warp that reduces a row does not hold
+ * that row's block neighbours), then the MXFP8 GEMM, which arms by row kind
+ * itself.  A mixed batch emits and multiplies each range in its pure regime,
+ * exactly as the single entry did, so every row's bytes are unchanged. */
+int pulsar_gpu_attention_output_b_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_b_offset,
+        uint64_t                low_dim,
+        uint64_t                out_dim,
+        pulsar_gpu_tensor       *low,
+        uint32_t                n_tokens) {
+    if (!out || !low || !model_map || low_dim == 0 || out_dim == 0 || n_tokens == 0) return 0;
+    {
+        const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
+        if (n_dec > 0 && n_dec < (uint64_t)n_tokens) {
+            const uint64_t lowb = low_dim * sizeof(float);
+            const uint64_t outb = out_dim * sizeof(float);
+            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
+            pulsar_gpu_tensor low_pre = pulsar_tensor_subview(low, 0, low->bytes);
+            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb, out->bytes - n_dec * outb);
+            pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
+            const int saved = g_batch_decode_rows;
+            g_batch_decode_rows = (int)n_dec;
+            int r1 = pulsar_gpu_attention_output_b_tensor(&out_pre, model_map, model_size, out_b_offset,
+                                                          low_dim, out_dim, &low_pre, (uint32_t)n_dec);
+            g_batch_decode_rows = 0;
+            const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
+            int r2 = emit_low_e4m3(&low_suf, n_suf, low_dim);
+            if (r2) r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size, out_b_offset,
+                                                          low_dim, out_dim, &low_suf, n_suf, "attn_output_b");
+            g_batch_decode_rows = saved;
+            return r1 && r2;
+        }
+    }
+    if (!g_fp8_offsets.count({model_map, out_b_offset})) return 0;
+    const uint64_t blocks_b = (low_dim + 31) / 32;
+    const uint64_t out_b_bytes = out_dim * blocks_b * 33u;
+    if (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+    if (!emit_low_e4m3(low, n_tokens, low_dim)) return 0;
+    return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, out_b_offset,
+                                           low_dim, out_dim, low, n_tokens, "attn_output_b");
 }
 
 

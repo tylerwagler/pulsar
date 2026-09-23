@@ -2596,30 +2596,33 @@ int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     return 1;
 }
 
-/* n-way VOCAB all-gather (slice 4d) -- see pulsar_tp.h for the contract.
- * Concatenation, NOT the sum above: a mistaken allreduce here would multiply
- * every rank's logits by the group size.
+/* n-way ROW all-gather (slice 4d vocab, 4g attention groups) -- see
+ * pulsar_tp.h for the contract.  Concatenation, NOT the sum above: a mistaken
+ * allreduce here would multiply every rank's logits by the group size.
  *
  * Loop shape: every rank walks k = 0..n-1 in ascending rank order, so the pair
  * (r,k) reaches its exchange in the same round on both sides and the existing
  * symmetric write-then-read exchange cannot deadlock.  The stride is padded to
- * ceil(n_total/n_ranks) so both directions of every exchange carry the same
- * byte count even when the partition is uneven. */
-int pulsar_tp_allgather_vocab(pulsar_tp *tp, uint32_t layer, uint64_t seq,
-                              float *full_out, const float *own_slice,
-                              float *scratch, uint32_t n_rows, uint32_t n_total) {
-    if (!tp || !full_out || !own_slice || !scratch || n_rows == 0 || n_total == 0) return 0;
+ * ceil(n_units/n_ranks) * unit so both directions of every exchange carry the
+ * same byte count even when the partition is uneven. */
+int pulsar_tp_allgather_rows(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+                             float *full_out, const float *own_slice,
+                             float *scratch, uint32_t n_rows,
+                             uint32_t n_units, uint32_t unit) {
+    if (!tp || !full_out || !own_slice || !scratch || n_rows == 0 || n_units == 0 || unit == 0) return 0;
     const uint32_t n_ranks = (uint32_t)(tp->n_ranks > 0 ? tp->n_ranks : 1);
-    const uint32_t stride = (n_total + n_ranks - 1u) / n_ranks;   /* padded slice */
+    const uint32_t n_total = n_units * unit;
+    const uint32_t stride = ((n_units + n_ranks - 1u) / n_ranks) * unit;   /* padded slice */
     for (uint32_t k = 0; k < n_ranks; k++) {
-        uint32_t lo = 0, hi = 0;
-        if (!pulsar_tp_owned_range((int)k, n_ranks, n_total, &lo, &hi)) return 0;
-        const uint64_t elems = (uint64_t)(hi - lo);
+        uint32_t ulo = 0, uhi = 0;
+        if (!pulsar_tp_owned_range((int)k, n_ranks, n_units, &ulo, &uhi)) return 0;
+        const uint32_t lo = ulo * unit;
+        const uint64_t elems = (uint64_t)(uhi - ulo) * unit;
         const float *src = own_slice;
         if (k != (uint32_t)tp->rank) {
             pulsar_tp_peer *pp = tp_peer_by_rank(tp, (int)k);
             if (!pp || pp->data_fd < 0) {
-                fprintf(stderr, "pulsar-tp: vocab all-gather has no channel to rank %u\n", k);
+                fprintf(stderr, "pulsar-tp: row all-gather has no channel to rank %u\n", k);
                 return 0;
             }
             /* Same rule as allreduce_sum: the pair rides the RDMA-capable entry

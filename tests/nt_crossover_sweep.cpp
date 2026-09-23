@@ -112,10 +112,14 @@ typedef struct {
 
 static bool attnout_launch(void *vctx, uint32_t n_tok) {
     attnout_ctx *c = (attnout_ctx *)vctx;
-    return pulsar_gpu_attention_output_batch_tensor(
-               c->out, c->low, c->e->model.map, c->e->model.size,
-               c->L->attn_output_a->abs_offset, c->L->attn_output_b->abs_offset,
-               c->group_dim, c->rank, c->n_groups, PULSAR_N_EMBD, c->heads, n_tok) != 0;
+    return pulsar_gpu_attention_output_a_tensor(
+               c->low, c->e->model.map, c->e->model.size,
+               c->L->attn_output_a->abs_offset,
+               c->group_dim, c->rank, c->n_groups, c->heads, n_tok) != 0 &&
+           pulsar_gpu_attention_output_b_tensor(
+               c->out, c->e->model.map, c->e->model.size,
+               c->L->attn_output_b->abs_offset,
+               (uint64_t)c->n_groups * c->rank, PULSAR_N_EMBD, c->low, n_tok) != 0;
 }
 
 static const pulsar_tensor *pick_q_a(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_a; }

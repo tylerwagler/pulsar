@@ -718,13 +718,20 @@ bool gpu_graph_dspark_draft_forward_banks(
          * quantise-from-heads fallback is gone. */
         if (ok) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_draft, n_groups, group_dim) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
-        if (ok) ok = pulsar_gpu_attention_output_batch_tensor(
-            g->batch_attn_out, g->batch_attn_low,
+        /* The drafter blocks are not head-split yet (4g-1b): whole tensors,
+         * every group, no gather between the two stages. */
+        if (ok) ok = pulsar_gpu_attention_output_a_tensor(
+            g->batch_attn_low,
             tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
             layer->attn_output_a->abs_offset,
-            layer->attn_output_b->abs_offset,
-            group_dim, rank, n_groups, PULSAR_N_EMBD,
+            group_dim, rank, n_groups,
             g->batch_heads, n_draft) != 0;
+        if (ok) ok = pulsar_gpu_attention_output_b_tensor(
+            g->batch_attn_out,
+            tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
+            layer->attn_output_b->abs_offset,
+            (uint64_t)n_groups * rank, PULSAR_N_EMBD,
+            g->batch_attn_low, n_draft) != 0;
         pulsar_gpu_mxfp8_gact_disarm();
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_out", g->batch_attn_out,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
@@ -1090,9 +1097,9 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
         }
     }
     if (ok) {
-        ok = pulsar_tp_allgather_vocab(g->tp, PULSAR_TP_NON_LAYER_TAG,
+        ok = pulsar_tp_allgather_rows(g->tp, PULSAR_TP_NON_LAYER_TAG,
                                        ++g->tp_vocab_seq, full, own, scratch,
-                                       n_rows, n_vocab) != 0;
+                                       n_rows, n_vocab, 1u) != 0;
     }
     if (ok) ok = pulsar_gpu_tensor_write(out, 0, full, full_bytes) != 0;
     pulsar_gpu_tensor_free(slice);
@@ -1439,6 +1446,40 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
                                                  x,
                                                  n_tok) != 0;
     return ok;
+}
+
+bool gpu_graph_matmul_mxfp8_rows_named_tensor(
+        const char             *module,
+        uint32_t                il,
+        uint32_t                pos0,
+        pulsar_gpu_tensor       *out,
+        const pulsar_model        *model,
+        const pulsar_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_full,
+        uint64_t                row_lo,
+        uint64_t                row_hi,
+        const pulsar_gpu_tensor *x,
+        uint64_t                n_tok) {
+    (void)il;
+    (void)pos0;
+    if (row_hi <= row_lo || row_hi > out_full) {
+        fprintf(stderr, "pulsar: %s rows [%llu,%llu) of %llu -- refusing\n", module ? module : "?",
+                (unsigned long long)row_lo, (unsigned long long)row_hi, (unsigned long long)out_full);
+        return false;
+    }
+    /* A whole tensor is its own offset; a slice is the offset the engine
+     * registered at open, parent + row_lo * in_dim (slice 4g).  An unregistered
+     * slice offset is unknown to the backend and refuses there. */
+    const uint64_t off = w->abs_offset + row_lo * in_dim;
+    return pulsar_gpu_matmul_mxfp8_tensor(out,
+                                          tensor_map_base(model, w),
+                                          tensor_map_size(model, w),
+                                          off,
+                                          in_dim,
+                                          row_hi - row_lo,
+                                          x,
+                                          n_tok) != 0;
 }
 
 

@@ -69,6 +69,7 @@ int gate_comp_state_gate_main(int, char **);
 int gate_chunk_neutrality_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
 int gate_session_payload_gate_main(int, char **);
+int gate_tp_head_split_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -394,6 +395,9 @@ int main(int argc, char **argv) {
          * instead of paying its own 92 GB load (the Makefile's last
          * not-yet-folded target).  1 bank: the classic payload layout. */
         {"cuda-session-payload-gate", gate_session_payload_gate_main,    1, NULL, NULL, {NULL}},
+        /* L241 (slice 4g): a rank's attn_q_b / attn_output_a row slices are
+         * byte-identical pieces of the whole projection on both GEMM arms. */
+        {"cuda-tp-head-split-gate",   gate_tp_head_split_gate_main,     1, NULL, NULL, {NULL}},
     };
     /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
     const gate_spec group_depth1[] = {
