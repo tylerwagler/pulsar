@@ -124,7 +124,32 @@ bug, not a design change.
       correct full routed sum — TP is now numerically correct.  Non-TP
       (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
       GPU/pair-gated (the prefill byte gate and the pair all-reduce check).
-- 4d. Vocab head split on the logits path (frames ported; engine-side wiring).
+- 4d. **Vocab head split on the logits path.  n-GENERAL, not two-rank**
+      (Tyler 2026-09-22: the target is n parallel Sparks).  Split = one vocab
+      RANGE per rank, `[r*V/n, (r+1)*V/n)` — the same floor partition as the
+      routed experts, and the same single authority pattern
+      (`pulsar_tp_owned_vocab_range`, mirroring `pulsar_tp_owned_expert_range`).
+      Each rank computes only its range, then the group ALL-GATHERS (concatenate,
+      NOT the sum `pulsar_tp_allreduce_sum` performs) so every rank holds the
+      full logits and can sample independently — no leader broadcast needed.
+      - **4d inc 1 LANDED 2026-09-22** (`tp-vision-exp` 6267908b): the range is
+        expressible.  The deciding fact is the head's STORED orientation —
+        `head.weight` is HF `[129280, 4096]` / `dims_ne [4096, 129280]`, i.e.
+        `[vocab, in_dim]` row-major (why the cuBLASLt arm sets `TRANSA=OP_T`), so
+        a vocab range IS a contiguous ROW range and the existing packed-block
+        GEMM needs no kernel change.  `gpu_graph_encode_output_head[_batch]`
+        take `(vocab_lo, vocab_dim, out)`; single-box passes
+        `(0, N_VOCAB, g->logits|spec_logits)` → byte-identical.  The MXFP8_LT arm
+        REFUSES a slice (its scale plane is not row-addressable); the target head
+        is bf16, so the drafter's MXFP8 head stays full-range.  The L119 segment
+        bracket is now taken only for the full-vocab range: a gate recv is a host
+        wait and cannot live in a captured graph, and the recorded body binds its
+        destination.
+      - **4d inc 2 (next):** `pulsar_tp_owned_vocab_range` + an n-way all-gather
+        primitive + the assembly.  Sized exchanges: pad each rank's slice to
+        `ceil(V/n)` so every rank sends the SAME byte count (the group exchange
+        has one size per round; 129280 does not divide by 3 or 5), with the last
+        rank's tail zero-padded.
 - 4e. Phase-3 lockstep over our session surface (banks/warm-fork, multiseq,
       mixed, spec rounds).
 
