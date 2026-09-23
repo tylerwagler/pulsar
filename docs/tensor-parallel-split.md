@@ -100,6 +100,10 @@ bug, not a design change.
       gate kernels for the DECODE per-layer arm are still unwired and
       `tp_role != 0` with no `--tp-arm` still fails loudly (rule 4).  The
       per-rank partial is ownership-aware only once 4c lands.
+      (2026-09-23, L239: `--tp-arm` is RETIRED.  Since 4c every lane -- owned
+      experts, vocab split, the session mirror -- is wired whenever a group is
+      configured, so the selector selected nothing; the flag, the field and its
+      guard are deleted.  A configured group is the only switch.)
 - **N-way transport (2026-09-22).** The transport is no longer two-rank-only:
       `pulsar_tp_create_mesh` brings up **n** ranks in a full mesh
       (`--tp-rank`/`--tp-nranks`/`--tp-peers`; every rank connects to every

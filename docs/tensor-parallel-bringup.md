@@ -143,7 +143,7 @@ legacy two-rank pair** — the target is n Sparks:
 ```sh
 # rank r of n, on each host (h0..hn-1 are the hosts' addresses in rank order):
 pulsar -m <checkpoint> --tp-rank r --tp-nranks n \
-       --tp-peers "h0:5590,h1:5590,..." --tp-port 5590 --tp-arm prefill \
+       --tp-peers "h0:5590,h1:5590,..." --tp-port 5590 \
        -p "<prompt>" --temp 0 --nothink -n 32 --dump-logprobs rank$r.lp.json
 ```
 

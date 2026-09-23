@@ -20,6 +20,10 @@
 # No positional args.  Environment:
 #   PULSAR_TP_HOSTS    REQUIRED. ssh targets in RANK ORDER, rank 0 first, at
 #                      least two.  e.g. "sparky workrig"
+#   PULSAR_TP_ADDRS    the addresses the ENGINE dials, in the same rank order
+#                      (default: the ssh targets).  The mesh resolves these with
+#                      getaddrinfo on every rank -- an ssh-config alias is not
+#                      an address; on a pair this is the RoCE-side name or IP.
 #   PULSAR_TP_MODEL    checkpoint dir (default /mnt/pve1-models/DeepSeek-v4-Flash, the
 #                      full-fidelity MXFP4 build -- the artifact a pair exists for; the
 #                      one-box IQ2 build refuses TP at layer 0 by design)
@@ -29,7 +33,6 @@
 #   PULSAR_TP_PROMPT   prompt (default: a short deterministic one)
 #   PULSAR_TP_TOKENS   generated tokens (default 32)
 #   PULSAR_TP_CTX      context (default 4096)
-#   PULSAR_TP_ARM      --tp-arm value (default prefill)
 #   PULSAR_TP_SSH      extra ssh args, e.g. "-p 2222"
 #   PULSAR_TP_TIMEOUT  per-rank seconds (default 900)
 #   PULSAR_TP_STAGGER  seconds between rank launches (default 5; the mesh dials
@@ -37,53 +40,75 @@
 #                      start order)
 #   PULSAR_TP_BASELINE single-box logprobs JSON to grade against (LEG B)
 #   PULSAR_TP_WORKDIR  staging dir on each host (default ~/tp-pair-grade)
+#   PULSAR_TP_SHA      when set, every rank's binary must carry this build sha
+#                      (the engine prints it at startup; asserted after the run
+#                      from rank*.err) -- "a tree hash is not a binary's provenance"
+#   PULSAR_TP_MIN_AVAIL_GIB  per-host MemAvailable floor before load (default 100:
+#                      ~83 GiB of owned experts at n=2 plus KV + slab)
 #   PULSAR_TP_DRYRUN=1 print the plan and exit without running anything
+#   PULSAR_TP_PREFLIGHT_ONLY=1  run the per-host preflight and exit
 #
-# Exit: 0 only if every rank exited 0, no rank refused/desynced, and LEG A
-# (all ranks byte-identical) passed.
+# PREFLIGHT (always, before any rank is launched; a pair window is short and
+# every one of these has cost a session before): each host must be reachable
+# over ssh; hold no live engine process (by executable, not argv); see the
+# checkpoint (config.json + at least one shard); have the binary; have >=
+# MIN_AVAIL GiB available AFTER a best-effort drop_caches (model-load
+# discipline); keep /tmp (tmpfs = memory on a Spark) under 4 GiB; resolve every
+# --tp-peers address with getaddrinfo the way the engine will (its own
+# included) and reach every other one (TCP to its ssh port, since the TP
+# listener is not up yet).  Any failure refuses the whole run by host and by
+# check.
+#
+# Exit: 0 only if the preflight passed, every rank exited 0, no rank
+# refused/desynced, and LEG A (all ranks byte-identical) passed.
 
 set -u
 
 HOSTS=${PULSAR_TP_HOSTS:-}
+ADDRS=${PULSAR_TP_ADDRS:-$HOSTS}
 MODEL=${PULSAR_TP_MODEL:-/mnt/pve1-models/DeepSeek-v4-Flash}
 BIN=${PULSAR_TP_BIN:-'$HOME/pulsar'}
 PORT=${PULSAR_TP_PORT:-5590}
 PROMPT=${PULSAR_TP_PROMPT:-"Explain how a C pointer differs from an array in one paragraph."}
 TOKENS=${PULSAR_TP_TOKENS:-32}
 CTX=${PULSAR_TP_CTX:-4096}
-ARM=${PULSAR_TP_ARM:-prefill}
 SSH_ARGS=${PULSAR_TP_SSH:-}
 TIMEOUT=${PULSAR_TP_TIMEOUT:-900}
 STAGGER=${PULSAR_TP_STAGGER:-5}
 BASELINE=${PULSAR_TP_BASELINE:-}
 WORKDIR=${PULSAR_TP_WORKDIR:-tp-pair-grade}
+WANT_SHA=${PULSAR_TP_SHA:-}
+MIN_AVAIL=${PULSAR_TP_MIN_AVAIL_GIB:-100}
 DRYRUN=${PULSAR_TP_DRYRUN:-0}
+PREFLIGHT_ONLY=${PULSAR_TP_PREFLIGHT_ONLY:-0}
 
 die() { echo "tp-pair-engine-grade: $*" >&2; exit 2; }
 
 [ -n "$HOSTS" ] || die "PULSAR_TP_HOSTS is required (rank order, rank 0 first, >= 2 hosts)"
 read -r -a RANKS <<< "$HOSTS"
+read -r -a RANK_ADDRS <<< "$ADDRS"
 N=${#RANKS[@]}
 [ "$N" -ge 2 ] || die "need at least two hosts, got $N"
+[ "${#RANK_ADDRS[@]}" -eq "$N" ] || die "PULSAR_TP_ADDRS has ${#RANK_ADDRS[@]} entries for $N hosts"
 
 # The mesh takes the whole group's listen addresses up front.
 PEERS=""
-for r in "${RANKS[@]}"; do
-    PEERS="${PEERS}${PEERS:+,}${r}:${PORT}"
+for a in "${RANK_ADDRS[@]}"; do
+    PEERS="${PEERS}${PEERS:+,}${a}:${PORT}"
 done
 
 echo "tp-pair-engine-grade: n=$N ranks"
-for i in "${!RANKS[@]}"; do echo "  rank $i -> ${RANKS[$i]}"; done
+for i in "${!RANKS[@]}"; do echo "  rank $i -> ssh ${RANKS[$i]}, dials as ${RANK_ADDRS[$i]}"; done
 echo "  peers: $PEERS"
-echo "  model: $MODEL   arm: $ARM   ctx: $CTX   tokens: $TOKENS"
+echo "  model: $MODEL   ctx: $CTX   tokens: $TOKENS"
 
 # ---- plan -------------------------------------------------------------------
 run_rank_cmd() {   # $1 = rank index
     local r=$1
     printf 'cd %s && PULSAR_LOCK_FILE=/tmp/tp-grade-lock-%d PULSAR_TP_RANK=%d %s -m %s ' \
            "$WORKDIR" "$r" "$r" "$BIN" "$MODEL"
-    printf -- '--tp-rank %d --tp-nranks %d --tp-peers %s --tp-port %d --tp-arm %s ' \
-           "$r" "$N" "$PEERS" "$PORT" "$ARM"
+    printf -- '--tp-rank %d --tp-nranks %d --tp-peers %s --tp-port %d ' \
+           "$r" "$N" "$PEERS" "$PORT"
     printf -- '-c %d --nothink --temp 0 -n %d --dump-logprobs rank%d.lp.json -p %q' \
            "$CTX" "$TOKENS" "$r" "$PROMPT"
 }
@@ -95,6 +120,57 @@ if [ "$DRYRUN" != 0 ]; then
     done
     exit 0
 fi
+
+# ---- preflight: every host, every check, before any rank is launched --------
+# The remote script prints one "ok"/"FAIL" line per check and exits nonzero on
+# any FAIL; nothing here mutates the host beyond a best-effort drop_caches.
+preflight_host() {   # $1 = rank index
+    local r=$1 h=${RANKS[$1]} peers_sh="" p
+    for p in "${RANK_ADDRS[@]}"; do peers_sh="$peers_sh $p"; done
+    ssh $SSH_ARGS -o BatchMode=yes -o ConnectTimeout=10 "$h" \
+        "MODEL=$MODEL BIN=$BIN MIN_AVAIL=$MIN_AVAIL SELF='${RANK_ADDRS[$r]}' PEERS='$peers_sh' bash -s" <<'REMOTE'
+set -u
+bad=0
+chk() { if [ "$1" = 0 ]; then echo "    ok    $2"; else echo "    FAIL  $2"; bad=1; fi; }
+live=$(for p in /proc/[0-9]*; do e=$(readlink "$p/exe" 2>/dev/null) || continue; case "${e##*/}" in pulsar|pulsar-server*|pulsar-bench|pulsar-eval|pulsar_test|gates_runner) echo "${p#/proc/} $e";; esac; done)
+[ -z "$live" ]; chk $? "no engine process alive (by executable)${live:+ -- $(echo "$live" | head -2 | tr '\n' ';')}"
+[ -f "$MODEL/config.json" ] && [ -n "$(ls "$MODEL"/*.safetensors 2>/dev/null | head -1)" ]
+chk $? "checkpoint at $MODEL (config.json + shards)"
+b=$(eval echo "$BIN"); [ -x "$b" ]; chk $? "binary $b ($(stat -c '%y' "$b" 2>/dev/null | cut -c1-19 || echo missing))"
+if sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then dc=dropped; else dc="not dropped (no sudo -n)"; fi
+avail=$(awk '/MemAvailable/ {printf "%d", $2/1048576}' /proc/meminfo)
+[ "$avail" -ge "$MIN_AVAIL" ]; chk $? "MemAvailable ${avail} GiB >= ${MIN_AVAIL} (caches $dc)"
+tmp=$(df -k --output=fstype,used /tmp 2>/dev/null | awk 'NR==2 && $1=="tmpfs" {printf "%d", $2/1048576}')
+[ -z "$tmp" ] || [ "$tmp" -le 4 ]; chk $? "/tmp ${tmp:-not tmpfs}${tmp:+ GiB in tmpfs (memory)} <= 4"
+echo "    info  memlock $(ulimit -l) KiB (TCP transport is unaffected; RDMA registration needs more)"
+# every address in --tp-peers must resolve HERE the way the engine resolves it
+# (getaddrinfo), including this rank's own listen address; the others must
+# also answer on tcp/22 (the TP listener is not up yet, ssh is).
+for host in $PEERS; do
+    ip=$(getent ahosts "$host" | awk 'NR==1 {print $1}')
+    if [ "$host" = "$SELF" ]; then
+        [ -n "$ip" ]; chk $? "own address $host resolves for getaddrinfo (${ip:-UNRESOLVED -- an ssh alias is not an address; set PULSAR_TP_ADDRS})"
+        continue
+    fi
+    [ -n "$ip" ] && timeout 5 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null
+    chk $? "peer $host resolves (${ip:-UNRESOLVED -- set PULSAR_TP_ADDRS}) and answers on tcp/22"
+done
+exit $bad
+REMOTE
+}
+
+echo "--- preflight (every host, before any launch) ---"
+pf_fail=0
+for r in $(seq 0 $((N - 1))); do
+    echo "  rank $r (${RANKS[$r]}):"
+    preflight_host "$r" || { echo "    => rank $r REFUSED by preflight"; pf_fail=1; }
+done
+if [ "$pf_fail" != 0 ]; then
+    echo "tp-pair-engine-grade: PREFLIGHT FAILED -- nothing was launched"
+    exit 3
+fi
+echo "  preflight: every host ok"
+[ "$PREFLIGHT_ONLY" = 0 ] || exit 0
 
 # ---- launch -----------------------------------------------------------------
 pids=()
@@ -129,6 +205,20 @@ for r in $(seq 0 $((N - 1))); do
     echo "  rank $r ($h): rc=${rc:-?}"
     [ "${rc:-}" = "0" ] || fail=1
 done
+
+# ---- provenance: the binary that ran, not the tree that was checked out -----
+if [ -n "$WANT_SHA" ]; then
+    echo "--- provenance: every rank's engine must announce $WANT_SHA ---"
+    for r in $(seq 0 $((N - 1))); do
+        h=${RANKS[$r]}
+        if ssh $SSH_ARGS -o BatchMode=yes "$h" "grep -q '$WANT_SHA' $WORKDIR/rank$r.err $WORKDIR/rank$r.out 2>/dev/null"; then
+            echo "  rank $r: $WANT_SHA announced"
+        else
+            echo "  rank $r: $WANT_SHA NOT found in its output -- a different binary ran"
+            fail=1
+        fi
+    done
+fi
 
 # ---- refusal/desync scan ----------------------------------------------------
 echo "--- refusal / desync scan ---"

@@ -127,12 +127,12 @@ typedef struct {
      *    n ranks) + tp_port.  Full-mesh; all ranks are symmetric.
      *  - legacy 2-rank: tp_role (1 = leader listens on tp_port, 2 = worker dials
      *    tp_peer:tp_port), tp_peers NULL.  tp_rank/nranks are derived (leader=0).
-     * tp_arm selects which TP arm is wired: 0 = none, 1 = prefill big-gate.
-     * A nonzero tp_role/tp_rank with tp_arm==0 fails loudly (rule 4). */
+     * A configured group wires EVERY TP lane (owned experts, vocab split, the
+     * session mirror); there is no per-lane arm to select (L239 retired
+     * `--tp-arm`, which had selected nothing since slice 4c). */
     int tp_role;
     const char *tp_peer;
     int tp_port;
-    int tp_arm;
     int tp_rank;        /* this rank's index in the group; -1 = unset */
     int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
     const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */

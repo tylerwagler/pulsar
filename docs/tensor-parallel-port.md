@@ -392,8 +392,9 @@ worker "blocks in the wrapper", read "the loop applies the frame".
     need IQ2" (Tyler).  Bring-up therefore uses an MXFP4 artifact; the refusal
     on IQ2 stays loud and stays;
   - images: mirrored since increment 7 (`SYNC_MM`);
-  - `--tp-arm prefill` is a misnomer: decode and verify rows (<= 8) also gate
-    through the slab big-gate path, so the arm is "all lanes, one mechanism";
+  - there is no per-lane arm: decode and verify rows (<= 8) gate through the
+    same slab big-gate path as prefill, "all lanes, one mechanism" (`--tp-arm`,
+    which had selected nothing since 4c, was retired 2026-09-23, L239);
   - the control-plane deadline on the worker's `recv_command` presumes the
     same-driver model above (a worker only waits for a frame once its own
     driver issued the operation); it is not an idle timeout.

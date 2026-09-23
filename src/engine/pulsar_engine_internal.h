@@ -1697,8 +1697,8 @@ struct pulsar_engine {
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
     float directional_steering_ffn_scale;   ///< steering strength on the FFN stream
     uint32_t prefill_chunk;     ///< tokens per prefill chunk
-    /** Two-rank TP state (slice 4b).  Non-NULL only when the pair was actually
-     * armed (tp_role != 0 with a wired tp_arm).  The slab is the host-pinned,
+    /** TP state (slices 4b..4f).  Non-NULL only when a TP group was actually
+     * configured (tp_role != 0 or tp_peers).  The slab is the host-pinned,
      * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off

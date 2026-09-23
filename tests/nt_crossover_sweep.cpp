@@ -118,7 +118,6 @@ static bool attnout_launch(void *vctx, uint32_t n_tok) {
                c->group_dim, c->rank, c->n_groups, PULSAR_N_EMBD, c->heads, n_tok) != 0;
 }
 
-static const pulsar_tensor *pick_layer_shape(const pulsar_engine *e, uint32_t il) { return NULL; }
 static const pulsar_tensor *pick_q_a(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_a; }
 static const pulsar_tensor *pick_q_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_b; }
 static const pulsar_tensor *pick_kv(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_kv; }

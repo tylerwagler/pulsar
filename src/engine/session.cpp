@@ -324,15 +324,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->prefill_chunk = opt->prefill_chunk;
-    if ((opt->tp_role != 0 || opt->tp_peers) && opt->tp_arm == 0) {
-        fprintf(stderr, "pulsar: tensor parallelism (tp_role=%d) with no TP "
-                        "arm selected; pass --tp-arm prefill (slice 4b) to wire the "
-                        "prefill big-gate; see docs/tensor-parallel-split.md\n",
-                opt->tp_role);
-        free(e);
-        *out = NULL;
-        return 1;
-    }
     /* Slice 4f (L237): the rank this process loads the model FOR, decided from
      * the options before any weight is staged -- the transport is created
      * after the load, and on GB10 staging IS residency (a rank stages only its

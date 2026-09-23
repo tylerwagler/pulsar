@@ -198,7 +198,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -1513,7 +1513,29 @@ GATE_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # the runner here (before any recipe line runs) means the whole CORE_OBJS set
 # is fresh before those sub-makes start -- they then only compile their own
 # test TU and link, so concurrent make processes cannot race shared objects.
+# The battery's own model-load discipline, run before the first gate (L239,
+# 2026-09-23): the same three checks every hand-written gate script carries.
+# /tmp on the Spark is tmpfs, i.e. the same memory the engines load into --
+# 17 GB of scratch left there OOMed a battery's second engine while
+# MemAvailable read fine.  On a box with no GPU the battery cannot run at all,
+# so the preflight only says so; it never "passes" by skipping on the Spark.
+.PHONY: gates-preflight
+gates-preflight:
+	@if [ ! -e /dev/nvidiactl ]; then echo "gates-preflight: no GPU on this host -- the battery is a Spark job"; exit 0; fi; \
+	bad=0; \
+	live=$$(for p in /proc/[0-9]*; do e=$$(readlink "$$p/exe" 2>/dev/null) || continue; case "$${e##*/}" in pulsar|pulsar-server*|pulsar-bench|pulsar-eval|pulsar_test|gates_runner) echo "$${p#/proc/} $$e";; esac; done); \
+	if [ -n "$$live" ]; then echo "gates-preflight: an engine process is alive (by executable):"; echo "$$live" | head -3 | sed 's/^/  /'; bad=1; fi; \
+	tmp=$$(df -k --output=fstype,used /tmp 2>/dev/null | awk 'NR==2 && $$1=="tmpfs" {printf "%d", $$2/1048576}'); \
+	if [ -n "$$tmp" ] && [ "$$tmp" -gt 4 ]; then \
+	  echo "gates-preflight: /tmp is tmpfs (memory) and holds $${tmp} GiB -- move it off before loading engines:"; \
+	  du -xsh /tmp/* 2>/dev/null | sort -rh | head -5 | sed 's/^/  /'; bad=1; fi; \
+	avail=$$(awk '/MemAvailable/ {printf "%d", $$2/1048576}' /proc/meminfo); \
+	if [ "$$avail" -lt 100 ]; then echo "gates-preflight: only $${avail} GiB available; the battery loads the served artifact (~87 GB)"; bad=1; fi; \
+	if [ $$bad -ne 0 ]; then echo "gates-preflight: REFUSING"; exit 1; fi; \
+	echo "gates-preflight: ok ($${avail} GiB available, /tmp $${tmp:-0} GiB in tmpfs)"
+
 gates: tests/gates_runner pulsar-eval
+	@$(MAKE) --no-print-directory gates-preflight || exit 1
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
 	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
 	for g in $(GATE_TARGETS); do \
@@ -1611,6 +1633,7 @@ gates-dev:
 	  printf '  or the CUDA flag stamp flips and the next `make gates` rebuilds every .cu\n'; \
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
+	$(MAKE) --no-print-directory gates-preflight || exit 1; \
 	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
