@@ -148,7 +148,12 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
      * would read 1000*sum(ranks) instead of 1000*owner, so the pattern makes the
      * two impossible to confuse. */
     {
-        const uint32_t V = 1000u;
+        /* Two totals: 1000 (uneven for n=3/4/5, exercising the padded stride) and
+         * 129280 -- the REAL n_vocab, which is uneven for every n>2 the group can
+         * have.  A fixed seq per case keeps the desync guard meaningful. */
+        const uint32_t totals[2] = { 1000u, 129280u };
+        for (int ci = 0; ci < 2; ci++) {
+        const uint32_t V = totals[ci];
         const uint32_t rows = 2u;
         const uint32_t stride = (V + (uint32_t)n - 1u) / (uint32_t)n;
         float *full = (float *)std::calloc((size_t)rows * V, sizeof(float));
@@ -160,8 +165,8 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             for (uint32_t i = lo; i < hi; i++)
                 own[(size_t)r * stride + (i - lo)] =
                     (float)(1000 * rank + (int)(i % 7) + 10000 * (int)r);
-        if (!pulsar_tp_allgather_vocab(tp, 0, 2, full, own, scr, rows, V)) {
-            CHECK(0, "rank %d vocab all-gather failed", rank);
+        if (!pulsar_tp_allgather_vocab(tp, 0, 2 + (uint64_t)ci, full, own, scr, rows, V)) {
+            CHECK(0, "rank %d vocab all-gather failed (V=%u)", rank, V);
         } else {
             int vbad = 0;
             for (uint32_t r = 0; r < rows; r++) {
@@ -189,6 +194,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         std::free(full);
         std::free(own);
         std::free(scr);
+        }   /* totals */
     }
 
     pulsar_tp_free(tp);
@@ -239,7 +245,7 @@ static int run_mesh(int n) {
 
 int main(void) {
     int rc = 0;
-    for (int n = 2; n <= 3; n++) {
+    for (int n = 2; n <= 5; n++) {
         std::printf("tp_mesh_test: n=%d\n", n);
         std::fflush(stdout);
         if (run_mesh(n) != 0) rc = 1;
@@ -247,7 +253,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2 and n=3 mesh + all-reduce, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;
