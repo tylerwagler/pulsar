@@ -564,9 +564,10 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                 CHECK(cmd.type == PULSAR_TP_FRAME_EVAL_BATCH,
                       "rank %d got frame type %d, expected EVAL_BATCH (%d)",
                       rank, (int)cmd.type, (int)PULSAR_TP_FRAME_EVAL_BATCH);
-                CHECK(cmd.n_items == (uint32_t)BATCH_ROWS,
-                      "rank %d mirrored batch carried %u rows, expected %d",
-                      rank, cmd.n_items, (int)BATCH_ROWS);
+                CHECK(cmd.n_items == (uint32_t)BATCH_ROWS && cmd.session_id == sid,
+                      "rank %d mirrored batch carried %u rows for session %llu, expected %d/%llu",
+                      rank, cmd.n_items, (unsigned long long)cmd.session_id,
+                      (int)BATCH_ROWS, (unsigned long long)sid);
                 int row_bad = 0;
                 if (cmd.items) {
                     for (int i = 0; i < BATCH_ROWS; i++) {
@@ -607,7 +608,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         char cerr[256];
         cerr[0] = 0;
         if (rank == 0) {
-            CHECK(pulsar_tp_send_mixed_batch(tp, items, MIXED_ROWS) != 0,
+            CHECK(pulsar_tp_send_mixed_batch(tp, items, MIXED_ROWS, 3u) != 0,
                   "rank 0 mirrored mixed send must report success as nonzero");
             CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed batch", cerr, sizeof(cerr)),
                   "rank 0 mirrored mixed ack over %d peers: %s", n - 1, cerr);
@@ -620,9 +621,10 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                       "rank %d got frame type %d, expected MIXED_BATCH (%d) -- the frame "
                       "type IS the operation's identity",
                       rank, (int)cmd.type, (int)PULSAR_TP_FRAME_MIXED_BATCH);
-                CHECK(cmd.n_items == (uint32_t)MIXED_ROWS,
-                      "rank %d mirrored mixed carried %u rows, expected %d",
-                      rank, cmd.n_items, (int)MIXED_ROWS);
+                CHECK(cmd.n_items == (uint32_t)MIXED_ROWS && cmd.value == 3 && cmd.session_id == sid,
+                      "rank %d mirrored mixed carried %u rows (head_runs %d, session %llu), expected %d/3/%llu",
+                      rank, cmd.n_items, cmd.value, (unsigned long long)cmd.session_id,
+                      (int)MIXED_ROWS, (unsigned long long)sid);
                 int row_bad = 0;
                 if (cmd.items) {
                     for (int i = 0; i < MIXED_ROWS; i++) {

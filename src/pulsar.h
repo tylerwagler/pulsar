@@ -175,6 +175,16 @@ typedef struct {
 } pulsar_session_payload_file;
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
+/** Tensor parallelism (slice 4e, L238): is this engine a WORKER rank of a TP
+ * group?  A worker drives no sessions of its own -- its driver must call
+ * pulsar_tp_worker_run right after open and exit when it returns; every
+ * pulsar_session_* operation on a worker is refused by name. */
+bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
+/** The worker receive loop: applies the leader's frames (create, sync, eval,
+ * batched and mixed decode, rewind, invalidate, rng state) to a session
+ * registry keyed by the create ordinal until the leader sends STOP or the
+ * transport fails.  Returns 0 on a clean stop, 1 on a failure (err filled). */
+int pulsar_tp_worker_run(pulsar_engine *e, char *err, size_t errlen);
 void pulsar_engine_close(pulsar_engine *e);
 void pulsar_engine_summary(pulsar_engine *e);
 /** Tokenizer table length. NOT the logits row width — see

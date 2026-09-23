@@ -217,7 +217,7 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         /* The mixed step rides the SAME row payload on its own frame type
          * (4e increment 5): rows only, no separate prefill prompt. */
         pulsar_tp_batch_item m = { 2001, 5, 90, 71, 0 };
-        CHECK(pulsar_tp_send_mixed_batch(tp, &m, 1) == 1,
+        CHECK(pulsar_tp_send_mixed_batch(tp, &m, 1, 4u) == 1,
               "leader send_mixed_batch");
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed_batch", err, sizeof(err)),
               "leader mixed_batch ack: %s", err);
@@ -261,8 +261,8 @@ static void frames_phase(pulsar_tp *tp, int rank) {
               "worker recv mixed_batch: %s", err);
         CHECK(cmd.type == PULSAR_TP_FRAME_MIXED_BATCH,
               "worker mixed_batch type %d", (int)cmd.type);
-        CHECK(cmd.n_items == 1 && cmd.n_tokens == 0,
-              "worker mixed_batch header (rows only)");
+        CHECK(cmd.n_items == 1 && cmd.n_tokens == 0 && cmd.value == 4 && cmd.session_id == 2001,
+              "worker mixed_batch header (rows only; head_runs + the rows' session ride it)");
         CHECK(cmd.items && cmd.items[0].session_id == 2001 && cmd.items[0].bank == 5 &&
               cmd.items[0].pos == 90 && cmd.items[0].token == 71,
               "worker mixed_batch payload");

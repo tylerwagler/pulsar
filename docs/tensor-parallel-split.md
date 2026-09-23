@@ -161,11 +161,13 @@ bug, not a design change.
         The pair (n=2, even split) never showed it, and the mesh test builds
         its slice at stride pitch, which is why neither caught it.
 - 4e. Phase-3 lockstep over our session surface — **IN PROGRESS**, tracked in
-      docs/tensor-parallel-port.md: create, sync, eval, batched decode, the
-      mixed step, rewind and invalidate are mirrored, and speculation shares
-      one rng (both the CLI's `generate_speculative` and `spec_next_base` sync
-      it before drawing).  Open: warm-fork, the bank agreement question, the
-      server driver model, images (refused under TP until they ride the frame).
+      docs/tensor-parallel-port.md.  Driver model DECIDED 2026-09-23 (L238): a
+      worker rank runs the receive loop `pulsar_tp_worker_run` over a session
+      registry keyed by the create ordinal; the leader's wrappers ship frames.
+      Mirrored: create, destroy, sync, eval, batched decode, the mixed step
+      (head policy on the wire), rewind, invalidate, the speculation rng.
+      Next: banks (save/restore/fork/partial fork), rewrite_from_common,
+      note_committed_tokens, set_logits, the speculative round family.
 - **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
       ownership but every rank still staged every expert: on GB10 host
       registration is unsupported, so the supported load path stages each

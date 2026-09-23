@@ -1,39 +1,38 @@
-/* 4e ENGINE-MIRROR test: the layer between the transport and the graph.
+/* 4e ENGINE-MIRROR test (L238): the worker RECEIVE LOOP and the leader wrappers.
  *
  * WHY THIS EXISTS
  * ---------------
- * `tp_mesh_test` proves the TRANSPORT (frames, acks, all-reduce) and the
- * single-Spark gates prove the NON-TP path, but neither ever enters the engine
- * wrappers that decide whether a session operation is mirrored at all.  That
- * gap shipped a real bug: all seven transport send/recv calls in the first
- * three mirroring increments read the transport's convention backwards
- * (nonzero is SUCCESS), so the leader refused every successful send and the
- * worker treated a failed ack as delivered.  A two-process engine pair cannot
- * cover this on one box -- earlyoom kills it during model load -- so this test
- * takes the other route.
+ * `tp_mesh_test` proves the TRANSPORT and the single-Spark gates prove the
+ * NON-TP path; neither enters the engine layer between them -- the leader
+ * wrappers that ship frames and the worker loop that applies them.  That gap
+ * once shipped an inverted return convention at seven call sites, and later a
+ * batch frame that never carried its session id (a correct batched decode
+ * would have been refused in production).  A two-process engine pair cannot
+ * cover this on one box (earlyoom kills two 86 GB engines during load), so
+ * this test takes the other route.
  *
  * HOW
  * ---
- * A session is FABRICATED: a zeroed pulsar_engine carrying a real mesh
- * transport, and a zeroed pulsar_session whose `tp_session_id` is deliberately
- * NOT the id the leader mirrors under.  Every path asserted here returns
- * BEFORE the wrapper reaches the graph, so no model, no weights and no GPU work
- * are needed -- and the assertions are exactly the plumbing that was inverted:
+ * The worker rank runs the REAL loop, `pulsar_tp_worker_run`, on a fabricated
+ * engine: a zeroed pulsar_engine carrying a real mesh transport and an empty
+ * session registry.  Every frame the leader sends names a session the worker
+ * never created, so every path asserted here returns BEFORE the loop touches
+ * a graph -- no model, no weights, no GPU work -- and the assertions are the
+ * plumbing that matters:
  *
- *   A. worker, session-id mismatch  -> refuse loudly, and ack the refusal
- *   B. worker, frame-type mismatch  -> refuse loudly, and ack the refusal
- *   C. leader, dead transport       -> refuse before sending anything
+ *   A. sync / eval / batched decode / mixed step for an unknown session
+ *      -> refused by name, and the refusal ACKED so the leader reads it at once
+ *   B. a void frame (rewind) for an unknown session -> the worker marks the
+ *      pair failed with NO ack; the NEXT acked frame carries the refusal back
+ *      as a failed ack, not as a deadline ("did not answer")
+ *   C. STOP ends the loop cleanly (rc 0) even on a failed pair, and a worker
+ *      that has stopped but stays alive makes the leader's collect time out
+ *   D. the leader wrapper on a dead transport refuses before sending
+ *   E. a worker rank calling a leader wrapper is refused by name (the
+ *      same-driver model this slice retired)
  *
- * The leader side of A and B drives the transport directly (pulsar_tp_send_sync
- * / send_eval + wait_command_ack), because the leader's wrapper would call
- * sync() on the fabricated session.  What that still proves is the half that
- * matters: the worker's ack reaches the leader AND the leader reports the
- * failure, which is only true if send reports success as nonzero and the ack
- * carries a nonzero status.
- *
- * The target is run under `timeout`: a missing ack would otherwise HANG the
- * leader in wait_command_ack rather than fail it, and a hang is not a test
- * result. */
+ * The target sets PULSAR_TP_TIMEOUT_SEC=1 and runs under `timeout`: a missing
+ * ack would otherwise HANG the leader, and a hang is not a test result. */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -85,29 +84,30 @@ static int free_port(void) {
     return port;
 }
 
-/** A session the graph never sees.  Every path this test asserts on returns
- * before the wrapper dereferences the graph, so the all-zero graph is not a
- * lie the test tells -- it is the boundary of what is being asserted. */
-static pulsar_session *fabricate_session(pulsar_tp *tp, uint64_t mirror_id) {
-    pulsar_session *s = (pulsar_session *)std::calloc(1, sizeof(*s));
+/** An engine the graph never sees: a real transport, an empty registry. */
+static pulsar_engine *fabricate_engine(pulsar_tp *tp) {
     pulsar_engine *e = (pulsar_engine *)std::calloc(1, sizeof(*e));
-    if (!s || !e) {
+    if (!e) {
         std::fprintf(stderr, "tp_mirror_test: out of memory\n");
         std::exit(1);
     }
     e->tp = tp;
+    return e;
+}
+
+/** A session the graph never sees, on the LEADER: its wrappers must refuse
+ * before touching it. */
+static pulsar_session *fabricate_session(pulsar_engine *e, uint64_t mirror_id) {
+    pulsar_session *s = (pulsar_session *)std::calloc(1, sizeof(*s));
+    if (!s) {
+        std::fprintf(stderr, "tp_mirror_test: out of memory\n");
+        std::exit(1);
+    }
     s->engine = e;
     s->tp_session_id = mirror_id;
     return s;
 }
 
-static void free_session(pulsar_session *s) {
-    pulsar_engine *e = s->engine;
-    std::free(s);
-    std::free(e);
-}
-
-/** A borrowed token view: the wrapper must not free a caller's buffer. */
 static void fill_prompt(pulsar_tokens *p, int *v, int n) {
     std::memset(p, 0, sizeof(*p));
     for (int i = 0; i < n; i++) v[i] = 100 + i;
@@ -116,9 +116,7 @@ static void fill_prompt(pulsar_tokens *p, int *v, int n) {
     p->cap = n;
 }
 
-/* The leader: the id every frame carries, and the id the worker does NOT have. */
-#define LEADER_SID 7ull
-#define WORKER_SID 8ull
+#define SID 7ull   /* a session the worker never created */
 
 static int run_leader(pulsar_tp *tp) {
     char err[512];
@@ -126,223 +124,111 @@ static int run_leader(pulsar_tp *tp) {
     pulsar_tokens prompt;
     fill_prompt(&prompt, toks, 16);
 
-    /* A. The worker holds session 8; every frame here says 7, so the worker
-     * must refuse and say so.  send_sync reporting nonzero is itself the
-     * convention check: a zero here means the transport refused a good frame. */
-    CHECK(pulsar_tp_send_sync(tp, LEADER_SID, prompt.v, (uint32_t)prompt.len) != 0,
+    /* A. Four acked operations for an unknown session: each must come back as
+     * a failed ACK naming the operation.  send_* reporting nonzero is itself
+     * the convention check. */
+    CHECK(pulsar_tp_send_sync(tp, SID, prompt.v, (uint32_t)prompt.len) != 0,
           "send_sync must report success as nonzero");
     err[0] = 0;
-    CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "sync", err, sizeof(err)),
-          "the leader must see the worker's refusal, not a success");
-    CHECK(std::strstr(err, "sync failed") != NULL,
-          "the refusal must name the operation the leader was waiting on: %s", err);
+    CHECK(!pulsar_tp_wait_command_ack(tp, SID, "sync", err, sizeof(err)) &&
+          std::strstr(err, "sync failed") != NULL,
+          "the leader must read the worker's sync refusal as a failed ack: %s", err);
 
-    /* B. A frame the worker is not expecting (EVAL where it called sync): the
-     * refusal must come from the frame-TYPE check, and travel the same way. */
-    CHECK(pulsar_tp_send_eval(tp, LEADER_SID, 4242, 99) != 0,
-          "send_eval must report success as nonzero");
+    CHECK(pulsar_tp_send_eval(tp, SID, 4242, 99) != 0, "send_eval must report success as nonzero");
     err[0] = 0;
-    CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "eval", err, sizeof(err)),
-          "the leader must see the worker's frame-type refusal");
-    CHECK(std::strstr(err, "eval failed") != NULL,
-          "the refusal must name the operation: %s", err);
+    CHECK(!pulsar_tp_wait_command_ack(tp, SID, "eval", err, sizeof(err)) &&
+          std::strstr(err, "eval failed") != NULL,
+          "the leader must read the worker's eval refusal: %s", err);
 
-    /* C. The batched decode.  The worker is on session 8 again, so the frame's
-     * id (7) must stop it before it builds a single row -- and this is the only
-     * place the EVAL_BATCH payload's encode/decode is driven by the engine's own
-     * sender. */
-    {
-        pulsar_tp_batch_item items[2];
-        for (int i = 0; i < 2; i++) {
-            items[i].session_id = LEADER_SID;
-            items[i].bank = 1;
-            items[i].pos = 10 + i;
-            items[i].token = 1000 + i;
-            items[i].reserved = 0;
-        }
-        CHECK(pulsar_tp_send_eval_batch(tp, items, 2) != 0,
-              "send_eval_batch must report success as nonzero");
-        err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "batch decode", err, sizeof(err)),
-              "the leader must see the worker's batch refusal");
-        CHECK(std::strstr(err, "batch decode failed") != NULL,
-              "the batch refusal must name the operation: %s", err);
+    pulsar_tp_batch_item items[2];
+    for (int i = 0; i < 2; i++) {
+        items[i].session_id = SID;
+        items[i].bank = 1;
+        items[i].pos = 10 + i;
+        items[i].token = 1000 + i;
+        items[i].reserved = 0;
     }
+    CHECK(pulsar_tp_send_eval_batch(tp, items, 2) != 0, "send_eval_batch must report success as nonzero");
+    err[0] = 0;
+    CHECK(!pulsar_tp_wait_command_ack(tp, SID, "batch decode", err, sizeof(err)) &&
+          std::strstr(err, "batch decode failed") != NULL,
+          "the leader must read the worker's batch refusal (the frame now carries its session id): %s", err);
 
-    /* E. The mixed step, on its own frame type.  Same divergence, but this also
-     * pins WHICH frame the wrapper expects: decode_mixed and decode_multiseq
-     * take identical rows, so the type is the only thing that says which
-     * contract the leader is in. */
-    {
-        pulsar_tp_batch_item items[2];
-        for (int i = 0; i < 2; i++) {
-            items[i].session_id = LEADER_SID;
-            items[i].bank = 4;
-            items[i].pos = 900 + i;
-            items[i].token = 80000 + i;
-            items[i].reserved = 0;
-        }
-        CHECK(pulsar_tp_send_mixed_batch(tp, items, 2) != 0,
-              "send_mixed_batch must report success as nonzero");
-        err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "mixed batch", err, sizeof(err)),
-              "the leader must see the worker's mixed-batch refusal");
-        CHECK(std::strstr(err, "mixed batch failed") != NULL,
-              "the mixed refusal must name the operation: %s", err);
-    }
+    CHECK(pulsar_tp_send_mixed_batch(tp, items, 2, 3u) != 0, "send_mixed_batch must report success as nonzero");
+    err[0] = 0;
+    CHECK(!pulsar_tp_wait_command_ack(tp, SID, "mixed batch", err, sizeof(err)) &&
+          std::strstr(err, "mixed batch failed") != NULL,
+          "the leader must read the worker's mixed refusal: %s", err);
 
-    /* H. A worker that has already found the pair broken must not go on
-     * applying frames -- and the refusal must reach the leader at ONCE, not
-     * through the deadline.  The assertion distinguishes the two: the error has
-     * to be the worker's failed ack, not "did not answer". */
-    {
-        int toks2[2] = { 21, 22 };
-        pulsar_tokens prompt2;
-        fill_prompt(&prompt2, toks2, 2);
-        CHECK(pulsar_tp_send_sync(tp, LEADER_SID, prompt2.v, 2) != 0,
-              "post-failure sync send failed");
-        err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "sync", err, sizeof(err)),
-              "the leader must see the worker's refusal");
-        CHECK(std::strstr(err, "sync failed") != NULL,
-              "the refusal must arrive as a failed ACK, not a deadline: %s", err);
-        CHECK(std::strstr(err, "did not answer") == NULL,
-              "propagation must be immediate, not by timeout: %s", err);
-    }
+    /* B. A void frame for an unknown session marks the worker's pair failed
+     * silently; the next acked frame must carry that back AT ONCE. */
+    CHECK(pulsar_tp_send_rewind(tp, SID, 12) != 0, "send_rewind must report success as nonzero");
+    CHECK(pulsar_tp_send_sync(tp, SID, prompt.v, 4) != 0, "post-void sync send failed");
+    err[0] = 0;
+    CHECK(!pulsar_tp_wait_command_ack(tp, SID, "sync", err, sizeof(err)),
+          "the leader must see the worker's refusal after the void divergence");
+    CHECK(std::strstr(err, "sync failed") != NULL && std::strstr(err, "did not answer") == NULL,
+          "propagation must be a failed ack, not a deadline: %s", err);
 
-    /* G. A peer that stays ALIVE but SILENT must produce a refusal, not a hang.
-     * This is the failure mode that made every blocking mirror in this slice
-     * look dangerous, and it is why this target used to need `timeout`: with no
-     * control-plane deadline the leader sat in wait_command_ack forever.  The
-     * worker is at its own tail here, holding the connection open and saying
-     * nothing. */
+    /* C. STOP ends the loop; the worker then stays alive and silent past the
+     * control-plane deadline, so this collect must time out rather than hang. */
+    CHECK(pulsar_tp_send_stop(tp) != 0, "send_stop must report success as nonzero");
     {
         char terr[256];
         terr[0] = 0;
-        CHECK(!pulsar_tp_wait_command_ack(tp, LEADER_SID, "silent peer", terr, sizeof(terr)),
-              "a silent peer must fail the collect, not satisfy it");
-        CHECK(std::strstr(terr, "did not answer") != NULL,
-              "the refusal must name the timeout rather than a closed channel: %s", terr);
+        CHECK(!pulsar_tp_wait_command_ack(tp, SID, "silent peer", terr, sizeof(terr)) &&
+              std::strstr(terr, "did not answer") != NULL,
+              "a stopped-but-alive peer must time the collect out, not satisfy it: %s", terr);
     }
 
-    /* F. A leader whose transport is already dead refuses before it sends
-     * anything -- no frame, no graph, no half-mirrored operation.  Last,
-     * because marking the pair failed poisons the transport for good. */
+    /* D. A leader whose transport is already dead refuses before it sends
+     * anything.  Last, because marking the pair failed poisons the transport. */
     pulsar_tp_mark_failed(tp);
-    pulsar_session *s = fabricate_session(tp, LEADER_SID);
+    pulsar_engine *e = fabricate_engine(tp);
+    pulsar_session *s = fabricate_session(e, SID);
     err[0] = 0;
     const int rc = pulsar_session_sync_mm(s, &prompt, NULL, 0, err, sizeof(err));
-    CHECK(rc == 1, "a leader on a dead transport must refuse, got rc=%d", rc);
-    CHECK(std::strstr(err, "transport failed earlier") != NULL,
-          "the refusal must name the dead transport: %s", err);
-    free_session(s);
+    CHECK(rc == 1 && std::strstr(err, "transport failed earlier") != NULL,
+          "a leader on a dead transport must refuse before sending, got rc=%d: %s", rc, err);
+    std::free(s);
+    std::free(e);
     return g_failures;
 }
 
 static int run_worker(pulsar_tp *tp) {
     char err[512];
-    int toks[16];
-    pulsar_tokens prompt;
-    fill_prompt(&prompt, toks, 16);
-
-    /* A. Session-id mismatch: the wrapper must refuse and ACK the refusal.  If
-     * it returns without acking, the leader's collect above hangs -- which the
-     * `timeout` on this target turns into a failure rather than a hang. */
-    pulsar_session *s = fabricate_session(tp, WORKER_SID);
     err[0] = 0;
-    int rc = pulsar_session_sync_mm(s, &prompt, NULL, 0, err, sizeof(err));
-    CHECK(rc == 1, "the worker must refuse a frame for another session, got rc=%d", rc);
-    CHECK(std::strstr(err, "diverged") != NULL,
-          "the refusal must name the divergence: %s", err);
+    pulsar_engine *e = fabricate_engine(tp);
 
-    /* B. Frame-type mismatch, with the session id now MATCHING: the refusal has
-     * to come from the type check, so this covers the branch the id check
-     * short-circuits in A. */
-    free_session(s);
-    s = fabricate_session(tp, LEADER_SID);
+    /* E. A worker rank does not drive sessions: the leader wrappers refuse it
+     * by name, before any frame moves. */
+    {
+        pulsar_session *s = fabricate_session(e, SID);
+        int toks[4];
+        pulsar_tokens prompt;
+        fill_prompt(&prompt, toks, 4);
+        const int rc = pulsar_session_sync_mm(s, &prompt, NULL, 0, err, sizeof(err));
+        CHECK(rc == 1 && std::strstr(err, "is a worker") != NULL,
+              "a worker calling a leader wrapper must be refused by name, got rc=%d: %s", rc, err);
+        pulsar_session *created = (pulsar_session *)0x1;
+        CHECK(pulsar_session_create(&created, e, 4096) == 1 && created == NULL,
+              "a worker creating a session from its own driver must be refused");
+        std::free(s);
+    }
+
+    /* The real loop, on the fabricated engine.  Every frame names a session it
+     * never created, so nothing here reaches a graph. */
     err[0] = 0;
-    rc = pulsar_session_sync_mm(s, &prompt, NULL, 0, err, sizeof(err));
-    CHECK(rc == 1, "the worker must refuse an unexpected frame type, got rc=%d", rc);
-    CHECK(std::strstr(err, "expected a mirrored sync") != NULL,
-          "the refusal must name the frame it expected: %s", err);
+    const int rc = pulsar_tp_worker_run(e, err, sizeof(err));
+    CHECK(rc == 0, "the loop must end cleanly on STOP even with the pair marked failed, got rc=%d: %s", rc, err);
+    CHECK(pulsar_tp_failed(tp), "the void divergence (rewind for an unknown session) must have marked the pair failed");
+    CHECK(e->tp_worker_n == 0 && e->tp_worker_slots == NULL,
+          "the registry must be empty and released after the loop");
+    std::free(e);
 
-    /* D. The batched decode, same divergence: the wrapper must refuse on the
-     * frame's session id before it builds a row, and ack.  A fresh session on
-     * the MISMATCHED id, because the id is what has to stop it -- with a
-     * matching id the wrapper would go on to decode into the fabricated
-     * session's graph. */
-    free_session(s);
-    s = fabricate_session(tp, WORKER_SID);
-    {
-        pulsar_multiseq_req rows[2];
-        rows[0].bank = 1; rows[0].pos = 10; rows[0].token = 1000;
-        rows[1].bank = 1; rows[1].pos = 11; rows[1].token = 1001;
-        float logits[8] = { 0 };
-        err[0] = 0;
-        rc = pulsar_session_decode_multiseq(s, rows, 2, logits, 8, err, sizeof(err));
-        CHECK(rc == 1, "the worker must refuse a batch for another session, got rc=%d", rc);
-        CHECK(std::strstr(err, "diverged") != NULL,
-              "the batch refusal must name the divergence: %s", err);
-    }
-    free_session(s);
-
-    /* E. The mixed step: a fresh session on the mismatched id again, so the
-     * frame's session id is what stops it. */
-    s = fabricate_session(tp, WORKER_SID);
-    {
-        pulsar_multiseq_req rows[2];
-        rows[0].bank = 4; rows[0].pos = 900; rows[0].token = 80000;
-        rows[1].bank = 4; rows[1].pos = 901; rows[1].token = 80001;
-        float logits[8] = { 0 };
-        uint32_t out_rows = 0;
-        err[0] = 0;
-        rc = pulsar_session_decode_mixed(s, rows, 2, logits, 8, &out_rows,
-                                         PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
-        CHECK(rc == 1, "the worker must refuse a mixed batch for another session, got rc=%d", rc);
-        CHECK(std::strstr(err, "diverged") != NULL,
-              "the mixed refusal must name the divergence: %s", err);
-
-        /* F. Speculation FAILS CLOSED on a pair whose rng stream it does not
-         * share: the accept walk draws from the caller's rng, so a round may
-         * only begin once pulsar_session_spec_next_base has taken the leader's
-         * state.  The refusal comes from the round gate before anything reads
-         * the graph, which is what makes it assertable on a fabricated
-         * session. */
-        pulsar_spec_round *round = pulsar_spec_round_new();
-        CHECK(round != NULL, "pulsar_spec_round_new failed");
-        if (round) {
-            err[0] = 0;
-            const int brc = pulsar_session_spec_round_begin(s, round, 12345, 8, 8,
-                                                            0.0f, 0, 1.0f, 0.0f,
-                                                            err, sizeof(err));
-            CHECK(brc != 0, "a pair must refuse to begin a spec round, got rc=%d", brc);
-            CHECK(std::strstr(err, "has not synchronized its speculation rng") != NULL,
-                  "the refusal must say why: %s", err);
-            pulsar_spec_round_free(round);
-        }
-    }
-    free_session(s);
-
-    /* H. Mark this rank's pair failed, then take one more acked frame through
-     * the wrapper: it must be consumed, refused and ACKED -- never applied. */
-    s = fabricate_session(tp, LEADER_SID);
-    pulsar_tp_mark_failed(tp);
-    {
-        int toks2[2] = { 21, 22 };
-        pulsar_tokens prompt2;
-        fill_prompt(&prompt2, toks2, 2);
-        err[0] = 0;
-        const int mrc = pulsar_session_sync_mm(s, &prompt2, NULL, 0, err, sizeof(err));
-        CHECK(mrc == 1, "a failed pair must refuse a further sync, got rc=%d", mrc);
-        CHECK(std::strstr(err, "marked the pair failed") != NULL,
-              "the refusal must say the pair was already failed: %s", err);
-    }
-    free_session(s);
-
-    /* Stay ALIVE and SILENT past the leader's control-plane deadline, so its
-     * last round tests a timeout rather than a closed channel.  The target sets
-     * PULSAR_TP_TIMEOUT_SEC=1; this sleeps longer than that and shorter than the
-     * target's `timeout`. */
+    /* Stay ALIVE and SILENT past the leader's deadline (the target sets
+     * PULSAR_TP_TIMEOUT_SEC=1) so its last collect tests a timeout, not a
+     * closed channel. */
     std::fflush(stdout);
     std::fflush(stderr);
     sleep(3);
@@ -415,7 +301,7 @@ int main(void) {
         if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) rc = 1;
     }
     if (rc == 0)
-        std::printf("tp_mirror_test: ok (worker refusals + acks, leader collect, dead-transport refusal)\n");
+        std::printf("tp_mirror_test: ok (worker loop refusals + acks, void divergence propagation, clean STOP, dead-transport and worker-rank refusals)\n");
     else
         std::printf("tp_mirror_test: FAILED\n");
     return rc;

@@ -533,6 +533,15 @@ int main(int argc, char **argv) {
 
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
+    /* Slice 4e (L238): a TP worker rank serves no HTTP and schedules nothing;
+     * it applies the leader's frames until the leader stops it. */
+    if (pulsar_engine_is_tp_worker(engine)) {
+        char werr[512];
+        const int wrc = pulsar_tp_worker_run(engine, werr, sizeof(werr));
+        if (wrc != 0) server_log(PULSAR_LOG_DEFAULT, "pulsar-server: TP worker stopped on a failure: %s", werr);
+        pulsar_engine_close(engine);
+        return wrc;
+    }
 
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged

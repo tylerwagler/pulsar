@@ -245,7 +245,6 @@ void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { 
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
 
-void pulsar_session_free(pulsar_session *s) { if (s) s->destroy(); }
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
@@ -263,14 +262,15 @@ int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t d
 int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
 
 /* ---------------------------------------------------------------------------
- * Slice 4e: lockstep mirroring of the session's input.
+ * Slice 4e: lockstep mirroring of the session's input -- the LEADER half.
  *
- * Both ranks run the same driver with the same arguments, but only the LEADER's
- * arguments are authoritative.  The leader ships the operation and then waits
- * for the worker's ack; the worker blocks for that frame and runs on what it
- * received.  A worker whose own driver disagreed -- a stale prompt, a truncated
- * request, a session opened out of order -- therefore cannot desync the pair,
- * because its arguments are never read.
+ * Rank 0 drives the pair: every public session operation below ships a frame
+ * to the workers, runs its own half, and collects one ack per peer.  A rank
+ * above 0 drives nothing -- it runs pulsar_tp_worker_run (tp_worker.cpp), the
+ * receive loop that applies the leader's frames to a session registry keyed
+ * by the create ordinal.  A worker rank reaching one of these wrappers is
+ * therefore a driver bug (its arguments are not authoritative and never were),
+ * and is refused by name rather than mirrored.
  *
  * The mirror lives at this, the public API boundary, and not on the member
  * sync()/eval(): those are re-entered from inside a running operation (the
@@ -298,6 +298,19 @@ static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
+/** A worker rank has no arguments of its own to mirror: its sessions are driven
+ * by the leader's frames through pulsar_tp_worker_run.  A driver that calls a
+ * session operation on a worker is the same-driver model this slice retired,
+ * and it is refused before any frame moves. */
+static int tp_mirror_worker_drives_nothing(pulsar_tp *tp, const char *operation,
+                                           char *err, size_t errlen) {
+    if (pulsar_tp_rank(tp) == 0) return 0;
+    if (err) snprintf(err, errlen,
+                      "tp: rank %d is a worker; it does not drive %s -- it runs pulsar_tp_worker_run",
+                      pulsar_tp_rank(tp), operation);
+    return 1;
+}
+
 /** The collector every mirrored operation ends with on the leader: one ack per
  * peer.  It is read even when `body_rc` failed locally, because an unread ack
  * would be consumed by the NEXT operation, shifting every later frame by one. */
@@ -316,253 +329,109 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
     return 0;
 }
 
-/** The checks every worker-side frame passes before its body runs.  A frame for
- * another session means the ranks' drivers diverged; without this it would
- * mirror a stranger's command into this session -- wrong output, silently. */
-static int tp_mirror_worker_frame(pulsar_session *s, const pulsar_tp_command *command,
-                                  pulsar_tp_frame_type expected, const char *operation,
-                                  char *err, size_t errlen) {
-    if (command->type != expected) {
-        if (err) snprintf(err, errlen,
-                          "tp: expected a mirrored %s but the leader sent frame type %d",
-                          operation, (int)command->type);
-        return 1;
-    }
-    if (command->session_id != s->tp_session_id) {
-        if (err) snprintf(err, errlen,
-                          "tp: the leader mirrored session %llu but this is session %llu; "
-                          "the ranks' drivers diverged, refusing to mirror into the wrong session",
-                          (unsigned long long)command->session_id,
-                          (unsigned long long)s->tp_session_id);
-        return 1;
-    }
-    /* A rank that has ALREADY found the pair broken must stop applying frames.
-     * It still consumes this one and acks the refusal, which is what makes the
-     * documented propagation true: the leader reads a failed ack at once instead
-     * of waiting out its control-plane deadline, and this rank commits no
-     * further state on a stream it has already found inconsistent.  (The
-     * leader-side tp_mirror_dead check refuses BEFORE sending, because a leader
-     * that skipped a frame would leave its own stream misaligned.) */
-    if (pulsar_tp_failed(s->engine->tp)) {
-        if (err) snprintf(err, errlen,
-                          "tp: this rank marked the pair failed earlier; refusing to apply %s",
-                          operation);
-        return 1;
-    }
-    return 0;
-}
-
-/** Reports this worker's half back to the leader.  Sent even on a refusal: a
- * rank that dies without answering hangs the leader instead of failing it.
- * The id is the one the COMMAND carried, not this rank's own: on a session
- * divergence the leader must read back its own id with the refusal status, not
- * a stranger's id that would send it looking for the wrong session. */
-static int tp_mirror_worker_ack(pulsar_tp *tp, uint64_t command_session_id, int rc,
-                                char *err, size_t errlen) {
-    if (pulsar_tp_send_command_ack(tp, command_session_id, rc) != 0) return 0;
-    if (err) snprintf(err, errlen, "tp: could not ack the mirrored command to the leader");
-    return 1;
-}
-
 /** The failure report a `void` operation can make: it has no error channel, so
  * the pair is marked failed -- every later mirrored operation then refuses
- * through tp_mirror_dead -- and the reason is printed here, named, while it is
- * still the newest line on stderr. */
-static void tp_mirror_fail_void(pulsar_tp *tp, const char *operation, const char *why) {
+ * through tp_mirror_dead on the leader, and through the worker loop's failed
+ * check on a worker -- and the reason is printed here, named, while it is still
+ * the newest line on stderr.  Shared with tp_worker.cpp. */
+void pulsar_tp_mirror_fail_void(pulsar_tp *tp, const char *operation, const char *why) {
     pulsar_tp_mark_failed(tp);
     fprintf(stderr, "pulsar: tp: the mirrored %s failed (%s); the pair is marked failed\n",
             operation, why ? why : "no reason given");
 }
 
-/* The two operations that return void.  Which entry point a caller is in is the
- * only thing that varies between them, so the mirror below is written once
- * against this tag. */
-typedef enum {
-    TP_MIRROR_REWIND,
-    TP_MIRROR_INVALIDATE,
-} tp_mirror_void_op;
-
-static const char *tp_mirror_void_name(tp_mirror_void_op op) {
-    return op == TP_MIRROR_REWIND ? "rewind" : "invalidate";
-}
-
-static pulsar_tp_frame_type tp_mirror_void_frame(tp_mirror_void_op op) {
-    return op == TP_MIRROR_REWIND ? PULSAR_TP_FRAME_REWIND : PULSAR_TP_FRAME_INVALIDATE;
-}
-
-static int tp_mirror_void_send(pulsar_tp *tp, uint64_t session_id,
-                               tp_mirror_void_op op, int value) {
-    return op == TP_MIRROR_REWIND ? pulsar_tp_send_rewind(tp, session_id, value)
-                                  : pulsar_tp_send_invalidate(tp, session_id);
-}
-
-static void tp_mirror_void_apply(pulsar_session *s, tp_mirror_void_op op, int value) {
-    if (op == TP_MIRROR_REWIND) s->rewind(value);
-    else                         s->invalidate();
-}
-
-/** Rewind and invalidate, mirrored.  These are the one pair of mirrored
- * operations that collects NO ack, for two reasons that agree: a `void` caller
- * has nowhere to put a peer's refusal, and a leader that waited would hang on
- * the first operation the peer's driver did not happen to make -- which is a
- * live risk here, because several callers are the server's cache and scheduler
- * (`kv_cache.cpp`, `server_sched.cpp`), whose timing follows LOCAL memory state
- * rather than the request stream.  The frame is fire-and-forget, and the
- * worker's frame-type check is the divergence alarm: an unexpected frame marks
- * the pair failed and prints, so the next ACKED operation carries the refusal
- * back to the leader instead of the pair hanging on it. */
-static void pulsar_tp_mirror_void(pulsar_session *s, pulsar_tp *tp,
-                                  tp_mirror_void_op op, int value) {
-    const char *name = tp_mirror_void_name(op);
-    if (pulsar_tp_rank(tp) == 0) {
-        if (tp_mirror_void_send(tp, s->tp_session_id, op, value) == 0) {
-            tp_mirror_fail_void(tp, name, "the frame could not be shipped");
-            return;
-        }
-        tp_mirror_void_apply(s, op, value);
-        return;
-    }
-    char err[256];
-    err[0] = '\0';
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
-        tp_mirror_fail_void(tp, name, err);
-        return;
-    }
-    if (tp_mirror_worker_frame(s, &command, tp_mirror_void_frame(op), name,
-                               err, sizeof(err)) != 0) {
-        tp_mirror_fail_void(tp, name, err);
-        pulsar_tp_command_free(&command);
-        return;
-    }
-    if (op == TP_MIRROR_REWIND && command.value != value) {
-        fprintf(stderr, "pulsar: tp: worker rewind %d differs from the leader's %d; "
-                        "mirroring the leader's\n", value, command.value);
-    }
-    tp_mirror_void_apply(s, op, command.value);
-    pulsar_tp_command_free(&command);
+/** The void operations the leader mirrors FIRE-AND-FORGET: destroy, rewind and
+ * invalidate.  A `void` caller has nowhere to put a peer's refusal, and several
+ * callers are the server's cache and scheduler, whose timing follows LOCAL
+ * memory state -- so no ack is collected; the worker loop's checks are the
+ * divergence alarm, and the next ACKED operation carries the refusal back. */
+static int tp_mirror_void_send(pulsar_tp *tp, uint64_t session_id, const char *name, int sent) {
+    if (sent != 0) return 1;
+    pulsar_tp_mirror_fail_void(tp, name, "the frame could not be shipped");
+    (void)session_id;
+    return 0;
 }
 
 int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng) {
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp || !rng) return 0;   /* pair off: the caller's stream is its own */
-    if (pulsar_tp_rank(tp) == 0) {
-        if (pulsar_tp_send_rng_state(tp, s->tp_session_id, *rng) == 0) {
-            tp_mirror_fail_void(tp, "rng sync", "the frame could not be shipped");
-            return -1;
-        }
-        s->spec_rng_synced = true;
-        return 0;
-    }
     char err[256];
-    err[0] = '\0';
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
-        tp_mirror_fail_void(tp, "rng sync", err);
+    if (tp_mirror_worker_drives_nothing(tp, "the speculation rng", err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, "rng sync", err);
         return -1;
     }
-    int rc = -1;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_RNG_STATE, "rng sync",
-                               err, sizeof(err)) == 0) {
-        /* The leader's stream BECOMES this rank's.  Every draw the round makes
-         * from here -- the fresh base, each accept test, the carry, the redraft
-         * -- then follows the leader's, which is what keeps the two ranks'
-         * accepted sets and KV frontiers identical. */
-        *rng = command.seq;
-        s->spec_rng_synced = true;
-        rc = 0;
-    } else {
-        tp_mirror_fail_void(tp, "rng sync", err);
-    }
-    pulsar_tp_command_free(&command);
-    return rc;
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "rng sync",
+                             pulsar_tp_send_rng_state(tp, s->tp_session_id, *rng))) return -1;
+    s->spec_rng_synced = true;
+    return 0;
 }
+
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    /* A worker rank creates sessions only from the leader's frames (the loop
+     * calls the member directly); a driver creating one here is refused before
+     * the ordinal is consumed, so the two ranks' ordinals stay aligned. */
+    if (e && e->tp && pulsar_tp_rank(e->tp) != 0) {
+        fprintf(stderr, "pulsar: tp: rank %d is a worker; it does not create sessions -- "
+                        "it runs pulsar_tp_worker_run\n", pulsar_tp_rank(e->tp));
+        if (out) *out = NULL;
+        return 1;
+    }
     const int rc = pulsar_session::create(out, e, ctx_size);
     if (rc != 0 || !out || !*out) return rc;
     pulsar_session *s = *out;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return 0;
-    /* Slice 4e: session create IS mirrored -- the last of the objective's five
-     * operations, and the one that was refused for three rounds on the grounds
-     * that a worker blocking here would deadlock a pair whose admission
-     * decisions differ.  The control-plane deadline removed that objection: the
-     * same divergence is now a bounded refusal instead of a hang.
-     *
-     * The session's mirror id is its create ordinal, so both ranks already agree
-     * on it by construction; what the frame adds is the CHECK -- the leader
-     * announces the id and the context size it actually created, and a worker
-     * whose own create produced something else refuses HERE, at the earliest
-     * point, instead of at the first mirrored operation.  This function has no
-     * error buffer, so the reason goes to stderr and the return code carries it,
-     * the same shape as the engine failures it sits beside.
-     *
-     * A refused create frees the session on BOTH ranks and leaves *out NULL:
-     * a session the pair did not agree on must not reach a caller, and each rank
-     * can only clean up its own. */
+    /* Slice 4e: the session's mirror id is its create ordinal, so both ranks
+     * already agree on it by construction; what the frame adds is the CHECK --
+     * the leader announces the id and the context size it created, and a
+     * worker whose own create produced a different ordinal refuses HERE, at
+     * the earliest point.  A refused create frees the session on the leader
+     * and leaves *out NULL: a session the pair did not agree on must not reach
+     * a caller.  This function has no error buffer, so the reason goes to
+     * stderr and the return code carries it. */
     char err[256];
     err[0] = '\0';
-    if (pulsar_tp_rank(tp) == 0) {
-        if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size) == 0) {
-            tp_mirror_fail_void(tp, "session create", "the frame could not be shipped");
-            fprintf(stderr, "pulsar: tp: could not mirror the session create\n");
-            pulsar_session_free(s);
-            *out = NULL;
-            return 1;
-        }
-        if (!pulsar_tp_wait_command_ack(tp, s->tp_session_id, "session create",
-                                        err, sizeof(err))) {
-            fprintf(stderr, "pulsar: tp: %s\n", err);
-            pulsar_session_free(s);
-            *out = NULL;
-            return 1;
-        }
-        return 0;
-    }
-    /* Worker: the leader's id and context size are the authority. */
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, sizeof(err)) == 0) {
-        tp_mirror_fail_void(tp, "session create", err);
-        fprintf(stderr, "pulsar: tp: %s\n", err);
-        pulsar_session_free(s);
+    if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size) == 0) {
+        pulsar_tp_mirror_fail_void(tp, "session create", "the frame could not be shipped");
+        s->destroy();
         *out = NULL;
         return 1;
     }
-    int refused = 1;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_SESSION_CREATE,
-                               "session create", err, sizeof(err)) == 0) {
-        if (command.value != ctx_size) {
-            /* A different context size is not a cosmetic disagreement: the raw
-             * cap, every scratch buffer and the KV layout are sized from it. */
-            snprintf(err, sizeof(err),
-                     "tp: the leader created this session with ctx %d but this rank "
-                     "created ctx %d; the ranks' drivers diverged",
-                     command.value, ctx_size);
-            tp_mirror_fail_void(tp, "session create", err);
-            fprintf(stderr, "pulsar: %s\n", err);
-        } else {
-            refused = 0;
-        }
-    } else {
-        tp_mirror_fail_void(tp, "session create", err);
-        fprintf(stderr, "pulsar: %s\n", err);
-    }
-    /* Ack either way: a refusal that sat out the leader's deadline would cost the
-     * pair seconds to learn what it could learn at once. */
-    if (tp_mirror_worker_ack(tp, command.session_id, refused, err, sizeof(err)) != 0 &&
-        refused == 0) {
-        refused = 1;
-    }
-    pulsar_tp_command_free(&command);
-    if (refused != 0) {
-        pulsar_session_free(s);
+    if (!pulsar_tp_wait_command_ack(tp, s->tp_session_id, "session create", err, sizeof(err))) {
+        fprintf(stderr, "pulsar: tp: %s\n", err);
+        s->destroy();
         *out = NULL;
         return 1;
     }
     return 0;
+}
+
+void pulsar_session_free(pulsar_session *s) {
+    if (!s) return;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (tp && pulsar_tp_rank(tp) == 0) {
+        /* Fire-and-forget like rewind: the worker loop drops its registry
+         * entry, and an unknown id there marks the pair failed. */
+        (void)tp_mirror_void_send(tp, s->tp_session_id, "session destroy",
+                                  pulsar_tp_send_session_destroy(tp, s->tp_session_id));
+    }
+    s->destroy();
+}
+
+/** The wire rows of a batched step: the engine's own row contract plus the
+ * session.  Shared by the batched decode and the mixed step so the two frames
+ * cannot encode a row differently. */
+static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsar_multiseq_req *reqs,
+                                            uint32_t n) {
+    pulsar_tp_batch_item *items = (pulsar_tp_batch_item *)xmalloc((size_t)n * sizeof(*items));
+    for (uint32_t i = 0; i < n; i++) {
+        items[i].session_id = s->tp_session_id;
+        items[i].bank       = (int32_t)reqs[i].bank;
+        items[i].pos        = reqs[i].pos;
+        items[i].token      = reqs[i].token;
+        items[i].reserved   = 0;
+    }
+    return items;
 }
 
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
@@ -573,67 +442,30 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->sync(prompt, images, n_images, err, errlen);
-    /* Leader only: the worker must still RECEIVE the frame, because a worker
-     * that returned here would leave the leader blocked in wait_command_ack
-     * forever.  A dead transport makes its recv fail, which fails loudly --
-     * that is the right ending, and the wrong one is a hang. */
-    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
-    /* Images do not ride the frame yet: the worker would run the leader's
-     * tokens against ITS OWN images, and the mirror's whole claim is that a
-     * worker's arguments are never read.  Refused on EVERY rank before any
-     * frame moves, so the same driver refuses the same request on both sides
-     * (rule 9). */
+    if (tp_mirror_worker_drives_nothing(tp, "sync", err, errlen)) return 1;
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    /* Images do not ride the frame yet; a worker has no images of its own to
+     * run the leader's tokens against.  Refused before any frame moves. */
     if (n_images > 0) {
         if (err) snprintf(err, errlen,
                           "tp: images are not mirrored onto the pair yet (%d supplied); refusing",
                           n_images);
         return 1;
     }
-    const int is_leader = pulsar_tp_rank(tp) == 0;
-    if (is_leader) {
-        /* The leader's arguments ARE the operation, so an empty prompt here is
-         * a caller bug.  A worker's empty prompt is not: its driver may have
-         * had nothing to say, and the frame below is the real input. */
-        if (!prompt || prompt->len <= 0) {
-            if (err) snprintf(err, errlen, "tp: the prompt is empty; refusing to mirror it");
-            return 1;
-        }
-        /* Ship first, run second: the worker is blocked in its own open() and
-         * unblocks as soon as the frame lands, so both ranks prefill together
-         * instead of the worker waiting out the leader's whole sync. */
-        if (pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v,
-                                (uint32_t)prompt->len) == 0) {
-            if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
-            return 1;
-        }
-        return tp_mirror_leader_ack(s, tp, "sync",
-                                    s->sync(prompt, images, n_images, err, errlen),
-                                    err, errlen);
+    /* The leader's arguments ARE the operation, so an empty prompt is a caller bug. */
+    if (!prompt || prompt->len <= 0) {
+        if (err) snprintf(err, errlen, "tp: the prompt is empty; refusing to mirror it");
+        return 1;
     }
-    /* Worker: the leader's frame is the input, and this rank's own prompt is
-     * never even looked at.  `borrowed` is a view of the frame's buffer -- the
-     * sync must not free it, and it stays valid until the ack below. */
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
-    int rc = 1;
-    pulsar_tokens borrowed;
-    borrowed.v = command.tokens;
-    borrowed.len = (int)command.n_tokens;
-    borrowed.cap = (int)command.n_tokens;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_SYNC, "sync", err, errlen) == 0) {
-        /* The loud form of "this rank's own arguments were not the leader's" --
-         * the exact condition this slice exists to make harmless.  Not an
-         * error: the leader's prompt is the one that runs. */
-        if (prompt && prompt->len != borrowed.len) {
-            fprintf(stderr, "pulsar: tp: worker prompt (%d tokens) differs from the leader's "
-                            "(%d); mirroring the leader's\n", prompt->len, borrowed.len);
-        }
-        rc = s->sync(&borrowed, images, n_images, err, errlen);
+    /* Ship first, run second, so both ranks prefill together instead of the
+     * worker waiting out the leader's whole sync. */
+    if (pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
+        return 1;
     }
-    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
-    pulsar_tp_command_free(&command);
-    return rc;
+    return tp_mirror_leader_ack(s, tp, "sync",
+                                s->sync(prompt, images, n_images, err, errlen),
+                                err, errlen);
 }
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
@@ -715,175 +547,66 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->eval(token, err, errlen);
-    /* Leader only: the worker must still RECEIVE the frame, because a worker
-     * that returned here would leave the leader blocked in wait_command_ack
-     * forever.  A dead transport makes its recv fail, which fails loudly --
-     * that is the right ending, and the wrong one is a hang. */
-    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
+    if (tp_mirror_worker_drives_nothing(tp, "eval", err, errlen)) return 1;
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
     /* The frame's seq is this session's decode position -- the number of tokens
      * whose KV the graph holds -- so the worker can do more than trust the
-     * leader's token: it can check that both ranks are at the same place before
-     * decoding it.  Without that check a rank that fell behind would decode the
-     * right token at the wrong position and produce confident nonsense. */
+     * leader's token: it refuses when the two ranks are not at the same place.
+     * Without that check a rank that fell behind would decode the right token
+     * at the wrong position and produce confident nonsense. */
     const uint64_t pos = (uint64_t)s->checkpoint.len;
-    if (pulsar_tp_rank(tp) == 0) {
-        if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) == 0) {
-            if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
-            return 1;
-        }
-        return tp_mirror_leader_ack(s, tp, "eval", s->eval(token, err, errlen), err, errlen);
+    if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
+        return 1;
     }
-    /* Worker: the leader's token is the one that runs, and this rank's `token`
-     * argument is never read. */
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
-    int rc = 1;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_EVAL, "eval", err, errlen) == 0) {
-        if (command.seq != pos) {
-            if (err) snprintf(err, errlen,
-                              "tp: the leader evaluated at position %llu but this rank is at %llu; "
-                              "the ranks are out of lockstep, refusing to decode",
-                              (unsigned long long)command.seq, (unsigned long long)pos);
-        } else {
-            /* Same harmless-drift condition as sync's prompt length: the leader's
-             * token is authoritative, and the disagreement is worth a line. */
-            if (token != command.value) {
-                fprintf(stderr, "pulsar: tp: worker token %d differs from the leader's %d; "
-                                "mirroring the leader's\n", token, command.value);
-            }
-            rc = s->eval(command.value, err, errlen);
-        }
-    }
-    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
-    pulsar_tp_command_free(&command);
-    return rc;
+    return tp_mirror_leader_ack(s, tp, "eval", s->eval(token, err, errlen), err, errlen);
 }
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) {
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen);
-    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
-    if (pulsar_tp_rank(tp) == 0) {
-        if (!reqs || n == 0) {
-            if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
-            return 1;
-        }
-        pulsar_tp_batch_item *items =
-            (pulsar_tp_batch_item *)xmalloc((size_t)n * sizeof(*items));
-        for (uint32_t i = 0; i < n; i++) {
-            items[i].session_id = s->tp_session_id;
-            items[i].bank       = (int32_t)reqs[i].bank;
-            items[i].pos        = reqs[i].pos;
-            items[i].token      = reqs[i].token;
-            items[i].reserved   = 0;
-        }
-        const int sent = pulsar_tp_send_eval_batch(tp, items, n);
-        free(items);
-        if (sent == 0) {
-            if (err) snprintf(err, errlen, "tp: could not mirror the batch to the workers");
-            return 1;
-        }
-        return tp_mirror_leader_ack(s, tp, "batch decode",
-                                    s->decode_multiseq(reqs, n, logits, logits_cap,
-                                                       err, errlen),
-                                    err, errlen);
+    if (tp_mirror_worker_drives_nothing(tp, "the batched decode", err, errlen)) return 1;
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    if (!reqs || n == 0) {
+        if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
+        return 1;
     }
-    /* Worker: the leader's rows ARE the batch, and this rank's own `reqs` are
-     * never read.  The row count is checked rather than warned about (unlike a
-     * single token, whose value cannot resize anything): the caller sized
-     * `logits` for ITS OWN n, so decoding the leader's different count would be
-     * decoding into a buffer shaped for someone else's batch. */
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
-    int rc = 1;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_EVAL_BATCH, "batch decode",
-                               err, errlen) == 0) {
-        if (command.n_items != n) {
-            if (err) snprintf(err, errlen,
-                              "tp: the leader mirrored %u rows but this rank is decoding %u; "
-                              "the ranks' drivers diverged on the batch shape",
-                              command.n_items, n);
-        } else {
-            pulsar_multiseq_req *rows =
-                (pulsar_multiseq_req *)xmalloc((size_t)n * sizeof(*rows));
-            for (uint32_t i = 0; i < n; i++) {
-                rows[i].bank  = (uint32_t)command.items[i].bank;
-                rows[i].pos   = command.items[i].pos;
-                rows[i].token = command.items[i].token;
-            }
-            rc = s->decode_multiseq(rows, n, logits, logits_cap, err, errlen);
-            free(rows);
-        }
+    pulsar_tp_batch_item *items = tp_mirror_rows(s, reqs, n);
+    const int sent = pulsar_tp_send_eval_batch(tp, items, n);
+    free(items);
+    if (sent == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the batch to the workers");
+        return 1;
     }
-    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
-    pulsar_tp_command_free(&command);
-    return rc;
+    return tp_mirror_leader_ack(s, tp, "batch decode",
+                                s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen),
+                                err, errlen);
 }
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) {
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows,
                                     max_head_runs, err, errlen);
-    if (pulsar_tp_rank(tp) == 0 && tp_mirror_dead(tp, err, errlen)) return 1;
-    if (pulsar_tp_rank(tp) == 0) {
-        if (!reqs || n_rows == 0) {
-            if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
-            return 1;
-        }
-        pulsar_tp_batch_item *items =
-            (pulsar_tp_batch_item *)xmalloc((size_t)n_rows * sizeof(*items));
-        for (uint32_t i = 0; i < n_rows; i++) {
-            items[i].session_id = s->tp_session_id;
-            items[i].bank       = (int32_t)reqs[i].bank;
-            items[i].pos        = reqs[i].pos;
-            items[i].token      = reqs[i].token;
-            items[i].reserved   = 0;
-        }
-        const int sent = pulsar_tp_send_mixed_batch(tp, items, n_rows);
-        free(items);
-        if (sent == 0) {
-            if (err) snprintf(err, errlen, "tp: could not mirror the mixed batch to the workers");
-            return 1;
-        }
-        return tp_mirror_leader_ack(s, tp, "mixed batch",
-                                    s->decode_mixed(reqs, n_rows, logits, logits_cap,
-                                                    out_n_rows, max_head_runs,
-                                                    err, errlen),
-                                    err, errlen);
+    if (tp_mirror_worker_drives_nothing(tp, "the mixed step", err, errlen)) return 1;
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    if (!reqs || n_rows == 0) {
+        if (err) snprintf(err, errlen, "tp: refusing to mirror an empty batch");
+        return 1;
     }
-    /* Worker: the leader's rows are the batch.  `out_n_rows` and
-     * `max_head_runs` stay LOCAL -- they are this caller's own output and its
-     * own head policy, and both ranks run the same kernel over the same rows,
-     * so the run count agrees by construction.  Only the rows cross the wire. */
-    pulsar_tp_command command;
-    memset(&command, 0, sizeof(command));
-    if (pulsar_tp_recv_command(tp, &command, err, errlen) == 0) return 1;
-    int rc = 1;
-    if (tp_mirror_worker_frame(s, &command, PULSAR_TP_FRAME_MIXED_BATCH, "mixed batch",
-                               err, errlen) == 0) {
-        if (command.n_items != n_rows) {
-            if (err) snprintf(err, errlen,
-                              "tp: the leader mirrored %u rows but this rank is decoding %u; "
-                              "the ranks' drivers diverged on the batch shape",
-                              command.n_items, n_rows);
-        } else {
-            pulsar_multiseq_req *rows =
-                (pulsar_multiseq_req *)xmalloc((size_t)n_rows * sizeof(*rows));
-            for (uint32_t i = 0; i < n_rows; i++) {
-                rows[i].bank  = (uint32_t)command.items[i].bank;
-                rows[i].pos   = command.items[i].pos;
-                rows[i].token = command.items[i].token;
-            }
-            rc = s->decode_mixed(rows, n_rows, logits, logits_cap, out_n_rows,
-                                 max_head_runs, err, errlen);
-            free(rows);
-        }
+    /* `max_head_runs` is the caller's head policy and rides the frame: a worker
+     * has no caller of its own to take it from, and both ranks must head the
+     * same rows.  `out_n_rows` is output and stays local on each rank. */
+    pulsar_tp_batch_item *items = tp_mirror_rows(s, reqs, n_rows);
+    const int sent = pulsar_tp_send_mixed_batch(tp, items, n_rows, max_head_runs);
+    free(items);
+    if (sent == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the mixed batch to the workers");
+        return 1;
     }
-    if (tp_mirror_worker_ack(tp, command.session_id, rc, err, errlen) != 0 && rc == 0) rc = 1;
-    pulsar_tp_command_free(&command);
-    return rc;
+    return tp_mirror_leader_ack(s, tp, "mixed batch",
+                                s->decode_mixed(reqs, n_rows, logits, logits_cap,
+                                                out_n_rows, max_head_runs, err, errlen),
+                                err, errlen);
 }
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
 int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) { return s ? s->bank_repoint(bank) : 1; }
@@ -901,12 +624,26 @@ void pulsar_session_invalidate(pulsar_session *s) {
     /* The pair-off shape is untouched: one call, no TP code on the live path. */
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->invalidate(); return; }
-    pulsar_tp_mirror_void(s, tp, TP_MIRROR_INVALIDATE, 0);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "invalidate", err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, "invalidate", err);
+        return;
+    }
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "invalidate",
+                             pulsar_tp_send_invalidate(tp, s->tp_session_id))) return;
+    s->invalidate();
 }
 void pulsar_session_rewind(pulsar_session *s, int pos) {
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->rewind(pos); return; }
-    pulsar_tp_mirror_void(s, tp, TP_MIRROR_REWIND, pos);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "rewind", err, sizeof(err))) {
+        pulsar_tp_mirror_fail_void(tp, "rewind", err);
+        return;
+    }
+    if (!tp_mirror_void_send(tp, s->tp_session_id, "rewind",
+                             pulsar_tp_send_rewind(tp, s->tp_session_id, pos))) return;
+    s->rewind(pos);
 }
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }

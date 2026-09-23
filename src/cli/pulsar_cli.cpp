@@ -1660,6 +1660,17 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
+    /* Slice 4e (L238): a TP worker rank drives nothing of its own -- not the
+     * prompt on its command line, not a session.  It applies the leader's
+     * frames until the leader stops it, then exits with the loop's verdict. */
+    if (pulsar_engine_is_tp_worker(engine)) {
+        char werr[512];
+        const int wrc = pulsar_tp_worker_run(engine, werr, sizeof(werr));
+        if (wrc != 0) fprintf(stderr, "pulsar: TP worker stopped on a failure: %s\n", werr);
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return wrc;
+    }
     if (!cfg.inspect) {
         char ctxmem_line[256];
         fprintf(stderr, "%s\n",

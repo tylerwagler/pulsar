@@ -20,6 +20,7 @@
  * no-copy GPU buffers.
  */
 
+#include "tp/pulsar_tp.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -1711,6 +1712,12 @@ struct pulsar_engine {
      * not match the receiving session therefore means the drivers diverged, and
      * the receiver fails loud instead of mirroring into the wrong session. */
     uint64_t tp_session_seq;
+    /** Slice 4e (L238): a WORKER rank's session registry, keyed by the create
+     * ordinal the leader names in every frame; owned and driven only by
+     * pulsar_tp_worker_run (tp_worker.cpp).  Empty on the leader. */
+    struct pulsar_tp_worker_slot *tp_worker_slots;
+    uint32_t tp_worker_n;
+    uint32_t tp_worker_cap;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
@@ -2099,6 +2106,16 @@ bool pulsar_session_is_mirrored(const pulsar_session *s);
  * when the caller may draw and -1 when the pair could not agree, in which case
  * it must NOT draw.  Nothing crosses the wire when the pair is off. */
 int pulsar_session_mirror_rng(pulsar_session *s, uint64_t *rng);
+
+/** Slice 4e (L238): the failure report a void mirrored operation can make --
+ * marks the pair failed and prints the reason once.  Defined in engine_api.cpp,
+ * shared with the worker loop. */
+void pulsar_tp_mirror_fail_void(struct pulsar_tp *tp, const char *operation, const char *why);
+/** The worker loop's per-frame body, exposed for the mirror test (which feeds
+ * it frames for sessions that do not exist and asserts the refusals).  Returns
+ * 1 to continue, 0 on STOP, -1 on a failure that ends the loop (err filled). */
+int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c,
+                              char *err, size_t errlen);
 
 
 struct pulsar_session {

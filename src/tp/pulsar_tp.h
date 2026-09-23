@@ -23,7 +23,7 @@
 #include <stdint.h>
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 9u            /* v9: row payload on EVAL_BATCH/MIXED_BATCH, RNG_STATE frame; v8: hello carries rank + n_ranks */
+#define PULSAR_TP_PROTOCOL_VERSION 10u           /* v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -319,7 +319,7 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
  * else to send.  The header's shape was fixed while it still had no user. */
 int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
-                               uint32_t count);
+                               uint32_t count, uint32_t max_head_runs);
 /** Ship this rank's rng state.  Speculation's accept walk draws from the
  * CALLER's rng, so two ranks seeded independently would accept different tokens
  * and commit different session state; the leader's state is the pair's stream.

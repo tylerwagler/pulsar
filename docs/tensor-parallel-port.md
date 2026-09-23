@@ -92,15 +92,37 @@ highest risk; interacts with MLA, attn-pack KV, indexer.
    **= slice 4e; IN PROGRESS.** Increment 1 (the prompt mirror on sync) landed
    2026-09-23; see the section below for the model it fixes.
 
-### 4e: how the worker is driven (decided 2026-09-23)
+### 4e: how the worker is driven (decided 2026-09-23, REVISED the same day: L238)
 
-Both ranks run the **same driver with the same arguments** (the CLI/server, told
-apart by `--tp-role`); there is no worker-side receive loop and no session
-registry. Only the **leader's arguments are authoritative**: the leader ships the
-operation on the command plane and then waits for one ack per peer, and the worker
-blocks for that frame and runs on what it received. A worker whose own driver
-disagreed — a stale prompt, a truncated request — therefore cannot desync the
-pair, because its own arguments are never read.
+**The model, as landed (L238 increment 1):** rank 0 drives the pair; a rank
+above 0 drives nothing of its own. A worker never opens its HTTP listener and
+never reads a prompt: right after `pulsar_engine_open` its driver (CLI or
+server) calls `pulsar_tp_worker_run`, ONE loop that receives a frame, looks the
+session up in a registry keyed by the **create ordinal**, applies the operation
+through the session member, and acks. The leader's public wrappers ship frames
+and collect one ack per peer, exactly as before; a worker rank reaching a
+wrapper is refused by name. "Only the leader's arguments are authoritative" is
+therefore literally true — a worker has none — which also retires the images
+gap and the worker-side halves that used to sit inside every wrapper.
+
+Why the revision: the first cut had both ranks run the **same driver with the
+same arguments**, with the worker's wrappers blocking for the leader's frame.
+That holds for the CLI, but a `pulsar-server` worker receives no HTTP requests,
+creates no sessions and issues no operations, so a server pair could not be
+driven that way at all (census in `pulsar-notes/rows/L238.md`). The loop is the
+only version that serves production. Increments: (1) registry + loop for the
+frames that exist — create, destroy, sync, eval, batched and mixed decode,
+rewind, invalidate, rng state, stop — with the mixed step's `max_head_runs`
+riding the batch header and `pulsar_session_free` gaining the destroy frame;
+(2) banks: state save/restore, fork, partial fork (the leader's scheduler
+decides, the frame carries the decision, the ordinal names the target);
+(3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
+round family; (5) cancel/abort semantics. Latent bug fixed in (1):
+`pulsar_tp_recv_command` never set the session id on batch frames, so a
+CORRECT batched decode would have been refused as a divergence in production.
+
+The paragraphs below describe the first cut's mechanics; where they say the
+worker "blocks in the wrapper", read "the loop applies the frame".
 
 - The mirror lives at the **public API boundary** (`pulsar_session_sync_mm` and
   `pulsar_session_eval` in `engine_api.cpp`), *not* on the member

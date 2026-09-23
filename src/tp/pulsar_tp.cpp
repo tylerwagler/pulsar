@@ -2670,7 +2670,7 @@ typedef struct {
 
 typedef struct {
     uint32_t count;
-    uint32_t reserved;
+    uint32_t head_runs;   /* the mixed step's max_head_runs (the caller's head policy); 0 on EVAL_BATCH */
 } pulsar_tp_batch_command_header;
 
 typedef struct {
@@ -2752,14 +2752,15 @@ int pulsar_tp_send_invalidate(pulsar_tp *tp, uint64_t session_id) {
  * decode_mixed); without it a driver that diverged between the two would
  * decode the same rows through a different contract and say nothing. */
 static int tp_send_batch(pulsar_tp *tp, uint32_t frame_type,
-                         const pulsar_tp_batch_item *items, uint32_t count) {
+                         const pulsar_tp_batch_item *items, uint32_t count,
+                         uint32_t head_runs) {
     const uint64_t bytes64 = sizeof(pulsar_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
     if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
     if (!payload) return 0;
-    pulsar_tp_batch_command_header h = { count, 0 };
+    pulsar_tp_batch_command_header h = { count, head_runs };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
     const int ok = tp_send_frame_to_peers(tp, frame_type, payload, bytes);
@@ -2769,13 +2770,13 @@ static int tp_send_batch(pulsar_tp *tp, uint32_t frame_type,
 
 int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
                               uint32_t count) {
-    return tp_send_batch(tp, PULSAR_TP_FRAME_EVAL_BATCH, items, count);
+    return tp_send_batch(tp, PULSAR_TP_FRAME_EVAL_BATCH, items, count, 0u);
 }
 
 int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
-                               uint32_t count) {
-    return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count);
+                               uint32_t count, uint32_t max_head_runs) {
+    return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count, max_head_runs);
 }
 
 int pulsar_tp_send_rng_state(pulsar_tp *tp, uint64_t session_id, uint64_t state) {
@@ -2953,6 +2954,12 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         memcpy(command->items, payload + sizeof(h),
                (size_t)h.count * sizeof(*command->items));
         command->n_items = h.count;
+        /* The frame's session is the rows' session (every row carries the same
+         * one), and the mixed step's head policy rides the header.  Before this
+         * was set, a CORRECT batched decode would have been refused as a
+         * session divergence: the worker compared session_id 0 to its own. */
+        command->session_id = command->items[0].session_id;
+        command->value = (int)h.head_runs;
         break;
     }
     case PULSAR_TP_FRAME_STOP:
