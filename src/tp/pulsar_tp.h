@@ -305,6 +305,9 @@ typedef enum {
     PULSAR_TP_FRAME_RDMA_INFO = 7,
     PULSAR_TP_FRAME_SYNC_ACK = 8,
     PULSAR_TP_FRAME_RDMA_READY = 9,
+    /* RETIRED 2026-09-22: the leader-collect vocab half that slice 4d's
+     * all-gather replaced.  The NUMBER is never reused -- these are wire
+     * values, and a future frame must take a fresh one. */
     PULSAR_TP_FRAME_LOGITS = 10,
     PULSAR_TP_FRAME_VERIFY = 11,
     PULSAR_TP_FRAME_VERIFY_COMMIT = 12,
@@ -334,12 +337,6 @@ typedef struct {
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen);
 void pulsar_tp_command_free(pulsar_tp_command *command);
-
-/* Vocab-split output head: the worker ships its logits half to the leader
- * after every eval (and after a sync) on the control socket. */
-int pulsar_tp_send_logits_half(pulsar_tp *tp, const float *half,
-                               uint32_t count);
-int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

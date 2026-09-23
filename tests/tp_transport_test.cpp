@@ -230,9 +230,6 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_send_verify_commit(tp, 1, 0) == 1,
               "leader send_verify_commit");
 
-        const float half[4] = { 0.5f, 1.5f, 2.5f, 3.5f };
-        CHECK(pulsar_tp_send_logits_half(tp, half, 4) == 1,
-              "leader send_logits_half");
     } else {
         pulsar_tp_command cmd;
 
@@ -282,10 +279,6 @@ static void frames_phase(pulsar_tp *tp, int rank) {
               "worker recv_verify_commit");
         CHECK(full == 1 && replay == 0, "worker verify_commit values");
 
-        float half[4];
-        CHECK(pulsar_tp_recv_logits_half(tp, half, 4) == 1,
-              "worker recv_logits_half");
-        CHECK(half[0] == 0.5f && half[3] == 3.5f, "worker logits values");
     }
 }
 

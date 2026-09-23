@@ -2957,22 +2957,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     return 1;
 }
 
-int pulsar_tp_send_logits_half(pulsar_tp *tp, const float *half, uint32_t count) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "vocab logits half");
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_LOGITS,
-                         half, count * sizeof(float));
-}
-
-int pulsar_tp_recv_logits_half(pulsar_tp *tp, float *half, uint32_t count) {
-    if (tp->n_ranks > 2) return tp_refuse_nway(tp, "vocab logits half");
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != PULSAR_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
-        fprintf(stderr, "pulsar-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
-        return 0;
-    }
-    return tp_read_full(tp->control_fd, half, bytes);
-}
 
 int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
                           const int *drafts, uint32_t n) {
