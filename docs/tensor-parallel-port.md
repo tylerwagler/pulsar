@@ -147,7 +147,12 @@ the server's `.tmp.<pid>` stripped, read back from the descriptor), and the
 worker mirrors it as `<tp_spill_dir>/tp-<key>`, the server handing the engine
 its KV-disk directory as `pulsar_engine_options.tp_spill_dir`.  A worker with
 no spill directory answers a split verdict, never a quiet success.  With this
-the server's whole mutating session surface is mirrored.
+the server's whole mutating session surface is mirrored; (7) LANDED with (1):
+images ride the sync frame (`SYNC_MM`: the expanded tokens, a per-image table
+of start position and length, the concatenated bytes), and every rank's own
+replicated vision tower encodes the same bytes -- the earlier refusal of
+images under TP is gone, so a pair can serve the Vision-Exp model's image
+requests.
 (3) rewrite_from_common, note_committed_tokens, set_logits; (4) the speculative
 round family; (5) cancel/abort semantics. Latent bug fixed in (1):
 `pulsar_tp_recv_command` never set the session id on batch frames, so a
@@ -386,8 +391,7 @@ worker "blocks in the wrapper", read "the loop applies the frame".
     CUTLASS arms already split.  "If we've got more than one GB10, we won't
     need IQ2" (Tyler).  Bring-up therefore uses an MXFP4 artifact; the refusal
     on IQ2 stays loud and stays;
-  - **images** are not mirrored; `pulsar_session_sync_mm` refuses a non-zero
-    image count under TP on every rank, before any frame moves;
+  - images: mirrored since increment 7 (`SYNC_MM`);
   - `--tp-arm prefill` is a misnomer: decode and verify rows (<= 8) also gate
     through the slab big-gate path, so the arm is "all lanes, one mechanism";
   - the control-plane deadline on the worker's `recv_command` presumes the

@@ -200,14 +200,17 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         worker_drop(e, slot);
         return 1;
 
-    case PULSAR_TP_FRAME_SYNC: {
+    case PULSAR_TP_FRAME_SYNC:
+    case PULSAR_TP_FRAME_SYNC_MM: {
+        /* SYNC_MM carries the images too: this rank's own tower encodes the
+         * same bytes at the same start positions the leader's did. */
         int rc = 1;
         if (!worker_refused(e, c, "sync", &slot, ferr, sizeof(ferr))) {
             pulsar_tokens borrowed;
             borrowed.v = c->tokens;
             borrowed.len = (int)c->n_tokens;
             borrowed.cap = (int)c->n_tokens;
-            rc = slot->s->sync(&borrowed, NULL, 0, ferr, sizeof(ferr));
+            rc = slot->s->sync(&borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr, sizeof(ferr));
         }
         if (rc != 0) fprintf(stderr, "pulsar: tp worker: sync refused: %s\n", ferr);
         return worker_ack(e, c->session_id, rc, err, errlen);

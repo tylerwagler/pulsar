@@ -2949,6 +2949,44 @@ int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_
     return ok;
 }
 
+typedef struct {
+    uint64_t session_id;
+    uint32_t n_tokens;
+    uint32_t n_images;
+} pulsar_tp_sync_mm_header;
+typedef struct {
+    int32_t  start_pos;
+    uint32_t len;
+} pulsar_tp_image_entry;
+
+int pulsar_tp_send_sync_mm(pulsar_tp *tp, uint64_t session_id, const int *tokens, uint32_t n_tokens,
+                           const pulsar_image_ref *images, uint32_t n_images) {
+    if (!tp || (n_tokens && !tokens) || n_images == 0 || !images) return 0;
+    uint64_t img_bytes = 0;
+    for (uint32_t i = 0; i < n_images; i++) {
+        if (!images[i].bytes || images[i].len == 0 || images[i].len > UINT32_MAX) return 0;
+        img_bytes += images[i].len;
+    }
+    const uint64_t bytes64 = sizeof(pulsar_tp_sync_mm_header) + (uint64_t)n_tokens * sizeof(int32_t) +
+                             (uint64_t)n_images * sizeof(pulsar_tp_image_entry) + img_bytes;
+    if (bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    uint8_t *p = payload;
+    pulsar_tp_sync_mm_header h = { session_id, n_tokens, n_images };
+    memcpy(p, &h, sizeof(h)); p += sizeof(h);
+    for (uint32_t i = 0; i < n_tokens; i++) { const int32_t t = (int32_t)tokens[i]; memcpy(p, &t, sizeof(t)); p += sizeof(t); }
+    for (uint32_t i = 0; i < n_images; i++) {
+        pulsar_tp_image_entry e = { (int32_t)images[i].start_pos, (uint32_t)images[i].len };
+        memcpy(p, &e, sizeof(e)); p += sizeof(e);
+    }
+    for (uint32_t i = 0; i < n_images; i++) { memcpy(p, images[i].bytes, images[i].len); p += images[i].len; }
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SYNC_MM, payload, bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status) {
     pulsar_tp_command_ack ack = { session_id, (int32_t)status, 0 };
     return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_COMMAND_ACK,
@@ -3030,6 +3068,11 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     command->spec_rngs = NULL;
     free(command->spill_key);
     command->spill_key = NULL;
+    free(command->images);
+    free(command->image_bytes);
+    command->images = NULL;
+    command->image_bytes = NULL;
+    command->n_images = 0;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -3149,6 +3192,37 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
             for (uint32_t i = 0; i < h.count; i++) command->tokens[i] = wire[i];
         }
         command->n_tokens = h.count;
+        break;
+    }
+    case PULSAR_TP_FRAME_SYNC_MM: {
+        pulsar_tp_sync_mm_header h;
+        if (bytes < sizeof(h)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        const uint64_t fixed = sizeof(h) + (uint64_t)h.n_tokens * sizeof(int32_t) +
+                               (uint64_t)h.n_images * sizeof(pulsar_tp_image_entry);
+        if (h.n_images == 0 || fixed > bytes) { ok = 0; break; }
+        const uint8_t *p = payload + sizeof(h);
+        command->tokens = static_cast<int *>(malloc(h.n_tokens ? (size_t)h.n_tokens * sizeof(int) : 1u));
+        command->images = static_cast<pulsar_image_ref *>(malloc((size_t)h.n_images * sizeof(pulsar_image_ref)));
+        if (!command->tokens || !command->images) { ok = -1; break; }
+        for (uint32_t i = 0; i < h.n_tokens; i++) { int32_t t; memcpy(&t, p, sizeof(t)); p += sizeof(t); command->tokens[i] = t; }
+        uint64_t img_total = 0;
+        for (uint32_t i = 0; i < h.n_images; i++) {
+            pulsar_tp_image_entry e; memcpy(&e, p, sizeof(e)); p += sizeof(e);
+            command->images[i].start_pos = e.start_pos;
+            command->images[i].len = e.len;
+            command->images[i].bytes = NULL;
+            img_total += e.len;
+        }
+        if (fixed + img_total != bytes || img_total == 0) { ok = 0; break; }
+        command->image_bytes = static_cast<uint8_t *>(malloc((size_t)img_total));
+        if (!command->image_bytes) { ok = -1; break; }
+        memcpy(command->image_bytes, p, (size_t)img_total);
+        uint64_t off = 0;
+        for (uint32_t i = 0; i < h.n_images; i++) { command->images[i].bytes = command->image_bytes + off; off += command->images[i].len; }
+        command->session_id = h.session_id;
+        command->n_tokens = h.n_tokens;
+        command->n_images = h.n_images;
         break;
     }
     case PULSAR_TP_FRAME_BANK_KV_SAVE:

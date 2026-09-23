@@ -170,7 +170,9 @@ bug, not a design change.
       agreed verdicts), rewrite_from_common, note_committed_tokens, set_logits
       and the speculative round family (rng on every drawing frame; the CLI's
       generate_speculative as one frame); set_cancel is not polled inside a
-      mirrored operation.  Remaining: the pair run.
+      mirrored operation; the spill path (free/alloc physical, kv save/load,
+      each rank to its own disk) and images on the sync frame.  Remaining:
+      the pair run, then the attention head split.
 - **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
       ownership but every rank still staged every expert: on GB10 host
       registration is unsupported, so the supported load path stages each

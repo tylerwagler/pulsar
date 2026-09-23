@@ -431,23 +431,25 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     if (!tp) return s->sync(prompt, images, n_images, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "sync", err, errlen)) return 1;
     if (tp_mirror_dead(tp, err, errlen)) return 1;
-    /* Images do not ride the frame yet; a worker has no images of its own to
-     * run the leader's tokens against.  Refused before any frame moves. */
-    if (n_images > 0) {
-        if (err) snprintf(err, errlen,
-                          "tp: images are not mirrored onto the pair yet (%d supplied); refusing",
-                          n_images);
-        return 1;
-    }
     /* The leader's arguments ARE the operation, so an empty prompt is a caller bug. */
     if (!prompt || prompt->len <= 0) {
         if (err) snprintf(err, errlen, "tp: the prompt is empty; refusing to mirror it");
         return 1;
     }
+    if (n_images < 0 || (n_images > 0 && !images)) {
+        if (err) snprintf(err, errlen, "tp: an image request with no images; refusing");
+        return 1;
+    }
     /* Ship first, run second, so both ranks prefill together instead of the
-     * worker waiting out the leader's whole sync. */
-    if (pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len) == 0) {
-        if (err) snprintf(err, errlen, "tp: could not mirror the prompt to the workers");
+     * worker waiting out the leader's whole sync.  Images ride the frame
+     * (increment 7): the tokens already carry the expanded sentinel blocks,
+     * and every rank's own replicated tower encodes the same bytes. */
+    const int sent = n_images > 0
+        ? pulsar_tp_send_sync_mm(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len, images, (uint32_t)n_images)
+        : pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len);
+    if (sent == 0) {
+        if (err) snprintf(err, errlen, "tp: could not mirror the prompt%s to the workers",
+                          n_images > 0 ? " and its images" : "");
         return 1;
     }
     return tp_mirror_leader_ack(s, tp, "sync",

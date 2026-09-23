@@ -877,6 +877,36 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* Increment 7: a sync with images -- tokens, the per-image table and the
+     * concatenated bytes must arrive intact and re-pointed. */
+    {
+        const uint64_t sid = 0xC0DEB000ULL;
+        char cerr[256];
+        cerr[0] = 0;
+        const int toks[3] = { 900, 901, 902 };
+        const uint8_t img0[5] = { 1, 2, 3, 4, 5 };
+        const uint8_t img1[3] = { 9, 8, 7 };
+        pulsar_image_ref imgs[2] = { { img0, sizeof(img0), 1 }, { img1, sizeof(img1), 2 } };
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_sync_mm(tp, sid, toks, 3u, imgs, 2u) != 0, "rank 0 sync_mm send failed");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync_mm", cerr, sizeof(cerr)), "rank 0 sync_mm ack: %s", cerr);
+        } else {
+            pulsar_tp_command cmd;
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d sync_mm recv: %s", rank, cerr);
+            else {
+                CHECK(cmd.type == PULSAR_TP_FRAME_SYNC_MM && cmd.session_id == sid && cmd.n_tokens == 3 &&
+                      cmd.tokens && cmd.tokens[2] == 902 && cmd.n_images == 2 && cmd.images &&
+                      cmd.images[0].start_pos == 1 && cmd.images[0].len == 5 && cmd.images[0].bytes &&
+                      std::memcmp(cmd.images[0].bytes, img0, 5) == 0 &&
+                      cmd.images[1].start_pos == 2 && cmd.images[1].len == 3 && cmd.images[1].bytes &&
+                      std::memcmp(cmd.images[1].bytes, img1, 3) == 0,
+                      "rank %d sync_mm frame differs (n_tokens %u n_images %u)", rank, cmd.n_tokens, cmd.n_images);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d sync_mm ack failed", rank);
+                pulsar_tp_command_free(&cmd);
+            }
+        }
+    }
+
     pulsar_tp_free(tp);
     std::free(slab);
     std::free(out);
@@ -933,7 +963,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec/spill verdicts, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab all-gather + command plane + bank/rewrite/logits/spec/spill verdicts + images, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

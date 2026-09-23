@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
 #define PULSAR_TP_PROTOCOL_VERSION 10u           /* v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
@@ -357,6 +358,9 @@ int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_t bank, const char *key);
+/* Increment 7: sync with images (n_images > 0; use pulsar_tp_send_sync otherwise). */
+int pulsar_tp_send_sync_mm(pulsar_tp *tp, uint64_t session_id, const int *tokens, uint32_t n_tokens,
+                           const pulsar_image_ref *images, uint32_t n_images);
 int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
 /* Collect one ack per peer and return the VERDICT they agree on in *status
  * (1 on success).  Unlike pulsar_tp_wait_command_ack, a nonzero status is not
@@ -446,6 +450,12 @@ typedef enum {
     PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL = 37,
     PULSAR_TP_FRAME_BANK_KV_SAVE = 38,
     PULSAR_TP_FRAME_BANK_KV_LOAD = 39,
+    /* Increment 7: a sync that carries IMAGES -- the tokens (with the vision
+     * sentinel blocks already expanded by the leader), then a per-image table
+     * of {start_pos, len}, then the concatenated image bytes.  Every rank's
+     * own replicated tower encodes the same bytes; nothing image-shaped is
+     * gathered.  Acked like SYNC. */
+    PULSAR_TP_FRAME_SYNC_MM = 40,
 } pulsar_tp_frame_type;
 
 
@@ -475,6 +485,11 @@ typedef struct {
     /* BANK_KV_SAVE / BANK_KV_LOAD: the snapshot key (malloc'd, NUL-terminated);
      * the bank rides `value`. */
     char *spill_key;
+    /* SYNC_MM: the images (malloc'd table whose `bytes` point into
+     * `image_bytes`, one malloc'd block). */
+    pulsar_image_ref *images;
+    uint32_t n_images;
+    uint8_t *image_bytes;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
