@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "tp/pulsar_tp.h"
 #include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
 #include "pulsar_utf8.h"
@@ -1707,6 +1708,9 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return wrc;
     }
+    /* The main thread launches every step from here on; on a TP leader it
+     * gets the big core the transport reserved for it (no-op otherwise). */
+    pulsar_tp_pin_launch_thread(pulsar_engine_tp(engine));
     if (!cfg.inspect) {
         char ctxmem_line[256];
         fprintf(stderr, "%s\n",

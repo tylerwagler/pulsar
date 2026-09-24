@@ -40,6 +40,8 @@
 #include <dlfcn.h>
 #include <new>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/prctl.h>
 
 #define PULSAR_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
 
@@ -583,6 +585,12 @@ struct pulsar_tp {
     bool proxy_started = false;
     std::atomic<bool> proxy_stop{false};
     std::atomic<bool> proxy_failed{false};
+    /* Core pinning (tp_pick_cores, at proxy start): the row-lane proxy and the
+     * engine's launch thread each get their own big core, or both stay -1 when
+     * discovery found no two -- pinning is a performance hint, so a miss is
+     * announced once and the lane runs unpinned. */
+    int pin_proxy_cpu = -1;
+    int pin_launch_cpu = -1;
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
     pulsar_tp_node self;    /* this rank's own NODE record */
     /* The bulk lane (pulsar_tp_set_bulk): caller-owned, host-pinned and
@@ -1699,8 +1707,91 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
     return 1;
 }
 
+/* CORE PINNING (the pair's arrival skew).  Every row-lane exchange waits for
+ * the later of the two ranks; an unpinned thread that the scheduler migrates,
+ * or whose core dropped into a deep idle state, arrives hundreds of us late
+ * (LPI exit measured 231/433 us on GB10).  So the proxy and the thread that
+ * launches the engine's work each own one big core.
+ *
+ * Big cores are discovered, never hard-coded: every CPU this process may run
+ * on (sched_getaffinity, so taskset/cgroup limits are honoured), cpu0 excluded
+ * (it takes the housekeeping interrupts), ranked by
+ * /sys/devices/system/cpu/cpuN/cpu_capacity -- or, when any allowed CPU lacks
+ * that file, by cpufreq/cpuinfo_max_freq -- highest first, ties to the lower
+ * id.  The top two are taken: the proxy the first, the launch thread the
+ * second.  Fewer than two ranked CPUs = pinning skipped, said once. */
+static int tp_read_cpu_u64(int cpu, const char *leaf, uint64_t *out) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long v = 0;
+    const int ok = fscanf(f, "%llu", &v) == 1 && v > 0;
+    fclose(f);
+    if (ok) *out = (uint64_t)v;
+    return ok;
+}
+
+static void tp_pick_cores(pulsar_tp *tp, char *how, size_t howlen) {
+    tp->pin_proxy_cpu = tp->pin_launch_cpu = -1;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        fprintf(stderr, "pulsar-tp: rank %d core pinning skipped: sched_getaffinity: %s\n",
+                tp->rank, strerror(errno));
+        return;
+    }
+    static const char *const leaves[2] = { "cpu_capacity", "cpufreq/cpuinfo_max_freq" };
+    for (int src = 0; src < 2; src++) {
+        int best[2] = { -1, -1 };
+        uint64_t bestv[2] = { 0, 0 }, maxv = 0;
+        int n = 0, complete = 1;
+        for (int cpu = 1; cpu < CPU_SETSIZE && complete; cpu++) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            uint64_t v = 0;
+            if (!tp_read_cpu_u64(cpu, leaves[src], &v)) { complete = 0; break; }
+            n++;
+            if (v > maxv) maxv = v;
+            if (best[0] < 0 || v > bestv[0]) {
+                best[1] = best[0]; bestv[1] = bestv[0];
+                best[0] = cpu; bestv[0] = v;
+            } else if (best[1] < 0 || v > bestv[1]) {
+                best[1] = cpu; bestv[1] = v;
+            }
+        }
+        if (!complete || n < 2) continue;
+        tp->pin_proxy_cpu = best[0];
+        tp->pin_launch_cpu = best[1];
+        snprintf(how, howlen, "%s %llu/%llu, %d CPUs ranked, cpu0 excluded", leaves[src],
+                 (unsigned long long)bestv[1], (unsigned long long)maxv, n);
+        return;
+    }
+    fprintf(stderr, "pulsar-tp: rank %d core pinning skipped: no two CPUs (cpu0 excluded) with a "
+                    "readable cpu_capacity or cpuinfo_max_freq -- the lane runs unpinned\n", tp->rank);
+}
+
+static int tp_pin_thread(pthread_t th, int cpu) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(cpu, &one);
+    return pthread_setaffinity_np(th, sizeof(one), &one);
+}
+
+void pulsar_tp_pin_launch_thread(pulsar_tp *tp) {
+    if (!tp || tp->pin_launch_cpu < 0) return;   /* no row lane, or skipped (announced) */
+    const int rc = tp_pin_thread(pthread_self(), tp->pin_launch_cpu);
+    if (rc != 0)
+        fprintf(stderr, "pulsar-tp: rank %d launch thread NOT pinned to cpu%d: %s -- runs unpinned\n",
+                tp->rank, tp->pin_launch_cpu, strerror(rc));
+    else
+        fprintf(stderr, "pulsar-tp: rank %d launch thread pinned to cpu%d\n", tp->rank, tp->pin_launch_cpu);
+}
+
 static void *tp_row_proxy_main(void *arg) {
     pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
+    /* Timer slack is per thread: the idle backoff's usleep wakes on time. */
+    if (prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) != 0)
+        fprintf(stderr, "pulsar-tp: rank %d proxy timerslack not set: %s\n", tp->rank, strerror(errno));
     volatile uint64_t *desc = tp_row_desc(tp);
     std::atomic<uint64_t> *done = tp_row_done(tp);
     uint64_t last_exch = 0, next_msg = 1;
@@ -1766,6 +1857,18 @@ static int tp_row_proxy_start(pulsar_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     tp->proxy_started = true;
+    char how[128] = {0};
+    tp_pick_cores(tp, how, sizeof(how));
+    if (tp->pin_proxy_cpu >= 0) {
+        const int rc = tp_pin_thread(tp->proxy, tp->pin_proxy_cpu);
+        if (rc != 0)
+            fprintf(stderr, "pulsar-tp: rank %d proxy NOT pinned to cpu%d: %s -- runs unpinned\n",
+                    tp->rank, tp->pin_proxy_cpu, strerror(rc));
+        else
+            fprintf(stderr, "pulsar-tp: rank %d proxy pinned to cpu%d, launch thread cpu%d reserved "
+                            "(%s; proxy timerslack 1 ns)\n",
+                    tp->rank, tp->pin_proxy_cpu, tp->pin_launch_cpu, how);
+    }
     return 1;
 }
 

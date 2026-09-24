@@ -614,6 +614,8 @@ int pulsar_tp_worker_run(pulsar_engine *e, char *err, size_t errlen) {
     }
     fprintf(stderr, "pulsar: TP worker rank %d/%u: driving sessions from the leader's frames\n",
             pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
+    /* This thread launches every step the leader's frames drive. */
+    pulsar_tp_pin_launch_thread(e->tp);
     int rc = 0;
     for (;;) {
         pulsar_tp_command c;

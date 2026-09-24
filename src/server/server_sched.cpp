@@ -6,6 +6,7 @@
  * switching, and the frontier/committed-pos readers. */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
+#include "tp/pulsar_tp.h"
 
 
 
@@ -2802,6 +2803,9 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 
 void *worker_main(void *arg) {
     server *s = (server *)arg;
+    /* This thread launches every engine step; on a TP leader it gets the big
+     * core the transport reserved for it (no-op without a row lane). */
+    pulsar_tp_pin_launch_thread(pulsar_engine_tp(s->engine));
     int rr = 0; /* round-robin cursor: first slot index to consider next */
     for (;;) {
         bool bound = false;

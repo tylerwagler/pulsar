@@ -279,6 +279,14 @@ bool pulsar_tp_in_slab(const pulsar_tp *tp, const void *ptr, uint64_t bytes);
  * keeps it as plain TCP staging.  Returns 1 on success, 0 on failure. */
 int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
 
+/* Pin the CALLING thread to the big core reserved for the engine's launch
+ * thread (chosen with the row-lane proxy's core at attach; announced there).
+ * The driver calls it once from the thread that will launch the engine's work
+ * -- AFTER creating its other threads, which would otherwise inherit the
+ * one-core mask.  A hint: no row lane or no core found = no-op; a refused
+ * pin is said once and the thread runs unpinned.  tp may be NULL. */
+void pulsar_tp_pin_launch_thread(pulsar_tp *tp);
+
 /* One gate: send out[layer][gate] to the peer's in[layer][gate] and wait for
  * the peer's partial for `seq` to land.  Returns 0 on failure. */
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
