@@ -308,6 +308,15 @@ static const char *const g_env_keep[] = {
     "PULSAR_TP_NRANKS",
     "PULSAR_TP_PEERS",
     "PULSAR_TP_PORT",
+    /* Transport addressing, not numerics: the HCA (and GID index) the group's
+     * RDMA rides, read by src/tp/pulsar_tp.cpp (tp_rdma_probe / tp_rdma_open,
+     * linked here).  On a multi-HCA Spark an unpinned rank auto-picks the first
+     * ACTIVE device by name -- the IP-less port -- and the gate's rank sat on a
+     * link-local GID with no peer (first LEG C attempt, 2026-09-24) while the
+     * engine binary beside it, launched with the same variable, rode mlx5_3.
+     * Which cable carries the partials cannot change what is summed. */
+    "PULSAR_TP_RDMA_DEV",
+    "PULSAR_TP_RDMA_GID_INDEX",
 };
 
 /* Numerics knobs OUTSIDE the PULSAR_ namespace.  The scrub below sweeps PULSAR_* by

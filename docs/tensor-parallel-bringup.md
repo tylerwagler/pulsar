@@ -288,6 +288,30 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 > as the step-4 managed-memory verdict); the loader falls back to its local
 > copy path and the run is unaffected.
 
+> **LEG C -- REFERENCE GATE PASS THROUGH THE PAIR (2026-09-24, dev `ece8a459` +
+> `work/tp-raw-path-refuse`, capture = the Vision-Exp B300 blobs from
+> pulsar-notes `gate-baseline/ref-vexp`, story.ref.bin 27fec79e / code.ref.bin
+> 1b987bf8, tol 1e-4, anchors story known-high 512,30464 / known-flip 30464,
+> code known-high 3840).** Story: 2048 KL 1.45e-6, 4096 4.38e-6, 4102 1.61e-7,
+> 6144 5.34e-9, 30464 **top-1 MATCH** KL 1.89e-2 (known-high, informational);
+> code: 512 4.34e-7, 2048 1.53e-8, 3840 1.71e-2 (known-high). Top-1 matched at
+> every enforced depth, both blobs PASS, rank 1 `TP worker loop ended rc=0`.
+> Against the served one-box IQ2 budgets (3.16e-6 / 6.91e-6 / 5.33e-6 / 7.30e-8 /
+> 0.349; 1.88e-6 / 5.18e-7 / 0.191) the pair grades closer to the source at
+> EVERY depth, and the IQ2's 30464 flip does not flip here -- the gate says
+> "drop it from --known-flip" for this artifact's anchors. Prefill at real shape
+> the same morning: the ~35k-token story prompt through 9 chunks at 368.57 t/s,
+> 16/16 needle assignments recalled, 17/17 frames byte-identical.
+>
+> Two things the run needed that the handoff did not say: the gate reads the
+> reference blob on EVERY rank before opening the engine ("cannot read
+> reference blob" on a worker without it), so `PULSAR_TP_REF_DIR` must be
+> readable on every host; and `tests/prefill_bitexact_gate`'s environment
+> scrub kept the four TP-group variables but not `PULSAR_TP_RDMA_DEV` /
+> `PULSAR_TP_RDMA_GID_INDEX`, so the gate's rank auto-picked the IP-less
+> `mlx5_0` (link-local GID, no peer) while the engine beside it rode
+> `mlx5_3`; both are on the keep-list now (transport addressing, not numerics).
+
 ## Rollback
 
 Single-box behavior is untouched by design (`tp_role` defaults 0; the guard is
