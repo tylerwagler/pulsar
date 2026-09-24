@@ -1024,36 +1024,79 @@ bool gpu_graph_encode_output_head_batch(
 /* ------------------------------------------------------------------------- *
  * Slice 4d: the ONE place the output head knows about TP.
  *
- * With the group off the two entry points below are exactly the calls they
+ * With the group off the entry points below are exactly the calls they
  * replace (whole range, same destination, same captures) -- the single-box path
  * is byte-identical by construction.  With the group armed this rank projects
- * only ITS vocab range into a slice at the head of `out`, stages it to host,
- * all-gathers every rank's range (concatenation in rank order) and writes the
- * assembled full logits back over `out`.  Every rank therefore ends with the
- * same full vector and samples independently: no leader-only decision, no token
- * broadcast.
+ * only ITS vocab range (`head(lo, width, dst)` writes the packed slice: row r
+ * at r * width), every rank's range is gathered, and the assembled full logits
+ * land in `out` in rank order.  Every rank therefore ends with the same full
+ * vector and samples independently: no leader-only decision, no token
+ * broadcast.  Copies only -- the assembled rows are the bytes the heads wrote.
  *
- * Host staging is per call and transient, exactly like the prefill big gate's:
- * the gather takes host pointers today, so an eval costs one D2H of the slice
- * and one H2D of the assembled vector.  Moving both onto the registered GB10
- * slab is the same later optimization the big gate carries.
+ * Two lanes, chosen by the transport (like tp_allreduce_rows):
  *
- * The padded tail of each rank's slice is ZEROED after the read: the head only
- * writes [0, hi-lo) of a stride-wide row, and the stride is rounded up so the
- * group exchange can carry one byte count per round.
+ *  - a row-lane pair (4g-2) gathers ON THE STREAM: the slice is written to
+ *    g->tp_vocab_own, scattered into its columns of `out`, and cut into
+ *    row-lane messages (<= PULSAR_TP_BATCH_MAX_ROWS per exchange); each
+ *    exchange's combine scatters the peer's chunk into the peer's columns.
+ *    The engine thread never waits; a failed exchange latches the lane's
+ *    error word, which the next stream drain refuses (pulsar_gpu_end_commands).
+ *    Both ranks cut the same number of messages: the count is taken at the
+ *    padded stride, not at either rank's own width.
+ *  - otherwise the slice is staged to host, all-gathered by the transport, and
+ *    written back (one D2H + one H2D per eval).  The padded tail of each
+ *    rank's slice is ZEROED after the read: the head only writes [0, hi-lo) of
+ *    a stride-wide row, and the stride is rounded up so the group exchange can
+ *    carry one byte count per round.
  * ------------------------------------------------------------------------- */
-static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
-                           uint32_t row0, uint32_t n_rows,
-                           const pulsar_model *model, const pulsar_weights *weights,
+template <class Head>
+static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
                            pulsar_gpu_tensor *out) {
     const uint32_t n_vocab = (uint32_t)PULSAR_N_VOCAB;
     const uint32_t n_ranks = pulsar_tp_n_ranks(g->tp);
     const uint32_t stride = (n_vocab + n_ranks - 1u) / n_ranks;
+    const int rank = pulsar_tp_rank(g->tp);
     uint32_t lo = 0, hi = 0;
-    if (!pulsar_tp_owned_range(pulsar_tp_rank(g->tp), n_ranks, n_vocab, &lo, &hi)) {
+    if (!pulsar_tp_owned_range(rank, n_ranks, n_vocab, &lo, &hi)) {
         fprintf(stderr, "pulsar: tp vocab range refused (rank=%d n_ranks=%u n_vocab=%u)\n",
-                pulsar_tp_rank(g->tp), n_ranks, n_vocab);
+                rank, n_ranks, n_vocab);
         return false;
+    }
+    if (pulsar_tp_row_lane(g->tp)) {
+        uint32_t plo = 0, phi = 0;
+        if (!pulsar_tp_owned_range(1 - rank, n_ranks, n_vocab, &plo, &phi) ||
+            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ROWS || !g->tp_vocab_own || !g->tp_slab_dev) {
+            fprintf(stderr, "pulsar: tp vocab gather refused (%u rows, scratch %s) -- refusing\n",
+                    n_rows, g->tp_vocab_own ? "ok" : "MISSING");
+            return false;
+        }
+        pulsar_tp_row_lane_layout_t L;
+        pulsar_tp_row_lane_layout(g->tp, &L);
+        uint8_t *slab = (uint8_t *)g->tp_slab_dev;
+        const uint64_t vf = L.vec_bytes / sizeof(float);
+        const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
+        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->tp_vocab_own, 0,
+                                                        (uint64_t)n_rows * (hi - lo) * sizeof(float));
+        bool ok = own && head(lo, hi - lo, own) &&
+                  pulsar_gpu_tp_scatter_cols(out, own, n_rows, hi - lo, n_vocab, lo) != 0;
+        pulsar_gpu_tensor_free(own);
+        for (uint32_t m0 = 0; ok && m0 < msgs; m0 += PULSAR_TP_BATCH_MAX_ROWS) {
+            const uint32_t m = msgs - m0 < PULSAR_TP_BATCH_MAX_ROWS ? msgs - m0 : PULSAR_TP_BATCH_MAX_ROWS;
+            uint64_t first = 0, exch = 0;
+            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->tp_vocab_own, (uint64_t)m0 * L.vec_bytes,
+                                                              (uint64_t)m * L.vec_bytes);
+            ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
+                 pulsar_gpu_tp_stage_rows(chunk, slab, L.out_off, L.vec_bytes, first, L.n_slots, m) != 0 &&
+                 pulsar_gpu_tp_publish(slab + L.desc_off, exch, first, m) != 0 &&
+                 pulsar_gpu_tp_combine_scatter(out, slab, L.in_off, L.vec_bytes, first, L.n_slots, m,
+                                               (uint64_t)m0 * vf, n_rows, phi - plo, n_vocab, plo,
+                                               slab + L.done_off, exch, slab + L.err_off,
+                                               L.timeout_ns) != 0;
+            pulsar_gpu_tensor_free(chunk);
+        }
+        if (!ok) fprintf(stderr, "pulsar: tp vocab gather: row lane refused (%u rows, %u messages)\n",
+                         n_rows, msgs);
+        return ok;
     }
     const uint64_t slice_bytes = (uint64_t)n_rows * stride * sizeof(float);
     const uint64_t full_bytes  = (uint64_t)n_rows * n_vocab * sizeof(float);
@@ -1071,12 +1114,7 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
                       (unsigned long long)slice_bytes, (unsigned long long)full_bytes);
     /* This rank's range only.  slice 4d inc 1 made the range expressible: the
      * head weight is [vocab, in_dim] row-major, so it is a contiguous row range. */
-    if (ok) {
-        ok = single_row
-                 ? gpu_graph_encode_output_head(g, model, weights, row0, lo, hi - lo, slice)
-                 : gpu_graph_encode_output_head_batch(g, model, weights, row0, n_rows,
-                                                      lo, hi - lo, slice);
-    }
+    if (ok) ok = head(lo, hi - lo, slice);
     /* The head wrote the slice PACKED: row r of the GEMM output starts at
      * r * (hi - lo), because the GEMM's out_dim IS the range width.  The gather
      * wants rows at the padded pitch `stride` (one byte count per exchange
@@ -1118,7 +1156,9 @@ bool gpu_graph_encode_output_head_row_tp(
     if (!g->tp)
         return gpu_graph_encode_output_head(g, model, weights, row, 0u,
                                             (uint64_t)PULSAR_N_VOCAB, out);
-    return tp_vocab_split(g, true, row, 1u, model, weights, out);
+    return tp_vocab_split(g, 1u, [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
+        return gpu_graph_encode_output_head(g, model, weights, row, lo, width, dst);
+    }, out);
 }
 
 bool gpu_graph_encode_output_head_batch_tp(
@@ -1131,7 +1171,9 @@ bool gpu_graph_encode_output_head_batch_tp(
     if (!g->tp)
         return gpu_graph_encode_output_head_batch(g, model, weights, row0, n_tokens,
                                                   0u, (uint64_t)PULSAR_N_VOCAB, out);
-    return tp_vocab_split(g, false, row0, n_tokens, model, weights, out);
+    return tp_vocab_split(g, n_tokens, [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
+        return gpu_graph_encode_output_head_batch(g, model, weights, row0, n_tokens, lo, width, dst);
+    }, out);
 }
 
 static bool gpu_graph_encode_output_head_batch_impl(
@@ -1363,16 +1405,33 @@ bool gpu_graph_encode_dspark_output_head_batch(
         dn_b,
         dw->final_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok && dn_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
-    if (ok) {
-        if (bw->output->type == PULSAR_TENSOR_BF16)
-            ok = pulsar_gpu_matmul_bf16_tensor(logits, tensor_map_base(base_model, bw->output), tensor_map_size(base_model, bw->output),
-                                            bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                            output_norm, n_tokens) != 0;
-        else
-            ok = pulsar_gpu_matmul_mxfp8_tensor(logits, tensor_map_base(base_model, bw->output), tensor_map_size(base_model, bw->output),
-                                             bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                             output_norm, n_tokens) != 0;
+    /* The projection over a vocab range: [vocab, in_dim] row-major, so a range
+     * is a contiguous row range of the bf16 head (the MXFP8_LT scale plane is
+     * not row-addressable -- that arm takes the whole vocab only, like the
+     * target heads).  Under TP (4g-2) each rank projects its own range and
+     * tp_vocab_split gathers the full rows into spec_logits: the drafter's
+     * head was the one whole-vocab GEMM both ranks still ran in full. */
+    const bool dh_mx = bw->output->type != PULSAR_TENSOR_BF16;
+    auto project = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) -> bool {
+        if (dh_mx && (lo != 0u || width != vocab_dim)) {
+            fprintf(stderr, "pulsar: MXFP8 drafter head cannot be vocab-sliced (range [%u, %u)) -- refusing\n",
+                    lo, lo + width);
+            return false;
+        }
+        const uint64_t off = bw->output->abs_offset + (uint64_t)lo * PULSAR_N_EMBD * (dh_mx ? 1u : sizeof(uint16_t));
+        return dh_mx
+            ? pulsar_gpu_matmul_mxfp8_tensor(dst, tensor_map_base(base_model, bw->output), tensor_map_size(base_model, bw->output),
+                                             off, PULSAR_N_EMBD, width, output_norm, n_tokens) != 0
+            : pulsar_gpu_matmul_bf16_tensor(dst, tensor_map_base(base_model, bw->output), tensor_map_size(base_model, bw->output),
+                                            off, PULSAR_N_EMBD, width, output_norm, n_tokens) != 0;
+    };
+    if (ok && g->tp && vocab_dim != (uint64_t)PULSAR_N_VOCAB) {
+        fprintf(stderr, "pulsar: tp drafter head over %llu logits, not the full vocab -- refusing\n",
+                (unsigned long long)vocab_dim);
+        ok = false;
     }
+    if (ok) ok = g->tp ? tp_vocab_split(g, n_tokens, project, g->spec_logits)
+                       : project(0u, (uint32_t)vocab_dim, logits);
     pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);

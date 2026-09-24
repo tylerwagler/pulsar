@@ -236,6 +236,13 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
 
 void server::close_resources() {
     auto *s = this;
+    for (int i = 0; i < s->tp_rank_json_n; i++) free(s->tp_rank_json[i]);
+    free(s->tp_rank_json);
+    free(s->tp_rank_ids);
+    s->tp_rank_json = NULL;
+    s->tp_rank_ids = NULL;
+    s->tp_rank_json_n = 0;
+    s->tp = NULL;
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -541,6 +548,11 @@ int main(int argc, char **argv) {
     /* A TP worker spills bank KV to ITS OWN disk under the same directory
      * policy the leader uses (slice 4e increment 6). */
     cfg.engine.tp_spill_dir = cfg.kv_disk_dir;
+    /* Every rank tells the group its build (the NODE frame), so the leader's
+     * /health can show a mixed-build pair for what it is.  Stamped here, not in
+     * the transport: this TU is rebuilt whenever HEAD moves (Makefile), and a
+     * library object carrying the -D string would serve a stale one. */
+    cfg.engine.build_id = PULSAR_VERSION_STR;
 
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
@@ -1085,6 +1097,8 @@ int main(int argc, char **argv) {
      * runs before the worker thread starts, so it is still single-threaded
      * engine access. */
     s.publish_metrics_snapshot();
+    /* Same window: still single-threaded, and the TP records are final. */
+    s.build_tp_health();
 
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");

@@ -38,8 +38,6 @@ int ds4_exl3_moe_gemv_pair_launch(
     int             K,
     int64_t         n_assign,
     int             n_experts,
-    int             e_lo,          /**< TP ownership [e_lo, e_hi): a peer-owned assignment writes zeros */
-    int             e_hi,
     cudaStream_t    stream);
 
 /** The pair GEMV with the row block pinned (1, 4 or 16 assignments per CTA)
@@ -58,8 +56,6 @@ int ds4_exl3_moe_gemv_pair_launch_rows(
     int             K,
     int64_t         n_assign,
     int             n_experts,
-    int             e_lo,
-    int             e_hi,
     int             rows_per_block,
     cudaStream_t    stream);
 
@@ -76,8 +72,6 @@ int ds4_exl3_moe_gemv_single_launch(
     int             K,
     int64_t         n_assign,
     int             n_experts,
-    int             e_lo,
-    int             e_hi,
     cudaStream_t    stream);
 
 /** The EXL3 SwiGLU fold: per pair (pair = tok * n_expert + slot, expert =

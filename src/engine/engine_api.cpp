@@ -353,6 +353,9 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
                                 int body_rc, char *err, size_t errlen) {
     char peer_err[256];
     peer_err[0] = '\0';
+    /* An INTERRUPTED sync stopped at a chunk verdict both ranks took: the
+     * worker answers at once, nothing to rescue. */
+    if (body_rc != 0 && body_rc != PULSAR_SESSION_SYNC_INTERRUPTED) pulsar_tp_own_step_failed(tp, operation);
     const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, operation,
                                                    peer_err, sizeof(peer_err));
     if (body_rc != 0) return body_rc;
@@ -364,13 +367,53 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
     return 0;
 }
 
-/** The collector for the operations that PRODUCE logits (eval, batch decode,
- * mixed batch): the peers' acks carry the digest of their assembled logits and
- * must equal the leader's own -- the cross-rank identity check (L243).  When the
- * leader's own body failed there is nothing to compare; the acks are drained in
- * either shape so the next frame is not shifted, and the local failure is the
- * result.  `n_rows` rows of the engine's logits width, exactly the rows the body
- * wrote. */
+/** The cross-rank identity digest of a BATCHED step (decode_multiseq /
+ * decode_mixed): of what the step actually produced.  Under a greedy
+ * speculative step the readback is the per-row argmaxes (L219,
+ * spec_argmax_host) and under the sparse min-p contract the compact candidate
+ * block (L149, spec_compact_host) -- the caller's `logits` rows are NOT
+ * written then, and digesting them compared two processes' stale buffers: the
+ * server's first speculative step on the pair refused a correct step as a
+ * divergence.  gpu_graph_decode_multiseq_batch records the form on every step
+ * (exactly one of the two row counts nonzero, or both zero for full rows), so
+ * the leader's collect and the worker's ack read it the same way.  The width
+ * seeds the digest, so the three forms cannot collide. */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows) {
+    const pulsar_gpu_graph *g = &s->graph;
+    if (g->spec_argmax_rows > 0)
+        return pulsar_tp_logits_digest((const float *)g->spec_argmax_host, g->spec_argmax_rows, 1u);
+    if (g->spec_compact_rows > 0)
+        return pulsar_tp_logits_digest((const float *)g->spec_compact_host, g->spec_compact_rows,
+                                       (uint32_t)PULSAR_DSPARK_PREFILTER_ROW_I32);
+    return pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+}
+
+/** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
+ * L241 4g-2): before logits VALUES leave the engine (copy, logprobs) and
+ * before the session ends.  Token decisions (sample, argmax) do not settle --
+ * the next eval does, before the token it drew is returned to its caller.
+ * With no `err` the refusal is printed.  1 = nothing pending or it matched. */
+static int tp_mirror_settle(pulsar_session *s, char *err, size_t errlen) {
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp || pulsar_tp_rank(tp) != 0) return 1;
+    char why[512];
+    why[0] = '\0';
+    if (pulsar_tp_settle_deferred_ack(tp, why, sizeof(why))) return 1;
+    if (err) snprintf(err, errlen, "%s", why);
+    else fprintf(stderr, "pulsar: %s\n", why);
+    return 0;
+}
+
+int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen) {
+    return s && tp_mirror_settle(s, err, errlen) ? 0 : 1;
+}
+
+/** The collector for the BATCHED steps (batch decode, mixed batch): the peers'
+ * acks carry the digest of what their step produced (pulsar_session_batch_digest)
+ * and must equal the leader's own -- the cross-rank identity check (L243).  The
+ * eval pipelines its own check (pulsar_session_eval).  When the leader's own
+ * body failed there is nothing to compare; the acks are drained in either shape
+ * so the next frame is not shifted, and the local failure is the result. */
 static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                        int body_rc, const float *logits, uint32_t n_rows,
                                        char *err, size_t errlen) {
@@ -384,7 +427,7 @@ static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const c
                           "check them by", operation, n_rows);
         return 1;
     }
-    const uint64_t own = pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+    const uint64_t own = pulsar_session_batch_digest(s, logits, n_rows);
     char peer_err[256];
     peer_err[0] = '\0';
     if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, operation, own,
@@ -444,7 +487,7 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
      * stderr and the return code carries it. */
     char err[256];
     err[0] = '\0';
-    if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size) == 0) {
+    if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size, gpu_graph_bank_pool_n()) == 0) {
         pulsar_tp_mirror_fail_void(tp, "session create", "the frame could not be shipped");
         s->destroy();
         *out = NULL;
@@ -463,6 +506,7 @@ void pulsar_session_free(pulsar_session *s) {
     if (!s) return;
     pulsar_tp *tp = tp_mirror_target(s);
     if (tp && pulsar_tp_rank(tp) == 0) {
+        (void)tp_mirror_settle(s, NULL, 0);   /* a refusal is printed; the pair is marked failed */
         /* Fire-and-forget like rewind: the worker loop drops its registry
          * entry, and an unknown id there marks the pair failed. */
         (void)tp_mirror_void_send(tp, s->tp_session_id, "session destroy",
@@ -611,9 +655,9 @@ void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) { return s->sample(temperature, top_k, top_p, min_p, rng); }
-int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s ? s->top_logprobs(out, k) : 0; }
-int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s ? s->token_logprob(token, out) : 0; }
-int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s ? s->copy_logits(out, cap) : 0; }
+int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
+int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token, out) : 0; }
+int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s && tp_mirror_settle(s, NULL, 0) ? s->copy_logits(out, cap) : 0; }
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
@@ -650,8 +694,41 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
         if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
         return 1;
     }
-    return tp_mirror_leader_ack_logits(s, tp, "eval", s->eval(token, err, errlen),
-                                       s->logits, 1u, err, errlen);
+    /* PIPELINED identity check (L241 4g-2): the previous eval's digest ack is
+     * settled here, after this step's body -- it has been in the socket since
+     * the worker finished that step -- and this step's own digest is DEFERRED
+     * instead of waited on, so the leader samples and ships the next token
+     * while the worker is still acking this one.  No token leaves unchecked:
+     * the one drawn from these logits is returned by the NEXT eval, which
+     * settles them first; logits values settle before they are copied out
+     * (tp_mirror_settle).  The body runs even when the settle failed, so both
+     * ranks finish this step and its ack is drained, not left in the socket. */
+    const int body_rc = s->eval(token, err, errlen);
+    char why[512];
+    why[0] = '\0';
+    const int settled = pulsar_tp_settle_deferred_ack(tp, why, sizeof(why));
+    if (body_rc != 0 || !settled) {
+        pulsar_tp_drain_command_acks(tp);
+        if (body_rc != 0) return body_rc;
+        if (err) snprintf(err, errlen, "%s (found at the eval of position %llu)", why,
+                          (unsigned long long)pos);
+        return 1;
+    }
+    if (!s->logits) {
+        pulsar_tp_drain_command_acks(tp);
+        if (err) snprintf(err, errlen, "tp: the mirrored eval produced no logits to check");
+        return 1;
+    }
+    char what[96];
+    snprintf(what, sizeof(what), "eval at position %llu", (unsigned long long)pos);
+    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what,
+                                            pulsar_tp_logits_digest(s->logits, 1u,
+                                                                    (uint32_t)s->engine->logits_width()))) {
+        pulsar_tp_drain_command_acks(tp);
+        if (err) snprintf(err, errlen, "tp: could not defer the eval's identity check");
+        return 1;
+    }
+    return 0;
 }
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) {
     if (!s) return 1;
@@ -971,6 +1048,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
         return -1;
     }
     const int own = s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen);
+    if (own < 0) pulsar_tp_own_step_failed(tp, "generate_speculative");
     const int agreed = tp_mirror_bank_verdict_logits(s, tp, "generate_speculative", own + 1, -1,
                                                      s->logits, 1u);
     return agreed < 0 ? -1 : own;
@@ -1073,6 +1151,7 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
         return -1;
     }
     const int own = pulsar_session_spec_redraft_batch_local(s, rounds, banks, rngs, n, err, errlen);
+    if (own != 0) pulsar_tp_own_step_failed(tp, "spec_redraft_batch");
     return tp_mirror_bank_verdict(s, tp, "spec_redraft_batch", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {

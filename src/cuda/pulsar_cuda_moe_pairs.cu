@@ -59,25 +59,6 @@ __device__ static __forceinline__ void moe_clamp_expert_id(int32_t &expert_i, ui
     }
 }
 
-/** TP OWNERSHIP (slice 4c): is `expert_i` in this rank's slice of the routed
- *  experts?  A peer-owned pair contributes NOTHING to this rank's partial --
- *  the group's all-reduce sums the ranks' partials into the full routed sum,
- *  so a rank that also counted a peer's pair would double it.  Dropping it
- *  here is what leaves the grouped GEMM's group for that expert at M=0 (no
- *  bytes, no FLOPs) and is the whole byte/FLOP cut of the split.
- *
- *  The full range [0, n_total) is the single-rank path: every pair is owned
- *  and the predicate is inert.  The bound comes from the ONE authority,
- *  `pulsar_tp_owned_range` (src/tp) -- the kernel never recomputes it.
- *
- *  BOTH builders call this with the same arguments, and it runs AFTER
- *  `moe_clamp_expert_id`: an out-of-range id is folded to 0 and flagged first,
- *  so the route-bounds refusal still fires on every rank no matter which slice
- *  happens to own expert 0. */
-__device__ static __forceinline__ bool moe_pair_owned(uint32_t expert_i, uint32_t expert_lo, uint32_t expert_hi) {
-    return expert_i >= expert_lo && expert_i < expert_hi;
-}
-
 int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm) {
     uint32_t code = 0u;
     if (!cuda_ok(cudaMemcpyFromSymbol(&code, g_moe_route_oob, sizeof code, 0, cudaMemcpyDeviceToHost),
@@ -104,14 +85,11 @@ __global__ void moe_count_sorted_pairs_kernel(
         const int32_t *selected,
         uint32_t pair_count,
         uint32_t n_total,
-        uint32_t oob_code,
-        uint32_t expert_lo,
-        uint32_t expert_hi) {
+        uint32_t oob_code) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     moe_clamp_expert_id(expert_i, n_total, oob_code);
-    if (!moe_pair_owned((uint32_t)expert_i, expert_lo, expert_hi)) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
 
@@ -167,14 +145,11 @@ __global__ void moe_scatter_sorted_pairs_kernel(
         const int32_t *selected,
         uint32_t pair_count,
         uint32_t n_total,
-        uint32_t oob_code,
-        uint32_t expert_lo,
-        uint32_t expert_hi) {
+        uint32_t oob_code) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     moe_clamp_expert_id(expert_i, n_total, oob_code);
-    if (!moe_pair_owned((uint32_t)expert_i, expert_lo, expert_hi)) return;
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
 }

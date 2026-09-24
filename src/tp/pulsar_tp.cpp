@@ -98,6 +98,12 @@ typedef struct {
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
+    /* v14: the BULK lane -- this rank's registered bulk buffer and the second
+     * (bulk) QP; all zero when this rank attached no bulk buffer. */
+    uint64_t bulk_base;
+    uint32_t bulk_rkey;
+    uint32_t bulk_qpn;
+    uint32_t bulk_psn;
 } pulsar_tp_rdma_info;
 
 /* ---- verbs ABI thunk (see head-of-section note) ---- */
@@ -156,6 +162,8 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 #define TP_IBV_PORT_INIT        IBV_PORT_INIT
 #define TP_IBV_PORT_ARMED       IBV_PORT_ARMED
 #define TP_IBV_WR_SEND          IBV_WR_SEND
+#define TP_IBV_WR_RDMA_WRITE    IBV_WR_RDMA_WRITE
+#define TP_IBV_WR_RDMA_WRITE_WITH_IMM IBV_WR_RDMA_WRITE_WITH_IMM
 #define TP_IBV_WC_SUCCESS       IBV_WC_SUCCESS
 #define TP_IBV_WC_SEND          IBV_WC_SEND
 #define TP_IBV_WC_RECV          IBV_WC_RECV
@@ -211,8 +219,9 @@ enum { TP_IBV_QPS_RESET = 0, TP_IBV_QPS_INIT = 1, TP_IBV_QPS_RTR = 2,
 /* enum ibv_port_state */
 enum { TP_IBV_PORT_NOP = 0, TP_IBV_PORT_DOWN = 1, TP_IBV_PORT_ACTIVE = 2,
        TP_IBV_PORT_INIT = 3, TP_IBV_PORT_ARMED = 4 };
-/* enum ibv_wr_opcode (only SEND is used) */
-enum { TP_IBV_WR_SEND = 0 };
+/* enum ibv_wr_opcode: RDMA_WRITE, RDMA_WRITE_WITH_IMM, SEND -- the order in
+ * <infiniband/verbs.h> (SEND is 2; this thunk used to say 0, i.e. RDMA_WRITE) */
+enum { TP_IBV_WR_RDMA_WRITE = 0, TP_IBV_WR_RDMA_WRITE_WITH_IMM = 1, TP_IBV_WR_SEND = 2 };
 /* enum ibv_wc_status (only success/error are distinguished) */
 enum { TP_IBV_WC_SUCCESS = 0, TP_IBV_WC_GENERAL_ERR = 19 };
 /* enum ibv_wc_opcode: recv completions share the bit upstream tests */
@@ -268,7 +277,7 @@ struct tp_ibv_send_wr {
         struct { tp_ibv_ah *ah; uint32_t remote_qpn; uint32_t remote_qkey; } ud;
         struct { uint32_t remote_qpn; uint32_t remote_qkey; uint32_t pkey_index; } xrc;
     } wr;
-    union { uint32_t imm_data; uint32_t invalidate_rkey; } ex;
+    union { uint32_t imm_data; uint32_t invalidate_rkey; };   /* anonymous, as in <infiniband/verbs.h> */
 };
 
 struct tp_ibv_recv_wr {
@@ -464,6 +473,10 @@ typedef struct {
 #define PULSAR_TP_RDMA_RECV_WINDOW 16
 #define PULSAR_TP_RDMA_BULK_SLOTS 64
 #define PULSAR_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+/* The bulk lane (v14): one RDMA write per piece, the last WITH_IMM. */
+#define PULSAR_TP_BULK_PIECE (UINT64_C(4) << 20)
+#define PULSAR_TP_BULK_IMM_WINDOW 16u
+#define PULSAR_TP_BULK_WR_TAG (UINT64_C(1) << 62)
 /* TCP fallback write/read round: small enough that two simultaneous rounds can
  * never fill both send buffers under ANY kernel socket-buffer clamp (the pair
  * hosts clamp SO_SNDBUF to net.core.wmem_max ~212K; a 2 MiB round there meant
@@ -481,9 +494,12 @@ typedef struct {
     tp_ibv_pd pd;
     tp_ibv_cq cq;
     tp_ibv_mr mr;
+    tp_ibv_cq bulk_cq;   /* the bulk lane's own CQ: its completions never mix with the gates' */
+    tp_ibv_mr bulk_mr;   /* the registered bulk buffer (pulsar_tp_set_bulk), or NULL */
     struct tp_ibv_port_attr port;
     union tp_ibv_gid gid;
     int gid_index;
+    char dev_name[PULSAR_TP_NODE_STR];   /* the HCA tp_rdma_open chose, for the NODE frame */
 } pulsar_tp_rdma;
 
 /* PER-PEER RDMA state: one QP connected to one peer, that peer's exchanged
@@ -498,6 +514,12 @@ typedef struct {
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
     pthread_mutex_t post_lock;
+    /* The bulk lane (v14): a second UC QP whose receive queue holds only the
+     * zero-length receives the peer's RDMA_WRITE_WITH_IMM consumes -- so it
+     * never mixes with the gate QP's 16 KB receives. */
+    tp_ibv_qp bulk_qp;
+    uint64_t bulk_imm_count;    /* imm arrivals reaped (the peer's bulk exchanges, in order) */
+    uint32_t bulk_last_imm;     /* the exchange id the latest arrival carried */
 } pulsar_tp_rdma_link;
 
 /* One peer in the TP mesh.  A full-mesh rank connects to every other rank
@@ -511,6 +533,9 @@ typedef struct {
     int data_fd;
     uint32_t peer_ctx;
     bool connected;
+    /* What the peer told us about itself in the NODE frame (protocol v13). */
+    pulsar_tp_node node;
+    bool node_known;
     /* This peer's own QP and completion state.  The HCA, PD, CQ and the slab MR
      * are shared (pulsar_tp_rdma on the transport). */
     pulsar_tp_rdma_link rdma;
@@ -543,7 +568,31 @@ struct pulsar_tp {
     /* The cross-rank logits identity tally (leader only; L243). */
     uint64_t identity_frames;
     uint64_t identity_matched;
+    /* The DEFERRED digest ack (L241 4g-2, pulsar_tp_defer_command_ack_digest):
+     * the leader's own digest of a step whose peer acks it has not read yet.
+     * Settled before any other ack is read. */
+    bool deferred_armed = false;
+    uint64_t deferred_session = 0, deferred_digest = 0;
+    char deferred_operation[96] = {0};
+    /* The row lane (4g-2).  Engine thread: gate_seq = last message numbered,
+     * row_exch = last exchange numbered.  Proxy thread: proxy_* below. */
+    uint64_t gate_seq = 0;
+    uint64_t row_exch = 0;
+    uint64_t last_gate_exch = 0;   /* the latest exchange numbered that uses the GATE QP (not bulk) */
+    pthread_t proxy;
+    bool proxy_started = false;
+    std::atomic<bool> proxy_stop{false};
+    std::atomic<bool> proxy_failed{false};
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
+    pulsar_tp_node self;    /* this rank's own NODE record */
+    /* The bulk lane (pulsar_tp_set_bulk): caller-owned, host-pinned and
+     * GPU-mapped, laid out out | in[0] | in[1], each bulk_cap bytes. */
+    uint8_t *bulk = nullptr;
+    uint64_t bulk_bytes = 0;
+    uint64_t bulk_cap = 0;
+    uint64_t bulk_seq = 0;          /* engine thread: bulk exchanges numbered (buffer parity) */
+    uint64_t peer_bulk_base = 0;    /* the peer's bulk buffer and rkey (v14 info) */
+    uint32_t peer_bulk_rkey = 0;
 };
 
 /* ------------------------------------------------------------------------
@@ -604,6 +653,17 @@ static void tp_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Keepalive: an idle pair waits forever (pulsar_tp_recv_command), so a
+     * peer HOST that disappears without closing (power, cable) must still
+     * surface -- ~60 s: 30 s idle, then 3 probes 10 s apart.  Probes are
+     * answered by the peer's kernel, so an idle-but-alive peer never trips it. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    int idle = 30, intvl = 10, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
     /* Gate exchanges are latency-critical 16KB messages; large socket
      * buffers only matter for the TCP fallback's pipelining.  The kernel
      * clamps these to net.core.wmem_max anyway.  PULSAR_TP_TEST_TINY_BUFFERS
@@ -861,6 +921,7 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         if (chose) {
             r->ctx = ctx;
             r->port = pa;
+            snprintf(r->dev_name, sizeof(r->dev_name), "%s", name);
             fprintf(stderr, "pulsar-tp: rdma device %s (port state %d)\n",
                     name, (int)pa.state);
             break;
@@ -989,6 +1050,11 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
     }
+    r->bulk_cq = r->api.create_cq(r->ctx, 256, NULL, NULL, 0);
+    if (!r->bulk_cq) {
+        tp_set_err(err, errlen, "tp rdma: create_cq (bulk) failed");
+        return 0;
+    }
     /* The QP itself is per PEER and is created later, once the peers exist --
      * the HCA open runs before they do.  See tp_rdma_qp_create. */
     return 1;
@@ -1093,6 +1159,76 @@ static int tp_rdma_register_slab(pulsar_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
+/* INIT -> RTR -> RTS for one UC QP toward `peer` (GRH addressing through its
+ * GID, the lower of the two ports' MTUs).  The gate QP and the bulk QP share it. */
+static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_info *peer,
+                              uint32_t dest_qpn, uint32_t dest_psn, uint32_t my_psn, int rank,
+                              char *err, size_t errlen) {
+    /* INIT -> RTR -> RTS with GRH addressing through the exchanged GID. */
+    struct tp_ibv_qp_attr a;
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_INIT;
+    a.pkey_index = 0;
+    a.port_num = 1;
+    a.qp_access_flags = TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
+                        TP_IBV_ACCESS_REMOTE_WRITE;
+    if (tp->rdma.api.modify_qp(qp, &a,
+            TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
+            TP_IBV_QP_ACCESS_FLAGS) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_RTR;
+    /* path_mtu must AGREE between the two QPs.  The pair's second link
+     * reports active_mtu 1024 on one rank and 4096 on the other; each rank
+     * using its own makes the faster side emit frames the narrower port
+     * silently drops (bisected with a probe: >1024 fails with per-port
+     * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
+     * two ports' MTUs, on both ranks. */
+    a.path_mtu = tp->rdma.port.active_mtu;
+    if (peer->mtu != 0 && (int)peer->mtu < (int)a.path_mtu)
+        a.path_mtu = (decltype(a.path_mtu))(int)peer->mtu;
+    a.dest_qp_num = dest_qpn;
+    a.rq_psn = dest_psn;
+    a.ah_attr.dlid = (uint16_t)peer->lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, peer->gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)tp->rdma.gid_index;
+    a.ah_attr.grh.hop_limit = 1;
+    if (tp->rdma.api.modify_qp(qp, &a,
+            TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
+            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_RTS;
+    a.sq_psn = my_psn;
+    if (tp->rdma.api.modify_qp(qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+/* The bulk lane's zero-length receive: consumed by the peer's final
+ * RDMA_WRITE_WITH_IMM of an exchange (the data itself lands by RDMA write). */
+static int tp_bulk_post_imm_recv(pulsar_tp *tp, pulsar_tp_rdma_link *r) {
+    struct tp_ibv_recv_wr wr;
+    struct tp_ibv_recv_wr *bad = NULL;
+    (void)memset(&wr, 0, sizeof(wr));
+    wr.wr_id = PULSAR_TP_BULK_WR_TAG;
+    wr.sg_list = NULL;
+    wr.num_sge = 0;
+    if (tp->rdma.api.post_recv(r->bulk_qp, &wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk imm post_recv: %s\n", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
 /* Bring up ONE peer's QP: create it over the shared PD/CQ, exchange this rank's
  * registered-slab address and QP identity with THAT peer over its own control
  * socket, then INIT -> RTR -> RTS.  The MR is already registered above, so
@@ -1109,6 +1245,26 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
     mine.qpn = TP_QPN(r->qp);
     /* PSND must differ per peer, so mix the peer in. */
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp ^ (uintptr_t)pp) & 0xffffff;
+    if (tp->rdma.bulk_mr && tp->n_ranks == 2) {
+        struct tp_ibv_qp_init_attr qia;
+        (void)memset(&qia, 0, sizeof(qia));
+        qia.send_cq = (decltype(qia.send_cq))tp->rdma.bulk_cq;
+        qia.recv_cq = (decltype(qia.recv_cq))tp->rdma.bulk_cq;
+        qia.qp_type = TP_IBV_QPT_UC;
+        qia.cap.max_send_wr = 64;
+        qia.cap.max_recv_wr = 2u * PULSAR_TP_BULK_IMM_WINDOW;
+        qia.cap.max_send_sge = 1;
+        qia.cap.max_recv_sge = 1;
+        r->bulk_qp = tp->rdma.api.create_qp(tp->rdma.pd, &qia);
+        if (!r->bulk_qp) {
+            tp_set_err(err, errlen, "tp rdma: create_qp(UC, bulk): %s", strerror(errno));
+            return 0;
+        }
+        mine.bulk_base = (uint64_t)(uintptr_t)tp->bulk;
+        mine.bulk_rkey = TP_RKEY(tp->rdma.bulk_mr);
+        mine.bulk_qpn = TP_QPN(r->bulk_qp);
+        mine.bulk_psn = (mine.psn ^ 0x5a5a5au) & 0xffffff;
+    }
     mine.mtu = (uint32_t)tp->rdma.port.active_mtu;
     mine.lid = tp->rdma.port.lid;
     memcpy(mine.gid, tp->rdma.gid.raw, 16);
@@ -1126,51 +1282,24 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
         return 0;
     }
 
-    /* INIT -> RTR -> RTS with GRH addressing through the exchanged GID. */
-    struct tp_ibv_qp_attr a;
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_INIT;
-    a.pkey_index = 0;
-    a.port_num = 1;
-    a.qp_access_flags = TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
-                        TP_IBV_ACCESS_REMOTE_WRITE;
-    if (tp->rdma.api.modify_qp(r->qp, &a,
-            TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
-            TP_IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", pp->rank, strerror(errno));
+    if (!tp_rdma_qp_connect(tp, r->qp, &r->peer, r->peer.qpn, r->peer.psn, mine.psn, pp->rank,
+                            err, errlen))
         return 0;
-    }
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_RTR;
-    /* path_mtu must AGREE between the two QPs.  The pair's second link
-     * reports active_mtu 1024 on one rank and 4096 on the other; each rank
-     * using its own makes the faster side emit frames the narrower port
-     * silently drops (bisected with a probe: >1024 fails with per-port
-     * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
-     * two ports' MTUs, on both ranks. */
-    a.path_mtu = tp->rdma.port.active_mtu;
-    if (r->peer.mtu != 0 && (int)r->peer.mtu < (int)a.path_mtu)
-        a.path_mtu = (decltype(a.path_mtu))(int)r->peer.mtu;
-    a.dest_qp_num = r->peer.qpn;
-    a.rq_psn = r->peer.psn;
-    a.ah_attr.dlid = (uint16_t)r->peer.lid;
-    a.ah_attr.port_num = 1;
-    a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)tp->rdma.gid_index;
-    a.ah_attr.grh.hop_limit = 1;
-    if (tp->rdma.api.modify_qp(r->qp, &a,
-            TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
-            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", pp->rank, strerror(errno));
-        return 0;
-    }
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_RTS;
-    a.sq_psn = mine.psn;
-    if (tp->rdma.api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", pp->rank, strerror(errno));
-        return 0;
+    /* The bulk lane: both ranks attached a bulk buffer (the info says so), so
+     * connect the second QP and post its imm window BEFORE the ready barrier --
+     * a WRITE_WITH_IMM that arrives before the peer posted its receive is
+     * dropped by UC. */
+    if (r->bulk_qp && r->peer.bulk_qpn != 0) {
+        if (!tp_rdma_qp_connect(tp, r->bulk_qp, &r->peer, r->peer.bulk_qpn, r->peer.bulk_psn,
+                                mine.bulk_psn, pp->rank, err, errlen))
+            return 0;
+        tp->peer_bulk_base = r->peer.bulk_base;
+        tp->peer_bulk_rkey = r->peer.bulk_rkey;
+        for (uint32_t k = 0; k < PULSAR_TP_BULK_IMM_WINDOW; k++)
+            if (!tp_bulk_post_imm_recv(tp, r)) {
+                tp_set_err(err, errlen, "tp rdma: bulk imm window post to rank %d failed", pp->rank);
+                return 0;
+            }
     }
     /* Leave the receive queue empty for an initial bulk prefill; the first
      * decode gate arms the normal lookahead window. */
@@ -1336,6 +1465,315 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
+}
+
+/* The row lane's three slab words (layout: pulsar_tp.h). */
+static inline volatile uint64_t *tp_row_desc(pulsar_tp *tp) {
+    return (volatile uint64_t *)(tp->slab + tp->layout.out_flags_off);
+}
+static inline std::atomic<uint64_t> *tp_row_done(pulsar_tp *tp) {
+    return reinterpret_cast<std::atomic<uint64_t> *>(tp->slab + tp->layout.in_flags_off);
+}
+static inline volatile uint32_t *tp_row_err(pulsar_tp *tp) {
+    return (volatile uint32_t *)(tp->slab + tp->layout.gpu_flags_off);
+}
+
+/* ROW-LANE ABORT (L241 4g-2).  A rank that will not run a step its peer is
+ * running -- a refused frame, a failed body -- leaves the peer's GPU spinning
+ * in a combine for rows that never come, until the transport timeout (900 s:
+ * the pair looked hung).  The failing rank sends this message on the DATA
+ * socket, idle during decode (the control socket may hold pipelined acks ahead
+ * of it); the peer's proxy peeks for it while it waits on an exchange and
+ * latches the lane's error word, which every spinning kernel watches -- the
+ * stream drains in microseconds and the drain refuses the step
+ * (pulsar_gpu_end_commands).  The message is never consumed: the pair is
+ * failed from here on.  The magic is distinct from every data-socket header. */
+static const char TP_ROW_ABORT_MAGIC[8] = { 'P', 'T', 'P', 'A', 'B', 'O', 'R', 'T' };
+typedef struct {
+    char magic[8];
+    int32_t rank;
+    char why[116];
+} tp_row_abort_msg;
+
+static void tp_row_err_latch(pulsar_tp *tp, uint32_t code) {
+    if (tp->slab && pulsar_tp_row_lane(tp) && *tp_row_err(tp) == 0) *tp_row_err(tp) = code;
+}
+
+void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why) {
+    if (!tp) return;
+    static std::atomic<bool> sent{false};
+    pulsar_tp_mark_failed(tp);
+    tp_row_err_latch(tp, 2u);
+    if (sent.exchange(true)) return;
+    fprintf(stderr, "pulsar-tp: rank %d aborts the pair's row lane: %s\n", tp->rank,
+            why ? why : "(no reason)");
+    tp_row_abort_msg m;
+    memset(&m, 0, sizeof(m));
+    memcpy(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic));
+    m.rank = tp->rank;
+    snprintf(m.why, sizeof(m.why), "%s", why ? why : "");
+    for (int i = 0; i < tp->n_peers; i++)
+        if (tp->peers[i].data_fd >= 0) (void)tp_write_full(tp->peers[i].data_fd, &m, sizeof(m));
+}
+
+/* 1 = the peer sent the abort (printed once, `why` filled). */
+static int tp_peer_aborted(pulsar_tp *tp) {
+    tp_row_abort_msg m;
+    const ssize_t n = recv(tp->data_fd, &m, sizeof(m), MSG_PEEK | MSG_DONTWAIT);
+    if (n < (ssize_t)sizeof(m) || memcmp(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic)) != 0) return 0;
+    m.why[sizeof(m.why) - 1] = '\0';
+    fprintf(stderr, "pulsar-tp: rank %d aborted the pair's row lane: %s\n", (int)m.rank, m.why);
+    return 1;
+}
+
+/* Arm the row lane's receive window at message `first`: post WINDOW
+ * receives, then the ARMED handshake on the control socket (a rank that sends
+ * before the peer's window is armed silently loses messages under UC).
+ * Engine thread only. */
+static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    pthread_mutex_lock(&r->post_lock);
+    int ok = 1;
+    for (uint64_t s = first; ok && s < first + PULSAR_TP_RDMA_RECV_WINDOW; s++)
+        ok = tp_rdma_post_gate_recv(tp, s);
+    if (ok) ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
+    if (ok) {
+        uint32_t rtype = 0, rbytes = 0;
+        ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
+             rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
+    }
+    if (ok) r->recv_window_active = true;
+    pthread_mutex_unlock(&r->post_lock);
+    return ok;
+}
+
+/* One exchange, proxy thread.  Message t is sent from out-slot (t-1)%n_slots
+ * (the GPU staged it there) and received into in-slot (t-1)%n_slots (posted
+ * WINDOW messages earlier).  Completion = the peer's `rows` landed AND our
+ * own sends retired, so the GPU may rewrite those out-slots the moment it
+ * sees done.  The window is re-posted before done is written, so the proxy is
+ * idle -- and the QP quiet -- whenever the engine observes done == enqueued. */
+static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    const uint64_t vb = tp->vec_bytes, last = first + rows - 1u;
+    pthread_mutex_lock(&r->post_lock);
+    int ok = r->recv_window_active ? 1 : 0;
+    if (!ok) fprintf(stderr, "pulsar-tp: row lane proxy: exchange published with no armed window\n");
+    for (uint32_t k = 0; ok && k < rows; k++) {
+        const uint64_t t = first + k;
+        struct tp_ibv_sge sge;
+        struct tp_ibv_send_wr wr;
+        struct tp_ibv_send_wr *bad = NULL;
+        (void)memset(&wr, 0, sizeof(wr));
+        sge.addr = (uintptr_t)(tp->slab + tp->layout.out_off + (uint64_t)tp_gate_slot(tp, t) * vb);
+        sge.length = (uint32_t)vb;
+        sge.lkey = TP_LKEY(tp->rdma.mr);
+        wr.wr_id = t;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = TP_IBV_WR_SEND;
+        wr.send_flags = TP_IBV_SEND_SIGNALED;
+        ok = tp->rdma.api.post_send(r->qp, &wr, &bad) == 0;
+        if (!ok) fprintf(stderr, "pulsar-tp: row lane post_send (seq %llu): %s\n",
+                         (unsigned long long)t, strerror(errno));
+        else r->send_outstanding++;
+    }
+    const double t_posted = tp_now_sec();
+    const double deadline = t_posted + (double)tp->timeout_sec;
+    double next_abort_check = t_posted + 1e-3;
+    while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_now_sec() > next_abort_check) {
+            next_abort_check = tp_now_sec() + 1e-3;
+            if (tp_peer_aborted(tp)) {
+                tp_row_err_latch(tp, 2u);
+                pulsar_tp_mark_failed(tp);
+                ok = 0;
+            }
+        }
+        if (ok && tp_now_sec() > deadline) {
+            fprintf(stderr, "pulsar-tp: row lane: timeout at seq %llu (recv_done %llu, "
+                            "%u sends outstanding)\n", (unsigned long long)last,
+                    (unsigned long long)r->recv_done, r->send_outstanding);
+            ok = 0;
+        }
+    }
+    for (uint32_t k = 0; ok && k < rows; k++)
+        ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
+    if (ok) r->last_gate_seq = last;
+    pthread_mutex_unlock(&r->post_lock);
+    return ok;
+}
+
+/* One BULK exchange, proxy thread (v14).  This rank's payload sits in its bulk
+ * out-region (the GPU staged it); it is RDMA-written straight into the peer's
+ * in[buf], PULSAR_TP_BULK_PIECE at a time, the last write carrying the exchange
+ * id as immediate data.  Completion = the peer's matching WITH_IMM arrived (its
+ * data is in our in[buf]: UC delivers a QP's writes in order, so the imm lands
+ * after them) AND our own writes retired (the out-region may be restaged).
+ * One zero-length receive is re-posted per exchange, keeping the window full.
+ * No handshake: both ranks number bulk exchanges identically, and the window
+ * was armed before the bring-up's ready barrier. */
+static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uint32_t buf) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    const uint32_t n = (uint32_t)((bytes + PULSAR_TP_BULK_PIECE - 1u) / PULSAR_TP_BULK_PIECE);
+    if (!r || !r->bulk_qp || n == 0 || n > 64u) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu refused (%llu bytes, %u pieces)\n",
+                (unsigned long long)e, (unsigned long long)bytes, n);
+        return 0;
+    }
+    const uint64_t remote = tp->peer_bulk_base + (1u + buf) * tp->bulk_cap;
+    struct tp_ibv_sge sge[64];
+    struct tp_ibv_send_wr wr[64];
+    (void)memset(wr, 0, sizeof(wr));
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t off = (uint64_t)i * PULSAR_TP_BULK_PIECE;
+        const uint64_t len = bytes - off < PULSAR_TP_BULK_PIECE ? bytes - off : PULSAR_TP_BULK_PIECE;
+        const bool last = i + 1u == n;
+        sge[i].addr = (uintptr_t)(tp->bulk + off);
+        sge[i].length = (uint32_t)len;
+        sge[i].lkey = TP_LKEY(tp->rdma.bulk_mr);
+        wr[i].wr_id = PULSAR_TP_BULK_WR_TAG | e;
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = last ? TP_IBV_WR_RDMA_WRITE_WITH_IMM : TP_IBV_WR_RDMA_WRITE;
+        wr[i].send_flags = last ? TP_IBV_SEND_SIGNALED : 0;
+        wr[i].wr.rdma.remote_addr = remote + off;
+        wr[i].wr.rdma.rkey = tp->peer_bulk_rkey;
+        if (last) wr[i].imm_data = (uint32_t)e;
+        wr[i].next = last ? NULL : &wr[i + 1u];
+    }
+    struct tp_ibv_send_wr *bad = NULL;
+    if (tp->rdma.api.post_send(r->bulk_qp, wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk rdma write post (exchange %llu): %s\n",
+                (unsigned long long)e, strerror(errno));
+        return 0;
+    }
+    const double t_posted = tp_now_sec();
+    /* The peer's k-th bulk exchange is our k-th imm arrival. */
+    const uint64_t want = r->bulk_imm_count + 1u;
+    bool sent = false;
+    const double deadline = t_posted + (double)tp->timeout_sec;
+    double next_abort_check = t_posted + 1e-3;
+    while (!sent || r->bulk_imm_count < want) {
+        struct tp_ibv_wc wc[8];
+        const int got = tp->rdma.api.poll_cq(tp->rdma.bulk_cq, 8, wc);
+        if (got < 0) return 0;
+        for (int i = 0; i < got; i++) {
+            if (wc[i].status != TP_IBV_WC_SUCCESS) {
+                fprintf(stderr, "pulsar-tp: bulk rdma completion error: %s (exchange %llu)\n",
+                        tp_wc_status_str(wc[i].status), (unsigned long long)e);
+                return 0;
+            }
+            if (wc[i].opcode & TP_IBV_WC_RECV) {
+                r->bulk_imm_count++;
+                r->bulk_last_imm = wc[i].imm_data;
+            } else {
+                sent = true;
+            }
+        }
+        const double now = tp_now_sec();
+        if (now > next_abort_check) {
+            next_abort_check = now + 1e-3;
+            if (tp_peer_aborted(tp)) {
+                tp_row_err_latch(tp, 2u);
+                pulsar_tp_mark_failed(tp);
+                return 0;
+            }
+            if (now > deadline) {
+                fprintf(stderr, "pulsar-tp: bulk exchange %llu timed out (imm %llu/%llu, sent %d)\n",
+                        (unsigned long long)e, (unsigned long long)r->bulk_imm_count,
+                        (unsigned long long)want, (int)sent);
+                return 0;
+            }
+        }
+    }
+    /* The ranks number exchanges identically: the peer's arrival must carry
+     * this exchange's id, or the lanes are out of step. */
+    if (r->bulk_last_imm != (uint32_t)e) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu received the peer's exchange %u -- the ranks' "
+                        "exchange order diverged\n", (unsigned long long)e, r->bulk_last_imm);
+        return 0;
+    }
+    if (!tp_bulk_post_imm_recv(tp, r)) return 0;
+    return 1;
+}
+
+static void *tp_row_proxy_main(void *arg) {
+    pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
+    volatile uint64_t *desc = tp_row_desc(tp);
+    std::atomic<uint64_t> *done = tp_row_done(tp);
+    uint64_t last_exch = 0, next_msg = 1;
+    double idle_since = tp_now_sec();
+    while (!tp->proxy_stop.load(std::memory_order_acquire)) {
+        const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
+        if (e == last_exch) {
+            /* busy-poll while decode is running; back off once idle */
+            if (tp_now_sec() - idle_since > 0.002) usleep(50);
+            continue;
+        }
+        if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
+            /* A bulk exchange (v14): desc[1] = bytes, desc[2] low bit = the
+             * receive buffer.  It takes no gate messages, so next_msg stays. */
+            const uint64_t bytes = desc[1];
+            const uint32_t buf = (uint32_t)(desc[2] & 1u);
+            if (e != last_exch + 1u || bytes == 0 || bytes > tp->bulk_cap) {
+                fprintf(stderr, "pulsar-tp: row lane proxy: bulk descriptor out of order or oversized "
+                                "(exchange %llu after %llu, %llu bytes, cap %llu) -- lane failed\n",
+                        (unsigned long long)e, (unsigned long long)last_exch,
+                        (unsigned long long)bytes, (unsigned long long)tp->bulk_cap);
+                tp->proxy_failed.store(true, std::memory_order_release);
+                break;
+            }
+            if (!tp_bulk_proxy_exchange(tp, e, bytes, buf)) {
+                tp->proxy_failed.store(true, std::memory_order_release);
+                break;
+            }
+            last_exch = e;
+            done->store(e, std::memory_order_release);
+            idle_since = tp_now_sec();
+            continue;
+        }
+        const uint64_t first = desc[1];
+        const uint32_t rows = (uint32_t)desc[2];
+        if (e != last_exch + 1u || first != next_msg || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) {
+            fprintf(stderr, "pulsar-tp: row lane proxy: descriptor out of order (exchange %llu after %llu, "
+                            "first msg %llu want %llu, %u rows) -- lane failed\n",
+                    (unsigned long long)e, (unsigned long long)last_exch,
+                    (unsigned long long)first, (unsigned long long)next_msg, rows);
+            tp->proxy_failed.store(true, std::memory_order_release);
+            break;
+        }
+        if (!tp_row_proxy_exchange(tp, first, rows)) {
+            tp->proxy_failed.store(true, std::memory_order_release);
+            break;
+        }
+        last_exch = e;
+        next_msg = first + rows;
+        done->store(e, std::memory_order_release);
+        idle_since = tp_now_sec();
+    }
+    return NULL;
+}
+
+static int tp_row_proxy_start(pulsar_tp *tp, char *err, size_t errlen) {
+    tp_row_desc(tp)[0] = 0; tp_row_desc(tp)[1] = 0; tp_row_desc(tp)[2] = 0;
+    tp_row_done(tp)->store(0, std::memory_order_release);
+    *tp_row_err(tp) = 0;
+    tp->proxy_stop.store(false);
+    if (pthread_create(&tp->proxy, NULL, tp_row_proxy_main, tp) != 0) {
+        tp_set_err(err, errlen, "tp: row lane proxy thread: %s", strerror(errno));
+        return 0;
+    }
+    tp->proxy_started = true;
+    return 1;
+}
+
+static void tp_row_proxy_stop(pulsar_tp *tp) {
+    if (!tp->proxy_started) return;
+    tp->proxy_stop.store(true, std::memory_order_release);
+    pthread_join(tp->proxy, NULL);
+    tp->proxy_started = false;
 }
 
 static int tp_rdma_big_gate_capable(const pulsar_tp *tp, const pulsar_tp_rdma_link *l) {
@@ -1601,12 +2039,16 @@ static void tp_rdma_close(pulsar_tp *tp) {
      * destroy -- only the shared HCA objects, each checked individually. */
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     if (r && r->qp) tp->rdma.api.destroy_qp(r->qp);
+    if (r && r->bulk_qp) tp->rdma.api.destroy_qp(r->bulk_qp);
     if (tp->rdma.mr) tp->rdma.api.dereg_mr(tp->rdma.mr);
+    if (tp->rdma.bulk_mr) tp->rdma.api.dereg_mr(tp->rdma.bulk_mr);
     if (tp->rdma.cq) tp->rdma.api.destroy_cq(tp->rdma.cq);
+    if (tp->rdma.bulk_cq) tp->rdma.api.destroy_cq(tp->rdma.bulk_cq);
     if (tp->rdma.pd) tp->rdma.api.dealloc_pd(tp->rdma.pd);
     if (tp->rdma.ctx) tp->rdma.api.close_device(tp->rdma.ctx);
-    if (r) r->qp = NULL;
+    if (r) { r->qp = NULL; r->bulk_qp = NULL; }
     tp->rdma.mr = NULL; tp->rdma.cq = NULL; tp->rdma.pd = NULL; tp->rdma.ctx = NULL;
+    tp->rdma.bulk_mr = NULL; tp->rdma.bulk_cq = NULL;
 }
 
 /* ------------------------------------------------------------------------
@@ -1693,6 +2135,7 @@ static pulsar_tp *tp_alloc(void) {
 
 static void tp_destroy(pulsar_tp *tp) {
     if (!tp) return;
+    tp_row_proxy_stop(tp);   /* before the QP it posts to goes away */
     tp_rdma_close(tp);
     /* The primary link's fds are ALSO peers[0]'s once bring-up completed, so
      * each descriptor is closed once: the primary here, and below every peer
@@ -1809,6 +2252,88 @@ static int tp_hello_exchange(pulsar_tp *tp, int fd, int expected_rank,
     return 1;
 }
 
+/* The NODE frame (protocol v13): who each rank is, for operators.  Sent once per
+ * peer on the control socket at the very end of bring-up -- after the hello,
+ * after the RDMA device is open -- so the device named is the one actually in
+ * use.  Fixed-size strings, NUL-terminated on receipt whatever the peer sent. */
+#define PULSAR_TP_NODE_MAGIC UINT32_C(0x4E4F4445)   /* "NODE" */
+typedef struct {
+    uint32_t magic;
+    uint32_t rank;
+    char host[PULSAR_TP_NODE_STR];
+    char build[PULSAR_TP_NODE_STR];
+    char addr[PULSAR_TP_NODE_STR];
+    char rdma_device[PULSAR_TP_NODE_STR];
+    uint32_t rdma_port;
+    uint32_t pad;
+} pulsar_tp_node_wire;
+
+static void tp_fill_self(pulsar_tp *tp, const char *addr) {
+    pulsar_tp_node *n = &tp->self;
+    memset(n, 0, sizeof(*n));
+    n->rank = tp->rank;
+    if (gethostname(n->host, sizeof(n->host)) != 0) n->host[0] = '\0';
+    n->host[sizeof(n->host) - 1] = '\0';
+    snprintf(n->build, sizeof(n->build), "%s", tp->opt.build ? tp->opt.build : "");
+    snprintf(n->addr, sizeof(n->addr), "%s", addr ? addr : "");
+    if (tp->rdma_active && tp->rdma.ctx) {
+        snprintf(n->rdma_device, sizeof(n->rdma_device), "%s", tp->rdma.dev_name);
+        n->rdma_port = 1;   /* tp_rdma_open always queries and uses port 1 */
+    }
+}
+
+static void tp_terminate(char *s, size_t n) { s[n - 1] = '\0'; }
+
+static int tp_node_exchange(pulsar_tp *tp, pulsar_tp_peer *pp, char *err, size_t errlen) {
+    pulsar_tp_node_wire mine;
+    memset(&mine, 0, sizeof(mine));
+    mine.magic = PULSAR_TP_NODE_MAGIC;
+    mine.rank = (uint32_t)tp->self.rank;
+    memcpy(mine.host, tp->self.host, sizeof(mine.host));
+    memcpy(mine.build, tp->self.build, sizeof(mine.build));
+    memcpy(mine.addr, tp->self.addr, sizeof(mine.addr));
+    memcpy(mine.rdma_device, tp->self.rdma_device, sizeof(mine.rdma_device));
+    mine.rdma_port = (uint32_t)tp->self.rdma_port;
+    pulsar_tp_node_wire theirs;
+    if (!tp_write_full(pp->control_fd, &mine, sizeof(mine)) ||
+        !tp_read_full(pp->control_fd, &theirs, sizeof(theirs))) {
+        tp_set_err(err, errlen, "tp: node exchange with peer %d failed", pp->rank);
+        return 0;
+    }
+    if (theirs.magic != PULSAR_TP_NODE_MAGIC || (int)theirs.rank != pp->rank) {
+        tp_set_err(err, errlen, "tp: bad node frame from peer %d (magic %08x rank %u)",
+                   pp->rank, theirs.magic, theirs.rank);
+        return 0;
+    }
+    tp_terminate(theirs.host, sizeof(theirs.host));
+    tp_terminate(theirs.build, sizeof(theirs.build));
+    tp_terminate(theirs.addr, sizeof(theirs.addr));
+    tp_terminate(theirs.rdma_device, sizeof(theirs.rdma_device));
+    pulsar_tp_node *n = &pp->node;
+    n->rank = pp->rank;
+    memcpy(n->host, theirs.host, sizeof(n->host));
+    memcpy(n->build, theirs.build, sizeof(n->build));
+    memcpy(n->addr, theirs.addr, sizeof(n->addr));
+    memcpy(n->rdma_device, theirs.rdma_device, sizeof(n->rdma_device));
+    n->rdma_port = (int)theirs.rdma_port;
+    pp->node_known = true;
+    return 1;
+}
+
+/* "ip:port" of this end of `fd`, or "" -- the pair path's only record of its
+ * own endpoint (the mesh has the authoritative peers list instead). */
+static void tp_local_addr(int fd, int port, char *out, size_t outlen) {
+    out[0] = '\0';
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&ss, &len) != 0) return;
+    char ip[INET6_ADDRSTRLEN] = "";
+    if (getnameinfo((struct sockaddr *)&ss, len, ip, sizeof(ip), NULL, 0, NI_NUMERICHOST) != 0)
+        return;
+    if (port > 0) snprintf(out, outlen, "%s:%d", ip, port);
+    else snprintf(out, outlen, "%s", ip);
+}
+
 int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
                      const pulsar_tp_identity *id, char *err, size_t errlen) {
     *out = NULL;
@@ -1894,6 +2419,13 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->peers[0].data_fd = tp->data_fd;
     tp->peers[0].peer_ctx = tp->peer_ctx;
     tp->peers[0].connected = true;
+    {
+        /* The leader knows its listen port; a dialing worker has none of its own. */
+        char addr[PULSAR_TP_NODE_STR];
+        tp_local_addr(tp->control_fd, tp->rank == 0 ? opt->port : 0, addr, sizeof(addr));
+        tp_fill_self(tp, addr);
+    }
+    if (!tp_node_exchange(tp, &tp->peers[0], err, errlen)) goto fail;
     fprintf(stderr, "pulsar-tp: rank %d connected (n_ranks=%d, %d peer), transport=%s\n",
             tp->rank, tp->n_ranks, tp->n_peers,
             tp->rdma_active ? "rdma" : "tcp");
@@ -2115,6 +2647,16 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->data_fd = tp->peers[0].data_fd;
     tp->peer_ctx = tp->peers[0].peer_ctx;
 
+    {
+        char addr[PULSAR_TP_NODE_STR];
+        /* Bounded: the record is for display, and a 255-byte peers entry must
+         * not be able to push the port out of it. */
+        snprintf(addr, sizeof(addr), "%.48s:%d", ep[R].host, ep[R].port);
+        tp_fill_self(tp, addr);
+    }
+    for (int i = 0; i < tp->n_peers; i++)
+        if (!tp_node_exchange(tp, &tp->peers[i], err, errlen)) goto fail;
+
     close(listener);
     free(ep);
     fprintf(stderr, "pulsar-tp: rank %d/%d mesh connected (%d peers), transport=%s\n",
@@ -2137,8 +2679,18 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
          * -- the pair has one, the mesh n_ranks-1, and every peer sees the same
          * slab address/rkey. */
         if (!tp_rdma_register_slab(tp, err, errlen)) return 0;
+        if (tp->bulk) {
+            tp->rdma.bulk_mr = tp->rdma.api.reg_mr(tp->rdma.pd, tp->bulk, (size_t)tp->bulk_bytes,
+                                                   TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_WRITE);
+            if (!tp->rdma.bulk_mr) {
+                tp_set_err(err, errlen, "tp rdma: reg_mr(bulk, %llu bytes): %s",
+                           (unsigned long long)tp->bulk_bytes, strerror(errno));
+                return 0;
+            }
+        }
         for (int i = 0; i < tp->n_peers; i++)
             if (!tp_rdma_link_bringup(tp, &tp->peers[i], err, errlen)) return 0;
+        if (pulsar_tp_row_lane(tp) && !tp_row_proxy_start(tp, err, errlen)) return 0;
         return 1;
     }
     (void)err; (void)errlen;
@@ -2152,6 +2704,17 @@ void pulsar_tp_free(pulsar_tp *tp) {
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp) { return tp->n_ranks; }
 
+int pulsar_tp_node_info(const pulsar_tp *tp, int rank, pulsar_tp_node *out) {
+    if (!tp || !out) return 0;
+    if (rank == tp->rank) { *out = tp->self; return 1; }
+    for (int i = 0; i < tp->n_peers; i++)
+        if (tp->peers[i].rank == rank && tp->peers[i].node_known) {
+            *out = tp->peers[i].node;
+            return 1;
+        }
+    return 0;
+}
+
 int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
                                  uint32_t *lo, uint32_t *hi) {
     if (!lo || !hi || rank < 0 || (uint32_t)rank >= (n_ranks ? n_ranks : 1u))
@@ -2159,16 +2722,6 @@ int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
     if (n_ranks <= 1 || n_total == 0) { *lo = 0; *hi = n_total; return 1; }
     *lo = (uint32_t)(((uint64_t)rank    * n_total) / n_ranks);
     *hi = (uint32_t)(((uint64_t)(rank + 1) * n_total) / n_ranks);
-    return 1;
-}
-
-int pulsar_tp_owned_byte_span(int rank, uint32_t n_ranks, uint32_t n_total,
-                              uint64_t expert_bytes, uint64_t *off, uint64_t *bytes) {
-    uint32_t lo = 0, hi = 0;
-    if (!off || !bytes || expert_bytes == 0) return 0;
-    if (!pulsar_tp_owned_range(rank, n_ranks, n_total, &lo, &hi)) return 0;
-    *off = (uint64_t)lo * expert_bytes;
-    *bytes = (uint64_t)(hi - lo) * expert_bytes;
     return 1;
 }
 
@@ -2186,6 +2739,129 @@ void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer) {
 void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer) {
     if (!tp || !tp->slab || layer >= tp->n_layer) return NULL;
     return tp->slab + pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+}
+bool pulsar_tp_row_lane(const pulsar_tp *tp) {
+    return tp && tp->n_ranks == 2 && tp->rdma_active && tp->slab &&
+           tp->vec_bytes > 0 && tp->vec_bytes <= PULSAR_TP_RDMA_MAX_MSG &&
+           PULSAR_TP_RDMA_RECV_WINDOW + PULSAR_TP_BATCH_MAX_ROWS <= tp->n_slots;
+}
+
+static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first);
+
+void pulsar_tp_set_bulk(pulsar_tp *tp, void *base, uint64_t bytes) {
+    if (!tp) return;
+    tp->bulk = static_cast<uint8_t *>(base);
+    tp->bulk_bytes = base ? bytes : 0;
+    tp->bulk_cap = base ? (bytes / 3u) / tp->vec_bytes * tp->vec_bytes : 0;
+}
+
+bool pulsar_tp_bulk_lane(const pulsar_tp *tp) {
+    if (!pulsar_tp_row_lane(tp) || !tp->bulk || tp->bulk_cap == 0 || !tp->rdma.bulk_mr ||
+        tp->peer_bulk_base == 0 || !tp->proxy_started)
+        return false;
+    const pulsar_tp_rdma_link *r = tp_pair_link(const_cast<pulsar_tp *>(tp));
+    return r && r->bulk_qp;
+}
+
+void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!tp) return;
+    out->cap_bytes = tp->bulk_cap;
+    out->out_off = 0;
+    out->in_off[0] = tp->bulk_cap;
+    out->in_off[1] = 2u * tp->bulk_cap;
+}
+
+int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
+    if (!pulsar_tp_bulk_lane(tp) || bytes == 0 || bytes > tp->bulk_cap || !exch || !buf) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused (%llu bytes, cap %llu; pair+rdma+bulk buffer "
+                        "required) -- the caller must pick the lane\n",
+                (unsigned long long)bytes, (unsigned long long)(tp ? tp->bulk_cap : 0));
+        return 0;
+    }
+    if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused: an earlier exchange failed "
+                        "(proxy %s, device spin %s)\n",
+                tp->proxy_failed.load() ? "failed" : "ok",
+                *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
+        return 0;
+    }
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: bulk lane armed (async: GPU stage/publish/combine + "
+                                   "RDMA writes on a second QP, %llu MiB per exchange)\n",
+                                   (unsigned long long)(tp->bulk_cap >> 20)); }
+    *exch = ++tp->row_exch;
+    *buf = (uint32_t)(tp->bulk_seq++ & 1u);
+    return 1;
+}
+
+void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!tp) return;
+    out->out_off = tp->layout.out_off;
+    out->in_off = tp->layout.in_off;
+    out->desc_off = tp->layout.out_flags_off;
+    out->done_off = tp->layout.in_flags_off;
+    out->err_off = tp->layout.gpu_flags_off;
+    out->vec_bytes = tp->vec_bytes;
+    out->n_slots = tp->n_slots;
+    out->timeout_ns = tp->timeout_sec * 1000000000ull;
+}
+
+
+int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch) {
+    if (!pulsar_tp_row_lane(tp) || !tp->proxy_started || rows == 0 ||
+        rows > PULSAR_TP_BATCH_MAX_ROWS || !first_msg || !exch) {
+        fprintf(stderr, "pulsar-tp: row lane refused (%u rows; pair+rdma+slab+proxy required, "
+                        "rows 1..%u) -- the caller must pick the lane\n", rows, PULSAR_TP_BATCH_MAX_ROWS);
+        return 0;
+    }
+    if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
+        fprintf(stderr, "pulsar-tp: row lane refused: an earlier exchange failed "
+                        "(proxy %s, device spin %s)\n",
+                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
+        return 0;
+    }
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: row lane armed (async: GPU stage/publish/combine "
+                                   "+ verbs proxy thread; rdma window %u, <= %u rows per exchange)\n",
+                                   (unsigned)PULSAR_TP_RDMA_RECV_WINDOW, PULSAR_TP_BATCH_MAX_ROWS); }
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    if (!r->recv_window_active) {
+        /* The window is down before the first row exchange, or after a big
+         * gate drained it (transports with no bulk lane, after a stream sync).
+         * Arming posts receives on the GATE QP, so only a gate-QP exchange may
+         * not be in flight; bulk exchanges (v14) ride their own QP and may
+         * still be running -- a prefill's last bulk exchanges usually are when
+         * its head's vocab gather arms the lane. */
+        if (tp_row_done(tp)->load(std::memory_order_acquire) < tp->last_gate_exch) {
+            fprintf(stderr, "pulsar-tp: row lane: re-arm with gate exchange %llu still in flight "
+                            "(done %llu) -- refusing\n", (unsigned long long)tp->last_gate_exch,
+                    (unsigned long long)tp_row_done(tp)->load());
+            return 0;
+        }
+        if (!tp_row_lane_arm(tp, tp->gate_seq + 1u)) return 0;
+    }
+    *first_msg = tp->gate_seq + 1u;
+    tp->gate_seq += rows;
+    *exch = ++tp->row_exch;
+    tp->last_gate_exch = *exch;
+    return 1;
+}
+
+int pulsar_tp_row_lane_check(pulsar_tp *tp) {
+    if (!tp || !tp->proxy_started) return 1;
+    const uint64_t done = tp_row_done(tp)->load(std::memory_order_acquire);
+    const uint32_t err = *tp_row_err(tp);
+    if (tp->proxy_failed.load(std::memory_order_acquire) || err || done != tp->row_exch) {
+        fprintf(stderr, "pulsar-tp: row lane check FAILED at a drained stream: exchange %llu "
+                        "enqueued, %llu completed, proxy %s, device spin %s -- refusing\n",
+                (unsigned long long)tp->row_exch, (unsigned long long)done,
+                tp->proxy_failed.load() ? "failed" : "ok", err == 2u ? "aborted" : err ? "timed out" : "ok");
+        tp->failed.store(true, std::memory_order_release);
+        return 0;
+    }
+    return 1;
 }
 
 /* The RDMA big gate's DIRECT rule -- see pulsar_tp.h.  Boundary matches the
@@ -2720,8 +3396,13 @@ static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
     return ok;
 }
 
-int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size) {
-    pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
+int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size,
+                                  uint32_t n_banks) {
+    if (n_banks == 0) {
+        fprintf(stderr, "pulsar-tp: session create with a zero bank pool -- refusing to ship it\n");
+        return 0;
+    }
+    pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, n_banks };
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
@@ -2741,6 +3422,31 @@ int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
                         uint64_t seq, int token) {
     pulsar_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
+}
+
+int pulsar_tp_send_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int stop) {
+    pulsar_tp_value_command msg = { session_id, stop ? 1 : 0, 0 };
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_CHUNK_VERDICT, &msg, sizeof(msg));
+}
+
+int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
+                                 char *err, size_t errlen) {
+    if (!tp || !stop) return 0;
+    const double deadline = tp_control_deadline(tp);
+    uint32_t type = 0, bytes = 0;
+    pulsar_tp_value_command msg;
+    if ((deadline > 0.0 && !tp_wait_readable(tp->control_fd, deadline)) ||
+        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != PULSAR_TP_FRAME_CHUNK_VERDICT || bytes != sizeof(msg) ||
+        !tp_read_full(tp->control_fd, &msg, sizeof(msg)) || msg.session_id != session_id) {
+        pulsar_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp: expected the leader's chunk verdict for session %llu inside a "
+                                "mirrored prefill (frame type %u) -- the ranks' prefills are out of step",
+                   (unsigned long long)session_id, type);
+        return 0;
+    }
+    *stop = msg.value != 0;
+    return 1;
 }
 
 int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
@@ -2829,9 +3535,29 @@ int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
 
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
  * and pulsar_tp_wait_command_status_digest (want_digest 1). */
+static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen);
+
+static int tp_collect_status_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                  int *status, int want_digest, uint64_t own_digest,
+                                  char *err, size_t errlen);
+
+/* Every ack read settles the deferred one first: the peers answer in frame
+ * order, so its ack is the next one in the socket.  A failed settle fails
+ * this collect too (its own acks are still read, so no frame is left behind),
+ * and its message is the one reported. */
 static int tp_collect_status(pulsar_tp *tp, uint64_t session_id, const char *operation,
                              int *status, int want_digest, uint64_t own_digest,
                              char *err, size_t errlen) {
+    char scratch[256];
+    const int settled = tp_settle_deferred(tp, err, errlen);
+    const int rc = tp_collect_status_body(tp, session_id, operation, status, want_digest, own_digest,
+                                          settled ? err : scratch, settled ? errlen : sizeof(scratch));
+    return settled && rc;
+}
+
+static int tp_collect_status_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                  int *status, int want_digest, uint64_t own_digest,
+                                  char *err, size_t errlen) {
     if (!tp || tp->n_peers < 1 || !status) return 0;
     const double deadline = tp_control_deadline(tp);
     int agreed = 0, have = 0, bad = 0;
@@ -3090,8 +3816,45 @@ void pulsar_tp_identity_stats(const pulsar_tp *tp, uint64_t *frames, uint64_t *m
  * failed). */
 enum { TP_ACK_PLAIN = 0, TP_ACK_DIGEST = 1, TP_ACK_DRAIN = 2 };
 
+static int tp_collect_acks_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                int mode, uint64_t own_digest, char *err, size_t errlen);
+
 static int tp_collect_acks(pulsar_tp *tp, uint64_t session_id, const char *operation,
                            int mode, uint64_t own_digest, char *err, size_t errlen) {
+    char scratch[256];
+    const int settled = tp_settle_deferred(tp, err, errlen);
+    const int rc = tp_collect_acks_body(tp, session_id, operation, mode, own_digest,
+                                        settled ? err : scratch, settled ? errlen : sizeof(scratch));
+    return settled && rc;
+}
+
+static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen) {
+    if (!tp || !tp->deferred_armed) return 1;
+    tp->deferred_armed = false;
+    return tp_collect_acks_body(tp, tp->deferred_session, tp->deferred_operation,
+                                TP_ACK_DIGEST, tp->deferred_digest, err, errlen);
+}
+
+int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
+                                       const char *operation, uint64_t own_digest) {
+    if (!tp || tp->deferred_armed) {
+        fprintf(stderr, "pulsar-tp: a deferred ack is already pending for %s -- settle it before "
+                        "deferring another (refusing)\n", tp ? tp->deferred_operation : "?");
+        return 0;
+    }
+    tp->deferred_armed = true;
+    tp->deferred_session = session_id;
+    tp->deferred_digest = own_digest;
+    snprintf(tp->deferred_operation, sizeof(tp->deferred_operation), "%s", operation ? operation : "the step");
+    return 1;
+}
+
+int pulsar_tp_settle_deferred_ack(pulsar_tp *tp, char *err, size_t errlen) {
+    return tp_settle_deferred(tp, err, errlen);
+}
+
+static int tp_collect_acks_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                int mode, uint64_t own_digest, char *err, size_t errlen) {
     /* One ack per PEER: every worker must have applied the command, and all
      * must succeed.  The first failure names the rank that refused -- but a
      * refusal (an ack that arrived with a nonzero status, a foreign session
@@ -3182,7 +3945,24 @@ int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
     return tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
 }
 
+void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation) {
+    /* A peer that failed the step too answers at once; one still running it is
+     * spinning on an exchange this rank will never join -- no step stays silent
+     * for seconds between exchanges -- so after a short wait the lane is
+     * aborted, which frees the peer's GPU and brings its (failed) ack. */
+    for (int i = 0; tp && i < tp->n_peers; i++) {
+        const int pfd = tp->peers[i].control_fd;
+        if (pfd >= 0 && !tp_wait_readable(pfd, tp_now_sec() + 5.0)) {
+            char why[160];
+            snprintf(why, sizeof(why), "this rank's %s failed and the peer did not answer within 5 s "
+                                       "(it is still running the step)", operation ? operation : "step");
+            pulsar_tp_row_lane_abort(tp, why);
+        }
+    }
+}
+
 void pulsar_tp_drain_command_acks(pulsar_tp *tp) {
+    pulsar_tp_own_step_failed(tp, "step");
     (void)tp_collect_acks(tp, 0ull, "drain", TP_ACK_DRAIN, 0ull, NULL, 0);
 }
 
@@ -3251,16 +4031,25 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    const double deadline = tp_control_deadline(tp);
-    if (deadline > 0.0 && !tp_wait_readable(tp->control_fd, deadline)) {
-        /* A silent peer is NOT the same failure as a closed one, and telling
-         * them apart is the whole point of the deadline: the pair is out of
-         * lockstep (or the peer is wedged), which is a refusal, not a hang. */
+    /* NO deadline: between commands a worker waits as long as its leader is
+     * idle -- a server with no traffic is not a failure (Tyler: "they should be
+     * able to idle forever"; the 300 s deadline killed an idle pair).  A leader
+     * that exits or crashes closes the socket, which wakes this wait and fails
+     * the header read below; a peer HOST that vanishes is caught by the
+     * socket's keepalive (tp_socket_tune).  Mid-operation silence is still
+     * bounded where it can occur: the ack collects, the exchanges and the
+     * device spins keep the transport timeout. */
+    struct pollfd pfd;
+    pfd.fd = tp->control_fd;
+    pfd.events = POLLIN;
+    int prc;
+    do {
+        pfd.revents = 0;
+        prc = poll(&pfd, 1, -1);
+    } while (prc < 0 && errno == EINTR);
+    if (prc < 0) {
         pulsar_tp_mark_failed(tp);
-        tp_set_err(err, errlen,
-                   "tp: no command from the leader within %llu s -- the ranks are not in "
-                   "lockstep or the peer is wedged",
-                   (unsigned long long)tp->timeout_sec);
+        tp_set_err(err, errlen, "tp: waiting for the leader's next command: %s", strerror(errno));
         return 0;
     }
     if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
@@ -3399,6 +4188,8 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->value = msg.value;
+        /* SESSION_CREATE's bank-pool size (v12); the other value frames send 0. */
+        command->seq = msg.reserved;
         break;
     }
     case PULSAR_TP_FRAME_SESSION_DESTROY:

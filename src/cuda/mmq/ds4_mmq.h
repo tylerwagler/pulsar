@@ -138,8 +138,6 @@ int ds4_exl3_moe_pair(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    int             expert_lo,     /**< TP ownership [lo,hi): peer-owned pairs write zeros */
-    int             expert_hi,
     cudaStream_t    stream,
     const void    * act_q,
     const void    * act_sf,
@@ -155,8 +153,6 @@ int ds4_exl3_moe_single(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    int             expert_lo,
-    int             expert_hi,
     cudaStream_t    stream,
     const void    * act_q,
     const void    * act_sf,

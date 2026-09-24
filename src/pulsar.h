@@ -127,7 +127,7 @@ typedef struct {
      *    n ranks) + tp_port.  Full-mesh; all ranks are symmetric.
      *  - legacy 2-rank: tp_role (1 = leader listens on tp_port, 2 = worker dials
      *    tp_peer:tp_port), tp_peers NULL.  tp_rank/nranks are derived (leader=0).
-     * A configured group wires EVERY TP lane (owned experts, vocab split, the
+     * A configured group wires EVERY TP lane (expert halves, vocab split, the
      * session mirror); there is no per-lane arm to select (L239 retired
      * `--tp-arm`, which had selected nothing since slice 4c). */
     int tp_role;
@@ -136,6 +136,10 @@ typedef struct {
     int tp_rank;        /* this rank's index in the group; -1 = unset */
     int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
     const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */
+    /** This build's id (git describe), carried to every TP peer in the NODE
+     *  frame so each rank can report the whole group's builds.  NULL = not
+     *  stamped (the CLI); the transport sends it empty. */
+    const char *build_id;
     /** Slice 4e increment 6 (L238): where a WORKER rank keeps its own bank
      * KV disk snapshots.  KV is replicated per rank, so a spill is per rank
      * to its own disk; the leader's frames name the snapshot by the key of
@@ -192,6 +196,10 @@ bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
  * raw whole-graph path (pulsar_engine_generate_argmax) has no transport and
  * refuses by name. */
 bool pulsar_engine_is_tp(const pulsar_engine *e);
+/** The engine's TP transport, or NULL when it is not tensor-parallel.  For
+ * read-only operator views (pulsar-server's /health tp block) that read the
+ * transport's bring-up records; owned by the engine, valid until close. */
+struct pulsar_tp *pulsar_engine_tp(const pulsar_engine *e);
 /** The worker receive loop: applies the leader's frames (create, sync, eval,
  * batched and mixed decode, rewind, invalidate, rng state) to a session
  * registry keyed by the create ordinal until the leader sends STOP or the
@@ -602,6 +610,13 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 /** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
+/** Tensor-parallel leader: read and check the pair's pending logits-identity
+ * acks now (pulsar_session_eval pipelines them one step; logits readers and
+ * pulsar_session_free settle on their own).  A driver that ends generation on
+ * a token decision (EOS) calls this to learn whether the step that drew it
+ * agreed across ranks.  @return 0 on success (also for untensored sessions),
+ * 1 with `err` filled on a mismatch or a dead pair. */
+int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
 /** Row-based twins of the two readers above (pulsar_sample_logits' relation to
  * pulsar_session_sample): score a caller-supplied logits row.  The batched

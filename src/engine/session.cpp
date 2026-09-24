@@ -297,7 +297,7 @@ int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
 
     /* The raw whole-graph pipeline builds its own graph with no TP transport
      * and no owned head-group span: under a pair it cannot gather the
-     * attention `low` rows, big-gate the FFN or all-reduce the owned experts,
+     * attention `low` rows, big-gate the FFN or all-reduce the expert halves,
      * and the first layer's guard refuses with a message about the GRAPH.
      * Say it here, once, by name (rule 9): generation under TP rides the
      * session lane, whose operations the group mirrors (slice 4e). */
@@ -343,6 +343,77 @@ static void register_model_fds(const pulsar_model *m) {
     }
 }
 
+/* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
+ * one layer's three routed stacks -- gate/up by intermediate ROWS, down by
+ * intermediate (input) COLUMNS, the same owned range for all three, so the
+ * SwiGLU halves line up and the rank's down output is a partial the FFN
+ * exchange sums.  Both ranks do identical work (every selected expert, half
+ * width), so there is no skew by construction.  Byte geometry: one authority,
+ * cutlass_mxfp4_expert_layout, for the full and the half shapes. */
+static bool tp_register_expert_half(const void *key, const pulsar_model *m,
+                                    const pulsar_layer_weights *L, int rank, uint32_t nr) {
+    if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */
+    const pulsar_tensor *G = L->ffn_gate_exps, *U = L->ffn_up_exps, *D = L->ffn_down_exps;
+    if (G->type != PULSAR_TENSOR_CUTLASS_MXFP4 || U->type != PULSAR_TENSOR_CUTLASS_MXFP4 ||
+        D->type != PULSAR_TENSOR_CUTLASS_MXFP4) {
+        fprintf(stderr, "pulsar: expert tensor-parallel needs cutlass_mxfp4 routed stacks "
+                        "(gate %u up %u down %u) -- refusing\n", G->type, U->type, D->type);
+        return false;
+    }
+    const uint64_t in = G->dim[0], mid = G->dim[1], out = D->dim[1];
+    const uint32_t n_exp = (uint32_t)G->dim[2];
+    uint32_t lo = 0, hi = 0;
+    if (D->dim[0] != mid || U->dim[1] != mid || D->dim[2] != n_exp ||
+        !pulsar_tp_owned_range(rank, nr, (uint32_t)mid, &lo, &hi) || lo % 128 || hi % 128) {
+        fprintf(stderr, "pulsar: expert tensor-parallel: intermediate %llu cannot split 128-aligned "
+                        "over %u ranks -- refusing\n", (unsigned long long)mid, nr);
+        return false;
+    }
+    uint64_t gd = 0, gsf = 0, gs = 0, hgd = 0, hgsf = 0, hgs = 0;
+    uint64_t dd = 0, dsf = 0, ds = 0, hdd = 0, hdsf = 0, hds = 0;
+    cutlass_mxfp4_expert_layout(in, mid, &gd, &gsf, &gs);
+    cutlass_mxfp4_expert_layout(in, hi - lo, &hgd, &hgsf, &hgs);
+    cutlass_mxfp4_expert_layout(mid, out, &dd, &dsf, &ds);
+    cutlass_mxfp4_expert_layout(hi - lo, out, &hdd, &hdsf, &hds);
+    return pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, G),
+                                                 tensor_map_base(m, G), G->abs_offset, n_exp,
+                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
+           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, U),
+                                                 tensor_map_base(m, U), U->abs_offset, n_exp,
+                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
+           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, D),
+                                                 tensor_map_base(m, D), D->abs_offset, n_exp,
+                                                 mid, out, 1, lo, hi, ds, dd, hds, hdd);
+}
+
+/* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by
+ * OUTPUT rows (column-parallel: this rank's half of the intermediate), down by
+ * INPUT columns (row-parallel: the matching half of the reduction).  The rank's
+ * shared output is then a PARTIAL that rides the FFN's existing exchange with
+ * the routed partial, so the split costs no exchange of its own.  The range is
+ * the one authority every split shares (pulsar_tp_owned_range over the shared
+ * width).  Registered once at open, for the target's layers and the drafter's.
+ * The K-half's key is (engine, the tensor OBJECT's address) -- never its
+ * abs_offset: a safetensors checkpoint is one shard per layer with identical
+ * layouts, so every layer's down projection sits at the SAME offset, and an
+ * offset key made all 43 layers resolve to whichever registered last. */
+static bool tp_register_shared_split(const void *kslice_key, const pulsar_model *m,
+                                     const pulsar_layer_weights *L, int rank, uint32_t nr) {
+    if (!L->ffn_gate_shexp || !L->ffn_up_shexp || !L->ffn_down_shexp) return false;
+    const uint64_t in_dim = L->ffn_gate_shexp->dim[0];
+    const uint64_t shared_dim = L->ffn_gate_shexp->dim[1];
+    uint32_t lo = 0, hi = 0;
+    if (!pulsar_tp_owned_range(rank, nr, (uint32_t)shared_dim, &lo, &hi) || hi <= lo) return false;
+    return pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_gate_shexp),
+                                                L->ffn_gate_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
+           pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_up_shexp),
+                                                L->ffn_up_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
+           pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(m, L->ffn_down_shexp),
+                                             L->ffn_down_shexp->abs_offset, shared_dim,
+                                             L->ffn_down_shexp->dim[1], lo, hi,
+                                             kslice_key, pulsar_tp_kslice_key_offset(L->ffn_down_shexp));
+}
+
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -351,12 +422,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->prefill_chunk = opt->prefill_chunk;
     /* Slice 4f (L237): the rank this process loads the model FOR, decided from
      * the options before any weight is staged -- the transport is created
-     * after the load, and on GB10 staging IS residency (a rank stages only its
-     * owned experts).  Rank 0 of 1 when the pair is off.  The transport's rank
-     * is asserted equal once it exists, so the two readers of this fact cannot
-     * disagree.  An expert overlay swaps expert stacks from a donor file and
-     * is staged by its own path, which has no ownership notion: refused under
-     * TP rather than staged whole on every rank (rule 9). */
+     * after the load, and on GB10 staging IS residency (a rank does not stage
+     * the stored expert stacks).  Rank 0 of 1 when the pair is off.  The
+     * transport's rank is asserted equal once it exists, so the two readers of
+     * this fact cannot disagree.  An expert overlay swaps expert stacks from a donor file and
+     * is staged by its own path, which has no half-expert notion: refused
+     * under TP rather than staged whole on every rank (rule 9). */
     int tp_rank_at_load = 0;
     uint32_t tp_n_ranks_at_load = 1;
     if (opt->tp_peers) {
@@ -654,6 +725,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
          * the transport is built for that same identity. */
         tp_opt.rank = tp_rank_at_load;
         tp_opt.n_ranks = (int)tp_n_ranks_at_load;
+        tp_opt.build = opt->build_id;
         pulsar_tp_identity id;
         pulsar_tp_identity_init_defaults(&id,
                                          (uint64_t)e->model.size,
@@ -675,15 +747,38 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
         if (opt->tp_spill_dir && opt->tp_spill_dir[0]) e->tp_spill_dir = pulsar_strdup(opt->tp_spill_dir);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
+        /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
+         * GPU-direct through a buffer of out | in[0] | in[1], each one prefill
+         * chunk of f32 rows; attach registers it beside the slab.  A chunk
+         * larger than that is cut by tp_allreduce_rows. */
+        if (pulsar_tp_is_rdma(e->tp) && pulsar_tp_n_ranks(e->tp) == 2) {
+            const uint64_t rows = e->prefill_chunk ? e->prefill_chunk : PULSAR_PREFILL_CHUNK_DEFAULT;
+            e->tp_bulk_bytes = 3u * rows * (uint64_t)PULSAR_N_EMBD * sizeof(float);
+            if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_bulk_bytes, &e->tp_bulk_base, tperr, sizeof(tperr)) ||
+                !(e->tp_bulk_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_bulk_base, tperr, sizeof(tperr)))) {
+                fprintf(stderr, "pulsar: tensor parallelism bulk buffer (%llu bytes) setup failed: %s\n",
+                        (unsigned long long)e->tp_bulk_bytes, tperr);
+                e->destroy();
+                *out = NULL;
+                return 1;
+            }
+            pulsar_tp_set_bulk(e->tp, e->tp_bulk_base, e->tp_bulk_bytes);
+        }
         if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_slab_bytes,
                                               &e->tp_slab_base,
                                               tperr, sizeof(tperr)) ||
-            !pulsar_tp_attach_slab(e->tp, e->tp_slab_base, tperr, sizeof(tperr))) {
+            !pulsar_tp_attach_slab(e->tp, e->tp_slab_base, tperr, sizeof(tperr)) ||
+            !(e->tp_slab_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_slab_base, tperr, sizeof(tperr)))) {
             fprintf(stderr, "pulsar: tensor parallelism slab setup failed: %s\n",
                     tperr);
             e->destroy();
             *out = NULL;
             return 1;
+        }
+        if (pulsar_tp_row_lane(e->tp)) {
+            pulsar_tp_row_lane_layout_t L;
+            pulsar_tp_row_lane_layout(e->tp, &L);
+            pulsar_gpu_tp_err_word_set((const volatile uint32_t *)((uint8_t *)e->tp_slab_base + L.err_off));
         }
         /* Slice 4f: the weights were staged for one identity and the transport
          * came up as another only if the two derivations drifted -- a bug, and
@@ -699,9 +794,9 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, "
-                        "%.2f GiB of peer-owned experts not resident\n",
+                        "routed experts as per-rank halves (%.2f GiB of stored stacks)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
-                (double)pulsar_model_peer_expert_bytes(&e->model) / 1073741824.0);
+                (double)pulsar_model_unstaged_expert_bytes(&e->model) / 1073741824.0);
     }
 
     /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
@@ -745,22 +840,67 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
                                                           L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
                     !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
-                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi)) {
+                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
+                    /* 4g-2: stage 'b' row-parallel -- the K-half over the same
+                     * owned group columns [a_lo, a_hi) of its a_out_full input. */
+                    !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
+                                                       L->attn_output_b->abs_offset, a_out_full,
+                                                       L->attn_output_b->dim[1], a_lo, a_hi,
+                                                       e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
                     fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
                                     "registered -- refusing\n", il);
                     e->destroy();
                     *out = NULL;
                     return 1;
                 }
-                registered += 2;
+                registered += 3;
+                if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
+                                    "registered -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
+                if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
+                                    "not be built -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
             }
+            for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+                if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
+                                    "could not be built -- refusing\n", dl);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
+                                    "registered -- refusing\n", dl);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
+            }
+            const pulsar_layer_weights *L0 = &e->weights.layer[0];
+            uint32_t sx_lo = 0, sx_hi = 0;
+            (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
             fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                            "[%u,%u): %u row slices registered (attn_q_b rows [%llu,%llu), "
-                            "attn_output_a rows [%llu,%llu))\n",
+                            "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
+                            "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
+                            "%u layers + %u drafter blocks): %u slices registered\n",
                     tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
-                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads, registered,
+                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
                     (unsigned long long)q_lo, (unsigned long long)q_hi,
-                    (unsigned long long)a_lo, (unsigned long long)a_hi);
+                    (unsigned long long)a_lo, (unsigned long long)a_hi,
+                    sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
+                    (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
         }
     }
 
@@ -831,9 +971,9 @@ uint64_t pulsar_engine::weights_resident_bytes() {
      * runtime, which is precisely why it had to be fixed here rather than
      * noticed: the static formula is the bound that is supposed to hold when the
      * measured one reads inflated. */
-    uint64_t bytes = e->model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->model);
+    uint64_t bytes = e->model.mapped_bytes - pulsar_model_unstaged_expert_bytes(&e->model);
     if (e->dspark_ready && e->dspark_external) {
-        bytes += e->dspark_model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->dspark_model);
+        bytes += e->dspark_model.mapped_bytes - pulsar_model_unstaged_expert_bytes(&e->dspark_model);
     }
     if (e->overlay_ready) bytes += e->overlay_model.mapped_bytes;
     return bytes;
@@ -870,9 +1010,17 @@ void pulsar_engine::destroy() {
     free(e->tp_spill_dir);
     e->tp_spill_dir = NULL;
     if (e->tp_slab_base) {
+        pulsar_gpu_tp_err_word_set(NULL);
         pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);
         e->tp_slab_base = NULL;
+        e->tp_slab_dev = NULL;
         e->tp_slab_bytes = 0;
+    }
+    if (e->tp_bulk_base) {   /* after pulsar_tp_free deregistered it */
+        pulsar_tp_gpu_slab_free_hostpin(e->tp_bulk_base);
+        e->tp_bulk_base = NULL;
+        e->tp_bulk_dev = NULL;
+        e->tp_bulk_bytes = 0;
     }
     weights_free(&e->weights);
     e->vocab.vocab_free();
@@ -887,6 +1035,25 @@ void pulsar_engine::destroy() {
     free(e->directional_steering_file);
     free(e);
 }
+/* The per-session tensor-parallel scratch (4g-2): the vocab gather's own-slice
+ * buffer (pulsar_gpu_graph::tp_vocab_own) -- PULSAR_SPEC_LOGITS_ROWS rows at
+ * the widest rank range, rounded up to whole row-lane messages.  One helper for
+ * create AND the admission price (session_cost_bytes_banked), which dry-runs
+ * the same steps: a buffer allocated in only one of them is the SESSION COST
+ * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
+static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
+    if (!tp || !pulsar_tp_row_lane(tp)) return true;
+    const uint64_t n_ranks = pulsar_tp_n_ranks(tp);
+    const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
+    const uint64_t vb = pulsar_tp_vec_bytes(tp);
+    const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
+    g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
+    if (!g->tp_vocab_own)
+        fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
+                (unsigned long long)bytes);
+    return g->tp_vocab_own != NULL;
+}
+
 
 
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
@@ -930,6 +1097,14 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp = e->tp;
     s->graph.tp_group_lo = e->tp_group_lo;
     s->graph.tp_group_hi = e->tp_group_hi;
+    s->graph.tp_slab_dev = e->tp_slab_dev;
+    s->graph.tp_bulk_dev = e->tp_bulk_dev;
+    s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
+    if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
+        gpu_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
      * session created with no pair armed keeps 0 and stays out of the mirror. */
@@ -982,7 +1157,8 @@ uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale) &&
         (!e->dspark_ready ||
-         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids));
+         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids)) &&
+        session_alloc_tp_scratch(&g, e->tp);
     uint64_t bytes = 0;
     pulsar_gpu_tensor_dry_end(&bytes, NULL);
     gpu_graph_release(&g);
@@ -1046,14 +1222,35 @@ void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
 
 
 static bool pulsar_session_cancelled(pulsar_session *s) {
-    /* Slice 4e increment 5 (L238): a MIRRORED session never cancels inside an
-     * operation.  The hook is polled at prefill chunk boundaries; a leader
-     * that stopped after k chunks would leave its workers running the full
-     * sync and waiting at a big gate the leader never joins -- a data-plane
-     * hang the control plane cannot see.  Under TP, cancellation is between
-     * operations only: the driver simply issues no further frame. */
-    if (pulsar_session_is_mirrored(s)) return false;
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    /* A MIRRORED session stops at a chunk boundary only TOGETHER (v15): a
+     * leader that stopped after k chunks alone would leave its workers running
+     * the rest of the sync, waiting at an exchange the leader never joins (the
+     * reason slice 4e disabled this hook outright -- which also froze the
+     * server's per-chunk yield: no progress published, no disconnect honoured,
+     * every other session stalled for the whole prompt).  Every rank polls at
+     * the same boundaries; the leader decides with its own hook and ships the
+     * verdict, each worker reads it here. */
+    if (!s) return false;
+    if (pulsar_session_is_mirrored(s)) {
+        pulsar_tp *tp = s->engine->tp;
+        if (pulsar_tp_rank(tp) == 0) {
+            const bool stop = s->cancel && s->cancel(s->cancel_ud);
+            if (!pulsar_tp_send_chunk_verdict(tp, s->tp_session_id, stop ? 1 : 0)) {
+                pulsar_tp_mark_failed(tp);
+                fprintf(stderr, "pulsar: tp: could not ship the chunk verdict -- stopping the prefill\n");
+                return true;
+            }
+            return stop;
+        }
+        int stop = 0;
+        char err[256];
+        if (!pulsar_tp_recv_chunk_verdict(tp, s->tp_session_id, &stop, err, sizeof(err))) {
+            fprintf(stderr, "pulsar: %s\n", err);
+            return true;
+        }
+        return stop != 0;
+    }
+    return s->cancel && s->cancel(s->cancel_ud);
 }
 
 

@@ -418,7 +418,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         char cerr[256];
         cerr[0] = 0;
         if (rank == 0) {
-            if (!pulsar_tp_send_session_create(tp, sid, 4096)) {
+            if (!pulsar_tp_send_session_create(tp, sid, 4096, 3u)) {
                 CHECK(0, "rank 0 command broadcast failed");
             } else {
                 CHECK(pulsar_tp_wait_command_ack(tp, sid, "session create",
@@ -436,6 +436,8 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                 CHECK(cmd.session_id == sid,
                       "rank %d received session %llu, expected %llu", rank,
                       (unsigned long long)cmd.session_id, (unsigned long long)sid);
+                CHECK(cmd.seq == 3u, "rank %d received bank pool %llu, expected 3", rank,
+                      (unsigned long long)cmd.seq);
                 CHECK(pulsar_tp_send_command_ack(tp, sid, 0),
                       "rank %d ack failed", rank);
                 pulsar_tp_command_free(&cmd);

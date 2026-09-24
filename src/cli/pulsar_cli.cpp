@@ -370,6 +370,15 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
         }
         if (stop) break;
     }
+    /* A pair pipelines its identity check one eval (pulsar_session_eval): the
+     * last step's -- the one whose logits drew the EOS, or that no token was
+     * drawn from -- is read here, so a divergence still fails the run. */
+    if (pulsar_session_settle(session, err, sizeof(err)) != 0) {
+        generation_done(&printer);
+        fprintf(stderr, "pulsar: decode failed: %s\n", err);
+        pulsar_session_free(session);
+        return 1;
+    }
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();

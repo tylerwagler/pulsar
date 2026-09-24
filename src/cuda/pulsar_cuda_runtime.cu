@@ -973,6 +973,108 @@ static const char *cuda_model_range_ptr_from_fd(
 
 
 
+/* L241 4g-2 EXPERT TENSOR-PARALLEL: build this rank's half of every expert of
+ * one routed cutlass_mxfp4 stack straight from the host mapping, and register
+ * it as a model range under (key_map, key_offset) so every 40/40 arm resolves
+ * it through cuda_model_range_ptr exactly like a staged stack.
+ *
+ *   rows mode (gate/up, k_half == 0): output rows [lo, hi) of each expert --
+ *     in the pre-stored layout two CONTIGUOUS chunks per expert (the data band
+ *     at lo*k/2 and the 128-row scale band at data + lo*k/32), so two strided
+ *     copies cover the whole stack;
+ *   K mode (down, k_half != 0): input columns [lo, hi) of each expert -- per
+ *     row a (hi-lo)/2-byte sub-chunk at lo/2, and per 128-row scale band the
+ *     scale atoms [lo/128, hi/128) (band-major tiles, 512 B per atom) -- two
+ *     strided copies per expert.
+ *
+ * lo and hi must be 128-aligned (whole scale bands / atom columns).  The
+ * destination layout is exactly cutlass_mxfp4_expert_layout of the half shape;
+ * the caller passes both geometries so this file needs no byte model of its
+ * own.  The buffer is owned by the range table (freed at release). */
+int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
+                                          const void *model_map, uint64_t src_offset,
+                                          uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
+                                          uint64_t lo, uint64_t hi,
+                                          uint64_t src_stride, uint64_t src_data,
+                                          uint64_t dst_stride, uint64_t dst_data) {
+    if (!key_map || !model_map || n_expert == 0 || hi <= lo || lo % 128 || hi % 128 ||
+        (k_half ? hi > k : hi > n) || dst_data >= dst_stride || src_data >= src_stride) {
+        fprintf(stderr, "pulsar: expert half refused: %s [%llu,%llu) of k=%llu n=%llu\n",
+                k_half ? "K" : "rows", (unsigned long long)lo, (unsigned long long)hi,
+                (unsigned long long)k, (unsigned long long)n);
+        return 0;
+    }
+    const uint64_t dst_sf = dst_stride - dst_data;
+    const uint64_t n_bands = (n + 127) / 128, k_pad = (k + 127) / 128 * 128;
+    const uint64_t built_sf = k_half ? n_bands * (hi - lo) * 4 : (hi - lo) * k / 32;
+    if (built_sf != dst_sf) {
+        fprintf(stderr, "pulsar: expert half geometry: %llu scale bytes to build, layout says %llu -- refusing\n",
+                (unsigned long long)built_sf, (unsigned long long)dst_sf);
+        return 0;
+    }
+    const model_fd_entry *entry = model_fd_for(model_map);
+    if (!entry || entry->fd < 0) {
+        fprintf(stderr, "pulsar: expert half: no model fd for the stack's mapping -- refusing\n");
+        return 0;
+    }
+    /* Whole experts per read, as many as the staging buffer holds: the stack is
+     * read once, sequentially, through the pinned stage (never paged in through
+     * the mapping -- a K half touches every row of every expert, which faulted
+     * the whole file in 4 KiB at a time). */
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    uint32_t per = (uint32_t)(chunk / src_stride);
+    if (per == 0) per = 1;
+    const uint64_t read_bytes = (uint64_t)per * src_stride;
+    const uint64_t align = model_fd_max_align();
+    if (!cuda_model_stage_pool_alloc(read_bytes + (align > 1 ? align : 1))) return 0;
+    const uint64_t bytes = (uint64_t)n_expert * dst_stride;
+    void *dev = NULL, *tmp = NULL;
+    if (!cuda_ok(cudaMalloc(&dev, bytes), "expert half alloc")) return 0;
+    if (!cuda_ok(cudaMalloc(&tmp, read_bytes), "expert half stage")) { (void)cudaFree(dev); return 0; }
+    uint8_t *d = (uint8_t *)dev, *t = (uint8_t *)tmp;
+    cudaError_t err = cudaMemset(d, 0, bytes);   /* padding bytes of the scale plane */
+    for (uint32_t e0 = 0; err == cudaSuccess && e0 < n_expert; e0 += per) {
+        const uint32_t ne = (n_expert - e0 < per) ? n_expert - e0 : per;
+        const uint64_t off = src_offset + (uint64_t)e0 * src_stride, nb = (uint64_t)ne * src_stride;
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(entry, g_model_stage[0], g_model_stage_bytes, off, nb, &payload)) {
+            fprintf(stderr, "pulsar: expert half read failed at offset %llu: %s\n",
+                    (unsigned long long)off, strerror(errno));
+            err = cudaErrorUnknown;
+            break;
+        }
+        err = cudaMemcpy(t, payload, (size_t)nb, cudaMemcpyHostToDevice);
+        uint8_t *de0 = d + (uint64_t)e0 * dst_stride;
+        if (err == cudaSuccess && !k_half) {
+            err = cudaMemcpy2D(de0, dst_stride, t + lo * k / 2, src_stride, dst_data, ne, cudaMemcpyDeviceToDevice);
+            if (err == cudaSuccess)
+                err = cudaMemcpy2D(de0 + dst_data, dst_stride, t + src_data + lo * k / 32, src_stride,
+                                   dst_sf, ne, cudaMemcpyDeviceToDevice);
+        }
+        for (uint32_t e = 0; err == cudaSuccess && k_half && e < ne; e++) {
+            const uint8_t *se = t + (uint64_t)e * src_stride;
+            uint8_t *de = de0 + (uint64_t)e * dst_stride;
+            err = cudaMemcpy2D(de, (hi - lo) / 2, se + lo / 2, k / 2, (hi - lo) / 2, n, cudaMemcpyDeviceToDevice);
+            if (err == cudaSuccess)
+                err = cudaMemcpy2D(de + dst_data, (hi - lo) * 4, se + src_data + lo * 4, k_pad * 4,
+                                   (hi - lo) * 4, n_bands, cudaMemcpyDeviceToDevice);
+        }
+        cuda_model_drop_file_pages(model_map, off, nb);
+    }
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    (void)cudaFree(tmp);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "pulsar: expert half build failed: %s\n", cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_model_ranges.push_back({key_map, key_offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_range_by_offset[{key_map, key_offset}] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    return 1;
+}
+
 static void cuda_model_range_release_all(void) {
     cuda_model_load_progress_finish();
     for (const cuda_model_range &r : g_model_ranges) {
@@ -1665,9 +1767,26 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 
 
+/* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = a device spin
+ * timed out, 2 = the lane was aborted (pulsar_tp_row_lane_abort).  Latched:
+ * once set the lane is dead, so every later drain refuses too. */
+static const volatile uint32_t *g_tp_err_word = NULL;
+
+void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word) { g_tp_err_word = word; }
+
+static int tp_err_word_ok(void) {
+    if (!g_tp_err_word || *g_tp_err_word == 0u) return 1;
+    fprintf(stderr, "pulsar: a tensor-parallel row-lane exchange %s -- refusing the step "
+                    "(its logits are not the pair's; 4g-2)\n",
+            *g_tp_err_word == 2u ? "was aborted (a rank would not run this step; see the pulsar-tp line)"
+                                 : "timed out on the device");
+    return 0;
+}
+
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     if (!cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands")) return 0;
+    if (!tp_err_word_ok()) return 0;
     /* L188: the stream is drained -- this is where every step reads its logits
      * back -- so the routed experts' non-finite flag is read here, once, with no
      * extra synchronisation.  A set flag fails the step by name; nothing
@@ -1721,7 +1840,7 @@ int pulsar_gpu_synchronize(void) {
     if (oob > 0)
         fprintf(stderr, "pulsar: routed expert id out of range at layer %u (%s) in a step that did not "
                         "complete -- flag cleared (PLAN 94 phase 1)\n", oob_layer, oob_arm);
-    return nf >= 0 && oob >= 0;
+    return nf >= 0 && oob >= 0 && tp_err_word_ok();
 }
 
 

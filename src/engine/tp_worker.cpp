@@ -122,6 +122,10 @@ bool pulsar_engine_is_tp(const pulsar_engine *e) {
     return e && e->tp;
 }
 
+struct pulsar_tp *pulsar_engine_tp(const pulsar_engine *e) {
+    return e ? e->tp : NULL;
+}
+
 /* The two refusals every acked frame shares.  Returns 1 when the frame must be
  * refused (err filled), 0 when the body may run. */
 static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const char *op,
@@ -139,6 +143,17 @@ static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const ch
         return 1;
     }
     return 0;
+}
+
+/* A MODEL-RUNNING frame this rank refused or failed: the leader is running
+ * the step (its exchanges wait on this rank's rows), so the row lane is
+ * aborted -- the leader's spinning kernels exit and its step refuses at once,
+ * instead of waiting out the transport timeout (L241 4g-2).  The pair is
+ * failed from here on, which is what a rank leaving lockstep means. */
+static void worker_abort_step(pulsar_engine *e, const char *op, const char *why) {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "the worker could not run %s: %s", op, why);
+    pulsar_tp_row_lane_abort(e->tp, msg);
 }
 
 static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t errlen) {
@@ -181,7 +196,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int rc = 1;
         if (pulsar_tp_failed(tp)) {
             snprintf(ferr, sizeof(ferr), "tp: this rank marked the pair failed earlier; refusing session create");
+        } else if (c->seq == 0 || c->seq > PULSAR_MSEQ_MAX) {
+            snprintf(ferr, sizeof(ferr), "tp: session create carries bank pool %llu (want 1..%u)",
+                     (unsigned long long)c->seq, (unsigned)PULSAR_MSEQ_MAX);
         } else {
+            /* The leader's pool size is the authority (its server sized it at
+             * startup); set it for this create exactly as the server does. */
+            gpu_graph_bank_pool_set((uint32_t)c->seq);
             pulsar_session *s = NULL;
             rc = pulsar_session::create(&s, e, c->value);
             if (rc != 0 || !s) {
@@ -229,7 +250,12 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             borrowed.cap = (int)c->n_tokens;
             rc = slot->s->sync(&borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr, sizeof(ferr));
         }
-        if (rc != 0) fprintf(stderr, "pulsar: tp worker: sync refused: %s\n", ferr);
+        /* INTERRUPTED is the leader's chunk verdict (v15), taken at the same
+         * boundary on both ranks: an outcome, not a refusal. */
+        if (rc != 0 && rc != PULSAR_SESSION_SYNC_INTERRUPTED) {
+            fprintf(stderr, "pulsar: tp worker: sync refused: %s\n", ferr);
+            worker_abort_step(e, "sync", ferr);
+        }
         return worker_ack(e, c->session_id, rc, err, errlen);
     }
 
@@ -246,7 +272,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 rc = slot->s->eval(c->value, ferr, sizeof(ferr));
             }
         }
-        if (rc != 0) fprintf(stderr, "pulsar: tp worker: eval refused: %s\n", ferr);
+        if (rc != 0) {
+            fprintf(stderr, "pulsar: tp worker: eval refused: %s\n", ferr);
+            worker_abort_step(e, "eval", ferr);
+        }
         return worker_ack_logits(e, c->session_id, rc, rc == 0 ? slot->s->logits : NULL, 1u,
                                  err, errlen);
     }
@@ -272,8 +301,18 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             }
             free(rows);
         }
-        if (rc != 0) fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
-        return worker_ack_logits(e, c->session_id, rc, logits, out_rows, err, errlen);
+        if (rc != 0) {
+            fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+            worker_abort_step(e, op, ferr);
+            return worker_ack(e, c->session_id, rc, err, errlen);
+        }
+        /* The digest of what the step PRODUCED (argmax / compact / logits rows),
+         * the same helper the leader's collect uses. */
+        if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
+                                              pulsar_session_batch_digest(slot->s, logits, out_rows)) != 0)
+            return 1;
+        snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
+        return -1;
     }
 
     case PULSAR_TP_FRAME_REWIND:
@@ -453,6 +492,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             status = rc == 0 ? 0 : 1;
             if (rc != 0) fprintf(stderr, "pulsar: tp worker: spec_redraft_batch failed: %s\n", ferr);
         } else fprintf(stderr, "pulsar: tp worker: spec_redraft_batch refused: %s\n", ferr);
+        if (status != 0) worker_abort_step(e, "spec_redraft_batch", ferr);
         return worker_ack(e, c->session_id, status, err, errlen);
     }
     case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT: {
@@ -476,8 +516,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                                                         &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;
             if (status < 0) status = 0;
-            if (n < 0) fprintf(stderr, "pulsar: tp worker: generate_speculative failed: %s\n", ferr);
-            else {
+            if (n < 0) {
+                fprintf(stderr, "pulsar: tp worker: generate_speculative failed: %s\n", ferr);
+                worker_abort_step(e, "generate_speculative", ferr);
+            } else {
                 /* The run's last row is this rank's assembled logits after the
                  * whole loop; the positive verdict carries its digest (L243). */
                 const uint64_t digest = pulsar_tp_logits_digest(slot->s->logits, 1u,
@@ -487,7 +529,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
                 return -1;
             }
-        } else fprintf(stderr, "pulsar: tp worker: generate_speculative refused: %s\n", ferr);
+        } else {
+            fprintf(stderr, "pulsar: tp worker: generate_speculative refused: %s\n", ferr);
+            worker_abort_step(e, "generate_speculative", ferr);
+        }
         return worker_ack(e, c->session_id, status, err, errlen);
     }
 

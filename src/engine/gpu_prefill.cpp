@@ -1164,50 +1164,11 @@ static bool gpu_graph_indexed_attention_span(
 }
 
 
-/* Slice 4g (L241): gather the owned output groups' `low` rows into the full
- * [tokens][n_groups_total * rank] block on every rank, between the attention
- * output's stage 'a' (owned groups) and stage 'b' (whole).  Stage 'a' wrote
- * `low` PACKED at the owned width; this re-pitches it to the gather's padded
- * per-rank stride (a whole number of groups, see pulsar_tp_allgather_rows),
- * exchanges in rank order -- rank order IS group order -- and writes the full
- * block back over the same buffer.  Concatenation, never a sum: every rank's
- * groups are distinct pieces of one row.  Rides the same monotonic seq as the
- * FFN big gate, so the two exchanges of a layer stay in lockstep across ranks. */
-static bool tp_attn_gather_low(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
-                               uint32_t rank, uint32_t n_groups_total) {
-    if (!g->tp) {
-        fprintf(stderr, "pulsar: layer %u attention owns output groups [%u,%u) of %u but has no "
-                        "TP transport to gather the rest -- refusing\n",
-                il, g->tp_group_lo, g->tp_group_hi, n_groups_total);
-        return false;
-    }
-    const uint32_t n_ranks = pulsar_tp_n_ranks(g->tp);
-    const uint64_t own_dim  = (uint64_t)(g->tp_group_hi - g->tp_group_lo) * rank;
-    const uint64_t stride   = (uint64_t)((n_groups_total + n_ranks - 1u) / n_ranks) * rank;
-    const uint64_t full_dim = (uint64_t)n_groups_total * rank;
-    float *packed  = (float *)xmalloc((size_t)n_tokens * own_dim * sizeof(float));
-    float *own     = (float *)calloc((size_t)n_tokens * stride, sizeof(float));   /* padded tail stays zero */
-    float *scratch = (float *)calloc((size_t)n_tokens * stride, sizeof(float));
-    float *full    = (float *)xmalloc((size_t)n_tokens * full_dim * sizeof(float));
-    bool ok = packed && own && scratch && full;
-    if (!ok) fprintf(stderr, "pulsar: tp attention gather out of memory (layer %u, %u rows)\n", il, n_tokens);
-    if (ok) ok = pulsar_gpu_tensor_read(g->batch_attn_low, 0, packed,
-                                        (uint64_t)n_tokens * own_dim * sizeof(float)) != 0;
-    if (ok) {
-        for (uint32_t r = 0; r < n_tokens; r++)
-            memcpy(own + (uint64_t)r * stride, packed + (uint64_t)r * own_dim, own_dim * sizeof(float));
-        ok = pulsar_tp_allgather_rows(g->tp, il, ++g->tp_prefill_seq, full, own, scratch,
-                                      n_tokens, n_groups_total, rank) != 0;
-        if (!ok) fprintf(stderr, "pulsar: tp attention gather failed (layer %u, %u rows)\n", il, n_tokens);
-    }
-    if (ok) ok = pulsar_gpu_tensor_write(g->batch_attn_low, 0, full,
-                                         (uint64_t)n_tokens * full_dim * sizeof(float)) != 0;
-    free(packed);
-    free(own);
-    free(scratch);
-    free(full);
-    return ok;
-}
+/* The pair's all-reduce of a [n_tokens][n_embd] f32 partial, in place
+ * (defined with the FFN encoder below): the row lane for decode/verify rows,
+ * the big gate for prefill chunks. */
+static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+                              pulsar_gpu_tensor *t, const char *what);
 
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
@@ -2403,8 +2364,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     /* Stage 'a' over the owned groups (the registered row slice of attn_output_a
-     * on a TP rank; the whole tensor on one box), the gather of `low` across
-     * the group, then stage 'b' whole on every rank. */
+     * on a TP rank; the whole tensor on one box), then stage 'b'.  One box:
+     * 'b' whole.  TP (4g-2): 'b' ROW-PARALLEL -- this rank's `low` is exactly
+     * its owned groups' columns of 'b''s input, so it multiplies the matching
+     * K-half of attn_output_b (registered at open) into a PARTIAL attention
+     * output, and the pair sums the partials.  That replaces the `low` gather
+     * one for one (same exchange count and size) and halves 'b', the largest
+     * GEMV each rank used to run whole. */
     if (ok) {
         ok = pulsar_gpu_attention_output_a_tensor(g->batch_attn_low,
                                                   tensor_map_base(model, layer->attn_output_a),
@@ -2417,8 +2383,19 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   g->batch_heads,
                                                   n_tokens) != 0;
     }
-    if (ok && n_groups != n_groups_total) ok = tp_attn_gather_low(g, il, n_tokens, rank, n_groups_total);
-    if (ok) {
+    if (ok && n_groups != n_groups_total) {
+        ok = g->tp && g->tp_kslice_key &&
+             pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
+                                                  g->tp_kslice_key, UINT64_MAX / 2u,
+                                                  pulsar_tp_kslice_key_offset(layer->attn_output_b),
+                                                  (uint64_t)n_groups * rank,
+                                                  PULSAR_N_EMBD,
+                                                  g->batch_attn_low,
+                                                  n_tokens) != 0;
+        if (!ok) fprintf(stderr, "pulsar: layer %u attention: row-parallel stage 'b' refused (owned groups "
+                                 "[%u,%u) of %u)\n", il, g_lo, g_hi, n_groups_total);
+        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, "attention");
+    } else if (ok) {
         ok = pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
                                                   tensor_map_base(model, layer->attn_output_a),
                                                   tensor_map_size(model, layer->attn_output_a),
@@ -2430,7 +2407,7 @@ bool gpu_graph_encode_layer_attention_batch(
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
-                                      (uint64_t)n_tokens * n_groups_total * rank,
+                                      (uint64_t)n_tokens * n_groups * rank,
                                       il,
                                       pos0);
     }
@@ -2482,10 +2459,66 @@ bool gpu_graph_encode_layer_attention_batch(
  * only when g->tp is armed; returns 0 (fail loud) on any tensor/transport
  * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
  * can move onto the registerable GB10 slab later. */
-static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+                              pulsar_gpu_tensor *t, const char *what) {
     if (!g->tp) return 1;
     const uint64_t nelt = (uint64_t)n_tokens * PULSAR_N_EMBD;
     const uint64_t bytes = nelt * sizeof(float);
+    /* Decode and verify rows on a pair ride the ROW LANE (4g-2): enqueued
+     * entirely on the stream -- stage, publish, combine -- while the
+     * transport's proxy thread moves the rows; the engine thread never waits.
+     * Chosen by row count, like the staging split below.  The combine is the
+     * all-reduce's own + peer add, same operands, same order -- bit-identical. */
+    if (n_tokens <= PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_row_lane(g->tp) &&
+        (uint64_t)PULSAR_N_EMBD * sizeof(float) == pulsar_tp_vec_bytes(g->tp)) {
+        pulsar_tp_row_lane_layout_t L;
+        pulsar_tp_row_lane_layout(g->tp, &L);
+        uint8_t *slab = (uint8_t *)g->tp_slab_dev;
+        uint64_t first = 0, exch = 0;
+        bool ok = slab && pulsar_tp_row_lane_begin(g->tp, n_tokens, &first, &exch) != 0;
+        if (ok) ok = pulsar_gpu_tp_stage_rows(t, slab, L.out_off, L.vec_bytes,
+                                              first, L.n_slots, n_tokens) != 0;
+        if (ok) ok = pulsar_gpu_tp_publish(slab + L.desc_off, exch, first, n_tokens) != 0;
+        if (ok) ok = pulsar_gpu_tp_combine_sum(t, slab, L.in_off, L.vec_bytes,
+                                               first, L.n_slots, n_tokens, slab + L.done_off,
+                                               exch, slab + L.err_off, L.timeout_ns) != 0;
+        if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
+        return ok;
+    }
+    /* Prefill-sized exchanges on a pair ride the BULK LANE (v14): the same
+     * stream-enqueued stage / publish / combine, but the rows go GPU-direct
+     * through the registered bulk buffer and cross as RDMA writes on the
+     * second QP -- no host copy, no handshake.  A payload larger than one
+     * bulk buffer is cut into buffer-sized row runs, each its own exchange.
+     * The combine is the all-reduce's own + peer add -- bit-identical to the
+     * host big gate below, which remains the lane for transports with no bulk
+     * buffer (TCP). */
+    if (n_tokens > PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_bulk_lane(g->tp) && g->tp_slab_dev && g->tp_bulk_dev) {
+        pulsar_tp_row_lane_layout_t L;
+        pulsar_tp_row_lane_layout(g->tp, &L);
+        pulsar_tp_bulk_layout_t BL;
+        pulsar_tp_bulk_layout(g->tp, &BL);
+        uint8_t *slab = (uint8_t *)g->tp_slab_dev;
+        uint8_t *bulk = (uint8_t *)g->tp_bulk_dev;
+        const uint64_t row_bytes = (uint64_t)PULSAR_N_EMBD * sizeof(float);
+        const uint64_t piece_rows = BL.cap_bytes / row_bytes;
+        bool ok = piece_rows > 0;
+        for (uint64_t r0 = 0; ok && r0 < n_tokens; r0 += piece_rows) {
+            const uint64_t rows = n_tokens - r0 < piece_rows ? n_tokens - r0 : piece_rows;
+            const uint64_t off = r0 * row_bytes, len = rows * row_bytes;
+            uint64_t exch = 0;
+            uint32_t buf = 0;
+            ok = pulsar_tp_bulk_begin(g->tp, len, &exch, &buf) != 0 &&
+                 pulsar_gpu_tp_bulk_stage(t, off, bulk + BL.out_off, len) != 0 &&
+                 pulsar_gpu_tp_publish_bulk(slab + L.desc_off, exch, len,
+                                            PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
+                 pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.in_off[buf], len, slab + L.done_off,
+                                                exch, slab + L.err_off, L.timeout_ns) != 0;
+        }
+        if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
+                         il, what, n_tokens);
+        return ok;
+    }
     /* Two staging shapes, chosen by ROW COUNT because that is the slab's sizing
      * boundary rather than a semantic variant (so nothing selects it by flag):
      *
@@ -2520,13 +2553,14 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
         }
         heap = true;
     }
-    bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
+    bool ok = pulsar_gpu_tensor_read(t, 0, out, bytes) != 0 &&
+              pulsar_tp_row_lane_check(g->tp) != 0;   /* stream drained: every row-lane exchange done */
     if (ok) {
         ok = pulsar_tp_allreduce_sum(g->tp, il, ++g->tp_prefill_seq,
                                      out, in, bytes) != 0;
     }
     if (ok) {
-        ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, out, bytes) != 0;
+        ok = pulsar_gpu_tensor_write(t, 0, out, bytes) != 0;
     }
     if (heap) {
         free(out);
@@ -2738,8 +2772,22 @@ bool gpu_graph_encode_layer_ffn_batch(
 
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos0);
 
+    /* L241 4g-2: under TP this rank computes its half of the shared expert
+     * (tp_register_shared_split): gate/up over its owned intermediate rows,
+     * down over the matching input columns -- a partial that joins the routed
+     * partial in the FFN exchange.  One box: the whole range, the whole
+     * tensors, byte for byte the path before this split. */
+    uint32_t shx_lo = 0u, shx_hi = (uint32_t)shared_dim;
+    if (ok && g->tp &&
+        !pulsar_tp_owned_range(pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp),
+                               (uint32_t)shared_dim, &shx_lo, &shx_hi)) {
+        fprintf(stderr, "pulsar: tp owned shared-expert range refused (layer %u)\n", il);
+        ok = false;
+    }
+    const uint64_t shared_own = (uint64_t)(shx_hi - shx_lo);
+
 #define PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT() do { \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_gate", \
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_gate", \
                                                           il, \
                                                           pos0, \
                                                           g->batch_shared_gate, \
@@ -2747,9 +2795,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           layer->ffn_gate_shexp, \
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
+                                                          shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_up", \
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
                                                           g->batch_shared_up, \
@@ -2757,14 +2806,15 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           layer->ffn_up_shexp, \
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
+                                                          shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
         void *shmid_q = NULL, *shmid_sf = NULL; int shmid_kbp = 0; \
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
-                                                        (uint64_t)shared_dim, \
+                                                        shared_own, \
                                                         &shmid_q, &shmid_sf, &shmid_kbp)) { \
             fprintf(stderr, "pulsar: shared_mid: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n", \
-                    n_tokens, (unsigned)shared_dim); \
+                    n_tokens, (unsigned)shared_own); \
             ok = false; \
         } \
         /* DEAD-STORE ELIMINATION. batch_shared_mid's only reader is the MXFP8 \
@@ -2796,16 +2846,16 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
-                                             (uint32_t)((uint64_t)n_tokens * shared_dim), \
+                                             (uint32_t)((uint64_t)n_tokens * shared_own), \
                                              PULSAR_SWIGLU_CLAMP_EXP, \
                                              1.0f, \
                                              shmid_q, shmid_sf, shmid_kbp, \
-                                             (uint32_t)shared_dim, \
+                                             (uint32_t)shared_own, \
                                              shmid_skip_f32) != 0; \
-        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, (uint64_t)shared_dim); \
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, shared_own); \
         if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
         if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n_tokens); \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
+        if (ok && !g->tp) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \
                                                                               g->batch_shared_out, \
@@ -2815,44 +2865,57 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                               PULSAR_N_EMBD, \
                                                                               g->batch_shared_mid, \
                                                                               n_tokens); \
+        /* TP: this rank's input-column half of down, repacked at open and keyed \
+         * (engine key, parent offset) -- a partial of the shared output. */ \
+        if (ok && g->tp) ok = pulsar_gpu_matmul_mxfp8_tensor(g->batch_shared_out, \
+                                                             g->tp_kslice_key, UINT64_MAX / 2u, \
+                                                             pulsar_tp_kslice_key_offset(layer->ffn_down_shexp), \
+                                                             shared_own, PULSAR_N_EMBD, \
+                                                             g->batch_shared_mid, n_tokens) != 0; \
         if (ok) { \
             gpu_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out, \
                                           (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0); \
         } \
     } while (0)
 
-    /* The range is over THIS layer's routed experts -- the count the kernel is
-     * handed below (n_expert_present), not the target table's entry for `il`.
-     * The drafter reaches this encoder with ITS OWN layer index, and a REAP'd
-     * or V4.1 layout gives the two tables different numbers; a range wider
-     * than the kernel's total is a refusal there, and one narrower silently
-     * drops experts. */
-    uint32_t exp_lo = 0u;
-    uint32_t exp_hi = layer->n_expert_present;
-    if (ok && g->tp) {
-        /* Slice 4c: under TP each rank computes ONLY its owned expert slice
-         * (single authority), so the all-reduce at tp_prefill_big_gate sums the
-         * owned partials into the correct full routed sum.  Co-gated with the
-         * combine: a narrowed partial is only ever emitted when the all-reduce
-         * runs, and never summed twice. */
-        if (!pulsar_tp_owned_range(pulsar_tp_rank(g->tp),
-                                          pulsar_tp_n_ranks(g->tp), exp_hi,
-                                          &exp_lo, &exp_hi)) {
-            fprintf(stderr, "pulsar: tp owned-expert range refused (rank=%d n=%u)\n",
-                    pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp));
+    /* L241 4g-2 expert tensor-parallel: under TP every rank runs EVERY selected
+     * expert over its half of the intermediate width, from the compact
+     * half-stacks built at open (tp_register_expert_half) and resolved under
+     * the engine key.  The rank's routed output is a partial the FFN exchange
+     * sums.  One box: the stored stacks, the whole width. */
+    const void *moe_map = tensor_map_base(model, layer->ffn_gate_exps);
+    uint64_t moe_size = tensor_map_size(model, layer->ffn_gate_exps);
+    uint64_t moe_gate_off = layer->ffn_gate_exps->abs_offset;
+    uint64_t moe_up_off = layer->ffn_up_exps->abs_offset;
+    uint64_t moe_down_off = layer->ffn_down_exps->abs_offset;
+    uint64_t moe_mid = down_in_dim;
+    if (g->tp) {
+        uint32_t lo = 0, hi = 0;
+        uint64_t sf = 0;
+        if (!pulsar_tp_owned_range(pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp),
+                                   (uint32_t)down_in_dim, &lo, &hi) || !g->tp_kslice_key) {
+            fprintf(stderr, "pulsar: tp expert half refused (layer %u)\n", il);
             ok = false;
         }
+        moe_map = g->tp_kslice_key;
+        moe_size = UINT64_MAX / 2u;
+        moe_gate_off = pulsar_tp_expert_half_offset(model, layer->ffn_gate_exps);
+        moe_up_off = pulsar_tp_expert_half_offset(model, layer->ffn_up_exps);
+        moe_down_off = pulsar_tp_expert_half_offset(model, layer->ffn_down_exps);
+        moe_mid = hi - lo;
+        cutlass_mxfp4_expert_layout(expert_in_dim, moe_mid, &gate_row_bytes, &sf, &gate_expert_bytes);
+        cutlass_mxfp4_expert_layout(moe_mid, routed_out_dim, &down_row_bytes, &sf, &down_expert_bytes);
     }
     if (ok) {
         ok = pulsar_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_up,
                                                g->batch_routed_mid,
                                                g->batch_routed_down,
-                                               tensor_map_base(model, layer->ffn_gate_exps),
-                                               tensor_map_size(model, layer->ffn_gate_exps),
-                                               layer->ffn_gate_exps->abs_offset,
-                                               layer->ffn_up_exps->abs_offset,
-                                               layer->ffn_down_exps->abs_offset,
+                                               moe_map,
+                                               moe_size,
+                                               moe_gate_off,
+                                               moe_up_off,
+                                               moe_down_off,
                                                layer->ffn_gate_exps->type,
                                                layer->ffn_down_exps->type,
                                                gate_expert_bytes,
@@ -2860,7 +2923,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                down_expert_bytes,
                                                down_row_bytes,
                                                (uint32_t)expert_in_dim,
-                                               (uint32_t)down_in_dim,
+                                               (uint32_t)moe_mid,
                                                (uint32_t)routed_out_dim,
                                                g->batch_router_selected,
                                                g->batch_router_weights,
@@ -2870,8 +2933,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                g->batch_ffn_norm,
                                                il,
                                                n_tokens,
-                                               exp_lo,
-                                               exp_hi) != 0;
+                                               g->tp ? 1u : 0u) != 0;
     }
     if (ok && g->imatrix_f32_rows) {
         /* L246: the imatrix collector reads batch_routed_mid as the down
@@ -2921,7 +2983,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT();
 #undef PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
 
-    /* Slice 4b: with the group armed, exchange this layer's owned routed
+    /* Slice 4b: with the group armed, exchange this layer's routed
      * partial and fold the peers' in BEFORE the HC expansion below, so the layer
      * output carried into the next layer is the full routed sum.  One big gate
      * per layer for the whole chunk (amortized, not per token).  The ffn_out
@@ -2935,7 +2997,14 @@ bool gpu_graph_encode_layer_ffn_batch(
                                   (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;
     }
     if (ok && g->tp) {
-        ok = tp_prefill_big_gate(g, il, n_tokens);
+        /* 4g-2: this rank's shared-expert PARTIAL joins its routed partial, so
+         * the one exchange sums both; shared_out is then zero and every
+         * consumer below (hc expand-add, ffn_out) reads the full sum from
+         * routed_out unchanged. */
+        const uint32_t n_ffn = (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD);
+        ok = pulsar_gpu_add_tensor(g->batch_routed_out, g->batch_routed_out, g->batch_shared_out, n_ffn) != 0 &&
+             pulsar_gpu_tensor_fill_f32(g->batch_shared_out, 0.0f, n_ffn) != 0;
+        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, "FFN");
         if (ok && keep_ffn_out) {
             ok = gpu_graph_ensure_batch_ffn_out(g) &&
                  pulsar_gpu_add_tensor(g->batch_ffn_out,

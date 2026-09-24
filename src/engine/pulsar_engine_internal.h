@@ -677,10 +677,10 @@ typedef struct {
     /** Slice 4f (L237): the rank this process loads the model FOR and the TP
      * group size (rank 0 of 1 when the pair is off).  Set by the engine from
      * its options BEFORE the tensor staging pass, because staging IS
-     * residency on GB10: a routed-expert stack is staged only over the rank's
-     * owned expert range (pulsar_tp_owned_byte_span) and the admission budget
-     * charges the same bytes.  The transport, created after the load, is
-     * asserted to come up as this same rank. */
+     * residency on GB10: under TP the stored routed-expert stacks are not
+     * staged (each rank builds its half of every expert at open) and the
+     * admission budget charges the same bytes.  The transport, created after
+     * the load, is asserted to come up as this same rank. */
     int tp_rank;
     uint32_t tp_n_ranks;
 
@@ -1564,14 +1564,30 @@ typedef struct {
      * prefill big-gate call sites read this rather than threading the engine
      * through every prefill entry point. */
     struct pulsar_tp *tp;
-    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented once
-     * per layer per chunk by tp_prefill_big_gate and once per layer per chunk by
-     * the attention `low` gather (slice 4g).  Every rank advances it in the same
+    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented by
+     * tp_allreduce_rows on its big-gate path: once per layer per prefill chunk
+     * for the attention output and once for the FFN (4g-2).  Every rank advances it in the same
      * order from the same starting value, so the exchange seq stays in
      * lockstep (the transport uses it as a desync guard). */
     uint64_t tp_prefill_seq;
+    /** The registered slab's device mapping, borrowed from the engine at graph
+     * init beside `tp` -- what the row-lane kernels (4g-2) address. */
+    void *tp_slab_dev;
+    /** The bulk lane's buffer, device mapping (v14), borrowed the same way. */
+    void *tp_bulk_dev;
+    /** The vocab gather's own-slice scratch (4g-2): this rank's packed head
+     * slice, PULSAR_SPEC_LOGITS_ROWS rows at the widest range, rounded up to
+     * whole row-lane messages so the last chunk's stage reads inside it.
+     * Allocated at graph init on a row-lane pair; NULL otherwise. */
+    pulsar_gpu_tensor *tp_vocab_own;
+    /** The key the engine registered this rank's K-half weights under (4g-2
+     * row-parallel splits: the shared expert's down projection), borrowed at
+     * graph init; resolved as (key, parent tensor's abs_offset). */
+    const void *tp_kslice_key;
+    /* (key offset: pulsar_tp_kslice_key_offset below) */
     /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
-     * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
+     * by tp_vocab_split's host lane (a row-lane pair gathers on the stream and
+     * is sequenced by the lane's own message counter instead).  Every rank advances it
      * the same number of times in the same order, so the gather's seq stays in
      * lockstep -- the transport's desync guard keys on it, which is also what
      * catches a lane that ran a different number of heads on the two ranks. */
@@ -1772,6 +1788,10 @@ struct pulsar_engine {
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
+    void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
+    void *tp_bulk_base;         ///< the bulk lane's buffer (host-pinned, v14), or NULL
+    void *tp_bulk_dev;          ///< its device mapping (bulk stage/combine), or NULL
+    uint64_t tp_bulk_bytes;
     size_t tp_slab_bytes;       ///< slab size in bytes
     /** Slice 4g (L241): the attention OUTPUT GROUPS this rank owns,
      * [tp_group_lo, tp_group_hi) of PULSAR_N_OUT_GROUP, from the range
@@ -2802,16 +2822,11 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count,
                                             const char *skip_prefix);
-/** Slice 4f (L237): is `t` a routed-expert STACK -- gate/up/down experts stored
- * back-to-back, `dim[2]` experts of `bytes/dim[2]` each (blk.N and dspark.N
- * `*_exps.weight`)?  When it is, `*off` and `*bytes` receive the sub-span this
- * model's rank owns (relative to the tensor payload; the whole tensor when the
- * pair is off).  When it is not, the whole tensor.  Returns true for a stack. */
-bool pulsar_model_expert_stack_owned_span(const pulsar_model *m, const pulsar_tensor *t,
-                                          uint64_t *off, uint64_t *bytes);
-/** Slice 4f: bytes of routed-expert payload this rank does NOT stage (peer-owned);
- * 0 when the pair is off.  The admission budget subtracts it from mapped_bytes. */
-uint64_t pulsar_model_peer_expert_bytes(const pulsar_model *m);
+/** L241 4g-2: bytes of stored routed-expert stacks this rank does NOT stage --
+ * every `*_exps.weight` stack under TP, where each rank serves its half of every
+ * expert from per-rank stacks built at open; 0 when the pair is off.  The
+ * admission budget subtracts it from mapped_bytes. */
+uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m);
 /** Return the in-place tensor payload inside the mapped GGUF (or inside the
  * overlay file's mapping for --expert-overlay swapped tensors).
  */
@@ -3717,6 +3732,9 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
 /** THE row-max rule: the first finite value seeds, lowest id wins a tie.
  * @return the argmax id, or -1 when the row has no finite value. */
 int sample_argmax(const float *logits, uint32_t n_vocab);
+/* The identity digest of a batched step's output (engine_api.cpp): argmax
+ * rows, compact rows or logits rows, whichever the step read back. */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
     int *ids;      ///< candidate token ids
@@ -3867,4 +3885,20 @@ static inline float f16_to_f32(uint16_t h) {
  * max_draft reports at least MAX so the per-position waterfall covers every
  * position the controller can reach. */
 enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
+/* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
+ * object's address, unique per tensor per engine -- abs_offsets repeat across
+ * safetensors shards.  One authority for registration and lookup. */
+static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
+    return (uint64_t)(uintptr_t)t;
+}
+
+/* The expert tensor-parallel half-stack key's offset for one routed stack
+ * (L241 4g-2): the tensor's index in its model's tensor table, 4 GiB apart so
+ * no two half-stacks' ranges overlap under the one engine key.  The drafter
+ * aliases the target's table, so indices are unique across both.  One
+ * authority for registration (open) and lookup (the FFN encoder). */
+static inline uint64_t pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
+    return ((uint64_t)(t - m->tensors) + 1u) << 32;
+}
+
 #endif /* PULSAR_ENGINE_INTERNAL_H */

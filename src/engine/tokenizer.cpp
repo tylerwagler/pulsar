@@ -1204,16 +1204,60 @@ int pulsar_token_assistant(pulsar_engine *e) {
  * seeds, then strict '>' so the lowest id wins a tie; a row with no finite
  * value has no argmax (-1).  No sentinel seed -- sample_full_vocab used to
  * seed -1e30 and classed a row whose finite logits all sat below it as
- * empty, emitting token 0 at zero probability (L186). */
+ * empty, emitting token 0 at zero probability (L186).
+ *
+ * Blocked (L241 4g-2): under this build's -ffast-math GCC if-converts the
+ * obvious one-pass loop (skip non-finite; `v > best_v` updates) into a
+ * select chain -- every element waits on the last compare, ~10 cycles each:
+ * 340 us over the 129,280-entry vocab on GB10's X925 cores, 420 us on the
+ * A725s, against 47 us for the same source at -O2.  That was the leader's
+ * whole per-token host gap on the pair.  Here each block's finite max is an
+ * 8-accumulator reduction (finiteness tested on the exponent bits, which
+ * fast-math cannot fold), and only a block whose max strictly beats the
+ * running best is scanned for its first index equal to that max: 35 us.
+ *
+ * Identical result, by construction: the one-pass loop keeps the first index
+ * at which the running finite max last strictly rose, i.e. the lowest index
+ * whose value == the row's finite max (IEEE ==, so +0 and -0 tie and the
+ * first wins, as `v > best_v` never replaces one with the other).  Blocks
+ * are visited in order and replace the best only on a strictly larger max;
+ * within the winning block the scan takes the first equal index. */
+static inline bool sample_finite_bits(float v) {
+    uint32_t b;
+    memcpy(&b, &v, sizeof(b));
+    return (b & 0x7f800000u) != 0x7f800000u;
+}
+
 int sample_argmax(const float *logits, uint32_t n_vocab) {
+    constexpr uint32_t BLOCK = 256u, LANES = 8u;
     int best = -1;
     float best_v = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (best < 0 || v > best_v) {
-            best_v = v;
-            best = (int)i;
+    for (uint32_t b0 = 0; b0 < n_vocab; b0 += BLOCK) {
+        const uint32_t b1 = n_vocab - b0 < BLOCK ? n_vocab : b0 + BLOCK;
+        float acc[LANES];
+        for (uint32_t k = 0; k < LANES; k++) acc[k] = -INFINITY;
+        uint32_t i = b0;
+        for (; i + LANES <= b1; i += LANES) {
+            for (uint32_t k = 0; k < LANES; k++) {
+                const float v = logits[i + k];
+                const float f = sample_finite_bits(v) ? v : -INFINITY;
+                acc[k] = f > acc[k] ? f : acc[k];
+            }
+        }
+        for (; i < b1; i++) {
+            const float v = logits[i];
+            const float f = sample_finite_bits(v) ? v : -INFINITY;
+            acc[0] = f > acc[0] ? f : acc[0];
+        }
+        float m = acc[0];
+        for (uint32_t k = 1; k < LANES; k++) m = acc[k] > m ? acc[k] : m;
+        if (m == -INFINITY || (best >= 0 && !(m > best_v))) continue;   /* no finite, or no rise */
+        for (uint32_t j = b0; j < b1; j++) {
+            if (logits[j] == m) {
+                best = (int)j;
+                best_v = m;
+                break;
+            }
         }
     }
     return best;
@@ -1605,18 +1649,10 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
          * runs instead). Pass 1: the row max by THE rule (sample_argmax):
          * first finite value seeds, lowest id on ties — the same candidate
          * the stable descending sort puts at cand[0]. */
-        float max_logit = 0.0f;
-        uint32_t max_id = 0;
-        uint32_t finite = 0;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            if (finite == 0 || v > max_logit) {
-                max_logit = v;
-                max_id = i;
-            }
-            finite++;
-        }
+        const int best = sample_argmax(logits, n_vocab);
+        const uint32_t max_id = best >= 0 ? (uint32_t)best : 0u;
+        const float max_logit = best >= 0 ? logits[max_id] : 0.0f;
+        const uint32_t finite = best >= 0 ? 1u : 0u;   /* "any finite logit" is all pass 2 asks */
         /* Pass 2: one prob per finite candidate, computed ONCE and carried
          * through the sort; `sum` over ALL of them, in this (index) order;
          * survivors collected in ascending-id order so the stable radix keeps

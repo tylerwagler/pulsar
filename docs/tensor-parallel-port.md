@@ -400,7 +400,8 @@ worker "blocks in the wrapper", read "the loop applies the frame".
     driver issued the operation); it is not an idle timeout.
 6f. **Owned-expert residency (slice 4f, L237, 2026-09-23)** — a rank stages
    only its owned experts (see split.md 4f).  Without it the pair could not
-   open the artifact it exists to serve.
+   open the artifact it exists to serve.  Superseded by 4g-2 (every rank holds
+   half of every expert); the ownership machinery is deleted.
 7. **Attention head split (Phase 4)** — v1 landed 2026-09-23 (split.md 4g-1,
    L241): owned OUTPUT GROUPS, bit-exact, one `low` all-gather per layer.
    v2 (row-parallel `wo_b`, all-reduce) after the pair measures collectives.

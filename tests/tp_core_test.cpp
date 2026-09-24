@@ -252,28 +252,6 @@ static void test_owned_range(void) {
           "n=2/256 split not [0,128)+[128,256)");
     CHECK(pulsar_tp_owned_range(-1, 2, 256u, &lo0, &hi0) == 0,
           "negative rank accepted");
-    /* Slice 4f: the byte span the loader stages, the budget charges and the
-     * dispatch resolves -- one authority, checked against the range above. */
-    {
-        uint64_t off = 1, by = 1;
-        const uint64_t eb = 4096u;
-        CHECK(pulsar_tp_owned_byte_span(1, 2, 256u, eb, &off, &by) == 1 &&
-              off == 128u * eb && by == 128u * eb, "byte span n=2 rank 1");
-        CHECK(pulsar_tp_owned_byte_span(0, 1, 256u, eb, &off, &by) == 1 &&
-              off == 0 && by == 256u * eb, "byte span n=1 is the whole stack");
-        CHECK(pulsar_tp_owned_byte_span(2, 3, 256u, eb, &off, &by) == 1 &&
-              off == 170u * eb && by == 86u * eb, "byte span n=3 rank 2 (floor partition tail)");
-        CHECK(pulsar_tp_owned_byte_span(3, 3, 256u, eb, &off, &by) == 0, "byte span bad rank refused");
-        CHECK(pulsar_tp_owned_byte_span(0, 2, 256u, 0u, &off, &by) == 0, "byte span zero expert_bytes refused");
-        /* the spans of every rank tile the stack exactly */
-        uint64_t sum = 0;
-        for (int r = 0; r < 5; r++) {
-            CHECK(pulsar_tp_owned_byte_span(r, 5, 256u, eb, &off, &by) == 1 && off == sum,
-                  "byte spans n=5 tile in order (rank %d)", r);
-            sum += by;
-        }
-        CHECK(sum == 256u * eb, "byte spans n=5 sum to the stack");
-    }
 }
 
 static void test_logits_digest(void) {
@@ -345,6 +323,6 @@ int main(void) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range + byte span, logits digest)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range, logits digest)\n");
     return 0;
 }

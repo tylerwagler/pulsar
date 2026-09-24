@@ -697,6 +697,29 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi);
+/* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
+ * one routed cutlass_mxfp4 stack from the host mapping (rows [lo,hi) for
+ * gate/up, input columns [lo,hi) for down when k_half) and register it as a
+ * model range under (key_map, key_offset); src/dst geometries are the
+ * cutlass_mxfp4_expert_layout of the full and half shapes.  Returns 1, or 0
+ * with the reason printed. */
+int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
+                                          const void *model_map, uint64_t src_offset,
+                                          uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
+                                          uint64_t lo, uint64_t hi,
+                                          uint64_t src_stride, uint64_t src_data,
+                                          uint64_t dst_stride, uint64_t dst_data);
+/* L241 4g-2: register the INPUT-COLUMN half [k_lo, k_hi) of a pre-stored
+ * MXFP8_LT weight (a row-parallel TP split: the rank's share of the
+ * reduction).  Repacked once into device buffers the backend owns (freed with
+ * the weight cache) and registered under (key_map, key_offset), in_dim =
+ * k_hi - k_lo; the GEMMs then resolve it by that key like any weight, with a
+ * model_size covering key_offset.  Bounds must be 128-aligned.  Returns 1, or
+ * 0 with the reason printed. */
+int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
+                                      uint64_t in_full, uint64_t out_dim,
+                                      uint64_t k_lo, uint64_t k_hi,
+                                      const void *key_map, uint64_t key_offset);
 /* L242: a pre-stored MXFP8_LT weight already resident in device buffers (data
  * plane, then the swizzled scale plane as separate tensors) enters the resolved
  * cache under (map_key, offset); the GEMMs then find it by offset.  For gates
@@ -1911,8 +1934,7 @@ int pulsar_gpu_routed_moe_batch_tensor(
         const pulsar_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
-        uint32_t                expert_lo,
-        uint32_t                expert_hi);
+        uint32_t                expert_split);
 
 
 /** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS MXFP4 weights:
@@ -1946,9 +1968,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         int             out_dim,
         const void     *act_q,
         const void     *act_sf,
-        int             act_kbp,
-        unsigned        expert_lo,
-        unsigned        expert_hi);
+        int             act_kbp);
 
 /** Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
  * blockscaled grouped GEMM launch each -- replacing the per-expert host loop + blocking offsets
@@ -2047,16 +2067,14 @@ int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float 
         uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp,
-    void *emit_q, void *emit_sf, int emit_kbp,
-    unsigned expert_lo, unsigned expert_hi);
+    void *emit_q, void *emit_sf, int emit_kbp);
 /** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
  * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
 int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
         const uint8_t *const *down_tab,   /* PLAN 94 phase 1 */
         uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
-        const void *mid_q, const void *mid_sf, int mid_kbp,
-        unsigned expert_lo, unsigned expert_hi);
+        const void *mid_q, const void *mid_sf, int mid_kbp);
 
 
 /** =========================================================================
@@ -2410,5 +2428,47 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const uint16_t *patches, int n_h, int n_w,
                                uint16_t *out, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks);
+
+/* Tensor-parallel row lane, GPU half (L241 4g-2; src/cuda/pulsar_cuda_tp.cu).
+ * One exchange = stage + publish + combine on the calling thread's stream;
+ * nothing here waits on the host.  `slab_dev` is the registered slab's device
+ * mapping; offsets, the ring size and the exchange/message numbers come from
+ * the transport (pulsar_tp_row_lane_begin / pulsar_tp_row_lane_layout). */
+int pulsar_gpu_tp_stage_rows(const pulsar_gpu_tensor *src, void *slab_dev,
+                             uint64_t out_off, uint64_t vec_bytes, uint64_t first_msg,
+                             uint32_t n_slots, uint32_t rows);
+int pulsar_gpu_tp_publish(void *desc_dev, uint64_t exch, uint64_t first_msg, uint32_t rows);
+/* dst[r][*] = dst[r][*] + peer[r][*]; waits for done >= exch first. */
+int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
+                              uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                              uint32_t n_slots, uint32_t rows, const void *done_dev,
+                              uint64_t exch, void *err_dev, uint64_t timeout_ns);
+/* The vocab gather's peer half: waits for done >= exch, then scatters this
+ * chunk (`msgs` messages holding payload elements elem0..) of the peer's
+ * packed [rows][width] slice to dst[r * pitch + col0 + c]. */
+int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
+                                  uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                                  uint32_t n_slots, uint32_t msgs, uint64_t elem0,
+                                  uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
+                                  const void *done_dev, uint64_t exch, void *err_dev,
+                                  uint64_t timeout_ns);
+/* The own half: packed [rows][width] src -> dst[r * pitch + col0 + c]. */
+int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *src,
+                               uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0);
+/* The row lane's error word (host view of the slab's), read at every stream
+ * drain (pulsar_gpu_end_commands / pulsar_gpu_synchronize) beside the routed
+ * experts' flags: a set word fails the step there, by name, before any logits
+ * the drained work produced are read back.  NULL disarms. */
+void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
+/* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
+ * `src` from src_off into the mapped bulk out-region (stream-ordered copy),
+ * publish the descriptor {exch, bytes, word2 = bulk flag | buffer}, and combine
+ * dst[off..] += the peer's rows in the mapped receive buffer once done >= exch. */
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, uint64_t src_off, void *dst_dev,
+                             uint64_t bytes);
+int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2);
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *peer_dev,
+                                   uint64_t bytes, const void *done_dev, uint64_t exch,
+                                   void *err_dev, uint64_t timeout_ns);
 
 #endif

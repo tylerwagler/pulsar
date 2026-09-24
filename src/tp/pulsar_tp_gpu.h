@@ -25,6 +25,10 @@
 int pulsar_tp_gpu_slab_alloc_hostpin(size_t bytes, void **base,
                                      char *err, size_t errlen);
 
+/* The slab's device mapping (cudaHostGetDevicePointer on the Mapped
+ * registration) -- what the row-lane kernels address.  NULL on failure. */
+void *pulsar_tp_gpu_slab_device_ptr(void *base, char *err, size_t errlen);
+
 /* Release a host-pinned slab from pulsar_tp_gpu_slab_alloc_hostpin. */
 void pulsar_tp_gpu_slab_free_hostpin(void *base);
 

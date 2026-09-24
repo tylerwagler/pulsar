@@ -667,11 +667,6 @@ int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm
  * the same process would otherwise be served the first model's addresses (the
  * fp8 pointer cache's hazard, same contract). */
 const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total);
-/** Slice 4f (L237): the same table for a stack whose experts [lo,hi) are the
- *  only ones staged behind `base` (which is REBASED to where expert 0 would
- *  sit).  Peer-owned entries clamp to expert lo; they are never read. */
-const uint8_t *const *mxfp4_expert_table_owned(const void *base, uint64_t stride, uint32_t n_total,
-                                               uint32_t lo, uint32_t hi);
 /** PLAN 94 phase 1: the same table for a TYPE 44 (IQ2_XXS_MMQ_K) stack, whose
  *  expert is TWO planes (d and q).  Returns an interleaved device array of
  *  [d,q] pointer pairs -- one eviction unit -- laid out exactly as
@@ -683,11 +678,6 @@ const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t
  *  bytes in (exl3_expert_layout).  Interleaved [trellis, scales] pointer
  *  pairs; refuses a split that is not strictly inside the slice. */
 const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_t stride, uint64_t split);
-/** Slice 4f for EXL3: experts [lo,hi) staged behind a REBASED base; peer
- *  entries clamp to expert lo and are never read (the arm zero-fills a
- *  peer-owned assignment before touching its table entry). */
-const void *const *exl3_expert_table_owned(const void *base, uint32_t n_total, uint64_t stride, uint64_t split,
-                                           uint32_t lo, uint32_t hi);
 void mxfp4_expert_tables_clear(void);
 
 /* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----
@@ -711,14 +701,12 @@ static __host__ __device__ __forceinline__ uint32_t moe_route_oob_code(uint32_t 
 }
 
 __global__ void moe_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected,
-                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code,
-                                              uint32_t expert_lo, uint32_t expert_hi);
+                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code);
 __global__ void moe_prefix_sorted_pairs_kernel(uint32_t *offsets, uint32_t *cursors,
                                                const uint32_t *counts, uint32_t expert_count);
 __global__ void moe_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors,
                                                 const int32_t *selected, uint32_t pair_count,
-                                                uint32_t n_total, uint32_t oob_code,
-                                                uint32_t expert_lo, uint32_t expert_hi);
+                                                uint32_t n_total, uint32_t oob_code);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 

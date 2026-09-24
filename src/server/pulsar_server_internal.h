@@ -1564,6 +1564,21 @@ struct server {
      * mu (same discipline as /metrics — no engine calls on the client thread).
      */
     bool send_health(int fd);
+    /** The /health `tp` block's fixed part, built once by build_tp_health()
+     *  before any client thread runs: one JSON object per rank, each missing
+     *  its closing brace so send_health can append the live `connected`.
+     *  Ranks, hosts, builds and devices do not change for the life of the
+     *  transport.  `tp` is read on client threads only for
+     *  pulsar_tp_failed(), an atomic load; clients drain before the engine
+     *  (and with it the transport) closes. */
+    char **tp_rank_json;
+    int *tp_rank_ids;           ///< the rank each fragment describes
+    int tp_rank_json_n;
+    int tp_nranks;
+    int tp_self_rank;
+    const char *tp_transport;   ///< "rdma" | "tcp" | NULL when not TP
+    struct pulsar_tp *tp;
+    void build_tp_health();
     /** Version + build identity (/version), vLLM/OpenAI convention. Version is the
      * git-describe string baked in at build time (see Makefile).
      */

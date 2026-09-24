@@ -67,6 +67,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->vision_visible);
     pulsar_gpu_tensor_free(g->logits);
     pulsar_gpu_tensor_free(g->spec_logits);
+    pulsar_gpu_tensor_free(g->tp_vocab_own);
+    g->tp_vocab_own = NULL;
     pulsar_gpu_tensor_free(g->dspark_main_x);
     for (int i = 0; i < 3; i++) {
         pulsar_gpu_tensor_free(g->dspark_target_h[i]);
