@@ -2140,6 +2140,15 @@ tests/tp_sched_test: tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/p
 tp-sched-test: tests/tp_sched_test
 	./tests/tp_sched_test
 
+# TP NODE frame test (protocol v13): after bring-up every rank knows every
+# rank's host, build and TP address, over the pair and the 3-rank mesh paths.
+# Host-only: no CUDA, no RDMA.
+tests/tp_node_test: tests/tp_node_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_node_test.cpp src/tp/pulsar_tp.cpp
+
+tp-node-test: tests/tp_node_test
+	./tests/tp_node_test
+
 # TP identity / hello-robustness test (branch tensor_parallel): the real-rank
 # model-mismatch matrix, the ctx-diff connect rule, the raw-peer leader
 # robustness set, and the worker dial-timeout -- all with per-child alarms so

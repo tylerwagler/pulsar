@@ -2,6 +2,7 @@
 #include <time.h>
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
+#include "tp/pulsar_tp.h" /* the /health tp block reads the NODE records */
 
 
 
@@ -202,6 +203,58 @@ bool server::send_liveness(int fd) {
                          "{\"status\":\"ok\"}\n");
 }
 
+/* One rank's fixed /health fields, left open for the live `connected`. */
+static char *tp_rank_fragment(const pulsar_tp_node *n) {
+    buf b = {0};
+    buf_printf(&b, "{\"rank\":%d,\"host\":", n->rank);
+    json_escape(&b, n->host);
+    /* Empty means "this rank did not say", which is absent, not "". */
+    const struct { const char *key; const char *val; } strs[] = {
+        { "addr", n->addr }, { "version", n->build }, { "rdma_device", n->rdma_device },
+    };
+    for (const auto &kv : strs) {
+        buf_printf(&b, ",\"%s\":", kv.key);
+        if (kv.val[0]) json_escape(&b, kv.val);
+        else buf_puts(&b, "null");
+    }
+    if (n->rdma_port > 0) buf_printf(&b, ",\"rdma_port\":%d", n->rdma_port);
+    else buf_puts(&b, ",\"rdma_port\":null");
+    return b.ptr;
+}
+
+/* The /health tp block's fixed part.  Called once, single-threaded, after the
+ * engine is open and before any client thread exists (cli_main).  A server that
+ * is not tensor-parallel still publishes itself as a one-rank group, so a
+ * dashboard shows its GPU without a separate code path.  A rank the transport
+ * has no NODE record for is left out rather than invented; nranks still says
+ * how many there should be. */
+void server::build_tp_health() {
+    tp = pulsar_engine_tp(engine);
+    const int n = tp ? (int)pulsar_tp_n_ranks(tp) : 1;
+    tp_nranks = n;
+    tp_self_rank = tp ? pulsar_tp_rank(tp) : 0;
+    tp_transport = tp ? (pulsar_tp_is_rdma(tp) ? "rdma" : "tcp") : NULL;
+    tp_rank_json = (char **)calloc((size_t)n, sizeof(char *));
+    tp_rank_ids = (int *)calloc((size_t)n, sizeof(int));
+    tp_rank_json_n = 0;
+    if (!tp_rank_json || !tp_rank_ids) return;
+    for (int r = 0; r < n; r++) {
+        pulsar_tp_node node;
+        if (tp) {
+            if (!pulsar_tp_node_info(tp, r, &node)) continue;
+        } else {
+            memset(&node, 0, sizeof(node));
+            if (gethostname(node.host, sizeof(node.host)) != 0) node.host[0] = '\0';
+            node.host[sizeof(node.host) - 1] = '\0';
+            snprintf(node.build, sizeof(node.build), "%s", PULSAR_VERSION_STR);
+        }
+        char *frag = tp_rank_fragment(&node);
+        if (!frag) continue;
+        tp_rank_ids[tp_rank_json_n] = r;
+        tp_rank_json[tp_rank_json_n++] = frag;
+    }
+}
+
 /* Readiness + status (/health): is the server ready to accept work, and what
  * is it doing right now? 200 {"status":"ok",...} when serving; 503
  * {"status":"draining",...} once shutdown has been requested so a load
@@ -244,9 +297,30 @@ bool server::send_health(int fd) {
         "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
         "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d,"
         "\"capacity\":%d},"
-        "\"kv_cache_usage\":%.6f}\n",
+        "\"kv_cache_usage\":%.6f,",
         draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
         uptime, n_slots, running, waiting, capacity, kv);
+    /* The tp block (pulsar-gui docs/contract.md, "Upstream: the /health tp
+     * block").  Only `failed` and `connected` are live, and both come from one
+     * atomic load; everything else was fixed at bring-up.  Every rank but this
+     * one is connected exactly while the transport has not failed: the
+     * transport marks itself failed on any peer loss (keepalive included), and
+     * it has no per-peer notion finer than that. */
+    const bool failed = tp && pulsar_tp_failed(tp);
+    buf_printf(&b, "\"tp\":{\"nranks\":%d,\"transport\":", tp_nranks);
+    if (tp_transport) buf_printf(&b, "\"%s\"", tp_transport);
+    else buf_puts(&b, "null");
+    buf_printf(&b, ",\"failed\":%s,\"ranks\":[", failed ? "true" : "false");
+    for (int i = 0; i < tp_rank_json_n; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_puts(&b, tp_rank_json[i]);
+        /* tp_rank_ids, not i: a rank with no record is skipped, so the i-th
+         * fragment is not necessarily rank i. */
+        if (tp && tp_rank_ids[i] != tp_self_rank)
+            buf_printf(&b, ",\"connected\":%s", failed ? "false" : "true");
+        buf_putc(&b, '}');
+    }
+    buf_puts(&b, "]}}\n");
     bool ok = http_response(fd, draining ? 503 : 200,
                             "application/json", b.ptr);
     buf_free(&b);

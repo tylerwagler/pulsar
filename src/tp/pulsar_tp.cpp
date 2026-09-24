@@ -484,6 +484,7 @@ typedef struct {
     struct tp_ibv_port_attr port;
     union tp_ibv_gid gid;
     int gid_index;
+    char dev_name[PULSAR_TP_NODE_STR];   /* the HCA tp_rdma_open chose, for the NODE frame */
 } pulsar_tp_rdma;
 
 /* PER-PEER RDMA state: one QP connected to one peer, that peer's exchanged
@@ -511,6 +512,9 @@ typedef struct {
     int data_fd;
     uint32_t peer_ctx;
     bool connected;
+    /* What the peer told us about itself in the NODE frame (protocol v13). */
+    pulsar_tp_node node;
+    bool node_known;
     /* This peer's own QP and completion state.  The HCA, PD, CQ and the slab MR
      * are shared (pulsar_tp_rdma on the transport). */
     pulsar_tp_rdma_link rdma;
@@ -558,6 +562,7 @@ struct pulsar_tp {
     std::atomic<bool> proxy_stop{false};
     std::atomic<bool> proxy_failed{false};
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
+    pulsar_tp_node self;    /* this rank's own NODE record */
 };
 
 /* ------------------------------------------------------------------------
@@ -935,6 +940,7 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         if (chose) {
             r->ctx = ctx;
             r->port = pa;
+            snprintf(r->dev_name, sizeof(r->dev_name), "%s", name);
             fprintf(stderr, "pulsar-tp: rdma device %s (port state %d)\n",
                     name, (int)pa.state);
             break;
@@ -2098,6 +2104,88 @@ static int tp_hello_exchange(pulsar_tp *tp, int fd, int expected_rank,
     return 1;
 }
 
+/* The NODE frame (protocol v13): who each rank is, for operators.  Sent once per
+ * peer on the control socket at the very end of bring-up -- after the hello,
+ * after the RDMA device is open -- so the device named is the one actually in
+ * use.  Fixed-size strings, NUL-terminated on receipt whatever the peer sent. */
+#define PULSAR_TP_NODE_MAGIC UINT32_C(0x4E4F4445)   /* "NODE" */
+typedef struct {
+    uint32_t magic;
+    uint32_t rank;
+    char host[PULSAR_TP_NODE_STR];
+    char build[PULSAR_TP_NODE_STR];
+    char addr[PULSAR_TP_NODE_STR];
+    char rdma_device[PULSAR_TP_NODE_STR];
+    uint32_t rdma_port;
+    uint32_t pad;
+} pulsar_tp_node_wire;
+
+static void tp_fill_self(pulsar_tp *tp, const char *addr) {
+    pulsar_tp_node *n = &tp->self;
+    memset(n, 0, sizeof(*n));
+    n->rank = tp->rank;
+    if (gethostname(n->host, sizeof(n->host)) != 0) n->host[0] = '\0';
+    n->host[sizeof(n->host) - 1] = '\0';
+    snprintf(n->build, sizeof(n->build), "%s", tp->opt.build ? tp->opt.build : "");
+    snprintf(n->addr, sizeof(n->addr), "%s", addr ? addr : "");
+    if (tp->rdma_active && tp->rdma.ctx) {
+        snprintf(n->rdma_device, sizeof(n->rdma_device), "%s", tp->rdma.dev_name);
+        n->rdma_port = 1;   /* tp_rdma_open always queries and uses port 1 */
+    }
+}
+
+static void tp_terminate(char *s, size_t n) { s[n - 1] = '\0'; }
+
+static int tp_node_exchange(pulsar_tp *tp, pulsar_tp_peer *pp, char *err, size_t errlen) {
+    pulsar_tp_node_wire mine;
+    memset(&mine, 0, sizeof(mine));
+    mine.magic = PULSAR_TP_NODE_MAGIC;
+    mine.rank = (uint32_t)tp->self.rank;
+    memcpy(mine.host, tp->self.host, sizeof(mine.host));
+    memcpy(mine.build, tp->self.build, sizeof(mine.build));
+    memcpy(mine.addr, tp->self.addr, sizeof(mine.addr));
+    memcpy(mine.rdma_device, tp->self.rdma_device, sizeof(mine.rdma_device));
+    mine.rdma_port = (uint32_t)tp->self.rdma_port;
+    pulsar_tp_node_wire theirs;
+    if (!tp_write_full(pp->control_fd, &mine, sizeof(mine)) ||
+        !tp_read_full(pp->control_fd, &theirs, sizeof(theirs))) {
+        tp_set_err(err, errlen, "tp: node exchange with peer %d failed", pp->rank);
+        return 0;
+    }
+    if (theirs.magic != PULSAR_TP_NODE_MAGIC || (int)theirs.rank != pp->rank) {
+        tp_set_err(err, errlen, "tp: bad node frame from peer %d (magic %08x rank %u)",
+                   pp->rank, theirs.magic, theirs.rank);
+        return 0;
+    }
+    tp_terminate(theirs.host, sizeof(theirs.host));
+    tp_terminate(theirs.build, sizeof(theirs.build));
+    tp_terminate(theirs.addr, sizeof(theirs.addr));
+    tp_terminate(theirs.rdma_device, sizeof(theirs.rdma_device));
+    pulsar_tp_node *n = &pp->node;
+    n->rank = pp->rank;
+    memcpy(n->host, theirs.host, sizeof(n->host));
+    memcpy(n->build, theirs.build, sizeof(n->build));
+    memcpy(n->addr, theirs.addr, sizeof(n->addr));
+    memcpy(n->rdma_device, theirs.rdma_device, sizeof(n->rdma_device));
+    n->rdma_port = (int)theirs.rdma_port;
+    pp->node_known = true;
+    return 1;
+}
+
+/* "ip:port" of this end of `fd`, or "" -- the pair path's only record of its
+ * own endpoint (the mesh has the authoritative peers list instead). */
+static void tp_local_addr(int fd, int port, char *out, size_t outlen) {
+    out[0] = '\0';
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&ss, &len) != 0) return;
+    char ip[INET6_ADDRSTRLEN] = "";
+    if (getnameinfo((struct sockaddr *)&ss, len, ip, sizeof(ip), NULL, 0, NI_NUMERICHOST) != 0)
+        return;
+    if (port > 0) snprintf(out, outlen, "%s:%d", ip, port);
+    else snprintf(out, outlen, "%s", ip);
+}
+
 int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
                      const pulsar_tp_identity *id, char *err, size_t errlen) {
     *out = NULL;
@@ -2183,6 +2271,13 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->peers[0].data_fd = tp->data_fd;
     tp->peers[0].peer_ctx = tp->peer_ctx;
     tp->peers[0].connected = true;
+    {
+        /* The leader knows its listen port; a dialing worker has none of its own. */
+        char addr[PULSAR_TP_NODE_STR];
+        tp_local_addr(tp->control_fd, tp->rank == 0 ? opt->port : 0, addr, sizeof(addr));
+        tp_fill_self(tp, addr);
+    }
+    if (!tp_node_exchange(tp, &tp->peers[0], err, errlen)) goto fail;
     fprintf(stderr, "pulsar-tp: rank %d connected (n_ranks=%d, %d peer), transport=%s\n",
             tp->rank, tp->n_ranks, tp->n_peers,
             tp->rdma_active ? "rdma" : "tcp");
@@ -2404,6 +2499,16 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->data_fd = tp->peers[0].data_fd;
     tp->peer_ctx = tp->peers[0].peer_ctx;
 
+    {
+        char addr[PULSAR_TP_NODE_STR];
+        /* Bounded: the record is for display, and a 255-byte peers entry must
+         * not be able to push the port out of it. */
+        snprintf(addr, sizeof(addr), "%.48s:%d", ep[R].host, ep[R].port);
+        tp_fill_self(tp, addr);
+    }
+    for (int i = 0; i < tp->n_peers; i++)
+        if (!tp_node_exchange(tp, &tp->peers[i], err, errlen)) goto fail;
+
     close(listener);
     free(ep);
     fprintf(stderr, "pulsar-tp: rank %d/%d mesh connected (%d peers), transport=%s\n",
@@ -2441,6 +2546,17 @@ void pulsar_tp_free(pulsar_tp *tp) {
 
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp) { return tp->n_ranks; }
+
+int pulsar_tp_node_info(const pulsar_tp *tp, int rank, pulsar_tp_node *out) {
+    if (!tp || !out) return 0;
+    if (rank == tp->rank) { *out = tp->self; return 1; }
+    for (int i = 0; i < tp->n_peers; i++)
+        if (tp->peers[i].rank == rank && tp->peers[i].node_known) {
+            *out = tp->peers[i].node;
+            return 1;
+        }
+    return 0;
+}
 
 int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
                                  uint32_t *lo, uint32_t *hi) {

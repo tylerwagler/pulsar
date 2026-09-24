@@ -725,6 +725,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
          * the transport is built for that same identity. */
         tp_opt.rank = tp_rank_at_load;
         tp_opt.n_ranks = (int)tp_n_ranks_at_load;
+        tp_opt.build = opt->build_id;
         pulsar_tp_identity id;
         pulsar_tp_identity_init_defaults(&id,
                                          (uint64_t)e->model.size,

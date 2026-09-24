@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 12u           /* v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 13u           /* v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -47,7 +47,24 @@ typedef struct {
     const char *peer;       /* legacy 2-rank: worker's dial target (NULL on the leader) */
     const char *peers;      /* n-way: ordered "host:port,..." list for ALL n ranks */
     int port;               /* this rank's own control/listen port */
+    const char *build;      /* this rank's build id (git describe), carried to every
+                             * peer in the NODE frame; NULL/"" = not stamped */
 } pulsar_tp_options;
+
+/* What one rank is, as the group knows it: exchanged once per peer in the NODE
+ * frame at the end of bring-up (protocol v13), after each rank has opened its
+ * RDMA device, so the device is known.  Every string is NUL-terminated and may
+ * be empty.  This exists for operators (/health's tp block), never for the data
+ * plane: nothing here is compared or acted on. */
+#define PULSAR_TP_NODE_STR 64
+typedef struct {
+    int rank;
+    char host[PULSAR_TP_NODE_STR];        /* gethostname() on that rank */
+    char build[PULSAR_TP_NODE_STR];       /* pulsar_tp_options.build on that rank */
+    char addr[PULSAR_TP_NODE_STR];        /* its TP endpoint ("host:port"), if known */
+    char rdma_device[PULSAR_TP_NODE_STR]; /* the HCA it opened; "" under TCP */
+    int rdma_port;                        /* the HCA port; 0 under TCP */
+} pulsar_tp_node;
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
  * any inference runs.  Field-for-field mirror of upstream ds4_tp_identity. */
@@ -169,6 +186,11 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
 void pulsar_tp_free(pulsar_tp *tp);
 int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
 uint32_t pulsar_tp_n_ranks(const pulsar_tp *tp);    /* ranks in this TP group */
+/* The NODE frame's record for `rank` (this rank's own included).  Returns 1 and
+ * fills *out when the group knows that rank, 0 otherwise.  The records are
+ * written once during bring-up and never again, so any thread may read them
+ * for the life of the transport. */
+int pulsar_tp_node_info(const pulsar_tp *tp, int rank, pulsar_tp_node *out);
 
 /* Owned slice of a dimension for `rank` in a group of `n_ranks`, floor-
  * partitioned over [0,n_total): lo = rank*n/n_ranks, hi = (rank+1)*n/n_ranks

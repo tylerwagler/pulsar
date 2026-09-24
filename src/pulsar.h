@@ -136,6 +136,10 @@ typedef struct {
     int tp_rank;        /* this rank's index in the group; -1 = unset */
     int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
     const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */
+    /** This build's id (git describe), carried to every TP peer in the NODE
+     *  frame so each rank can report the whole group's builds.  NULL = not
+     *  stamped (the CLI); the transport sends it empty. */
+    const char *build_id;
     /** Slice 4e increment 6 (L238): where a WORKER rank keeps its own bank
      * KV disk snapshots.  KV is replicated per rank, so a spill is per rank
      * to its own disk; the leader's frames name the snapshot by the key of
@@ -192,6 +196,10 @@ bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
  * raw whole-graph path (pulsar_engine_generate_argmax) has no transport and
  * refuses by name. */
 bool pulsar_engine_is_tp(const pulsar_engine *e);
+/** The engine's TP transport, or NULL when it is not tensor-parallel.  For
+ * read-only operator views (pulsar-server's /health tp block) that read the
+ * transport's bring-up records; owned by the engine, valid until close. */
+struct pulsar_tp *pulsar_engine_tp(const pulsar_engine *e);
 /** The worker receive loop: applies the leader's frames (create, sync, eval,
  * batched and mixed decode, rewind, invalidate, rng state) to a session
  * registry keyed by the create ordinal until the leader sends STOP or the
