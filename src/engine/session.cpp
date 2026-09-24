@@ -757,6 +757,11 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (pulsar_tp_row_lane(e->tp)) {
+            pulsar_tp_row_lane_layout_t L;
+            pulsar_tp_row_lane_layout(e->tp, &L);
+            pulsar_gpu_tp_err_word_set((const volatile uint32_t *)((uint8_t *)e->tp_slab_base + L.err_off));
+        }
         /* Slice 4f: the weights were staged for one identity and the transport
          * came up as another only if the two derivations drifted -- a bug, and
          * one that would compute the wrong experts on both ranks in silence. */
@@ -988,6 +993,7 @@ void pulsar_engine::destroy() {
     free(e->tp_spill_dir);
     e->tp_spill_dir = NULL;
     if (e->tp_slab_base) {
+        pulsar_gpu_tp_err_word_set(NULL);
         pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);
         e->tp_slab_base = NULL;
         e->tp_slab_dev = NULL;
@@ -1051,6 +1057,20 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp_group_hi = e->tp_group_hi;
     s->graph.tp_slab_dev = e->tp_slab_dev;
     s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
+    if (e->tp && pulsar_tp_row_lane(e->tp)) {
+        const uint64_t n_ranks = pulsar_tp_n_ranks(e->tp);
+        const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
+        const uint64_t vb = pulsar_tp_vec_bytes(e->tp);
+        const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
+        s->graph.tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
+        if (!s->graph.tp_vocab_own) {
+            fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
+                    (unsigned long long)bytes);
+            gpu_graph_free(&s->graph);
+            free(s);
+            return 1;
+        }
+    }
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
      * session created with no pair armed keeps 0 and stays out of the mirror. */

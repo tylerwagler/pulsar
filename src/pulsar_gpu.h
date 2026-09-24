@@ -2449,5 +2449,22 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
                               uint64_t exch, void *err_dev, uint64_t timeout_ns);
+/* The vocab gather's peer half: waits for done >= exch, then scatters this
+ * chunk (`msgs` messages holding payload elements elem0..) of the peer's
+ * packed [rows][width] slice to dst[r * pitch + col0 + c]. */
+int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
+                                  uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                                  uint32_t n_slots, uint32_t msgs, uint64_t elem0,
+                                  uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
+                                  const void *done_dev, uint64_t exch, void *err_dev,
+                                  uint64_t timeout_ns);
+/* The own half: packed [rows][width] src -> dst[r * pitch + col0 + c]. */
+int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *src,
+                               uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0);
+/* The row lane's error word (host view of the slab's), read at every stream
+ * drain (pulsar_gpu_end_commands / pulsar_gpu_synchronize) beside the routed
+ * experts' flags: a set word fails the step there, by name, before any logits
+ * the drained work produced are read back.  NULL disarms. */
+void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
 
 #endif

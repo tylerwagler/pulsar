@@ -1767,9 +1767,23 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 
 
+/* The TP row lane's error word (pulsar_gpu_tp_err_word_set).  Latched by the
+ * transport: once set the lane is dead, so every later drain refuses too. */
+static const volatile uint32_t *g_tp_err_word = NULL;
+
+void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word) { g_tp_err_word = word; }
+
+static int tp_err_word_ok(void) {
+    if (!g_tp_err_word || *g_tp_err_word == 0u) return 1;
+    fprintf(stderr, "pulsar: a tensor-parallel row-lane exchange timed out on the device -- "
+                    "refusing the step (its logits are not the pair's; 4g-2)\n");
+    return 0;
+}
+
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     if (!cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands")) return 0;
+    if (!tp_err_word_ok()) return 0;
     /* L188: the stream is drained -- this is where every step reads its logits
      * back -- so the routed experts' non-finite flag is read here, once, with no
      * extra synchronisation.  A set flag fails the step by name; nothing
@@ -1823,7 +1837,7 @@ int pulsar_gpu_synchronize(void) {
     if (oob > 0)
         fprintf(stderr, "pulsar: routed expert id out of range at layer %u (%s) in a step that did not "
                         "complete -- flag cleared (PLAN 94 phase 1)\n", oob_layer, oob_arm);
-    return nf >= 0 && oob >= 0;
+    return nf >= 0 && oob >= 0 && tp_err_word_ok();
 }
 
 

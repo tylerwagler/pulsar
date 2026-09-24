@@ -104,6 +104,44 @@ static __global__ void tp_combine_sum_kernel(float *dst, const uint8_t *slab,
     }
 }
 
+/* The vocab gather's two halves (4g-2).  A head slice travels as a packed
+ * payload -- row r of this rank's `width` logits at r * width -- cut into
+ * vec-sized messages.  Each chunk's combine waits on the done word like the
+ * sum does, then scatters payload element e (chunk start elem0 + i) to row
+ * e / width, column col0 + e % width of the pitched destination; the own
+ * slice is scattered the same way with no wait.  Copies only: the assembled
+ * rows hold exactly the bytes the heads wrote. */
+static __global__ void tp_combine_scatter_kernel(float *dst, const uint8_t *slab,
+                                                 uint64_t in_off, uint64_t vec_floats,
+                                                 uint64_t first_msg, uint32_t n_slots,
+                                                 uint32_t msgs, uint64_t elem0,
+                                                 uint64_t n_elem, uint64_t width,
+                                                 uint64_t pitch, uint64_t col0,
+                                                 const uint64_t *done, uint64_t exch,
+                                                 uint32_t *err, uint64_t timeout_ns) {
+    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+    const uint64_t n = (uint64_t)msgs * vec_floats;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t e = elem0 + i;
+        if (e >= n_elem) break;
+        const uint64_t m = i / vec_floats, j = i - m * vec_floats;
+        const uint64_t slot = (first_msg + m - 1u) % n_slots;
+        const float *peer = (const float *)(slab + in_off) + slot * vec_floats;
+        const uint64_t r = e / width;
+        dst[r * pitch + col0 + (e - r * width)] = __ldcv(peer + j);
+    }
+}
+
+static __global__ void tp_scatter_cols_kernel(float *dst, const float *src, uint64_t n_elem,
+                                              uint64_t width, uint64_t pitch, uint64_t col0) {
+    for (uint64_t e = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; e < n_elem;
+         e += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t r = e / width;
+        dst[r * pitch + col0 + (e - r * width)] = src[e];
+    }
+}
+
 static unsigned tp_grid(uint64_t n) {
     const uint64_t b = (n + 255u) / 256u;
     return (unsigned)(b > 256u ? 256u : (b ? b : 1u));
@@ -137,4 +175,33 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
         (float *)dst->ptr, (const uint8_t *)slab_dev, in_off, vf, first_msg, n_slots, rows,
         (const uint64_t *)done_dev, exch, (uint32_t *)err_dev, timeout_ns);
     return cuda_ok(cudaGetLastError(), "tp combine sum launch");
+}
+
+int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
+                                  uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                                  uint32_t n_slots, uint32_t msgs, uint64_t elem0,
+                                  uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
+                                  const void *done_dev, uint64_t exch, void *err_dev,
+                                  uint64_t timeout_ns) {
+    const uint64_t vf = vec_bytes / sizeof(float);
+    const uint64_t n_elem = (uint64_t)rows * width;
+    if (!dst || !slab_dev || !done_dev || !err_dev || msgs == 0 || n_slots == 0 || vf == 0 ||
+        width == 0 || col0 + width > pitch || elem0 >= n_elem ||
+        (uint64_t)rows * pitch * sizeof(float) > dst->bytes) return 0;
+    tp_combine_scatter_kernel<<<tp_grid((uint64_t)msgs * vf), 256>>>(
+        (float *)dst->ptr, (const uint8_t *)slab_dev, in_off, vf, first_msg, n_slots, msgs,
+        elem0, n_elem, width, pitch, col0, (const uint64_t *)done_dev, exch,
+        (uint32_t *)err_dev, timeout_ns);
+    return cuda_ok(cudaGetLastError(), "tp combine scatter launch");
+}
+
+int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *src,
+                               uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0) {
+    const uint64_t n_elem = (uint64_t)rows * width;
+    if (!dst || !src || rows == 0 || width == 0 || col0 + width > pitch ||
+        n_elem * sizeof(float) > src->bytes ||
+        (uint64_t)rows * pitch * sizeof(float) > dst->bytes) return 0;
+    tp_scatter_cols_kernel<<<tp_grid(n_elem), 256>>>(
+        (float *)dst->ptr, (const float *)src->ptr, n_elem, width, pitch, col0);
+    return cuda_ok(cudaGetLastError(), "tp scatter cols launch");
 }

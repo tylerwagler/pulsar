@@ -1573,13 +1573,19 @@ typedef struct {
     /** The registered slab's device mapping, borrowed from the engine at graph
      * init beside `tp` -- what the row-lane kernels (4g-2) address. */
     void *tp_slab_dev;
+    /** The vocab gather's own-slice scratch (4g-2): this rank's packed head
+     * slice, PULSAR_SPEC_LOGITS_ROWS rows at the widest range, rounded up to
+     * whole row-lane messages so the last chunk's stage reads inside it.
+     * Allocated at graph init on a row-lane pair; NULL otherwise. */
+    pulsar_gpu_tensor *tp_vocab_own;
     /** The key the engine registered this rank's K-half weights under (4g-2
      * row-parallel splits: the shared expert's down projection), borrowed at
      * graph init; resolved as (key, parent tensor's abs_offset). */
     const void *tp_kslice_key;
     /* (key offset: pulsar_tp_kslice_key_offset below) */
     /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
-     * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
+     * by tp_vocab_split's host lane (a row-lane pair gathers on the stream and
+     * is sequenced by the lane's own message counter instead).  Every rank advances it
      * the same number of times in the same order, so the gather's seq stays in
      * lockstep -- the transport's desync guard keys on it, which is also what
      * catches a lane that ran a different number of heads on the two ranks. */
