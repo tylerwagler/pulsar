@@ -77,8 +77,7 @@ struct Schedule {
 };
 
 static int run_schedule(const std::vector<int32_t> &ids, uint32_t n_total,
-                        uint32_t oob_code, Schedule &out,
-                        uint32_t expert_lo, uint32_t expert_hi) {
+                        uint32_t oob_code, Schedule &out) {
     const uint32_t pair_count = (uint32_t)ids.size();
     CHECK(n_total > 0 && n_total <= 256, "n_total %u outside the prefix kernel's one-block range", n_total);
 
@@ -108,11 +107,9 @@ static int run_schedule(const std::vector<int32_t> &ids, uint32_t n_total,
     CUDA_OK(cudaMemcpy(sel, ids.data(), pair_count * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     const uint32_t blocks = (pair_count + 255u) / 256u;
-    moe_count_sorted_pairs_kernel<<<blocks, 256>>>(cnt + 1, sel, pair_count, n_total, oob_code,
-                                                   expert_lo, expert_hi);
+    moe_count_sorted_pairs_kernel<<<blocks, 256>>>(cnt + 1, sel, pair_count, n_total, oob_code);
     moe_prefix_sorted_pairs_kernel<<<1, 256>>>(off + 1, cur + 1, cnt + 1, n_total);
-    moe_scatter_sorted_pairs_kernel<<<blocks, 256>>>(pr + 1, cur + 1, sel, pair_count, n_total, oob_code,
-                                                     expert_lo, expert_hi);
+    moe_scatter_sorted_pairs_kernel<<<blocks, 256>>>(pr + 1, cur + 1, sel, pair_count, n_total, oob_code);
     CUDA_OK(cudaDeviceSynchronize());
 
     CUDA_OK(cudaMemcpy(cnt_h.data(), cnt, cnt_n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -146,52 +143,6 @@ static int run_schedule(const std::vector<int32_t> &ids, uint32_t n_total,
     CUDA_OK(cudaFree(cnt)); CUDA_OK(cudaFree(off)); CUDA_OK(cudaFree(cur));
     CUDA_OK(cudaFree(pr));  CUDA_OK(cudaFree(sel));
     return g_fail;
-}
-
-/* Single-rank convenience: the full range owns every pair, so the ownership
- * predicate is inert -- which is exactly what makes the non-TP path
- * byte-identical to what it was before slice 4c. */
-static int run_schedule(const std::vector<int32_t> &ids, uint32_t n_total,
-                        uint32_t oob_code, Schedule &out) {
-    return run_schedule(ids, n_total, oob_code, out, 0u, n_total);
-}
-
-/* (6) TP OWNERSHIP (slice 4c): with this rank owning [lo,hi), the schedule must
- * hold EXACTLY the pairs whose (clamped) expert is in range, each exactly once,
- * and every peer-owned expert's run must be EMPTY.  A peer-owned pair appearing
- * in a rank's partial would be summed twice by the all-reduce, which is the
- * whole correctness claim of the split. */
-static void check_owned(const char *what, const std::vector<int32_t> &ids, uint32_t n_total,
-                        uint32_t lo, uint32_t hi, const Schedule &s) {
-    const uint32_t pair_count = (uint32_t)ids.size();
-    std::vector<int> seen(pair_count, 0);
-    for (uint32_t e = 0; e < n_total; e++) {
-        if (!(e >= lo && e < hi)) {
-            CHECK(s.offsets[e] == s.offsets[e + 1],
-                  "%s: peer-owned expert %u has run [%u,%u), expected empty",
-                  what, e, s.offsets[e], s.offsets[e + 1]);
-            continue;
-        }
-        for (uint32_t p = s.offsets[e]; p < s.offsets[e + 1]; p++) {
-            if (p >= pair_count) { CHECK(false, "%s: expert %u's run reaches %u, past pair_count %u",
-                                         what, e, p, pair_count); return; }
-            const uint32_t pair = s.pairs[p];
-            CHECK(pair < pair_count, "%s: sorted_pairs[%u] = %u out of range", what, p, pair);
-            if (pair >= pair_count) continue;
-            const int32_t raw = ids[pair];
-            const uint32_t clamped = (raw < 0 || (uint32_t)raw >= n_total) ? 0u : (uint32_t)raw;
-            CHECK(clamped == e, "%s: pair %u (id %d -> expert %u) landed in expert %u's run",
-                  what, pair, raw, clamped, e);
-            seen[pair]++;
-        }
-    }
-    for (uint32_t i = 0; i < pair_count; i++) {
-        const int32_t raw = ids[i];
-        const uint32_t clamped = (raw < 0 || (uint32_t)raw >= n_total) ? 0u : (uint32_t)raw;
-        const int want = (clamped >= lo && clamped < hi) ? 1 : 0;
-        CHECK(seen[i] == want, "%s: pair %u (expert %u) appears %d times, expected %d",
-              what, i, clamped, seen[i], want);
-    }
 }
 
 /* (2) the schedule is a tiling: run e covers exactly the pairs whose clamped id
@@ -328,43 +279,6 @@ int main(void) {
         CHECK(s.counts[0] == 256, "full-width: counts[0] = %u, expected 256", s.counts[0]);
         expect_flag("full-width", 0, "grouped CUTLASS MXFP4 count", 1);
         printf("full width: id 256 at n_total 256 clamped, not written past\n");
-    }
-
-    /* TP ownership (slice 4c): rank 1 of 2 owns [3,6), rank 0 owns [0,3).  Each
-     * rank's schedule must hold exactly its own half -- and the two halves must
-     * be DISJOINT and COMPLETE, which is the property the split's correctness
-     * rests on once the all-reduce sums them. */
-    {
-        std::vector<int32_t> ids = {0, 1, 2, 3, 4, 5, 3, 5, 0, 4, 2, 1};
-        Schedule s1, s0, sf;
-        if (run_schedule(ids, n_total, moe_route_oob_code(layer, MOE_OOB_ARM_GROUPED_COUNT), s1, 3u, 6u)) return 1;
-        if (run_schedule(ids, n_total, moe_route_oob_code(layer, MOE_OOB_ARM_GROUPED_COUNT), s0, 0u, 3u)) return 1;
-        if (run_schedule(ids, n_total, moe_route_oob_code(layer, MOE_OOB_ARM_GROUPED_COUNT), sf)) return 1;
-        check_owned("owned-rank1", ids, n_total, 3u, 6u, s1);
-        check_owned("owned-rank0", ids, n_total, 0u, 3u, s0);
-        /* In-range ids only: neither rank may raise the route-bounds flag. */
-        expect_flag("owned-rank1", 0, NULL, 0);
-        expect_flag("owned-rank0", 0, NULL, 0);
-        /* Disjoint + complete: every expert's full run is the sum of the two
-         * halves', and the owned runs tile each rank's own partial. */
-        uint32_t n1 = 0, n0 = 0;
-        for (uint32_t e = 0; e < n_total; e++) {
-            const uint32_t r1 = s1.offsets[e + 1] - s1.offsets[e];
-            const uint32_t r0 = s0.offsets[e + 1] - s0.offsets[e];
-            const uint32_t rf = sf.offsets[e + 1] - sf.offsets[e];
-            CHECK(r1 + r0 == rf, "owned: expert %u's halves (%u + %u) do not sum to the full run %u",
-                  e, r1, r0, rf);
-            n1 += r1; n0 += r0;
-        }
-        CHECK(n1 + n0 == (uint32_t)ids.size(),
-              "owned: the two partials cover %u + %u pairs, expected %zu", n1, n0, ids.size());
-        uint32_t lo1 = 0;
-        for (uint32_t e = 3; e < 6; e++) {
-            CHECK(s1.offsets[e] == lo1, "owned-rank1: its owned runs do not tile [0,%u)", n1);
-            lo1 = s1.offsets[e + 1];
-        }
-        CHECK(lo1 == n1, "owned-rank1: partial run ends at %u, expected %u", lo1, n1);
-        printf("tp ownership: rank halves are disjoint and complete (%u + %u pairs)\n", n1, n0);
     }
 
     if (g_fail) { fprintf(stderr, "MOE-ROUTE-BOUNDS GATE FAIL\n"); return 1; }

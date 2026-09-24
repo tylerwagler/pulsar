@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
     auto call = [&]() {
         const int rc = pulsar_cutlass_expert_ffn_gemv_small(dout, dsel, drw, gt, ut, dt, gs, gd, ds, dd,
                                                             7.0f, n_tokens, n_expert, (unsigned)n_total,
-                                                            in, mid, out, dxq, dxs, kbp, 0u, (unsigned)n_total);
+                                                            in, mid, out, dxq, dxs, kbp);
         if (rc) { fprintf(stderr, "expert_gemv_bench: the GEMV refused (rc %d)\n", rc); exit(1); }
     };
     for (int i = 0; i < 10; i++) call();

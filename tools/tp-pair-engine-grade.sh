@@ -76,7 +76,7 @@
 #                      (the engine prints it at startup; asserted after the run
 #                      from rank*.err) -- "a tree hash is not a binary's provenance"
 #   PULSAR_TP_MIN_AVAIL_GIB  per-host MemAvailable floor before load (default 100:
-#                      ~83 GiB of owned experts at n=2 plus KV + slab)
+#                      ~83 GiB of expert halves at n=2 plus KV + slab)
 #   PULSAR_TP_DRYRUN=1 print the plan and exit without running anything
 #   PULSAR_TP_PREFLIGHT_ONLY=1  run the per-host preflight and exit
 #
@@ -285,7 +285,7 @@ for r in $(seq 0 $((N - 1))); do
     h=${RANKS[$r]}
     bad=$(ssh $SSH_ARGS -o BatchMode=yes "$h" \
           "[ -f $WORKDIR/rank$r.err ] || { echo missing; exit 0; }; \
-           grep -icE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|cannot honor expert ownership|owned-expert range refused|vocab range refused' $WORKDIR/rank$r.err" \
+           grep -icE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|vocab range refused' $WORKDIR/rank$r.err" \
           | tr -d '[:space:]')
     if [ "${bad:-missing}" = "missing" ]; then
         echo "  rank $r: no stderr file -- the rank never launched (fail closed)"
@@ -293,7 +293,7 @@ for r in $(seq 0 $((N - 1))); do
     elif [ "$bad" != "0" ]; then
         echo "  rank $r: $bad refusal/desync line(s):"
         ssh $SSH_ARGS -o BatchMode=yes "$h" \
-            "grep -iE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|cannot honor expert ownership|owned-expert range refused|vocab range refused' $WORKDIR/rank$r.err | head -5"
+            "grep -iE 'tensor parallelism bring-up failed|desync|refus|no channel to rank|vocab range refused' $WORKDIR/rank$r.err | head -5"
         fail=1
     else
         echo "  rank $r: clean"

@@ -297,7 +297,7 @@ int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
 
     /* The raw whole-graph pipeline builds its own graph with no TP transport
      * and no owned head-group span: under a pair it cannot gather the
-     * attention `low` rows, big-gate the FFN or all-reduce the owned experts,
+     * attention `low` rows, big-gate the FFN or all-reduce the expert halves,
      * and the first layer's guard refuses with a message about the GRAPH.
      * Say it here, once, by name (rule 9): generation under TP rides the
      * session lane, whose operations the group mirrors (slice 4e). */
@@ -422,12 +422,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->prefill_chunk = opt->prefill_chunk;
     /* Slice 4f (L237): the rank this process loads the model FOR, decided from
      * the options before any weight is staged -- the transport is created
-     * after the load, and on GB10 staging IS residency (a rank stages only its
-     * owned experts).  Rank 0 of 1 when the pair is off.  The transport's rank
-     * is asserted equal once it exists, so the two readers of this fact cannot
-     * disagree.  An expert overlay swaps expert stacks from a donor file and
-     * is staged by its own path, which has no ownership notion: refused under
-     * TP rather than staged whole on every rank (rule 9). */
+     * after the load, and on GB10 staging IS residency (a rank does not stage
+     * the stored expert stacks).  Rank 0 of 1 when the pair is off.  The
+     * transport's rank is asserted equal once it exists, so the two readers of
+     * this fact cannot disagree.  An expert overlay swaps expert stacks from a donor file and
+     * is staged by its own path, which has no half-expert notion: refused
+     * under TP rather than staged whole on every rank (rule 9). */
     int tp_rank_at_load = 0;
     uint32_t tp_n_ranks_at_load = 1;
     if (opt->tp_peers) {
@@ -796,7 +796,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, "
                         "routed experts as per-rank halves (%.2f GiB of stored stacks)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
-                (double)pulsar_model_peer_expert_bytes(&e->model) / 1073741824.0);
+                (double)pulsar_model_unstaged_expert_bytes(&e->model) / 1073741824.0);
     }
 
     /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
@@ -971,9 +971,9 @@ uint64_t pulsar_engine::weights_resident_bytes() {
      * runtime, which is precisely why it had to be fixed here rather than
      * noticed: the static formula is the bound that is supposed to hold when the
      * measured one reads inflated. */
-    uint64_t bytes = e->model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->model);
+    uint64_t bytes = e->model.mapped_bytes - pulsar_model_unstaged_expert_bytes(&e->model);
     if (e->dspark_ready && e->dspark_external) {
-        bytes += e->dspark_model.mapped_bytes - pulsar_model_peer_expert_bytes(&e->dspark_model);
+        bytes += e->dspark_model.mapped_bytes - pulsar_model_unstaged_expert_bytes(&e->dspark_model);
     }
     if (e->overlay_ready) bytes += e->overlay_model.mapped_bytes;
     return bytes;

@@ -127,7 +127,7 @@ typedef struct {
      *    n ranks) + tp_port.  Full-mesh; all ranks are symmetric.
      *  - legacy 2-rank: tp_role (1 = leader listens on tp_port, 2 = worker dials
      *    tp_peer:tp_port), tp_peers NULL.  tp_rank/nranks are derived (leader=0).
-     * A configured group wires EVERY TP lane (owned experts, vocab split, the
+     * A configured group wires EVERY TP lane (expert halves, vocab split, the
      * session mirror); there is no per-lane arm to select (L239 retired
      * `--tp-arm`, which had selected nothing since slice 4c). */
     int tp_role;

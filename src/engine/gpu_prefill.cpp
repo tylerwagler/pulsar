@@ -2878,12 +2878,6 @@ bool gpu_graph_encode_layer_ffn_batch(
         } \
     } while (0)
 
-    /* The range is over THIS layer's routed experts -- the count the kernel is
-     * handed below (n_expert_present), not the target table's entry for `il`.
-     * The drafter reaches this encoder with ITS OWN layer index, and a REAP'd
-     * or V4.1 layout gives the two tables different numbers; a range wider
-     * than the kernel's total is a refusal there, and one narrower silently
-     * drops experts. */
     /* L241 4g-2 expert tensor-parallel: under TP every rank runs EVERY selected
      * expert over its half of the intermediate width, from the compact
      * half-stacks built at open (tp_register_expert_half) and resolved under
@@ -2939,8 +2933,6 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                g->batch_ffn_norm,
                                                il,
                                                n_tokens,
-                                               0u,
-                                               layer->n_expert_present,
                                                g->tp ? 1u : 0u) != 0;
     }
     if (ok && g->imatrix_f32_rows) {
@@ -2991,7 +2983,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT();
 #undef PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
 
-    /* Slice 4b: with the group armed, exchange this layer's owned routed
+    /* Slice 4b: with the group armed, exchange this layer's routed
      * partial and fold the peers' in BEFORE the HC expansion below, so the layer
      * output carried into the next layer is the full routed sum.  One big gate
      * per layer for the whole chunk (amortized, not per token).  The ffn_out

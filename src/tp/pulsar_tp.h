@@ -199,21 +199,13 @@ int pulsar_tp_node_info(const pulsar_tp *tp, int rank, pulsar_tp_node *out);
  * [0,0).  Returns 1 on success, 0 on bad args.
  *
  * This is the single authority (rule 4) for "which slice does a rank own", and
- * it is deliberately generic: the routed-EXPERT split (256 experts over the
- * group) and the 4d vocab split (n_vocab over the group) are the SAME rule, so
- * they share one implementation and cannot drift.  Callers never recompute it. */
+ * it is deliberately generic: the attention output groups, the shared- and
+ * routed-expert intermediate halves and the 4d vocab split are the SAME rule,
+ * so they share one implementation and cannot drift.  Callers never recompute
+ * it. */
 int pulsar_tp_owned_range(int rank, uint32_t n_ranks, uint32_t n_total,
                           uint32_t *lo, uint32_t *hi);
 
-/* Slice 4f (L237): the BYTE span of a rank's owned slice of an expert stack
- * whose experts are stored back-to-back at `expert_bytes` each:
- * off = lo*expert_bytes, bytes = (hi-lo)*expert_bytes, from the range authority
- * above.  The loader stages ONLY these bytes, the admission budget charges ONLY
- * these bytes and the MoE dispatch resolves ONLY these bytes, so the three
- * cannot drift.  n_ranks<=1 -> the whole stack.  Returns 1 on success, 0 on
- * bad args. */
-int pulsar_tp_owned_byte_span(int rank, uint32_t n_ranks, uint32_t n_total,
-                              uint64_t expert_bytes, uint64_t *off, uint64_t *bytes);
 
 /* n-way full-mesh bring-up: connects every rank (n_ranks) to every other with
  * rank-ordered dial/accept.  opt->peers is the ordered "host:port,..." list for

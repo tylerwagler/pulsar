@@ -151,28 +151,6 @@ int main(void) {
             printf("exl3 k3: 384 [trellis,scales] pairs, %llu B/expert (trellis %llu + scales %llu)\n",
                    (unsigned long long)stride, (unsigned long long)trellis, (unsigned long long)scales);
         }
-        /* slice 4f: experts [100,200) owned; every other entry clamps to expert
-         * 100's address (both planes), so no device array names unstaged bytes */
-        {
-            const void *const *o = exl3_expert_table_owned(base, E, stride, trellis, 100, 200);
-            CHECK(o != NULL, "exl3_expert_table_owned returned NULL for a valid range");
-            if (o) {
-                std::vector<const void *> got((size_t)E * 2);
-                CHECK(cudaMemcpy(got.data(), o, got.size() * sizeof(void *), cudaMemcpyDeviceToHost) == cudaSuccess,
-                      "reading the owned EXL3 table back");
-                unsigned bad = 0;
-                for (uint32_t e = 0; e < E; e++) {
-                    const uint32_t src = (e >= 100 && e < 200) ? e : 100;
-                    const char *t0 = (const char *)base + (size_t)src * stride;
-                    if (got[2 * e] != (const void *)t0 || got[2 * e + 1] != (const void *)(t0 + trellis)) bad++;
-                }
-                CHECK(bad == 0, "owned EXL3 table: %u of %u entries wrong (peer entries must clamp to expert lo)", bad, E);
-                CHECK(o != t, "the owned table must not alias the whole-stack table");
-                printf("exl3 k3 owned [100,200): peer entries clamp to expert 100, both planes\n");
-            }
-            CHECK(exl3_expert_table_owned(base, E, stride, trellis, 200, 100) == NULL, "an inverted range must refuse");
-            CHECK(exl3_expert_table_owned(base, E, stride, trellis, 0, E + 1) == NULL, "hi > n_total must refuse");
-        }
         CHECK(exl3_expert_table(base, E, stride, 0) == NULL, "a zero split must refuse (EXL3)");
         CHECK(exl3_expert_table(base, E, stride, stride) == NULL, "a split at the stride must refuse (EXL3)");
         CHECK(exl3_expert_table(base, 0, stride, trellis) == NULL, "a zero expert count must refuse (EXL3)");

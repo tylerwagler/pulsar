@@ -118,7 +118,7 @@ bug, not a design change.
       runtime GPU/pair-gated).** Each rank now computes ONLY its owned expert
       slice — the single authority `pulsar_tp_owned_range(rank, n_ranks,
       n_total, &lo, &hi)` (floor partition `[r·n/nr, (r+1)·n/nr)`), threaded as
-      `expert_lo/expert_hi` into `pulsar_gpu_routed_moe_batch_tensor`.  The
+      an expert range into `pulsar_gpu_routed_moe_batch_tensor`.  The
       CUTLASS MXFP4 grouped arm skips peer-owned pairs in the count/scatter
       (making those groups M=0 in the grouped GEMM — no bytes, no FLOPs) with a
       sentinel `sorted_pairs` + gather guard; the small-batch GEMV arm extends
@@ -218,15 +218,30 @@ bug, not a design change.
       not open on a 121 GB Spark, pair or no pair.  Now: the model carries the
       rank it is loaded for (`pulsar_model.tp_rank/tp_n_ranks`, set from the
       options BEFORE staging), a routed-expert stack is staged only over the
-      rank's owned byte span (`pulsar_tp_owned_byte_span`, the range authority
+      rank's owned byte span (a byte-span helper over the range authority
       in bytes), the MoE dispatch requests that span and REBASES the pointer so
       `base + e*stride` is unchanged (`routed_expert_stack_ptr`), the expert
       table clamps peer-owned entries to the owned base
-      (`mxfp4_expert_table_owned`), the admission budget subtracts the
+      (an "owned" expert-table builder), the admission budget subtracts the
       peer-owned bytes, and the transport's rank is asserted equal to the
       staged rank.  `--expert-overlay` is refused under TP.  Per rank on the
       full artifact: ~10.5 GB replicated + 157.4/n GB of experts -> ~89 GB at
       n=2 (derived from the build record, to be measured).
+- **4g-2. Routed experts go tensor-parallel (L241, 2026-09-24) -- supersedes
+      the 4c/4f ownership machinery.**  Every rank holds HALF of EVERY expert
+      (`pulsar_gpu_register_mxfp4_expert_half`: gate/up by rows, down by input
+      columns, the `pulsar_tp_owned_range` split of the intermediate width) and
+      runs every selected expert over that half; the routed output is a
+      partial the FFN exchange sums.  Under TP no stored routed stack is staged
+      (`pulsar_model_unstaged_expert_bytes` is what the budget subtracts), and
+      the routed entry refuses every non-type-40 arm (`expert_split`).  The
+      expert range therefore became the whole range on every call, and the
+      cleanup commit deleted it: the expert-range parameters on every MoE
+      launcher and kernel, the count/scatter ownership predicate and the
+      `sorted_pairs` sentinel + gather guard, the GEMV `valid` range, the
+      EXL3 zero-fill, the owned (clamping) expert tables for MXFP4 and EXL3,
+      the owned byte-span helper and the 4f owned span.  The 4c/4f entries
+      above are history.
 
 ## Open items for bring-up
 - **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**
