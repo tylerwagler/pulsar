@@ -3515,6 +3515,31 @@ int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
+int pulsar_tp_send_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int stop) {
+    pulsar_tp_value_command msg = { session_id, stop ? 1 : 0, 0 };
+    return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_CHUNK_VERDICT, &msg, sizeof(msg));
+}
+
+int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
+                                 char *err, size_t errlen) {
+    if (!tp || !stop) return 0;
+    const double deadline = tp_control_deadline(tp);
+    uint32_t type = 0, bytes = 0;
+    pulsar_tp_value_command msg;
+    if ((deadline > 0.0 && !tp_wait_readable(tp->control_fd, deadline)) ||
+        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != PULSAR_TP_FRAME_CHUNK_VERDICT || bytes != sizeof(msg) ||
+        !tp_read_full(tp->control_fd, &msg, sizeof(msg)) || msg.session_id != session_id) {
+        pulsar_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp: expected the leader's chunk verdict for session %llu inside a "
+                                "mirrored prefill (frame type %u) -- the ranks' prefills are out of step",
+                   (unsigned long long)session_id, type);
+        return 0;
+    }
+    *stop = msg.value != 0;
+    return 1;
+}
+
 int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
     pulsar_tp_value_command msg = { session_id, (int32_t)pos, 0 };
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_REWIND,

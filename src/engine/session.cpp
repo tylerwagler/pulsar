@@ -1223,14 +1223,35 @@ void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
 
 
 static bool pulsar_session_cancelled(pulsar_session *s) {
-    /* Slice 4e increment 5 (L238): a MIRRORED session never cancels inside an
-     * operation.  The hook is polled at prefill chunk boundaries; a leader
-     * that stopped after k chunks would leave its workers running the full
-     * sync and waiting at a big gate the leader never joins -- a data-plane
-     * hang the control plane cannot see.  Under TP, cancellation is between
-     * operations only: the driver simply issues no further frame. */
-    if (pulsar_session_is_mirrored(s)) return false;
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    /* A MIRRORED session stops at a chunk boundary only TOGETHER (v15): a
+     * leader that stopped after k chunks alone would leave its workers running
+     * the rest of the sync, waiting at an exchange the leader never joins (the
+     * reason slice 4e disabled this hook outright -- which also froze the
+     * server's per-chunk yield: no progress published, no disconnect honoured,
+     * every other session stalled for the whole prompt).  Every rank polls at
+     * the same boundaries; the leader decides with its own hook and ships the
+     * verdict, each worker reads it here. */
+    if (!s) return false;
+    if (pulsar_session_is_mirrored(s)) {
+        pulsar_tp *tp = s->engine->tp;
+        if (pulsar_tp_rank(tp) == 0) {
+            const bool stop = s->cancel && s->cancel(s->cancel_ud);
+            if (!pulsar_tp_send_chunk_verdict(tp, s->tp_session_id, stop ? 1 : 0)) {
+                pulsar_tp_mark_failed(tp);
+                fprintf(stderr, "pulsar: tp: could not ship the chunk verdict -- stopping the prefill\n");
+                return true;
+            }
+            return stop;
+        }
+        int stop = 0;
+        char err[256];
+        if (!pulsar_tp_recv_chunk_verdict(tp, s->tp_session_id, &stop, err, sizeof(err))) {
+            fprintf(stderr, "pulsar: %s\n", err);
+            return true;
+        }
+        return stop != 0;
+    }
+    return s->cancel && s->cancel(s->cancel_ud);
 }
 
 

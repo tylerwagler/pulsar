@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 14u           /* v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 15u           /* v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -559,6 +559,17 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
                                const char *operation,
                                char *err, size_t errlen);
 int pulsar_tp_send_stop(pulsar_tp *tp);
+/* A MIRRORED prefill's chunk-boundary decision (v15).  Every rank reaches the
+ * same boundaries (identical chunk plan); the leader evaluates its own cancel
+ * hook there -- a client disconnect, or the scheduler's one-chunk yield -- and
+ * sends the verdict; each worker reads it at the same boundary and stops, or
+ * not, with it.  Both ranks therefore stop at the same row, and the next
+ * mirrored sync resumes both from there.  The worker's read is bounded by the
+ * transport timeout (the leader is at the same boundary); a missing or foreign
+ * frame fails the group. */
+int pulsar_tp_send_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int stop);
+int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
+                                 char *err, size_t errlen);
 
 /* Worker: blocks for the next mirrored command.  For FRAME_SYNC the token
  * array is returned in *tokens / *n_tokens (malloc'd, caller frees), for
@@ -640,6 +651,10 @@ typedef enum {
      * own replicated tower encodes the same bytes; nothing image-shaped is
      * gathered.  Acked like SYNC. */
     PULSAR_TP_FRAME_SYNC_MM = 40,
+    /* v15: the leader's per-chunk "stop here?" inside a mirrored prefill
+     * (pulsar_tp_send_chunk_verdict).  Read by the worker's prefill loop at the
+     * same chunk boundary, never by the command loop. */
+    PULSAR_TP_FRAME_CHUNK_VERDICT = 41,
 } pulsar_tp_frame_type;
 
 

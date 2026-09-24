@@ -336,6 +336,10 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
               "deferred: settle #3: %s", err);
         CHECK(!pulsar_tp_failed(tp), "deferred: agreement must not mark the group failed");
+        /* d. chunk verdicts (v15): the leader's per-chunk stop/continue arrive
+         * in order, read by the worker's prefill loop, not its command loop. */
+        CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 0) == 1, "verdict: send continue");
+        CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 1) == 1, "verdict: send stop");
     } else {
         pulsar_tp_command cmd;
         for (int step = 0; step < 4; step++) {
@@ -347,6 +351,13 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
                                      : pulsar_tp_send_command_ack_digest(tp, sid, 0, digest);
             CHECK(ok == 1, "deferred: worker ack step %d", step);
         }
+        int stop = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_recv_chunk_verdict(tp, sid, &stop, err, sizeof(err)) == 1 && stop == 0,
+              "verdict: worker reads continue (stop %d): %s", stop, err);
+        stop = -1;
+        CHECK(pulsar_tp_recv_chunk_verdict(tp, sid, &stop, err, sizeof(err)) == 1 && stop == 1,
+              "verdict: worker reads stop (stop %d): %s", stop, err);
     }
 }
 

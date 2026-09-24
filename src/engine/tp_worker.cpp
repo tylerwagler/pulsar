@@ -250,7 +250,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             borrowed.cap = (int)c->n_tokens;
             rc = slot->s->sync(&borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr, sizeof(ferr));
         }
-        if (rc != 0) {
+        /* INTERRUPTED is the leader's chunk verdict (v15), taken at the same
+         * boundary on both ranks: an outcome, not a refusal. */
+        if (rc != 0 && rc != PULSAR_SESSION_SYNC_INTERRUPTED) {
             fprintf(stderr, "pulsar: tp worker: sync refused: %s\n", ferr);
             worker_abort_step(e, "sync", ferr);
         }

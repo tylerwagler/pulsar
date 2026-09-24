@@ -353,7 +353,9 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
                                 int body_rc, char *err, size_t errlen) {
     char peer_err[256];
     peer_err[0] = '\0';
-    if (body_rc != 0) pulsar_tp_own_step_failed(tp, operation);
+    /* An INTERRUPTED sync stopped at a chunk verdict both ranks took: the
+     * worker answers at once, nothing to rescue. */
+    if (body_rc != 0 && body_rc != PULSAR_SESSION_SYNC_INTERRUPTED) pulsar_tp_own_step_failed(tp, operation);
     const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, operation,
                                                    peer_err, sizeof(peer_err));
     if (body_rc != 0) return body_rc;
