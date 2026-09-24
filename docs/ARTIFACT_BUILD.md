@@ -1,364 +1,104 @@
-# Reproducing a serving artifact from source weights
+# Building a serving artifact from the HF checkpoint
 
-> **2026-09-24: the pipeline this document describes is ARCHIVED.**  Tyler: "We shouldn't
-> be using gguf anywhere."  `gguf-tools/` (the header-only GGUF template builders,
-> `deepseek4-quantize`, the GGUF utilities and the safetensors lane's GGUF reader) is gone
-> from the tree and recoverable at tag `archive/gguf-tooling-2026-09-24`.  The direct
-> builder that replaces it -- HF checkpoint(s) to the served container, no GGUF -- is
-> `tools/container/` (L247); this document is rewritten when it lands.  Until then the
-> text below is history, kept for the lessons its gates recorded.
+The engine serves a safetensors container whose header declares every tensor's
+storage layout.  `tools/container/build.py` builds that container directly from
+the HF checkpoint(s): no intermediate format, no GGUF (the GGUF-era pipeline is
+archived at tag `archive/gguf-tooling-2026-09-24`; L247 replaced it).  The
+builder is pure Python (numpy for the codecs) and runs anywhere the checkpoints
+are mounted; it never needs a GPU.
 
-Written 2026-08-12 after auditing whether the shipped artifact could actually be
-rebuilt. It could not, cleanly: the format map that decides every tensor's type
-was an untracked JSON in a scratch directory, and the imatrix that drives every
-quantization decision was a 450 MB file whose only backup nobody could find
-because the NAS copy has a different name. Both are now pinned below.
+The container's tensor names are the HF checkpoint's names.  The engine reads
+exactly three metadata keys (`src/engine/safetensors.cpp`): `pulsar.kv`
+(the model hyper-parameters and the tokenizer, on the first shard),
+`pulsar.tensors` (per dense tensor: `layout`, `dims_ne`, `gguf_name`) and
+`pulsar.experts` (per routed-expert stack: layout, `expert_bytes`, count).
+It binds tensors by `gguf_name`.
 
-## ✅ VERIFIED 2026-08-12 — this recipe has been executed end to end
+## Inputs
 
-> ⚠ **THIS SECTION DESCRIBES A SUPERSEDED ARTIFACT. MEASURED 2026-09-01.**
->
-> The verification below is dated 2026-08-12 and reproduces
-> `v5mx4-0731-ltdraft.gguf`. That is not what the GB10 box serves any more.
-> Inspecting the artifact actually on `/srv/models` (`pulsar --inspect`):
->
-> | type | doc's census (2026-08-12) | served now |
-> |---|---:|---:|
-> | f32 | 536 | 430 |
-> | **f16** | **359** | **0** |
-> | **bf16** | — | **445** |
-> | mxfp8_lt | 370 | 390 |
-> | iq2_xxs_mmq | 91 | 91 |
-> | cutlass_mxfp4 | 47 | 47 |
-> | i32 | 3 | 3 |
-> | **total** | 1406 | 1406 |
->
-> The 359 F16 tensors became bf16 when L079 retired F16 weights (2026-08-16),
-> four days after this section was written — which is why
-> `src/pulsar_gpu.h` states the shipped artifact contains ZERO F16 tensors, and
-> it is right. Tensor-data size differs too (the served file is
-> 92,769,087,904 B against the 92,490,470,016 B recorded here), so
-> `b4c4ac7c…` cannot match and a mismatch is NOT a rebuild error.
->
-> **What still holds:** the pipeline, the inputs table, the stage collapse and
-> the gates below are all current — this recipe is how you build an artifact.
-> **What does not:** the sha, the census and the file size are a record of the
-> 2026-08-12 run, not a target to reproduce. Re-verifying them against a
-> current build is open release-prep work; the numbers above are an inspection
-> of the served file, not a rebuild.
+| input | what it supplies |
+|---|---|
+| `--hf DIR` | the HF checkpoint: `config.json`, the shards, the tokenizer files.  Every dense tensor, the tower, the drafter, and (without `--exl3`) the routed experts in the QAT FP4 source (I8 nibbles + E8M0 scale). |
+| `--exl3 DIR` | an exllamav3 EXL3 checkpoint (MIT; the MiaAI V4.1 quantization is public).  Its routed experts (`layers.N.ffn.experts.E.{w1,w2,w3}.{trellis,suh,svh}`) become `exl3m_k2 / k2h / k3` stacks verbatim; `--exl3-layers 5,18-22` restricts which layers, the default is every layer the checkpoint holds.  Drafter experts always come from `--hf`. |
+| `--format-map JSON` | per-tensor layout overrides (fnmatch patterns on container names; GGUF-era maps are re-keyed by `policy.rekey_format_map`).  An override that the source cannot be written in refuses. |
+| `--mxfp8-scale rederive\|verbatim` | how an FP8 dense weight's per-32 E8M0 scale is formed: `rederive` (per-32 amax; byte-identical to the archived C codec and to the served Vision-Exp artifact) or `verbatim` (the source's 128-block scale broadcast).  Default `rederive`. |
+| `--tokenizer DIR` | tokenizer files if not beside the checkpoint. |
 
-A full rebuild from the source weights was run and compared against the served
-artifact `v5mx4-0731-ltdraft.gguf`:
+## Commands
 
-    tensor data, both 92,490,470,016 bytes
-      rebuild b4c4ac7c47463b4046215975aa904603c0b63789c3e5cbb68e026413b3350523
-      served  b4c4ac7c47463b4046215975aa904603c0b63789c3e5cbb68e026413b3350523
-
-**Byte-identical.** Same 1406 tensors, same 69 KVs, same type census
-(F32 536 / MXFP8_LT 370 / F16 359 / IQ2_XXS_MMQ 91 / CUTLASS_MXFP4 47 / I32 3),
-audit gate PASS. The ONLY difference in the whole 92.5 GB file is the
-`quantize.imatrix.file` KV, which records the imatrix's PATH — `../v5mx2-build/
-routed-moe-ds4-1p5m.dat` on the served copy vs the NAS path here. That 46-byte
-string difference pushes `data_pos` one 32-byte alignment unit, which is the
-entire 32-byte file-size delta.
-
-**Fixed 2026-08-12.** The GGUF now records `quantize.imatrix.sha256` — the
-imatrix's content hash — and no longer records its path at all. A path says
-where someone's disk was; a hash says which imatrix it was. The KV is now a
-fixed 64 hex chars, so it is identical on every machine and the one remaining
-metadata divergence (and the 32-byte `data_pos` shift it caused) is gone.
-
-SHA-256 is implemented in `gguf-tools/quantize/dsq_sha256.c` to keep the quantizer
-dependency-free. It self-tests against the FIPS 180-4 vectors on first use,
-including a multi-block case, because a silently wrong hash would stamp a
-confident and meaningless identity into every artifact. It was also checked
-against this document's independently recorded value for the real 450 MB
-imatrix — `02a7c78c…` — which it reproduces exactly.
-
-Note the ordering: artifacts built before this change (including the first
-collapsed-pipeline validation run) still carry `quantize.imatrix.file`. Compare
-their metadata accordingly.
-
-**Executable form: `gguf-tools/build/rebuild_collapsed.sh`** — the whole build
-with `set -euo pipefail`. Prefer it over the prose below; a script cannot
-silently omit a stage, and four of the defects listed under §5 were exactly
-that.
-
----
-
-## 1. Inputs — what you need before you start
-
-| input | location | identity |
-|---|---|---|
-| HF source checkpoint | `/mnt/pve1-models/dsv4-flash-0731/` (NAS; **not** on any local disk) | 225 shards |
-| imatrix | `/mnt/pve1-models/ds4-quant-archive/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat` | sha256 `02a7c78c29875e4653d6ce21d8821c02161e83ed90c506bdd8d275f76d4ac97e`, 450,892,648 B |
-| format map (v5mx4, **the only one**) | `gguf-tools/prisma/v5mx4-format-map.json` | 345 MXFP8_LT / 38 CUTLASS_MXFP4 / 91 IQ2_XXS_MMQ |
-| REAP survivor map | `gguf-tools/reap/reap25-lcb50-survivors.json` | — |
-| drafter type pins | `gguf-tools/dspark_type_flags.txt` | 25 mxfp8_lt / 44 f32 / 9 cutlass_mxfp4 |
-| imatrix calib corpus | `gguf-tools/imatrix/dataset/` | `calib-diverse-ds4-v1` |
-| eval corpus (scoring only) | `gguf-tools/quality-testing/data/` | 100 cases |
-| **a known-good existing GGUF** | see the bootstrap warning below | tokenizer source |
-
-The imatrix filename on the NAS does not contain the word "imatrix". That is the
-whole reason it looked missing during the audit. It is byte-identical to what was
-sitting in `~/Projects/AI/temp/imatrix.dat`; prefer the NAS copy and verify the
-hash above.
-
-### Upstream provenance
-
-Everything in this repo derives from two external artifacts:
-
-1. **`deepseek-ai/DeepSeek-V4-Flash-DSpark`** (MIT) — the source checkpoint:
-   FP8/FP4 QAT weights plus the DSpark drafter, which rides in the same repo as
-   the `mtp.*` block rather than as a separate download.
-2. **`eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4`** — the REAP-25
-   (LiveCodeBench-50-calibrated) expert prune. The 68 GB GGUF is **not**
-   needed: its survivor map is vendored here as
-   `gguf-tools/reap/reap25-lcb50-survivors.json`. To regenerate it,
-   `gguf-tools/reap/recover_survivors.py` range-fetches only the router
-   tensors (~140 MB, not the whole file).
-
-**Regenerating the imatrix** (the IQ2 floor needs a real importance vector):
-
-```sh
-python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py   # corpus, in-tree
-./pulsar -m ARTIFACT.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out routed-moe.dat --ctx 32768
+```
+PY=/home/claude/Projects/AI/prismaquant/.venv/bin/python     # any python with numpy
+$PY tools/container/build.py plan   --hf $HF [--exl3 $EXL3]                        # seconds: shards, per-shard layout census, total bytes
+$PY tools/container/build.py emit   --hf $HF [--exl3 $EXL3] --out $DIR --all       # or --shard layers.7 / vision / top / mtp.2
+$PY tools/container/build.py verify --hf $HF [--exl3 $EXL3] --out $DIR --all       # re-produces every payload from the SOURCE and compares
+$PY tools/container/build.py audit  --out $DIR                                     # declarations and entries closed both ways
 ```
 
-A published imatrix also exists at `antirez/deepseek-v4-gguf`
-(`imatrix/…routed-moe-ds4-1p5m.dat`).
+`emit` streams: the header is fixed from the byte model before any payload is
+read, every entry is copied (native spans, EXL3 ranges) or produced straight
+into the file, and `--all` writes `model.safetensors.index.json` at the end.
+Emitting one shard at a time and moving it (`rsync` over ssh, never a stat on an
+in-flight NFS copy) is the way to build onto pve1.
 
-### Tokenizer: the bootstrap is now broken (2026-08-12)
+## The decisions (all in `tools/container/policy.py`)
 
-`build_main_template.py` still defaults to `--splice-tokenizer-from <existing ds4
-GGUF>`, copying `tokenizer.*` KVs verbatim from a prior artifact. That made a
-strict from-source rebuild impossible: each artifact needed an earlier one.
+Checked against the checkpoints' own shard headers, the whole format policy is
+five decisions; everything else keeps the source dtype (`bf16`, `f32`, `i32`):
 
-**`gguf-tools/tokenizer/build_tokenizer_kvs.py` replaces it.** It derives all
-eleven KVs from `tokenizer.json` + `tokenizer_config.json`, verified
-**byte-identical** to the live artifact (including the 2.3 MB tokens and 2.4 MB
-merges arrays):
+1. FP8 (E4M3) 2-D dense weights -> `mxfp8_lt`, the `.scale` companion folds in.
+2. Routed experts -> the expert SOURCE's layout: the QAT FP4 source -> `cutlass_mxfp4`; an EXL3 trellis names its own rate by its words-per-tile (32/40/48 -> `exl3m_k2/k2h/k3`).
+3. The drafter's `markov_w2` -> `fp8_e4m3_soa_k`, transposed k-major (L213; the one lossy-by-design row).
+4. `ffn.gate.tid2eid` I64 -> `i32` (the one dtype narrowing; every value is checked to fit).
+5. The declared shape is what the container holds: `[1, n]` -> `[n]` (the confidence head), `markov_w2` -> `[256, V]`; nothing else reshapes.
 
-    python3 gguf-tools/tokenizer/build_tokenizer_kvs.py \
-        --hf /mnt/pve1-models/dsv4-flash-0731 --out KVDIR \
-        [--verify-against REFDIR]
+A source dtype the engine has no layout for refuses.  There is no fallback
+format anywhere in the builder.
 
-Three inputs are **not derivable** from any HF file and live in the repo as
-explicit constants — they are our decisions, not borrowed artifact bytes:
+## Modules
 
-| input | where | why not derivable |
+| file | role | proven by |
 |---|---|---|
-| `tokenizer.ggml.pre` = `joyai-llm` | `build_tokenizer_kvs.py` | llama.cpp pretokenizer id; a classification |
-| chat template | `gguf-tools/tokenizer/chat_template.jinja` | checkpoint ships the format as Python (`encoding/encoding_dsv4.py`), not Jinja |
-| 6 `USER_DEFINED` tokens | `build_tokenizer_kvs.py` | hand-curated; HF's `special` flag gives 1230/53, not the required 1277/6 |
+| `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw`, `config` with `text_config` merged), `Exl3Checkpoint` (`layers`, `expert(layer, e, part, k, n)` with every refusal the format allows) | used by every test below |
+| `names.py` | HF name -> container entry (`Mapped`: container name, `gguf_name`, family, shard, expert/part, `emit`); `ModelShape.from_config`; the shard plan | `test_names.py` |
+| `policy.py` | the five decisions: `layout_for`, `declared_shape`, `rekey_format_map` | `test_names.py` |
+| `kv.py` | the `pulsar.kv` block from `config.json` + tokenizer files, in the engine's spelling | `test_kv.py` |
+| `producers.py` | the codecs, bytes in / bytes out: `mxfp8_lt`, `cutlass_mxfp4`, `fp8_e4m3_soa_k_from_bf16`, `i64_to_i32`, `native`, `bytes_for` (== `st_bytes_for` / `routed_expert_side_layout`) | `test_producers.py` |
+| `build.py` | plan / emit / verify / audit | the shard comparison below |
 
-That last one is not cosmetic. `<think>`, `</think>` and the DSML markers must be
-USER_DEFINED (4), not CONTROL (3), because CONTROL tokens are skipped during
-detokenization — mark them wrong and the model's reasoning output and tool calls
-are silently swallowed, with every other gate still green.
+## The instrument
 
-**Always run `--verify-against` when the tokenizer path changes.** A tokenizer
-that is merely close yields an artifact that loads, generates, and mis-tokenizes;
-nothing else here catches that.
+The oracle is the served Vision-Exp artifact `/mnt/models/DeepSeek-v4-Flash`,
+which the archived lane built from the same HF checkpoint.  The builder must
+reproduce it, and the comparison is entry-for-entry, not file-for-file: payload
+bytes by tensor name, declarations (dtype/shape), and the three `pulsar.*`
+blocks.  Result on 2026-09-24 (L247): every one of the 36,909 dense entries and
+every expert stack byte-identical, with three header differences decided
+against the old spelling because the engine is the authority for each:
 
-⚠ **Still to do:** wire this into `build_main_template.py` so splicing is no
-longer the default. Needs a full template build to verify; not yet run. Until
-then, if you do splice: never proceed past a template build whose log does not
-show >0 spliced tokenizer KVs and an MB-scale file size.
+- native layouts are declared by their dtype name (`bf16`/`f32`/`i32`), the loader's own name table; the lane wrote `native`;
+- the seven GGUF bookkeeping keys (`general.file_type`, `general.quantization_version`, `deepseek4.expert_gating_func`, `quantize.imatrix.*`) are not written -- nothing in `src/` reads them;
+- entry order inside a shard follows the HF walk; the loader parses entries in any order.
 
-## 2. Pipeline
+The header comparison is not optional: it found two declarations the engine
+would have refused at load (the confidence head's rank, the k-major
+`markov_w2` dims) while every payload byte already matched.  `test_names.py`
+grades `dims_ne` against the served artifact for that reason.
 
-**Reproducing an artifact does NOT re-run the probe/cost/allocator stages.** Those
-MEASURE, and re-measuring yields a new map — a different (also valid) exercise.
-A reproduction uses the pinned `v5mx4-format-map.json` from §1. Re-derivation is:
+The tests need numpy:
 
-    HF checkpoint -> sensitivity_probe.py -> measure_quant_cost.py
-                  -> PrismaQuant allocator.py -> map
-    (CACHE_HEADROOM_GB=90 REQUIRED for probe AND cost, or autoscale takes an
-     ~86 GB layer cache and earlyoom kills the run, exit 137)
+```
+cd tools/container && for t in test_names.py test_kv.py test_producers.py; do $PY $t | tail -1; done
+```
 
-The allocator is UPSTREAM PrismaQuant, not anything in this repo, and the two
-expensive stages do not need re-running: the 0731 probe/cost pickles survive at
-`/mnt/pve1-models/prisma-0731-run/` and still validate against PrismaQuant
-v0.11. Full provenance -- producing branch, invocation, why 7 layers are mixed,
-and a v0.11 cross-check that reproduces 127/129 allocation units -- is in
-`gguf-tools/prisma/README.md`.
+## What the artifact directory holds
 
-The build proper, given a map — run it with
-`gguf-tools/build/rebuild_collapsed.sh`:
+`model-NNNNN-of-MMMMM.safetensors` (shard 1 = the vision tower, then one per
+layer, `top`, one per drafter layer), `model.safetensors.index.json`, and
+`config.json` copied from the source for provenance.  The engine needs only
+the shards: the tokenizer rides in `pulsar.kv`.
 
-    1. build_main_template.py --hf DIR --out T.gguf --tokenizer-from-hf      5 MB
-         --reap-survivors SURV     -> REAP-SHAPED template (expert dim 192,
-                                      router/bias still 256)
-    2. deepseek4-quantize --hf DIR --template T.gguf --out COMPACT          81.5 GB
-         --format-map MAP-MMQ --reap-survivors SURV [--imatrix ...] --threads N
-         -> pruned AND pre-formatted in one pass
-    3. build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
+## Known limits (2026-09-24)
 
-...and that is the whole build. Step 2 takes `--dspark-template` too, so one
-quantizer pass emits main + drafter, pruned and pre-formatted, straight to the
-92.5 GB artifact.
-
-**Three stages collapsed into the quantizer on 2026-08-12** (see §Collapse
-below): the REAP transplant → `--reap-survivors`, `merge_dspark_gguf.py` →
-`--dspark-template`, and `repack_iq2_mmq.py` → a format map naming
-`IQ2_XXS_MMQ`. The 102 GB full-256 intermediate is gone entirely.
-
-**Cost.** ~92.5 GB written for a 92.5 GB artifact (1.0x amplification, was
-4.1x). There are no full-size intermediates left, so nothing has to be deleted
-mid-run. The old staged script was deleted along with the passes it drove.
-
-**Every stage here fails silently if skipped.** That is why they were collapsed
-rather than documented harder: the drafter shipped 0.43 GiB of double-store for
-months because a repack was never run, and skipping the REAP stage produces an
-unpruned artifact ~16 GB too large with nothing going red. Prefer fewer stages
-over better discipline.
-
-### Collapse: why the order was forced
-
-REAP had to collapse **first**, and that is not a preference:
-
-- the old REAP transplant was a post-quantize pass that re-sliced whole tensors, so
-  it needs block geometry for every type in the file. Pointing the old pipeline
-  at an MMQ format map died with `KeyError: 43` in `tbytes()` — the repack stage
-  ran *after* trim, but trim had to parse the type trim itself never emits.
-- With REAP inside the quantizer there is no post-pass left to trip over, so
-  MMQ became emittable in the same step. The transplant script was deleted
-  rather than taught about type 43, so the broken ordering cannot be re-entered;
-  git history is the record.
-
-Both collapses were verified byte-exact against the shipped v5mx4 artifact
-*before* replacing the staged script, using `--compare-tensor`:
-
-| check | tensor | result |
-|---|---|---|
-| REAP router permutation | `blk.5.ffn_gate_inp.weight` (f16) | byte-identical |
-| REAP bias sentinels | `blk.5.exp_probs_b.bias` (f32) | byte-identical |
-| REAP policy-1 control | `blk.0.ffn_gate_inp.weight` | byte-identical (untouched) |
-| REAP expert remap | `blk.5.ffn_gate_exps.weight` (cutlass_mxfp4, 855 MB) | byte-identical |
-| REAP + imatrix-by-original-id | `blk.12.ffn_down_exps.weight` (iq2_xxs, 415 MB) | byte-identical |
-| MMQ collapse | `blk.12.ffn_down_exps.weight` type 43 | == `repack(type 39)` |
-| merge collapse, drafter experts | `dspark.0.ffn_gate_exps.weight` (1.14 GB) | byte-identical |
-| merge collapse, drafter dense | `dspark.main_norm.weight`, `dspark.0.hc_attn_fn.weight` | byte-identical |
-| merge collapse, main unaffected | `blk.5.ffn_gate_inp.weight` | byte-identical |
-
-The fully-collapsed plan also reproduces the shipped artifact's shape exactly
-before a single byte is quantized: 1406 tensors and `approx_file_bytes`
-92,495,809,696, both matching the served copy.
-
-**The template is bound to its survivor map by hash.** `build_main_template.py
---reap-survivors` stamps `reap.survivors.sha256`, and the quantizer refuses any
-map that does not match it. This closes a hole the shape checks could not see:
-the `reap.*` KVs carry only per-layer counts and policies, so two maps keeping
-the same *number* of experts per layer — but different ones — shape a
-byte-identical template, pass the expert-count cross-check, and route every
-token to a different expert. The artifact loads, generates, and is quietly
-wrong. Verified by building a map that swaps one survivor in layer 5 while
-keeping `keep_count` and `policy` identical: the old checks accept it, the hash
-refuses it and prints both digests. A template built before this change is
-rejected with an instruction to rebuild rather than silently trusted.
-
-**The drafter carries its own `dspark.N.ffn_*_exps` stacks**, and those N
-collide with main layer indices. Handing the REAP survivor map down to them
-would trim them against an unrelated layer's policy. It is harmless *today*
-only because dspark's layers 0-2 land on the three policy-1 (untouched) layers
-— luck, not design — so `generate_tensor` cuts REAP off by name for anything
-under `dspark.`. Without that, changing the survivor map would silently corrupt
-the drafter's experts.
-
-Layers 5 and 12 were chosen because their survivor lists deviate from identity
-at slot 0 and 1 respectively and run out to source experts 254/255 — an identity
-bug cannot pass there by luck. The negative control matters as much as the
-checks: re-running the router comparison **without** `--reap-survivors` fails at
-byte 0 with 2,038,329 mismatches, which is what proves the passing runs are
-testing anything at all.
-
-**`fnv1a64_bytes()` in `dsq_gguf_io.c` is not standard FNV-1a** — its offset
-basis is `1469598103934665603`, one digit short of the real
-`14695981039346656037`. It is a self-consistent checksum used only for
-diagnostics, and `--compare-tensor`'s OK/FAIL verdict comes from an actual
-bytewise comparison rather than the hash, so no result is affected. It does mean
-these hashes cannot be cross-checked against any external FNV implementation
-without reproducing the typo.
-
-`CACHE_HEADROOM_GB=90` must be set explicitly for the probe and cost stages or
-autoscale grabs an ~86 GB layer cache and earlyoom kills the run (exit 137).
-
-The DSpark drafter always ships **inside** the checkpoint as the `mtp.*` weight
-block (4,705 tensors) — there is no separate drafter repo or file. Check the
-weight index, not filenames.
-
-**Drafter-only fixes rerun step 2 with the fixed drafter template.** The old
-`merge_dspark_gguf.py`/`unmerge_dspark_gguf.py` shortcut (unmerge + fix +
-re-merge without touching the main region) was deleted 2026-08-19 along with
-the standalone merge step it belonged to; the quantizer's `--dspark-template`
-pass is the only supported way to combine main + drafter now. It preserves
-the main region byte-for-byte just the same, so the cost of a drafter fix is
-one quantizer pass, not a from-scratch rebuild.
-
-### EXL3 routed experts (L245)
-
-The container also carries routed experts in exllamav3's trellis format
-(layouts `exl3m_k2` / `exl3m_k2h` / `exl3m_k3`, one id per rate, the mul1
-codebook pinned by the name): one contiguous `[trellis | suh | svh]` slice per
-expert, the trellis words verbatim.  They enter through the lane, not the
-quantizer: `safetensors_lane.py emit --gguf G --out DIR --all --exl3-experts
-EXL3_DIR [--exl3-layers 5,18-22]` sources those layers' routed experts from an
-EXL3 checkpoint's HF shards (the public Mia-AiLab V4.1 build, or a shard our
-own driver wrote with exllamav3's `quantize_exl3`) and everything else from the
-GGUF as before; gate/up must share one rate per layer, down may differ.  The
-byte model is `src/engine/exl3_trellis.h` (`exl3_expert_layout`), the engine
-re-derives `expert_bytes` from it at load and refuses a stack that disagrees,
-and `verify` checks those experts against the EXL3 shards.  Fidelity is graded
-like any other quant: the reference gate against the B300 capture, never argued
-from the bit rate.  Kernel: the EXL3 arm (`src/cuda/mmq/ds4_exl3_gemv.cu`,
-`routed_moe_launch_exl3`) runs every row; the announce line names it.
-
-## 3. Gates before anything is served
-
-Run all of these. Each one has caught a real defect:
-
-- **Tensor census** — 0 mismatches against the expected manifest.
-- **Tokenizer KVs** — >0 spliced, MB-scale template (see the bootstrap warning).
-- **Drafter type parity** — diff against `dspark_type_flags.txt` must be 0. A
-  drafter built with plain quantizer defaults once came out 60 tensors different
-  and refused to load (`dspark.main_norm.weight has type bf16, expected f32`).
-- **`gguf-tools/audit_artifact_types.py MODEL.gguf`** — fails if any tensor ships
-  a plain type that has a pre-formatted twin (16 -> 42/43, 38 -> 41, 39 -> 40).
-  These are never *incorrect*, so nothing else catches them; the drafter shipped
-  0.429 GiB of avoidable double-store this way for months.
-- **Generation smoke** — load, generate, check a known answer. Do not leave a
-  model swap before a health check AND a real generation have returned.
-
-## 5. What executing it caught that reading it did not
-
-Every one of these was present in the first written version of this document and
-invisible until the pipeline was actually run. They are listed because they are
-the argument for the script over the prose.
-
-1. **The REAP stage was missing entirely.** Following the doc produced an
-   unpruned 256-expert artifact ~16 GB too large, with no gate to say so.
-2. **The drafter type flags were attached to the wrong tool.**
-   `dspark_type_flags.txt` holds `--tensor-type` overrides for the QUANTIZER;
-   the doc hung them on `build_dspark_template.py`, which does not take them.
-   Building the drafter with default types is the 2026-08-01
-   `has type bf16, expected f32` load failure.
-3. **The Python environment never migrated off the decommissioned LXC.**
-   the REAP transplant died on `ModuleNotFoundError: numpy` at the first stage. The
-   tools need `/home/claude/.venvs/pulsar-quant`, not system python3.
-4. **Disk sequencing needed two deletion points, not one.** Dropping only the
-   102 GB intermediate still left compact + drafter + merged + final = 277 GB on
-   a 296 GB disk, which hit ENOSPC partway through the final copy.
-
-## 4. Known reproduction gaps
-
-- No one has completed a full source-to-artifact rebuild against this document.
-  Until that happens, §2 is reconstructed rather than verified.
-- The tokenizer bootstrap (§1) means "from source weights alone" is not strictly
-  achievable today. Removing it needs an HF-tokenizer converter.
-- `~/Projects/ds4-quant/` (the decommissioned LXC rescue: legacy monolith, quant
-  recipes, mse baselines) is a git repo with **no remote**, on one disk. Its
-  `gguf-tools/` is a 2026-07-02 snapshot and must not be used to build —
-  see [`ds4-quant-lxc`] in memory and the MANIFEST in that repo.
+- V4.1's tower lacks `image_pad`, which `weights.cpp` requires when a tower is present; loading a V4.1 artifact with its tower is an engine question (L247), not a builder one -- the builder emits what the checkpoint has.
+- Engram (V4.1) row tables stay side files (L242); `wkv/q/k` are ordinary layer-shard tensors.
+- No IQ2 producer: the type-44 permutation lived in the archived `repack_iq2_mmq.py`; an IQ2 row in a format map is reported and refused.
