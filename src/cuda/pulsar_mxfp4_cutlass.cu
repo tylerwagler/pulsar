@@ -739,7 +739,12 @@ __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsi
   return m;
 }
 
-template <class SFL, bool EMIT_E4M3>
+/* MAXR: the most deduplicated rows one CTA carries.  The one-row decode
+ * launch instantiates MAXR = 1 -- the per-row accumulators, results and
+ * owners shrink from 8 to 1, which is what bought back the occupancy (80 ->
+ * fewer registers) and room for a deeper prefetch; every other launch keeps
+ * GEMV_DEDUPE_MAX.  Arithmetic is identical for every r either way. */
+template <class SFL, bool EMIT_E4M3, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
     uint8_t *midq,            // [n_slots, N] E4M3 out            (EMIT_E4M3)
@@ -754,7 +759,8 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     int n_expert, unsigned n_total, unsigned n_slots, int K, int N,
     unsigned expert_lo, unsigned expert_hi) {
   __shared__ float lut[16];
-  __shared__ float vblk[GEMV_DEDUPE_MAX][32];
+  __shared__ float vblk[MAXR][32];
+  constexpr int PF = GEMV_PREFETCH;
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
   __syncthreads();
   const int slot = (int)blockIdx.y;
@@ -768,6 +774,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   int owned[GEMV_DEDUPE_MAX];
   const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
   if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
+  if (m > MAXR) __trap();              /* launch contract: MAXR = 1 only for one-row steps */
   /* the table is indexed only when `valid`: an id past n_total must not
    * reach it (PLAN 94 phase 1's route-bounds rule, enforced at the producer). */
   const uint8_t *ge = valid ? gate_tab[e] : nullptr;
@@ -775,32 +782,41 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   for (int i = 0; i < 4; i++) {
     const int n = n0 + i * 8 + warp;
     if (n >= N) break;                 /* N % 8 == 0: uniform across the CTA */
-    float v[GEMV_DEDUPE_MAX];
+    float v[MAXR];
     #pragma unroll
-    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) v[r] = 0.f;   /* an invalid expert contributes zero */
+    for (int r = 0; r < MAXR; r++) v[r] = 0.f;   /* an invalid expert contributes zero */
     if (valid) {
       const uint8_t *gd = ge + (size_t)n * (K / 2);
       const uint8_t *ud = ue + (size_t)n * (K / 2);
       const uint8_t *gsf = ge + data_bytes;
       const uint8_t *usf = ue + data_bytes;
-      float g[GEMV_DEDUPE_MAX], u[GEMV_DEDUPE_MAX];
+      float g[MAXR], u[MAXR];
       #pragma unroll
-      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) { g[r] = 0.f; u[r] = 0.f; }
-      for (int kc = lane * 8; kc < K; kc += GEMV_PREFETCH * 32 * 8) {
-      uint32_t pwg[GEMV_PREFETCH], pwu[GEMV_PREFETCH];
-      uint8_t psg[GEMV_PREFETCH], psu[GEMV_PREFETCH];
+      for (int r = 0; r < MAXR; r++) { g[r] = 0.f; u[r] = 0.f; }
+      for (int kc = lane * 8; kc < K; kc += PF * 32 * 8) {
+      uint32_t pwg[PF], pwu[PF];
+      uint8_t psg[PF], psu[PF];
+      /* one row: the activation bytes and scale join the prefetch batch too
+       * (the loop below would otherwise stall on each chunk's L1 hit) */
+      uint2 pxw[MAXR == 1 ? PF : 1];
+      uint8_t pxs[MAXR == 1 ? PF : 1];
       #pragma unroll
-      for (int c = 0; c < GEMV_PREFETCH; c++) {
+      for (int c = 0; c < PF; c++) {
         const int k0 = kc + c * 32 * 8;
         if (k0 < K) {
           pwg[c] = *(const uint32_t *)(gd + (k0 >> 1));
           pwu[c] = *(const uint32_t *)(ud + (k0 >> 1));
           psg[c] = gsf[sfl(n, k0 & ~31, 0)];
           psu[c] = usf[sfl(n, k0 & ~31, 0)];
+          if constexpr (MAXR == 1) {
+            const int xrow = owned[0] / n_expert;
+            pxw[c] = *(const uint2 *)(xq8 + (size_t)xrow * K + k0);
+            pxs[c] = xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)];
+          }
         }
       }
       #pragma unroll
-      for (int c = 0; c < GEMV_PREFETCH; c++) {
+      for (int c = 0; c < PF; c++) {
         const int k0 = kc + c * 32 * 8;
         if (k0 >= K) break;
         /* the expert's bytes: once per k chunk for every owned row */
@@ -809,14 +825,25 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
         const float sg = gemv_sf_val(psg[c]);
         const float su = gemv_sf_val(psu[c]);
         #pragma unroll
-        for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+        for (int r = 0; r < MAXR; r++) {
           if (r < m) {
             const int xrow = owned[r] / n_expert;
             const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
-            const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
+            float sa;
+            uint2 xw;
+            if constexpr (MAXR == 1) {
+              sa = gemv_sf_val(pxs[c]);
+              xw = pxw[c];
+            } else {
+              sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
+              /* the chunk's 8 activation bytes in ONE load (k0 % 8 == 0), the
+               * same values the per-byte loads returned */
+              xw = *(const uint2 *)(xt8 + k0);
+            }
+            const __nv_fp8_e4m3 *xb = (const __nv_fp8_e4m3 *)&xw;
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-              const float xv = __half2float((__half)xt8[k0 + j]) * sa;
+              const float xv = __half2float((__half)xb[j]) * sa;
               g[r] += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
               u[r] += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
             }
@@ -825,7 +852,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
       }
       }   /* the k-chunk group */
       #pragma unroll
-      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+      for (int r = 0; r < MAXR; r++) {
         if (r < m) {
           for (int sh = 16; sh > 0; sh >>= 1) {
             g[r] += __shfl_xor_sync(0xffffffffu, g[r], sh);
@@ -843,7 +870,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
       }
     }
     #pragma unroll
-    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+    for (int r = 0; r < MAXR; r++) {
       if (r < m && lane == 0) {
         if constexpr (EMIT_E4M3) vblk[r][n - n0] = v[r];
         else                     mid[(size_t)owned[r] * N + n] = v[r];
@@ -1036,7 +1063,15 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   }
   {
     dim3 g((unsigned)(mid_dim / 32), n_slots);
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+    if (n_tokens == 1)
+      expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 1><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi);
+    else
+      expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
         nullptr, midq8, midsf, mid_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
         gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,

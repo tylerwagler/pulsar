@@ -449,6 +449,13 @@ tests/moe_route_bounds_gate: tests/moe_route_bounds_gate.cu Makefile \
 # the type-44 layout against the shipped artifact's OWN tensor size.  A wrong
 # expert address looks like fluent text, which is why this is a gate and not a
 # comment (plan s4.1).
+# L241 4g-2: the routed-expert decode GEMV microbenchmark -- the pair's
+# production shape (every expert at half the intermediate width, 6 slots) on
+# one GPU, where ncu can profile it.  Prints us/call, GB/s and an output
+# checksum (a bit-exact kernel change must keep it).  Not a gate.
+tests/expert_gemv_bench: tests/expert_gemv_bench.cu $(CUTLASS_CUDA_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -Isrc -Isrc/cuda -o $@ $< $(CUTLASS_CUDA_OBJS) $(CUDA_LDLIBS)
+
 tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
                          src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h \
                          src/engine/exl3_trellis.h
