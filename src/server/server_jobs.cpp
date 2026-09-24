@@ -2129,8 +2129,14 @@ void server::generate_job_step(session_slot *sl) {
      * mode / when already live. Finding 1: fail the request on a failed spill
      * restore rather than run engine work against the wrong bank's KV. */
     if (!s->bank_switch(sl->bank)) {
-        snprintf(g->err, sizeof g->err,
-                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        /* The FIRST error wins: a slot already finishing on an error (a
+         * refused forward, a failed tensor-parallel step -- after which every
+         * bank switch refuses too) must report that cause, not this echo of
+         * it.  Overwriting it here hid the pair's real refusal behind "bank 0
+         * state restore failed" (L241). */
+        if (!g->err[0])
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         g->finish = "error";
         if (g->phase == GEN_FINISH) {
             /* Already finishing and the restore STILL fails: run the finish
