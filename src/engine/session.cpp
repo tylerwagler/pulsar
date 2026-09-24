@@ -747,6 +747,23 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
         if (opt->tp_spill_dir && opt->tp_spill_dir[0]) e->tp_spill_dir = pulsar_strdup(opt->tp_spill_dir);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
+        /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
+         * GPU-direct through a buffer of out | in[0] | in[1], each one prefill
+         * chunk of f32 rows; attach registers it beside the slab.  A chunk
+         * larger than that is cut by tp_allreduce_rows. */
+        if (pulsar_tp_is_rdma(e->tp) && pulsar_tp_n_ranks(e->tp) == 2) {
+            const uint64_t rows = e->prefill_chunk ? e->prefill_chunk : PULSAR_PREFILL_CHUNK_DEFAULT;
+            e->tp_bulk_bytes = 3u * rows * (uint64_t)PULSAR_N_EMBD * sizeof(float);
+            if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_bulk_bytes, &e->tp_bulk_base, tperr, sizeof(tperr)) ||
+                !(e->tp_bulk_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_bulk_base, tperr, sizeof(tperr)))) {
+                fprintf(stderr, "pulsar: tensor parallelism bulk buffer (%llu bytes) setup failed: %s\n",
+                        (unsigned long long)e->tp_bulk_bytes, tperr);
+                e->destroy();
+                *out = NULL;
+                return 1;
+            }
+            pulsar_tp_set_bulk(e->tp, e->tp_bulk_base, e->tp_bulk_bytes);
+        }
         if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_slab_bytes,
                                               &e->tp_slab_base,
                                               tperr, sizeof(tperr)) ||
@@ -1000,6 +1017,12 @@ void pulsar_engine::destroy() {
         e->tp_slab_dev = NULL;
         e->tp_slab_bytes = 0;
     }
+    if (e->tp_bulk_base) {   /* after pulsar_tp_free deregistered it */
+        pulsar_tp_gpu_slab_free_hostpin(e->tp_bulk_base);
+        e->tp_bulk_base = NULL;
+        e->tp_bulk_dev = NULL;
+        e->tp_bulk_bytes = 0;
+    }
     weights_free(&e->weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
@@ -1076,6 +1099,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp_group_lo = e->tp_group_lo;
     s->graph.tp_group_hi = e->tp_group_hi;
     s->graph.tp_slab_dev = e->tp_slab_dev;
+    s->graph.tp_bulk_dev = e->tp_bulk_dev;
     s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
     if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
         gpu_graph_free(&s->graph);

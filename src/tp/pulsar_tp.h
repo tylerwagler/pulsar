@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 13u           /* v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 14u           /* v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -346,6 +346,29 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
 /* At a host sync point (the stream is drained): 1 when every enqueued
  * exchange completed cleanly, 0 (refused by name) otherwise. */
 int pulsar_tp_row_lane_check(pulsar_tp *tp);
+
+/* THE BULK LANE (v14): prefill-sized exchanges on the row lane's machinery.
+ * The engine attaches a caller-owned, host-pinned, GPU-mapped buffer BEFORE
+ * pulsar_tp_attach_slab (pulsar_tp_set_bulk); attach registers it and brings up
+ * a second UC QP whose receive queue holds only zero-length imm receives, so
+ * bulk traffic never mixes with the gates' 16 KB receives.  Laid out
+ * out | in[0] | in[1], each cap_bytes (a multiple of vec_bytes).  Per exchange:
+ * the GPU stages its rows into `out`, publishes {exch, bytes, BULK|buf} on the
+ * row lane's descriptor (the same exchange numbering), the proxy RDMA-writes
+ * `out` into the PEER's in[buf] (the last write WITH_IMM = the exchange id),
+ * and the combine adds in[buf] once `done` reaches the exchange.  Receive
+ * buffers alternate per bulk exchange: the peer can only be one exchange ahead,
+ * so the buffer it writes next is never the one being read.  A payload larger
+ * than cap_bytes is the caller's to cut. */
+typedef struct { uint64_t cap_bytes, out_off, in_off[2]; } pulsar_tp_bulk_layout_t;
+void pulsar_tp_set_bulk(pulsar_tp *tp, void *base, uint64_t bytes);
+bool pulsar_tp_bulk_lane(const pulsar_tp *tp);
+void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out);
+/* Number one bulk exchange of `bytes` (<= cap): *exch on the row lane's
+ * sequence, *buf the receive buffer it lands in.  0 = refused (printed). */
+int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf);
+/* The row-lane descriptor's bulk flag (word 2; low bit = buffer). */
+#define PULSAR_TP_DESC_BULK_FLAG (UINT64_C(1) << 63)
 
 /* Verify-block batch gate: exchange `rows` (<= PULSAR_TP_BATCH_MAX_ROWS) row
  * partials for one layer in one bulk transfer.  Returns 0 on failure. */

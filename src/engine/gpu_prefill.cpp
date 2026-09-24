@@ -2485,6 +2485,40 @@ static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_token
         if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
         return ok;
     }
+    /* Prefill-sized exchanges on a pair ride the BULK LANE (v14): the same
+     * stream-enqueued stage / publish / combine, but the rows go GPU-direct
+     * through the registered bulk buffer and cross as RDMA writes on the
+     * second QP -- no host copy, no handshake.  A payload larger than one
+     * bulk buffer is cut into buffer-sized row runs, each its own exchange.
+     * The combine is the all-reduce's own + peer add -- bit-identical to the
+     * host big gate below, which remains the lane for transports with no bulk
+     * buffer (TCP). */
+    if (n_tokens > PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_bulk_lane(g->tp) && g->tp_slab_dev && g->tp_bulk_dev) {
+        pulsar_tp_row_lane_layout_t L;
+        pulsar_tp_row_lane_layout(g->tp, &L);
+        pulsar_tp_bulk_layout_t BL;
+        pulsar_tp_bulk_layout(g->tp, &BL);
+        uint8_t *slab = (uint8_t *)g->tp_slab_dev;
+        uint8_t *bulk = (uint8_t *)g->tp_bulk_dev;
+        const uint64_t row_bytes = (uint64_t)PULSAR_N_EMBD * sizeof(float);
+        const uint64_t piece_rows = BL.cap_bytes / row_bytes;
+        bool ok = piece_rows > 0;
+        for (uint64_t r0 = 0; ok && r0 < n_tokens; r0 += piece_rows) {
+            const uint64_t rows = n_tokens - r0 < piece_rows ? n_tokens - r0 : piece_rows;
+            const uint64_t off = r0 * row_bytes, len = rows * row_bytes;
+            uint64_t exch = 0;
+            uint32_t buf = 0;
+            ok = pulsar_tp_bulk_begin(g->tp, len, &exch, &buf) != 0 &&
+                 pulsar_gpu_tp_bulk_stage(t, off, bulk + BL.out_off, len) != 0 &&
+                 pulsar_gpu_tp_publish_bulk(slab + L.desc_off, exch, len,
+                                            PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
+                 pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.in_off[buf], len, slab + L.done_off,
+                                                exch, slab + L.err_off, L.timeout_ns) != 0;
+        }
+        if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
+                         il, what, n_tokens);
+        return ok;
+    }
     /* Two staging shapes, chosen by ROW COUNT because that is the slab's sizing
      * boundary rather than a semantic variant (so nothing selects it by flag):
      *

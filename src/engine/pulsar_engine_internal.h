@@ -1573,6 +1573,8 @@ typedef struct {
     /** The registered slab's device mapping, borrowed from the engine at graph
      * init beside `tp` -- what the row-lane kernels (4g-2) address. */
     void *tp_slab_dev;
+    /** The bulk lane's buffer, device mapping (v14), borrowed the same way. */
+    void *tp_bulk_dev;
     /** The vocab gather's own-slice scratch (4g-2): this rank's packed head
      * slice, PULSAR_SPEC_LOGITS_ROWS rows at the widest range, rounded up to
      * whole row-lane messages so the last chunk's stage reads inside it.
@@ -1787,6 +1789,9 @@ struct pulsar_engine {
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
+    void *tp_bulk_base;         ///< the bulk lane's buffer (host-pinned, v14), or NULL
+    void *tp_bulk_dev;          ///< its device mapping (bulk stage/combine), or NULL
+    uint64_t tp_bulk_bytes;
     size_t tp_slab_bytes;       ///< slab size in bytes
     /** Slice 4g (L241): the attention OUTPUT GROUPS this rank owns,
      * [tp_group_lo, tp_group_hi) of PULSAR_N_OUT_GROUP, from the range

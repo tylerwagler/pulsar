@@ -2466,5 +2466,15 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
  * experts' flags: a set word fails the step there, by name, before any logits
  * the drained work produced are read back.  NULL disarms. */
 void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
+/* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
+ * `src` from src_off into the mapped bulk out-region (stream-ordered copy),
+ * publish the descriptor {exch, bytes, word2 = bulk flag | buffer}, and combine
+ * dst[off..] += the peer's rows in the mapped receive buffer once done >= exch. */
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, uint64_t src_off, void *dst_dev,
+                             uint64_t bytes);
+int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2);
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *peer_dev,
+                                   uint64_t bytes, const void *done_dev, uint64_t exch,
+                                   void *err_dev, uint64_t timeout_ns);
 
 #endif

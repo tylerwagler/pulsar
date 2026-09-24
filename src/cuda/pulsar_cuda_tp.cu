@@ -148,6 +148,27 @@ static __global__ void tp_scatter_cols_kernel(float *dst, const float *src, uint
     }
 }
 
+/* The bulk lane's publish: word 1 = bytes, word 2 = flag | receive buffer. */
+static __global__ void tp_publish_bulk_kernel(uint64_t *desc, uint64_t exch, uint64_t bytes,
+                                              uint64_t word2) {
+    __threadfence_system();
+    desc[1] = bytes;
+    desc[2] = word2;
+    tp_st_release_sys(&desc[0], exch);
+}
+
+/* The bulk lane's combine: dst[i] = dst[i] + peer[i] once the proxy reports
+ * the exchange done -- the all-reduce's own + peer, one add per element,
+ * bit-identical to the host big gate it replaces (acc[i] += peer[i]). */
+static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *peer, uint64_t n,
+                                                  const uint64_t *done, uint64_t exch,
+                                                  uint32_t *err, uint64_t timeout_ns) {
+    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] = dst[i] + __ldcv(peer + i);
+}
+
 static unsigned tp_grid(uint64_t n) {
     const uint64_t b = (n + 255u) / 256u;
     return (unsigned)(b > 256u ? 256u : (b ? b : 1u));
@@ -210,4 +231,33 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
     tp_scatter_cols_kernel<<<tp_grid(n_elem), 256>>>(
         (float *)dst->ptr, (const float *)src->ptr, n_elem, width, pitch, col0);
     return cuda_ok(cudaGetLastError(), "tp scatter cols launch");
+}
+
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, uint64_t src_off, void *dst_dev,
+                             uint64_t bytes) {
+    if (!src || !dst_dev || bytes == 0 || src_off > src->bytes || bytes > src->bytes - src_off) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst_dev, (const uint8_t *)src->ptr + src_off, (size_t)bytes,
+                                   cudaMemcpyDefault, cudaStreamPerThread),
+                   "tp bulk stage");
+}
+
+int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2) {
+    if (!desc_dev || exch == 0 || bytes == 0) return 0;
+    tp_publish_bulk_kernel<<<1, 1>>>((uint64_t *)desc_dev, exch, bytes, word2);
+    return cuda_ok(cudaGetLastError(), "tp publish bulk launch");
+}
+
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *peer_dev,
+                                   uint64_t bytes, const void *done_dev, uint64_t exch,
+                                   void *err_dev, uint64_t timeout_ns) {
+    if (!dst || !peer_dev || !done_dev || !err_dev || bytes == 0 || bytes % sizeof(float) != 0 ||
+        dst_off % sizeof(float) != 0 || dst_off > dst->bytes || bytes > dst->bytes - dst_off) return 0;
+    const uint64_t n = bytes / sizeof(float);
+    const uint64_t b = (n + 255u) / 256u;
+    const unsigned grid = (unsigned)(b > 2048u ? 2048u : b);
+    tp_bulk_combine_sum_kernel<<<grid, 256>>>((float *)((uint8_t *)dst->ptr + dst_off),
+                                              (const float *)peer_dev, n,
+                                              (const uint64_t *)done_dev, exch,
+                                              (uint32_t *)err_dev, timeout_ns);
+    return cuda_ok(cudaGetLastError(), "tp bulk combine sum launch");
 }

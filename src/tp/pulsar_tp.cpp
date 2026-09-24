@@ -98,6 +98,12 @@ typedef struct {
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
+    /* v14: the BULK lane -- this rank's registered bulk buffer and the second
+     * (bulk) QP; all zero when this rank attached no bulk buffer. */
+    uint64_t bulk_base;
+    uint32_t bulk_rkey;
+    uint32_t bulk_qpn;
+    uint32_t bulk_psn;
 } pulsar_tp_rdma_info;
 
 /* ---- verbs ABI thunk (see head-of-section note) ---- */
@@ -156,6 +162,8 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 #define TP_IBV_PORT_INIT        IBV_PORT_INIT
 #define TP_IBV_PORT_ARMED       IBV_PORT_ARMED
 #define TP_IBV_WR_SEND          IBV_WR_SEND
+#define TP_IBV_WR_RDMA_WRITE    IBV_WR_RDMA_WRITE
+#define TP_IBV_WR_RDMA_WRITE_WITH_IMM IBV_WR_RDMA_WRITE_WITH_IMM
 #define TP_IBV_WC_SUCCESS       IBV_WC_SUCCESS
 #define TP_IBV_WC_SEND          IBV_WC_SEND
 #define TP_IBV_WC_RECV          IBV_WC_RECV
@@ -211,8 +219,9 @@ enum { TP_IBV_QPS_RESET = 0, TP_IBV_QPS_INIT = 1, TP_IBV_QPS_RTR = 2,
 /* enum ibv_port_state */
 enum { TP_IBV_PORT_NOP = 0, TP_IBV_PORT_DOWN = 1, TP_IBV_PORT_ACTIVE = 2,
        TP_IBV_PORT_INIT = 3, TP_IBV_PORT_ARMED = 4 };
-/* enum ibv_wr_opcode (only SEND is used) */
-enum { TP_IBV_WR_SEND = 0 };
+/* enum ibv_wr_opcode: RDMA_WRITE, RDMA_WRITE_WITH_IMM, SEND -- the order in
+ * <infiniband/verbs.h> (SEND is 2; this thunk used to say 0, i.e. RDMA_WRITE) */
+enum { TP_IBV_WR_RDMA_WRITE = 0, TP_IBV_WR_RDMA_WRITE_WITH_IMM = 1, TP_IBV_WR_SEND = 2 };
 /* enum ibv_wc_status (only success/error are distinguished) */
 enum { TP_IBV_WC_SUCCESS = 0, TP_IBV_WC_GENERAL_ERR = 19 };
 /* enum ibv_wc_opcode: recv completions share the bit upstream tests */
@@ -268,7 +277,7 @@ struct tp_ibv_send_wr {
         struct { tp_ibv_ah *ah; uint32_t remote_qpn; uint32_t remote_qkey; } ud;
         struct { uint32_t remote_qpn; uint32_t remote_qkey; uint32_t pkey_index; } xrc;
     } wr;
-    union { uint32_t imm_data; uint32_t invalidate_rkey; } ex;
+    union { uint32_t imm_data; uint32_t invalidate_rkey; };   /* anonymous, as in <infiniband/verbs.h> */
 };
 
 struct tp_ibv_recv_wr {
@@ -464,6 +473,10 @@ typedef struct {
 #define PULSAR_TP_RDMA_RECV_WINDOW 16
 #define PULSAR_TP_RDMA_BULK_SLOTS 64
 #define PULSAR_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+/* The bulk lane (v14): one RDMA write per piece, the last WITH_IMM. */
+#define PULSAR_TP_BULK_PIECE (UINT64_C(4) << 20)
+#define PULSAR_TP_BULK_IMM_WINDOW 16u
+#define PULSAR_TP_BULK_WR_TAG (UINT64_C(1) << 62)
 /* TCP fallback write/read round: small enough that two simultaneous rounds can
  * never fill both send buffers under ANY kernel socket-buffer clamp (the pair
  * hosts clamp SO_SNDBUF to net.core.wmem_max ~212K; a 2 MiB round there meant
@@ -481,6 +494,8 @@ typedef struct {
     tp_ibv_pd pd;
     tp_ibv_cq cq;
     tp_ibv_mr mr;
+    tp_ibv_cq bulk_cq;   /* the bulk lane's own CQ: its completions never mix with the gates' */
+    tp_ibv_mr bulk_mr;   /* the registered bulk buffer (pulsar_tp_set_bulk), or NULL */
     struct tp_ibv_port_attr port;
     union tp_ibv_gid gid;
     int gid_index;
@@ -499,6 +514,12 @@ typedef struct {
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
     pthread_mutex_t post_lock;
+    /* The bulk lane (v14): a second UC QP whose receive queue holds only the
+     * zero-length receives the peer's RDMA_WRITE_WITH_IMM consumes -- so it
+     * never mixes with the gate QP's 16 KB receives. */
+    tp_ibv_qp bulk_qp;
+    uint64_t bulk_imm_count;    /* imm arrivals reaped (the peer's bulk exchanges, in order) */
+    uint32_t bulk_last_imm;     /* the exchange id the latest arrival carried */
 } pulsar_tp_rdma_link;
 
 /* One peer in the TP mesh.  A full-mesh rank connects to every other rank
@@ -557,12 +578,21 @@ struct pulsar_tp {
      * row_exch = last exchange numbered.  Proxy thread: proxy_* below. */
     uint64_t gate_seq = 0;
     uint64_t row_exch = 0;
+    uint64_t last_gate_exch = 0;   /* the latest exchange numbered that uses the GATE QP (not bulk) */
     pthread_t proxy;
     bool proxy_started = false;
     std::atomic<bool> proxy_stop{false};
     std::atomic<bool> proxy_failed{false};
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
     pulsar_tp_node self;    /* this rank's own NODE record */
+    /* The bulk lane (pulsar_tp_set_bulk): caller-owned, host-pinned and
+     * GPU-mapped, laid out out | in[0] | in[1], each bulk_cap bytes. */
+    uint8_t *bulk = nullptr;
+    uint64_t bulk_bytes = 0;
+    uint64_t bulk_cap = 0;
+    uint64_t bulk_seq = 0;          /* engine thread: bulk exchanges numbered (buffer parity) */
+    uint64_t peer_bulk_base = 0;    /* the peer's bulk buffer and rkey (v14 info) */
+    uint32_t peer_bulk_rkey = 0;
 };
 
 /* ------------------------------------------------------------------------
@@ -574,6 +604,7 @@ static struct { uint64_t n; double ph[PULSAR_TP_TPH_N]; uint64_t bytes; } g_tsit
 static struct { uint64_t n, rounds; double hdr, arm, stage, wire; uint64_t bytes; } g_tx;
 static struct { uint64_t n; double t, post, recv, send, repost; uint64_t early, hist[6]; } g_tg;   /* the row lane (4g-2) */
 static struct { uint64_t n_ack, n_cmd; double ack, cmd; } g_ctl;   /* the control round trip per step */
+static struct { uint64_t n, bytes; double t, post, wait; } g_tb;     /* the bulk lane (v14) */
 double pulsar_tp_now_sec(void);
 void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
     if (site < 0 || site >= PULSAR_TP_TSITE_N || phase < 0 || phase >= PULSAR_TP_TPH_N) return;
@@ -604,6 +635,11 @@ void pulsar_tp_timing_report(const pulsar_tp *tp) {
                 (unsigned long long)g_tg.hist[0], (unsigned long long)g_tg.hist[1], (unsigned long long)g_tg.hist[2],
                 (unsigned long long)g_tg.hist[3], (unsigned long long)g_tg.hist[4], (unsigned long long)g_tg.hist[5]);
     }
+    if (g_tb.n)
+        fprintf(stderr, "pulsar: tp-timing rank %d: bulk lane: %llu exchanges, %.1f MB avg, %.1f ms total, "
+                        "%.1f us per exchange (post %.1f, wait %.1f)\n",
+                rank, (unsigned long long)g_tb.n, (double)g_tb.bytes / (double)g_tb.n / 1e6, g_tb.t * 1e3,
+                g_tb.t * 1e6 / (double)g_tb.n, g_tb.post * 1e6 / (double)g_tb.n, g_tb.wait * 1e6 / (double)g_tb.n);
     if (g_ctl.n_ack || g_ctl.n_cmd)
         fprintf(stderr, "pulsar: tp-timing rank %d: control: leader ack-digest wait %llu x %.1f us, worker command wait %llu x %.1f us\n",
                 rank, (unsigned long long)g_ctl.n_ack, g_ctl.n_ack ? g_ctl.ack * 1e6 / g_ctl.n_ack : 0.0,
@@ -1069,6 +1105,11 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
     }
+    r->bulk_cq = r->api.create_cq(r->ctx, 256, NULL, NULL, 0);
+    if (!r->bulk_cq) {
+        tp_set_err(err, errlen, "tp rdma: create_cq (bulk) failed");
+        return 0;
+    }
     /* The QP itself is per PEER and is created later, once the peers exist --
      * the HCA open runs before they do.  See tp_rdma_qp_create. */
     return 1;
@@ -1173,6 +1214,76 @@ static int tp_rdma_register_slab(pulsar_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
+/* INIT -> RTR -> RTS for one UC QP toward `peer` (GRH addressing through its
+ * GID, the lower of the two ports' MTUs).  The gate QP and the bulk QP share it. */
+static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_info *peer,
+                              uint32_t dest_qpn, uint32_t dest_psn, uint32_t my_psn, int rank,
+                              char *err, size_t errlen) {
+    /* INIT -> RTR -> RTS with GRH addressing through the exchanged GID. */
+    struct tp_ibv_qp_attr a;
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_INIT;
+    a.pkey_index = 0;
+    a.port_num = 1;
+    a.qp_access_flags = TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
+                        TP_IBV_ACCESS_REMOTE_WRITE;
+    if (tp->rdma.api.modify_qp(qp, &a,
+            TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
+            TP_IBV_QP_ACCESS_FLAGS) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_RTR;
+    /* path_mtu must AGREE between the two QPs.  The pair's second link
+     * reports active_mtu 1024 on one rank and 4096 on the other; each rank
+     * using its own makes the faster side emit frames the narrower port
+     * silently drops (bisected with a probe: >1024 fails with per-port
+     * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
+     * two ports' MTUs, on both ranks. */
+    a.path_mtu = tp->rdma.port.active_mtu;
+    if (peer->mtu != 0 && (int)peer->mtu < (int)a.path_mtu)
+        a.path_mtu = (decltype(a.path_mtu))(int)peer->mtu;
+    a.dest_qp_num = dest_qpn;
+    a.rq_psn = dest_psn;
+    a.ah_attr.dlid = (uint16_t)peer->lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, peer->gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)tp->rdma.gid_index;
+    a.ah_attr.grh.hop_limit = 1;
+    if (tp->rdma.api.modify_qp(qp, &a,
+            TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
+            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    (void)memset(&a, 0, sizeof(a));
+    a.qp_state = TP_IBV_QPS_RTS;
+    a.sq_psn = my_psn;
+    if (tp->rdma.api.modify_qp(qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", rank, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+/* The bulk lane's zero-length receive: consumed by the peer's final
+ * RDMA_WRITE_WITH_IMM of an exchange (the data itself lands by RDMA write). */
+static int tp_bulk_post_imm_recv(pulsar_tp *tp, pulsar_tp_rdma_link *r) {
+    struct tp_ibv_recv_wr wr;
+    struct tp_ibv_recv_wr *bad = NULL;
+    (void)memset(&wr, 0, sizeof(wr));
+    wr.wr_id = PULSAR_TP_BULK_WR_TAG;
+    wr.sg_list = NULL;
+    wr.num_sge = 0;
+    if (tp->rdma.api.post_recv(r->bulk_qp, &wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk imm post_recv: %s\n", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
 /* Bring up ONE peer's QP: create it over the shared PD/CQ, exchange this rank's
  * registered-slab address and QP identity with THAT peer over its own control
  * socket, then INIT -> RTR -> RTS.  The MR is already registered above, so
@@ -1189,6 +1300,26 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
     mine.qpn = TP_QPN(r->qp);
     /* PSND must differ per peer, so mix the peer in. */
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp ^ (uintptr_t)pp) & 0xffffff;
+    if (tp->rdma.bulk_mr && tp->n_ranks == 2) {
+        struct tp_ibv_qp_init_attr qia;
+        (void)memset(&qia, 0, sizeof(qia));
+        qia.send_cq = (decltype(qia.send_cq))tp->rdma.bulk_cq;
+        qia.recv_cq = (decltype(qia.recv_cq))tp->rdma.bulk_cq;
+        qia.qp_type = TP_IBV_QPT_UC;
+        qia.cap.max_send_wr = 64;
+        qia.cap.max_recv_wr = 2u * PULSAR_TP_BULK_IMM_WINDOW;
+        qia.cap.max_send_sge = 1;
+        qia.cap.max_recv_sge = 1;
+        r->bulk_qp = tp->rdma.api.create_qp(tp->rdma.pd, &qia);
+        if (!r->bulk_qp) {
+            tp_set_err(err, errlen, "tp rdma: create_qp(UC, bulk): %s", strerror(errno));
+            return 0;
+        }
+        mine.bulk_base = (uint64_t)(uintptr_t)tp->bulk;
+        mine.bulk_rkey = TP_RKEY(tp->rdma.bulk_mr);
+        mine.bulk_qpn = TP_QPN(r->bulk_qp);
+        mine.bulk_psn = (mine.psn ^ 0x5a5a5au) & 0xffffff;
+    }
     mine.mtu = (uint32_t)tp->rdma.port.active_mtu;
     mine.lid = tp->rdma.port.lid;
     memcpy(mine.gid, tp->rdma.gid.raw, 16);
@@ -1206,51 +1337,24 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
         return 0;
     }
 
-    /* INIT -> RTR -> RTS with GRH addressing through the exchanged GID. */
-    struct tp_ibv_qp_attr a;
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_INIT;
-    a.pkey_index = 0;
-    a.port_num = 1;
-    a.qp_access_flags = TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
-                        TP_IBV_ACCESS_REMOTE_WRITE;
-    if (tp->rdma.api.modify_qp(r->qp, &a,
-            TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
-            TP_IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", pp->rank, strerror(errno));
+    if (!tp_rdma_qp_connect(tp, r->qp, &r->peer, r->peer.qpn, r->peer.psn, mine.psn, pp->rank,
+                            err, errlen))
         return 0;
-    }
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_RTR;
-    /* path_mtu must AGREE between the two QPs.  The pair's second link
-     * reports active_mtu 1024 on one rank and 4096 on the other; each rank
-     * using its own makes the faster side emit frames the narrower port
-     * silently drops (bisected with a probe: >1024 fails with per-port
-     * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
-     * two ports' MTUs, on both ranks. */
-    a.path_mtu = tp->rdma.port.active_mtu;
-    if (r->peer.mtu != 0 && (int)r->peer.mtu < (int)a.path_mtu)
-        a.path_mtu = (decltype(a.path_mtu))(int)r->peer.mtu;
-    a.dest_qp_num = r->peer.qpn;
-    a.rq_psn = r->peer.psn;
-    a.ah_attr.dlid = (uint16_t)r->peer.lid;
-    a.ah_attr.port_num = 1;
-    a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)tp->rdma.gid_index;
-    a.ah_attr.grh.hop_limit = 1;
-    if (tp->rdma.api.modify_qp(r->qp, &a,
-            TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
-            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", pp->rank, strerror(errno));
-        return 0;
-    }
-    (void)memset(&a, 0, sizeof(a));
-    a.qp_state = TP_IBV_QPS_RTS;
-    a.sq_psn = mine.psn;
-    if (tp->rdma.api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", pp->rank, strerror(errno));
-        return 0;
+    /* The bulk lane: both ranks attached a bulk buffer (the info says so), so
+     * connect the second QP and post its imm window BEFORE the ready barrier --
+     * a WRITE_WITH_IMM that arrives before the peer posted its receive is
+     * dropped by UC. */
+    if (r->bulk_qp && r->peer.bulk_qpn != 0) {
+        if (!tp_rdma_qp_connect(tp, r->bulk_qp, &r->peer, r->peer.bulk_qpn, r->peer.bulk_psn,
+                                mine.bulk_psn, pp->rank, err, errlen))
+            return 0;
+        tp->peer_bulk_base = r->peer.bulk_base;
+        tp->peer_bulk_rkey = r->peer.bulk_rkey;
+        for (uint32_t k = 0; k < PULSAR_TP_BULK_IMM_WINDOW; k++)
+            if (!tp_bulk_post_imm_recv(tp, r)) {
+                tp_set_err(err, errlen, "tp rdma: bulk imm window post to rank %d failed", pp->rank);
+                return 0;
+            }
     }
     /* Leave the receive queue empty for an initial bulk prefill; the first
      * decode gate arms the normal lookahead window. */
@@ -1566,6 +1670,103 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     return ok;
 }
 
+/* One BULK exchange, proxy thread (v14).  This rank's payload sits in its bulk
+ * out-region (the GPU staged it); it is RDMA-written straight into the peer's
+ * in[buf], PULSAR_TP_BULK_PIECE at a time, the last write carrying the exchange
+ * id as immediate data.  Completion = the peer's matching WITH_IMM arrived (its
+ * data is in our in[buf]: UC delivers a QP's writes in order, so the imm lands
+ * after them) AND our own writes retired (the out-region may be restaged).
+ * One zero-length receive is re-posted per exchange, keeping the window full.
+ * No handshake: both ranks number bulk exchanges identically, and the window
+ * was armed before the bring-up's ready barrier. */
+static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uint32_t buf) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    const double t0 = tp_now_sec();
+    const uint32_t n = (uint32_t)((bytes + PULSAR_TP_BULK_PIECE - 1u) / PULSAR_TP_BULK_PIECE);
+    if (!r || !r->bulk_qp || n == 0 || n > 64u) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu refused (%llu bytes, %u pieces)\n",
+                (unsigned long long)e, (unsigned long long)bytes, n);
+        return 0;
+    }
+    const uint64_t remote = tp->peer_bulk_base + (1u + buf) * tp->bulk_cap;
+    struct tp_ibv_sge sge[64];
+    struct tp_ibv_send_wr wr[64];
+    (void)memset(wr, 0, sizeof(wr));
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t off = (uint64_t)i * PULSAR_TP_BULK_PIECE;
+        const uint64_t len = bytes - off < PULSAR_TP_BULK_PIECE ? bytes - off : PULSAR_TP_BULK_PIECE;
+        const bool last = i + 1u == n;
+        sge[i].addr = (uintptr_t)(tp->bulk + off);
+        sge[i].length = (uint32_t)len;
+        sge[i].lkey = TP_LKEY(tp->rdma.bulk_mr);
+        wr[i].wr_id = PULSAR_TP_BULK_WR_TAG | e;
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = last ? TP_IBV_WR_RDMA_WRITE_WITH_IMM : TP_IBV_WR_RDMA_WRITE;
+        wr[i].send_flags = last ? TP_IBV_SEND_SIGNALED : 0;
+        wr[i].wr.rdma.remote_addr = remote + off;
+        wr[i].wr.rdma.rkey = tp->peer_bulk_rkey;
+        if (last) wr[i].imm_data = (uint32_t)e;
+        wr[i].next = last ? NULL : &wr[i + 1u];
+    }
+    struct tp_ibv_send_wr *bad = NULL;
+    if (tp->rdma.api.post_send(r->bulk_qp, wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk rdma write post (exchange %llu): %s\n",
+                (unsigned long long)e, strerror(errno));
+        return 0;
+    }
+    const double t_posted = tp_now_sec();
+    /* The peer's k-th bulk exchange is our k-th imm arrival. */
+    const uint64_t want = r->bulk_imm_count + 1u;
+    bool sent = false;
+    const double deadline = t_posted + (double)tp->timeout_sec;
+    double next_abort_check = t_posted + 1e-3;
+    while (!sent || r->bulk_imm_count < want) {
+        struct tp_ibv_wc wc[8];
+        const int got = tp->rdma.api.poll_cq(tp->rdma.bulk_cq, 8, wc);
+        if (got < 0) return 0;
+        for (int i = 0; i < got; i++) {
+            if (wc[i].status != TP_IBV_WC_SUCCESS) {
+                fprintf(stderr, "pulsar-tp: bulk rdma completion error: %s (exchange %llu)\n",
+                        tp_wc_status_str(wc[i].status), (unsigned long long)e);
+                return 0;
+            }
+            if (wc[i].opcode & TP_IBV_WC_RECV) {
+                r->bulk_imm_count++;
+                r->bulk_last_imm = wc[i].imm_data;
+            } else {
+                sent = true;
+            }
+        }
+        const double now = tp_now_sec();
+        if (now > next_abort_check) {
+            next_abort_check = now + 1e-3;
+            if (tp_peer_aborted(tp)) {
+                tp_row_err_latch(tp, 2u);
+                pulsar_tp_mark_failed(tp);
+                return 0;
+            }
+            if (now > deadline) {
+                fprintf(stderr, "pulsar-tp: bulk exchange %llu timed out (imm %llu/%llu, sent %d)\n",
+                        (unsigned long long)e, (unsigned long long)r->bulk_imm_count,
+                        (unsigned long long)want, (int)sent);
+                return 0;
+            }
+        }
+    }
+    /* The ranks number exchanges identically: the peer's arrival must carry
+     * this exchange's id, or the lanes are out of step. */
+    if (r->bulk_last_imm != (uint32_t)e) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu received the peer's exchange %u -- the ranks' "
+                        "exchange order diverged\n", (unsigned long long)e, r->bulk_last_imm);
+        return 0;
+    }
+    if (!tp_bulk_post_imm_recv(tp, r)) return 0;
+    g_tb.n++; g_tb.bytes += bytes; g_tb.post += t_posted - t0;
+    g_tb.wait += tp_now_sec() - t_posted; g_tb.t += tp_now_sec() - t0;
+    return 1;
+}
+
 static void *tp_row_proxy_main(void *arg) {
     pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
     volatile uint64_t *desc = tp_row_desc(tp);
@@ -1577,6 +1778,28 @@ static void *tp_row_proxy_main(void *arg) {
         if (e == last_exch) {
             /* busy-poll while decode is running; back off once idle */
             if (tp_now_sec() - idle_since > 0.002) usleep(50);
+            continue;
+        }
+        if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
+            /* A bulk exchange (v14): desc[1] = bytes, desc[2] low bit = the
+             * receive buffer.  It takes no gate messages, so next_msg stays. */
+            const uint64_t bytes = desc[1];
+            const uint32_t buf = (uint32_t)(desc[2] & 1u);
+            if (e != last_exch + 1u || bytes == 0 || bytes > tp->bulk_cap) {
+                fprintf(stderr, "pulsar-tp: row lane proxy: bulk descriptor out of order or oversized "
+                                "(exchange %llu after %llu, %llu bytes, cap %llu) -- lane failed\n",
+                        (unsigned long long)e, (unsigned long long)last_exch,
+                        (unsigned long long)bytes, (unsigned long long)tp->bulk_cap);
+                tp->proxy_failed.store(true, std::memory_order_release);
+                break;
+            }
+            if (!tp_bulk_proxy_exchange(tp, e, bytes, buf)) {
+                tp->proxy_failed.store(true, std::memory_order_release);
+                break;
+            }
+            last_exch = e;
+            done->store(e, std::memory_order_release);
+            idle_since = tp_now_sec();
             continue;
         }
         const uint64_t first = desc[1];
@@ -1895,12 +2118,16 @@ static void tp_rdma_close(pulsar_tp *tp) {
      * destroy -- only the shared HCA objects, each checked individually. */
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     if (r && r->qp) tp->rdma.api.destroy_qp(r->qp);
+    if (r && r->bulk_qp) tp->rdma.api.destroy_qp(r->bulk_qp);
     if (tp->rdma.mr) tp->rdma.api.dereg_mr(tp->rdma.mr);
+    if (tp->rdma.bulk_mr) tp->rdma.api.dereg_mr(tp->rdma.bulk_mr);
     if (tp->rdma.cq) tp->rdma.api.destroy_cq(tp->rdma.cq);
+    if (tp->rdma.bulk_cq) tp->rdma.api.destroy_cq(tp->rdma.bulk_cq);
     if (tp->rdma.pd) tp->rdma.api.dealloc_pd(tp->rdma.pd);
     if (tp->rdma.ctx) tp->rdma.api.close_device(tp->rdma.ctx);
-    if (r) r->qp = NULL;
+    if (r) { r->qp = NULL; r->bulk_qp = NULL; }
     tp->rdma.mr = NULL; tp->rdma.cq = NULL; tp->rdma.pd = NULL; tp->rdma.ctx = NULL;
+    tp->rdma.bulk_mr = NULL; tp->rdma.bulk_cq = NULL;
 }
 
 /* ------------------------------------------------------------------------
@@ -2531,6 +2758,15 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
          * -- the pair has one, the mesh n_ranks-1, and every peer sees the same
          * slab address/rkey. */
         if (!tp_rdma_register_slab(tp, err, errlen)) return 0;
+        if (tp->bulk) {
+            tp->rdma.bulk_mr = tp->rdma.api.reg_mr(tp->rdma.pd, tp->bulk, (size_t)tp->bulk_bytes,
+                                                   TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_WRITE);
+            if (!tp->rdma.bulk_mr) {
+                tp_set_err(err, errlen, "tp rdma: reg_mr(bulk, %llu bytes): %s",
+                           (unsigned long long)tp->bulk_bytes, strerror(errno));
+                return 0;
+            }
+        }
         for (int i = 0; i < tp->n_peers; i++)
             if (!tp_rdma_link_bringup(tp, &tp->peers[i], err, errlen)) return 0;
         if (pulsar_tp_row_lane(tp) && !tp_row_proxy_start(tp, err, errlen)) return 0;
@@ -2601,6 +2837,53 @@ bool pulsar_tp_row_lane(const pulsar_tp *tp) {
 
 static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first);
 
+void pulsar_tp_set_bulk(pulsar_tp *tp, void *base, uint64_t bytes) {
+    if (!tp) return;
+    tp->bulk = static_cast<uint8_t *>(base);
+    tp->bulk_bytes = base ? bytes : 0;
+    tp->bulk_cap = base ? (bytes / 3u) / tp->vec_bytes * tp->vec_bytes : 0;
+}
+
+bool pulsar_tp_bulk_lane(const pulsar_tp *tp) {
+    if (!pulsar_tp_row_lane(tp) || !tp->bulk || tp->bulk_cap == 0 || !tp->rdma.bulk_mr ||
+        tp->peer_bulk_base == 0 || !tp->proxy_started)
+        return false;
+    const pulsar_tp_rdma_link *r = tp_pair_link(const_cast<pulsar_tp *>(tp));
+    return r && r->bulk_qp;
+}
+
+void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!tp) return;
+    out->cap_bytes = tp->bulk_cap;
+    out->out_off = 0;
+    out->in_off[0] = tp->bulk_cap;
+    out->in_off[1] = 2u * tp->bulk_cap;
+}
+
+int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
+    if (!pulsar_tp_bulk_lane(tp) || bytes == 0 || bytes > tp->bulk_cap || !exch || !buf) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused (%llu bytes, cap %llu; pair+rdma+bulk buffer "
+                        "required) -- the caller must pick the lane\n",
+                (unsigned long long)bytes, (unsigned long long)(tp ? tp->bulk_cap : 0));
+        return 0;
+    }
+    if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused: an earlier exchange failed "
+                        "(proxy %s, device spin %s)\n",
+                tp->proxy_failed.load() ? "failed" : "ok",
+                *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
+        return 0;
+    }
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: bulk lane armed (async: GPU stage/publish/combine + "
+                                   "RDMA writes on a second QP, %llu MiB per exchange)\n",
+                                   (unsigned long long)(tp->bulk_cap >> 20)); }
+    *exch = ++tp->row_exch;
+    *buf = (uint32_t)(tp->bulk_seq++ & 1u);
+    return 1;
+}
+
 void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out) {
     memset(out, 0, sizeof(*out));
     if (!tp) return;
@@ -2634,11 +2917,15 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
                                    (unsigned)PULSAR_TP_RDMA_RECV_WINDOW, PULSAR_TP_BATCH_MAX_ROWS); }
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     if (!r->recv_window_active) {
-        /* Only ever after a big gate drained the window, i.e. after a stream
-         * sync, so the previous exchange is complete and the proxy is idle. */
-        if (tp_row_done(tp)->load(std::memory_order_acquire) != tp->row_exch) {
-            fprintf(stderr, "pulsar-tp: row lane: re-arm with exchange %llu still in flight "
-                            "(done %llu) -- refusing\n", (unsigned long long)tp->row_exch,
+        /* The window is down before the first row exchange, or after a big
+         * gate drained it (transports with no bulk lane, after a stream sync).
+         * Arming posts receives on the GATE QP, so only a gate-QP exchange may
+         * not be in flight; bulk exchanges (v14) ride their own QP and may
+         * still be running -- a prefill's last bulk exchanges usually are when
+         * its head's vocab gather arms the lane. */
+        if (tp_row_done(tp)->load(std::memory_order_acquire) < tp->last_gate_exch) {
+            fprintf(stderr, "pulsar-tp: row lane: re-arm with gate exchange %llu still in flight "
+                            "(done %llu) -- refusing\n", (unsigned long long)tp->last_gate_exch,
                     (unsigned long long)tp_row_done(tp)->load());
             return 0;
         }
@@ -2647,6 +2934,7 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
     *first_msg = tp->gate_seq + 1u;
     tp->gate_seq += rows;
     *exch = ++tp->row_exch;
+    tp->last_gate_exch = *exch;
     return 1;
 }
 
