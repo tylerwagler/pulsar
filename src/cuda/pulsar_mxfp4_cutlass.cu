@@ -739,11 +739,13 @@ __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsi
   return m;
 }
 
-/* MAXR: the most deduplicated rows one CTA carries.  The one-row decode
- * launch instantiates MAXR = 1 -- the per-row accumulators, results and
- * owners shrink from 8 to 1, which is what bought back the occupancy (80 ->
- * fewer registers) and room for a deeper prefetch; every other launch keeps
- * GEMV_DEDUPE_MAX.  Arithmetic is identical for every r either way. */
+/* MAXR: the most deduplicated rows one CTA carries.  A slot dedupes with at
+ * most one slot per ROW, so a step of n_tokens rows never needs more than
+ * n_tokens: the small FFN instantiates MAXR = n_tokens for 1..4 rows (the
+ * decode and DSpark-verify widths) and GEMV_DEDUPE_MAX above that.  Fewer
+ * per-row accumulators is fewer registers, more CTAs per SM; the one-row
+ * instance also prefetches its activation.  Arithmetic is identical for every
+ * r either way. */
 template <class SFL, bool EMIT_E4M3, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
@@ -774,7 +776,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   int owned[GEMV_DEDUPE_MAX];
   const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
   if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
-  if (m > MAXR) __trap();              /* launch contract: MAXR = 1 only for one-row steps */
+  if (m > MAXR) __trap();              /* launch contract: MAXR >= the step's row count */
   /* the table is indexed only when `valid`: an id past n_total must not
    * reach it (PLAN 94 phase 1's route-bounds rule, enforced at the producer). */
   const uint8_t *ge = valid ? gate_tab[e] : nullptr;
@@ -890,7 +892,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
 /* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
  * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the gate/up epilogue
  * above in the small FFN): 1 byte read per element, the source's own format. */
-template <class SFL>
+template <class SFL, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
     const uint8_t *midq8,     // [n_slots, K] E4M3 mid
@@ -908,8 +910,8 @@ __global__ static void expert_gemv_down_kernel(
    * sharing the weights across rows costs no L2 latency chain (the per-warp-one-row
    * variant measured +45..65%).  Per-row arithmetic is the per-slot kernel's exactly. */
   __shared__ float lut[16];
-  __shared__ __align__(16) uint8_t s_x[GEMV_DEDUPE_MAX][GEMV_DOWN_MAX_K];
-  __shared__ float s_sa[GEMV_DEDUPE_MAX][GEMV_DOWN_MAX_K / 32];
+  __shared__ __align__(16) uint8_t s_x[MAXR][GEMV_DOWN_MAX_K];
+  __shared__ float s_sa[MAXR][GEMV_DOWN_MAX_K / 32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
   const int slot = (int)blockIdx.y;
   const int lane = (int)(threadIdx.x & 31u);
@@ -922,6 +924,7 @@ __global__ static void expert_gemv_down_kernel(
   int owned[GEMV_DEDUPE_MAX];
   const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
   if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
+  if (m > MAXR) __trap();              /* launch contract: MAXR >= the step's row count */
   const int n_base = (int)(blockIdx.x * GEMV_DOWN_TILE_N) + warp * 8;
   if (!valid) {                        /* an invalid expert contributes zero to its own slot */
     if (lane == 0) for (int i = 0; i < 8 && n_base + i < N; i++) down_out[(size_t)slot * N + n_base + i] = 0.f;
@@ -941,9 +944,9 @@ __global__ static void expert_gemv_down_kernel(
     const int n = n_base + i;
     if (n >= N) break;                 /* N % 8 == 0: uniform across the warp */
     const uint8_t *dd = de + (size_t)n * (K / 2);
-    float a[GEMV_DEDUPE_MAX];
+    float a[MAXR];
     #pragma unroll
-    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) a[r] = 0.f;
+    for (int r = 0; r < MAXR; r++) a[r] = 0.f;
     for (int kc = lane * 8; kc < K; kc += GEMV_PREFETCH * 32 * 8) {
     uint32_t pw[GEMV_PREFETCH];
     uint8_t psc[GEMV_PREFETCH];
@@ -962,7 +965,7 @@ __global__ static void expert_gemv_down_kernel(
       const uint32_t w = pw[c];   /* the expert's bytes, once for every owned row */
       const float sc = gemv_sf_val(psc[c]);
       #pragma unroll
-      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+      for (int r = 0; r < MAXR; r++) {
         if (r < m) {
           const float sa = s_sa[r][k0 >> 5];
           const uint8_t *xt8 = s_x[r] + k0;
@@ -976,7 +979,7 @@ __global__ static void expert_gemv_down_kernel(
     }
     }   /* the k-chunk group */
     #pragma unroll
-    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+    for (int r = 0; r < MAXR; r++) {
       if (r < m) {
         for (int sh = 16; sh > 0; sh >>= 1) a[r] += __shfl_xor_sync(0xffffffffu, a[r], sh);
         if (lane == 0) down_out[(size_t)owned[r] * N + n] = a[r];
@@ -1063,28 +1066,70 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   }
   {
     dim3 g((unsigned)(mid_dim / 32), n_slots);
-    if (n_tokens == 1)
-      expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 1><<<g, 256>>>(
+    switch (n_tokens) {
+    case 1: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 1><<<g, 256>>>(
         nullptr, midq8, midsf, mid_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
         gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, n_slots, in_dim, mid_dim,
-        expert_lo, expert_hi);
-    else
-      expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        expert_lo, expert_hi); break;
+    case 2: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 2><<<g, 256>>>(
         nullptr, midq8, midsf, mid_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
         gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, n_slots, in_dim, mid_dim,
-        expert_lo, expert_hi);
+        expert_lo, expert_hi); break;
+    case 3: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 3><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi); break;
+    case 4: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 4><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi); break;
+    default: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim,
+        expert_lo, expert_hi); break;
+    }
+
   }
   {
     dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
-    expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+    switch (n_tokens) {
+    case 1: expert_gemv_down_kernel<decltype(sfl_dn), 1><<<g, 256>>>(
         down_out, midq8, midsf, mid_kbp, selected,
         down_tab, down_data_bytes, sfl_dn,
         n_total_expert, n_slots, mid_dim, out_dim,
-        expert_lo, expert_hi);
+        expert_lo, expert_hi); break;
+    case 2: expert_gemv_down_kernel<decltype(sfl_dn), 2><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim,
+        expert_lo, expert_hi); break;
+    case 3: expert_gemv_down_kernel<decltype(sfl_dn), 3><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim,
+        expert_lo, expert_hi); break;
+    case 4: expert_gemv_down_kernel<decltype(sfl_dn), 4><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim,
+        expert_lo, expert_hi); break;
+    default: expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim,
+        expert_lo, expert_hi); break;
+    }
+
   }
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
