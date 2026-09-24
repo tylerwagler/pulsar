@@ -411,7 +411,7 @@ static uint16_t smoke_f32_to_bf16(float x) {            /* round to nearest even
     return (uint16_t)(u >> 16);
 }
 static float smoke_bf16_to_f32(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
-/* E4M3 codec, the quantizer's (gguf-tools/quants_fp.c) rounding and decode */
+/* E4M3 codec: the archived quantizer's rounding and decode (tag archive/gguf-tooling-2026-09-24) */
 static uint8_t smoke_f32_to_e4m3(float x) {
     if (x != x) return 0x7f;
     uint8_t sgn = (x < 0.0f) ? 0x80 : 0x00;

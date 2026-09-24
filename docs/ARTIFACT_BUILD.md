@@ -1,5 +1,13 @@
 # Reproducing a serving artifact from source weights
 
+> **2026-09-24: the pipeline this document describes is ARCHIVED.**  Tyler: "We shouldn't
+> be using gguf anywhere."  `gguf-tools/` (the header-only GGUF template builders,
+> `deepseek4-quantize`, the GGUF utilities and the safetensors lane's GGUF reader) is gone
+> from the tree and recoverable at tag `archive/gguf-tooling-2026-09-24`.  The direct
+> builder that replaces it -- HF checkpoint(s) to the served container, no GGUF -- is
+> `tools/container/` (L247); this document is rewritten when it lands.  Until then the
+> text below is history, kept for the lessons its gates recorded.
+
 Written 2026-08-12 after auditing whether the shipped artifact could actually be
 rebuilt. It could not, cleanly: the format map that decides every tensor's type
 was an untracked JSON in a scratch directory, and the imatrix that drives every

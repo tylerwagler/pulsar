@@ -66,9 +66,12 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
 - `cutlass/` — EXTERNAL header-only dependency, **required** for the MXFP4
   expert path. Deliberately **not** a git submodule (see `cutlass.pin` for the
   rationale and the pinned sha); `CUTLASS_DIR` may point anywhere.
-- `gguf-tools/` — offline quantization/imatrix tooling. It still carries the
-  GGUF plumbing the quantization pipeline was built around; the artifact this
-  fork SERVES is the declared-layout safetensors checkpoint.
+- `tools/container/` — the direct artifact builder (HF checkpoint(s) -> the
+  declared-layout safetensors checkpoint the engine serves; L247).  No GGUF
+  anywhere: that tooling was archived 2026-09-24 at tag
+  `archive/gguf-tooling-2026-09-24`.  `tools/imatrix/` is the calibration corpus
+  and collector docs, `tools/reap/` the router audit the battery runs,
+  `tools/quality-testing/` the official-continuation scorer.
 
 Internal-header convention: a symbol is de-static'd and declared in the
 module's `pulsar_*_internal.h` only when another TU of the same module needs it.

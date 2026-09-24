@@ -49,7 +49,7 @@ and any non-default flags for every manual run.
 **Run them with one command:**
 
 ```
-make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
+make gates FRONTIER_MODEL=/srv/models/<checkpoint-dir>
 ```
 
 It runs every gate below, continues past failures so one break does not hide
@@ -113,10 +113,10 @@ model.  Record pass/fail against the release commit:
 
 ## 3. Flash Inference Path
 
-Use the normal Flash GGUF that 128 GB users run.
+Use the served Flash checkpoint that 128 GB users run.
 
 - One-shot CLI:
-  `./pulsar -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+  `./pulsar -m /srv/models/<checkpoint-dir> --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
 - Thinking and max-thinking prompts:
   run one short coding prompt with default thinking and one with max thinking.
 - Long-context recall:
@@ -205,16 +205,10 @@ The agent is the most stateful component.  Test it manually, not only by build.
   behavior, file naming, and symlink policy.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
-- Run the artifact-type gate on every shipped gguf:
-  `python3 gguf-tools/audit_artifact_types.py MODEL.gguf`
-  It fails if any tensor ships in a PLAIN type that has a pre-formatted twin
-  (16 -> 42/43, 38 -> 41, 39 -> 40). Those are pure byte permutations, so the
-  plain form is never *wrong* -- the engine just converts at first use and
-  keeps a second device copy beside the mmap, silently. The drafter shipped
-  0.429 GiB of type-38 double-store this way from its first build until
-  2026-08-12, because it is built from a separate pinned type table
-  (`gguf-tools/dspark_type_flags.txt`) that was never revisited when the main
-  model moved to MXFP8_LT. Use `--census` for the full type breakdown.
+- Run the container audit on every shipped checkpoint (`tools/container`, L247): every
+  tensor declared in the layout its kernel reads, no plain twin of a pre-formatted
+  layout, the expert stacks contiguous.  (The GGUF-era `audit_artifact_types.py` was
+  archived 2026-09-24 at tag `archive/gguf-tooling-2026-09-24`.)
 
 ## 8. Performance
 

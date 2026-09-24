@@ -40,7 +40,7 @@ Build the vector:
 ```sh
 python3 dir-steering/tools/build_direction.py \
   --ds4 ./pulsar \
-  --model ds4flash.gguf \
+  --model /srv/models/<checkpoint-dir> \
   --good-file dir-steering/examples/succinct.txt \
   --bad-file dir-steering/examples/verbose.txt \
   --out dir-steering/out/verbosity.json \
@@ -58,7 +58,7 @@ dir-steering/out/verbosity.f32
 Try a terse run:
 
 ```sh
-./pulsar -m ds4flash.gguf --nothink --temp 0 -n 160 \
+./pulsar -m /srv/models/<checkpoint-dir> --nothink --temp 0 -n 160 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn -1 \
   -p "Explain why databases use indexes."
@@ -67,7 +67,7 @@ Try a terse run:
 Try a verbose run:
 
 ```sh
-./pulsar -m ds4flash.gguf --nothink --temp 0 -n 220 \
+./pulsar -m /srv/models/<checkpoint-dir> --nothink --temp 0 -n 220 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn 2 \
   -p "Explain why databases use indexes."
@@ -86,7 +86,7 @@ Use the sweep helper to test several strengths on a fixed prompt set:
 ```sh
 python3 dir-steering/tools/run_sweep.py \
   --ds4 ./pulsar \
-  --model ds4flash.gguf \
+  --model /srv/models/<checkpoint-dir> \
   --direction dir-steering/out/verbosity.f32 \
   --prompts dir-steering/examples/eval_prompts.txt \
   --scales "-1,-0.5,0,0.5,1,2" \

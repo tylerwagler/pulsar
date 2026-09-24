@@ -896,7 +896,7 @@ cuda-mixed-prefill-gate: tests/mixed_prefill_gate
 # srcfmt-v1 shipped exactly that on 40 of 43 layers. Cheap enough to run on
 # every artifact before it is ever loaded.
 cuda-reap-router-audit:
-	python3 gguf-tools/reap/audit_reap_router.py $(FRONTIER_MODEL)
+	python3 tools/reap/audit_reap_router.py $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
@@ -1474,7 +1474,7 @@ cuda-runner-gate: tests/gates_runner
 #
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
-#   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
+#   make gates FRONTIER_MODEL=/srv/models/<checkpoint-dir>
 # The unit suite (make test) runs INSIDE the battery since 2026-09-03: it was
 # the one test set a landing could skip, and L156 found a golden in it that had
 # been failing since May because nobody ran it.  Same model as the frontier

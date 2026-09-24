@@ -1523,7 +1523,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
      * i * vocab + v, so the markov kernels' warps read contiguous memory. The
      * source and markov_w1 are (256, vocab). An artifact still carrying the
      * v-major markov_w2 fails this dims check and refuses to load -- there is
-     * no runtime transpose; gguf-tools/gguf_transpose_bf16_tensor.py migrates
+     * no runtime transpose; the archived GGUF-era transpose tool migrated
      * an existing artifact in place and --verify proves the result.
      *
      * Its storage is one of three (L213 step 2; pulsar_markov_w2_fmt is the

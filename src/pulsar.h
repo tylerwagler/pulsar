@@ -112,7 +112,7 @@ typedef struct {
     bool dspark_disable;
     /** "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
-     * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
+     * aid for per-layer quant-format KL probes (the prisma allocator, archived at tag archive/gguf-tooling-2026-09-24). */
     const char *expert_overlay;
     pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
     uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default (PULSAR_PREFILL_CHUNK_DEFAULT for prompts longer than it, else the whole prompt)

@@ -62,10 +62,10 @@ What they cover:
 - `--tool-call-quality`: exercises actual model behavior for DSML tool-call
   emission in both fast and exact paths.
 
-The runner defaults to `ds4flash.gguf`. Override paths when needed:
+Point the runner at a checkpoint directory:
 
 ```sh
-PULSAR_TEST_MODEL=/path/to/model.gguf ./pulsar_test --logprob-vectors
+PULSAR_TEST_MODEL=/srv/models/<checkpoint-dir> ./pulsar_test --logprob-vectors
 PULSAR_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
 PULSAR_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
@@ -78,30 +78,30 @@ make cuda-regression
 
 ## Quality Checks For Quantization Changes
 
-For GGUF or quantization work, use the official-continuation scorer in
-`gguf-tools/quality-testing`. The test compares how much probability a local
-GGUF assigns to official DeepSeek V4 Flash continuations, token by token.
+For quantization work, use the official-continuation scorer in
+`tools/quality-testing`. The test compares how much probability a local
+checkpoint assigns to official DeepSeek V4 Flash continuations, token by token.
 
 Build the scorer:
 
 ```sh
-make -C gguf-tools quality-score
+make -C tools/quality-testing
 ```
 
-Then score old and new GGUFs against the same manifest and compare:
+Then score old and new checkpoints against the same manifest and compare:
 
 ```sh
-gguf-tools/quality-testing/score_official OLD.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
+tools/quality-testing/score_official /srv/models/OLD-checkpoint \
+  tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
 
-gguf-tools/quality-testing/score_official NEW.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
+tools/quality-testing/score_official /srv/models/NEW-checkpoint \
+  tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
 
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+python3 tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
 
 Lower `avg_nll` is better. See
-`gguf-tools/quality-testing/README.md` for collecting or refreshing official
+`tools/quality-testing/README.md` for collecting or refreshing official
 continuations.
 
 ## Speed Regression Tests
@@ -115,7 +115,7 @@ Default linear sweep:
 
 ```sh
 ./pulsar-bench \
-  -m ds4flash.gguf \
+  -m /srv/models/<checkpoint-dir> \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \

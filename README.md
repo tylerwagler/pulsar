@@ -52,14 +52,14 @@ This fork also stands on:
   compressed-KV architecture.
 - **[PrismaQuant](https://github.com/RobTand/prismaquant)** (Rob Tand) — the
   measured-KL mixed-precision quant allocation approach used to build this
-  fork's GGUFs (see `gguf-tools/prisma/`).
+  fork's mixed-precision artifacts (the map lives in `tools/container/format-maps/`).
 - **[REAP](https://arxiv.org/abs/2510.13999)** (Router-weighted Expert
   Activation Pruning) — the expert-pruning method behind the production build's
   25%-pruned routed experts.
 - **[eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)**
   — the REAP-25 (LiveCodeBench-50-calibrated) DeepSeek-V4-Flash expert-survivor
-  set, vendored as index metadata in `gguf-tools/reap/` and used by the v5mx
-  build's REAP transplant.
+  set, used by the earlier REAP-trimmed builds (tooling archived at tag
+  `archive/gguf-tooling-2026-09-24`).
 
 ## Status
 
@@ -122,23 +122,20 @@ next sections.
 
 - [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
-- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
-  imatrix collection, quantization tooling, and quality checks.
-- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
-  routed-MoE imatrix is collected and used.
-- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
-  how the calibration prompt corpus is generated.
-- [gguf-tools/prisma/README.md](gguf-tools/prisma/README.md): measured-KL
-  per-layer expert-format allocation, used to build the mixed-quant GGUFs.
-- [gguf-tools/reap/README.md](gguf-tools/reap/README.md): the vendored REAP-25
-  expert-survivor map and the Path-B transplant tool.
+- [tools/container/README.md](tools/container/README.md): the direct artifact
+  builder -- HF checkpoint(s) to the served safetensors container, no GGUF (L247).
+- [tools/imatrix/README.md](tools/imatrix/README.md): how the routed-MoE imatrix
+  is collected and used.
+- [tools/imatrix/dataset/README.md](tools/imatrix/dataset/README.md): how the
+  calibration prompt corpus is generated.
+- [tools/reap/README.md](tools/reap/README.md): the router audit the battery runs.
 - [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md): the verified end-to-end
   rebuild of the serving artifact from source weights (two templates, then a
   single quantizer pass that prunes, pre-formats and merges the drafter).
 - [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
   V4 model card, with the architecture details that matter for Pulsar.
-- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
-  how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
+- [tools/quality-testing/README.md](tools/quality-testing/README.md): how local
+  checkpoints are scored against official DeepSeek V4 Flash/PRO continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
 - [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
@@ -159,93 +156,23 @@ binder is stricter than upstream's.** It accepts exactly:
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 
-Legacy `Q4_K` and `Q8_0` weight tensors are **rejected at load** with a clear
-error. This means the GGUFs published for upstream ds4 do not load in this
-fork: they use `Q8_0` attention/shared-expert/output tensors (and `Q4_K` in
-the q4 and PRO variants). GGUFs for this fork are produced offline with the
-tools in [gguf-tools/](gguf-tools/README.md), starting from the original FP8
-safetensors (`deepseek4-quantize`, driven per tensor by a `--format-map`
-manifest from the prisma allocator). The asymmetric-quantization idea is
-unchanged from upstream: only the routed MoE experts — the large majority of
-the model bytes — are pushed to 2 or 4 bits, while everything else stays high
-precision.
+The served artifact is a **declared-layout safetensors checkpoint**: every
+tensor is stored in the layout the kernel reads (`mxfp8_lt` dense, `cutlass_mxfp4`
+/ `iq2_xxs_mmq_k` / EXL3 `exl3m_k*` routed experts, native `bf16`/`f32` for the
+rest) and declared by name in the shard metadata; the engine converts nothing at
+load.  GGUF is not read, written or built anywhere in this tree since
+2026-09-24 (the old pipeline is archived at tag `archive/gguf-tooling-2026-09-24`;
+the direct builder that replaces it is `tools/container/`, L247).
 
-A few things this fork's GGUFs do beyond upstream:
-
-- **Per-layer expert formats.** The expert combo is validated per layer, so
-  one GGUF can mix formats across layers. The production allocation is
-  measured, not guessed: the prisma pipeline measures real per-layer KL and
-  promotes whole layers from the `IQ2_XXS`/`Q2_K` floor to `MXFP4` under a
-  byte budget. The `MXFP4` expert tensors are a byte-lossless re-encode of
-  the original Hugging Face expert weights, so promoted layers pay zero
-  requantization loss. Gate/up and down formats are chosen independently per
-  layer; the CUTLASS tensor-core layout is the one exception, since its
-  grouped GEMM runs the whole expert FFN in one dispatch, it applies to all
-  three tensors or none. The measured-allocation build is the **shipped
-  release**: in the hardmode `tool-eval-bench` bake-off that selected it, it
-  scored 92/100 against 84/100 for a uniform all-`Q2_K` build, so the measured
-  build ships and the all-`Q2_K` build was dropped. (A fresh 4-seed
-  re-measure of the shipping build averages ~90/100 with hardmode, range 87–92; the weakest
-  area is Category K safety/refusal — including one cross-turn prompt-injection
-  scenario the model does not resist — a model-alignment limitation, not a
-  quantization artifact.) Recommended sampling for the shipped build is
-  temperature 0.95, top-p 0.38 (send these as the `temperature`/`top_p` API
-  parameters).
-- **`IQ2_XXS_MMQ` (type 43) aligned pre-store.** The v4 line stores the
-  2-bit experts with the MMQ tensor-core tile layout baked at quantize time,
-  so the engine maps the weights and starts serving in ~21 s with no
-  boot-time repack pass.  Same values as `IQ2_XXS`, byte-identical logits.
-- **REAP expert pruning (v3 line).** The v3 GGUFs are REAP expert-pruned:
-  expert tensors are dense-trimmed to a per-layer survivor count while the
-  router stays padded to the full expert count. This trades a small quality
-  margin for significant residency headroom on the GB10. The survivor set is
-  the REAP-25 (LiveCodeBench-50-calibrated) prune published by
-  [eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4),
-  vendored and applied by the quantizer's `--reap-survivors` (full build in
-  [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md)).  **Every shipped release is REAP-25 trimmed
-  with a per-layer keep policy**: layers 3–42 keep 192 of 256 routed
-  experts, the first three layers keep the full 256.  The keep counts ship
-  in the GGUF header (`reap.layer.keep_count`) — verifiable from the file
-  itself.  (Earlier revisions of this README claimed the v4 line was
-  unpruned; the shipped v4 file's header says otherwise, and the claim was
-  an error.)
-- **Merged DSpark drafter.** The speculative drafter's tensors ship inside
-  the same GGUF file, emitted there by the quantizer's `--dspark-template`
-  pass; see the speculative decoding section below. (The old standalone
-  `merge_dspark_gguf.py` splice was deleted 2026-08-19 when that stage
-  collapsed into the quantizer — see `docs/ARTIFACT_BUILD.md`.)
-
-`download_model.sh` fetches this fork's shipped GGUF from our release repo:
+The shipped Flash checkpoint is published on Hugging Face as
+[`ElytronAI/DeepSeek-v4-Flash`](https://huggingface.co/ElytronAI/DeepSeek-v4-Flash)
+(the source-precision repack of DeepSeek-V4-Flash-Vision-Exp: MXFP4 routed
+experts byte-lossless from the source's FP4, MXFP8 attention/dense, the DSpark
+drafter merged in; 48 shards, 168 GB).  Fetch it with the Hugging Face CLI:
 
 ```sh
-./download_model.sh v5          # current release: 0731 weights, srcfmt numerics, type-43 pre-store
+hf download ElytronAI/DeepSeek-v4-Flash --local-dir /srv/models/DeepSeek-v4-Flash
 ```
-
-`v5` downloads `ds4flash-v5.gguf` (92,769,087,904 bytes, sha256
-`997098411c5082934c6f69bc05e22d16720e5eca4aeebeda1805a8274f5f2e8f`):
-DeepSeek-V4-Flash-**0731** weights on the srcfmt lineage (BF16 source
-tensors end to end, byte-lossless MXFP8/MXFP4 re-encodes, NVFP4 runtime
-KV), the REAP-25 per-layer expert trim, the 0731 DSpark drafter merged in-file,
-2-bit experts in the type-43 `IQ2_XXS_MMQ` aligned pre-store with 16 layers
-promoted to CUTLASS `MXFP4`, and MXFP8 attention/shared/head.  **Requires an
-engine with type-43 support** (this release); older engines reject it at
-load.  The release repo also hosts the previous line's `ds4flash-v4.gguf`
-(pre-srcfmt) for rollback; older lines are no longer published.
-
-It comes from
-<https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
-is stored under `./gguf/`, and `./ds4flash.gguf` is updated to point at it. The
-script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated
-and resumable) when present and falls back to `curl -C -` otherwise. The repo is
-public, so authentication is optional; `--token TOKEN`, `HF_TOKEN`, or the local
-Hugging Face token cache are used when present.
-
-If you want to regenerate GGUF files or collect a new imatrix, see
-[gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
-model-building work and can take a long time on the full DeepSeek V4 Flash
-weights. Flash GGUF generation is supported by the local tools. PRO GGUF
-production currently still depends on the external `llama.cpp`-based workflow;
-native tooling can be added later.
 
 CUTLASS is an external, header-only dependency. It is deliberately **not** a
 git submodule (see `cutlass.pin`); fetch the pinned revision once, anywhere you
@@ -261,12 +188,11 @@ make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
 The build checks the headers exist before compiling the CUTLASS translation
 unit, and warns if the clone's HEAD does not match `cutlass.pin`.
 
-`./ds4flash.gguf` is the default model path used by `pulsar-server`. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./pulsar-server --help` for the
+Pass the checkpoint directory with `-m`; run `./pulsar-server --help` for the
 full flag list, and start serving with:
 
 ```sh
-./pulsar-server -m ds4flash.gguf --ctx 100000
+./pulsar-server -m /srv/models/DeepSeek-v4-Flash --ctx 100000
 ```
 
 ## Speed
