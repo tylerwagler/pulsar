@@ -8,7 +8,7 @@ GPU; reads only the byte ranges it needs from both trees.
                             edge case; code/value difference counts reported
   * cutlass_mxfp4        -> byte-identical for every expert of one layer, 3 parts
   * fp8_e4m3_soa_k       -> byte-identical (the drafter's markov_w2)
-  * native / i32_from_i64-> byte-identical
+  * native / i64_to_i32-> byte-identical
   * bytes_for            -> == every served tensor's span, all 48 shards
   * self-checks: the vectorised E4M3 encoder against a scalar port of the C,
     swizzle_sf against mx_sfoff on every shape touched
@@ -395,8 +395,8 @@ def run_native(served: Tree, hf: Tree, name: str) -> None:
     raw = hf.read(name)
     t0 = time.perf_counter()
     if we["dtype"] == "I64" and se_["dtype"] == "I32":
-        got = P.i32_from_i64(raw)
-        how = "i32_from_i64"
+        got = P.i64_to_i32(raw)
+        how = "i64_to_i32"
     else:
         got = P.native(raw)
         how = "native"

@@ -184,13 +184,13 @@ def native(raw: bytes) -> bytes:
     return bytes(raw)
 
 
-def i32_from_i64(raw: bytes) -> bytes:
+def i64_to_i32(raw: bytes) -> bytes:
     """The one native-dtype conversion the C did (`i64_to_i32`, dsq_generate.c
     :78-90): the checkpoint's I64 index tables (ffn.gate.tid2eid) are stored
     I32; a value outside int32 refuses."""
     v = np.frombuffer(raw, dtype="<i8")
     if v.size and (v.min() < np.iinfo(np.int32).min or v.max() > np.iinfo(np.int32).max):
-        raise ValueError("i32_from_i64: value out of int32 range")
+        raise ValueError("i64_to_i32: value out of int32 range")
     return v.astype("<i4").tobytes()
 
 
