@@ -47,11 +47,9 @@ def align_for(nbytes):
 
 
 def shard_order(shape):
-    order = (['vision'] + [f'layers.{i}' for i in range(shape.n_layer)] + ['top']
-             + [f'mtp.{i}' for i in range(shape.n_mtp)])
-    n = len(order)
-    files = {s: f'model-{i:05d}-of-{n:05d}.safetensors' for i, s in enumerate(order, 1)}
-    return order, files
+    """names.py owns the plan (vision first and primary, one per layer, top, one per drafter layer)."""
+    order = N.shard_order(shape)
+    return order, {s: N.shard_file(shape, s) for s in order}
 
 
 def parse_layers(spec):
@@ -69,13 +67,8 @@ def parse_layers(spec):
 
 
 def model_shape(hf):
-    cfg = hf.config
-    n_layer = int(cfg['num_hidden_layers'])
-    mtp = {int(m.group(1)) for m in (re.match(r'^mtp\.(\d+)\.', n) for n in hf.names()) if m}
-    return N.ModelShape(n_layer=n_layer, n_mtp=(max(mtp) + 1) if mtp else 0,
-                        has_vision=any(n.startswith('vision.') for n in hf.names()),
-                        v41=bool(cfg.get('engram_layers') or cfg.get('model_type', '').endswith('v41')
-                                 or any('.engram.' in n for n in hf.names())))
+    """From config.json alone (names.py's rule): the checkpoint's word, not a guess from its names."""
+    return N.ModelShape.from_config(hf.config['top_level'])
 
 
 # ---------------------------------------------------------------------------
@@ -87,10 +80,14 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
     shards = {s: {'entries': [], 'tensors': {}, 'experts': []} for s in order}
     hf_names = hf.names()
     experts = {}        # (shard, layer, part) -> {e: (weight_name, scale_name)}
+    consumed = 0        # names the source carries and the engine never binds (names.py: emit=False)
     for name in hf_names:
         m = N.map_hf(name, shape)
         if m is None:
             raise SystemExit(f'{name}: not a tensor this builder maps -- refusing (names.py)')
+        if not m.emit:
+            consumed += 1
+            continue
         if m.family == 'expert':
             key = (m.shard, m.layer, m.part)
             slot = experts.setdefault(key, {}).setdefault(m.expert, {})
@@ -106,10 +103,18 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         layout = P.layout_for(m, dtype, hshape, overrides)
         dims_ne = list(reversed(hshape))
         entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
-        if layout in NATIVE_DTYPES:
+        if layout in NATIVE_DTYPES and dtype == NATIVE_DTYPES[layout]:
             path, off, n = hf.span(name)
             entry.update(dtype=NATIVE_DTYPES[layout], shape=list(hshape), nbytes=n,
                          src=('ranges', [(path, off, n)]))
+        elif layout == 'i32' and dtype == 'I64':
+            # the ONE narrowing: the routing table ffn.gate.tid2eid is I64 in the
+            # checkpoint and I32 in the engine (tensor_expect_layout); values must fit
+            n_el = 1
+            for d in hshape:
+                n_el *= d
+            entry.update(dtype='I32', shape=list(hshape), nbytes=4 * n_el,
+                         src=('produce', (lambda w=name: PR.i64_to_i32(hf.raw(w)))))
         elif layout == 'mxfp8_lt':
             scale = name[:-len('.weight')] + '.scale'
             if not hf.has(scale):
@@ -188,11 +193,6 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
     for s in order:
         p = shards[s]
         exp_layouts = {e['layout'] for e in p['experts']}
-        for lay in {e['gguf_name'] for e in p['experts']}:
-            pass
-        by_layer = {}
-        for e in p['experts']:
-            by_layer.setdefault(e['gguf_name'].rsplit('.', 2)[0], set())
         gu = {}
         for e in p['experts']:
             if e['part'] in ('w1', 'w3'):
@@ -218,7 +218,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         }
         if s == 'vision':
             p['meta']['pulsar.kv'] = json.dumps(kvs, separators=(',', ':'))
-    return shape, order, files, shards
+    return shape, order, files, shards, consumed
 
 
 # ---------------------------------------------------------------------------
@@ -303,14 +303,14 @@ def load_sources(args):
         missing = sorted(layers - have)
         if missing:
             raise SystemExit(f'{args.exl3}: layers {missing} requested but not present (have {sorted(have)})')
-    overrides = P.rekey_format_map(args.format_map, model_shape(hf)) if args.format_map else {}
+    overrides = P.rekey_format_map(json.load(open(args.format_map)), model_shape(hf)) if args.format_map else {}
     return hf, exl3, layers, overrides
 
 
 def cmd_plan(args):
     hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
-    print(f'model: {shape}; shards {len(order)}')
+    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    print(f'model: {shape}; shards {len(order)}; source tensors consumed but not written: {consumed}')
     tot = 0
     for s in order:
         p = shards[s]
@@ -328,7 +328,7 @@ def cmd_plan(args):
 
 def cmd_emit(args):
     hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
     todo = order if args.all else [args.shard]
     os.makedirs(args.out, exist_ok=True)
     import time
@@ -350,7 +350,7 @@ def cmd_verify(args):
     every EXL3 slice equal to its source ranges, the declared byte model equal
     to the span, expert families contiguous."""
     hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
     todo = order if args.all else [args.shard]
     failing = 0
     for s in todo:
