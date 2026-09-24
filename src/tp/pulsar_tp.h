@@ -284,22 +284,19 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);
 
-/* The per-layer gate lane for the engine's DECODE exchanges (L241 4g-2 step 2).
- * The transport owns the gate seq: every call advances one monotonic counter
- * and exchanges at that seq, so the slot the seq maps to (see
- * pulsar_tp_gate_slot: (seq-1) % n_slots under the identity schedule) must be
- * [layer][gate] -- the ATTN then FFN order per layer, every layer, every token;
- * a call out of order is refused by the transport ("gate order broke").  Both
- * ranks advance the counter by running the same exchanges in the same order,
- * which is the lockstep the group already requires.  The payload is ONE slot
- * (vec_bytes) in the registered slab: the caller stages its partial in
- * out[layer][gate] (pulsar_tp_slab_gate_out) and reads the peer's from
- * in[layer][gate] (pulsar_tp_slab_gate_in) after the call.  Unlike the big
- * gate this lane has no per-call TCP handshake: the RDMA receive window is
- * pre-posted (16 deep) and re-armed once after any big gate drained it. */
-int pulsar_tp_gate_exchange_next(pulsar_tp *tp, uint32_t layer, uint32_t gate);
-void *pulsar_tp_slab_gate_out(const pulsar_tp *tp, uint32_t layer, uint32_t gate);
-void *pulsar_tp_slab_gate_in(const pulsar_tp *tp, uint32_t layer, uint32_t gate);
+/* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges.  Swaps
+ * `rows` (1..PULSAR_TP_BATCH_MAX_ROWS) vectors of vec_bytes with the peer:
+ * `own` is this rank's rows, `peer` receives the peer's, both caller host
+ * memory ([rows][vec_bytes]).  Rides the pre-posted RDMA receive window as a
+ * sequence-numbered ring over the slab's gate slots -- one message per row, a
+ * transport-owned monotonic seq -- with no per-call TCP handshake (the big
+ * gate's header + ARMED round trips were ~670 us of every ~720 us exchange).
+ * Both ranks must call it with the same `rows` in the same order, which the
+ * group's lockstep already guarantees; the seq keeps them paired.  Only valid
+ * when pulsar_tp_row_lane() says so -- the caller picks the lane, this call
+ * never falls back.  Returns 1 on success, 0 on failure (refused by name). */
+bool pulsar_tp_row_lane(const pulsar_tp *tp);
+int pulsar_tp_row_exchange(pulsar_tp *tp, const void *own, void *peer, uint32_t rows);
 
 /* Verify-block batch gate: exchange `rows` (<= PULSAR_TP_BATCH_MAX_ROWS) row
  * partials for one layer in one bulk transfer.  Returns 0 on failure. */
