@@ -774,14 +774,20 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
                                                           L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
                     !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
-                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi)) {
+                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
+                    /* 4g-2: stage 'b' row-parallel -- the K-half over the same
+                     * owned group columns [a_lo, a_hi) of its a_out_full input. */
+                    !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
+                                                       L->attn_output_b->abs_offset, a_out_full,
+                                                       L->attn_output_b->dim[1], a_lo, a_hi,
+                                                       e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
                     fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
                                     "registered -- refusing\n", il);
                     e->destroy();
                     *out = NULL;
                     return 1;
                 }
-                registered += 2;
+                registered += 3;
                 if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
                     fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
                                     "registered -- refusing\n", il);
@@ -805,7 +811,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             uint32_t sx_lo = 0, sx_hi = 0;
             (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
             fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                            "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu)) and "
+                            "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
                             "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
                             "%u layers + %u drafter blocks): %u slices registered\n",
                     tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,

@@ -2436,13 +2436,5 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
                               uint64_t exch, void *err_dev, uint64_t timeout_ns);
-/* dst[r][self_off..] = own row, dst[r][peer_off..] = peer row (row pitch
- * full_floats); waits for done >= exch first. */
-int pulsar_gpu_tp_combine_gather(pulsar_gpu_tensor *dst, const void *slab_dev,
-                                 uint64_t out_off, uint64_t in_off, uint64_t vec_bytes,
-                                 uint64_t first_msg, uint32_t n_slots, uint32_t rows,
-                                 uint64_t self_off_floats, uint64_t peer_off_floats,
-                                 uint64_t full_floats, const void *done_dev, uint64_t exch,
-                                 void *err_dev, uint64_t timeout_ns);
 
 #endif

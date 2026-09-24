@@ -1564,9 +1564,9 @@ typedef struct {
      * prefill big-gate call sites read this rather than threading the engine
      * through every prefill entry point. */
     struct pulsar_tp *tp;
-    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented once
-     * per layer per chunk by tp_prefill_big_gate and once per layer per chunk by
-     * the attention `low` gather (slice 4g).  Every rank advances it in the same
+    /** Monotonic prefill big-gate exchange counter (slice 4b), incremented by
+     * tp_allreduce_rows on its big-gate path: once per layer per prefill chunk
+     * for the attention output and once for the FFN (4g-2).  Every rank advances it in the same
      * order from the same starting value, so the exchange seq stays in
      * lockstep (the transport uses it as a desync guard). */
     uint64_t tp_prefill_seq;
