@@ -1274,7 +1274,10 @@ static int routed_moe_try_mmq_down(
  * dataflow is the IQ2 arm's -- the same sorted pairs, the same producer E4M3
  * staging, per-pair f32 outputs, a fixed-order sum -- with the trellis GEMV
  * in place of the D2R launch and the format's rotations in the fold and the
- * sum (mmq/ds4_exl3_gemv.cuh).  EVERY row takes it, decode and prefill: one
+ * sum (mmq/ds4_exl3_gemv.cuh).  Under TP (slice 4f) only the owned experts
+ * are staged: a peer-owned assignment writes zeros in both GEMVs (the fold and
+ * the sum then carry zeros) and the layer's all-reduce sums the ranks.  EVERY
+ * row takes it, decode and prefill: one
  * arithmetic, no row-kind boundary in this lane.  A prefill assignment
  * re-streams its expert, so long prompts are slow here; the tile arm for
  * prefill is a later slice, and the announce line says which arm ran. */
@@ -1316,14 +1319,7 @@ static int routed_moe_launch_exl3(
                     gate_type, down_type); }
         return 0;
     }
-    if (expert_lo != 0u || expert_hi != n_total_expert) {
-        static int said = 0;
-        if (!said) { said = 1;
-            fprintf(stderr, "pulsar: EXL3 routed MoE cannot honor expert ownership "
-                    "(range [%u,%u) of %u) yet -- no fallback; refusing\n",
-                    expert_lo, expert_hi, n_total_expert); }
-        return 0;
-    }
+    if (expert_lo >= expert_hi || expert_hi > n_total_expert) return 0;
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % 256u != 0 || expert_mid_dim % 256u != 0 || out_dim % 128u != 0 ||
@@ -1340,16 +1336,15 @@ static int routed_moe_launch_exl3(
 #ifndef PULSAR_HAVE_MMQ
     return 0;   /* the pair/single drivers live in the MMQ TU */
 #else
-    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
-    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_bytes > model_size - gate_offset ||
-        gate_bytes > model_size - up_offset ||
-        down_bytes > model_size - down_offset) {
-        return 0;
-    }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    /* slice 4f: only the owned experts [lo,hi) are staged; the pointers are
+     * REBASED to where expert 0 would sit (routed_expert_stack_ptr) and the
+     * owned table clamps peer entries.  lo=0, hi=n_total is the whole stack. */
+    const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_expert_bytes, n_total_expert,
+                                                 expert_lo, expert_hi, "moe_exl3_gate");
+    const char *up_w = routed_expert_stack_ptr(model_map, up_offset, gate_expert_bytes, n_total_expert,
+                                               expert_lo, expert_hi, "moe_exl3_up");
+    const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_expert_bytes, n_total_expert,
+                                                 expert_lo, expert_hi, "moe_exl3_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
     static int mmq_ready = -1;
@@ -1369,9 +1364,12 @@ static int routed_moe_launch_exl3(
                 k2g / 2.0, k2d / 2.0);
     }
     /* the [trellis, scales] tables: row_bytes is the split point (routed_expert_side_layout) */
-    const void *const *gt = exl3_expert_table(gate_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
-    const void *const *ut = exl3_expert_table(up_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
-    const void *const *dt = exl3_expert_table(down_w, n_total_expert, down_expert_bytes, down_row_bytes);
+    const void *const *gt = exl3_expert_table_owned(gate_w, n_total_expert, gate_expert_bytes, gate_row_bytes,
+                                                    expert_lo, expert_hi);
+    const void *const *ut = exl3_expert_table_owned(up_w, n_total_expert, gate_expert_bytes, gate_row_bytes,
+                                                    expert_lo, expert_hi);
+    const void *const *dt = exl3_expert_table_owned(down_w, n_total_expert, down_expert_bytes, down_row_bytes,
+                                                    expert_lo, expert_hi);
     if (!gt || !ut || !dt) {
         fprintf(stderr, "pulsar: EXL3 routed MoE: no expert table -- refusing\n");
         return 0;
@@ -1398,8 +1396,8 @@ static int routed_moe_launch_exl3(
     float *up_z = (float *)mid->ptr;     /* pairs x mid f32, the unrotated up z; the fold reads both */
     int rc = ds4_exl3_moe_pair(gt, ut, k2g, selected_ptr, gate_z, up_z,
                                (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
-                               (int)n_total_expert, (int)n_expert, cudaStreamPerThread,
-                               act_q, act_sf, act_kbp);
+                               (int)n_total_expert, (int)n_expert, (int)expert_lo, (int)expert_hi,
+                               cudaStreamPerThread, act_q, act_sf, act_kbp);
     if (rc != 0) {
         fprintf(stderr, "pulsar: EXL3 routed MoE gate/up declined (rc=%d) -- no fallback\n", rc);
         return 0;
@@ -1412,7 +1410,8 @@ static int routed_moe_launch_exl3(
     pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     rc = ds4_exl3_moe_single(dt, k2d, selected_ptr, (float *)down->ptr,
                              (int)out_dim, (int)expert_mid_dim, (int)pairs,
-                             (int)n_total_expert, 1, cudaStreamPerThread, mid_q, mid_sf, mid_kbp);
+                             (int)n_total_expert, 1, (int)expert_lo, (int)expert_hi,
+                             cudaStreamPerThread, mid_q, mid_sf, mid_kbp);
     if (rc != 0) {
         fprintf(stderr, "pulsar: EXL3 routed MoE down declined (rc=%d) -- no fallback\n", rc);
         return 0;

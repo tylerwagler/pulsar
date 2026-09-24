@@ -683,6 +683,11 @@ const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t
  *  bytes in (exl3_expert_layout).  Interleaved [trellis, scales] pointer
  *  pairs; refuses a split that is not strictly inside the slice. */
 const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_t stride, uint64_t split);
+/** Slice 4f for EXL3: experts [lo,hi) staged behind a REBASED base; peer
+ *  entries clamp to expert lo and are never read (the arm zero-fills a
+ *  peer-owned assignment before touching its table entry). */
+const void *const *exl3_expert_table_owned(const void *base, uint32_t n_total, uint64_t stride, uint64_t split,
+                                           uint32_t lo, uint32_t hi);
 void mxfp4_expert_tables_clear(void);
 
 /* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----

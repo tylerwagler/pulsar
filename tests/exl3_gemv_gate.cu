@@ -239,7 +239,7 @@ int main(void) {
         dev_stack sg, su;
         if (upload_stack(gate, sg) || upload_stack(up, su)) return 1;
         CUDA_OK(cudaMemset(d_zg, 0, (size_t)r.n_assign * M * sizeof(float)));
-        const int rc = ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, k2, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0);
+        const int rc = ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, k2, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 0);
         CHECK(rc == 0, "pair launch k2=%d rc=%d", k2, rc);
         CUDA_OK(cudaDeviceSynchronize());
         CUDA_OK(cudaMemcpy(zg.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -373,7 +373,7 @@ int main(void) {
                 CUDA_OK(cudaMalloc((void **)&d_am, am.bytes()));
                 CUDA_OK(cudaMemcpy(d_am, am.raw.data(), am.bytes(), cudaMemcpyHostToDevice));
                 CUDA_OK(cudaMalloc((void **)&d_zdown, (size_t)r.n_assign * K * sizeof(float)));
-                const int drc = ds4_exl3_moe_gemv_single_launch(sd.table, 6, d_am, d_ids, d_bounds, d_zdown, K, M, r.n_assign, E, 0);
+                const int drc = ds4_exl3_moe_gemv_single_launch(sd.table, 6, d_am, d_ids, d_bounds, d_zdown, K, M, r.n_assign, E, 0, E, 0);
                 CHECK(drc == 0, "down launch rc=%d", drc);
                 CUDA_OK(cudaDeviceSynchronize());
                 std::vector<float> zdown((size_t)r.n_assign * K);
@@ -422,26 +422,26 @@ int main(void) {
                     CUDA_OK(cudaEventCreate(&t0)); CUDA_OK(cudaEventCreate(&t1));
                     const int iters = 40;
                     float ms = 0;
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0);
+                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0);
+                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     const double pair_bytes = 2.0 * 12 * (double)bg[0].stride;
                     printf("  pair GEMV K=3 5120->2304 x 12 assignments (12 experts, DRAM): %.1f us, %.0f GB/s (%.1f MB; %.1f us per matrix)\n",
                            ms * 1000.0, pair_bytes / (ms * 1e-3) / 1e9, pair_bytes / 1e6, ms * 1000.0 / 24.0);
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0);
+                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0);
+                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     const double down_bytes = 12.0 * (double)bd[0].stride;
                     printf("  down GEMV K=3 2304->5120 x 12 assignments (12 experts, DRAM): %.1f us, %.0f GB/s (%.1f MB; %.1f us per matrix)\n",
                            ms * 1000.0, down_bytes / (ms * 1e-3) / 1e9, down_bytes / 1e6, ms * 1000.0 / 12.0);
                     /* the same at ONE assignment (the single-stream decode step of one expert) */
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0);
+                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0);
+                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0, Eb, 0);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     printf("  pair GEMV K=3 x 1 assignment (L2-warm after the first rep): %.1f us, %.0f GB/s equivalent\n",
@@ -452,6 +452,37 @@ int main(void) {
                 }
                 cudaFree(d_am); cudaFree(d_zdown);
             }
+            /* 4b. TP ownership: with experts [1,3) owned, every assignment routed to
+             * expert 0 or 3 must come out exactly zero and every owned one must equal
+             * the whole-range run bit for bit (the same kernel, the same order). */
+            {
+                std::vector<float> zg_own(zg.size()), zu_own(zu.size());
+                CUDA_OK(cudaMemset(d_zg, 0x7f, zg.size() * sizeof(float)));   /* poison: zeros must be WRITTEN */
+                CUDA_OK(cudaMemset(d_zu, 0x7f, zu.size() * sizeof(float)));
+                const int orc = ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 1, 3, 0);
+                CHECK(orc == 0, "owned pair launch rc=%d", orc);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(zg_own.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(zu_own.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t peer_nonzero = 0, owned_diff = 0, n_peer = 0, n_owned = 0;
+                for (int pair = 0; pair < r.n_assign; pair++) {
+                    const bool owned = r.selected[pair] >= 1 && r.selected[pair] < 3;
+                    for (int n = 0; n < M; n++) {
+                        const size_t i = (size_t)pair * M + n;
+                        if (owned) { n_owned++; owned_diff += (zg_own[i] != zg[i]) || (zu_own[i] != zu[i]); }
+                        else       { n_peer++;  peer_nonzero += (zg_own[i] != 0.0f) || (zu_own[i] != 0.0f); }
+                    }
+                }
+                CHECK(n_peer > 0 && n_owned > 0, "the ownership case needs both owned and peer assignments (routing seed)");
+                CHECK(peer_nonzero == 0, "ownership: %zu of %zu peer-owned outputs are not zero", peer_nonzero, n_peer);
+                CHECK(owned_diff == 0, "ownership: %zu of %zu owned outputs differ from the whole-range run", owned_diff, n_owned);
+                CHECK(ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 3, 1, 0) != 0,
+                      "an inverted ownership range must refuse");
+                printf("  ownership [1,3): %zu peer outputs zero, %zu owned outputs bit-identical\n", n_peer, n_owned);
+                /* restore the whole-range z for the mutation check below */
+                ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+            }
             /* 5. the mutation: one flipped trellis bit in expert 0's gate must move z */
             {
                 uint8_t byte = 0;
@@ -459,7 +490,7 @@ int main(void) {
                 byte ^= 0x10u;
                 CUDA_OK(cudaMemcpy(sg.arena + 1000, &byte, 1, cudaMemcpyHostToDevice));
                 std::vector<float> zg2(zg.size());
-                ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0);
+                ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 0);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(zg2.data(), d_zg, zg2.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 size_t moved = 0;

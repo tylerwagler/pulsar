@@ -269,8 +269,11 @@ int ds4_mmq_moe_impl(
         int             act_kbp    = 0,
         /* L245: 0 = the IQ2 D2R arm over x_soa; a rate in half-bit units
          * (4/5/6) = the EXL3 trellis GEMV over the [trellis, scales] table W
-         * (the same sorted pairs and E4M3 staging feed it). */
-        int             exl3_k2    = 0) {
+         * (the same sorted pairs and E4M3 staging feed it), over the owned
+         * experts [exl3_lo, exl3_hi). */
+        int             exl3_k2    = 0,
+        int             exl3_lo    = 0,
+        int             exl3_hi    = 0) {
 
     if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -471,7 +474,7 @@ int ds4_mmq_moe_impl(
     {
         const int rc = exl3_k2
             ? ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                              out_f32, M, K, ne_get_rows, n_experts, stream)
+                                              out_f32, M, K, ne_get_rows, n_experts, exl3_lo, exl3_hi, stream)
             : ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
@@ -529,7 +532,9 @@ int ds4_mmq_moe_pair_impl(
         const void    * act_sf     = NULL,
         int             act_kbp    = 0,
         /* L245: see ds4_mmq_moe_impl; the EXL3 tables ride in W_a / W_b. */
-        int             exl3_k2    = 0) {
+        int             exl3_k2    = 0,
+        int             exl3_lo    = 0,
+        int             exl3_hi    = 0) {
 
     if (!W_a || !W_b || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -705,7 +710,7 @@ int ds4_mmq_moe_pair_impl(
                         nvtx_prefill);
                 const int d2r_rc = exl3_k2
                     ? ds4_exl3_moe_gemv_pair_launch(W_a, W_b, exl3_k2, src1_e4m3, ids_dst, expert_bounds,
-                                                    out_a, out_b, M, K, ne_get_rows, n_experts, stream)
+                                                    out_a, out_b, M, K, ne_get_rows, n_experts, exl3_lo, exl3_hi, stream)
                     : ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks,
                         src1_e4m3, ids_dst,
@@ -836,6 +841,7 @@ extern "C" int ds4_exl3_moe_pair(
         const void * gate_table, const void * up_table, int k2,
         const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int expert_lo, int expert_hi,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
     if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
@@ -845,12 +851,13 @@ extern "C" int ds4_exl3_moe_pair(
     return ds4_mmq_moe_pair_impl(
         "ds4_exl3_moe_pair", gate_table, up_table, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
-        NULL, NULL, 0, act_q, act_sf, act_kbp, k2);
+        NULL, NULL, 0, act_q, act_sf, act_kbp, k2, expert_lo, expert_hi);
 }
 
 extern "C" int ds4_exl3_moe_single(
         const void * table, int k2, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int expert_lo, int expert_hi,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
     if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
@@ -859,5 +866,5 @@ extern "C" int ds4_exl3_moe_single(
     }
     return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
                             M, K, n_tokens, n_experts, n_expert_used, stream,
-                            NULL, 0, act_q, act_sf, act_kbp, k2);
+                            NULL, 0, act_q, act_sf, act_kbp, k2, expert_lo, expert_hi);
 }

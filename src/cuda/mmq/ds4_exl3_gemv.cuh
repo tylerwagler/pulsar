@@ -38,6 +38,8 @@ int ds4_exl3_moe_gemv_pair_launch(
     int             K,
     int64_t         n_assign,
     int             n_experts,
+    int             e_lo,          /**< TP ownership [e_lo, e_hi): a peer-owned assignment writes zeros */
+    int             e_hi,
     cudaStream_t    stream);
 
 /** down: out [n_assign][M] f32 = the UNROTATED z_d; the input (mid) arrives
@@ -53,6 +55,8 @@ int ds4_exl3_moe_gemv_single_launch(
     int             K,
     int64_t         n_assign,
     int             n_experts,
+    int             e_lo,
+    int             e_hi,
     cudaStream_t    stream);
 
 /** The EXL3 SwiGLU fold: per pair (pair = tok * n_expert + slot, expert =

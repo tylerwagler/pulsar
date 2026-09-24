@@ -119,7 +119,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      const int32_t *__restrict__ expert_bounds,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
-                     int M, int K, int n_assign, int E) {
+                     int M, int K, int n_assign, int E, int e_lo, int e_hi) {
     constexpr int W32 = Exl3Rate<K2>::words32;
     __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
     __shared__ float s_red[kWarps][kRows][2];
@@ -142,6 +142,17 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
     }
     __syncthreads();
     const int expert = s_expert;
+    /* TP ownership (slice 4f): a peer-owned assignment contributes ZERO on this
+     * rank -- the engine all-reduces each layer's routed output across ranks --
+     * and its table entry is never dereferenced (it is clamped, not staged). */
+    if (expert < e_lo || expert >= e_hi) {
+        if (warp == 0 && row < M) {
+            const uint64_t o = (uint64_t)ids_dst[col] * (uint64_t)M + (uint64_t)row;
+            out_gate[o] = 0.0f;
+            if constexpr (PAIR) out_up[o] = 0.0f;
+        }
+        return;
+    }
 
     const void *const *pg = reinterpret_cast<const void *const *>(gate_table);
     const void *const *pu = reinterpret_cast<const void *const *>(up_table);
@@ -330,11 +341,16 @@ exl3_moe_sum_kernel(float *__restrict__ out,
 template <bool PAIR>
 int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
                      const int32_t *ids_dst, const int32_t *expert_bounds,
-                     float *og, float *ou, int M, int K, int64_t n_assign, int E, cudaStream_t stream) {
+                     float *og, float *ou, int M, int K, int64_t n_assign, int E,
+                     int e_lo, int e_hi, cudaStream_t stream) {
     const char *tag = PAIR ? "ds4_exl3_moe_gemv_pair_launch" : "ds4_exl3_moe_gemv_single_launch";
     if (!gt || (PAIR && !ut) || !act || !ids_dst || !expert_bounds || !og || (PAIR && !ou) ||
         M <= 0 || K <= 0 || n_assign <= 0 || E <= 0) {
         fprintf(stderr, "%s: null pointer or bad shape\n", tag);
+        return -1;
+    }
+    if (e_lo < 0 || e_lo >= e_hi || e_hi > E) {
+        fprintf(stderr, "%s: expert ownership [%d,%d) of %d is not a range -- refusing\n", tag, e_lo, e_hi, E);
         return -1;
     }
     if (M % kRows || K % EXL3_HAD_BLOCK || K > kMaxK || n_assign > INT32_MAX) {
@@ -347,9 +363,9 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
     const dim3 block(kRows, kWarps, 1);
     const block_mx_act_mmq *a = (const block_mx_act_mmq *)act;
     switch (k2) {
-    case 4: exl3_moe_gemv_kernel<PAIR, 4><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 5: exl3_moe_gemv_kernel<PAIR, 5><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 6: exl3_moe_gemv_kernel<PAIR, 6><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
+    case 4: exl3_moe_gemv_kernel<PAIR, 4><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E, e_lo, e_hi); break;
+    case 5: exl3_moe_gemv_kernel<PAIR, 5><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E, e_lo, e_hi); break;
+    case 6: exl3_moe_gemv_kernel<PAIR, 6><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E, e_lo, e_hi); break;
     default:
         fprintf(stderr, "%s: rate k2=%d has no instance (2, 2.5, 3) -- refusing\n", tag, k2);
         return -1;
@@ -369,17 +385,17 @@ bool ds4_exl3_gemv_rate_supported(int k2) { return k2 == 4 || k2 == 5 || k2 == 6
 int ds4_exl3_moe_gemv_pair_launch(const void *gate_table, const void *up_table, int k2, const void *act,
                                   const int32_t *ids_dst, const int32_t *expert_bounds,
                                   float *out_gate, float *out_up, int M, int K, int64_t n_assign,
-                                  int n_experts, cudaStream_t stream) {
+                                  int n_experts, int e_lo, int e_hi, cudaStream_t stream) {
     return exl3_gemv_launch<true>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
-                                  out_gate, out_up, M, K, n_assign, n_experts, stream);
+                                  out_gate, out_up, M, K, n_assign, n_experts, e_lo, e_hi, stream);
 }
 
 int ds4_exl3_moe_gemv_single_launch(const void *table, int k2, const void *act,
                                     const int32_t *ids_dst, const int32_t *expert_bounds,
                                     float *out, int M, int K, int64_t n_assign,
-                                    int n_experts, cudaStream_t stream) {
+                                    int n_experts, int e_lo, int e_hi, cudaStream_t stream) {
     return exl3_gemv_launch<false>(table, nullptr, k2, act, ids_dst, expert_bounds,
-                                   out, nullptr, M, K, n_assign, n_experts, stream);
+                                   out, nullptr, M, K, n_assign, n_experts, e_lo, e_hi, stream);
 }
 
 int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32_t *selected,

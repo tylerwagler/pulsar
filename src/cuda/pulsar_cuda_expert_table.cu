@@ -128,6 +128,12 @@ const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_
     return expert_table_get(base, n_total, 2, stride, split, stride, 0, n_total);
 }
 
+const void *const *exl3_expert_table_owned(const void *base, uint32_t n_total, uint64_t stride, uint64_t split,
+                                           uint32_t lo, uint32_t hi) {
+    if (split == 0 || split >= stride) return NULL;
+    return expert_table_get(base, n_total, 2, stride, split, stride, lo, hi);
+}
+
 void mxfp4_expert_tables_clear(void) {
     for (struct expert_table *t = g_expert_tables; t; ) {
         struct expert_table *next = t->next;
