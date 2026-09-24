@@ -92,10 +92,10 @@ typedef struct {
  *
  *   out vectors    S*vec   written by local GPU kernels
  *   in  vectors    S*vec   RDMA/TCP-written peer partials
- *   in  seq flags  S*8     written after each in vector
+ *   in  seq flags  S*8     [0] = row lane done word (proxy-written exchange id)
  *   token slot     16      {seq u64, token i32, pad} leader->worker
- *   out flag sats  S*8
- *   gpu flags      S*4     GPU-written gate-ready flags
+ *   out flag sats  S*8     [0..2] = row lane descriptor (GPU-written, id last)
+ *   gpu flags      S*4     [0] = row lane device spin-timeout latch
  *   batch out      n_layer*MAX_ROWS*vec   (verify-block partial rows)
  *   batch in       n_layer*MAX_ROWS*vec
  */
@@ -284,19 +284,45 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);
 
-/* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges.  Swaps
- * `rows` (1..PULSAR_TP_BATCH_MAX_ROWS) vectors of vec_bytes with the peer:
- * `own` is this rank's rows, `peer` receives the peer's, both caller host
- * memory ([rows][vec_bytes]).  Rides the pre-posted RDMA receive window as a
- * sequence-numbered ring over the slab's gate slots -- one message per row, a
- * transport-owned monotonic seq -- with no per-call TCP handshake (the big
- * gate's header + ARMED round trips were ~670 us of every ~720 us exchange).
- * Both ranks must call it with the same `rows` in the same order, which the
- * group's lockstep already guarantees; the seq keeps them paired.  Only valid
- * when pulsar_tp_row_lane() says so -- the caller picks the lane, this call
- * never falls back.  Returns 1 on success, 0 on failure (refused by name). */
+/* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges, fully
+ * asynchronous.  An exchange swaps `rows` (1..PULSAR_TP_BATCH_MAX_ROWS)
+ * vectors of vec_bytes with the peer and never makes the engine thread wait:
+ *
+ *  - the engine thread calls pulsar_tp_row_lane_begin, which numbers the
+ *    exchange (monotonic id) and its messages (one per row, monotonic seq --
+ *    message t lives in slab slot (t-1) % n_slots, out-slots to send, in-slots
+ *    to receive), and arms the pre-posted RDMA receive window when a big gate
+ *    drained it (the ARMED handshake stays on the engine thread: the proxy
+ *    never touches the control socket);
+ *  - the engine then enqueues the GPU half (pulsar_gpu_tp_{stage_rows,
+ *    publish,combine_*}): stage own rows into the out-slots, publish the
+ *    descriptor, combine once the done word reaches the exchange id;
+ *  - the proxy thread (verbs only, NO CUDA -- port rule 1) polls the
+ *    descriptor, posts the sends, waits for the peer's rows AND its own send
+ *    completions, re-posts the window, then writes the done word.
+ *
+ * Ring invariants (checked by pulsar_tp_row_lane): WINDOW + MAX_ROWS <=
+ * n_slots, and at most one exchange in flight -- the GPU combines exchange e
+ * before it stages e+1 -- so no slot is rewritten or re-posted while live.
+ * Both ranks number exchanges identically by lockstep.  A proxy timeout
+ * latches failed(); a device spin timeout sets the slab's error word; the
+ * engine refuses at its next host sync through pulsar_tp_row_lane_check. */
+typedef struct {
+    uint64_t out_off, in_off;   /* gate-slot rings (message slots) */
+    uint64_t desc_off;          /* u64[3] {exchange id (written last), first msg, rows} */
+    uint64_t done_off;          /* u64: last exchange the proxy completed */
+    uint64_t err_off;           /* u32: device spin timeout latch */
+    uint64_t vec_bytes;
+    uint32_t n_slots;
+    uint64_t timeout_ns;        /* device spin bound = the transport timeout */
+} pulsar_tp_row_lane_layout_t;
+
 bool pulsar_tp_row_lane(const pulsar_tp *tp);
-int pulsar_tp_row_exchange(pulsar_tp *tp, const void *own, void *peer, uint32_t rows);
+void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out);
+int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch);
+/* At a host sync point (the stream is drained): 1 when every enqueued
+ * exchange completed cleanly, 0 (refused by name) otherwise. */
+int pulsar_tp_row_lane_check(pulsar_tp *tp);
 
 /* Verify-block batch gate: exchange `rows` (<= PULSAR_TP_BATCH_MAX_ROWS) row
  * partials for one layer in one bulk transfer.  Returns 0 on failure. */

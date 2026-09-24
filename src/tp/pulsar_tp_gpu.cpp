@@ -32,6 +32,17 @@ int pulsar_tp_gpu_slab_alloc_hostpin(size_t bytes, void **base,
     return 1;
 }
 
+void *pulsar_tp_gpu_slab_device_ptr(void *base, char *err, size_t errlen) {
+    void *dev = NULL;
+    const cudaError_t ce = cudaHostGetDevicePointer(&dev, base, 0);
+    if (ce != cudaSuccess || !dev) {
+        if (err && errlen)
+            snprintf(err, errlen, "tp gpu: cudaHostGetDevicePointer: %s", cudaGetErrorString(ce));
+        return NULL;
+    }
+    return dev;
+}
+
 void pulsar_tp_gpu_slab_free_hostpin(void *base) {
     if (!base) return;
     cudaHostUnregister(base);

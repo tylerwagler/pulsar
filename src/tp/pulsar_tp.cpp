@@ -543,9 +543,14 @@ struct pulsar_tp {
     /* The cross-rank logits identity tally (leader only; L243). */
     uint64_t identity_frames;
     uint64_t identity_matched;
-    /* The row lane's monotonic message seq (4g-2): one per row, advanced by
-     * pulsar_tp_row_exchange, identical on every rank by lockstep. */
+    /* The row lane (4g-2).  Engine thread: gate_seq = last message numbered,
+     * row_exch = last exchange numbered.  Proxy thread: proxy_* below. */
     uint64_t gate_seq = 0;
+    uint64_t row_exch = 0;
+    pthread_t proxy;
+    bool proxy_started = false;
+    std::atomic<bool> proxy_stop{false};
+    std::atomic<bool> proxy_failed{false};
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
 };
 
@@ -577,7 +582,7 @@ void pulsar_tp_timing_report(const pulsar_tp *tp) {
                 tot * 1e3, tot * 1e6 / (double)g_tsite[s].n);
     }
     if (g_tg.n)
-        fprintf(stderr, "pulsar: tp-timing rank %d: transport gate lane: %llu calls, %.1f ms total, %.1f us per call\n",
+        fprintf(stderr, "pulsar: tp-timing rank %d: row lane proxy: %llu exchanges, %.1f ms total, %.1f us per exchange (descriptor seen -> done)\n",
                 rank, (unsigned long long)g_tg.n, g_tg.t * 1e3, g_tg.t * 1e6 / g_tg.n);
     if (g_tx.n)
         fprintf(stderr, "pulsar: tp-timing rank %d: transport pair big-gate: %llu calls, %llu rdma rounds, "
@@ -1377,51 +1382,57 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
     return ok;
 }
 
-/* The row lane over RDMA.  Message seq t (1-based, one per row) is sent from
- * out-slot (t-1) % n_slots and received into in-slot (t-1) % n_slots -- the
- * receive for t was posted RECV_WINDOW messages earlier (tp_rdma_post_gate_recv,
- * wr_id = t on its final chunk, so recv_done is the arrival watermark).  Ring
- * invariants, both asserted by pulsar_tp_row_lane's WINDOW + MAX_ROWS <= n_slots:
- *   - an in-slot is re-posted only after its row was copied out (read, then post);
- *   - an out-slot is rewritten only after its previous send completed (sends
- *     complete in order on one QP, so send_outstanding + rows <= n_slots does it).
- * Arming and the drain before any big gate are the single-row gate's, unchanged. */
-static int tp_rdma_row_exchange(pulsar_tp *tp, const uint8_t *own, uint8_t *peer, uint32_t rows) {
+/* The row lane's three slab words (layout: pulsar_tp.h). */
+static inline volatile uint64_t *tp_row_desc(pulsar_tp *tp) {
+    return (volatile uint64_t *)(tp->slab + tp->layout.out_flags_off);
+}
+static inline std::atomic<uint64_t> *tp_row_done(pulsar_tp *tp) {
+    return reinterpret_cast<std::atomic<uint64_t> *>(tp->slab + tp->layout.in_flags_off);
+}
+static inline volatile uint32_t *tp_row_err(pulsar_tp *tp) {
+    return (volatile uint32_t *)(tp->slab + tp->layout.gpu_flags_off);
+}
+
+/* Arm the row lane's receive window at message `first`: post WINDOW
+ * receives, then the ARMED handshake on the control socket (a rank that sends
+ * before the peer's window is armed silently loses messages under UC).
+ * Engine thread only. */
+static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    const uint64_t vb = tp->vec_bytes;
-    const uint64_t first = tp->gate_seq + 1u, last = tp->gate_seq + rows;
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
-    if (!r->recv_window_active) {
-        for (uint64_t s = first; ok && s < first + PULSAR_TP_RDMA_RECV_WINDOW; s++)
-            ok = tp_rdma_post_gate_recv(tp, s);
-        if (ok) ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
-        if (ok) {
-            uint32_t rtype = 0, rbytes = 0;
-            ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
-                 rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
-        }
-        if (ok) r->recv_window_active = true;
+    for (uint64_t s = first; ok && s < first + PULSAR_TP_RDMA_RECV_WINDOW; s++)
+        ok = tp_rdma_post_gate_recv(tp, s);
+    if (ok) ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
+    if (ok) {
+        uint32_t rtype = 0, rbytes = 0;
+        ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
+             rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
     }
-    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
-    uint32_t peer_poll = 0;
-    /* out-slot reuse: every send that last used these slots has completed */
-    while (ok && r->send_outstanding + rows > tp->n_slots) {
-        ok = tp_rdma_drain_cq(tp);
-        if (ok && tp_now_sec() > deadline) {
-            fprintf(stderr, "pulsar-tp: row lane: timeout reaping sends (%u outstanding)\n", r->send_outstanding);
-            ok = 0;
-        }
-    }
+    if (ok) r->recv_window_active = true;
+    pthread_mutex_unlock(&r->post_lock);
+    return ok;
+}
+
+/* One exchange, proxy thread.  Message t is sent from out-slot (t-1)%n_slots
+ * (the GPU staged it there) and received into in-slot (t-1)%n_slots (posted
+ * WINDOW messages earlier).  Completion = the peer's `rows` landed AND our
+ * own sends retired, so the GPU may rewrite those out-slots the moment it
+ * sees done.  The window is re-posted before done is written, so the proxy is
+ * idle -- and the QP quiet -- whenever the engine observes done == enqueued. */
+static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    const uint64_t vb = tp->vec_bytes, last = first + rows - 1u;
+    pthread_mutex_lock(&r->post_lock);
+    int ok = r->recv_window_active ? 1 : 0;
+    if (!ok) fprintf(stderr, "pulsar-tp: row lane proxy: exchange published with no armed window\n");
     for (uint32_t k = 0; ok && k < rows; k++) {
         const uint64_t t = first + k;
-        uint8_t *slot = tp->slab + tp->layout.out_off + (uint64_t)tp_gate_slot(tp, t) * vb;
-        memcpy(slot, own + (uint64_t)k * vb, vb);
         struct tp_ibv_sge sge;
         struct tp_ibv_send_wr wr;
         struct tp_ibv_send_wr *bad = NULL;
         (void)memset(&wr, 0, sizeof(wr));
-        sge.addr = (uintptr_t)slot;
+        sge.addr = (uintptr_t)(tp->slab + tp->layout.out_off + (uint64_t)tp_gate_slot(tp, t) * vb);
         sge.length = (uint32_t)vb;
         sge.lkey = TP_LKEY(tp->rdma.mr);
         wr.wr_id = t;
@@ -1434,29 +1445,78 @@ static int tp_rdma_row_exchange(pulsar_tp *tp, const uint8_t *own, uint8_t *peer
                          (unsigned long long)t, strerror(errno));
         else r->send_outstanding++;
     }
-    while (ok && r->recv_done < last) {
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
-        if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-            fprintf(stderr, "pulsar-tp: peer disconnected during row lane exchange\n");
-            ok = 0;
-        }
         if (ok && tp_now_sec() > deadline) {
-            fprintf(stderr, "pulsar-tp: row lane: timeout waiting seq %llu (recv_done %llu)\n",
-                    (unsigned long long)last, (unsigned long long)r->recv_done);
+            fprintf(stderr, "pulsar-tp: row lane: timeout at seq %llu (recv_done %llu, "
+                            "%u sends outstanding)\n", (unsigned long long)last,
+                    (unsigned long long)r->recv_done, r->send_outstanding);
             ok = 0;
         }
     }
-    if (ok) {
-        std::atomic_thread_fence(std::memory_order_acquire);
-        for (uint32_t k = 0; k < rows; k++)
-            memcpy(peer + (uint64_t)k * vb,
-                   tp->slab + tp->layout.in_off + (uint64_t)tp_gate_slot(tp, first + k) * vb, vb);
-        for (uint32_t k = 0; ok && k < rows; k++)
-            ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
-    }
-    if (ok) { tp->gate_seq = last; r->last_gate_seq = last; }
+    for (uint32_t k = 0; ok && k < rows; k++)
+        ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
+    if (ok) r->last_gate_seq = last;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
+}
+
+static void *tp_row_proxy_main(void *arg) {
+    pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
+    volatile uint64_t *desc = tp_row_desc(tp);
+    std::atomic<uint64_t> *done = tp_row_done(tp);
+    uint64_t last_exch = 0, next_msg = 1;
+    double idle_since = tp_now_sec();
+    while (!tp->proxy_stop.load(std::memory_order_acquire)) {
+        const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
+        if (e == last_exch) {
+            /* busy-poll while decode is running; back off once idle */
+            if (tp_now_sec() - idle_since > 0.002) usleep(50);
+            continue;
+        }
+        const uint64_t first = desc[1];
+        const uint32_t rows = (uint32_t)desc[2];
+        if (e != last_exch + 1u || first != next_msg || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) {
+            fprintf(stderr, "pulsar-tp: row lane proxy: descriptor out of order (exchange %llu after %llu, "
+                            "first msg %llu want %llu, %u rows) -- lane failed\n",
+                    (unsigned long long)e, (unsigned long long)last_exch,
+                    (unsigned long long)first, (unsigned long long)next_msg, rows);
+            tp->proxy_failed.store(true, std::memory_order_release);
+            break;
+        }
+        const double t0 = tp_now_sec();
+        if (!tp_row_proxy_exchange(tp, first, rows)) {
+            tp->proxy_failed.store(true, std::memory_order_release);
+            break;
+        }
+        g_tg.n++; g_tg.t += tp_now_sec() - t0;
+        last_exch = e;
+        next_msg = first + rows;
+        done->store(e, std::memory_order_release);
+        idle_since = tp_now_sec();
+    }
+    return NULL;
+}
+
+static int tp_row_proxy_start(pulsar_tp *tp, char *err, size_t errlen) {
+    tp_row_desc(tp)[0] = 0; tp_row_desc(tp)[1] = 0; tp_row_desc(tp)[2] = 0;
+    tp_row_done(tp)->store(0, std::memory_order_release);
+    *tp_row_err(tp) = 0;
+    tp->proxy_stop.store(false);
+    if (pthread_create(&tp->proxy, NULL, tp_row_proxy_main, tp) != 0) {
+        tp_set_err(err, errlen, "tp: row lane proxy thread: %s", strerror(errno));
+        return 0;
+    }
+    tp->proxy_started = true;
+    return 1;
+}
+
+static void tp_row_proxy_stop(pulsar_tp *tp) {
+    if (!tp->proxy_started) return;
+    tp->proxy_stop.store(true, std::memory_order_release);
+    pthread_join(tp->proxy, NULL);
+    tp->proxy_started = false;
 }
 
 static int tp_rdma_big_gate_capable(const pulsar_tp *tp, const pulsar_tp_rdma_link *l) {
@@ -1823,6 +1883,7 @@ static pulsar_tp *tp_alloc(void) {
 
 static void tp_destroy(pulsar_tp *tp) {
     if (!tp) return;
+    tp_row_proxy_stop(tp);   /* before the QP it posts to goes away */
     tp_rdma_close(tp);
     /* The primary link's fds are ALSO peers[0]'s once bring-up completed, so
      * each descriptor is closed once: the primary here, and below every peer
@@ -2269,6 +2330,7 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
         if (!tp_rdma_register_slab(tp, err, errlen)) return 0;
         for (int i = 0; i < tp->n_peers; i++)
             if (!tp_rdma_link_bringup(tp, &tp->peers[i], err, errlen)) return 0;
+        if (pulsar_tp_row_lane(tp) && !tp_row_proxy_start(tp, err, errlen)) return 0;
         return 1;
     }
     (void)err; (void)errlen;
@@ -2323,21 +2385,70 @@ bool pulsar_tp_row_lane(const pulsar_tp *tp) {
            PULSAR_TP_RDMA_RECV_WINDOW + PULSAR_TP_BATCH_MAX_ROWS <= tp->n_slots;
 }
 
-static int tp_rdma_row_exchange(pulsar_tp *tp, const uint8_t *own, uint8_t *peer, uint32_t rows);
+static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first);
 
-int pulsar_tp_row_exchange(pulsar_tp *tp, const void *own, void *peer, uint32_t rows) {
-    if (!pulsar_tp_row_lane(tp) || !own || !peer || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) {
-        fprintf(stderr, "pulsar-tp: row lane refused (%u rows; pair+rdma+slab required, "
+void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!tp) return;
+    out->out_off = tp->layout.out_off;
+    out->in_off = tp->layout.in_off;
+    out->desc_off = tp->layout.out_flags_off;
+    out->done_off = tp->layout.in_flags_off;
+    out->err_off = tp->layout.gpu_flags_off;
+    out->vec_bytes = tp->vec_bytes;
+    out->n_slots = tp->n_slots;
+    out->timeout_ns = tp->timeout_sec * 1000000000ull;
+}
+
+
+int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch) {
+    if (!pulsar_tp_row_lane(tp) || !tp->proxy_started || rows == 0 ||
+        rows > PULSAR_TP_BATCH_MAX_ROWS || !first_msg || !exch) {
+        fprintf(stderr, "pulsar-tp: row lane refused (%u rows; pair+rdma+slab+proxy required, "
                         "rows 1..%u) -- the caller must pick the lane\n", rows, PULSAR_TP_BATCH_MAX_ROWS);
         return 0;
     }
+    if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
+        fprintf(stderr, "pulsar-tp: row lane refused: an earlier exchange failed "
+                        "(proxy %s, device spin %s)\n",
+                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) ? "timed out" : "ok");
+        return 0;
+    }
     static int said = 0;
-    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: row lane armed (pre-posted rdma window %u, <= %u rows per exchange)\n",
+    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: row lane armed (async: GPU stage/publish/combine "
+                                   "+ verbs proxy thread; rdma window %u, <= %u rows per exchange)\n",
                                    (unsigned)PULSAR_TP_RDMA_RECV_WINDOW, PULSAR_TP_BATCH_MAX_ROWS); }
-    const double t0 = tp_now_sec();
-    const int ok = tp_rdma_row_exchange(tp, (const uint8_t *)own, (uint8_t *)peer, rows);
-    g_tg.n++; g_tg.t += tp_now_sec() - t0;
-    return ok;
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    if (!r->recv_window_active) {
+        /* Only ever after a big gate drained the window, i.e. after a stream
+         * sync, so the previous exchange is complete and the proxy is idle. */
+        if (tp_row_done(tp)->load(std::memory_order_acquire) != tp->row_exch) {
+            fprintf(stderr, "pulsar-tp: row lane: re-arm with exchange %llu still in flight "
+                            "(done %llu) -- refusing\n", (unsigned long long)tp->row_exch,
+                    (unsigned long long)tp_row_done(tp)->load());
+            return 0;
+        }
+        if (!tp_row_lane_arm(tp, tp->gate_seq + 1u)) return 0;
+    }
+    *first_msg = tp->gate_seq + 1u;
+    tp->gate_seq += rows;
+    *exch = ++tp->row_exch;
+    return 1;
+}
+
+int pulsar_tp_row_lane_check(pulsar_tp *tp) {
+    if (!tp || !tp->proxy_started) return 1;
+    const uint64_t done = tp_row_done(tp)->load(std::memory_order_acquire);
+    const uint32_t err = *tp_row_err(tp);
+    if (tp->proxy_failed.load(std::memory_order_acquire) || err || done != tp->row_exch) {
+        fprintf(stderr, "pulsar-tp: row lane check FAILED at a drained stream: exchange %llu "
+                        "enqueued, %llu completed, proxy %s, device spin %s -- refusing\n",
+                (unsigned long long)tp->row_exch, (unsigned long long)done,
+                tp->proxy_failed.load() ? "failed" : "ok", err ? "timed out" : "ok");
+        tp->failed.store(true, std::memory_order_release);
+        return 0;
+    }
+    return 1;
 }
 
 /* The RDMA big gate's DIRECT rule -- see pulsar_tp.h.  Boundary matches the

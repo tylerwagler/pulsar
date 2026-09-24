@@ -1570,6 +1570,9 @@ typedef struct {
      * order from the same starting value, so the exchange seq stays in
      * lockstep (the transport uses it as a desync guard). */
     uint64_t tp_prefill_seq;
+    /** The registered slab's device mapping, borrowed from the engine at graph
+     * init beside `tp` -- what the row-lane kernels (4g-2) address. */
+    void *tp_slab_dev;
     /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
      * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
      * the same number of times in the same order, so the gather's seq stays in
@@ -1772,6 +1775,7 @@ struct pulsar_engine {
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
+    void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
     size_t tp_slab_bytes;       ///< slab size in bytes
     /** Slice 4g (L241): the attention OUTPUT GROUPS this rank owns,
      * [tp_group_lo, tp_group_hi) of PULSAR_N_OUT_GROUP, from the range

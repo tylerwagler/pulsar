@@ -678,7 +678,8 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_slab_bytes,
                                               &e->tp_slab_base,
                                               tperr, sizeof(tperr)) ||
-            !pulsar_tp_attach_slab(e->tp, e->tp_slab_base, tperr, sizeof(tperr))) {
+            !pulsar_tp_attach_slab(e->tp, e->tp_slab_base, tperr, sizeof(tperr)) ||
+            !(e->tp_slab_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_slab_base, tperr, sizeof(tperr)))) {
             fprintf(stderr, "pulsar: tensor parallelism slab setup failed: %s\n",
                     tperr);
             e->destroy();
@@ -873,6 +874,7 @@ void pulsar_engine::destroy() {
     if (e->tp_slab_base) {
         pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);
         e->tp_slab_base = NULL;
+        e->tp_slab_dev = NULL;
         e->tp_slab_bytes = 0;
     }
     weights_free(&e->weights);
@@ -931,6 +933,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp = e->tp;
     s->graph.tp_group_lo = e->tp_group_lo;
     s->graph.tp_group_hi = e->tp_group_hi;
+    s->graph.tp_slab_dev = e->tp_slab_dev;
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
      * session created with no pair armed keeps 0 and stays out of the mirror. */

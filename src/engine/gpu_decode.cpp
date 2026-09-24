@@ -1088,7 +1088,11 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
     const uint64_t packed_bytes = (uint64_t)n_rows * (hi - lo) * sizeof(float);
     const uint64_t xbytes = (uint64_t)n_rows * stride * sizeof(float);
     double t0 = pulsar_tp_now_sec();
-    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0;
+    /* The read drains the stream, so every row-lane exchange of this step has
+     * run: refuse here if any of them failed (4g-2) -- before these logits
+     * leave the engine. */
+    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0 &&
+                 pulsar_tp_row_lane_check(g->tp) != 0;
     double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TPH_D2H, t1 - t0, xbytes);
     if (ok) {
         for (uint32_t r = 0; r < n_rows; r++) {
