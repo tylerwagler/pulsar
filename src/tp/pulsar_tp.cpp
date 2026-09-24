@@ -4139,6 +4139,12 @@ static int tp_command_decode_tokens(pulsar_tp_command *command,
     return 1;
 }
 
+/* How long a worker spins on the control socket before it blocks for the
+ * leader's next frame: longer than a decode stream's host turnaround (the
+ * leader samples, sends the next EVAL), short enough that an idle worker
+ * burns only this much per command before it sleeps. */
+#define TP_WORKER_COMMAND_SPIN_SEC 0.005
+
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen) {
     memset(command, 0, sizeof(*command));
@@ -4151,15 +4157,30 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
      * the header read below; a peer HOST that vanishes is caught by the
      * socket's keepalive (tp_socket_tune).  Mid-operation silence is still
      * bounded where it can occur: the ack collects, the exchanges and the
-     * device spins keep the transport timeout. */
+     * device spins keep the transport timeout.
+     *
+     * In a decode stream the next frame follows within milliseconds, and a
+     * thread asleep in poll(-1) pays a scheduler wake plus its core's
+     * idle-state exit on every token.  So the wait first spins non-blocking
+     * for TP_WORKER_COMMAND_SPIN_SEC and only then blocks.  A zero-timeout
+     * poll reports exactly what the blocking one does (POLLIN, and a closed
+     * or failed socket as POLLHUP/POLLERR), so the close/keepalive semantics
+     * above are unchanged. */
     struct pollfd pfd;
     pfd.fd = tp->control_fd;
     pfd.events = POLLIN;
     int prc;
+    const double spin_until = tp_now_sec() + TP_WORKER_COMMAND_SPIN_SEC;
     do {
         pfd.revents = 0;
-        prc = poll(&pfd, 1, -1);
-    } while (prc < 0 && errno == EINTR);
+        prc = poll(&pfd, 1, 0);
+    } while ((prc == 0 && tp_now_sec() < spin_until) || (prc < 0 && errno == EINTR));
+    if (prc == 0) {
+        do {
+            pfd.revents = 0;
+            prc = poll(&pfd, 1, -1);
+        } while (prc < 0 && errno == EINTR);
+    }
     if (prc < 0) {
         pulsar_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp: waiting for the leader's next command: %s", strerror(errno));
