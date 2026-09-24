@@ -263,8 +263,19 @@ static void hc_expand_launch(uint32_t threads,
 static bool g_hc_head_mix = false;
 void pulsar_gpu_set_hc_head_mix(bool on) { g_hc_head_mix = on; }
 
-template <uint32_t BLK, uint32_t VEC, bool NWBF16>
-__global__ static void hc_split_weighted_sum_norm_fused_kernel(
+/* Q column quarters (L241 4g-2): the block is BLK * Q threads.  At decode
+ * the kernel runs one block per row -- 1..3 SMs of 48 -- and its 16 columns
+ * per thread were a serial latency chain (19 us a sublayer on the pair, 86 a
+ * token).  Thread (q, d) now collapses the VEC / Q columns d + u * BLK,
+ * u in [q * VEC/Q, (q+1) * VEC/Q), so four times the loads are in flight.
+ *
+ * BIT-EXACT: each column's collapse is the same expression; the row's sum of
+ * squares is still thread d's serial `sum += acc * acc` over u = 0..VEC-1 in
+ * order (the collapsed values meet in shared memory first), then the same
+ * 256-partial pairwise tree; a warp still spans 32 consecutive columns of one
+ * u, so every MX emit block is the same 32 values. */
+template <uint32_t BLK, uint32_t VEC, bool NWBF16, uint32_t Q>
+__global__ static void __launch_bounds__(BLK * Q) hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
         __nv_fp8_e4m3 *norm_out_q,
@@ -286,25 +297,30 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float epsv,
         float norm_eps,
         int head_mix) {
+    static_assert(VEC % Q == 0, "column quarters must split VEC evenly");
+    constexpr uint32_t VQ = VEC / Q;
     const uint32_t t = blockIdx.x;
-    const uint32_t d = threadIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t d = tid % BLK;
+    const uint32_t u0 = (tid / BLK) * VQ;
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
     float *sp = split + (uint64_t)t * mix_hc;
     float *pc = pre_carry + (uint64_t)t * 4u;
     __shared__ float hc4_c[16];
     __shared__ float pre_in[4];
-    if (d < 4u) pre_in[d] = pc[d];                 /* the pre handed to this sublayer */
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
+    __shared__ float col_acc[VEC][BLK];
+    if (tid < 4u) pre_in[tid] = pc[tid];           /* the pre handed to this sublayer */
+    if (tid < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, tid, hc4_c);
     __syncthreads();
-    if (d < 4u) pc[d] = sp[d];                     /* this sublayer's pre, for the next one */
+    if (tid < 4u) pc[tid] = sp[tid];               /* this sublayer's pre, for the next one */
 
     const uint64_t rbase = (uint64_t)t * 4u * n_embd;
     const uint64_t obase = (uint64_t)t * n_embd;
-    float accs[VEC];
-    float sum = 0.0f;
+    float accs[VQ];
     #pragma unroll
-    for (uint32_t u = 0; u < VEC; u++) {
+    for (uint32_t i = 0; i < VQ; i++) {
+        const uint32_t u = u0 + i;
         const uint32_t col = d + u * BLK;
         if (col < n_embd) {
             float acc = 0.0f;
@@ -322,30 +338,42 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
              * V4 a bf16 ULP in attn_norm that grew into a different answer. */
             if (!head_mix) acc = __bfloat162float(__float2bfloat16(acc));
             if (out) out[obase + col] = acc;
-            accs[u] = acc;
-            sum += acc * acc;
+            accs[i] = acc;
         } else {
-            accs[u] = 0.0f;
+            accs[i] = 0.0f;
         }
+        col_acc[u][d] = accs[i];
     }
+    __syncthreads();
 
     __shared__ float partial[BLK];
-    partial[d] = sum;
+    if (tid < BLK) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint32_t u = 0; u < VEC; u++) {
+            if (d + u * BLK < n_embd) {
+                const float acc = col_acc[u][d];
+                sum += acc * acc;
+            }
+        }
+        partial[d] = sum;
+    }
     __syncthreads();
     for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
-        if (d < stride) partial[d] += partial[d + stride];
+        if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
     const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
     #pragma unroll
-    for (uint32_t u = 0; u < VEC; u++) {
+    for (uint32_t i = 0; i < VQ; i++) {
+        const uint32_t u = u0 + i;
         const uint32_t col = d + u * BLK;
         /* (weight * x).to(bf16): the normed row is bf16 -- the value every
          * consumer sees, f32 plane, bf16 plane and the E4M3 quant alike */
         const float v = (col < n_embd)
                 ? (head_mix
-                       ? (accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))
-                       : __bfloat162float(__float2bfloat16(accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))))
+                       ? (accs[i] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))
+                       : __bfloat162float(__float2bfloat16(accs[i] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))))
                 : 0.0f;
         if (col < n_embd) {
             /* Row-conditional f32: below keep_from every consumer reads an
@@ -1147,6 +1175,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
             (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
 #define PULSAR_HCFUSED_BLK 256u
+#define PULSAR_HCFUSED_Q 4u     /* column quarters: the block is BLK * Q threads */
 /* The unroll must land EXACTLY on n_embd where it can.  A group past the end is
  * not free: every unrolled step calls pulsar_mx_emit_block, and a dead group
  * still runs through its shuffles, so a width that does not divide n_embd
@@ -1167,8 +1196,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
     }
     {
 #define PULSAR_HCFUSED_LAUNCH(VEC, NW)                                               \
-        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, VEC, NW>          \
-                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(                           \
+        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, VEC, NW, PULSAR_HCFUSED_Q> \
+                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_Q>>>(        \
                 out ? (float *)out->ptr : NULL,                                       \
                 (float *)norm_out->ptr,                                              \
                 (__nv_fp8_e4m3 *)norm_out_q,                                         \
