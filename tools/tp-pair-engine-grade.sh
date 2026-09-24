@@ -77,6 +77,10 @@
 #                      from rank*.err) -- "a tree hash is not a binary's provenance"
 #   PULSAR_TP_MIN_AVAIL_GIB  per-host MemAvailable floor before load (default 100:
 #                      ~83 GiB of expert halves at n=2 plus KV + slab)
+#   PULSAR_TP_EXTRA_ARGS  engine flags appended IDENTICALLY to every rank's
+#                      greedy-run command, word-split (e.g. "--no-dspark" for the
+#                      drafter-off leg of the arrival-skew A/B, bring-up runbook
+#                      "Arrival skew")
 #   PULSAR_TP_DRYRUN=1 print the plan and exit without running anything
 #   PULSAR_TP_PREFLIGHT_ONLY=1  run the per-host preflight and exit
 #
@@ -124,6 +128,7 @@ WORKDIR=${PULSAR_TP_WORKDIR:-'$HOME/tp-pair-grade'}
 WANT_SHA=${PULSAR_TP_SHA:-}
 MIN_AVAIL=${PULSAR_TP_MIN_AVAIL_GIB:-100}
 DRYRUN=${PULSAR_TP_DRYRUN:-0}
+EXTRA_ARGS=${PULSAR_TP_EXTRA_ARGS:-}
 PREFLIGHT_ONLY=${PULSAR_TP_PREFLIGHT_ONLY:-0}
 
 die() { echo "tp-pair-engine-grade: $*" >&2; exit 2; }
@@ -144,7 +149,7 @@ done
 echo "tp-pair-engine-grade: n=$N ranks"
 for i in "${!RANKS[@]}"; do echo "  rank $i -> ssh ${RANKS[$i]}, dials as ${RANK_ADDRS[$i]}"; done
 echo "  peers: $PEERS"
-echo "  model: $MODEL   ctx: $CTX   tokens: $TOKENS"
+echo "  model: $MODEL   ctx: $CTX   tokens: $TOKENS${EXTRA_ARGS:+   extra args: $EXTRA_ARGS}"
 echo "  rdma device: ${RDMA_DEV:-UNPINNED -- auto-pick by name; set PULSAR_TP_RDMA_DEV on a multi-HCA host}"
 
 # ---- plan -------------------------------------------------------------------
@@ -154,8 +159,8 @@ run_rank_cmd() {   # $1 = rank index
            "$WORKDIR" "$RDMA_ENV" "$r" "$BIN" "$MODEL"
     printf -- '--tp-rank %d --tp-nranks %d --tp-peers %s --tp-port %d ' \
            "$r" "$N" "$PEERS" "$PORT"
-    printf -- '-c %d --nothink --temp 0 -n %d --dump-logprobs rank%d.lp.json -p %q' \
-           "$CTX" "$TOKENS" "$r" "$PROMPT"
+    printf -- '-c %d --nothink --temp 0 -n %d --dump-logprobs rank%d.lp.json %s-p %q' \
+           "$CTX" "$TOKENS" "$r" "${EXTRA_ARGS:+$EXTRA_ARGS }" "$PROMPT"
 }
 
 if [ "$DRYRUN" != 0 ]; then

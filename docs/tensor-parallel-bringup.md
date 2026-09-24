@@ -312,6 +312,100 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 > `mlx5_0` (link-local GID, no peer) while the engine beside it rode
 > `mlx5_3`; both are on the keep-list now (transport addressing, not numerics).
 
+## 7. Arrival skew — clock lock + the pinning/spin A/B (`work/tp-skew`, L241 4g-2 follow-up)
+
+Decode does 86 row-lane exchanges per token; each costs 21-43 µs against a
+~5 µs wire (step 5), the same on both ranks — so most of it is the two ranks
+ARRIVING at different times, not the wire.  `work/tp-skew` attacks the host
+side of that (small-message latency traced to CPU idle-state wake, LPI exit
+231/433 µs) in three commits, plus a fourth on top that measures it and never
+lands:
+
+| commit | what it changes | how it announces itself |
+|---|---|---|
+| pinning | row-lane proxy + launch thread on two discovered big cores; proxy timerslack 1 ns | `pulsar-tp: rank R proxy pinned to cpuN, launch thread cpuM reserved (cpu_capacity V/MAX, ...)`, then `pulsar-tp: rank R launch thread pinned to cpuM` — or `core pinning skipped: ...` |
+| proxy spin | the proxy backs off to `usleep(50)` only after 100 ms without an exchange (was 2 ms) | the instrument counts backoffs |
+| worker wait | the worker spins 5 ms on the control socket before `poll(-1)` | the instrument counts `poll(-1)` fallbacks |
+| **TEMPORARY INSTRUMENT** (tip) | per-exchange timestamps in the proxy; histogram printed per rank at close | `pulsar-tp: TEMPORARY tp-skew instrument rank R: ...` |
+
+**Lock both GPUs to one clock first.**  The two hosts do not run the same
+clock (one is thermally capped), and a slower GPU is a late rank by
+construction — pinning cannot fix that.  On EACH host:
+
+```sh
+nvidia-smi -q -d SUPPORTED_CLOCKS | head -30          # what -lgc may take
+# during a decode run, watch both hosts; the capped one sets the target:
+nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,temperature.gpu,power.draw,clocks_event_reasons.active \
+           --format=csv -lms 500
+sudo nvidia-smi -lgc <mhz>,<mhz>   # SAME value on both hosts, at or below the capped host's sustained clock
+nvidia-smi --query-gpu=clocks.sm --format=csv   # verify it holds UNDER LOAD (watch during a run)
+# ... the A/B ...
+sudo nvidia-smi -rgc               # RESTORE on both hosts when done -- and after any abort
+```
+
+If `-lgc` is refused on GB10 ("not supported" / "insufficient permissions"),
+say so in the row, record both hosts' `clocks.sm` during every run, and run
+unlocked — the A/B is then only valid while the two clocks read alike.
+
+**Binaries** — three, on each host, from their own worktrees (never reset a
+tree someone is using); the engine prints its build sha and `PULSAR_TP_SHA`
+asserts it:
+
+| name | rev | what |
+|---|---|---|
+| `dev` | `05d162d3` | the baseline |
+| `skew` | `origin/work/tp-skew~1` | the three commits, WITHOUT the instrument — every timing comes from here |
+| `instr` | `origin/work/tp-skew` | `skew` + the instrument — histogram only, never a t/s |
+
+Build each with the host's usual `make cuda-spark` (zero warnings), copy the
+binary to `~/pulsar-<name>` and its short sha to `~/pulsar-<name>.sha`.
+
+**The A/B** — greedy (`--no-dspark`) and DSpark (default), 128 tokens, ctx
+4096, the grading tool's default prompt, 3 reps, dev and skew INTERLEAVED so
+drift hits both.  The comparison is ALWAYS against the `dev` arm measured in
+the same session, under the same clock lock, never against a number from
+another day.  For scale only: dev `05d162d3` on the pair measured greedy
+~27.2-27.45 t/s and DSpark ~38 t/s through the CLI (37.95 through
+pulsar-server) (pulsar-notes OPEN-REGISTER, 2026-09-24 15:25 and 21:05).  The
+15.57 / 10.75 t/s above were the first pair run, before the 4g-2 series.
+
+```sh
+export PULSAR_TP_HOSTS="ca1070wk30007 ca1070wk30008" PULSAR_TP_ADDRS="192.168.9.12 192.168.9.13"
+export PULSAR_TP_RDMA_DEV=mlx5_3 PULSAR_TP_TOKENS=128 PULSAR_TP_CTX=4096
+H=($PULSAR_TP_HOSTS); mkdir -p ab
+for rep in 1 2 3; do for arm in dev skew; do for mode in spec greedy; do
+  extra=; [ $mode = greedy ] && extra=--no-dspark
+  PULSAR_TP_BIN="\$HOME/pulsar-$arm" PULSAR_TP_EXTRA_ARGS="$extra" \
+  PULSAR_TP_SHA=$(ssh ${H[0]} cat pulsar-$arm.sha) \
+    ./tools/tp-pair-engine-grade.sh > ab/$arm-$mode-$rep.log 2>&1; echo "$arm $mode $rep rc=$?"
+  for r in 0 1; do ssh ${H[$r]} cat tp-pair-grade/rank$r.err > ab/$arm-$mode-$rep.rank$r.err; done
+done; done; done
+grep -H "generation:" ab/*.rank0.err                               # prefill: X t/s, generation: Y t/s
+grep -H "pulsar-tp: rank .* pinned\|pinning skipped" ab/skew-*.err  # the pin lines, BOTH ranks
+```
+
+Every run must grade PASS (the LEG A tally M/N with M = N), and greedy and
+DSpark outputs stay byte-identical: the branch moves no numeric path.  Report
+per arm and mode the three generation t/s and their median; a win is a median
+outside the other arm's range.  A skew run whose rank*.err lacks the two pin
+lines did not run the lane being measured.  Then ONE rep of each mode on
+`instr` (`PULSAR_TP_BIN="\$HOME/pulsar-instr"`) and keep both ranks' block:
+
+```sh
+grep -A8 "TEMPORARY tp-skew instrument" ab/instr-*.rank*.err
+```
+
+Reading it: `post->arrive` is how long this rank's proxy waited, after posting
+its rows, for the peer's rows (the wire is ~5 µs of it); `peer-first` counts
+exchanges whose peer rows were ALREADY there at the first poll after this
+rank's post — THIS rank arrived late.  The late rank shows the large
+`peer-first` and the early rank the fat histogram tail; equal tails and few
+`peer-first` on both ranks mean a common cause (the proxy or the wire), not
+skew.  `after-backoff` > 0 inside a stream means the proxy was asleep when an
+exchange came; worker `poll(-1) fallbacks` near its command count means the
+5 ms spin is shorter than the leader's turnaround.  Restore the clocks
+(`sudo nvidia-smi -rgc`, both hosts) before leaving.
+
 ## Rollback
 
 Single-box behavior is untouched by design (`tp_role` defaults 0; the guard is
