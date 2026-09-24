@@ -1573,6 +1573,11 @@ typedef struct {
     /** The registered slab's device mapping, borrowed from the engine at graph
      * init beside `tp` -- what the row-lane kernels (4g-2) address. */
     void *tp_slab_dev;
+    /** The key the engine registered this rank's K-half weights under (4g-2
+     * row-parallel splits: the shared expert's down projection), borrowed at
+     * graph init; resolved as (key, parent tensor's abs_offset). */
+    const void *tp_kslice_key;
+    /* (key offset: pulsar_tp_kslice_key_offset below) */
     /** Monotonic vocab all-gather counter (slice 4d), incremented once per eval
      * by gpu_graph_encode_output_head_{row,batch}_tp.  Every rank advances it
      * the same number of times in the same order, so the gather's seq stays in
@@ -3871,4 +3876,11 @@ static inline float f16_to_f32(uint16_t h) {
  * max_draft reports at least MAX so the per-position waterfall covers every
  * position the controller can reach. */
 enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
+/* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
+ * object's address, unique per tensor per engine -- abs_offsets repeat across
+ * safetensors shards.  One authority for registration and lookup. */
+static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
+    return (uint64_t)(uintptr_t)t;
+}
+
 #endif /* PULSAR_ENGINE_INTERNAL_H */

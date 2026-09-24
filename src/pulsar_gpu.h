@@ -697,6 +697,17 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi);
+/* L241 4g-2: register the INPUT-COLUMN half [k_lo, k_hi) of a pre-stored
+ * MXFP8_LT weight (a row-parallel TP split: the rank's share of the
+ * reduction).  Repacked once into device buffers the backend owns (freed with
+ * the weight cache) and registered under (key_map, key_offset), in_dim =
+ * k_hi - k_lo; the GEMMs then resolve it by that key like any weight, with a
+ * model_size covering key_offset.  Bounds must be 128-aligned.  Returns 1, or
+ * 0 with the reason printed. */
+int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
+                                      uint64_t in_full, uint64_t out_dim,
+                                      uint64_t k_lo, uint64_t k_hi,
+                                      const void *key_map, uint64_t key_offset);
 /* L242: a pre-stored MXFP8_LT weight already resident in device buffers (data
  * plane, then the swizzled scale plane as separate tensors) enters the resolved
  * cache under (map_key, offset); the GEMMs then find it by offset.  For gates

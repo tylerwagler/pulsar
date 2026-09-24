@@ -2804,8 +2804,22 @@ bool gpu_graph_encode_layer_ffn_batch(
 
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos0);
 
+    /* L241 4g-2: under TP this rank computes its half of the shared expert
+     * (tp_register_shared_split): gate/up over its owned intermediate rows,
+     * down over the matching input columns -- a partial that joins the routed
+     * partial in the FFN exchange.  One box: the whole range, the whole
+     * tensors, byte for byte the path before this split. */
+    uint32_t shx_lo = 0u, shx_hi = (uint32_t)shared_dim;
+    if (ok && g->tp &&
+        !pulsar_tp_owned_range(pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp),
+                               (uint32_t)shared_dim, &shx_lo, &shx_hi)) {
+        fprintf(stderr, "pulsar: tp owned shared-expert range refused (layer %u)\n", il);
+        ok = false;
+    }
+    const uint64_t shared_own = (uint64_t)(shx_hi - shx_lo);
+
 #define PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT() do { \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_gate", \
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_gate", \
                                                           il, \
                                                           pos0, \
                                                           g->batch_shared_gate, \
@@ -2813,9 +2827,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           layer->ffn_gate_shexp, \
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
+                                                          shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_up", \
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
                                                           g->batch_shared_up, \
@@ -2823,14 +2838,15 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           layer->ffn_up_shexp, \
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
+                                                          shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
         void *shmid_q = NULL, *shmid_sf = NULL; int shmid_kbp = 0; \
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
-                                                        (uint64_t)shared_dim, \
+                                                        shared_own, \
                                                         &shmid_q, &shmid_sf, &shmid_kbp)) { \
             fprintf(stderr, "pulsar: shared_mid: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n", \
-                    n_tokens, (unsigned)shared_dim); \
+                    n_tokens, (unsigned)shared_own); \
             ok = false; \
         } \
         /* DEAD-STORE ELIMINATION. batch_shared_mid's only reader is the MXFP8 \
@@ -2862,16 +2878,16 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
-                                             (uint32_t)((uint64_t)n_tokens * shared_dim), \
+                                             (uint32_t)((uint64_t)n_tokens * shared_own), \
                                              PULSAR_SWIGLU_CLAMP_EXP, \
                                              1.0f, \
                                              shmid_q, shmid_sf, shmid_kbp, \
-                                             (uint32_t)shared_dim, \
+                                             (uint32_t)shared_own, \
                                              shmid_skip_f32) != 0; \
-        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, (uint64_t)shared_dim); \
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, shared_own); \
         if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
         if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n_tokens); \
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
+        if (ok && !g->tp) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \
                                                                               g->batch_shared_out, \
@@ -2881,6 +2897,13 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                               PULSAR_N_EMBD, \
                                                                               g->batch_shared_mid, \
                                                                               n_tokens); \
+        /* TP: this rank's input-column half of down, repacked at open and keyed \
+         * (engine key, parent offset) -- a partial of the shared output. */ \
+        if (ok && g->tp) ok = pulsar_gpu_matmul_mxfp8_tensor(g->batch_shared_out, \
+                                                             g->tp_kslice_key, UINT64_MAX / 2u, \
+                                                             pulsar_tp_kslice_key_offset(layer->ffn_down_shexp), \
+                                                             shared_own, PULSAR_N_EMBD, \
+                                                             g->batch_shared_mid, n_tokens) != 0; \
         if (ok) { \
             gpu_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out, \
                                           (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0); \
@@ -3001,7 +3024,14 @@ bool gpu_graph_encode_layer_ffn_batch(
                                   (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD)) != 0;
     }
     if (ok && g->tp) {
-        ok = tp_prefill_big_gate(g, il, n_tokens);
+        /* 4g-2: this rank's shared-expert PARTIAL joins its routed partial, so
+         * the one exchange sums both; shared_out is then zero and every
+         * consumer below (hc expand-add, ffn_out) reads the full sum from
+         * routed_out unchanged. */
+        const uint32_t n_ffn = (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD);
+        ok = pulsar_gpu_add_tensor(g->batch_routed_out, g->batch_routed_out, g->batch_shared_out, n_ffn) != 0 &&
+             pulsar_gpu_tensor_fill_f32(g->batch_shared_out, 0.0f, n_ffn) != 0;
+        if (ok) ok = tp_prefill_big_gate(g, il, n_tokens);
         if (ok && keep_ffn_out) {
             ok = gpu_graph_ensure_batch_ffn_out(g) &&
                  pulsar_gpu_add_tensor(g->batch_ffn_out,

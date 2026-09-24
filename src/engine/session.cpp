@@ -343,6 +343,34 @@ static void register_model_fds(const pulsar_model *m) {
     }
 }
 
+/* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by
+ * OUTPUT rows (column-parallel: this rank's half of the intermediate), down by
+ * INPUT columns (row-parallel: the matching half of the reduction).  The rank's
+ * shared output is then a PARTIAL that rides the FFN's existing exchange with
+ * the routed partial, so the split costs no exchange of its own.  The range is
+ * the one authority every split shares (pulsar_tp_owned_range over the shared
+ * width).  Registered once at open, for the target's layers and the drafter's.
+ * The K-half's key is (engine, the tensor OBJECT's address) -- never its
+ * abs_offset: a safetensors checkpoint is one shard per layer with identical
+ * layouts, so every layer's down projection sits at the SAME offset, and an
+ * offset key made all 43 layers resolve to whichever registered last. */
+static bool tp_register_shared_split(const void *kslice_key, const pulsar_model *m,
+                                     const pulsar_layer_weights *L, int rank, uint32_t nr) {
+    if (!L->ffn_gate_shexp || !L->ffn_up_shexp || !L->ffn_down_shexp) return false;
+    const uint64_t in_dim = L->ffn_gate_shexp->dim[0];
+    const uint64_t shared_dim = L->ffn_gate_shexp->dim[1];
+    uint32_t lo = 0, hi = 0;
+    if (!pulsar_tp_owned_range(rank, nr, (uint32_t)shared_dim, &lo, &hi) || hi <= lo) return false;
+    return pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_gate_shexp),
+                                                L->ffn_gate_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
+           pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_up_shexp),
+                                                L->ffn_up_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
+           pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(m, L->ffn_down_shexp),
+                                             L->ffn_down_shexp->abs_offset, shared_dim,
+                                             L->ffn_down_shexp->dim[1], lo, hi,
+                                             kslice_key, pulsar_tp_kslice_key_offset(L->ffn_down_shexp));
+}
+
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -754,14 +782,38 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     return 1;
                 }
                 registered += 2;
+                if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
+                                    "registered -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
             }
+            for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+                if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
+                                    "registered -- refusing\n", dl);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
+            }
+            const pulsar_layer_weights *L0 = &e->weights.layer[0];
+            uint32_t sx_lo = 0, sx_hi = 0;
+            (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
             fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                            "[%u,%u): %u row slices registered (attn_q_b rows [%llu,%llu), "
-                            "attn_output_a rows [%llu,%llu))\n",
+                            "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu)) and "
+                            "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
+                            "%u layers + %u drafter blocks): %u slices registered\n",
                     tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
-                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads, registered,
+                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
                     (unsigned long long)q_lo, (unsigned long long)q_hi,
-                    (unsigned long long)a_lo, (unsigned long long)a_hi);
+                    (unsigned long long)a_lo, (unsigned long long)a_hi,
+                    sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
+                    (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
         }
     }
 
@@ -934,6 +986,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp_group_lo = e->tp_group_lo;
     s->graph.tp_group_hi = e->tp_group_hi;
     s->graph.tp_slab_dev = e->tp_slab_dev;
+    s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
      * session created with no pair armed keeps 0 and stays out of the mirror. */

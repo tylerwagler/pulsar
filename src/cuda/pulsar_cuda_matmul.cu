@@ -2202,6 +2202,97 @@ int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_
 }
 
 
+/* ---- MXFP8_LT K SLICES (L241 4g-2) ----------------------------------------
+ *
+ * A row-parallel TP split (the shared expert's down projection, attention
+ * wo_b) gives each rank the INPUT columns [k_lo, k_hi) of a weight: its half of
+ * the reduction, whose partial the pair then sums.  In the pre-stored layout a
+ * K range is not a contiguous span -- data is row-major [out][in] E4M3, the
+ * scale plane is 128-row x 4-block tiles ordered band-major (pulsar_mx_sfoff)
+ * -- so the K half is REPACKED once at open into device buffers of its own:
+ * data [out][k_hi-k_lo], scale tiles re-indexed to the narrower KBp, padding
+ * zero exactly as a whole tensor's.  k_lo and k_hi sit on 128-element
+ * boundaries, i.e. whole scale-tile columns, so no scale byte is shared.  The
+ * copy is registered like an L242 resident weight under (key_map,
+ * key_offset); the buffers are owned here and freed with the cache. */
+static std::vector<void *> g_mxfp8_lt_kslice_bufs;
+
+__global__ static void mxfp8_lt_kslice_data_kernel(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src,
+                                                   uint64_t out_dim, uint64_t in_full,
+                                                   uint64_t k_lo, uint64_t kin) {
+    const uint64_t n = out_dim * kin;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t o = i / kin, k = i - o * kin;
+        dst[i] = src[o * in_full + k_lo + k];
+    }
+}
+
+__global__ static void mxfp8_lt_kslice_scale_kernel(unsigned char *dst, const unsigned char *src,
+                                                    int out_dim, int kb_lo, int kb_n,
+                                                    int KBp_full, int KBp_new) {
+    const int n = out_dim * kb_n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const int o = i / kb_n, kb = i - o * kb_n;
+        dst[pulsar_mx_sfoff(o, kb, KBp_new)] = src[pulsar_mx_sfoff(o, kb_lo + kb, KBp_full)];
+    }
+}
+
+int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
+                                      uint64_t in_full, uint64_t out_dim,
+                                      uint64_t k_lo, uint64_t k_hi,
+                                      const void *key_map, uint64_t key_offset) {
+    if (!model_map || !key_map || in_full == 0 || out_dim == 0 || k_hi <= k_lo || k_hi > in_full ||
+        k_lo % 128 != 0 || k_hi % 128 != 0 || in_full % 32 != 0) {
+        fprintf(stderr, "pulsar: MXFP8_LT K slice refused: K [%llu,%llu) of %llu (128-aligned bounds "
+                        "required), %llu rows\n", (unsigned long long)k_lo, (unsigned long long)k_hi,
+                (unsigned long long)in_full, (unsigned long long)out_dim);
+        return 0;
+    }
+    if (!g_mxfp8_lt_offsets.count({model_map, parent_offset})) {
+        fprintf(stderr, "pulsar: MXFP8_LT K slice refused: parent offset %llu is not a registered "
+                        "pre-stored MXFP8_LT weight\n", (unsigned long long)parent_offset);
+        return 0;
+    }
+    const int KBp_full = mx_rup((int)(in_full / 32), 4);
+    const uint64_t kin = k_hi - k_lo;
+    const int kb_n = (int)(kin / 32), KBp_new = mx_rup(kb_n, 4);
+    const size_t src_data = (size_t)in_full * out_dim;
+    const size_t src_scale = (size_t)mx_rup((int)out_dim, 128) * KBp_full;
+    const size_t dst_data = (size_t)kin * out_dim;
+    const size_t dst_scale = (size_t)mx_rup((int)out_dim, 128) * KBp_new;
+    const __nv_fp8_e4m3 *sd = (const __nv_fp8_e4m3 *)cuda_model_range_ptr(model_map, parent_offset,
+                                                                          src_data, "fp8_mx_lt kslice data");
+    const unsigned char *ss = (const unsigned char *)cuda_model_range_ptr(model_map, parent_offset + src_data,
+                                                                          src_scale, "fp8_mx_lt kslice scale");
+    if (!sd || !ss) {
+        fprintf(stderr, "pulsar: MXFP8_LT K slice: parent offset %llu did not resolve to device memory\n",
+                (unsigned long long)parent_offset);
+        return 0;
+    }
+    void *dd = NULL, *ds = NULL;
+    if (!cuda_ok(cudaMalloc(&dd, dst_data), "kslice data alloc")) return 0;
+    if (!cuda_ok(cudaMalloc(&ds, dst_scale), "kslice scale alloc")) { cudaFree(dd); return 0; }
+    g_mxfp8_lt_kslice_bufs.push_back(dd);
+    g_mxfp8_lt_kslice_bufs.push_back(ds);
+    int ok = cuda_ok(cudaMemset(ds, 0, dst_scale), "kslice scale zero");
+    if (ok) {
+        mxfp8_lt_kslice_data_kernel<<<1024, 256>>>((__nv_fp8_e4m3 *)dd, sd, out_dim, in_full, k_lo, kin);
+        ok = cuda_ok(cudaGetLastError(), "kslice data launch");
+    }
+    if (ok) {
+        mxfp8_lt_kslice_scale_kernel<<<256, 256>>>((unsigned char *)ds, ss, (int)out_dim,
+                                                   (int)(k_lo / 32), kb_n, KBp_full, KBp_new);
+        ok = cuda_ok(cudaGetLastError(), "kslice scale launch");
+    }
+    if (ok) ok = cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "kslice repack");
+    if (!ok) return 0;
+    fp8_mx_weight w = { key_map, key_offset, kin, out_dim, (__nv_fp8_e4m3 *)dd, (unsigned char *)ds };
+    g_fp8_mx_by_offset[{key_map, key_offset}] = w;
+    g_fp8_offsets.insert({key_map, key_offset});
+    return 1;
+}
+
 /* Drop every process-global fp8 weight-cache entry. MUST run at backend
  * cleanup (pulsar_gpu_cleanup): pre-stored MXFP8_LT entries point straight into
  * the per-engine model arena that cleanup frees, and a subsequent engine open
@@ -2225,6 +2316,8 @@ void cuda_fp8_weight_cache_clear(void) {
     g_mxfp8_lt_offsets.clear();
     g_mxfp8_lt_slices.clear();
     g_mxfp8_lt_parent_rows.clear();
+    for (void *b : g_mxfp8_lt_kslice_bufs) (void)cudaFree(b);
+    g_mxfp8_lt_kslice_bufs.clear();
     /* L191: the F32-source -> bf16 copies were never cleared -- a second engine
      * open in one process served the first model's converted weights. */
     for (auto &kv : g_f32w_bf16) (void)cudaFree(kv.second);
