@@ -1173,6 +1173,8 @@ static bool gpu_graph_indexed_attention_span(
  * block back over the same buffer.  Concatenation, never a sum: every rank's
  * groups are distinct pieces of one row.  Rides the same monotonic seq as the
  * FFN big gate, so the two exchanges of a layer stay in lockstep across ranks. */
+
+
 static bool tp_attn_gather_low(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                                uint32_t rank, uint32_t n_groups_total) {
     if (!g->tp) {
@@ -1185,6 +1187,41 @@ static bool tp_attn_gather_low(pulsar_gpu_graph *g, uint32_t il, uint32_t n_toke
     const uint64_t own_dim  = (uint64_t)(g->tp_group_hi - g->tp_group_lo) * rank;
     const uint64_t stride   = (uint64_t)((n_groups_total + n_ranks - 1u) / n_ranks) * rank;
     const uint64_t full_dim = (uint64_t)n_groups_total * rank;
+    /* One decode row on a pair with an even split: the per-layer GATE lane
+     * (4g-2 step 2), same rule as the FFN site.  The row's owned `low` slice
+     * is exactly one gate slot; each rank's slice lands at its group offset in
+     * the full row (concatenation, rank order = group order), as the
+     * all-gather below places it. */
+    if (n_tokens == 1u && n_ranks == 2u && own_dim == stride &&
+        own_dim * sizeof(float) == pulsar_tp_vec_bytes(g->tp)) {
+        float *out = (float *)pulsar_tp_slab_gate_out(g->tp, il, PULSAR_TP_GATE_ATTN);
+        const float *in = (const float *)pulsar_tp_slab_gate_in(g->tp, il, PULSAR_TP_GATE_ATTN);
+        float *full = (float *)xmalloc(full_dim * sizeof(float));
+        if (!out || !in || !full) {
+            free(full);
+            fprintf(stderr, "pulsar: tp gate: no slab gate slot for layer %u attention -- refusing\n", il);
+            return false;
+        }
+        const uint64_t xb = own_dim * sizeof(float);
+        double t0 = pulsar_tp_now_sec();
+        bool ok = pulsar_gpu_tensor_read(g->batch_attn_low, 0, out, xb) != 0;
+        double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TPH_D2H, t1 - t0, xb);
+        if (ok) ok = pulsar_tp_gate_exchange_next(g->tp, il, PULSAR_TP_GATE_ATTN) != 0;
+        double t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TPH_XCHG, t2 - t1, xb);
+        const uint32_t self = (uint32_t)pulsar_tp_rank(g->tp);
+        for (uint32_t k = 0; ok && k < n_ranks; k++) {
+            uint32_t ulo = 0, uhi = 0;
+            ok = pulsar_tp_owned_range((int)k, n_ranks, n_groups_total, &ulo, &uhi) != 0;
+            if (ok) memcpy(full + (uint64_t)ulo * rank, k == self ? out : in,
+                           (uint64_t)(uhi - ulo) * rank * sizeof(float));
+        }
+        double t3 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TPH_HOST, t3 - t2, xb);
+        if (ok) ok = pulsar_gpu_tensor_write(g->batch_attn_low, 0, full, full_dim * sizeof(float)) != 0;
+        pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t3, xb);
+        if (!ok) fprintf(stderr, "pulsar: tp gate: layer %u attention gate exchange failed\n", il);
+        free(full);
+        return ok;
+    }
     float *packed  = (float *)xmalloc((size_t)n_tokens * own_dim * sizeof(float));
     float *own     = (float *)calloc((size_t)n_tokens * stride, sizeof(float));   /* padded tail stays zero */
     float *scratch = (float *)calloc((size_t)n_tokens * stride, sizeof(float));
@@ -2493,6 +2530,36 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
     if (!g->tp) return 1;
     const uint64_t nelt = (uint64_t)n_tokens * PULSAR_N_EMBD;
     const uint64_t bytes = nelt * sizeof(float);
+    /* One decode row on a pair: the per-layer GATE lane (4g-2 step 2).  Chosen
+     * by row count and payload, like the staging split below: the row's routed
+     * partial is exactly one gate slot, so it rides the pre-posted RDMA window
+     * with no per-call handshake.  The sum is the same own+peer add the
+     * all-reduce below performs, in the same order -- bit-identical. */
+    if (n_tokens == 1u && pulsar_tp_n_ranks(g->tp) == 2u && bytes == pulsar_tp_vec_bytes(g->tp)) {
+        float *out = (float *)pulsar_tp_slab_gate_out(g->tp, il, PULSAR_TP_GATE_FFN);
+        const float *in = (const float *)pulsar_tp_slab_gate_in(g->tp, il, PULSAR_TP_GATE_FFN);
+        if (!out || !in) {
+            fprintf(stderr, "pulsar: tp gate: no slab gate slot for layer %u -- refusing\n", il);
+            return false;
+        }
+        /* The out-slot is the NIC's send buffer and the gate lane does not wait
+         * for our own send completion, so it is never written after the
+         * exchange: the sum goes to a separate buffer (summing in place let the
+         * peer read a half-summed partial -- ~1 logit of drift on the pair). */
+        float *acc = (float *)xmalloc(bytes);
+        double t0 = pulsar_tp_now_sec();
+        bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
+        double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TPH_D2H, t1 - t0, bytes);
+        if (ok) ok = pulsar_tp_gate_exchange_next(g->tp, il, PULSAR_TP_GATE_FFN) != 0;
+        double t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TPH_XCHG, t2 - t1, bytes);
+        if (ok) for (uint64_t i = 0; i < nelt; i++) acc[i] = out[i] + in[i];
+        double t3 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TPH_HOST, t3 - t2, bytes);
+        if (ok) ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, acc, bytes) != 0;
+        free(acc);
+        pulsar_tp_timing_add(PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t3, bytes);
+        if (!ok) fprintf(stderr, "pulsar: tp gate: layer %u FFN gate exchange failed\n", il);
+        return ok;
+    }
     /* Two staging shapes, chosen by ROW COUNT because that is the slab's sizing
      * boundary rather than a semantic variant (so nothing selects it by flag):
      *

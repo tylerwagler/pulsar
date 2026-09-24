@@ -543,6 +543,9 @@ struct pulsar_tp {
     /* The cross-rank logits identity tally (leader only; L243). */
     uint64_t identity_frames;
     uint64_t identity_matched;
+    /* The engine-facing gate lane's monotonic seq (4g-2 step 2): advanced by
+     * pulsar_tp_gate_exchange_next, identical on every rank by lockstep. */
+    uint64_t gate_seq = 0;
     pulsar_tp_rdma rdma;    /* RDMA state (loaded lazily at create/attach) */
 };
 
@@ -553,6 +556,7 @@ struct pulsar_tp {
 /* TEMPORARY INSTRUMENT (4g-2 step 1): see pulsar_tp.h. */
 static struct { uint64_t n; double ph[PULSAR_TP_TPH_N]; uint64_t bytes; } g_tsite[PULSAR_TP_TSITE_N];
 static struct { uint64_t n, rounds; double hdr, arm, stage, wire; uint64_t bytes; } g_tx;
+static struct { uint64_t n; double t; } g_tg;   /* the gate lane (4g-2 step 2) */
 double pulsar_tp_now_sec(void);
 void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
     if (site < 0 || site >= PULSAR_TP_TSITE_N || phase < 0 || phase >= PULSAR_TP_TPH_N) return;
@@ -560,7 +564,7 @@ void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
     if (phase == PULSAR_TP_TPH_XCHG) { g_tsite[site].n++; g_tsite[site].bytes += bytes; }
 }
 void pulsar_tp_timing_report(const pulsar_tp *tp) {
-    static const char *site_name[PULSAR_TP_TSITE_N] = { "ffn-direct", "ffn-staged", "attn-low", "vocab" };
+    static const char *site_name[PULSAR_TP_TSITE_N] = { "ffn-direct", "ffn-staged", "attn-low", "vocab", "ffn-gate", "attn-gate" };
     const int rank = tp ? tp->rank : -1;
     fprintf(stderr, "pulsar: tp-timing rank %d: site         calls   bytes/call   d2h(ms)  host(ms)  xchg(ms)  h2d(ms)   total(ms)  per-call(us)\n", rank);
     for (int s = 0; s < PULSAR_TP_TSITE_N; s++) {
@@ -572,6 +576,9 @@ void pulsar_tp_timing_report(const pulsar_tp *tp) {
                 g_tsite[s].ph[0] * 1e3, g_tsite[s].ph[1] * 1e3, g_tsite[s].ph[2] * 1e3, g_tsite[s].ph[3] * 1e3,
                 tot * 1e3, tot * 1e6 / (double)g_tsite[s].n);
     }
+    if (g_tg.n)
+        fprintf(stderr, "pulsar: tp-timing rank %d: transport gate lane: %llu calls, %.1f ms total, %.1f us per call\n",
+                rank, (unsigned long long)g_tg.n, g_tg.t * 1e3, g_tg.t * 1e6 / g_tg.n);
     if (g_tx.n)
         fprintf(stderr, "pulsar: tp-timing rank %d: transport pair big-gate: %llu calls, %llu rdma rounds, "
                         "hdr-handshake %.1f ms, armed-ack %.1f ms, staging-memcpy %.1f ms, wire %.1f ms "
@@ -2227,6 +2234,23 @@ void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer) {
 void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer) {
     if (!tp || !tp->slab || layer >= tp->n_layer) return NULL;
     return tp->slab + pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
+}
+void *pulsar_tp_slab_gate_out(const pulsar_tp *tp, uint32_t layer, uint32_t gate) {
+    if (!tp || !tp->slab || layer >= tp->n_layer || gate >= PULSAR_TP_GATES_PER_LAYER) return NULL;
+    return tp->slab + pulsar_tp_slab_out_offset(&tp->layout, layer, gate, tp->vec_bytes);
+}
+void *pulsar_tp_slab_gate_in(const pulsar_tp *tp, uint32_t layer, uint32_t gate) {
+    if (!tp || !tp->slab || layer >= tp->n_layer || gate >= PULSAR_TP_GATES_PER_LAYER) return NULL;
+    return tp->slab + pulsar_tp_slab_in_offset(&tp->layout, layer, gate, tp->vec_bytes);
+}
+
+int pulsar_tp_gate_exchange_next(pulsar_tp *tp, uint32_t layer, uint32_t gate) {
+    if (!tp) return 0;
+    const uint64_t seq = ++tp->gate_seq;
+    const double t0 = tp_now_sec();
+    const int ok = pulsar_tp_gate_exchange(tp, layer, gate, seq);
+    g_tg.n++; g_tg.t += tp_now_sec() - t0;
+    return ok;
 }
 
 /* The RDMA big gate's DIRECT rule -- see pulsar_tp.h.  Boundary matches the

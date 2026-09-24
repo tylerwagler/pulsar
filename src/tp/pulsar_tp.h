@@ -211,7 +211,7 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
  * (TCP), staging memcpy, and wire (post -> completion).  Reported once per
  * rank at engine close. */
 enum { PULSAR_TP_TSITE_FFN_DIRECT = 0, PULSAR_TP_TSITE_FFN_STAGED, PULSAR_TP_TSITE_ATTN_LOW,
-       PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TSITE_N };
+       PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TSITE_N };
 enum { PULSAR_TP_TPH_D2H = 0, PULSAR_TP_TPH_HOST, PULSAR_TP_TPH_XCHG, PULSAR_TP_TPH_H2D, PULSAR_TP_TPH_N };
 double pulsar_tp_now_sec(void);
 void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes);
@@ -283,6 +283,23 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
  * the peer's partial for `seq` to land.  Returns 0 on failure. */
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);
+
+/* The per-layer gate lane for the engine's DECODE exchanges (L241 4g-2 step 2).
+ * The transport owns the gate seq: every call advances one monotonic counter
+ * and exchanges at that seq, so the slot the seq maps to (see
+ * pulsar_tp_gate_slot: (seq-1) % n_slots under the identity schedule) must be
+ * [layer][gate] -- the ATTN then FFN order per layer, every layer, every token;
+ * a call out of order is refused by the transport ("gate order broke").  Both
+ * ranks advance the counter by running the same exchanges in the same order,
+ * which is the lockstep the group already requires.  The payload is ONE slot
+ * (vec_bytes) in the registered slab: the caller stages its partial in
+ * out[layer][gate] (pulsar_tp_slab_gate_out) and reads the peer's from
+ * in[layer][gate] (pulsar_tp_slab_gate_in) after the call.  Unlike the big
+ * gate this lane has no per-call TCP handshake: the RDMA receive window is
+ * pre-posted (16 deep) and re-armed once after any big gate drained it. */
+int pulsar_tp_gate_exchange_next(pulsar_tp *tp, uint32_t layer, uint32_t gate);
+void *pulsar_tp_slab_gate_out(const pulsar_tp *tp, uint32_t layer, uint32_t gate);
+void *pulsar_tp_slab_gate_in(const pulsar_tp *tp, uint32_t layer, uint32_t gate);
 
 /* Verify-block batch gate: exchange `rows` (<= PULSAR_TP_BATCH_MAX_ROWS) row
  * partials for one layer in one bulk transfer.  Returns 0 on failure. */
