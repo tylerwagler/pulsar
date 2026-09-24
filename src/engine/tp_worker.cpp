@@ -181,7 +181,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int rc = 1;
         if (pulsar_tp_failed(tp)) {
             snprintf(ferr, sizeof(ferr), "tp: this rank marked the pair failed earlier; refusing session create");
+        } else if (c->seq == 0 || c->seq > PULSAR_MSEQ_MAX) {
+            snprintf(ferr, sizeof(ferr), "tp: session create carries bank pool %llu (want 1..%u)",
+                     (unsigned long long)c->seq, (unsigned)PULSAR_MSEQ_MAX);
         } else {
+            /* The leader's pool size is the authority (its server sized it at
+             * startup); set it for this create exactly as the server does. */
+            gpu_graph_bank_pool_set((uint32_t)c->seq);
             pulsar_session *s = NULL;
             rc = pulsar_session::create(&s, e, c->value);
             if (rc != 0 || !s) {
@@ -275,7 +281,14 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             free(rows);
         }
         if (rc != 0) fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
-        return worker_ack_logits(e, c->session_id, rc, logits, out_rows, err, errlen);
+        if (rc != 0) return worker_ack(e, c->session_id, rc, err, errlen);
+        /* The digest of what the step PRODUCED (argmax / compact / logits rows),
+         * the same helper the leader's collect uses. */
+        if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
+                                              pulsar_session_batch_digest(slot->s, logits, out_rows)) != 0)
+            return 1;
+        snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
+        return -1;
     }
 
     case PULSAR_TP_FRAME_REWIND:

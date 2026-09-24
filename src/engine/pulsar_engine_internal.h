@@ -3732,6 +3732,9 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
 /** THE row-max rule: the first finite value seeds, lowest id wins a tie.
  * @return the argmax id, or -1 when the row has no finite value. */
 int sample_argmax(const float *logits, uint32_t n_vocab);
+/* The identity digest of a batched step's output (engine_api.cpp): argmax
+ * rows, compact rows or logits rows, whichever the step read back. */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
     int *ids;      ///< candidate token ids

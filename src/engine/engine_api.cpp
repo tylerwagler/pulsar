@@ -364,6 +364,27 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
     return 0;
 }
 
+/** The cross-rank identity digest of a BATCHED step (decode_multiseq /
+ * decode_mixed): of what the step actually produced.  Under a greedy
+ * speculative step the readback is the per-row argmaxes (L219,
+ * spec_argmax_host) and under the sparse min-p contract the compact candidate
+ * block (L149, spec_compact_host) -- the caller's `logits` rows are NOT
+ * written then, and digesting them compared two processes' stale buffers: the
+ * server's first speculative step on the pair refused a correct step as a
+ * divergence.  gpu_graph_decode_multiseq_batch records the form on every step
+ * (exactly one of the two row counts nonzero, or both zero for full rows), so
+ * the leader's collect and the worker's ack read it the same way.  The width
+ * seeds the digest, so the three forms cannot collide. */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows) {
+    const pulsar_gpu_graph *g = &s->graph;
+    if (g->spec_argmax_rows > 0)
+        return pulsar_tp_logits_digest((const float *)g->spec_argmax_host, g->spec_argmax_rows, 1u);
+    if (g->spec_compact_rows > 0)
+        return pulsar_tp_logits_digest((const float *)g->spec_compact_host, g->spec_compact_rows,
+                                       (uint32_t)PULSAR_DSPARK_PREFILTER_ROW_I32);
+    return pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+}
+
 /** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
  * L241 4g-2): before logits VALUES leave the engine (copy, logprobs) and
  * before the session ends.  Token decisions (sample, argmax) do not settle --
@@ -384,13 +405,12 @@ int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen) {
     return s && tp_mirror_settle(s, err, errlen) ? 0 : 1;
 }
 
-/** The collector for the operations that PRODUCE logits (eval, batch decode,
- * mixed batch): the peers' acks carry the digest of their assembled logits and
- * must equal the leader's own -- the cross-rank identity check (L243).  When the
- * leader's own body failed there is nothing to compare; the acks are drained in
- * either shape so the next frame is not shifted, and the local failure is the
- * result.  `n_rows` rows of the engine's logits width, exactly the rows the body
- * wrote. */
+/** The collector for the BATCHED steps (batch decode, mixed batch): the peers'
+ * acks carry the digest of what their step produced (pulsar_session_batch_digest)
+ * and must equal the leader's own -- the cross-rank identity check (L243).  The
+ * eval pipelines its own check (pulsar_session_eval).  When the leader's own
+ * body failed there is nothing to compare; the acks are drained in either shape
+ * so the next frame is not shifted, and the local failure is the result. */
 static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                        int body_rc, const float *logits, uint32_t n_rows,
                                        char *err, size_t errlen) {
@@ -404,7 +424,7 @@ static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const c
                           "check them by", operation, n_rows);
         return 1;
     }
-    const uint64_t own = pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+    const uint64_t own = pulsar_session_batch_digest(s, logits, n_rows);
     char peer_err[256];
     peer_err[0] = '\0';
     if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, operation, own,
@@ -464,7 +484,7 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
      * stderr and the return code carries it. */
     char err[256];
     err[0] = '\0';
-    if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size) == 0) {
+    if (pulsar_tp_send_session_create(tp, s->tp_session_id, ctx_size, gpu_graph_bank_pool_n()) == 0) {
         pulsar_tp_mirror_fail_void(tp, "session create", "the frame could not be shipped");
         s->destroy();
         *out = NULL;
