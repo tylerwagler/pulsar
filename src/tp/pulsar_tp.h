@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 11u           /* v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 12u           /* v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -359,8 +359,13 @@ typedef struct {
     uint32_t reserved;    ///< pad to 24 bytes: keeps every field naturally aligned
 } pulsar_tp_batch_item;
 
+/* SESSION_CREATE carries the leader's Tier-2 bank-pool size (v12): the pool is
+ * sized by the SERVER at startup (auto-fit or PULSAR_MSEQ_BANKS), a step a
+ * worker process never runs, so a worker created its sessions with no bank
+ * pool and refused the first batched speculative redraft.  The worker adopts
+ * `n_banks` (command->seq, >= 1) before creating.  */
 int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id,
-                                  int ctx_size);
+                                  int ctx_size, uint32_t n_banks);
 int pulsar_tp_send_session_destroy(pulsar_tp *tp, uint64_t session_id);
 int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
                         const int *tokens, uint32_t n_tokens);

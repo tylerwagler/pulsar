@@ -327,7 +327,7 @@ static int leader_step(pulsar_tp *tp, gen *g, char *err, size_t errlen) {
     if (op == 10) { /* session_create */
         const int s = pool_pick_dead(g);
         if (s < 0) return 1; /* pool full — no-op, not an error */
-        if (!pulsar_tp_send_session_create(tp, ID_BASE + s, BASE_CTX)) return 0;
+        if (!pulsar_tp_send_session_create(tp, ID_BASE + s, BASE_CTX, 1u)) return 0;
         const int ok = pulsar_tp_wait_command_ack(tp, ID_BASE + s, "create",
                                                   err, errlen);
         if (ok) g_live[s] = true;
@@ -351,7 +351,7 @@ static int leader_run(pulsar_tp *tp, int steps) {
     /* Seed the pool so the very first random op has live sessions to target
      * (the ledger is primed through the same wire path the worker mirrors). */
     for (int s = 0; s < 3; s++) {
-        if (!pulsar_tp_send_session_create(tp, ID_BASE + s, BASE_CTX)) {
+        if (!pulsar_tp_send_session_create(tp, ID_BASE + s, BASE_CTX, 1u)) {
             CHECK(0, "leader seed create %d failed", s);
             return 1;
         }

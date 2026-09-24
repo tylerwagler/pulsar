@@ -3015,8 +3015,13 @@ static int tp_send_token_command(pulsar_tp *tp, uint32_t type,
     return ok;
 }
 
-int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size) {
-    pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
+int pulsar_tp_send_session_create(pulsar_tp *tp, uint64_t session_id, int ctx_size,
+                                  uint32_t n_banks) {
+    if (n_banks == 0) {
+        fprintf(stderr, "pulsar-tp: session create with a zero bank pool -- refusing to ship it\n");
+        return 0;
+    }
+    pulsar_tp_value_command msg = { session_id, (int32_t)ctx_size, n_banks };
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
@@ -3757,6 +3762,8 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->value = msg.value;
+        /* SESSION_CREATE's bank-pool size (v12); the other value frames send 0. */
+        command->seq = msg.reserved;
         break;
     }
     case PULSAR_TP_FRAME_SESSION_DESTROY:
