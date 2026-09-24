@@ -724,7 +724,7 @@ char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_sche
     /* V4.1 lead-in (encoding.py render_message, index 0): the System token
      * when the conversation opens with the effort line (thinking on) or with
      * system text, then the effort line, then the system region. */
-    const char *effort = pulsar_think_effort_prefix(think_mode);
+    const char *effort = pulsar_think_effort_prefix_family(think_mode, v41);
     /* V4.1 marks the lead-in system region with the System token
      * (pulsar_shape::chat_system_marker on the engine's side, which is the same
      * fact); V4 does not -- writing it costs V4 exactly one prompt token, enough
@@ -760,7 +760,7 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
 
 
 
-char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode,
+char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode, bool v41,
                                           chat_text_span **spans_out, uint32_t *n_spans_out) {
     chat_msgs msgs = {0};
     chat_msg system = {0};
@@ -771,14 +771,16 @@ char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode 
     user.role = xstrdup("user");
     user.content = xstrdup(prompt ? prompt : "");
     chat_msgs_push(&msgs, user);
-    char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, think_mode, true,
+    /* The loaded model's family, as every other render: a 0731 model served
+     * through /v1/completions rendered as V4.1 here (L239). */
+    char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, think_mode, v41,
                                               spans_out, n_spans_out);
     chat_msgs_free(&msgs);
     return text;
 }
 
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode) {
-    return render_completion_prompt_text_spans(prompt, think_mode, NULL, NULL);
+char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode, bool v41) {
+    return render_completion_prompt_text_spans(prompt, think_mode, v41, NULL, NULL);
 }
 
 

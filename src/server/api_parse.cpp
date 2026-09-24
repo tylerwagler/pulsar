@@ -154,7 +154,10 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
     bool got_top_logprobs = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
+    /* The default effort is the loaded family's: V4.1 defaults to high (the
+     * reference's default); the V4 (0731) encoder's default is low, which
+     * renders no effort line at all (L239). */
+    pulsar_think_mode reasoning_effort = pulsar_engine_think_default(e);
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -317,6 +320,10 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!r->chat_v41 && thinking_enabled && !pulsar_think_effort_v4_valid(reasoning_effort)) {
+        if (err && errlen) snprintf(err, errlen, "reasoning_effort: the V4 (0731) encoder has three levels -- low, high, max");
+        goto bad;
+    }
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     /* parse_chat_request accepts a NULL server (parse-without-server, exercised
      * by the tool-call-quality test). The predecessor free functions no-op'd on
@@ -403,7 +410,10 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
+    /* The default effort is the loaded family's: V4.1 defaults to high (the
+     * reference's default); the V4 (0731) encoder's default is low, which
+     * renders no effort line at all (L239). */
+    pulsar_think_mode reasoning_effort = pulsar_engine_think_default(e);
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -572,6 +582,10 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!r->chat_v41 && thinking_enabled && !pulsar_think_effort_v4_valid(reasoning_effort)) {
+        if (err && errlen) snprintf(err, errlen, "reasoning_effort: the V4 (0731) encoder has three levels -- low, high, max");
+        goto bad;
+    }
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (s && !s->anthropic_validate_tool_results(&msgs,
                                          &r->anthropic_requires_live_tool_state,
@@ -1500,7 +1514,10 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
+    /* The default effort is the loaded family's: V4.1 defaults to high (the
+     * reference's default); the V4 (0731) encoder's default is low, which
+     * renders no effort line at all (L239). */
+    pulsar_think_mode reasoning_effort = pulsar_engine_think_default(e);
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -1712,6 +1729,10 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!r->chat_v41 && thinking_enabled && !pulsar_think_effort_v4_valid(reasoning_effort)) {
+        if (err && errlen) snprintf(err, errlen, "reasoning_effort: the V4 (0731) encoder has three levels -- low, high, max");
+        goto bad;
+    }
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (s && !s->responses_validate_tool_outputs(&msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
@@ -1827,7 +1848,10 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
+    /* The default effort is the loaded family's: V4.1 defaults to high (the
+     * reference's default); the V4 (0731) encoder's default is low, which
+     * renders no effort line at all (L239). */
+    pulsar_think_mode reasoning_effort = pulsar_engine_think_default(e);
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1936,11 +1960,15 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!r->chat_v41 && thinking_enabled && !pulsar_think_effort_v4_valid(reasoning_effort)) {
+        if (err && errlen) snprintf(err, errlen, "reasoning_effort: the V4 (0731) encoder has three levels -- low, high, max");
+        goto bad;
+    }
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     free(r->prompt_spans);
     r->prompt_spans = NULL;
     r->prompt_n_spans = 0;
-    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode,
+    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode, r->chat_v41,
                                                          &r->prompt_spans, &r->prompt_n_spans);
     pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
                                         r->prompt_n_spans, &r->prompt);

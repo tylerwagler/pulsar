@@ -261,6 +261,21 @@ const char *pulsar_think_mode_name(pulsar_think_mode mode);
  * "Reasoning Effort: N (range 1-100, the higher the value, the more thorough
  * the reasoning)\n\n".  Static storage; valid for the process lifetime. */
 const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
+/** The effort line as the LOADED MODEL's encoder spells it.  V4.1 renders the
+ * numeric line for every effort (pulsar_think_effort_prefix); the V4 (0731)
+ * encoder has three levels -- low adds nothing, high and max carry their own
+ * texts (encoding_dsv4.py REASONING_EFFORT_PROMPTS) -- and no numeric line.
+ * Rendering V4.1's line to a 0731 model put 25 foreign tokens in front of
+ * every prompt (L239).  A V4 request with an effort the V4 encoder cannot
+ * spell is refused by the API before it reaches here; this dies on one. */
+const char *pulsar_think_effort_prefix_family(pulsar_think_mode mode, bool v41);
+/** Whether the V4 (0731) encoder can spell `mode` at all: none, low, high, max. */
+bool pulsar_think_effort_v4_valid(pulsar_think_mode mode);
+/** The loaded model's DEFAULT thinking effort: V4.1's reference default is high
+ * (PULSAR_THINK_DEFAULT); the V4 (0731) encoder's is low, which renders no
+ * effort line.  Every front end that did not receive an explicit effort
+ * resolves it here, after the engine is open (L239). */
+pulsar_think_mode pulsar_engine_think_default(const pulsar_engine *e);
 /** If `s` starts with SOME effort line, the length of that line (so a caller
  * that strips it does not have to know the effort), else 0. */
 size_t pulsar_think_effort_prefix_len(const char *s);

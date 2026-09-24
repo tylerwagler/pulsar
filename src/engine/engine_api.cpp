@@ -112,8 +112,36 @@ const char *pulsar_think_effort_prefix(pulsar_think_mode mode) {
 
 
 
+bool pulsar_think_effort_v4_valid(pulsar_think_mode mode) {
+    return mode == PULSAR_THINK_NONE || mode == PULSAR_THINK_LOW ||
+           mode == PULSAR_THINK_HIGH || mode == PULSAR_THINK_MAX;
+}
+
+
+
+const char *pulsar_think_effort_prefix_family(pulsar_think_mode mode, bool v41) {
+    if (v41) return pulsar_think_effort_prefix(mode);
+    switch (mode) {
+    case PULSAR_THINK_NONE:
+    case PULSAR_THINK_LOW:  return "";
+    case PULSAR_THINK_HIGH: return PULSAR_V4_REASONING_EFFORT_HIGH_PREFIX;
+    case PULSAR_THINK_MAX:  return PULSAR_V4_REASONING_EFFORT_MAX_PREFIX;
+    default: break;
+    }
+    pulsar_die("pulsar_think_effort_prefix_family: the V4 encoder has three effort levels "
+               "(low, high, max); the API refuses any other before rendering");
+    return "";
+}
+
+
+
 size_t pulsar_think_effort_prefix_len(const char *s) {
     if (!s) return 0;
+    /* The V4 (0731) texts first: they start with the same head and no digit. */
+    if (!strncmp(s, PULSAR_V4_REASONING_EFFORT_HIGH_PREFIX, sizeof(PULSAR_V4_REASONING_EFFORT_HIGH_PREFIX) - 1))
+        return sizeof(PULSAR_V4_REASONING_EFFORT_HIGH_PREFIX) - 1;
+    if (!strncmp(s, PULSAR_V4_REASONING_EFFORT_MAX_PREFIX, sizeof(PULSAR_V4_REASONING_EFFORT_MAX_PREFIX) - 1))
+        return sizeof(PULSAR_V4_REASONING_EFFORT_MAX_PREFIX) - 1;
     const size_t head = sizeof(PULSAR_REASONING_EFFORT_HEAD) - 1;
     if (strncmp(s, PULSAR_REASONING_EFFORT_HEAD, head) != 0) return 0;
     const char *p = s + head;
@@ -219,6 +247,12 @@ const char *pulsar_engine_model_name(pulsar_engine *e) { return e->model_name();
 bool pulsar_engine_chat_v41(const pulsar_engine *e) {
     if (!e) return true;   /* no engine: the compile-time default profile */
     return g_pulsar_shape.variant != PULSAR_VARIANT_V4;
+}
+
+
+
+pulsar_think_mode pulsar_engine_think_default(const pulsar_engine *e) {
+    return pulsar_engine_chat_v41(e) ? PULSAR_THINK_DEFAULT : PULSAR_THINK_LOW;
 }
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if (e) { e->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }

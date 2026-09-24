@@ -80,6 +80,22 @@
 #define PULSAR_REASONING_EFFORT_HEAD "Reasoning Effort: "
 #define PULSAR_REASONING_EFFORT_TAIL " (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 
+/** The V4 (0731) effort prefixes, byte-identical to the 0731 reference encoder
+ * (encoding_dsv4.py REASONING_EFFORT_PROMPTS).  The 0731 release restructured
+ * the levels: "low" (its default) adds nothing, "high" carries the text that
+ * was "max" in the original release, and "max" gained a new stronger text.
+ * They left the tree with the V4.1 numeric line (981090f7) and came back when
+ * the served 0731 model was found rendering V4.1's line (L239). */
+static const char PULSAR_V4_REASONING_EFFORT_HIGH_PREFIX[] =
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+
+static const char PULSAR_V4_REASONING_EFFORT_MAX_PREFIX[] =
+    "Reasoning Effort: Beyond maximum \xe2\x80\x94 exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
 
 #if defined(__GNUC__) || defined(__clang__)
 #define PULSAR_MAYBE_UNUSED __attribute__((unused))

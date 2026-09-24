@@ -1705,6 +1705,23 @@ static void test_reasoning_effort_mapping(void) {
      * REASONING_EFFORT_TEMPLATE; thinking-off renders nothing. */
     TEST_ASSERT(PULSAR_THINK_LOW == 50 && PULSAR_THINK_HIGH == 75 && PULSAR_THINK_MAX == 100);
     TEST_ASSERT(PULSAR_THINK_DEFAULT == PULSAR_THINK_HIGH);
+    /* The V4 (0731) family spells three levels and no numeric line: low (its
+     * default) renders nothing, high and max their own texts (L239: the served
+     * 0731 model had been getting V4.1's numeric line, 25 tokens per prompt). */
+    TEST_ASSERT(!pulsar_think_effort_prefix_family(PULSAR_THINK_NONE, false)[0]);
+    TEST_ASSERT(!pulsar_think_effort_prefix_family(PULSAR_THINK_LOW, false)[0]);
+    TEST_ASSERT(!strncmp(pulsar_think_effort_prefix_family(PULSAR_THINK_HIGH, false),
+                         "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n", 63));
+    TEST_ASSERT(!strncmp(pulsar_think_effort_prefix_family(PULSAR_THINK_MAX, false),
+                         "Reasoning Effort: Beyond maximum", 32));
+    TEST_ASSERT(!strcmp(pulsar_think_effort_prefix_family(PULSAR_THINK_HIGH, true),
+                        pulsar_think_effort_prefix(PULSAR_THINK_HIGH)));
+    TEST_ASSERT(pulsar_think_effort_v4_valid(PULSAR_THINK_LOW) && pulsar_think_effort_v4_valid(PULSAR_THINK_MAX) &&
+                !pulsar_think_effort_v4_valid(7) && !pulsar_think_effort_v4_valid(74));
+    TEST_ASSERT(pulsar_think_effort_prefix_len(pulsar_think_effort_prefix_family(PULSAR_THINK_HIGH, false)) ==
+                strlen(pulsar_think_effort_prefix_family(PULSAR_THINK_HIGH, false)));
+    TEST_ASSERT(pulsar_think_effort_prefix_len(pulsar_think_effort_prefix_family(PULSAR_THINK_MAX, false)) ==
+                strlen(pulsar_think_effort_prefix_family(PULSAR_THINK_MAX, false)));
     TEST_ASSERT(!pulsar_think_effort_prefix(PULSAR_THINK_NONE)[0]);
     TEST_ASSERT(!strcmp(pulsar_think_effort_prefix(PULSAR_THINK_HIGH),
                         "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"));
@@ -6953,7 +6970,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
 
     /* 8. the legacy /v1/completions template, pinned and through the renderer */
     {
-        char *legacy = render_completion_prompt_text("hi", PULSAR_THINK_HIGH);
+        char *legacy = render_completion_prompt_text("hi", PULSAR_THINK_HIGH, true);
         buf want = {0};
         buf_puts(&want, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM);
         buf_puts(&want, pulsar_think_effort_prefix(PULSAR_THINK_HIGH));
@@ -6961,7 +6978,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         TEST_ASSERT(!strcmp(legacy, want.ptr));
         buf_free(&want);
         free(legacy);
-        legacy = render_completion_prompt_text("hi", PULSAR_THINK_NONE);
+        legacy = render_completion_prompt_text("hi", PULSAR_THINK_NONE, true);
         TEST_ASSERT(!strcmp(legacy, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM "You are a helpful assistant<｜User｜>hi<｜Assistant｜></think>"));
         free(legacy);
     }

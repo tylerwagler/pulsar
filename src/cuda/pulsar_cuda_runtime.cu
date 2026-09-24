@@ -821,7 +821,22 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
-    const uint64_t align = 256u;
+    /* PAGE-align every staged span (L239, 2026-09-23).  At 256 B the device
+     * address of a span was whatever the sizes of the spans before it left
+     * over: the GGUF's spans happened to be 4 KiB multiples, so every
+     * routed-expert block landed page-aligned; the safetensors shards' spans
+     * are not (a 24 B router bias rides in some), so most expert blocks landed
+     * 2.5 KiB into a page -- and the expert stride is a page multiple, so all
+     * 256 experts of a block inherit it.  Same binary, same bytes: plain
+     * decode 21.0 tok/s page-aligned vs 20.7 not (rows/L239.md).  4 KiB costs
+     * at most one page per span; the model.cpp span builder starts every
+     * tensor of 1 MiB or more on its own span so the alignment reaches the
+     * tensor, not just the span. */
+    /* 4 KiB, not 2 MiB: 2 MiB for the 64 MiB+ spans measured +0.3 percent more
+     * plain decode (20.91 vs 20.85 @512) for ~900 MB of arena rounding, and
+     * the served lane at 3 clients FELL (43.8 -> 41.8 tok/s, one rep) -- the
+     * rounding comes out of the same memory the bank pool is sized from. */
+    const uint64_t align = 4096u;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
 
     for (cuda_model_arena &a : g_model_arenas) {
@@ -882,6 +897,12 @@ static const char *cuda_model_range_ptr_from_fd(
     if (!dev) {
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
+    /* PULSAR_VERIFY_RANGES also announces WHERE each span landed: the device
+     * alignment of the weights is a performance fact (L239), and the RANGE
+     * lines below hash bytes without saying where they live. */
+    if (getenv("PULSAR_VERIFY_RANGES"))
+        fprintf(stderr, "RANGEDEV %llu %llu %p %s\n", (unsigned long long)offset,
+                (unsigned long long)bytes, (void *)dev, what ? what : "?");
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();

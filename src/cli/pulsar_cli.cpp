@@ -62,6 +62,7 @@ typedef struct {
     int imatrix_max_prompts;         ///< cap on prompts consumed
     int imatrix_max_tokens;          ///< cap on tokens consumed
     pulsar_think_mode think_mode;    ///< reasoning mode for generation
+    bool think_mode_set;             ///< an explicit --think-* flag chose it (else the loaded family's default, after open)
 } cli_generation_options;
 
 /** The fully-resolved CLI configuration. */
@@ -1346,10 +1347,10 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
         } else if (!strncmp(cmd, "/think", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]) || cmd[6] == '-')) {
-            /* /think            -> the reference default (high, 75)
-             * /think N          -> effort N in [1, 100]
+            /* /think            -> the loaded family's default (V4.1 high 75, 0731 low)
+             * /think N          -> effort N in [1, 100] (V4.1 only)
              * /think-high, /think-max, /think-low -> the named presets */
-            pulsar_think_mode mode = PULSAR_THINK_DEFAULT;
+            pulsar_think_mode mode = pulsar_engine_think_default(engine);
             bool ok = true;
             if (cmd[6] == '-') {
                 if (!strcmp(cmd, "/think-low")) mode = PULSAR_THINK_LOW;
@@ -1362,6 +1363,10 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                     mode = parse_int(arg, "/think");
                     ok = mode >= PULSAR_THINK_EFFORT_MIN && mode <= PULSAR_THINK_EFFORT_MAX;
                 }
+            }
+            if (ok && !pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(mode)) {
+                fprintf(stderr, "pulsar: the V4 (0731) encoder has three levels -- /think-low, /think-high, /think-max\n");
+                ok = false;
             }
             if (!ok) {
                 fprintf(stderr, "pulsar: /think takes an effort in [1, 100] or -low/-high/-max\n");
@@ -1596,18 +1601,25 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            /* thinking on at the LOADED family's default effort, resolved after open */
             c.gen.think_mode = PULSAR_THINK_DEFAULT;
+            c.gen.think_mode_set = false;
         } else if (!strcmp(arg, "--think-low")) {
             c.gen.think_mode = PULSAR_THINK_LOW;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-effort")) {
             c.gen.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
                                                PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1657,6 +1669,18 @@ int main(int argc, char **argv) {
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
+    }
+    /* The default effort is the loaded family's (V4.1 high, 0731 low -- no
+     * effort line), known only now; an explicit --think-* flag stands.  An
+     * effort the 0731 encoder cannot spell is refused here by name rather than
+     * rendered (L239). */
+    if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);
+    if (!pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(cfg.gen.think_mode)) {
+        fprintf(stderr, "pulsar: --think-effort %d: the V4 (0731) encoder has three levels -- "
+                        "low, high, max (--think-low/--think-high/--think-max)\n", (int)cfg.gen.think_mode);
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return 2;
     }
     /* Slice 4e (L238): a TP worker rank drives nothing of its own -- not the
      * prompt on its command line, not a session.  It applies the leader's

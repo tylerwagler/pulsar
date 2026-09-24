@@ -2666,8 +2666,8 @@ char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_a
                                   chat_text_span **spans_out, uint32_t *n_spans_out);
 /** The legacy /v1/completions template: a fixed system line and the prompt
  * as the one user turn, through the same renderer. */
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode);
-char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode,
+char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode, bool v41);
+char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode, bool v41,
                                           chat_text_span **spans_out, uint32_t *n_spans_out);
 /** As render_chat_prompt_text, but also hands back the rendered text's
  * CLIENT-DATA ranges (see buf's span fields) so pulsar_tokenize_rendered_chat_spans

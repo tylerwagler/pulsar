@@ -514,10 +514,15 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
+        /* A tensor of 1 MiB or more starts its OWN span: the arena page-aligns
+         * span bases (cuda_model_arena_alloc), and only a tensor at the head of
+         * a span inherits that alignment.  Merged behind a 24 B bias, a routed
+         * expert block sat 24 B into a page for all 256 experts (L239). */
         while (i < nspan &&
                spans[i].base == base &&
                spans[i].off <= end + 65536u &&
-               spans[i].end - off <= max_span) {
+               spans[i].end - off <= max_span &&
+               spans[i].end - spans[i].off < 1048576u) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }

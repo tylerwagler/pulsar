@@ -1342,6 +1342,7 @@ typedef struct {
     /** @} */
 
     pulsar_think_mode think_mode;  ///< reasoning mode for the run
+    bool think_mode_set;           ///< an explicit --think-* flag chose it (else the loaded family's default, after open)
     bool plain;                    ///< plain output, no TUI
     bool self_test_extractors;     ///< run the answer-extractor self-tests and exit
     bool retry_incomplete;         ///< re-run an INCOMPLETE case once with twice the budget
@@ -1636,18 +1637,24 @@ static eval_config parse_options(int argc, char **argv) {
             }
             c.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--think")) {
-            c.think_mode = PULSAR_THINK_DEFAULT;
+            c.think_mode = PULSAR_THINK_DEFAULT;   /* the loaded family's default, resolved after open */
+            c.think_mode_set = false;
         } else if (!strcmp(arg, "--think-low")) {
             c.think_mode = PULSAR_THINK_LOW;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--think-effort")) {
             c.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
                                            PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.think_mode = PULSAR_THINK_HIGH;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.think_mode = PULSAR_THINK_MAX;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = PULSAR_THINK_NONE;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
         } else if (!strcmp(arg, "--self-test-extractors")) {
@@ -4208,6 +4215,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* The default effort is the loaded family's (L239); an effort the 0731
+     * encoder cannot spell is refused by name. */
+    if (!cfg.think_mode_set) cfg.think_mode = pulsar_engine_think_default(engine);
+    if (!pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(cfg.think_mode)) {
+        fprintf(stderr, "pulsar-eval: --think-effort %d: the V4 (0731) encoder has three levels -- low, high, max\n",
+                (int)cfg.think_mode);
+        return 2;
+    }
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
     /* The context has to hold the largest budget any attempt can use: the

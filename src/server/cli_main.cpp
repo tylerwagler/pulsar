@@ -1018,7 +1018,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
             buf hdr = {0};
             buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
-            buf_puts(&hdr, pulsar_think_effort_prefix(prefixed_modes[i]));
+            buf_puts(&hdr, pulsar_think_effort_prefix_family(prefixed_modes[i], pulsar_engine_chat_v41(engine)));
             pulsar_tokens hdr_tokens = {0};
             pulsar_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
             if (hdr_tokens.len > hdr_len) hdr_len = hdr_tokens.len;

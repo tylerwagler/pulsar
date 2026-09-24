@@ -735,7 +735,11 @@ static bool chat_tmpl_run_ends_tool_result(const pulsar_vocab *v, const pulsar_t
 
 static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
                                 pulsar_think_mode think_mode, token_vec *out) {
-    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
+    /* The effort line is the FAMILY's spelling (the same fact as the marker
+     * below: V4.1 marks the region and writes the numeric line; 0731 does
+     * neither at low and writes its own texts at high/max) -- L239: the CLI's
+     * 0731 prompt carried V4.1's numeric line, as the server's did. */
+    const char *effort_prefix = pulsar_think_effort_prefix_family(think_mode, PULSAR_CHAT_SYSTEM_MARKER);
     /* The MARKER is the template's, and the template is the model family's:
      * V4.1 marks its lead-in system region, 0731 does not.  Writing it for both
      * cost V4 exactly one prompt token -- enough to change the answer. */
