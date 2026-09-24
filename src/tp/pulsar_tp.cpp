@@ -1787,6 +1787,15 @@ void pulsar_tp_pin_launch_thread(pulsar_tp *tp) {
         fprintf(stderr, "pulsar-tp: rank %d launch thread pinned to cpu%d\n", tp->rank, tp->pin_launch_cpu);
 }
 
+/* The proxy's idle backoff.  Between two exchanges of one stream the gap is
+ * a token or round boundary: the host samples, the leader's next frame
+ * crosses TCP, the worker launches -- milliseconds.  The old 2 ms threshold
+ * let the proxy start sleeping inside exactly those gaps, and a core that
+ * sleeps pays an idle-state exit (up to ~430 us on GB10) on the next
+ * exchange of BOTH ranks' critical path.  100 ms is past any in-stream gap
+ * and short of a human's; beyond it the lane is idle and the core may rest. */
+#define TP_PROXY_IDLE_BACKOFF_SEC 0.100
+
 static void *tp_row_proxy_main(void *arg) {
     pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
     /* Timer slack is per thread: the idle backoff's usleep wakes on time. */
@@ -1799,8 +1808,9 @@ static void *tp_row_proxy_main(void *arg) {
     while (!tp->proxy_stop.load(std::memory_order_acquire)) {
         const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
         if (e == last_exch) {
-            /* busy-poll while decode is running; back off once idle */
-            if (tp_now_sec() - idle_since > 0.002) usleep(50);
+            /* Busy-poll through a decode stream; back off only once the lane
+             * is truly idle (TP_PROXY_IDLE_BACKOFF_SEC). */
+            if (tp_now_sec() - idle_since > TP_PROXY_IDLE_BACKOFF_SEC) usleep(50);
             continue;
         }
         if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
