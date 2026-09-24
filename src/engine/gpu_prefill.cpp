@@ -1191,17 +1191,24 @@ static bool tp_attn_gather_low(pulsar_gpu_graph *g, uint32_t il, uint32_t n_toke
     float *full    = (float *)xmalloc((size_t)n_tokens * full_dim * sizeof(float));
     bool ok = packed && own && scratch && full;
     if (!ok) fprintf(stderr, "pulsar: tp attention gather out of memory (layer %u, %u rows)\n", il, n_tokens);
+    const uint64_t xbytes = (uint64_t)n_tokens * stride * sizeof(float);
+    double t0 = pulsar_tp_now_sec();
     if (ok) ok = pulsar_gpu_tensor_read(g->batch_attn_low, 0, packed,
                                         (uint64_t)n_tokens * own_dim * sizeof(float)) != 0;
+    double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_LOW, PULSAR_TP_TPH_D2H, t1 - t0, xbytes);
+    double t2 = t1, t3 = t1;
     if (ok) {
         for (uint32_t r = 0; r < n_tokens; r++)
             memcpy(own + (uint64_t)r * stride, packed + (uint64_t)r * own_dim, own_dim * sizeof(float));
+        t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_LOW, PULSAR_TP_TPH_HOST, t2 - t1, xbytes);
         ok = pulsar_tp_allgather_rows(g->tp, il, ++g->tp_prefill_seq, full, own, scratch,
                                       n_tokens, n_groups_total, rank) != 0;
+        t3 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_LOW, PULSAR_TP_TPH_XCHG, t3 - t2, xbytes);
         if (!ok) fprintf(stderr, "pulsar: tp attention gather failed (layer %u, %u rows)\n", il, n_tokens);
     }
     if (ok) ok = pulsar_gpu_tensor_write(g->batch_attn_low, 0, full,
                                          (uint64_t)n_tokens * full_dim * sizeof(float)) != 0;
+    pulsar_tp_timing_add(PULSAR_TP_TSITE_ATTN_LOW, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t3, xbytes);
     free(packed);
     free(own);
     free(scratch);
@@ -2520,14 +2527,19 @@ static bool tp_prefill_big_gate(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tok
         }
         heap = true;
     }
+    const int tsite = heap ? PULSAR_TP_TSITE_FFN_STAGED : PULSAR_TP_TSITE_FFN_DIRECT;
+    double t0 = pulsar_tp_now_sec();
     bool ok = pulsar_gpu_tensor_read(g->batch_routed_out, 0, out, bytes) != 0;
+    double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_D2H, t1 - t0, bytes);
     if (ok) {
         ok = pulsar_tp_allreduce_sum(g->tp, il, ++g->tp_prefill_seq,
                                      out, in, bytes) != 0;
     }
+    double t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_XCHG, t2 - t1, bytes);
     if (ok) {
         ok = pulsar_gpu_tensor_write(g->batch_routed_out, 0, out, bytes) != 0;
     }
+    pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t2, bytes);
     if (heap) {
         free(out);
         free(in);

@@ -863,6 +863,7 @@ void pulsar_engine::destroy() {
             fprintf(stderr, "pulsar: tp: cross-rank logits identity: %llu/%llu worker frames matched\n",
                     (unsigned long long)matched, (unsigned long long)frames);
         }
+        pulsar_tp_timing_report(e->tp);   /* TEMPORARY INSTRUMENT (4g-2 step 1) */
         (void)pulsar_tp_send_stop(e->tp);
         pulsar_tp_free(e->tp);
         e->tp = NULL;

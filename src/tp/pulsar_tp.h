@@ -203,6 +203,20 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
  * owned partial and returns the combined sum of every rank's partial.  `in` is
  * caller scratch (clobbered).  n=2 is byte-identical to the old pairwise
  * exchange + add.  Returns 0 on failure. */
+/* TEMPORARY INSTRUMENT (L241 4g-2 step 1, branch work/tp-exchange-timing; not
+ * for landing): wall-time accounting of the pair's cross-rank exchanges.
+ * Sites are the engine call sites; phases are what the engine does around the
+ * transport call (D2H copy, host repack/sum, the transport call, H2D copy).
+ * The transport itself splits its call into header handshake (TCP), ARMED ack
+ * (TCP), staging memcpy, and wire (post -> completion).  Reported once per
+ * rank at engine close. */
+enum { PULSAR_TP_TSITE_FFN_DIRECT = 0, PULSAR_TP_TSITE_FFN_STAGED, PULSAR_TP_TSITE_ATTN_LOW,
+       PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TSITE_N };
+enum { PULSAR_TP_TPH_D2H = 0, PULSAR_TP_TPH_HOST, PULSAR_TP_TPH_XCHG, PULSAR_TP_TPH_H2D, PULSAR_TP_TPH_N };
+double pulsar_tp_now_sec(void);
+void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes);
+void pulsar_tp_timing_report(const pulsar_tp *tp);
+
 int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                             void *out, const void *in, uint64_t bytes);
 

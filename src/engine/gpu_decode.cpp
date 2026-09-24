@@ -1086,7 +1086,10 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
      * uneven split), and the tail zero-fill then overwrote the next row's head.
      * n=2 over 129280 is even, which is why the pair never showed it. */
     const uint64_t packed_bytes = (uint64_t)n_rows * (hi - lo) * sizeof(float);
+    const uint64_t xbytes = (uint64_t)n_rows * stride * sizeof(float);
+    double t0 = pulsar_tp_now_sec();
     if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0;
+    double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TPH_D2H, t1 - t0, xbytes);
     if (ok) {
         for (uint32_t r = 0; r < n_rows; r++) {
             memcpy(own + (uint64_t)r * stride,
@@ -1096,12 +1099,15 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, bool single_row,
                    (uint64_t)(stride - (hi - lo)) * sizeof(float));
         }
     }
+    double t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TPH_HOST, t2 - t1, xbytes);
     if (ok) {
         ok = pulsar_tp_allgather_rows(g->tp, PULSAR_TP_NON_LAYER_TAG,
                                        ++g->tp_vocab_seq, full, own, scratch,
                                        n_rows, n_vocab, 1u) != 0;
     }
+    double t3 = pulsar_tp_now_sec(); pulsar_tp_timing_add(PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TPH_XCHG, t3 - t2, xbytes);
     if (ok) ok = pulsar_gpu_tensor_write(out, 0, full, full_bytes) != 0;
+    pulsar_tp_timing_add(PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t3, xbytes);
     pulsar_gpu_tensor_free(slice);
     free(own);
     free(scratch);
