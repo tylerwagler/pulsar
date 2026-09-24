@@ -11,7 +11,13 @@
  * checksum of the output: a kernel change that claims bit-exactness must
  * leave the checksum unchanged.
  *
- *   tests/expert_gemv_bench [n_tokens=1] [iters=200]
+ * Consecutive calls cycle through N_SETS independent expert selections, as
+ * consecutive layers do in production: the same 6 experts every call would
+ * leave part of their bytes in L2 and time a warm cache no decode step sees.
+ * The checksum folds every set's output.  mid defaults to the pair's half
+ * width; 2048 is the one-box shape.
+ *
+ *   tests/expert_gemv_bench [n_tokens=1] [iters=200] [mid=1024]
  */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
@@ -73,8 +79,10 @@ static const uint8_t *const *make_table(uint8_t *base, uint64_t stride, int n_to
 int main(int argc, char **argv) {
     const int n_tokens = argc > 1 ? atoi(argv[1]) : 1;
     const int iters = argc > 2 ? atoi(argv[2]) : 200;
-    const int n_total = 256, n_expert = 6, in = 4096, mid = 1024, out = 4096;
+    const int mid = argc > 3 ? atoi(argv[3]) : 1024;
+    const int n_total = 256, n_expert = 6, in = 4096, out = 4096;
     const int n_slots = n_tokens * n_expert;
+    enum { N_SETS = 16 };
 
     uint64_t gs = 0, gd = 0, us = 0, ud = 0, ds = 0, dd = 0;
     uint8_t *g = make_stack(n_total, in, mid, &gs, &gd);
@@ -84,10 +92,10 @@ int main(int argc, char **argv) {
     const uint8_t *const *ut = make_table(u, us, n_total);
     const uint8_t *const *dt = make_table(dn, ds, n_total);
 
-    /* selected experts: distinct within a row, rows independent */
-    std::vector<int32_t> sel(n_slots);
+    /* selected experts: distinct within a row, rows independent; N_SETS sets */
+    std::vector<int32_t> sel((size_t)N_SETS * n_slots);
     std::vector<float> rw(n_slots, 1.0f / n_expert);
-    for (int t = 0; t < n_tokens; t++)
+    for (int t = 0; t < N_SETS * n_tokens; t++)
         for (int s = 0; s < n_expert; s++) {
             int e;
             bool dup;
@@ -95,7 +103,7 @@ int main(int argc, char **argv) {
             sel[t * n_expert + s] = e;
         }
     int32_t *dsel = NULL; float *drw = NULL, *dout = NULL;
-    CK(cudaMalloc(&dsel, n_slots * 4)); CK(cudaMemcpy(dsel, sel.data(), n_slots * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dsel, sel.size() * 4)); CK(cudaMemcpy(dsel, sel.data(), sel.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&drw, n_slots * 4)); CK(cudaMemcpy(drw, rw.data(), n_slots * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dout, (size_t)n_slots * out * 4));
 
@@ -108,34 +116,42 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&dxq, xq.size())); CK(cudaMemcpy(dxq, xq.data(), xq.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dxs, xs.size())); CK(cudaMemcpy(dxs, xs.data(), xs.size(), cudaMemcpyHostToDevice));
 
-    auto call = [&]() {
-        const int rc = pulsar_cutlass_expert_ffn_gemv_small(dout, dsel, drw, gt, ut, dt, gs, gd, ds, dd,
+    auto call = [&](int set) {
+        const int rc = pulsar_cutlass_expert_ffn_gemv_small(dout, dsel + (size_t)(set % N_SETS) * n_slots, drw, gt, ut, dt, gs, gd, ds, dd,
                                                             7.0f, n_tokens, n_expert, (unsigned)n_total,
                                                             in, mid, out, dxq, dxs, kbp);
         if (rc) { fprintf(stderr, "expert_gemv_bench: the GEMV refused (rc %d)\n", rc); exit(1); }
     };
-    for (int i = 0; i < 10; i++) call();
+    for (int i = 0; i < 2 * N_SETS; i++) call(i);
     CK(cudaDeviceSynchronize());
     cudaEvent_t a, b;
     CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
     CK(cudaEventRecord(a));
-    for (int i = 0; i < iters; i++) call();
+    for (int i = 0; i < iters; i++) call(i);
     CK(cudaEventRecord(b));
     CK(cudaEventSynchronize(b));
     float ms = 0.f;
     CK(cudaEventElapsedTime(&ms, a, b));
     const double us_call = 1e3 * ms / iters;
 
-    /* distinct experts' bytes the call must read (dedupe across rows) */
-    std::vector<int> seen(n_total, 0);
-    int distinct = 0;
-    for (int e : sel) if (!seen[e]++) distinct++;
-    const double bytes = (double)distinct * (gs + us + ds);
-    std::vector<float> h((size_t)n_slots * out);
-    CK(cudaMemcpy(h.data(), dout, h.size() * 4, cudaMemcpyDeviceToHost));
+    /* distinct experts' bytes a call must read (dedupe across rows), averaged
+     * over the sets the timed calls cycled through */
+    double distinct_sum = 0.0;
+    for (int i = 0; i < iters; i++) {
+        std::vector<int> seen(n_total, 0);
+        const int32_t *s = sel.data() + (size_t)(i % N_SETS) * n_slots;
+        for (int q = 0; q < n_slots; q++) if (!seen[s[q]]++) distinct_sum += 1.0;
+    }
+    const double distinct = distinct_sum / iters;
+    const double bytes = distinct * (gs + us + ds);
     uint64_t sum = 1469598103934665603ull;
-    for (float f : h) { uint32_t w; memcpy(&w, &f, 4); sum = (sum ^ w) * 1099511628211ull; }
-    printf("expert_gemv_bench: n_tokens=%d slots=%d distinct=%d  %.2f us/call  %.1f GB/s  checksum %016llx\n",
-           n_tokens, n_slots, distinct, us_call, bytes / (us_call * 1e3), (unsigned long long)sum);
+    std::vector<float> h((size_t)n_slots * out);
+    for (int set = 0; set < N_SETS; set++) {
+        call(set);
+        CK(cudaMemcpy(h.data(), dout, h.size() * 4, cudaMemcpyDeviceToHost));
+        for (float f : h) { uint32_t w; memcpy(&w, &f, 4); sum = (sum ^ w) * 1099511628211ull; }
+    }
+    printf("expert_gemv_bench: n_tokens=%d mid=%d slots=%d distinct=%.2f  %.2f us/call  %.1f GB/s  checksum %016llx\n",
+           n_tokens, mid, n_slots, distinct, us_call, bytes / (us_call * 1e3), (unsigned long long)sum);
     return 0;
 }
