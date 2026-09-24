@@ -599,66 +599,11 @@ struct pulsar_tp {
  * Small socket helpers (same conventions as upstream ds4_tp.c).
  * --------------------------------------------------------------------- */
 
-/* TEMPORARY INSTRUMENT (4g-2 step 1): see pulsar_tp.h. */
-static struct { uint64_t n; double ph[PULSAR_TP_TPH_N]; uint64_t bytes; } g_tsite[PULSAR_TP_TSITE_N];
-static struct { uint64_t n, rounds; double hdr, arm, stage, wire; uint64_t bytes; } g_tx;
-static struct { uint64_t n; double t, post, recv, send, repost; uint64_t early, hist[6]; } g_tg;   /* the row lane (4g-2) */
-static struct { uint64_t n_ack, n_cmd; double ack, cmd; } g_ctl;   /* the control round trip per step */
-static struct { uint64_t n, bytes; double t, post, wait; } g_tb;     /* the bulk lane (v14) */
-double pulsar_tp_now_sec(void);
-void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
-    if (site < 0 || site >= PULSAR_TP_TSITE_N || phase < 0 || phase >= PULSAR_TP_TPH_N) return;
-    g_tsite[site].ph[phase] += sec;
-    if (phase == PULSAR_TP_TPH_XCHG) { g_tsite[site].n++; g_tsite[site].bytes += bytes; }
-}
-void pulsar_tp_timing_report(const pulsar_tp *tp) {
-    static const char *site_name[PULSAR_TP_TSITE_N] = { "ffn-direct", "ffn-staged", "attn-low", "vocab", "ffn-gate", "attn-gate", "eval-step" };
-    const int rank = tp ? tp->rank : -1;
-    fprintf(stderr, "pulsar: tp-timing rank %d: site         calls   bytes/call   d2h(ms)  host(ms)  xchg(ms)  h2d(ms)   total(ms)  per-call(us)\n", rank);
-    for (int s = 0; s < PULSAR_TP_TSITE_N; s++) {
-        if (!g_tsite[s].n) continue;
-        const double tot = g_tsite[s].ph[0] + g_tsite[s].ph[1] + g_tsite[s].ph[2] + g_tsite[s].ph[3];
-        fprintf(stderr, "pulsar: tp-timing rank %d: %-12s %6llu %12llu %9.1f %9.1f %9.1f %9.1f %10.1f %12.1f\n",
-                rank, site_name[s], (unsigned long long)g_tsite[s].n,
-                (unsigned long long)(g_tsite[s].bytes / g_tsite[s].n),
-                g_tsite[s].ph[0] * 1e3, g_tsite[s].ph[1] * 1e3, g_tsite[s].ph[2] * 1e3, g_tsite[s].ph[3] * 1e3,
-                tot * 1e3, tot * 1e6 / (double)g_tsite[s].n);
-    }
-    if (g_tg.n) {
-        fprintf(stderr, "pulsar: tp-timing rank %d: row lane proxy: %llu exchanges, %.1f ms total, %.1f us per exchange (descriptor seen -> done)\n",
-                rank, (unsigned long long)g_tg.n, g_tg.t * 1e3, g_tg.t * 1e6 / g_tg.n);
-        const double n = (double)g_tg.n;
-        fprintf(stderr, "pulsar: tp-timing rank %d: row lane phases per exchange: post %.2f us, peer rows %.2f us, own sends %.2f us, repost %.2f us; "
-                        "peer rows already in at post: %.1f%%; peer-wait histogram <2/<5/<10/<20/<50/>=50 us: %llu/%llu/%llu/%llu/%llu/%llu\n",
-                rank, g_tg.post * 1e6 / n, g_tg.recv * 1e6 / n, g_tg.send * 1e6 / n, g_tg.repost * 1e6 / n,
-                100.0 * (double)g_tg.early / n,
-                (unsigned long long)g_tg.hist[0], (unsigned long long)g_tg.hist[1], (unsigned long long)g_tg.hist[2],
-                (unsigned long long)g_tg.hist[3], (unsigned long long)g_tg.hist[4], (unsigned long long)g_tg.hist[5]);
-    }
-    if (g_tb.n)
-        fprintf(stderr, "pulsar: tp-timing rank %d: bulk lane: %llu exchanges, %.1f MB avg, %.1f ms total, "
-                        "%.1f us per exchange (post %.1f, wait %.1f)\n",
-                rank, (unsigned long long)g_tb.n, (double)g_tb.bytes / (double)g_tb.n / 1e6, g_tb.t * 1e3,
-                g_tb.t * 1e6 / (double)g_tb.n, g_tb.post * 1e6 / (double)g_tb.n, g_tb.wait * 1e6 / (double)g_tb.n);
-    if (g_ctl.n_ack || g_ctl.n_cmd)
-        fprintf(stderr, "pulsar: tp-timing rank %d: control: leader ack-digest wait %llu x %.1f us, worker command wait %llu x %.1f us\n",
-                rank, (unsigned long long)g_ctl.n_ack, g_ctl.n_ack ? g_ctl.ack * 1e6 / g_ctl.n_ack : 0.0,
-                (unsigned long long)g_ctl.n_cmd, g_ctl.n_cmd ? g_ctl.cmd * 1e6 / g_ctl.n_cmd : 0.0);
-    if (g_tx.n)
-        fprintf(stderr, "pulsar: tp-timing rank %d: transport pair big-gate: %llu calls, %llu rdma rounds, "
-                        "hdr-handshake %.1f ms, armed-ack %.1f ms, staging-memcpy %.1f ms, wire %.1f ms "
-                        "(per call: hdr %.1f us, arm %.1f us, stage %.1f us, wire %.1f us)\n",
-                rank, (unsigned long long)g_tx.n, (unsigned long long)g_tx.rounds,
-                g_tx.hdr * 1e3, g_tx.arm * 1e3, g_tx.stage * 1e3, g_tx.wire * 1e3,
-                g_tx.hdr * 1e6 / g_tx.n, g_tx.arm * 1e6 / g_tx.n, g_tx.stage * 1e6 / g_tx.n, g_tx.wire * 1e6 / g_tx.n);
-}
-
 static double tp_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
-double pulsar_tp_now_sec(void) { return tp_now_sec(); }
 
 static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     if (!err || !errlen) return;
@@ -1609,7 +1554,6 @@ static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
  * sees done.  The window is re-posted before done is written, so the proxy is
  * idle -- and the QP quiet -- whenever the engine observes done == enqueued. */
 static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
-    const double t_first_post = tp_now_sec();
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     const uint64_t vb = tp->vec_bytes, last = first + rows - 1u;
     pthread_mutex_lock(&r->post_lock);
@@ -1635,13 +1579,10 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
         else r->send_outstanding++;
     }
     const double t_posted = tp_now_sec();
-    double t_recv = 0.0;
-    if (ok && tp_rdma_drain_cq(tp) && r->recv_done >= last) { t_recv = t_posted; g_tg.early++; }
-    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    const double deadline = t_posted + (double)tp->timeout_sec;
     double next_abort_check = t_posted + 1e-3;
     while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
-        if (ok && t_recv == 0.0 && r->recv_done >= last) t_recv = tp_now_sec();
         if (ok && tp_now_sec() > next_abort_check) {
             next_abort_check = tp_now_sec() + 1e-3;
             if (tp_peer_aborted(tp)) {
@@ -1657,16 +1598,10 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
             ok = 0;
         }
     }
-    const double t_sent = tp_now_sec();
-    if (t_recv == 0.0) t_recv = t_sent;
     for (uint32_t k = 0; ok && k < rows; k++)
         ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = last;
     pthread_mutex_unlock(&r->post_lock);
-    const double t_end = tp_now_sec(), pw = (t_recv - t_posted) * 1e6;
-    g_tg.post += t_posted - t_first_post; g_tg.recv += t_recv - t_posted;
-    g_tg.send += t_sent - t_recv; g_tg.repost += t_end - t_sent;
-    g_tg.hist[pw < 2 ? 0 : pw < 5 ? 1 : pw < 10 ? 2 : pw < 20 ? 3 : pw < 50 ? 4 : 5]++;
     return ok;
 }
 
@@ -1681,7 +1616,6 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
  * was armed before the bring-up's ready barrier. */
 static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uint32_t buf) {
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    const double t0 = tp_now_sec();
     const uint32_t n = (uint32_t)((bytes + PULSAR_TP_BULK_PIECE - 1u) / PULSAR_TP_BULK_PIECE);
     if (!r || !r->bulk_qp || n == 0 || n > 64u) {
         fprintf(stderr, "pulsar-tp: bulk exchange %llu refused (%llu bytes, %u pieces)\n",
@@ -1762,8 +1696,6 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
         return 0;
     }
     if (!tp_bulk_post_imm_recv(tp, r)) return 0;
-    g_tb.n++; g_tb.bytes += bytes; g_tb.post += t_posted - t0;
-    g_tb.wait += tp_now_sec() - t_posted; g_tb.t += tp_now_sec() - t0;
     return 1;
 }
 
@@ -1812,12 +1744,10 @@ static void *tp_row_proxy_main(void *arg) {
             tp->proxy_failed.store(true, std::memory_order_release);
             break;
         }
-        const double t0 = tp_now_sec();
         if (!tp_row_proxy_exchange(tp, first, rows)) {
             tp->proxy_failed.store(true, std::memory_order_release);
             break;
         }
-        g_tg.n++; g_tg.t += tp_now_sec() - t0;
         last_exch = e;
         next_msg = first + rows;
         done->store(e, std::memory_order_release);
@@ -1974,8 +1904,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
         uint32_t lens[PULSAR_TP_RDMA_BULK_SLOTS];
         uint64_t chunk_off[PULSAR_TP_RDMA_BULK_SLOTS];
         uint64_t round_bytes = 0;
-        g_tx.rounds++;
-        const double t_st0 = tp_now_sec();
         for (uint32_t i = 0; i < chunks; i++) {
             const uint64_t left = remaining - round_bytes;
             lens[i] = (uint32_t)(left > PULSAR_TP_RDMA_MAX_MSG ?
@@ -1989,7 +1917,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
             }
             round_bytes += lens[i];
         }
-        g_tx.stage += tp_now_sec() - t_st0;
 
         struct tp_ibv_sge recv_sge[PULSAR_TP_RDMA_BULK_SLOTS];
         struct tp_ibv_recv_wr recv_wr[PULSAR_TP_RDMA_BULK_SLOTS];
@@ -2017,7 +1944,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
          * Deterministic fix: exchange an armed ack over the control socket
          * (quiescent here after the batch header handshake) before sending —
          * both sides have the round's recvs posted once both acks crossed. */
-        const double t_arm0 = tp_now_sec();
         if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED,
                            NULL, 0))
             return 0;
@@ -2029,8 +1955,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
         }
         std::atomic_thread_fence(std::memory_order_release);
         struct tp_ibv_sge send_sge[PULSAR_TP_RDMA_BULK_SLOTS];
-        g_tx.arm += tp_now_sec() - t_arm0;
-        const double t_wire0 = tp_now_sec();
         struct tp_ibv_send_wr send_wr[PULSAR_TP_RDMA_BULK_SLOTS];
         (void)memset(send_wr, 0, sizeof(send_wr));
         for (uint32_t i = 0; i < chunks; i++) {
@@ -2096,16 +2020,13 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
             }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        g_tx.wire += tp_now_sec() - t_wire0;
         if (!direct) {
-            const double t_st1 = tp_now_sec();
             round_bytes = 0;
             for (uint32_t i = 0; i < chunks; i++) {
                 memcpy(static_cast<uint8_t *>(in) + off + round_bytes,
                        stage_recv + chunk_off[i], lens[i]);
                 round_bytes += lens[i];
             }
-            g_tx.stage += tp_now_sec() - t_st1;
         }
         off += round_bytes;
     }
@@ -3215,7 +3136,6 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
         return 1;
     }
     if (tp->data_fd < 0) return 0;
-    const double t_hdr0 = tp_now_sec();
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
@@ -3228,7 +3148,6 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
-    g_tx.n++; g_tx.bytes += bytes; g_tx.hdr += tp_now_sec() - t_hdr0;
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
         return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp), out, in, bytes);
@@ -3922,11 +3841,8 @@ static int tp_collect_acks(pulsar_tp *tp, uint64_t session_id, const char *opera
 static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen) {
     if (!tp || !tp->deferred_armed) return 1;
     tp->deferred_armed = false;
-    const double t0 = tp_now_sec();
-    const int rc = tp_collect_acks_body(tp, tp->deferred_session, tp->deferred_operation,
-                                        TP_ACK_DIGEST, tp->deferred_digest, err, errlen);
-    g_ctl.n_ack++; g_ctl.ack += tp_now_sec() - t0;
-    return rc;
+    return tp_collect_acks_body(tp, tp->deferred_session, tp->deferred_operation,
+                                TP_ACK_DIGEST, tp->deferred_digest, err, errlen);
 }
 
 int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
@@ -4133,7 +4049,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
      * socket's keepalive (tp_socket_tune).  Mid-operation silence is still
      * bounded where it can occur: the ack collects, the exchanges and the
      * device spins keep the transport timeout. */
-    const double t_wait0 = tp_now_sec();
     struct pollfd pfd;
     pfd.fd = tp->control_fd;
     pfd.events = POLLIN;
@@ -4142,7 +4057,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         pfd.revents = 0;
         prc = poll(&pfd, 1, -1);
     } while (prc < 0 && errno == EINTR);
-    g_ctl.n_cmd++; g_ctl.cmd += tp_now_sec() - t_wait0;
     if (prc < 0) {
         pulsar_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp: waiting for the leader's next command: %s", strerror(errno));

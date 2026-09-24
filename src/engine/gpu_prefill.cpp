@@ -2553,20 +2553,15 @@ static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_token
         }
         heap = true;
     }
-    const int tsite = heap ? PULSAR_TP_TSITE_FFN_STAGED : PULSAR_TP_TSITE_FFN_DIRECT;
-    double t0 = pulsar_tp_now_sec();
     bool ok = pulsar_gpu_tensor_read(t, 0, out, bytes) != 0 &&
               pulsar_tp_row_lane_check(g->tp) != 0;   /* stream drained: every row-lane exchange done */
-    double t1 = pulsar_tp_now_sec(); pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_D2H, t1 - t0, bytes);
     if (ok) {
         ok = pulsar_tp_allreduce_sum(g->tp, il, ++g->tp_prefill_seq,
                                      out, in, bytes) != 0;
     }
-    double t2 = pulsar_tp_now_sec(); pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_XCHG, t2 - t1, bytes);
     if (ok) {
         ok = pulsar_gpu_tensor_write(t, 0, out, bytes) != 0;
     }
-    pulsar_tp_timing_add(tsite, PULSAR_TP_TPH_H2D, pulsar_tp_now_sec() - t2, bytes);
     if (heap) {
         free(out);
         free(in);

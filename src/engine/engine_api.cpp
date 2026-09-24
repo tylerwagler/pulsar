@@ -690,9 +690,6 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
      * Without that check a rank that fell behind would decode the right token
      * at the wrong position and produce confident nonsense. */
     const uint64_t pos = (uint64_t)s->checkpoint.len;
-    static double t_prev_end = 0.0;   /* TEMPORARY instrument */
-    const double t_send = pulsar_tp_now_sec();
-    if (t_prev_end > 0.0) pulsar_tp_timing_add(PULSAR_TP_TSITE_STEP, PULSAR_TP_TPH_HOST, t_send - t_prev_end, 0);
     if (pulsar_tp_send_eval(tp, s->tp_session_id, pos, token) == 0) {
         if (err) snprintf(err, errlen, "tp: could not mirror the token to the workers");
         return 1;
@@ -707,8 +704,6 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
      * (tp_mirror_settle).  The body runs even when the settle failed, so both
      * ranks finish this step and its ack is drained, not left in the socket. */
     const int body_rc = s->eval(token, err, errlen);
-    t_prev_end = pulsar_tp_now_sec();
-    pulsar_tp_timing_add(PULSAR_TP_TSITE_STEP, PULSAR_TP_TPH_XCHG, t_prev_end - t_send, 0);
     char why[512];
     why[0] = '\0';
     const int settled = pulsar_tp_settle_deferred_ack(tp, why, sizeof(why));
