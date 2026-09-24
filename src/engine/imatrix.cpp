@@ -89,6 +89,11 @@ static bool imatrix_collect_layer_batch(
             for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
             c->gate_up_count[il][expert]++;
 
+            /* The down input: the SwiGLU leaf the down projection consumes --
+             * route-weighted, and E4M3-rounded because every routed arm emits
+             * it only as E4M3 (L219); gpu_prefill decodes the slot back into
+             * batch_routed_mid under this mode (L246: between L219 and L246
+             * this read the RAW UP on the MMQ arms). */
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
             const size_t mid_off = ((size_t)t * PULSAR_N_EXPERT_USED + slot) * PULSAR_N_FF_EXP;
             const float *mid = c->routed_mid_buf + mid_off;

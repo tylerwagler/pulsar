@@ -576,6 +576,21 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
 }
 
 
+/* L246: the inverse, for the ONE host consumer of an activation the producers
+ * no longer keep in f32 -- the imatrix collector's down-projection input,
+ * which since L219 every routed arm emits only as E4M3 into the mid slot.
+ * Decodes the slot the producer wrote (data byte x 2^(scale - 127)) into an
+ * f32 [rows][K] buffer.  Runs only under the collection mode; never on a
+ * serving path. */
+__global__ static void mxfp8_decode_act_kernel(const __nv_fp8_e4m3 *data, const unsigned char *scale,
+                                               int rows, int K, int KBp, float *X) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * K) return;
+    const int row = (int)(i / K), col = (int)(i - (size_t)row * K);
+    const float sc = exp2f((float)scale[pulsar_mx_sfoff(row, col >> 5, KBp)] - 127.0f);
+    X[i] = (float)data[i] * sc;
+}
+
 /* Grouped variant for the attn-output "a" projection. The activation tensor is
  * heads[tok][group][K] but each group is an independent GEMM, so the E4M3 data
  * is regrouped as n_groups slabs of [K, n_tokens] col-major and the E8M0 scale
@@ -1457,6 +1472,22 @@ int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n
     pulsar_gpu_mxfp8_act_cache_arm(x, n_tok, in_dim);
     pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     return 1;
+}
+
+int pulsar_gpu_mxfp8_act_cache_decode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim,
+                                          pulsar_gpu_tensor *dst) {
+    const void *q = NULL, *sf = NULL; int kbp = 0;
+    if (!x || !dst || !dst->ptr || n_tok == 0 || in_dim % 32 != 0) return 0;
+    if (dst->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tok, in_dim, &q, &sf, &kbp) || !q || !sf) {
+        fprintf(stderr, "pulsar: act decode: no E4M3 slot armed for (%p, %llu, %llu) -- refusing\n",
+                x->ptr, (unsigned long long)n_tok, (unsigned long long)in_dim);
+        return 0;
+    }
+    const size_t n = (size_t)n_tok * in_dim;
+    mxfp8_decode_act_kernel<<<(unsigned)((n + 255) / 256), 256>>>((const __nv_fp8_e4m3 *)q, (const unsigned char *)sf,
+                                                                 (int)n_tok, (int)in_dim, kbp, (float *)dst->ptr);
+    return cuda_ok(cudaGetLastError(), "act decode f32");
 }
 
 /* L158 inc 4: PRODUCER-side grouped encode of the attention output for a

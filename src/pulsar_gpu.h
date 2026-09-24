@@ -903,6 +903,13 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
                                         const void **scale,
                                         int *kbp);
 
+/** L246: decode the E4M3 slot armed for (x, n_tok, in_dim) into `dst` as f32
+ * [n_tok][in_dim] -- the collection-mode reader of an activation the producers
+ * keep only as E4M3 (the routed SwiGLU leaf).  Refuses when no slot is armed.
+ * Not a serving-path call. */
+int pulsar_gpu_mxfp8_act_cache_decode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim,
+                                          pulsar_gpu_tensor *dst);
+
 /** Same lookup keyed on the raw device pointer, for callers that only ever held
  * one (the routed-MoE path takes float* activations, not tensors). */
 int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,

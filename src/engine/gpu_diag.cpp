@@ -2101,6 +2101,15 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                n_banks,
         bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
+    /* A graph owns the WHOLE layer's output groups unless a session hands it
+     * the engine's TP span (session.cpp, right after this call).  The raw
+     * graphs -- imatrix collection, the raw one-shot generation, the render
+     * lane -- never get a span, and since slice 4g-1 the attention refuses an
+     * empty one ("owns output groups [0,0) of 8"), which broke imatrix
+     * collection on ONE box (L246, found 2026-09-24).  Under TP the raw paths
+     * refuse by name before reaching a layer. */
+    g->tp_group_lo = 0;
+    g->tp_group_hi = PULSAR_N_OUT_GROUP;
     if (n_banks < 1u) n_banks = 1u;
     gpu_graph_dims dz;
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);

@@ -2873,6 +2873,22 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                exp_lo,
                                                exp_hi) != 0;
     }
+    if (ok && g->imatrix_f32_rows) {
+        /* L246: the imatrix collector reads batch_routed_mid as the down
+         * projection's input, but since L219 every routed arm emits the SwiGLU
+         * leaf ONLY as E4M3 into the mid slot and the f32 buffer holds the raw
+         * up (MMQ arms) or stale bytes (type 40).  Under the collection mode
+         * decode the slot the arm wrote back into the f32 buffer, so the
+         * statistic is the leaf the down projection consumes (route-weighted,
+         * E4M3-rounded).  A missing slot refuses the collection, not silently
+         * records the wrong tensor. */
+        if (!pulsar_gpu_mxfp8_act_cache_decode_f32(g->batch_routed_mid,
+                                                   (uint64_t)n_tokens * layer->n_expert_used,
+                                                   down_in_dim, g->batch_routed_mid)) {
+            fprintf(stderr, "pulsar: imatrix: the routed leaf's E4M3 slot could not be decoded at layer %u\n", il);
+            ok = false;
+        }
+    }
     if (ok) {
         /* ARM-DEPENDENT: batch_routed_up is only written by the MMQ arms
          * (where it serves as raw-gate scratch); on 40/40-grouped and mixed
@@ -2891,8 +2907,8 @@ bool gpu_graph_encode_layer_ffn_batch(
          * element count reads the LAYER's router width, not the target's: a
          * drafter layer routes 128 experts / top-3 (L218 audit risk #2). */
         const uint64_t routed_mid_elems = (uint64_t)n_tokens * layer->n_expert_used * down_in_dim;
-        gpu_graph_debug_dump_tensor("ffn_moe_mid_raw_up", g->batch_routed_mid,
-                                      routed_mid_elems, il, pos0);
+        gpu_graph_debug_dump_tensor(g->imatrix_f32_rows ? "ffn_moe_mid_leaf" : "ffn_moe_mid_raw_up",
+                                      g->batch_routed_mid, routed_mid_elems, il, pos0);
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,
