@@ -2,6 +2,8 @@
 #include "pulsar_cuda_mx.cuh"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
+#include "mmq/ds4_exl3_gemv.cuh" /* L245: the EXL3 fold and sum */
+#include "engine/exl3_trellis.h" /* L245: exl3_type_k2 */
 
 #endif
 
@@ -99,6 +101,7 @@ enum moe_nonfinite_arm {
     MOE_NF_ARM_GROUPED_DOWN = 2,   ///< grouped CUTLASS MXFP4 down (routed_moe_launch_cutlass_grouped)
     MOE_NF_ARM_GEMV_DOWN    = 3,   ///< small-batch MXFP4 GEMV down (pulsar_cutlass_expert_ffn_gemv_small)
     MOE_NF_ARM_MIXED_DOWN   = 4,   ///< mixed type-40/type-43 down (routed_moe_launch_mixed40)
+    MOE_NF_ARM_EXL3_DOWN    = 5,   ///< EXL3 trellis down + rotated sum (routed_moe_launch_exl3, L245)
 };
 
 /** The flag value moe_sum stores for a non-finite sum at (layer_index, arm). */
@@ -126,6 +129,7 @@ int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm
         case MOE_NF_ARM_GROUPED_DOWN: *arm = "grouped CUTLASS MXFP4 down"; break;
         case MOE_NF_ARM_GEMV_DOWN:    *arm = "small-batch MXFP4 GEMV down"; break;
         case MOE_NF_ARM_MIXED_DOWN:   *arm = "mixed type-40/type-43 down"; break;
+        case MOE_NF_ARM_EXL3_DOWN:    *arm = "EXL3 trellis down"; break;
         default:                      *arm = "unknown arm"; break;
         }
     }
@@ -1264,6 +1268,167 @@ static int routed_moe_try_mmq_down(
 }
 #endif /* PULSAR_HAVE_MMQ */
 
+
+/* L245: the EXL3 routed arm.  Both sides carry an EXL3 rate (the binder
+ * refuses a mix with 40/44); gate/up and down may differ in rate.  The
+ * dataflow is the IQ2 arm's -- the same sorted pairs, the same producer E4M3
+ * staging, per-pair f32 outputs, a fixed-order sum -- with the trellis GEMV
+ * in place of the D2R launch and the format's rotations in the fold and the
+ * sum (mmq/ds4_exl3_gemv.cuh).  EVERY row takes it, decode and prefill: one
+ * arithmetic, no row-kind boundary in this lane.  A prefill assignment
+ * re-streams its expert, so long prompts are slow here; the tile arm for
+ * prefill is a later slice, and the announce line says which arm ran. */
+static int routed_moe_launch_exl3(
+        pulsar_gpu_tensor *out,
+        pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *mid,
+        pulsar_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const pulsar_gpu_tensor *x,
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        uint32_t expert_lo,
+        uint32_t expert_hi) {
+    const int k2g = exl3_type_k2(gate_type), k2d = exl3_type_k2(down_type);
+    if (!k2g || !k2d) {
+        static int said_mix = 0;
+        if (!said_mix) { said_mix = 1;
+            fprintf(stderr, "pulsar: routed MoE: an exl3 side paired with a non-exl3 side "
+                    "(gate type %u, down type %u) -- no kernel reads that mix; refusing\n",
+                    gate_type, down_type); }
+        return 0;
+    }
+    if (expert_lo != 0u || expert_hi != n_total_expert) {
+        static int said = 0;
+        if (!said) { said = 1;
+            fprintf(stderr, "pulsar: EXL3 routed MoE cannot honor expert ownership "
+                    "(range [%u,%u) of %u) yet -- no fallback; refusing\n",
+                    expert_lo, expert_hi, n_total_expert); }
+        return 0;
+    }
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
+        expert_in_dim % 256u != 0 || expert_mid_dim % 256u != 0 || out_dim % 128u != 0 ||
+        gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+#ifndef PULSAR_HAVE_MMQ
+    return 0;   /* the pair/single drivers live in the MMQ TU */
+#else
+    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_bytes > model_size - gate_offset ||
+        gate_bytes > model_size - up_offset ||
+        down_bytes > model_size - down_offset) {
+        return 0;
+    }
+    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
+    static int mmq_ready = -1;
+    if (mmq_ready < 0) {
+        int dev = 0;
+        (void)cudaGetDevice(&dev);
+        mmq_ready = (ds4_mmq_init(dev) == 0) ? 1 : 0;
+    }
+    if (!mmq_ready) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: the MMQ drivers are unavailable on this device -- refusing\n");
+        return 0;
+    }
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: L245 routed EXL3 arm = trellis GEMV on every row (gate/up K=%g, down K=%g)\n",
+                k2g / 2.0, k2d / 2.0);
+    }
+    /* the [trellis, scales] tables: row_bytes is the split point (routed_expert_side_layout) */
+    const void *const *gt = exl3_expert_table(gate_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
+    const void *const *ut = exl3_expert_table(up_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
+    const void *const *dt = exl3_expert_table(down_w, n_total_expert, down_expert_bytes, down_row_bytes);
+    if (!gt || !ut || !dt) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no expert table -- refusing\n");
+        return 0;
+    }
+    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    if (pairs > (uint64_t)INT32_MAX) return 0;
+    void *mid_q = NULL, *mid_sf = NULL;
+    int mid_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pairs, expert_mid_dim, &mid_q, &mid_sf, &mid_kbp)) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no E4M3 slot for the folded mid (mid_dim=%u pairs=%llu) -- refusing\n",
+                expert_mid_dim, (unsigned long long)pairs);
+        return 0;
+    }
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr((const float *)x->ptr, n_tokens, expert_in_dim,
+                                                 &act_q, &act_sf, &act_kbp) || !act_q) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                expert_in_dim, n_tokens);
+        return 0;
+    }
+    float *gate_z = (float *)up->ptr;    /* pairs x mid f32, the unrotated gate z */
+    float *up_z = (float *)mid->ptr;     /* pairs x mid f32, the unrotated up z; the fold reads both */
+    int rc = ds4_exl3_moe_pair(gt, ut, k2g, selected_ptr, gate_z, up_z,
+                               (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
+                               (int)n_total_expert, (int)n_expert, cudaStreamPerThread,
+                               act_q, act_sf, act_kbp);
+    if (rc != 0) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE gate/up declined (rc=%d) -- no fallback\n", rc);
+        return 0;
+    }
+    rc = ds4_exl3_moe_fold_launch(gate_z, up_z, selected_ptr, (const float *)weights->ptr, gt, ut, dt,
+                                  (int)expert_in_dim, (int)expert_mid_dim, (int64_t)pairs, clamp,
+                                  mid_q, mid_sf, mid_kbp, cudaStreamPerThread);
+    if (rc != 0) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+    rc = ds4_exl3_moe_single(dt, k2d, selected_ptr, (float *)down->ptr,
+                             (int)out_dim, (int)expert_mid_dim, (int)pairs,
+                             (int)n_total_expert, 1, cudaStreamPerThread, mid_q, mid_sf, mid_kbp);
+    if (rc != 0) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE down declined (rc=%d) -- no fallback\n", rc);
+        return 0;
+    }
+    static uint32_t *nf_flag = NULL;
+    if (!nf_flag && !cuda_ok(cudaGetSymbolAddress((void **)&nf_flag, g_moe_nonfinite),
+                             "routed MoE non-finite flag address")) return 0;
+    rc = ds4_exl3_moe_sum_launch((float *)out->ptr, (const float *)down->ptr, selected_ptr, dt,
+                                 (int)expert_mid_dim, (int)out_dim, (int)n_expert, (int)n_tokens,
+                                 nf_flag, moe_nonfinite_code(layer_index, MOE_NF_ARM_EXL3_DOWN),
+                                 cudaStreamPerThread);
+    if (rc != 0) return 0;
+    return cuda_ok(cudaGetLastError(), "routed_moe exl3");
+#endif
+}
+
 static int routed_moe_launch(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *up,
@@ -1539,6 +1704,15 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
             return (r1 && r2) ? 1 : 0;
         }
+    }
+    if (exl3_type_k2(gate_type) || exl3_type_k2(down_type)) {
+        /* L245: the EXL3 arm; a mix with 40/44 is refused inside, by name. */
+        return routed_moe_launch_exl3(out, up, mid, down, model_map, model_size,
+                                      gate_offset, up_offset, down_offset, gate_type, down_type,
+                                      gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                      expert_in_dim, expert_mid_dim, out_dim,
+                                      selected, weights, n_total_expert, n_expert, clamp, x,
+                                      layer_index, n_tokens, expert_lo, expert_hi);
     }
     if (gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 && down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) {
         /* Which expert-FFN arithmetic a row gets is a numerics boundary: the

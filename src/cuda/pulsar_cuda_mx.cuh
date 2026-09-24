@@ -54,7 +54,7 @@ __host__ __device__ __forceinline__ static size_t pulsar_mx_sf_slab_bytes(int ro
     return (size_t)pulsar_mx_rup(rows, 128) * (size_t)KBp;
 }
 
-__device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
+__host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
 }

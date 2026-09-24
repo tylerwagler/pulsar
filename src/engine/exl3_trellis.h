@@ -35,6 +35,16 @@
 
 #include "pulsar_gpu.h" /* the PULSAR_TENSOR_* ids */
 
+/* The bit-layout functions are callable from device code so the GEMV reads
+ * the SAME authority for "where does position p's state end" as the host
+ * dequant and the transcoder; nothing about the layout is restated in a
+ * kernel. */
+#ifdef __CUDACC__
+#define EXL3_HD __host__ __device__
+#else
+#define EXL3_HD
+#endif
+
 /* The header is included by host TUs and by CUDA TUs (the expert-table gate,
  * the kernels' launchers), so the fp16 conversions are software and exact --
  * no _Float16, no NEON, no engine header.  The dequant gate holds them to
@@ -102,14 +112,14 @@ static inline uint16_t exl3_f32_to_f16(float f) {
  * Bit rate in half-bit units: k2 = 2K for an integer K in 1..8, 2K+1 for the
  * half-integer rates 1.5, 2.5, 3.5.  Anything else is not an EXL3 rate.
  */
-static inline bool exl3_k2_valid(int k2) {
+EXL3_HD static inline bool exl3_k2_valid(int k2) {
     const int bits = k2 >> 1;
     if (k2 & 1) return bits >= 1 && bits <= 3;
     return bits >= 1 && bits <= 8;
 }
 
 /** uint16 words per 256-weight tile: 16K, or 16K + 8 for a half-integer K. */
-static inline int exl3_words_per_tile(int k2) {
+EXL3_HD static inline int exl3_words_per_tile(int k2) {
     return 16 * (k2 >> 1) + ((k2 & 1) ? 8 : 0);
 }
 
@@ -119,14 +129,14 @@ static inline int exl3_words_per_tile(int k2) {
  * checkpoint records it.  (16K + 8 for K=2 is 40 = 16 * 2.5: the half-integer
  * widths collide with nothing because 16K + 8 is never a multiple of 16.)
  */
-static inline int exl3_k2_from_words(int words) {
+EXL3_HD static inline int exl3_k2_from_words(int words) {
     if (words <= 0 || words % 8) return 0;
     const int k2 = (words % 16 == 0) ? 2 * (words / 16) : 2 * (words / 16) + 1;
     return exl3_k2_valid(k2) ? k2 : 0;
 }
 
 /** Stream bits per tile. */
-static inline int exl3_stream_bits(int k2) {
+EXL3_HD static inline int exl3_stream_bits(int k2) {
     return 16 * exl3_words_per_tile(k2);
 }
 
@@ -136,7 +146,7 @@ static inline int exl3_stream_bits(int k2) {
  * even position ends K bits in, the odd one at the pair's end
  * (`dq8_half`: w6 = w7 >> (K+1), w5 = w6 >> K).
  */
-static inline int exl3_state_end_bit(int k2, int p) {
+EXL3_HD static inline int exl3_state_end_bit(int k2, int p) {
     const int bits = k2 >> 1;
     if (!(k2 & 1)) return (p + 1) * bits;
     const int bits2 = 2 * bits + 1;
@@ -184,10 +194,9 @@ static inline uint16_t exl3_mul1_decode(uint32_t state) {
  * 16x16 tile, row along `in`, col along `out`.  Lane t = p >> 3, i = p & 7:
  * row = (t % 4) * 2 + {0, 1, 8, 9}[i & 3], col = t / 4 + 8 * (i >> 2).
  */
-static inline void exl3_tile_position(int p, int *row, int *col) {
-    static const int row_of[4] = {0, 1, 8, 9};
+EXL3_HD static inline void exl3_tile_position(int p, int *row, int *col) {
     const int t = p >> 3, i = p & 7;
-    *row = (t % 4) * 2 + row_of[i & 3];
+    *row = (t % 4) * 2 + (i & 1) + 8 * ((i >> 1) & 1); /* {0, 1, 8, 9}[i & 3] */
     *col = t / 4 + 8 * (i >> 2);
 }
 
@@ -208,7 +217,7 @@ static inline void exl3_tile_dequant(const uint16_t *tile, int k2, uint16_t out[
  * is not an EXL3 layout.  One id per rate because the rate is not recoverable
  * from a stack's dims; `m` in the names pins the mul1 codebook.
  */
-static inline int exl3_type_k2(uint32_t type) {
+EXL3_HD static inline int exl3_type_k2(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_EXL3M_K2:  return 4;
     case PULSAR_TENSOR_EXL3M_K2H: return 5;
@@ -228,7 +237,7 @@ static inline int exl3_type_k2(uint32_t type) {
  * precondition, and what keeps every plane 128-byte aligned; anything else is
  * refused (returns false), never padded.
  */
-static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
+EXL3_HD static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
                                       uint64_t *trellis_bytes, uint64_t *scale_bytes,
                                       uint64_t *stride) {
     if (!exl3_k2_valid(k2) || k == 0 || n == 0 || k % EXL3_HAD_BLOCK || n % EXL3_HAD_BLOCK) return false;

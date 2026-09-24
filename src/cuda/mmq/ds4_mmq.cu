@@ -20,6 +20,7 @@
 #include "mmid.cuh"
 #include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
+#include "ds4_exl3_gemv.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -265,7 +266,11 @@ int ds4_mmq_moe_impl(
          * every activation stride below is derived from K. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
-        int             act_kbp    = 0) {
+        int             act_kbp    = 0,
+        /* L245: 0 = the IQ2 D2R arm over x_soa; a rate in half-bit units
+         * (4/5/6) = the EXL3 trellis GEMV over the [trellis, scales] table W
+         * (the same sorted pairs and E4M3 staging feed it). */
+        int             exl3_k2    = 0) {
 
     if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -384,7 +389,7 @@ int ds4_mmq_moe_impl(
         d2r_iq2s_cc = cc;
         d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = (x_soa != nullptr && K % 256 == 0 && d2r_iq2s_avail != 0);
+    const bool d2r_iq2 = ((x_soa != nullptr || exl3_k2 != 0) && K % 256 == 0 && d2r_iq2s_avail != 0);
 
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
@@ -464,7 +469,10 @@ int ds4_mmq_moe_impl(
      * two days of cross-arm measurements came back bit-identical.
      * One path, one activation format, every batch size. */
     {
-        const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
+        const int rc = exl3_k2
+            ? ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
+                                              out_f32, M, K, ne_get_rows, n_experts, stream)
+            : ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
             ids_dst, expert_bounds,
@@ -519,7 +527,9 @@ int ds4_mmq_moe_pair_impl(
          * its ue8m0 plane and pitch.  Required. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
-        int             act_kbp    = 0) {
+        int             act_kbp    = 0,
+        /* L245: see ds4_mmq_moe_impl; the EXL3 tables ride in W_a / W_b. */
+        int             exl3_k2    = 0) {
 
     if (!W_a || !W_b || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -635,9 +645,8 @@ int ds4_mmq_moe_pair_impl(
         d2r_iq2_avail_cc = cc;
         d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = (xa_soa != nullptr &&
-                          xb_soa != nullptr && K % 256 == 0 &&
-                          d2r_iq2_avail != 0);
+    const bool d2r_iq2 = ((xa_soa != nullptr && xb_soa != nullptr) || exl3_k2 != 0) &&
+                         K % 256 == 0 && d2r_iq2_avail != 0;
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -694,7 +703,10 @@ int ds4_mmq_moe_pair_impl(
                         "ds4/prefill/moe/iq2_gate_up_d2r",
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
-                const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
+                const int d2r_rc = exl3_k2
+                    ? ds4_exl3_moe_gemv_pair_launch(W_a, W_b, exl3_k2, src1_e4m3, ids_dst, expert_bounds,
+                                                    out_a, out_b, M, K, ne_get_rows, n_experts, stream)
+                    : ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks,
                         src1_e4m3, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
@@ -814,4 +826,38 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
                                                M, K, n_tokens, n_experts, n_expert_used, stream,
                                                (const char *)W_soa, nblk,
                                                act_q, act_sf, act_kbp);
+}
+
+/* L245: the EXL3 twins.  Same drivers -- the expert-major sort and the E4M3
+ * staging are format-independent -- with the trellis GEMV in place of the
+ * D2R launch.  The tables are exl3_expert_table()'s [trellis, scales] pairs;
+ * k2 is the rate in half-bit units (one per family; gate/up share one). */
+extern "C" int ds4_exl3_moe_pair(
+        const void * gate_table, const void * up_table, int k2,
+        const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream,
+        const void * act_q, const void * act_sf, int act_kbp) {
+    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_pair: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_pair_impl(
+        "ds4_exl3_moe_pair", gate_table, up_table, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        NULL, NULL, 0, act_q, act_sf, act_kbp, k2);
+}
+
+extern "C" int ds4_exl3_moe_single(
+        const void * table, int k2, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream,
+        const void * act_q, const void * act_sf, int act_kbp) {
+    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_single: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
+                            M, K, n_tokens, n_experts, n_expert_used, stream,
+                            NULL, 0, act_q, act_sf, act_kbp, k2);
 }

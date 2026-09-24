@@ -262,10 +262,11 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
+	./tests/exl3_gemv_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -452,6 +453,19 @@ tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
                          src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h \
                          src/engine/exl3_trellis.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# L245 step 3: the EXL3 routed-expert arm -- both GEMVs, the fold and the sum
+# -- graded against the host authority (exl3_trellis.h + double arithmetic)
+# on random tiles at the V4.1 expert shape, plus the arm's GB/s.  Model-free;
+# needs a device.  Includes the kernel TU directly, as the table gate does.
+tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
+                      src/cuda/mmq/ds4_exl3_gemv.cuh src/cuda/mmq/ds4_act_block.cuh \
+                      src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -Isrc/cuda/mmq -o $@ $<
+
+.PHONY: exl3-gemv-gate
+exl3-gemv-gate: tests/exl3_gemv_gate
+	./tests/exl3_gemv_gate
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row

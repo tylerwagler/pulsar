@@ -120,6 +120,44 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * Upstream shipped a pair entry but no IQ2 SINGLE soa entry, which is what a
  * routed DOWN needs when the down tensor is IQ2 rather than Q2_K (our v5mx).
  * Same contract as the pair entry at one weight/one output. */
+/* L245: the EXL3 twins of the two entries above.  The weight arguments are
+ * exl3_expert_table()'s [trellis, scales] pointer pairs and k2 the rate in
+ * half-bit units (4 / 5 / 6); everything else -- sorted pairs, the producer's
+ * E4M3 activation, the per-pair f32 outputs -- is the same contract.  The
+ * outputs are the UNROTATED z of each projection: the EXL3 fold and sum
+ * (ds4_exl3_gemv.cuh) apply the format's output rotations. */
+int ds4_exl3_moe_pair(
+    const void    * gate_table,
+    const void    * up_table,
+    int             k2,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
+
+int ds4_exl3_moe_single(
+    const void    * table,
+    int             k2,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
+
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
     const int32_t * ids,

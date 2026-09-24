@@ -290,6 +290,24 @@ pass is the only supported way to combine main + drafter now. It preserves
 the main region byte-for-byte just the same, so the cost of a drafter fix is
 one quantizer pass, not a from-scratch rebuild.
 
+### EXL3 routed experts (L245)
+
+The container also carries routed experts in exllamav3's trellis format
+(layouts `exl3m_k2` / `exl3m_k2h` / `exl3m_k3`, one id per rate, the mul1
+codebook pinned by the name): one contiguous `[trellis | suh | svh]` slice per
+expert, the trellis words verbatim.  They enter through the lane, not the
+quantizer: `safetensors_lane.py emit --gguf G --out DIR --all --exl3-experts
+EXL3_DIR [--exl3-layers 5,18-22]` sources those layers' routed experts from an
+EXL3 checkpoint's HF shards (the public Mia-AiLab V4.1 build, or a shard our
+own driver wrote with exllamav3's `quantize_exl3`) and everything else from the
+GGUF as before; gate/up must share one rate per layer, down may differ.  The
+byte model is `src/engine/exl3_trellis.h` (`exl3_expert_layout`), the engine
+re-derives `expert_bytes` from it at load and refuses a stack that disagrees,
+and `verify` checks those experts against the EXL3 shards.  Fidelity is graded
+like any other quant: the reference gate against the B300 capture, never argued
+from the bit rate.  Kernel: the EXL3 arm (`src/cuda/mmq/ds4_exl3_gemv.cu`,
+`routed_moe_launch_exl3`) runs every row; the announce line names it.
+
 ## 3. Gates before anything is served
 
 Run all of these. Each one has caught a real defect:

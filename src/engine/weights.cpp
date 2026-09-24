@@ -359,17 +359,6 @@ static void tensor_expect_routed_expert_combo(
      * type. */
     const bool gate_exl3 = exl3_type_k2(gate->type) != 0;
     const bool down_exl3 = exl3_type_k2(down->type) != 0;
-    if (gate_exl3 || down_exl3) {
-        /* The container, the loader and the address table read EXL3 stacks
-         * (L245 step 2); no kernel arm reads them yet (step 3).  Refuse here,
-         * by name, rather than at the first routed layer's dispatch. */
-        fprintf(stderr,
-                "pulsar: tensor %.*s: exl3 routed experts (gate=%s down=%s) are declared, "
-                "but no decode arm reads them yet (L245 step 3); refusing the artifact\n",
-                (int)gate->name.len, gate->name.ptr,
-                tensor_type_name(gate->type), tensor_type_name(down->type));
-        exit(1);
-    }
     if (gate_up_pair && gate_ok && down_ok && gate_exl3 == down_exl3) return;
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
