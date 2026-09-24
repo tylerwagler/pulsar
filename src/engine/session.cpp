@@ -1012,6 +1012,25 @@ void pulsar_engine::destroy() {
     free(e->directional_steering_file);
     free(e);
 }
+/* The per-session tensor-parallel scratch (4g-2): the vocab gather's own-slice
+ * buffer (pulsar_gpu_graph::tp_vocab_own) -- PULSAR_SPEC_LOGITS_ROWS rows at
+ * the widest rank range, rounded up to whole row-lane messages.  One helper for
+ * create AND the admission price (session_cost_bytes_banked), which dry-runs
+ * the same steps: a buffer allocated in only one of them is the SESSION COST
+ * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
+static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
+    if (!tp || !pulsar_tp_row_lane(tp)) return true;
+    const uint64_t n_ranks = pulsar_tp_n_ranks(tp);
+    const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
+    const uint64_t vb = pulsar_tp_vec_bytes(tp);
+    const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
+    g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
+    if (!g->tp_vocab_own)
+        fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
+                (unsigned long long)bytes);
+    return g->tp_vocab_own != NULL;
+}
+
 
 
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
@@ -1057,19 +1076,10 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     s->graph.tp_group_hi = e->tp_group_hi;
     s->graph.tp_slab_dev = e->tp_slab_dev;
     s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
-    if (e->tp && pulsar_tp_row_lane(e->tp)) {
-        const uint64_t n_ranks = pulsar_tp_n_ranks(e->tp);
-        const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
-        const uint64_t vb = pulsar_tp_vec_bytes(e->tp);
-        const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
-        s->graph.tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
-        if (!s->graph.tp_vocab_own) {
-            fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
-                    (unsigned long long)bytes);
-            gpu_graph_free(&s->graph);
-            free(s);
-            return 1;
-        }
+    if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
+        gpu_graph_free(&s->graph);
+        free(s);
+        return 1;
     }
     /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
      * here, at the one place a session begins, from the engine's ordinal; a
@@ -1123,7 +1133,8 @@ uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale) &&
         (!e->dspark_ready ||
-         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids));
+         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids)) &&
+        session_alloc_tp_scratch(&g, e->tp);
     uint64_t bytes = 0;
     pulsar_gpu_tensor_dry_end(&bytes, NULL);
     gpu_graph_release(&g);
