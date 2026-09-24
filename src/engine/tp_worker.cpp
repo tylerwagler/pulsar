@@ -243,7 +243,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
+                const double t0 = pulsar_tp_now_sec();   /* TEMPORARY instrument */
                 rc = slot->s->eval(c->value, ferr, sizeof(ferr));
+                pulsar_tp_timing_add(PULSAR_TP_TSITE_STEP, PULSAR_TP_TPH_XCHG, pulsar_tp_now_sec() - t0, 0);
             }
         }
         if (rc != 0) fprintf(stderr, "pulsar: tp worker: eval refused: %s\n", ferr);

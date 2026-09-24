@@ -602,6 +602,13 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 /** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
+/** Tensor-parallel leader: read and check the pair's pending logits-identity
+ * acks now (pulsar_session_eval pipelines them one step; logits readers and
+ * pulsar_session_free settle on their own).  A driver that ends generation on
+ * a token decision (EOS) calls this to learn whether the step that drew it
+ * agreed across ranks.  @return 0 on success (also for untensored sessions),
+ * 1 with `err` filled on a mismatch or a dead pair. */
+int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
 /** Row-based twins of the two readers above (pulsar_sample_logits' relation to
  * pulsar_session_sample): score a caller-supplied logits row.  The batched

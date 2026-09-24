@@ -543,6 +543,12 @@ struct pulsar_tp {
     /* The cross-rank logits identity tally (leader only; L243). */
     uint64_t identity_frames;
     uint64_t identity_matched;
+    /* The DEFERRED digest ack (L241 4g-2, pulsar_tp_defer_command_ack_digest):
+     * the leader's own digest of a step whose peer acks it has not read yet.
+     * Settled before any other ack is read. */
+    bool deferred_armed = false;
+    uint64_t deferred_session = 0, deferred_digest = 0;
+    char deferred_operation[96] = {0};
     /* The row lane (4g-2).  Engine thread: gate_seq = last message numbered,
      * row_exch = last exchange numbered.  Proxy thread: proxy_* below. */
     uint64_t gate_seq = 0;
@@ -570,7 +576,7 @@ void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
     if (phase == PULSAR_TP_TPH_XCHG) { g_tsite[site].n++; g_tsite[site].bytes += bytes; }
 }
 void pulsar_tp_timing_report(const pulsar_tp *tp) {
-    static const char *site_name[PULSAR_TP_TSITE_N] = { "ffn-direct", "ffn-staged", "attn-low", "vocab", "ffn-gate", "attn-gate" };
+    static const char *site_name[PULSAR_TP_TSITE_N] = { "ffn-direct", "ffn-staged", "attn-low", "vocab", "ffn-gate", "attn-gate", "eval-step" };
     const int rank = tp ? tp->rank : -1;
     fprintf(stderr, "pulsar: tp-timing rank %d: site         calls   bytes/call   d2h(ms)  host(ms)  xchg(ms)  h2d(ms)   total(ms)  per-call(us)\n", rank);
     for (int s = 0; s < PULSAR_TP_TSITE_N; s++) {
@@ -3118,9 +3124,29 @@ int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
 
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
  * and pulsar_tp_wait_command_status_digest (want_digest 1). */
+static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen);
+
+static int tp_collect_status_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                  int *status, int want_digest, uint64_t own_digest,
+                                  char *err, size_t errlen);
+
+/* Every ack read settles the deferred one first: the peers answer in frame
+ * order, so its ack is the next one in the socket.  A failed settle fails
+ * this collect too (its own acks are still read, so no frame is left behind),
+ * and its message is the one reported. */
 static int tp_collect_status(pulsar_tp *tp, uint64_t session_id, const char *operation,
                              int *status, int want_digest, uint64_t own_digest,
                              char *err, size_t errlen) {
+    char scratch[256];
+    const int settled = tp_settle_deferred(tp, err, errlen);
+    const int rc = tp_collect_status_body(tp, session_id, operation, status, want_digest, own_digest,
+                                          settled ? err : scratch, settled ? errlen : sizeof(scratch));
+    return settled && rc;
+}
+
+static int tp_collect_status_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                  int *status, int want_digest, uint64_t own_digest,
+                                  char *err, size_t errlen) {
     if (!tp || tp->n_peers < 1 || !status) return 0;
     const double deadline = tp_control_deadline(tp);
     int agreed = 0, have = 0, bad = 0;
@@ -3379,8 +3405,48 @@ void pulsar_tp_identity_stats(const pulsar_tp *tp, uint64_t *frames, uint64_t *m
  * failed). */
 enum { TP_ACK_PLAIN = 0, TP_ACK_DIGEST = 1, TP_ACK_DRAIN = 2 };
 
+static int tp_collect_acks_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                int mode, uint64_t own_digest, char *err, size_t errlen);
+
 static int tp_collect_acks(pulsar_tp *tp, uint64_t session_id, const char *operation,
                            int mode, uint64_t own_digest, char *err, size_t errlen) {
+    char scratch[256];
+    const int settled = tp_settle_deferred(tp, err, errlen);
+    const int rc = tp_collect_acks_body(tp, session_id, operation, mode, own_digest,
+                                        settled ? err : scratch, settled ? errlen : sizeof(scratch));
+    return settled && rc;
+}
+
+static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen) {
+    if (!tp || !tp->deferred_armed) return 1;
+    tp->deferred_armed = false;
+    const double t0 = tp_now_sec();
+    const int rc = tp_collect_acks_body(tp, tp->deferred_session, tp->deferred_operation,
+                                        TP_ACK_DIGEST, tp->deferred_digest, err, errlen);
+    g_ctl.n_ack++; g_ctl.ack += tp_now_sec() - t0;
+    return rc;
+}
+
+int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
+                                       const char *operation, uint64_t own_digest) {
+    if (!tp || tp->deferred_armed) {
+        fprintf(stderr, "pulsar-tp: a deferred ack is already pending for %s -- settle it before "
+                        "deferring another (refusing)\n", tp ? tp->deferred_operation : "?");
+        return 0;
+    }
+    tp->deferred_armed = true;
+    tp->deferred_session = session_id;
+    tp->deferred_digest = own_digest;
+    snprintf(tp->deferred_operation, sizeof(tp->deferred_operation), "%s", operation ? operation : "the step");
+    return 1;
+}
+
+int pulsar_tp_settle_deferred_ack(pulsar_tp *tp, char *err, size_t errlen) {
+    return tp_settle_deferred(tp, err, errlen);
+}
+
+static int tp_collect_acks_body(pulsar_tp *tp, uint64_t session_id, const char *operation,
+                                int mode, uint64_t own_digest, char *err, size_t errlen) {
     /* One ack per PEER: every worker must have applied the command, and all
      * must succeed.  The first failure names the rank that refused -- but a
      * refusal (an ack that arrived with a nonzero status, a foreign session
@@ -3468,10 +3534,7 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
 int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
                                       const char *operation, uint64_t own_digest,
                                       char *err, size_t errlen) {
-    const double t0 = tp_now_sec();
-    const int rc = tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
-    g_ctl.n_ack++; g_ctl.ack += tp_now_sec() - t0;
-    return rc;
+    return tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
 }
 
 void pulsar_tp_drain_command_acks(pulsar_tp *tp) {

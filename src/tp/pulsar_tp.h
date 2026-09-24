@@ -211,7 +211,8 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
  * (TCP), staging memcpy, and wire (post -> completion).  Reported once per
  * rank at engine close. */
 enum { PULSAR_TP_TSITE_FFN_DIRECT = 0, PULSAR_TP_TSITE_FFN_STAGED, PULSAR_TP_TSITE_ATTN_LOW,
-       PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TSITE_ATTN_GATE, PULSAR_TP_TSITE_N };
+       PULSAR_TP_TSITE_VOCAB, PULSAR_TP_TSITE_FFN_GATE, PULSAR_TP_TSITE_ATTN_GATE,
+       PULSAR_TP_TSITE_STEP /* eval: d2h = frame->body start, host = gap before the send, xchg = body */, PULSAR_TP_TSITE_N };
 enum { PULSAR_TP_TPH_D2H = 0, PULSAR_TP_TPH_HOST, PULSAR_TP_TPH_XCHG, PULSAR_TP_TPH_H2D, PULSAR_TP_TPH_N };
 double pulsar_tp_now_sec(void);
 void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes);
@@ -466,6 +467,18 @@ int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
 int pulsar_tp_wait_command_status_digest(pulsar_tp *tp, uint64_t session_id,
                                          const char *operation, int *status,
                                          uint64_t own_digest, char *err, size_t errlen);
+/* PIPELINED identity check (L241 4g-2): instead of waiting for the peers'
+ * digest acks of a step before the next one starts, the leader records its own
+ * digest here and returns; the acks are read -- and the digests compared --
+ * the next time ANY ack is collected (they arrive in frame order, so they are
+ * the next ones in the socket) or at pulsar_tp_settle_deferred_ack.  A
+ * mismatch then fails that later call, names `operation` (the step whose
+ * logits differed), and marks the group failed, exactly as the direct check
+ * does.  One deferral at a time: deferring with one pending refuses (0). */
+int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
+                                       const char *operation, uint64_t own_digest);
+/* Read and check the deferred acks now (1 = none pending, or they matched). */
+int pulsar_tp_settle_deferred_ack(pulsar_tp *tp, char *err, size_t errlen);
 /* The leader's drain for a logits-producing operation whose OWN body failed:
  * the peers' acks are read (an unread ack would shift every later frame) in
  * either shape and their verdicts ignored -- the local failure is the result. */
