@@ -449,7 +449,8 @@ tests/moe_route_bounds_gate: tests/moe_route_bounds_gate.cu Makefile \
 # expert address looks like fluent text, which is why this is a gate and not a
 # comment (plan s4.1).
 tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
-                         src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h
+                         src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h \
+                         src/engine/exl3_trellis.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
@@ -517,7 +518,7 @@ engram-hash-check: tests/engram_hash_test
 # and random-word tiles at every rate.  Host-only and instant; the header is
 # the one authority the transcoder and the device kernels are held to.
 tests/exl3_dequant_gate: tests/exl3_dequant_gate.cpp src/engine/exl3_trellis.h \
-                         src/engine/pulsar_engine_internal.h Makefile
+                         src/pulsar_gpu.h Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/exl3_dequant_gate.cpp
 
 .PHONY: exl3-dequant-gate

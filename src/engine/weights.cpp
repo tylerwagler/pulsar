@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"
 
 
 
@@ -230,7 +231,8 @@ static void tensor_expect_plain_layout(
  * into a reader that no longer exists. */
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == PULSAR_TENSOR_IQ2_XXS_MMQ_K ||
-           type == PULSAR_TENSOR_CUTLASS_MXFP4;
+           type == PULSAR_TENSOR_CUTLASS_MXFP4 ||
+           exl3_type_k2(type) != 0;
 }
 
 
@@ -256,6 +258,38 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
 
 
 
+/* ONE side's byte model from (type, in = k, out = n): the per-expert stride
+ * and the "row bytes" value that side's consumers read -- an ordinary row
+ * stride for the IQ2 arm, the data/SF split point for CUTLASS MXFP4, the
+ * trellis/scales split point for EXL3 (exl3_expert_layout).  Both
+ * routed_expert_gate_down_layout() and the container's expert-stack check
+ * (st_add_expert_stacks) read this, so a stack whose declared expert_bytes
+ * disagrees with the type's own layout is refused at load instead of being
+ * addressed with a guessed stride. */
+bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
+                               uint64_t *expert_bytes, uint64_t *row_bytes) {
+    if (type == PULSAR_TENSOR_CUTLASS_MXFP4) {
+        uint64_t sf, stride;
+        cutlass_mxfp4_expert_layout(k, n, row_bytes, &sf, &stride);
+        *expert_bytes = stride;
+        return true;
+    }
+    if (exl3_type_k2(type)) {
+        uint64_t scales;
+        return exl3_expert_layout(k, n, exl3_type_k2(type), row_bytes, &scales, expert_bytes);
+    }
+    if (type == PULSAR_TENSOR_IQ2_XXS_MMQ_K) {
+        if (k % QK_K) return false;
+        *row_bytes = (k / QK_K) * routed_expert_block_bytes(type);
+        if (*row_bytes == 0 || n > UINT64_MAX / *row_bytes) return false;
+        *expert_bytes = n * *row_bytes;
+        return true;
+    }
+    return false;
+}
+
+
+
 /* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
  * for any supported routed-expert quant combo, centralizing the
  * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
@@ -267,7 +301,9 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
  * block: the SF blob starts *row_bytes bytes into that expert's slice, and
  * *expert_bytes is the full [data + SF] stride to the next expert. Callers
  * that dispatch on gate->type == PULSAR_TENSOR_CUTLASS_MXFP4 must read it that
- * way; only the CUTLASS MoE path does. */
+ * way; only the CUTLASS MoE path does.  The EXL3 layouts carry the same shape
+ * of answer: *row_bytes is the trellis/scales split point of an expert's
+ * slice and *expert_bytes its stride (exl3_expert_layout). */
 bool routed_expert_gate_down_layout(
         const pulsar_tensor *gate,
         const pulsar_tensor *down,
@@ -282,29 +318,10 @@ bool routed_expert_gate_down_layout(
      * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
      * the dp4a side yields ordinary expert/row byte counts. */
     if (!gate || !down) return false;
-
-    if (gate->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
-        uint64_t gate_sf, gate_stride;
-        cutlass_mxfp4_expert_layout(gate->dim[0], gate->dim[1],
-                                     gate_row_bytes, &gate_sf, &gate_stride);
-        *gate_expert_bytes = gate_stride;
-    } else {
-        *gate_row_bytes = routed_expert_row_bytes(gate);
-        if (*gate_row_bytes == 0 || gate->dim[1] > UINT64_MAX / *gate_row_bytes) return false;
-        *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
-    }
-
-    if (down->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
-        uint64_t down_sf, down_stride;
-        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
-                                     down_row_bytes, &down_sf, &down_stride);
-        *down_expert_bytes = down_stride;
-    } else {
-        *down_row_bytes = routed_expert_row_bytes(down);
-        if (*down_row_bytes == 0 || down->dim[1] > UINT64_MAX / *down_row_bytes) return false;
-        *down_expert_bytes = down->dim[1] * *down_row_bytes;
-    }
-    return true;
+    return routed_expert_side_layout(gate->type, gate->dim[0], gate->dim[1],
+                                     gate_expert_bytes, gate_row_bytes) &&
+           routed_expert_side_layout(down->type, down->dim[0], down->dim[1],
+                                     down_expert_bytes, down_row_bytes);
 }
 
 
@@ -336,12 +353,28 @@ static void tensor_expect_routed_expert_combo(
     const bool gate_up_pair = gate->type == up->type;
     const bool gate_ok = tensor_is_routed_expert_type(gate->type);
     const bool down_ok = tensor_is_routed_expert_type(down->type);
-    if (gate_up_pair && gate_ok && down_ok) return;
+    /* EXL3 (L245) runs its own arm on both projections: an EXL3 side never
+     * pairs with a 40/44 side (no kernel reads that mix), but the RATE may
+     * differ between gate/up and down -- the arm decodes each side by its own
+     * type. */
+    const bool gate_exl3 = exl3_type_k2(gate->type) != 0;
+    const bool down_exl3 = exl3_type_k2(down->type) != 0;
+    if (gate_exl3 || down_exl3) {
+        /* The container, the loader and the address table read EXL3 stacks
+         * (L245 step 2); no kernel arm reads them yet (step 3).  Refuse here,
+         * by name, rather than at the first routed layer's dispatch. */
+        fprintf(stderr,
+                "pulsar: tensor %.*s: exl3 routed experts (gate=%s down=%s) are declared, "
+                "but no decode arm reads them yet (L245 step 3); refusing the artifact\n",
+                (int)gate->name.len, gate->name.ptr,
+                tensor_type_name(gate->type), tensor_type_name(down->type));
+        exit(1);
+    }
+    if (gate_up_pair && gate_ok && down_ok && gate_exl3 == down_exl3) return;
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
-            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq_k (44); "
-            "combos may differ per layer\n",
+            "gate=%s up=%s down=%s; gate/up must match, an exl3 side pairs only "
+            "with an exl3 side, and each of gate/up and down must be one of:",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),
@@ -1079,6 +1112,9 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_CUTLASS_MXFP4:
     case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
     case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+    case PULSAR_TENSOR_EXL3M_K2:
+    case PULSAR_TENSOR_EXL3M_K2H:
+    case PULSAR_TENSOR_EXL3M_K3:
         return true;
     default:
         return false;
@@ -1181,6 +1217,37 @@ static void e8m0_scan_blocks(
 
 
 
+/* The EXL3 analogue: the per-expert scales plane is fp16 (suh[in] | svh[out],
+ * exl3_expert_layout), and an Inf/NaN there multiplies into every weight of
+ * its row or column -- the same "one bad byte, fluent nonsense" class as an
+ * E8M0 0xFF, and just as absent from a producer's output.  Trellis words have
+ * no invalid encoding and are not scanned. */
+static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
+    uint64_t trellis = 0, scales = 0, stride = 0;
+    if (!exl3_expert_layout(t->dim[0], t->dim[1], exl3_type_k2(t->type), &trellis, &scales, &stride)) return;
+    const uint64_t n_exp = t->dim[2];
+    if (n_exp == 0 || stride > t->bytes / n_exp) return;
+    const uint8_t *map = t->ext_map ? t->ext_map : m->map;
+    const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+    if (t->abs_offset > map_size || t->bytes > map_size - t->abs_offset) return;
+    for (uint64_t e = 0; e < n_exp; e++) {
+        const uint16_t *p = (const uint16_t *)(map + t->abs_offset + e * stride + trellis);
+        for (uint64_t i = 0; i < scales / 2; i++) {
+            if ((p[i] & 0x7c00u) != 0x7c00u) continue;
+            fprintf(stderr,
+                    "pulsar: tensor %.*s: expert %llu %s scale %llu is %s (0x%04x); "
+                    "refusing the artifact\n",
+                    (int)t->name.len, t->name.ptr, (unsigned long long)e,
+                    i < t->dim[0] ? "suh" : "svh",
+                    (unsigned long long)(i < t->dim[0] ? i : i - t->dim[0]),
+                    (p[i] & 0x03ffu) ? "NaN" : "Inf", p[i]);
+            exit(1);
+        }
+    }
+}
+
+
+
 static void weights_reject_bad_e8m0(const pulsar_model *m) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
@@ -1203,6 +1270,12 @@ static void weights_reject_bad_e8m0(const pulsar_model *m) {
              * divisible by 32 is refused by the consumer. */
             if (t->ndim < 2 || (t->dim[0] & 31u)) break;
             e8m0_scan_blocks(m, t, 0, t->dim[1] * (t->dim[0] >> 5), 0, 1, "SoA");
+            break;
+        case PULSAR_TENSOR_EXL3M_K2:
+        case PULSAR_TENSOR_EXL3M_K2H:
+        case PULSAR_TENSOR_EXL3M_K3:
+            if (t->ndim < 3) break;
+            exl3_scan_scales(m, t);
             break;
         default:
             break;

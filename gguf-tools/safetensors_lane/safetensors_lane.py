@@ -40,6 +40,17 @@ Subcommands:
     verify  --gguf G --out DIR [--shard S | --all]   byte-exact gate vs the GGUF
     audit   --out DIR           structure + 32B alignment + index closure
 
+  plan / emit / verify take `--exl3-experts DIR [--exl3-layers 5,18-22]`: the
+  routed experts of those layers (default: every blk layer the EXL3 checkpoint
+  holds) are sourced from an EXL3 checkpoint (exllamav3's HF shards -- the
+  public Mia-AiLab V4.1 build, or our own convert output) instead of the GGUF,
+  as one contiguous [trellis | suh | svh] slice per expert under the layout
+  `exl3m_k2|k2h|k3` the trellis width names (L245).  The bytes are copied
+  VERBATIM from the EXL3 shards; the mul1 codebook is required, the rate is
+  read off the trellis' last dim, and gate/up must share one rate.  `verify`
+  reassembles those experts from the EXL3 shards.  The shard plan (one shard
+  per layer) follows the GGUF's own layer count, not a constant.
+
 The `verify` gate is the stage-1 gate: it checks the file against the GGUF
 DIRECTLY (not against any intermediate dump), including reassembling each
 projection's 256 per-expert payloads and comparing the concatenation with the
@@ -70,9 +81,102 @@ EXP = re.compile(r'^(blk|dspark)\.(\d+)\.ffn_(gate|up|down)_exps\.weight$')
 EXP_PART = {'gate': 'w1', 'up': 'w3', 'down': 'w2'}
 EXP_HF = re.compile(r'^(layers|mtp)\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight$')
 
-SHARD_ORDER = (['vision'] + [f'layers.{i}' for i in range(43)] + ['top']
-               + [f'mtp.{i}' for i in range(3)])
-SHARD_FILE = {s: f'model-{i:05d}-of-00048.safetensors' for i, s in enumerate(SHARD_ORDER, 1)}
+SHARD_ORDER = None      # set by set_shard_plan() from the GGUF's own layer counts
+SHARD_FILE = None
+
+
+def set_shard_plan(tensors):
+    """One shard per layer, plus the vision tower, the head/norm and each drafter
+    layer: the counts come from the tensor names (0731: 43 + 3 -> 48 shards;
+    V4.1: 40 + 3 -> 45), never from a constant."""
+    global SHARD_ORDER, SHARD_FILE
+    n_layers = n_mtp = 0
+    for t in tensors:
+        m = re.match(r'^(blk|dspark)\.(\d+)\.', t['name'])
+        if not m:
+            continue
+        if m.group(1) == 'blk':
+            n_layers = max(n_layers, int(m.group(2)) + 1)
+        else:
+            n_mtp = max(n_mtp, int(m.group(2)) + 1)
+    if n_layers == 0:
+        raise SystemExit('no blk.N tensors in the GGUF -- cannot lay out shards')
+    SHARD_ORDER = (['vision'] + [f'layers.{i}' for i in range(n_layers)] + ['top']
+                   + [f'mtp.{i}' for i in range(n_mtp)])
+    n = len(SHARD_ORDER)
+    SHARD_FILE = {s: f'model-{i:05d}-of-{n:05d}.safetensors' for i, s in enumerate(SHARD_ORDER, 1)}
+
+
+# --------------------------------------------------------------------------
+# The EXL3 expert source (L245): exllamav3's HF shards, read by header, no
+# torch.  Mirrors src/engine/exl3_trellis.h: words per 16x16 tile name the
+# rate (16K, or 16K+8 for the half-integer rates), and one expert-projection
+# is [trellis | suh | svh] with trellis (in/16)(out/16) tiles x words x 2 B
+# and the two fp16 scale vectors -- the engine refuses a stack whose declared
+# expert_bytes disagrees with that model, so this and the header are checked
+# against each other at every load.
+# --------------------------------------------------------------------------
+EXL3_LAYOUT = {32: 'exl3m_k2', 40: 'exl3m_k2h', 48: 'exl3m_k3'}
+
+
+def exl3_expert_bytes(k, n, words):
+    if k % 128 or n % 128:
+        raise SystemExit(f'exl3: dims ({k}, {n}) are not multiples of 128')
+    trellis = (k // 16) * (n // 16) * words * 2
+    return trellis, (k + n) * 2
+
+
+class Exl3Checkpoint:
+    """name -> (shard path, absolute byte offset, byte count, dtype, shape) from
+    every model-*.safetensors header in the directory (a partial download of the
+    layers under test is enough; the index is not required)."""
+
+    def __init__(self, hf_dir):
+        self.dir = hf_dir
+        self.entries = {}
+        shards = sorted(f for f in os.listdir(hf_dir)
+                        if f.startswith('model-') and f.endswith('.safetensors'))
+        if not shards:
+            raise SystemExit(f'{hf_dir}: no model-*.safetensors shards')
+        for f in shards:
+            path = os.path.join(hf_dir, f)
+            with open(path, 'rb') as fh:
+                (n,) = struct.unpack('<Q', fh.read(8))
+                hdr = json.loads(fh.read(n))
+            hdr.pop('__metadata__', None)
+            for name, h in hdr.items():
+                o0, o1 = h['data_offsets']
+                self.entries[name] = (path, 8 + n + o0, o1 - o0, h['dtype'], h['shape'])
+
+    def layers(self):
+        return sorted({int(m.group(1)) for m in
+                       (re.match(r'^layers\.(\d+)\.ffn\.experts\.0\.w1\.trellis$', k)
+                        for k in self.entries) if m})
+
+    def expert(self, layer, e, part, k, n):
+        """The three source ranges of one expert-projection and the words per
+        tile, after every refusal the format allows."""
+        key = f'layers.{layer}.ffn.experts.{e}.{part}'
+        if f'{key}.mcg' in self.entries:
+            raise SystemExit(f'{key}: mcg codebook -- pulsar reads the mul1 codebook only')
+        for sub in ('trellis', 'suh', 'svh', 'mul1'):
+            if f'{key}.{sub}' not in self.entries:
+                raise SystemExit(f'{key}.{sub}: missing from the EXL3 checkpoint')
+        tp, to, tn, tdt, tsh = self.entries[f'{key}.trellis']
+        up, uo, un, udt, ush = self.entries[f'{key}.suh']
+        vp, vo, vn, vdt, vsh = self.entries[f'{key}.svh']
+        if tdt != 'I16' or len(tsh) != 3 or tsh[0] != k // 16 or tsh[1] != n // 16:
+            raise SystemExit(f'{key}.trellis: dtype {tdt} shape {tsh}, expected I16 [{k // 16}, {n // 16}, words]')
+        words = tsh[2]
+        if words not in EXL3_LAYOUT:
+            raise SystemExit(f'{key}.trellis: {words} words per tile is not a rate pulsar reads '
+                             f'({sorted(EXL3_LAYOUT)})')
+        if udt != 'F16' or ush != [k] or vdt != 'F16' or vsh != [n]:
+            raise SystemExit(f'{key}: suh {udt}{ush} / svh {vdt}{vsh}, expected F16 [{k}] / F16 [{n}]')
+        trellis, scales = exl3_expert_bytes(k, n, words)
+        if tn != trellis or un + vn != scales:
+            raise SystemExit(f'{key}: {tn} + {un} + {vn} bytes on disk, the layout says {trellis} + {scales}')
+        return [(tp, to, tn), (up, uo, un), (vp, vo, vn)], words
 
 
 # --------------------------------------------------------------------------
@@ -247,7 +351,7 @@ class Names:
 # --------------------------------------------------------------------------
 # Declarations: what the engine reads out of each shard's __metadata__.
 # --------------------------------------------------------------------------
-def build_declarations(tensors, names, kvs):
+def build_declarations(tensors, names, kvs, exl3=None, exl3_layers=None):
     """-> (plan, index, config-pieces).
 
     plan[shard] = {'entries': [...], 'tensors': {hf: decl},
@@ -269,17 +373,34 @@ def build_declarations(tensors, names, kvs):
             n_exp = t['dims'][2]
             eb = t['bytes'] // n_exp
             part = EXP_PART[m.group(3)]
+            layer = int(m.group(2))
+            layout = BLOB[t['type']]
+            per_expert = None
+            if exl3 is not None and ns == 'layers' and layer in exl3_layers:
+                k, n = t['dims'][0], t['dims'][1]
+                per_expert, words = [], None
+                for e in range(n_exp):
+                    ranges, w = exl3.expert(layer, e, part, k, n)
+                    if words is None:
+                        words = w
+                    elif w != words:
+                        raise SystemExit(f'layers.{layer}.ffn.experts.{e}.{part}: {w} words per tile, '
+                                         f'expert 0 has {words} -- one rate per family')
+                    per_expert.append(ranges)
+                trellis, scales = exl3_expert_bytes(k, n, words)
+                eb, layout = trellis + scales, EXL3_LAYOUT[words]
             p['experts'].append({
                 'gguf_name': t['name'], 'part': part, 'n_experts': n_exp,
-                'expert_bytes': eb, 'layout': BLOB[t['type']], 'contiguous': True,
+                'expert_bytes': eb, 'layout': layout, 'contiguous': True,
                 # ne order, NOT the HF reversal: one convention everywhere so a
                 # reader never has to know which key holds which orientation
                 'dims_per_expert_ne': list(t['dims'][:2])})
             for e in range(n_exp):
-                name = f'{ns}.{int(m.group(2))}.ffn.experts.{e}.{part}.weight'
+                name = f'{ns}.{layer}.ffn.experts.{e}.{part}.weight'
+                ranges = (per_expert[e] if per_expert is not None
+                          else [(None, t['off'] + e * eb, eb)])
                 p['entries'].append({'name': name, 'dtype': 'U8', 'shape': [eb],
-                                     'ranges': [(t['off'] + e * eb, eb)],
-                                     'layout': BLOB[t['type']]})
+                                     'ranges': ranges, 'layout': layout})
                 p['index'][name] = shard
             continue
         layout = BLOB.get(t['type'], 'native')
@@ -294,13 +415,21 @@ def build_declarations(tensors, names, kvs):
         else:
             dtype, shape = 'U8', [t['bytes']]
         p['entries'].append({'name': hf, 'dtype': dtype, 'shape': shape,
-                             'ranges': [(t['off'], t['bytes'])], 'layout': layout})
+                             'ranges': [(None, t['off'], t['bytes'])], 'layout': layout})
         p['tensors'][hf] = {'layout': layout, 'dims_ne': t['dims'],
                             'gguf_name': t['name']}
         p['index'][hf] = shard
 
     for shard, p in plan.items():
         exp_layouts = {e['layout'] for e in p['experts']}
+        exl3_layouts = {l for l in exp_layouts if l.startswith('exl3m_')}
+        # gate/up must share one rate per layer (the fused arm decodes them
+        # together); the engine refuses the mix at load, the lane refuses it here
+        for lay in {e['gguf_name'].split('.')[1] for e in p['experts']}:
+            gu = {e['layout'] for e in p['experts']
+                  if e['gguf_name'].split('.')[1] == lay and e['part'] in ('w1', 'w3')}
+            if len(gu) > 1:
+                raise SystemExit(f'{shard}: layer {lay} gate/up layouts differ: {sorted(gu)}')
         md = {
             'format': 'pt',                     # the near-universal HF convention
             'pulsar.format': 'pulsar-safetensors-v1',
@@ -318,6 +447,7 @@ def build_declarations(tensors, names, kvs):
             'pulsar.expert_dtype': ('none' if not exp_layouts else
                                     'iq2_xxs' if exp_layouts <= {'iq2_xxs_mmq_k'} else
                                     'mxfp4_cutlass' if exp_layouts <= {'cutlass_mxfp4'} else
+                                    'exl3' if exp_layouts == exl3_layouts else
                                     'mixed'),
         }
         if shard == 'vision':
@@ -327,23 +457,31 @@ def build_declarations(tensors, names, kvs):
 
 
 def write_shard(path, entries, meta, gguf_fh, data_start):
-    """Write one shard.  See the module docstring for the alignment contract."""
+    """Write one shard.  See the module docstring for the alignment contract.
+    A range is (source, offset, bytes): source None reads the GGUF's data
+    section, a path reads that file at an absolute offset (the EXL3 shards)."""
     sized = [(e['name'], e['dtype'], e['shape'], e['ranges'], e['layout'],
-              sum(n for _, n in e['ranges'])) for e in entries]
+              sum(n for _, _, n in e['ranges'])) for e in entries]
     sized.sort(key=lambda e: -align_for(e[5]))          # stable: expert runs stay adjacent
 
-    header, blobs, cursor, hist = {}, [], 0, {}
+    header, blobs, cursor, hist, handles = {}, [], 0, {}, {}
     for name, dtype, shape, ranges, layout, need in sized:
         a = align_for(need)
         if cursor % a:
             raise SystemExit(f'{name}: offset {cursor} violates {a}-byte alignment')
         hist[a] = hist.get(a, 0) + 1
         start = cursor
-        for off, n in ranges:
-            gguf_fh.seek(data_start + off)
-            b = gguf_fh.read(n)
+        for src, off, n in ranges:
+            if src is None:
+                fh, base = gguf_fh, data_start
+            else:
+                if src not in handles:
+                    handles[src] = open(src, 'rb')
+                fh, base = handles[src], 0
+            fh.seek(base + off)
+            b = fh.read(n)
             if len(b) != n:
-                raise SystemExit(f'{name}: short read from the GGUF')
+                raise SystemExit(f'{name}: short read from {src or "the GGUF"}')
             blobs.append(b)
         cursor += need
         header[name] = {'dtype': dtype, 'shape': shape, 'data_offsets': [start, cursor]}
@@ -359,6 +497,8 @@ def write_shard(path, entries, meta, gguf_fh, data_start):
         f.write(hj)
         for b in blobs:
             f.write(b)
+    for fh in handles.values():
+        fh.close()
     return header, cursor, hist
 
 
@@ -375,14 +515,53 @@ def read_shard(path):
 # --------------------------------------------------------------------------
 def load(gguf):
     tensors, data_start = scan_gguf(gguf)
+    set_shard_plan(tensors)
     names = Names()
     kvs = read_kvs(gguf)
     return tensors, data_start, names, kvs
 
 
+def parse_layers(spec):
+    out = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            out |= set(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def exl3_source(args):
+    """-> (Exl3Checkpoint, layer set) or (None, None)."""
+    d = getattr(args, 'exl3_experts', None)
+    if not d:
+        return None, None
+    ck = Exl3Checkpoint(d)
+    have = set(ck.layers())
+    if not have:
+        raise SystemExit(f'{d}: no layers.N.ffn.experts.0.w1.trellis in any shard')
+    want = parse_layers(args.exl3_layers) if args.exl3_layers else have
+    missing = sorted(want - have)
+    if missing:
+        raise SystemExit(f'{d}: layers {missing} requested but not present (have {sorted(have)})')
+    return ck, want
+
+
+def plan_for(args):
+    tensors, data_start, names, kvs = load(args.gguf)
+    if getattr(args, 'shard', None) and args.shard not in SHARD_ORDER:
+        raise SystemExit(f'unknown shard {args.shard!r}; one of {SHARD_ORDER}')
+    exl3, layers = exl3_source(args)
+    plan = build_declarations(tensors, names, kvs, exl3, layers)
+    return tensors, data_start, names, kvs, plan, exl3, layers
+
+
 def cmd_plan(args):
-    tensors, _ds, names, kvs = load(args.gguf)
-    plan = build_declarations(tensors, names, kvs)
+    tensors, _ds, names, _kvs, plan, exl3, layers = plan_for(args)
     holes = 0
     per_shard = {s: (len(p['entries']), len(p['experts'])) for s, p in plan.items()}
     for t in tensors:
@@ -390,8 +569,12 @@ def cmd_plan(args):
         if hf is None:
             holes += 1
             print(f'  HOLE {t["name"]}: {shard}')
-    print(f'gguf tensors: {len(tensors)}   kv entries: {len(kvs)}')
+    print(f'gguf tensors: {len(tensors)}')
     print(f'shards: {len(SHARD_ORDER)}   unmapped: {holes}')
+    if exl3 is not None:
+        fams = [e for p in plan.values() for e in p['experts'] if e['layout'].startswith('exl3m_')]
+        print(f'exl3 experts from {exl3.dir}: layers {sorted(layers)}, {len(fams)} families, '
+              f'{sum(e["n_experts"] * e["expert_bytes"] for e in fams) / 1e9:.2f} GB')
     for s in SHARD_ORDER:
         e, x = per_shard[s]
         print(f'  {SHARD_FILE[s]}  {s:10s} {e:6d} tensors  {x:3d} expert families')
@@ -399,8 +582,7 @@ def cmd_plan(args):
 
 
 def cmd_emit(args):
-    tensors, data_start, names, kvs = load(args.gguf)
-    plan = build_declarations(tensors, names, kvs)
+    _tensors, data_start, _names, _kvs, plan, _exl3, _layers = plan_for(args)
     shards = SHARD_ORDER if args.all else [args.shard]
     os.makedirs(args.out, exist_ok=True)
     with open(args.gguf, 'rb') as fh:
@@ -422,7 +604,7 @@ def cmd_verify(args):
     per-expert payloads reassembled byte-identical to the GGUF's stacked tensor
     -- the property the kernels' base + xid*expert_bytes arithmetic depends on.
     """
-    tensors, data_start, names, _kvs = load(args.gguf)
+    tensors, data_start, names, _kvs, plan, _exl3, _layers = plan_for(args)
     by_name = {t['name']: t for t in tensors}
     man = {t['name']: names.resolve(t['name']) for t in tensors}
     shards = SHARD_ORDER if args.all else [args.shard]
@@ -474,7 +656,10 @@ def cmd_verify(args):
             else:
                 n_bad += 1
                 print(f'  BYTES DIFFER {name} ({gn})')
-        e_ok = e_bad = 0
+        e_ok = e_bad = x_ok = x_bad = 0
+        exl3_entries = {e['name']: e for e in plan[s]['entries']
+                        if e['layout'].startswith('exl3m_')}
+        src_handles = {}
         for gn, (hf_t, sh) in man.items():
             if sh != s:
                 continue
@@ -484,7 +669,30 @@ def cmd_verify(args):
             t = by_name[gn]
             part = EXP_PART[m.group(3)]
             ns = 'layers' if m.group(1) == 'blk' else 'mtp'
-            n_exp, eb = t['dims'][2], t['bytes'] // t['dims'][2]
+            n_exp = t['dims'][2]
+            first = f'{ns}.{int(m.group(2))}.ffn.experts.0.{part}.weight'
+            if first in exl3_entries:
+                # each expert against ITS source ranges: [trellis | suh | svh]
+                # verbatim from the EXL3 shards, then the declared expert_bytes
+                bad = 0
+                for e in range(n_exp):
+                    ent = exl3_entries[f'{ns}.{int(m.group(2))}.ffn.experts.{e}.{part}.weight']
+                    want = b''
+                    for src, off, n in ent['ranges']:
+                        if src not in src_handles:
+                            src_handles[src] = open(src, 'rb')
+                        src_handles[src].seek(off)
+                        want += src_handles[src].read(n)
+                    got = st_bytes(hdr[ent['name']])
+                    if got != want or len(got) != ent['shape'][0]:
+                        bad += 1
+                if bad:
+                    x_bad += 1
+                    print(f'  EXL3 EXPERT BYTES DIFFER {gn} ({bad} experts)')
+                else:
+                    x_ok += 1
+                continue
+            eb = t['bytes'] // n_exp
             cat = b''.join(st_bytes(hdr[f'{ns}.{int(m.group(2))}.ffn.experts.{e}.{part}.weight'])
                            for e in range(n_exp))
             if cat == gguf_bytes(t):
@@ -492,6 +700,8 @@ def cmd_verify(args):
             else:
                 e_bad += 1
                 print(f'  EXPERT REASSEMBLY DIFFERS {gn}')
+        for fh in src_handles.values():
+            fh.close()
         # expert contiguity: offset(E) == offset(0) + E*expert_bytes
         proj = {}
         for name, h in hdr.items():
@@ -509,12 +719,12 @@ def cmd_verify(args):
                     print(f'  CONTIGUITY BROKEN {k}')
                     break
 
-        ok = (structure and not mis_align and n_bad == 0 and e_bad == 0
+        ok = (structure and not mis_align and n_bad == 0 and e_bad == 0 and x_bad == 0
               and unexpected == 0 and contig_bad == 0)
         bad_total += 0 if ok else 1
         print(f'{SHARD_FILE[s]}  {s:10s} structure={structure} misaligned={len(mis_align)} '
               f'non-expert {n_ok}/{n_ok+n_bad} experts {e_ok}/{e_ok+e_bad} '
-              f'contiguity_bad={contig_bad} -> {"PASS" if ok else "FAIL"}')
+              f'exl3 {x_ok}/{x_ok+x_bad} contiguity_bad={contig_bad} -> {"PASS" if ok else "FAIL"}')
         g.close()
         sf.close()
     print(f'shards checked: {len(shards)}  failing: {bad_total}')
@@ -579,10 +789,13 @@ def main():
             g = p.add_mutually_exclusive_group(required=True)
             g.add_argument('--shard')
             g.add_argument('--all', action='store_true')
+        if name != 'audit':
+            p.add_argument('--exl3-experts', metavar='DIR',
+                           help='source the routed experts from this EXL3 checkpoint (L245)')
+            p.add_argument('--exl3-layers', metavar='SPEC',
+                           help='which blk layers take EXL3 experts, e.g. 5,18-22 (default: all present)')
         p.set_defaults(fn=fn)
     args = ap.parse_args()
-    if getattr(args, 'shard', None) and args.shard not in SHARD_ORDER:
-        raise SystemExit(f'unknown shard {args.shard!r}; one of {SHARD_ORDER}')
     return args.fn(args)
 
 

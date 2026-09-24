@@ -29,6 +29,7 @@
  * usage: ./tests/expert_table_gate
  */
 #include "../src/cuda/pulsar_cuda_expert_table.cu"
+#include "../src/engine/exl3_trellis.h"
 
 #include <cstdio>
 #include <vector>
@@ -114,6 +115,45 @@ int main(void) {
             printf("type 44: 256 [d,q] pairs, %llu B/expert x 256 = %llu B (the artifact's tensor)\n",
                    (unsigned long long)(stride0 + stride1), (unsigned long long)total);
         }
+    }
+
+    /* 3b. EXL3 (L245): the [trellis, scales] pair for the public MiaAI V4.1
+     * checkpoint's expert geometry, 5120 -> 2304 at K=3: trellis (320 x 144
+     * tiles x 48 words x 2 B) = 4,423,680 B -- the very byte count the
+     * checkpoint's own quantization_config.json records for every K=3 gate/up
+     * tensor -- then suh[5120] | svh[2304] fp16 = 14,848 B; stride 4,438,528.
+     * Independent numbers: the trellis bytes come from the checkpoint's
+     * tensor table, the layout from exl3_trellis.h. */
+    {
+        const uint32_t E = 384;
+        uint64_t trellis = 0, scales = 0, stride = 0;
+        CHECK(exl3_expert_layout(5120, 2304, 6, &trellis, &scales, &stride),
+              "exl3_expert_layout refused the MiaAI gate/up shape");
+        CHECK(trellis == 4423680ull, "EXL3 K=3 trellis bytes = %llu, the checkpoint says 4,423,680",
+              (unsigned long long)trellis);
+        CHECK(scales == 14848ull, "EXL3 scales bytes = %llu, expected 14,848", (unsigned long long)scales);
+        CHECK(stride == 4438528ull, "EXL3 K=3 stride = %llu, expected 4,438,528", (unsigned long long)stride);
+        uint64_t t2 = 0, s2 = 0, st2 = 0;
+        CHECK(exl3_expert_layout(2304, 5120, 4, &t2, &s2, &st2) && t2 == 2949120ull && st2 == 2963968ull,
+              "EXL3 K=2 down (2304 -> 5120): trellis %llu stride %llu, expected 2,949,120 / 2,963,968",
+              (unsigned long long)t2, (unsigned long long)st2);
+        CHECK(exl3_expert_layout(5120, 2304, 7, &t2, &s2, &st2) && t2 == 5160960ull,
+              "K=3.5 (k2=7, 56 words) is an EXL3 rate: trellis %llu, expected 5,160,960", (unsigned long long)t2);
+        CHECK(!exl3_expert_layout(5120, 2304, 9, &t2, &s2, &st2), "k2=9 (4.5) is not an EXL3 rate and must be refused");
+        CHECK(!exl3_expert_layout(5120, 2304, 0, &t2, &s2, &st2), "k2=0 must be refused");
+        CHECK(!exl3_expert_layout(5120, 2304 + 64, 6, &t2, &s2, &st2), "a non-128-multiple dim must be refused");
+
+        const void *const *t = exl3_expert_table(base, E, stride, trellis);
+        CHECK(t != NULL, "exl3_expert_table returned NULL for a valid stack");
+        if (t) {
+            check_table("exl3 k3", t, base, E, 2, stride, trellis, stride);
+            CHECK(exl3_expert_table(base, E, stride, trellis) == t, "a second call returned a different EXL3 table");
+            printf("exl3 k3: 384 [trellis,scales] pairs, %llu B/expert (trellis %llu + scales %llu)\n",
+                   (unsigned long long)stride, (unsigned long long)trellis, (unsigned long long)scales);
+        }
+        CHECK(exl3_expert_table(base, E, stride, 0) == NULL, "a zero split must refuse (EXL3)");
+        CHECK(exl3_expert_table(base, E, stride, stride) == NULL, "a split at the stride must refuse (EXL3)");
+        CHECK(exl3_expert_table(base, 0, stride, trellis) == NULL, "a zero expert count must refuse (EXL3)");
     }
 
     /* 4. distinct stacks must NOT share a table (a key that ignores the base

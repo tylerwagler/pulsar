@@ -797,7 +797,7 @@ public:
         pulsar_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
         const int quant_bits = pulsar_engine_routed_quant_bits(engine);
-        if (quant_bits != 2 && quant_bits != 4) {
+        if (!pulsar_kvstore_quant_bits_valid(quant_bits)) {
             pulsar_tokens_free(&store_tokens);
             return false;
         }
@@ -1042,7 +1042,7 @@ public:
         if (effective_prompt) effective_prompt->len = 0;
         if (!kc_.enabled || !prompt_text) return 0;
         const int quant_bits = pulsar_engine_routed_quant_bits(engine);
-        if (quant_bits != 2 && quant_bits != 4) return 0;
+        if (!pulsar_kvstore_quant_bits_valid(quant_bits)) return 0;
         const int model_id = pulsar_engine_model_id(engine);
         const size_t prompt_bytes = strlen(prompt_text);
         int idx = find_text_prefix(prompt_text, model_id, quant_bits,
@@ -1331,7 +1331,12 @@ bool pulsar_kvstore_read_header(FILE *fp, pulsar_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = pulsar_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && pulsar_kvstore_quant_bits_valid(e->quant_bits);
+}
+
+bool pulsar_kvstore_quant_bits_valid(int quant_bits) {
+    return quant_bits == 2 || quant_bits == 4 ||
+           quant_bits == 24 || quant_bits == 25 || quant_bits == 26;
 }
 
 bool pulsar_kvstore_read_entry_file(const char *path, const char sha[41],

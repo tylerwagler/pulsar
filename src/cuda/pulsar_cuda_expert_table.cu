@@ -117,6 +117,17 @@ const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t
     return expert_table_get(base, n_total, 2, stride0, off1, stride1, 0, n_total);
 }
 
+/* The EXL3 arm (L245): one self-contained [trellis | scales] slice per expert
+ * (exl3_expert_layout), so both planes share the expert stride and plane 1 is
+ * `split` bytes into the slice: entries [t,s] with t[e] = base + e*stride,
+ * s[e] = t[e] + split.  Per-expert contiguity is what lets the TP owned spans
+ * and the restack code treat an EXL3 stack like any other; the table exists
+ * so the kernels never do the address arithmetic themselves. */
+const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_t stride, uint64_t split) {
+    if (split == 0 || split >= stride) return NULL;
+    return expert_table_get(base, n_total, 2, stride, split, stride, 0, n_total);
+}
+
 void mxfp4_expert_tables_clear(void) {
     for (struct expert_table *t = g_expert_tables; t; ) {
         struct expert_table *next = t->next;

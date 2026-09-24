@@ -645,6 +645,21 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         dim[1] = dim2[1];
         dim[2] = n_experts;
         uint32_t type = st_layout_type(layout, "U8");
+        /* The declared expert_bytes must be the layout's own byte model for
+         * these dims (the same authority the kernels' strides come from); a
+         * stack that merely tiles the file is not enough -- a wrong stride
+         * reads the wrong expert fluently. */
+        uint64_t model_expert_bytes = 0, model_row_bytes = 0;
+        if (!routed_expert_side_layout(type, dim[0], dim[1], &model_expert_bytes, &model_row_bytes)) {
+            st_die("safetensors: %s: %s: layout %s refuses dims_per_expert_ne [%llu, %llu]",
+                   s->name, gguf_name, layout, (unsigned long long)dim[0], (unsigned long long)dim[1]);
+        }
+        if (model_expert_bytes != expert_bytes) {
+            st_die("safetensors: %s: %s: expert_bytes=%llu but layout %s on [%llu, %llu] is %llu bytes per expert",
+                   s->name, gguf_name, (unsigned long long)expert_bytes, layout,
+                   (unsigned long long)dim[0], (unsigned long long)dim[1],
+                   (unsigned long long)model_expert_bytes);
+        }
         dir_push(d, gguf_name, type, dim, 3, s->map, s->size,
                  s->buf_off + first_off, n_experts * expert_bytes);
         free(part);

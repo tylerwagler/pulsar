@@ -213,7 +213,7 @@ static void check_vec(struct vec *v, bool *mutated_once) {
     /* 4. the rotation, in double, against their fused kernel */
     if (rows % EXL3_HAD_BLOCK == 0 && cols % EXL3_HAD_BLOCK == 0) {
         double *w = (double *)malloc(rows * cols * sizeof(double));
-        for (size_t i = 0; i < rows * cols; i++) w[i] = f16_to_f32(v->what[i]);
+        for (size_t i = 0; i < rows * cols; i++) w[i] = exl3_f16_to_f32(v->what[i]);
         double col_v[EXL3_HAD_BLOCK];
         for (size_t c = 0; c < cols; c++)                 /* H on the left: down each column, per 128-row block */
             for (size_t r0 = 0; r0 < rows; r0 += EXL3_HAD_BLOCK) {
@@ -226,8 +226,8 @@ static void check_vec(struct vec *v, bool *mutated_once) {
         double max_abs = 0, max_err = 0;
         for (size_t r = 0; r < rows; r++)
             for (size_t c = 0; c < cols; c++) {
-                const double ref = w[r * cols + c] * f16_to_f32(v->suh[r]) * f16_to_f32(v->svh[c]);
-                const double theirs = f16_to_f32(v->w_fused[r * cols + c]);
+                const double ref = w[r * cols + c] * exl3_f16_to_f32(v->suh[r]) * exl3_f16_to_f32(v->svh[c]);
+                const double theirs = exl3_f16_to_f32(v->w_fused[r * cols + c]);
                 const double e = fabs(ref - theirs);
                 if (fabs(ref) > max_abs) max_abs = fabs(ref);
                 if (e > max_err) max_err = e;

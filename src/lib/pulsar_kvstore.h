@@ -266,6 +266,11 @@ void pulsar_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *pulsar_kvstore_path_join(const char *dir, const char *name);
 void pulsar_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t pulsar_kvstore_le_get32(const uint8_t *p);
+/** The accepted values of the routed-format discriminator in a KV key
+ *  (pulsar_engine_routed_quant_bits): 2 = the IQ2 tier, 4 = the MXFP4 tier,
+ *  20 + k2 = an EXL3 rate in half-bit units (24, 25, 26).  ONE authority: the
+ *  store, the text-prefix lookup and the header reader all consult it. */
+bool pulsar_kvstore_quant_bits_valid(int quant_bits);
 
 
 #endif

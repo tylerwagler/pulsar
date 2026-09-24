@@ -678,6 +678,11 @@ const uint8_t *const *mxfp4_expert_table_owned(const void *base, uint64_t stride
  *  ds4_mmq_d2r.cu:918-926 derives it: d[e] = base + e*nb*M halves,
  *  q[e] = base + align64(E*nb*M*2) + e*nb*8*M uint2s, with nb = K/256. */
 const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t nb, uint32_t M);
+/** L245: the same table for an EXL3 stack, whose expert is ONE contiguous
+ *  [trellis | scales] slice of `stride` bytes with the fp16 scales `split`
+ *  bytes in (exl3_expert_layout).  Interleaved [trellis, scales] pointer
+ *  pairs; refuses a split that is not strictly inside the slice. */
+const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_t stride, uint64_t split);
 void mxfp4_expert_tables_clear(void);
 
 /* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----

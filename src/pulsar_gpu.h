@@ -286,7 +286,8 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  * numbers.
  *
  * A payload's storage is declared BY NAME in the container ("native" plus its
- * dtype, "mxfp8_lt", "iq2_xxs_mmq_k", "cutlass_mxfp4", "fp8_e4m3_soa_k") and
+ * dtype, "mxfp8_lt", "iq2_xxs_mmq_k", "cutlass_mxfp4", "fp8_e4m3_soa_k",
+ * "exl3m_k2" / "exl3m_k2h" / "exl3m_k3") and
  * resolved to one of these ids exactly once, at load (st_layout_type).  The
  * numbers used to be ggml's, which meant the engine's storage vocabulary came
  * from a project it no longer speaks to -- and types it can only REFUSE (q8_0,
@@ -322,6 +323,16 @@ enum {
      * 33-byte block forced five byte loads.  The drafter's markov_w2 is the
      * consumer. */
     PULSAR_TENSOR_FP8_E4M3_SOA_K = 6,
+    /* EXL3 trellis-coded routed experts (L245), the mul1 codebook pinned by
+     * the name.  Per expert one self-contained slice: the tile stream verbatim
+     * in exllamav3's (kt, nt, word) order, then the fp16 scale vectors
+     * suh[in] | svh[out]; stride, the TP spans and the two-plane table all
+     * follow from (dims, rate) -- exl3_expert_layout() in exl3_trellis.h is
+     * the one byte model.  One id per rate because the rate is not
+     * recoverable from a stack's dims. */
+    PULSAR_TENSOR_EXL3M_K2 = 7,          /* K = 2   */
+    PULSAR_TENSOR_EXL3M_K2H = 8,         /* K = 2.5 */
+    PULSAR_TENSOR_EXL3M_K3 = 9,          /* K = 3   */
     PULSAR_TENSOR_TYPE_COUNT
 };
 

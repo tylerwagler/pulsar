@@ -7,9 +7,10 @@
  * `quant/pack.cu` (the packer, which fixes the bit order), `quant/exl3_dq.cuh`
  * (the state windows, integer and half-integer K), `quant/codebook.cuh`
  * (`decode_3inst<2>`, the mul1 codebook) and `exl3_lib/quantize.py`
- * (`tensor_core_perm`, the position map).  This header is the ONE host
- * authority for those facts in pulsar; the transcoder that turns an EXL3
- * checkpoint into our container and the dequant gate both read it, and the
+ * (`tensor_core_perm`, the position map).  This header is the ONE authority
+ * for those facts in pulsar -- and for the container's per-expert byte model
+ * (exl3_expert_layout): the loader, the expert-address table, the lane that
+ * transcodes an EXL3 checkpoint and the dequant gate all read it, and the
  * device kernels are graded against it.
  *
  * The format, in one paragraph.  A quantized linear W (in, out) is stored as
@@ -30,8 +31,63 @@
 #define PULSAR_EXL3_TRELLIS_H
 
 #include <stdint.h>
+#include <string.h>
 
-#include "pulsar_engine_internal.h" /* f16_to_f32 */
+#include "pulsar_gpu.h" /* the PULSAR_TENSOR_* ids */
+
+/* The header is included by host TUs and by CUDA TUs (the expert-table gate,
+ * the kernels' launchers), so the fp16 conversions are software and exact --
+ * no _Float16, no NEON, no engine header.  The dequant gate holds them to
+ * exllamav3's own codebook values, all 65536 of them. */
+
+/** IEEE binary16 bits -> float, exact (subnormals, Inf, NaN included). */
+static inline float exl3_f16_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu, mant = h & 0x3ffu, bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while (!(mant & 0x400u)) { mant <<= 1; exp--; }
+            mant &= 0x3ffu;
+            bits = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/** float -> IEEE binary16 bits, round to nearest even (the rounding every
+ *  fp16 instruction applies), overflow to Inf, subnormals exact. */
+static inline uint16_t exl3_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof x);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t e = (x >> 23) & 0xffu;
+    uint32_t mant = x & 0x7fffffu;
+    if (e == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0u));
+    const int exp = (int)e - 127 + 15;
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half = mant >> shift;
+        const uint32_t rem = mant & ((1u << shift) - 1u), mid = 1u << (shift - 1);
+        if (rem > mid || (rem == mid && (half & 1u))) half++;
+        return (uint16_t)(sign | half);
+    }
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) half++; /* a carry rolls into the exponent correctly */
+    return (uint16_t)half;
+}
 
 /** Weights per tile (16 x 16). */
 #define EXL3_TILE_WEIGHTS 256
@@ -118,12 +174,9 @@ static inline uint32_t exl3_tile_state(const uint16_t *tile, int k2, int p) {
 static inline uint16_t exl3_mul1_decode(uint32_t state) {
     const uint32_t y = (state & 0xffffu) * EXL3_MUL1_MULTIPLIER;
     const uint32_t s = 0x6400u + (y & 0xffu) + ((y >> 8) & 0xffu) + ((y >> 16) & 0xffu) + (y >> 24);
-    const float h = f16_to_f32((uint16_t)s);
-    const float v = h * f16_to_f32(0x1eee) + f16_to_f32(0xc931);
-    const _Float16 r = (_Float16)v;
-    uint16_t bits;
-    __builtin_memcpy(&bits, &r, sizeof bits);
-    return bits;
+    const float h = exl3_f16_to_f32((uint16_t)s);
+    const float v = h * exl3_f16_to_f32(0x1eee) + exl3_f16_to_f32(0xc931);
+    return exl3_f32_to_f16(v);
 }
 
 /**
@@ -148,6 +201,41 @@ static inline void exl3_tile_dequant(const uint16_t *tile, int k2, uint16_t out[
         exl3_tile_position(p, &r, &c);
         out[r * 16 + c] = exl3_mul1_decode(exl3_tile_state(tile, k2, p));
     }
+}
+
+/**
+ * The rate a pulsar tensor type carries, in half-bit units, or 0 when the type
+ * is not an EXL3 layout.  One id per rate because the rate is not recoverable
+ * from a stack's dims; `m` in the names pins the mul1 codebook.
+ */
+static inline int exl3_type_k2(uint32_t type) {
+    switch (type) {
+    case PULSAR_TENSOR_EXL3M_K2:  return 4;
+    case PULSAR_TENSOR_EXL3M_K2H: return 5;
+    case PULSAR_TENSOR_EXL3M_K3:  return 6;
+    default:                      return 0;
+    }
+}
+
+/**
+ * Bytes of one expert-projection (in = k, out = n) at rate k2 in pulsar's
+ * container: the trellis plane, (k/16)(n/16) tiles x words x 2 B in
+ * exllamav3's (kt, nt, word) order, verbatim; then the scales plane,
+ * suh[k] | svh[n] fp16.  Each expert is one self-contained
+ * [trellis | scales] slice, so the stride to the next expert is their sum
+ * and the scales plane of expert e starts `trellis_bytes` into its slice.
+ * Both dims must be multiples of EXL3_HAD_BLOCK -- the quantizer's own
+ * precondition, and what keeps every plane 128-byte aligned; anything else is
+ * refused (returns false), never padded.
+ */
+static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
+                                      uint64_t *trellis_bytes, uint64_t *scale_bytes,
+                                      uint64_t *stride) {
+    if (!exl3_k2_valid(k2) || k == 0 || n == 0 || k % EXL3_HAD_BLOCK || n % EXL3_HAD_BLOCK) return false;
+    *trellis_bytes = (k / 16) * (n / 16) * (uint64_t)exl3_words_per_tile(k2) * 2u;
+    *scale_bytes = (k + n) * 2u;
+    *stride = *trellis_bytes + *scale_bytes;
+    return true;
 }
 
 /**

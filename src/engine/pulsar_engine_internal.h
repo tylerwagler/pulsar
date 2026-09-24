@@ -2838,6 +2838,12 @@ static inline uint64_t tensor_map_size(const pulsar_model *m, const pulsar_tenso
 }
 uint32_t required_u32(const pulsar_model *m, const char *key);
 PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t);
+/** One routed side's byte model from (type, in, out): per-expert stride and the
+ *  consumer's "row bytes" (row stride, or the plane split point for the
+ *  CUTLASS and EXL3 layouts).  False for a type that is not a routed-expert
+ *  layout or a shape the layout refuses. */
+bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
+                               uint64_t *expert_bytes, uint64_t *row_bytes);
 bool routed_expert_gate_down_layout(
         const pulsar_tensor *gate,
         const pulsar_tensor *down,

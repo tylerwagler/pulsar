@@ -11,9 +11,23 @@ python3 safetensors_lane.py verify --gguf MODEL.gguf --out DIR --all
 python3 safetensors_lane.py audit  --out DIR
 ```
 
-`emit --all` writes 48 shards (`model-000NN-of-00048.safetensors`) plus
-`model.safetensors.index.json`. `verify` is the stage-1 gate and `audit` is the
-directory-level one; both exit non-zero on a finding.
+`emit --all` writes one shard per layer plus the vision tower, the head and
+each drafter layer (`model-000NN-of-000MM.safetensors`; 48 for the 43-layer
+0731 artifacts, 45 for the 40-layer V4.1) plus `model.safetensors.index.json`.
+`verify` is the stage-1 gate and `audit` is the directory-level one; both exit
+non-zero on a finding.
+
+**EXL3 experts (L245).** `plan`/`emit`/`verify` take `--exl3-experts DIR
+[--exl3-layers 5,18-22]`: the routed experts of those blk layers are copied
+VERBATIM from an EXL3 checkpoint's HF shards (exllamav3's format; the public
+Mia-AiLab V4.1 build or our own convert output) instead of the GGUF, one
+contiguous `[trellis | suh | svh]` slice per expert under the layout the
+trellis width names (`exl3m_k2` 32 words, `exl3m_k2h` 40, `exl3m_k3` 48; the
+mul1 codebook is required, an `mcg` tensor is refused).  The byte model is
+`src/engine/exl3_trellis.h`'s `exl3_expert_layout`, and the engine re-derives
+`expert_bytes` from it at load and refuses a stack that disagrees.  `verify`
+checks those experts against the EXL3 shards, not the GGUF.  A partial
+download holding just the layers under test is enough (`--exl3-layers`).
 
 ## The contract, and why each part is not negotiable
 

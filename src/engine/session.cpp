@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"
 #include "tp/pulsar_tp.h"
 #include "tp/pulsar_tp_gpu.h"
 
@@ -15,6 +16,11 @@ int pulsar_engine::routed_quant_bits() {
      * pulsar_engine_model_id() is a compile-time constant, so this is the only
      * model-variant discriminator in the disk-KV key — a value change
      * invalidates old snapshots (one-time re-prefill; fine in dev). */
+    /* EXL3 (L245) is its own value space -- 20 + the rate in half-bit units
+     * (24 = K2, 25 = K2.5, 26 = K3; the highest rate present wins) -- so an
+     * EXL3 artifact never shares a KV key with the IQ2 (2) or MXFP4 (4) tier
+     * of the same model id.  pulsar_kvstore_quant_bits_valid() enumerates the
+     * accepted set; the kvstore refuses to store or match anything else. */
     int bits = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_tensor *proj[3] = {
@@ -27,6 +33,11 @@ int pulsar_engine::routed_quant_bits() {
             if (!t) continue;
             if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
                 return 4;
+            const int k2 = exl3_type_k2(t->type);
+            if (k2) {
+                if (20 + k2 > bits) bits = 20 + k2;
+                continue;
+            }
             if (bits == 0) bits = 2;
         }
     }
