@@ -1580,6 +1580,11 @@ typedef struct {
      * whole row-lane messages so the last chunk's stage reads inside it.
      * Allocated at graph init on a row-lane pair; NULL otherwise. */
     pulsar_gpu_tensor *tp_vocab_own;
+    /** The row lane's stage+publish ticket (one zeroed device u32): the
+     * stage kernel's blocks count themselves in on it and the last one
+     * publishes the descriptor and re-zeroes it.  Per graph, so two graphs
+     * on two streams never share one.  Allocated beside tp_vocab_own. */
+    pulsar_gpu_tensor *tp_stage_ticket;
     /** The key the engine registered this rank's K-half weights under (4g-2
      * row-parallel splits: the shared expert's down projection), borrowed at
      * graph init; resolved as (key, parent tensor's abs_offset). */

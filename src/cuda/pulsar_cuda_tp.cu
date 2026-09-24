@@ -3,13 +3,14 @@
  *
  * The slab is host-pinned and GPU-mapped (pulsar_tp_gpu.h); on GB10 it is
  * coherent with the CPU, which runs the transport's proxy thread.  Per
- * exchange the stream carries three kernels, and the engine thread never
+ * exchange the stream carries two kernels, and the engine thread never
  * waits:
  *
  *   stage    this rank's rows -> the slab's out-slots (message seq t lives in
- *            slot (t-1) % n_slots, the transport's ring rule)
- *   publish  the descriptor {exchange id, first message, rows}; the id is
- *            written LAST, release/system scope -- the proxy's go signal
+ *            slot (t-1) % n_slots, the transport's ring rule); the LAST block
+ *            to finish publishes the descriptor {exchange id, first message,
+ *            rows}, the id written LAST, release/system scope -- the proxy's
+ *            go signal
  *   combine  spin on the done word until the proxy reports the exchange
  *            complete (the peer's rows landed and our sends retired), then
  *            own + peer, one add per element, own first -- the all-reduce's
@@ -68,26 +69,45 @@ static __device__ bool tp_wait_done(const uint64_t *done, uint64_t exch,
     return ok != 0;
 }
 
-static __global__ void tp_stage_rows_kernel(const float *src, uint8_t *slab,
-                                            uint64_t out_off, uint64_t vec_floats,
-                                            uint64_t first_msg, uint32_t n_slots,
-                                            uint32_t rows) {
+/* Stage + publish in ONE launch.  Every block copies its rows into the slab's
+ * out-slots; with ADD the element staged is src + addend -- the same single
+ * f32 add, same operand order, as the engine's add_kernel it replaces (both
+ * TUs build with the same NVCCFLAGS) -- written back to src as the combine's
+ * own operand, and the addend is zeroed, the fill the caller's consumers
+ * expect.  Then a last-block-done ticket: each block's thread 0, after the
+ * block barrier (which orders every thread's slab stores before it), fences
+ * at system scope and takes a ticket; the block that draws the last one
+ * fences again (acquiring every other block's fenced writes through the
+ * ticket's RMW chain), resets the ticket for the next exchange on this
+ * stream, and publishes exactly what the old <<<1,1>>> publish kernel did:
+ * desc[1], desc[2], then desc[0] = exch with st.release.sys.  The proxy sees
+ * the same descriptor sequence over the same slab bytes. */
+template <bool ADD>
+static __global__ void tp_stage_publish_kernel(float *src, float *addend, uint8_t *slab,
+                                               uint64_t out_off, uint64_t vec_floats,
+                                               uint64_t first_msg, uint32_t n_slots,
+                                               uint32_t rows, uint64_t *desc, uint64_t exch,
+                                               unsigned int *ticket) {
     const uint64_t n = (uint64_t)rows * vec_floats;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x) {
         const uint64_t r = i / vec_floats, j = i - r * vec_floats;
         const uint64_t slot = (first_msg + r - 1u) % n_slots;
         float *dst = (float *)(slab + out_off) + slot * vec_floats;
-        dst[j] = src[i];
+        float v = src[i];
+        if constexpr (ADD) {
+            v = v + addend[i];
+            src[i] = v;
+            addend[i] = 0.0f;
+        }
+        dst[j] = v;
     }
-    /* Each thread's own writes to the mapped slab are ordered before the
-     * publish kernel's descriptor at system scope. */
+    __syncthreads();
+    if (threadIdx.x != 0) return;
     __threadfence_system();
-}
-
-static __global__ void tp_publish_kernel(uint64_t *desc, uint64_t exch,
-                                         uint64_t first_msg, uint64_t rows) {
+    if (atomicAdd(ticket, 1u) != gridDim.x - 1u) return;
     __threadfence_system();
+    *ticket = 0u;
     desc[1] = first_msg;
     desc[2] = rows;
     tp_st_release_sys(&desc[0], exch);
@@ -174,21 +194,25 @@ static unsigned tp_grid(uint64_t n) {
     return (unsigned)(b > 256u ? 256u : (b ? b : 1u));
 }
 
-int pulsar_gpu_tp_stage_rows(const pulsar_gpu_tensor *src, void *slab_dev,
-                             uint64_t out_off, uint64_t vec_bytes, uint64_t first_msg,
-                             uint32_t n_slots, uint32_t rows) {
+int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend,
+                                void *slab_dev, uint64_t out_off, uint64_t vec_bytes,
+                                uint64_t first_msg, uint32_t n_slots, uint32_t rows,
+                                void *desc_dev, uint64_t exch, pulsar_gpu_tensor *ticket) {
     const uint64_t vf = vec_bytes / sizeof(float);
-    if (!src || !slab_dev || rows == 0 || n_slots == 0 || vf == 0 ||
-        (uint64_t)rows * vec_bytes > src->bytes) return 0;
-    tp_stage_rows_kernel<<<tp_grid((uint64_t)rows * vf), 256>>>(
-        (const float *)src->ptr, (uint8_t *)slab_dev, out_off, vf, first_msg, n_slots, rows);
-    return cuda_ok(cudaGetLastError(), "tp stage rows launch");
-}
-
-int pulsar_gpu_tp_publish(void *desc_dev, uint64_t exch, uint64_t first_msg, uint32_t rows) {
-    if (!desc_dev || exch == 0) return 0;
-    tp_publish_kernel<<<1, 1>>>((uint64_t *)desc_dev, exch, first_msg, rows);
-    return cuda_ok(cudaGetLastError(), "tp publish launch");
+    if (!src || !slab_dev || !desc_dev || exch == 0 || !ticket ||
+        ticket->bytes < sizeof(unsigned int) || rows == 0 || n_slots == 0 || vf == 0 ||
+        (uint64_t)rows * vec_bytes > src->bytes ||
+        (addend && (uint64_t)rows * vec_bytes > addend->bytes)) return 0;
+    const unsigned grid = tp_grid((uint64_t)rows * vf);
+    if (addend)
+        tp_stage_publish_kernel<true><<<grid, 256>>>(
+            (float *)src->ptr, (float *)addend->ptr, (uint8_t *)slab_dev, out_off, vf, first_msg,
+            n_slots, rows, (uint64_t *)desc_dev, exch, (unsigned int *)ticket->ptr);
+    else
+        tp_stage_publish_kernel<false><<<grid, 256>>>(
+            (float *)src->ptr, NULL, (uint8_t *)slab_dev, out_off, vf, first_msg,
+            n_slots, rows, (uint64_t *)desc_dev, exch, (unsigned int *)ticket->ptr);
+    return cuda_ok(cudaGetLastError(), "tp stage+publish launch");
 }
 
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,

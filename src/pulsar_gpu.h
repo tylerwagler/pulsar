@@ -2430,14 +2430,20 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                uint16_t *dbg, uint32_t dbg_blocks);
 
 /* Tensor-parallel row lane, GPU half (L241 4g-2; src/cuda/pulsar_cuda_tp.cu).
- * One exchange = stage + publish + combine on the calling thread's stream;
+ * One exchange = stage+publish + combine on the calling thread's stream;
  * nothing here waits on the host.  `slab_dev` is the registered slab's device
  * mapping; offsets, the ring size and the exchange/message numbers come from
- * the transport (pulsar_tp_row_lane_begin / pulsar_tp_row_lane_layout). */
-int pulsar_gpu_tp_stage_rows(const pulsar_gpu_tensor *src, void *slab_dev,
-                             uint64_t out_off, uint64_t vec_bytes, uint64_t first_msg,
-                             uint32_t n_slots, uint32_t rows);
-int pulsar_gpu_tp_publish(void *desc_dev, uint64_t exch, uint64_t first_msg, uint32_t rows);
+ * the transport (pulsar_tp_row_lane_begin / pulsar_tp_row_lane_layout).
+ *
+ * Stage+publish: `rows` rows of src -> the slab's out-slots, and the last
+ * block to finish publishes the descriptor {exch, first_msg, rows} at
+ * `desc_dev` (id last, release/system).  A non-NULL `addend` is folded in
+ * first: src[i] = src[i] + addend[i] (the value staged), addend[i] = 0.
+ * `ticket` is a zeroed device u32 the kernel leaves zeroed; one per stream. */
+int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend,
+                                void *slab_dev, uint64_t out_off, uint64_t vec_bytes,
+                                uint64_t first_msg, uint32_t n_slots, uint32_t rows,
+                                void *desc_dev, uint64_t exch, pulsar_gpu_tensor *ticket);
 /* dst[r][*] = dst[r][*] + peer[r][*]; waits for done >= exch first. */
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,

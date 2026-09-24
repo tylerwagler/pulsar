@@ -1037,7 +1037,8 @@ void pulsar_engine::destroy() {
 }
 /* The per-session tensor-parallel scratch (4g-2): the vocab gather's own-slice
  * buffer (pulsar_gpu_graph::tp_vocab_own) -- PULSAR_SPEC_LOGITS_ROWS rows at
- * the widest rank range, rounded up to whole row-lane messages.  One helper for
+ * the widest rank range, rounded up to whole row-lane messages -- and the row
+ * lane's stage+publish ticket (tp_stage_ticket, zeroed).  One helper for
  * create AND the admission price (session_cost_bytes_banked), which dry-runs
  * the same steps: a buffer allocated in only one of them is the SESSION COST
  * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
@@ -1048,10 +1049,18 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
     const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
     g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
-    if (!g->tp_vocab_own)
+    if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
                 (unsigned long long)bytes);
-    return g->tp_vocab_own != NULL;
+        return false;
+    }
+    const uint32_t zero = 0u;
+    g->tp_stage_ticket = pulsar_gpu_tensor_alloc(sizeof(zero));
+    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, 0, &zero, sizeof(zero))) {
+        fprintf(stderr, "pulsar: tp row-lane stage ticket allocation failed\n");
+        return false;
+    }
+    return true;
 }
 
 

@@ -1065,7 +1065,8 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
     if (pulsar_tp_row_lane(g->tp)) {
         uint32_t plo = 0, phi = 0;
         if (!pulsar_tp_owned_range(1 - rank, n_ranks, n_vocab, &plo, &phi) ||
-            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ROWS || !g->tp_vocab_own || !g->tp_slab_dev) {
+            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ROWS || !g->tp_vocab_own || !g->tp_slab_dev ||
+            !g->tp_stage_ticket) {
             fprintf(stderr, "pulsar: tp vocab gather refused (%u rows, scratch %s) -- refusing\n",
                     n_rows, g->tp_vocab_own ? "ok" : "MISSING");
             return false;
@@ -1086,8 +1087,8 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
             pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->tp_vocab_own, (uint64_t)m0 * L.vec_bytes,
                                                               (uint64_t)m * L.vec_bytes);
             ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
-                 pulsar_gpu_tp_stage_rows(chunk, slab, L.out_off, L.vec_bytes, first, L.n_slots, m) != 0 &&
-                 pulsar_gpu_tp_publish(slab + L.desc_off, exch, first, m) != 0 &&
+                 pulsar_gpu_tp_stage_publish(chunk, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots, m,
+                                             slab + L.desc_off, exch, g->tp_stage_ticket) != 0 &&
                  pulsar_gpu_tp_combine_scatter(out, slab, L.in_off, L.vec_bytes, first, L.n_slots, m,
                                                (uint64_t)m0 * vf, n_rows, phi - plo, n_vocab, plo,
                                                slab + L.done_off, exch, slab + L.err_off,

@@ -1166,9 +1166,11 @@ static bool gpu_graph_indexed_attention_span(
 
 /* The pair's all-reduce of a [n_tokens][n_embd] f32 partial, in place
  * (defined with the FFN encoder below): the row lane for decode/verify rows,
- * the big gate for prefill chunks. */
+ * the big gate for prefill chunks.  A non-NULL `addend` is a second partial
+ * folded in first (t = t + addend, then addend = 0). */
 static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
-                              pulsar_gpu_tensor *t, const char *what);
+                              pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
+                              const char *what);
 
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
@@ -2394,7 +2396,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   n_tokens) != 0;
         if (!ok) fprintf(stderr, "pulsar: layer %u attention: row-parallel stage 'b' refused (owned groups "
                                  "[%u,%u) of %u)\n", il, g_lo, g_hi, n_groups_total);
-        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, "attention");
+        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, NULL, "attention");
     } else if (ok) {
         ok = pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
                                                   tensor_map_base(model, layer->attn_output_a),
@@ -2460,7 +2462,8 @@ bool gpu_graph_encode_layer_attention_batch(
  * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
  * can move onto the registerable GB10 slab later. */
 static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
-                              pulsar_gpu_tensor *t, const char *what) {
+                              pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
+                              const char *what) {
     if (!g->tp) return 1;
     const uint64_t nelt = (uint64_t)n_tokens * PULSAR_N_EMBD;
     const uint64_t bytes = nelt * sizeof(float);
@@ -2468,22 +2471,34 @@ static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_token
      * entirely on the stream -- stage, publish, combine -- while the
      * transport's proxy thread moves the rows; the engine thread never waits.
      * Chosen by row count, like the staging split below.  The combine is the
-     * all-reduce's own + peer add, same operands, same order -- bit-identical. */
+     * all-reduce's own + peer add, same operands, same order -- bit-identical.
+     * The addend is folded by the stage kernel itself (t + addend, the
+     * engine's add_kernel arithmetic; addend zeroed), so the fold costs no
+     * launch of its own on the decode path. */
     if (n_tokens <= PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_row_lane(g->tp) &&
         (uint64_t)PULSAR_N_EMBD * sizeof(float) == pulsar_tp_vec_bytes(g->tp)) {
         pulsar_tp_row_lane_layout_t L;
         pulsar_tp_row_lane_layout(g->tp, &L);
         uint8_t *slab = (uint8_t *)g->tp_slab_dev;
         uint64_t first = 0, exch = 0;
-        bool ok = slab && pulsar_tp_row_lane_begin(g->tp, n_tokens, &first, &exch) != 0;
-        if (ok) ok = pulsar_gpu_tp_stage_rows(t, slab, L.out_off, L.vec_bytes,
-                                              first, L.n_slots, n_tokens) != 0;
-        if (ok) ok = pulsar_gpu_tp_publish(slab + L.desc_off, exch, first, n_tokens) != 0;
+        bool ok = slab && g->tp_stage_ticket &&
+                  pulsar_tp_row_lane_begin(g->tp, n_tokens, &first, &exch) != 0;
+        if (ok) ok = pulsar_gpu_tp_stage_publish(t, addend, slab, L.out_off, L.vec_bytes,
+                                                 first, L.n_slots, n_tokens, slab + L.desc_off,
+                                                 exch, g->tp_stage_ticket) != 0;
         if (ok) ok = pulsar_gpu_tp_combine_sum(t, slab, L.in_off, L.vec_bytes,
                                                first, L.n_slots, n_tokens, slab + L.done_off,
                                                exch, slab + L.err_off, L.timeout_ns) != 0;
         if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
         return ok;
+    }
+    /* The prefill lanes fold the addend with the same add up front, then zero
+     * it: byte for byte the values the row lane's stage leaves behind. */
+    if (addend &&
+        (pulsar_gpu_add_tensor(t, t, addend, (uint32_t)nelt) == 0 ||
+         pulsar_gpu_tensor_fill_f32(addend, 0.0f, nelt) == 0)) {
+        fprintf(stderr, "pulsar: tp: layer %u %s addend fold refused (%u rows)\n", il, what, n_tokens);
+        return false;
     }
     /* Prefill-sized exchanges on a pair ride the BULK LANE (v14): the same
      * stream-enqueued stage / publish / combine, but the rows go GPU-direct
@@ -2998,13 +3013,12 @@ bool gpu_graph_encode_layer_ffn_batch(
     }
     if (ok && g->tp) {
         /* 4g-2: this rank's shared-expert PARTIAL joins its routed partial, so
-         * the one exchange sums both; shared_out is then zero and every
-         * consumer below (hc expand-add, ffn_out) reads the full sum from
-         * routed_out unchanged. */
-        const uint32_t n_ffn = (uint32_t)((uint64_t)n_tokens * PULSAR_N_EMBD);
-        ok = pulsar_gpu_add_tensor(g->batch_routed_out, g->batch_routed_out, g->batch_shared_out, n_ffn) != 0 &&
-             pulsar_gpu_tensor_fill_f32(g->batch_shared_out, 0.0f, n_ffn) != 0;
-        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, "FFN");
+         * the one exchange sums both: the exchange folds shared_out into
+         * routed_out (routed + shared, one f32 add) and zeroes shared_out --
+         * on the decode row lane inside its stage kernel, no launch of its
+         * own.  Every consumer below (hc expand-add, ffn_out) then reads the
+         * full sum from routed_out and +0.0f from shared_out, as before. */
+        ok = tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, g->batch_shared_out, "FFN");
         if (ok && keep_ffn_out) {
             ok = gpu_graph_ensure_batch_ffn_out(g) &&
                  pulsar_gpu_add_tensor(g->batch_ffn_out,

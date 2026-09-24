@@ -294,9 +294,10 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
  *    to receive), and arms the pre-posted RDMA receive window when a big gate
  *    drained it (the ARMED handshake stays on the engine thread: the proxy
  *    never touches the control socket);
- *  - the engine then enqueues the GPU half (pulsar_gpu_tp_{stage_rows,
- *    publish,combine_*}): stage own rows into the out-slots, publish the
- *    descriptor, combine once the done word reaches the exchange id;
+ *  - the engine then enqueues the GPU half (pulsar_gpu_tp_stage_publish,
+ *    pulsar_gpu_tp_combine_*): stage own rows into the out-slots and, from the
+ *    last block to finish, publish the descriptor; combine once the done word
+ *    reaches the exchange id;
  *  - the proxy thread (verbs only, NO CUDA -- port rule 1) polls the
  *    descriptor, posts the sends, waits for the peer's rows AND its own send
  *    completions, re-posts the window, then writes the done word.
