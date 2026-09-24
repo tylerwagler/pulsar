@@ -269,6 +269,25 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 > (round begin/end, redraft) do not carry a digest yet — that is the next
 > slice of this instrument.
 
+> **Pair on dev `ece8a459` (2026-09-24): graded PASS, first numbers.** LEG A via
+> the engine's tally (L243): 32/32 frames byte-identical. 128-token runs, ctx
+> 4096, 22-token prompt: DSpark on **15.57 t/s** generation (57 frames, ~2.2
+> tokens/round); drafter off, greedy **10.75 t/s** (116 frames); prefill ~40 t/s
+> (prompt too short to mean anything). The greedy and DSpark outputs are
+> byte-identical (592 B) -- speculation is lossless on the pair. Against the
+> one-box no-spec ceiling (24.2 t/s) decode TP costs ~2.3x today: every layer's
+> attention gather and FFN big gate stage through host memory
+> (`tp_attn_gather_low`: tensor read -> all-gather -> tensor write); that is the
+> collective-latency work L241 lists (4g-2). One CLI gap closed on the way:
+> `--no-dspark --temp 0` dispatched to the raw whole-graph path, which builds
+> its own graph with no transport and refused at layer 0 with a message about
+> the graph's owned groups; a TP engine now rides the session lane for every
+> one-shot generation and `pulsar_engine_generate_argmax` refuses under TP by
+> name. `CUDA host registration skipped: operation not supported` at load is
+> the mmap'd checkpoint not being HCA/GPU-registrable on GB10 (the same class
+> as the step-4 managed-memory verdict); the loader falls back to its local
+> copy path and the run is unaffected.
+
 ## Rollback
 
 Single-box behavior is untouched by design (`tp_role` defaults 0; the guard is

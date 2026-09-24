@@ -1012,7 +1012,12 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
                     pulsar_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_dspark(engine)) {
+    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_dspark(engine) ||
+               pulsar_engine_is_tp(engine)) {
+        /* Sampled, drafted, OR tensor-parallel: the session lane.  A TP engine
+         * cannot take the raw whole-graph path below (no transport; the engine
+         * refuses it by name), and the session lane at temperature 0 is the
+         * same greedy argmax, mirrored across the group frame by frame. */
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {

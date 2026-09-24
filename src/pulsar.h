@@ -187,6 +187,11 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
  * pulsar_tp_worker_run right after open and exit when it returns; every
  * pulsar_session_* operation on a worker is refused by name. */
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
+/** Any rank of a TP group (leader included).  Generation on such an engine
+ * rides the session lane, whose operations the group mirrors (slice 4e); the
+ * raw whole-graph path (pulsar_engine_generate_argmax) has no transport and
+ * refuses by name. */
+bool pulsar_engine_is_tp(const pulsar_engine *e);
 /** The worker receive loop: applies the leader's frames (create, sync, eval,
  * batched and mixed decode, rewind, invalidate, rng state) to a session
  * registry keyed by the create ordinal until the leader sends STOP or the

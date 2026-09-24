@@ -118,6 +118,10 @@ bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
     return e && e->tp && pulsar_tp_rank(e->tp) != 0;
 }
 
+bool pulsar_engine_is_tp(const pulsar_engine *e) {
+    return e && e->tp;
+}
+
 /* The two refusals every acked frame shares.  Returns 1 when the frame must be
  * refused (err filled), 0 when the body may run. */
 static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const char *op,
