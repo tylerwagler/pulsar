@@ -20,6 +20,17 @@ dtype and is not a decision at all:
      default), the engine binds PULSAR_TENSOR_I32 (weights.cpp
      tensor_expect_layout), and every value is an expert id < 256.  The ONLY
      dtype narrowing in the builder; any other I64 refuses.
+  5. The declared SHAPE (declared_shape; dims_ne is its reverse) is the shape
+     of what the container HOLDS, which is the source's except twice: a
+     `[1, n]` matrix is declared as the vector `[n]` -- the drafter's
+     `confidence_head.proj.weight` is stored `[1, E+256]` by both checkpoints
+     and bound rank-1 by weights.cpp (`tensor_expect_f32_or_bf16(..., 1,
+     E + 256, ...)`) -- and `markov_w2` is declared transposed, `[256, V]`
+     (dims_ne `[V, 256]`), because decision 3's producer writes it k-major
+     and weights.cpp binds those dims (`tensor_expect_layout(..., 2, V, 256,
+     0)`; "an artifact still carrying the v-major markov_w2 ... refuses to
+     load").  A rank-1 `[1]` (hc_head_scale) stays rank-1.  Nothing else
+     reshapes.
 
 Everything else keeps its native dtype: BF16 -> `bf16`, F32 -> `f32`, I32 ->
 `i32`.  A dtype the engine has no layout for (F16, U8, a lone F8_E8M0 ...)
@@ -92,6 +103,17 @@ def _default_layout(m: Mapped, dtype: str, shape: list[int]) -> str:
     if dtype in NATIVE:
         return NATIVE[dtype]
     raise PolicyError(f"{m.container_name}: source dtype {dtype} has no engine layout")
+
+
+def declared_shape(m: Mapped, shape: list[int]) -> list[int]:
+    """The row-major shape the container declares for the dense entry `m`
+    whose source has `shape` (decision 5); dims_ne is its reverse."""
+    if m.gguf_name.endswith(".markov_head.markov_w2.weight"):
+        rows, cols = shape
+        return [cols, rows]
+    if len(shape) == 2 and shape[0] == 1:
+        return [shape[1]]
+    return list(shape)
 
 
 def layout_for(m: Mapped, dtype: str, shape: list[int], overrides: dict) -> str:

@@ -99,13 +99,14 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         if m.shard not in shards:
             raise SystemExit(f'{name}: shard {m.shard} outside the plan ({len(order)} shards)')
         dtype = hf.dtype(name)
-        hshape = hf.shape(name)
+        hshape = hf.shape(name)                        # the SOURCE shape (producers take it)
+        dshape = P.declared_shape(m, hshape)           # what the container holds (policy decision 5)
         layout = P.layout_for(m, dtype, hshape, overrides)
-        dims_ne = list(reversed(hshape))
+        dims_ne = list(reversed(dshape))
         entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
         if layout in NATIVE_DTYPES and dtype == NATIVE_DTYPES[layout]:
             path, off, n = hf.span(name)
-            entry.update(dtype=NATIVE_DTYPES[layout], shape=list(hshape), nbytes=n,
+            entry.update(dtype=NATIVE_DTYPES[layout], shape=list(dshape), nbytes=n,
                          src=('ranges', [(path, off, n)]))
         elif layout == 'i32' and dtype == 'I64':
             # the ONE narrowing: the routing table ffn.gate.tid2eid is I64 in the
@@ -113,7 +114,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
             n_el = 1
             for d in hshape:
                 n_el *= d
-            entry.update(dtype='I32', shape=list(hshape), nbytes=4 * n_el,
+            entry.update(dtype='I32', shape=list(dshape), nbytes=4 * n_el,
                          src=('produce', (lambda w=name: PR.i64_to_i32(hf.raw(w)))))
         elif layout == 'mxfp8_lt':
             scale = name[:-len('.weight')] + '.scale'

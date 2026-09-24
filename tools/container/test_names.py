@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from names import Mapped, ModelShape, map_hf, shard_file, shard_order   # noqa: E402
-from policy import NATIVE, PolicyError, layout_for, rekey_format_map       # noqa: E402
+from policy import NATIVE, PolicyError, declared_shape, layout_for, rekey_format_map  # noqa: E402
 
 SERVED = "/mnt/models/DeepSeek-v4-Flash/"
 VEXP = "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp/snapshots/*/"
@@ -63,7 +63,7 @@ def hf_checkpoint(snap):
 
 
 def served_artifact(d):
-    """tensors: {container: (shard file, gguf_name, layout, dtype)};
+    """tensors: {container: (shard file, gguf_name, layout, dtype, dims_ne)};
     experts: {container: (shard file, layout, gguf_name, part)} per U8 expert entry."""
     tensors, experts = {}, {}
     files = sorted(glob.glob(os.path.join(d, "model-*.safetensors")))
@@ -74,7 +74,7 @@ def served_artifact(d):
         pt = json.loads(md["pulsar.tensors"])
         pe = json.loads(md["pulsar.experts"])
         for k, v in pt.items():
-            tensors[k] = (base, v["gguf_name"], v["layout"], h[k]["dtype"])
+            tensors[k] = (base, v["gguf_name"], v["layout"], h[k]["dtype"], list(v["dims_ne"]))
         stacks = {(e["gguf_name"].split(".")[0], int(e["gguf_name"].split(".")[1]), e["part"]): e for e in pe}
         for k in h:
             if k in pt:
@@ -151,7 +151,10 @@ def main():
             if got is None:
                 fail(f"{hf} -> {m.container_name}: not in the served artifact")
                 continue
-            sfile, sgguf, slayout, sdtype = got
+            sfile, sgguf, slayout, sdtype, sdims = got
+            dims = list(reversed(declared_shape(m, hshape)))
+            if sdims != dims:
+                fail(f"{hf}: dims_ne {sdims} served vs {dims} ours (source shape {hshape})")
             if sfile != want_shard:
                 fail(f"{hf}: shard {sfile} served vs {want_shard} ours")
             if sgguf != m.gguf_name:
