@@ -394,6 +394,31 @@ static bool gpu_graph_comp_ape_fold(
                                                width, ratio, pos0, n_tokens) != 0;
 }
 
+/* The per-position twin of the fold above: the store adds the ape as it writes
+ * the lane (pulsar_gpu_csa2_ape), so the row buffer is never modified and no
+ * separate launch runs -- the pre-CSA2 store's shape (L239).  Returns false only
+ * when the profile needs an ape and the layer has none; *out is NULL when the
+ * profile has no ape (V4.1). */
+static bool gpu_graph_comp_ape_desc(
+        const pulsar_model         *model,
+        const pulsar_layer_weights *layer,
+        pulsar_gpu_csa2_ape        *desc,
+        const pulsar_gpu_csa2_ape **out) {
+    *out = NULL;
+    if (!g_pulsar_shape.compressor_ape) return true;
+    const pulsar_tensor *ape = layer->attn_compressor_ape;
+    if (!ape) {
+        fprintf(stderr, "pulsar: the 0731 compressor needs its absolute-position embedding -- refusing\n");
+        return false;
+    }
+    desc->model_map = tensor_map_base(model, ape);
+    desc->model_size = tensor_map_size(model, ape);
+    desc->offset = ape->abs_offset;
+    desc->type = ape->type;
+    *out = desc;
+    return true;
+}
+
 
 /* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
  * hold the kv / score projections of every row) and emit what completes.
@@ -563,12 +588,14 @@ static bool gpu_graph_csa2_produce(
                 ok = false;
             }
         }
-        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
+        pulsar_gpu_csa2_ape ape_desc;
+        const pulsar_gpu_csa2_ape *ape = NULL;
+        if (ok) ok = gpu_graph_comp_ape_desc(model, layer, &ape_desc, &ape);
         ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
              pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
                                                       tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                       layer->attn_compressor_norm->abs_offset,
-                                                      layer->attn_compressor_norm->type,
+                                                      layer->attn_compressor_norm->type, ape,
                                                       PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
         /* The indexer's own compressor walks the SAME rows on the same schedule:
          * it stores this token whether or not the group closes, and its frontier
@@ -3147,8 +3174,10 @@ bool gpu_graph_dspark_compressor_rollforward(
                  * here or the rolled-forward pending group is a different
                  * function of its own inputs than the live path's. */
                 int emitted = 0;
+                pulsar_gpu_csa2_ape ape_desc;
+                const pulsar_gpu_csa2_ape *ape = NULL;
                 const bool ok = kv_view && sc_view &&
-                    gpu_graph_comp_ape_fold(model, &weights->layer[il], sc_view, comp_width, ratio, pos, 1u) &&
+                    gpu_graph_comp_ape_desc(model, &weights->layer[il], &ape_desc, &ape) &&
                     /* THE UPDATE KERNEL, not a bare store.  This function's own
                      * comment promises "same update kernels, same rows, same
                      * order", and the live path's per-token update is what stores
@@ -3163,7 +3192,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                             g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
                             tensor_map_base(model, weights->layer[il].attn_compressor_norm), tensor_map_size(model, weights->layer[il].attn_compressor_norm),
                             weights->layer[il].attn_compressor_norm->abs_offset,
-                            weights->layer[il].attn_compressor_norm->type,
+                            weights->layer[il].attn_compressor_norm->type, ape,
                             PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
                 pulsar_gpu_tensor_free(sc_view);
                 pulsar_gpu_tensor_free(kv_view);

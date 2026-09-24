@@ -1223,7 +1223,7 @@ static bool proj_ring_replay_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t ba
         pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], off * arow, arow);
         pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], off * arow, arow);
         ok = akv && asc &&
-             pulsar_gpu_csa2_compressor_store_tensor(akv, asc, st_kv, st_sc,
+             pulsar_gpu_csa2_compressor_store_tensor(akv, asc, st_kv, st_sc, NULL,
                                                      PULSAR_N_HEAD_DIM, ratio, p) != 0;
         pulsar_gpu_tensor_free(asc);
         pulsar_gpu_tensor_free(akv);
@@ -1231,7 +1231,7 @@ static bool proj_ring_replay_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t ba
             pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], off * irow, irow);
             pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], off * irow, irow);
             ok = ikv && isc &&
-                 pulsar_gpu_csa2_compressor_store_tensor(ikv, isc, ist_kv, ist_sc,
+                 pulsar_gpu_csa2_compressor_store_tensor(ikv, isc, ist_kv, ist_sc, NULL,
                                                          PULSAR_N_INDEXER_HEAD_DIM, ratio, p) != 0;
             pulsar_gpu_tensor_free(isc);
             pulsar_gpu_tensor_free(ikv);
@@ -1470,7 +1470,7 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
             const uint32_t save_w = pulsar_comp_row_width(pulsar_layer_compress_ratio(il), PULSAR_N_HEAD_DIM);
             pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], row, save_w);
             pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], row, save_w);
-            ok = kv && sc && pulsar_gpu_csa2_compressor_store_tensor(kv, sc, st_kv, st_sc, PULSAR_N_HEAD_DIM, ratio, p) != 0;
+            ok = kv && sc && pulsar_gpu_csa2_compressor_store_tensor(kv, sc, st_kv, st_sc, NULL, PULSAR_N_HEAD_DIM, ratio, p) != 0;
             pulsar_gpu_tensor_free(sc);
             pulsar_gpu_tensor_free(kv);
         }

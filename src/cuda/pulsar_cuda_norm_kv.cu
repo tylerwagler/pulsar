@@ -995,10 +995,10 @@ int pulsar_gpu_indexer_compressor_update_tensor(
      * group with a later row's embedding, and storing before it would leave the
      * carry without one.  The prefill composite does exactly this for the whole
      * batch, which is what makes the two paths write the same lane. */
-    if (ratio > 1u && !pulsar_gpu_csa2_comp_ape_add_tensor(sc, model_map, model_size, ape_offset, ape_type,
-                                                          width, ratio, pos, 1u)) return 0;
+    const pulsar_gpu_csa2_ape ape = { model_map, model_size, ape_offset, ape_type };
     if (!pulsar_gpu_csa2_compressor_update_tensor(latent, kv, sc, state_kv, state_score,
                                                   model_map, model_size, norm_offset, norm_type,
+                                                  ratio > 1u ? &ape : NULL,
                                                   head_dim, ratio, pos, rms_eps, emitted)) return 0;
     if (!*emitted) return 1;
     /* The destination row is checked only now: on a token that does not close a

@@ -199,9 +199,14 @@ __global__ static void csa2_comp_ape_add_kernel(
  *                  so a running token stores at slot_base = ratio and the
  *                  prefill's carry stores at slot_base = 0, both of which the
  *                  caller names explicitly rather than the kernel inferring. */
+/* APE: 0 = the score row is stored as it is; 1 / 2 = add the F32 / BF16 ape row
+ * for the position's slot (`ape[(pos0 + t) %% ratio]`) on the way in -- the same
+ * fp32 sum the separate csa2_comp_ape_add_kernel formed, inside the one launch
+ * the store already is (L239). */
+template <int APE>
 __global__ static void csa2_compressor_store_kernel(
         float *state_kv, float *state_sc,
-        const float *kv, const float *sc,
+        const float *kv, const float *sc, const void *ape,
         uint32_t head_dim, uint32_t ratio, uint32_t coff, uint32_t slot_base,
         uint32_t pos0, uint32_t src_row0, uint32_t n_tokens) {
     const uint32_t width = coff * head_dim;
@@ -210,9 +215,13 @@ __global__ static void csa2_compressor_store_kernel(
     if (gid >= n) return;
     const uint32_t t = (uint32_t)(gid / width);
     const uint32_t d = (uint32_t)(gid - (uint64_t)t * width);
-    const uint32_t slot = slot_base + (pos0 + t) % ratio;
+    const uint32_t r = (pos0 + t) % ratio;
+    const uint32_t slot = slot_base + r;
     state_kv[(uint64_t)slot * width + d] = kv[(uint64_t)(src_row0 + t) * width + d];
-    state_sc[(uint64_t)slot * width + d] = sc[(uint64_t)(src_row0 + t) * width + d];
+    float score = sc[(uint64_t)(src_row0 + t) * width + d];
+    if constexpr (APE == 1) score += pulsar_w_load_f32_or_bf16<false>(ape, (uint64_t)r * width + d);
+    if constexpr (APE == 2) score += pulsar_w_load_f32_or_bf16<true>(ape, (uint64_t)r * width + d);
+    state_sc[(uint64_t)slot * width + d] = score;
 }
 
 static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64_t norm_offset,
@@ -406,9 +415,9 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
              * their full 2*head_dim width -- the halves are read separately. */
             if (n_groups > 0u) {
                 const uint64_t n = (uint64_t)ratio * width;
-                csa2_compressor_store_kernel<<<(n + 255) / 256, 256>>>(
+                csa2_compressor_store_kernel<0><<<(n + 255) / 256, 256>>>(
                         (float *)state_kv->ptr, (float *)state_score->ptr,
-                        (const float *)kv->ptr, (const float *)sc->ptr,
+                        (const float *)kv->ptr, (const float *)sc->ptr, NULL,
                         head_dim, ratio, coff, 0u, 0u, (n_groups - 1u) * ratio, ratio);
                 if (!cuda_ok(cudaGetLastError(), "csa2 overlap carry store launch")) return 0;
             }
@@ -418,9 +427,9 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
             if (!csa2_lane_clear_current((float *)state_kv->ptr, (float *)state_score->ptr, head_dim, ratio)) return 0;
             if (rem) {
                 const uint64_t n = (uint64_t)rem * width;
-                csa2_compressor_store_kernel<<<(n + 255) / 256, 256>>>(
+                csa2_compressor_store_kernel<0><<<(n + 255) / 256, 256>>>(
                         (float *)state_kv->ptr, (float *)state_score->ptr,
-                        (const float *)kv->ptr, (const float *)sc->ptr,
+                        (const float *)kv->ptr, (const float *)sc->ptr, NULL,
                         head_dim, ratio, coff, ratio, 0u, n_groups * ratio, rem);
                 if (!cuda_ok(cudaGetLastError(), "csa2 overlap partial store launch")) return 0;
             }
@@ -433,9 +442,9 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
         if (!cuda_ok(cudaGetLastError(), "csa2 state score fill launch")) return 0;
         if (rem) {
             const uint64_t n = (uint64_t)rem * head_dim;
-            csa2_compressor_store_kernel<<<(n + 255) / 256, 256>>>(
+            csa2_compressor_store_kernel<0><<<(n + 255) / 256, 256>>>(
                     (float *)state_kv->ptr, (float *)state_score->ptr,
-                    (const float *)kv->ptr, (const float *)sc->ptr,
+                    (const float *)kv->ptr, (const float *)sc->ptr, NULL,
                     head_dim, ratio, 1u, 0u, pos0 + n_groups * ratio, n_groups * ratio, rem);
             if (!cuda_ok(cudaGetLastError(), "csa2 state store launch")) return 0;
         }
@@ -455,6 +464,7 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         uint64_t                model_size,
         uint64_t                norm_offset,
         uint32_t                norm_type,
+        const pulsar_gpu_csa2_ape *ape,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos,
@@ -485,7 +495,7 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         return csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv_cur->ptr, NULL, NULL, NULL, norm_w,
                                      norm_type == PULSAR_TENSOR_BF16, head_dim, 1u, 1u, 1u, CSA2_SRC_ROWS, pos, rms_eps);
     }
-    if (!pulsar_gpu_csa2_compressor_store_tensor(kv_cur, sc_cur, state_kv, state_score, head_dim, ratio, pos)) return 0;
+    if (!pulsar_gpu_csa2_compressor_store_tensor(kv_cur, sc_cur, state_kv, state_score, ape, head_dim, ratio, pos)) return 0;
     if ((pos + 1u) % ratio != 0u) return 1;   /* the group is still filling */
     *emitted = 1;
     if (!csa2_pool_norm_launch((float *)latent->ptr, NULL, NULL,
@@ -514,6 +524,7 @@ int pulsar_gpu_csa2_compressor_store_tensor(
         const pulsar_gpu_tensor *sc_row,
         pulsar_gpu_tensor       *state_kv,
         pulsar_gpu_tensor       *state_score,
+        const pulsar_gpu_csa2_ape *ape,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos) {
@@ -528,14 +539,36 @@ int pulsar_gpu_csa2_compressor_store_tensor(
                 ratio, head_dim, coff);
         return 0;
     }
+    /* The ape, when there is one, is a model-mapped table resolved like every
+     * other mapped weight on this path (the norm, the matmul operands): its
+     * range must lie inside its own mapping. */
+    const void *ape_w = NULL;
+    int ape_mode = 0;
+    if (ape) {
+        if (!ape->model_map || (ape->type != PULSAR_TENSOR_F32 && ape->type != PULSAR_TENSOR_BF16)) {
+            fprintf(stderr, "pulsar: csa2 compressor store: ape has no mapping or a type that is neither f32 nor bf16 (%u) -- refusing\n",
+                    ape->type);
+            return 0;
+        }
+        const uint64_t ape_bytes = (uint64_t)ratio * width * pulsar_w_elt_bytes(ape->type == PULSAR_TENSOR_BF16);
+        if (ape->offset > ape->model_size || ape_bytes > ape->model_size - ape->offset) {
+            fprintf(stderr, "pulsar: csa2 compressor store: ape range is outside the model map -- refusing\n");
+            return 0;
+        }
+        ape_w = cuda_model_range_ptr(ape->model_map, ape->offset, ape_bytes, "compressor_ape");
+        if (!ape_w) return 0;
+        ape_mode = ape->type == PULSAR_TENSOR_BF16 ? 2 : 1;
+    }
     /* A running token goes into the CURRENT half (rows ratio..); coff 1 has no
      * halves, so its slot is simply pos %% ratio. */
     const uint32_t slot_base = coff == 2u ? ratio : 0u;
     const uint64_t n = width;
-    csa2_compressor_store_kernel<<<(n + 255) / 256, 256>>>(
-            (float *)state_kv->ptr, (float *)state_score->ptr,
-            (const float *)kv_row->ptr, (const float *)sc_row->ptr,
-            head_dim, ratio, coff, slot_base, pos, 0u, 1u);
+    const dim3 grid((unsigned)((n + 255) / 256)), block(256);
+    float *skv = (float *)state_kv->ptr, *ssc = (float *)state_score->ptr;
+    const float *kv = (const float *)kv_row->ptr, *sc = (const float *)sc_row->ptr;
+    if (ape_mode == 2)      csa2_compressor_store_kernel<2><<<grid, block>>>(skv, ssc, kv, sc, ape_w, head_dim, ratio, coff, slot_base, pos, 0u, 1u);
+    else if (ape_mode == 1) csa2_compressor_store_kernel<1><<<grid, block>>>(skv, ssc, kv, sc, ape_w, head_dim, ratio, coff, slot_base, pos, 0u, 1u);
+    else                    csa2_compressor_store_kernel<0><<<grid, block>>>(skv, ssc, kv, sc, NULL,  head_dim, ratio, coff, slot_base, pos, 0u, 1u);
     return cuda_ok(cudaGetLastError(), "csa2 compressor store launch");
 }
 

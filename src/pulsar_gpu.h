@@ -1565,6 +1565,21 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
         uint32_t                n_tokens,
         float                   rms_eps);
 
+/** The 0731 compressor's absolute-position embedding as the STORE sees it: a
+ * model-mapped [ratio][coff * head_dim] table in F32 or BF16.  The per-position
+ * store adds `ape[pos %% ratio]` to the score row AS IT WRITES THE LANE (one
+ * kernel, the pre-CSA2 store's shape), instead of a separate in-place add on the
+ * row first: the same fp32 sum, one launch fewer per row per kv source -- and in
+ * the served lane that separate add was 62 extra launches per verify row
+ * (L239).  NULL = no ape (V4.1's compressor has none); the source row is then
+ * stored as it is.  The row buffer is never modified either way. */
+typedef struct {
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    offset;
+    uint32_t    type;          /* PULSAR_TENSOR_F32 or _BF16 */
+} pulsar_gpu_csa2_ape;
+
 int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *latent,       /* [1][head_dim] f32 out, written only when *emitted */
         const pulsar_gpu_tensor *kv_cur,
@@ -1575,6 +1590,7 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         uint64_t                model_size,
         uint64_t                norm_offset,
         uint32_t                norm_type,
+        const pulsar_gpu_csa2_ape *ape,        /* folded into the stored score row; NULL = none */
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos,
@@ -1583,12 +1599,15 @@ int pulsar_gpu_csa2_compressor_update_tensor(
 
 /** Store one position's kv / score projections into the state slot pos %% ratio
  * without pooling (the rewind path rebuilding a pending group from the verify
- * saves).  ratio > 1 only. */
+ * saves).  ratio > 1 only.  `ape` as for the update: added to the score row on
+ * the way into the lane, or NULL when the row already carries it / there is
+ * none. */
 int pulsar_gpu_csa2_compressor_store_tensor(
         const pulsar_gpu_tensor *kv_row,
         const pulsar_gpu_tensor *sc_row,
         pulsar_gpu_tensor       *state_kv,
         pulsar_gpu_tensor       *state_score,
+        const pulsar_gpu_csa2_ape *ape,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos);
