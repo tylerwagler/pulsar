@@ -483,6 +483,80 @@ int main(void) {
                 ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 0);
                 CUDA_OK(cudaDeviceSynchronize());
             }
+            /* 4c. the row block is a performance choice: R = 1, 4, 16 must be bit-identical,
+             * on the decode routing (6 assignments, distinct experts) and on a prefill-like
+             * routing (96 assignments over the 4 experts, ~24 rows per expert, so runs of
+             * many rows share one weight stream). */
+            {
+                std::vector<float> z1(zg.size()), z4(zg.size()), z16(zg.size()), u1(zu.size()), u4(zu.size()), u16(zu.size());
+                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 1, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(z1.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(u1.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 4, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(z4.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(u4.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0, E, 16, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(z16.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(u16.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t d4 = 0, d16 = 0;
+                for (size_t i = 0; i < zg.size(); i++) { d4 += (z4[i] != z1[i]) || (u4[i] != u1[i]); d16 += (z16[i] != z1[i]) || (u16[i] != u1[i]); }
+                CHECK(d4 == 0 && d16 == 0, "row block: R=4 differs in %zu, R=16 in %zu outputs from R=1 (decode routing)", d4, d16);
+                printf("  row block R=1/4/16 on the decode routing: bit-identical (%zu outputs)\n", zg.size());
+
+                const routing rp = make_routing(32, 3, E);      /* 96 assignments, ~24 per expert (3 distinct of 4 per token) */
+                const acts ap = make_acts(rp, K);
+                block_mx_act_mmq *d_ap = nullptr;
+                int32_t *d_pids = nullptr, *d_pb = nullptr;
+                float *d_pz = nullptr, *d_pu = nullptr;
+                CUDA_OK(cudaMalloc((void **)&d_ap, ap.bytes()));
+                CUDA_OK(cudaMemcpy(d_ap, ap.raw.data(), ap.bytes(), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMalloc((void **)&d_pids, rp.n_assign * sizeof(int32_t)));
+                CUDA_OK(cudaMemcpy(d_pids, rp.ids_dst.data(), rp.n_assign * sizeof(int32_t), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMalloc((void **)&d_pb, (E + 1) * sizeof(int32_t)));
+                CUDA_OK(cudaMemcpy(d_pb, rp.bounds.data(), (E + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMalloc((void **)&d_pz, (size_t)rp.n_assign * M * sizeof(float)));
+                CUDA_OK(cudaMalloc((void **)&d_pu, (size_t)rp.n_assign * M * sizeof(float)));
+                std::vector<float> p1((size_t)rp.n_assign * M), p16(p1.size()), q1(p1.size()), q16(p1.size());
+                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 0, E, 1, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(p1.data(), d_pz, p1.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(q1.data(), d_pu, q1.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 0, E, 16, 0);
+                CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(p16.data(), d_pz, p16.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(q16.data(), d_pu, q16.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t dp = 0;
+                for (size_t i = 0; i < p1.size(); i++) dp += (p16[i] != p1[i]) || (q16[i] != q1[i]);
+                CHECK(dp == 0, "row block: R=16 differs in %zu outputs from R=1 (prefill routing, 96 assignments)", dp);
+                /* and one of the 96 against the host authority, so the prefill shape is graded too */
+                {
+                    const int col = 37, pair = rp.ids_dst[col], e = rp.selected[pair], t = rp.ids_tok[col];
+                    std::vector<double> z;
+                    ref_gemv(what_g[e], K, M, ap.x.data() + (size_t)t * K, gate[e].suh(), true, z);
+                    double sc; const double rel = max_rel(p16, z, (size_t)pair * M, M, &sc);
+                    CHECK(rel < 2e-5, "prefill routing: assignment %d max rel %.3e vs host", col, rel);
+                    printf("  row block R=16 on 96 assignments: bit-identical to R=1; assignment %d vs host rel %.2e\n", col, rel);
+                }
+                /* the reuse: time R=1 vs R=16 on the 96-assignment routing (weights from L2 here;
+                 * the DRAM number for R=1 is the 12-assignment bench above) */
+                cudaEvent_t t0, t1;
+                CUDA_OK(cudaEventCreate(&t0)); CUDA_OK(cudaEventCreate(&t1));
+                float ms1 = 0, ms16 = 0;
+                for (int Rb : {1, 16}) {
+                    for (int i = 0; i < 2; i++) ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 0, E, Rb, 0);
+                    CUDA_OK(cudaEventRecord(t0));
+                    for (int i = 0; i < 10; i++) ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 0, E, Rb, 0);
+                    CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
+                    float ms = 0; CUDA_OK(cudaEventElapsedTime(&ms, t0, t1));
+                    if (Rb == 1) ms1 = ms / 10; else ms16 = ms / 10;
+                }
+                printf("  96 assignments x pair GEMV K=3: R=1 %.0f us (%.1f us/assignment), R=16 %.0f us (%.1f us/assignment), %.1fx\n",
+                       ms1 * 1000, ms1 * 1000 / 96, ms16 * 1000, ms16 * 1000 / 96, ms1 / ms16);
+                cudaFree(d_ap); cudaFree(d_pids); cudaFree(d_pb); cudaFree(d_pz); cudaFree(d_pu);
+            }
             /* 5. the mutation: one flipped trellis bit in expert 0's gate must move z */
             {
                 uint8_t byte = 0;

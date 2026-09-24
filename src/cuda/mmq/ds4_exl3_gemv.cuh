@@ -42,6 +42,27 @@ int ds4_exl3_moe_gemv_pair_launch(
     int             e_hi,
     cudaStream_t    stream);
 
+/** The pair GEMV with the row block pinned (1, 4 or 16 assignments per CTA)
+ *  instead of chosen from n_assign.  Every row block is bit-identical; the
+ *  gate uses this to prove it, the arm never calls it. */
+int ds4_exl3_moe_gemv_pair_launch_rows(
+    const void    * gate_table,
+    const void    * up_table,
+    int             k2,
+    const void    * act,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    float         * out_gate,
+    float         * out_up,
+    int             M,
+    int             K,
+    int64_t         n_assign,
+    int             n_experts,
+    int             e_lo,
+    int             e_hi,
+    int             rows_per_block,
+    cudaStream_t    stream);
+
 /** down: out [n_assign][M] f32 = the UNROTATED z_d; the input (mid) arrives
  *  pre-rotated by the fold, so nothing is rotated here. */
 int ds4_exl3_moe_gemv_single_launch(
