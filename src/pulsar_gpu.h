@@ -697,6 +697,18 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi);
+/* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
+ * one routed cutlass_mxfp4 stack from the host mapping (rows [lo,hi) for
+ * gate/up, input columns [lo,hi) for down when k_half) and register it as a
+ * model range under (key_map, key_offset); src/dst geometries are the
+ * cutlass_mxfp4_expert_layout of the full and half shapes.  Returns 1, or 0
+ * with the reason printed. */
+int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
+                                          const void *model_map, uint64_t src_offset,
+                                          uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
+                                          uint64_t lo, uint64_t hi,
+                                          uint64_t src_stride, uint64_t src_data,
+                                          uint64_t dst_stride, uint64_t dst_data);
 /* L241 4g-2: register the INPUT-COLUMN half [k_lo, k_hi) of a pre-stored
  * MXFP8_LT weight (a row-parallel TP split: the rank's share of the
  * reduction).  Repacked once into device buffers the backend owns (freed with
@@ -1923,7 +1935,8 @@ int pulsar_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         uint32_t                expert_lo,
-        uint32_t                expert_hi);
+        uint32_t                expert_hi,
+        uint32_t                expert_split);
 
 
 /** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS MXFP4 weights:

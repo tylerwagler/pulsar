@@ -409,12 +409,11 @@ bool pulsar_model_expert_stack_owned_span(const pulsar_model *m, const pulsar_te
     *bytes = t->bytes;
     if (!model_tensor_is_expert_stack(t)) return false;
     if (m->tp_n_ranks <= 1) return true;
-    const uint64_t n = t->dim[2];
-    const uint64_t expert_bytes = t->bytes / n;
-    if (n > UINT32_MAX ||
-        !pulsar_tp_owned_byte_span(m->tp_rank, m->tp_n_ranks, (uint32_t)n, expert_bytes, off, bytes)) {
-        pulsar_die("routed-expert stack: the owned byte span was refused (rank/group mismatch)");
-    }
+    /* L241 4g-2 expert tensor-parallel: a TP rank serves its HALF of every
+     * expert from compact per-rank stacks the engine builds at open straight
+     * from the mapping (pulsar_gpu_register_mxfp4_expert_half); the stack as
+     * stored is never staged or read on the device. */
+    *bytes = 0;
     return true;
 }
 
@@ -587,8 +586,8 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     /* Slice 4f: announce the residency lane (rule 5) with the bytes it
      * withholds, so a load log states which experts this rank holds. */
     if (m->tp_n_ranks > 1) {
-        fprintf(stderr, "pulsar: TP residency: rank %d/%u stages only its owned experts of every "
-                        "stack; %.2f GiB of peer-owned expert bytes are never staged or read\n",
+        fprintf(stderr, "pulsar: TP residency: rank %d/%u stages no routed-expert stack whole; "
+                        "its half of every expert (%.2f GiB of stored stacks) is built at open\n",
                 m->tp_rank, m->tp_n_ranks,
                 (double)pulsar_model_peer_expert_bytes(m) / 1073741824.0);
     }

@@ -3883,4 +3883,13 @@ static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
     return (uint64_t)(uintptr_t)t;
 }
 
+/* The expert tensor-parallel half-stack key's offset for one routed stack
+ * (L241 4g-2): the tensor's index in its model's tensor table, 4 GiB apart so
+ * no two half-stacks' ranges overlap under the one engine key.  The drafter
+ * aliases the target's table, so indices are unique across both.  One
+ * authority for registration (open) and lookup (the FFN encoder). */
+static inline uint64_t pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
+    return ((uint64_t)(t - m->tensors) + 1u) << 32;
+}
+
 #endif /* PULSAR_ENGINE_INTERNAL_H */

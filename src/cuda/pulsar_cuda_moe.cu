@@ -1832,7 +1832,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                              layer_index, n_tokens, expert_lo, expert_hi);
 }
 
-int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_lo, uint32_t expert_hi) {
+int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_lo, uint32_t expert_hi, uint32_t expert_split) {
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was
      * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
@@ -1852,6 +1852,25 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
         fprintf(stderr, "pulsar: routed MoE bad owned range [%u,%u) of %u -- refusing\n",
                 expert_lo, expert_hi, n_total_expert);
         return 0;
+    }
+    /* L241 4g-2 expert tensor-parallel: the stacks behind (model_map, offsets)
+     * are this rank's HALF of every expert (pulsar_gpu_register_mxfp4_expert_half)
+     * at expert_mid_dim = the half width.  Only the pure cutlass_mxfp4 arms read a
+     * stack through that geometry; every other arm (MMQ, mixed, EXL3) would read
+     * whole-expert bytes that are not there -- refuse by name (rule 1). */
+    if (expert_split) {
+        if (gate_type != (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 || down_type != (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) {
+            fprintf(stderr, "pulsar: routed MoE: expert tensor-parallel serves only cutlass_mxfp4 "
+                            "(type 40) stacks; layer %u is gate %u / down %u -- refusing\n",
+                    layer_index, gate_type, down_type);
+            return 0;
+        }
+        static int split_said = 0;
+        if (!split_said) {
+            split_said = 1;
+            fprintf(stderr, "pulsar: routed MoE expert tensor-parallel lane on (every expert, "
+                            "intermediate half of width %u)\n", expert_mid_dim);
+        }
     }
     /* Rule 5: announce the ownership lane once per shape when narrowed. */
     if (expert_lo != 0u || expert_hi != n_total_expert) {

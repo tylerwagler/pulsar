@@ -343,6 +343,49 @@ static void register_model_fds(const pulsar_model *m) {
     }
 }
 
+/* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
+ * one layer's three routed stacks -- gate/up by intermediate ROWS, down by
+ * intermediate (input) COLUMNS, the same owned range for all three, so the
+ * SwiGLU halves line up and the rank's down output is a partial the FFN
+ * exchange sums.  Both ranks do identical work (every selected expert, half
+ * width), so there is no skew by construction.  Byte geometry: one authority,
+ * cutlass_mxfp4_expert_layout, for the full and the half shapes. */
+static bool tp_register_expert_half(const void *key, const pulsar_model *m,
+                                    const pulsar_layer_weights *L, int rank, uint32_t nr) {
+    if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */
+    const pulsar_tensor *G = L->ffn_gate_exps, *U = L->ffn_up_exps, *D = L->ffn_down_exps;
+    if (G->type != PULSAR_TENSOR_CUTLASS_MXFP4 || U->type != PULSAR_TENSOR_CUTLASS_MXFP4 ||
+        D->type != PULSAR_TENSOR_CUTLASS_MXFP4) {
+        fprintf(stderr, "pulsar: expert tensor-parallel needs cutlass_mxfp4 routed stacks "
+                        "(gate %u up %u down %u) -- refusing\n", G->type, U->type, D->type);
+        return false;
+    }
+    const uint64_t in = G->dim[0], mid = G->dim[1], out = D->dim[1];
+    const uint32_t n_exp = (uint32_t)G->dim[2];
+    uint32_t lo = 0, hi = 0;
+    if (D->dim[0] != mid || U->dim[1] != mid || D->dim[2] != n_exp ||
+        !pulsar_tp_owned_range(rank, nr, (uint32_t)mid, &lo, &hi) || lo % 128 || hi % 128) {
+        fprintf(stderr, "pulsar: expert tensor-parallel: intermediate %llu cannot split 128-aligned "
+                        "over %u ranks -- refusing\n", (unsigned long long)mid, nr);
+        return false;
+    }
+    uint64_t gd = 0, gsf = 0, gs = 0, hgd = 0, hgsf = 0, hgs = 0;
+    uint64_t dd = 0, dsf = 0, ds = 0, hdd = 0, hdsf = 0, hds = 0;
+    cutlass_mxfp4_expert_layout(in, mid, &gd, &gsf, &gs);
+    cutlass_mxfp4_expert_layout(in, hi - lo, &hgd, &hgsf, &hgs);
+    cutlass_mxfp4_expert_layout(mid, out, &dd, &dsf, &ds);
+    cutlass_mxfp4_expert_layout(hi - lo, out, &hdd, &hdsf, &hds);
+    return pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, G),
+                                                 tensor_map_base(m, G), G->abs_offset, n_exp,
+                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
+           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, U),
+                                                 tensor_map_base(m, U), U->abs_offset, n_exp,
+                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
+           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, D),
+                                                 tensor_map_base(m, D), D->abs_offset, n_exp,
+                                                 mid, out, 1, lo, hi, ds, dd, hds, hdd);
+}
+
 /* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by
  * OUTPUT rows (column-parallel: this rank's half of the intermediate), down by
  * INPUT columns (row-parallel: the matching half of the reduction).  The rank's
@@ -728,7 +771,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, "
-                        "%.2f GiB of peer-owned experts not resident\n",
+                        "routed experts as per-rank halves (%.2f GiB of stored stacks)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
                 (double)pulsar_model_peer_expert_bytes(&e->model) / 1073741824.0);
     }
@@ -796,8 +839,23 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     return 1;
                 }
                 registered += 3;
+                if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
+                                    "not be built -- refusing\n", il);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
             }
             for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+                if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                    fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
+                                    "could not be built -- refusing\n", dl);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
                 if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
                     fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
                                     "registered -- refusing\n", dl);
