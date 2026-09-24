@@ -612,10 +612,12 @@ def cmd_verify(args):
     for s in shards:
         path = os.path.join(args.out, SHARD_FILE[s])
         hdr, meta, buf_off, size = read_shard(path)
-        end = max(h['data_offsets'][1] for h in hdr.values())
+        # a shard may hold metadata and no tensors (V4.1 has no vision tower,
+        # so its primary shard carries only the kv block): end = 0, no offsets
+        end = max((h['data_offsets'][1] for h in hdr.values()), default=0)
         offs = sorted((h['data_offsets'][0], h['data_offsets'][1]) for h in hdr.values())
         gaps = sum(1 for a, b in zip(offs, offs[1:]) if a[1] != b[0])
-        structure = (buf_off % ALIGN == 0) and (size == buf_off + end) and offs[0][0] == 0 and gaps == 0
+        structure = (buf_off % ALIGN == 0) and (size == buf_off + end) and (not offs or offs[0][0] == 0) and gaps == 0
 
         decl = json.loads(meta['pulsar.tensors'])
         mis_align = []
@@ -748,7 +750,7 @@ def cmd_audit(args):
             (n,) = struct.unpack('<Q', fh.read(8))
             hdr = json.loads(fh.read(n))
         md = hdr.pop('__metadata__', {})
-        end = max(h['data_offsets'][1] for h in hdr.values())
+        end = max((h['data_offsets'][1] for h in hdr.values()), default=0)   # a tensor-less shard is legal
         if (8 + n) % ALIGN or os.path.getsize(p) != 8 + n + end:
             bad.append(f)
         for k in ('format', 'pulsar.format', 'pulsar.alignment', 'pulsar.tensors',
