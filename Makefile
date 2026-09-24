@@ -511,6 +511,19 @@ tests/engram_hash_test: tests/engram_hash_test.cpp tests/engram_hash_fixture.h \
 engram-hash-check: tests/engram_hash_test
 	./tests/engram_hash_test
 
+# L245: the EXL3 trellis arithmetic (src/engine/exl3_trellis.h -- tile bit
+# layout, mul1 codebook, Hadamard basis) graded byte-exact against vectors
+# exllamav3's own reconstruct produced on real MiaAI V4.1 checkpoint blocks
+# and random-word tiles at every rate.  Host-only and instant; the header is
+# the one authority the transcoder and the device kernels are held to.
+tests/exl3_dequant_gate: tests/exl3_dequant_gate.cpp src/engine/exl3_trellis.h \
+                         src/engine/pulsar_engine_internal.h Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/exl3_dequant_gate.cpp
+
+.PHONY: exl3-dequant-gate
+exl3-dequant-gate: tests/exl3_dequant_gate
+	./tests/exl3_dequant_gate tests/test-vectors/exl3
+
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
 # a gather of the fixture's ids from the row file must return the fixture's bytes.
@@ -1500,7 +1513,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # RUN -- they do not race the runner's build (which reads the same objects).
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check \
-	host-checks
+	exl3-dequant-gate host-checks
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
@@ -1670,7 +1683,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -1685,6 +1698,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
+	        *exl3*) cls=exl3; exl3=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -1699,6 +1713,7 @@ gates-dev:
 	        server) for g in $(GATES_DEV_SERVER); do add $$g; done ;; \
 	        engine) for g in $(GATES_DEV_ENGINE); do add $$g; done ;; \
 	        vision) for g in $(GATES_DEV_VISION); do add $$g; done ;; \
+	        exl3) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
@@ -1729,6 +1744,9 @@ gates-dev:
 	           vision-visible-gate vision-placeholder-gate; do \
 	    $(MAKE) --no-print-directory $$h CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	  done; \
+	fi; \
+	if [ $$exl3 -eq 1 ]; then \
+	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \

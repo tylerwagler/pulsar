@@ -107,6 +107,7 @@ tests/gates_runner
 tests/runner/
 tests/dspark_batch_gate
 /tests/engram_hash_test
+/tests/exl3_dequant_gate
 /tests/attn_layout_test
 /tests/compressor_pool_test
 /tests/csa2_compressor_kernel_test
