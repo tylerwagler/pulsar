@@ -716,6 +716,15 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
  * n_tokens <= PULSAR_GPU_MNEUTRAL_ROWS_MAX (16) bounds a duplicate count at 16,
  * so at most two owners per expert per step.  Returns the owned count (0 = exit). */
 enum { GEMV_DEDUPE_MAX = 8 };
+/* L241 4g-2: both expert GEMVs issue a row's weight (and scale) loads a GROUP
+ * of GEMV_PREFETCH k chunks at a time, then run the unchanged FMA sequence over
+ * that group in the unchanged order -- bit-identical arithmetic with
+ * GEMV_PREFETCH loads in flight per lane instead of one.  One 32-bit word per
+ * lane per chunk was latency-bound (~160 GB/s at decode; under TP half the
+ * grid's slots exit, leaving fewer loads in flight).  A whole row prefetched
+ * at once (16 chunks) took the kernels from 64/56/80 to 148/124/155 registers
+ * and one CTA per SM, and ran SLOWER; the group keeps occupancy. */
+enum { GEMV_PREFETCH = 4 };
 enum { GEMV_DOWN_TILE_N = 64 };      /* down GEMV: outputs per CTA (8 warps x 8) */
 enum { GEMV_DOWN_MAX_K  = 2304 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim; V4.1 2304 = 9 x 256, L218) */
 __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
@@ -777,12 +786,28 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
       float g[GEMV_DEDUPE_MAX], u[GEMV_DEDUPE_MAX];
       #pragma unroll
       for (int r = 0; r < GEMV_DEDUPE_MAX; r++) { g[r] = 0.f; u[r] = 0.f; }
-      for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+      for (int kc = lane * 8; kc < K; kc += GEMV_PREFETCH * 32 * 8) {
+      uint32_t pwg[GEMV_PREFETCH], pwu[GEMV_PREFETCH];
+      uint8_t psg[GEMV_PREFETCH], psu[GEMV_PREFETCH];
+      #pragma unroll
+      for (int c = 0; c < GEMV_PREFETCH; c++) {
+        const int k0 = kc + c * 32 * 8;
+        if (k0 < K) {
+          pwg[c] = *(const uint32_t *)(gd + (k0 >> 1));
+          pwu[c] = *(const uint32_t *)(ud + (k0 >> 1));
+          psg[c] = gsf[sfl(n, k0 & ~31, 0)];
+          psu[c] = usf[sfl(n, k0 & ~31, 0)];
+        }
+      }
+      #pragma unroll
+      for (int c = 0; c < GEMV_PREFETCH; c++) {
+        const int k0 = kc + c * 32 * 8;
+        if (k0 >= K) break;
         /* the expert's bytes: once per k chunk for every owned row */
-        const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
-        const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
-        const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
-        const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
+        const uint32_t wg = pwg[c];
+        const uint32_t wu = pwu[c];
+        const float sg = gemv_sf_val(psg[c]);
+        const float su = gemv_sf_val(psu[c]);
         #pragma unroll
         for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
           if (r < m) {
@@ -798,6 +823,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
           }
         }
       }
+      }   /* the k-chunk group */
       #pragma unroll
       for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
         if (r < m) {
@@ -891,9 +917,23 @@ __global__ static void expert_gemv_down_kernel(
     float a[GEMV_DEDUPE_MAX];
     #pragma unroll
     for (int r = 0; r < GEMV_DEDUPE_MAX; r++) a[r] = 0.f;
-    for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
-      const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));   /* the expert's bytes, once for every owned row */
-      const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
+    for (int kc = lane * 8; kc < K; kc += GEMV_PREFETCH * 32 * 8) {
+    uint32_t pw[GEMV_PREFETCH];
+    uint8_t psc[GEMV_PREFETCH];
+    #pragma unroll
+    for (int c = 0; c < GEMV_PREFETCH; c++) {
+      const int k0 = kc + c * 32 * 8;
+      if (k0 < K) {
+        pw[c] = *(const uint32_t *)(dd + (k0 >> 1));
+        psc[c] = dsf[sfl(n, k0 & ~31, 0)];
+      }
+    }
+    #pragma unroll
+    for (int c = 0; c < GEMV_PREFETCH; c++) {
+      const int k0 = kc + c * 32 * 8;
+      if (k0 >= K) break;
+      const uint32_t w = pw[c];   /* the expert's bytes, once for every owned row */
+      const float sc = gemv_sf_val(psc[c]);
       #pragma unroll
       for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
         if (r < m) {
@@ -907,6 +947,7 @@ __global__ static void expert_gemv_down_kernel(
         }
       }
     }
+    }   /* the k-chunk group */
     #pragma unroll
     for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
       if (r < m) {
