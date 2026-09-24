@@ -667,6 +667,17 @@ static void tp_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Keepalive: an idle pair waits forever (pulsar_tp_recv_command), so a
+     * peer HOST that disappears without closing (power, cable) must still
+     * surface -- ~60 s: 30 s idle, then 3 probes 10 s apart.  Probes are
+     * answered by the peer's kernel, so an idle-but-alive peer never trips it. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    int idle = 30, intvl = 10, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
     /* Gate exchanges are latency-critical 16KB messages; large socket
      * buffers only matter for the TCP fallback's pipelining.  The kernel
      * clamps these to net.core.wmem_max anyway.  PULSAR_TP_TEST_TINY_BUFFERS
@@ -3685,19 +3696,27 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    const double deadline = tp_control_deadline(tp);
+    /* NO deadline: between commands a worker waits as long as its leader is
+     * idle -- a server with no traffic is not a failure (Tyler: "they should be
+     * able to idle forever"; the 300 s deadline killed an idle pair).  A leader
+     * that exits or crashes closes the socket, which wakes this wait and fails
+     * the header read below; a peer HOST that vanishes is caught by the
+     * socket's keepalive (tp_socket_tune).  Mid-operation silence is still
+     * bounded where it can occur: the ack collects, the exchanges and the
+     * device spins keep the transport timeout. */
     const double t_wait0 = tp_now_sec();
-    const bool readable = deadline <= 0.0 || tp_wait_readable(tp->control_fd, deadline);
+    struct pollfd pfd;
+    pfd.fd = tp->control_fd;
+    pfd.events = POLLIN;
+    int prc;
+    do {
+        pfd.revents = 0;
+        prc = poll(&pfd, 1, -1);
+    } while (prc < 0 && errno == EINTR);
     g_ctl.n_cmd++; g_ctl.cmd += tp_now_sec() - t_wait0;
-    if (!readable) {
-        /* A silent peer is NOT the same failure as a closed one, and telling
-         * them apart is the whole point of the deadline: the pair is out of
-         * lockstep (or the peer is wedged), which is a refusal, not a hang. */
+    if (prc < 0) {
         pulsar_tp_mark_failed(tp);
-        tp_set_err(err, errlen,
-                   "tp: no command from the leader within %llu s -- the ranks are not in "
-                   "lockstep or the peer is wedged",
-                   (unsigned long long)tp->timeout_sec);
+        tp_set_err(err, errlen, "tp: waiting for the leader's next command: %s", strerror(errno));
         return 0;
     }
     if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
