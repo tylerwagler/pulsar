@@ -484,6 +484,17 @@ int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
                                        const char *operation, uint64_t own_digest);
 /* Read and check the deferred acks now (1 = none pending, or they matched). */
 int pulsar_tp_settle_deferred_ack(pulsar_tp *tp, char *err, size_t errlen);
+/* This rank will not run (or could not finish) a step its peer is running:
+ * mark the group failed, latch the row lane's error word (this rank's spinning
+ * kernels exit), and send the peer the abort on the data socket so its proxy
+ * latches the same -- a refusal fails the pair in milliseconds instead of
+ * leaving the peer's GPU spinning until the transport timeout.  Idempotent. */
+void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why);
+/* The leader's own body of a mirrored step failed: give the peers 5 s to
+ * answer (they failed it too), else abort the row lane (they are spinning on
+ * exchanges this rank will not join).  Call before collecting their acks;
+ * pulsar_tp_drain_command_acks does. */
+void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation);
 /* The leader's drain for a logits-producing operation whose OWN body failed:
  * the peers' acks are read (an unread ack would shift every later frame) in
  * either shape and their verdicts ignored -- the local failure is the result. */

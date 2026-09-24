@@ -353,6 +353,7 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
                                 int body_rc, char *err, size_t errlen) {
     char peer_err[256];
     peer_err[0] = '\0';
+    if (body_rc != 0) pulsar_tp_own_step_failed(tp, operation);
     const int peer_ok = pulsar_tp_wait_command_ack(tp, s->tp_session_id, operation,
                                                    peer_err, sizeof(peer_err));
     if (body_rc != 0) return body_rc;
@@ -1050,6 +1051,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
         return -1;
     }
     const int own = s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen);
+    if (own < 0) pulsar_tp_own_step_failed(tp, "generate_speculative");
     const int agreed = tp_mirror_bank_verdict_logits(s, tp, "generate_speculative", own + 1, -1,
                                                      s->logits, 1u);
     return agreed < 0 ? -1 : own;
@@ -1152,6 +1154,7 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
         return -1;
     }
     const int own = pulsar_session_spec_redraft_batch_local(s, rounds, banks, rngs, n, err, errlen);
+    if (own != 0) pulsar_tp_own_step_failed(tp, "spec_redraft_batch");
     return tp_mirror_bank_verdict(s, tp, "spec_redraft_batch", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {

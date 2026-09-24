@@ -1412,6 +1412,54 @@ static inline volatile uint32_t *tp_row_err(pulsar_tp *tp) {
     return (volatile uint32_t *)(tp->slab + tp->layout.gpu_flags_off);
 }
 
+/* ROW-LANE ABORT (L241 4g-2).  A rank that will not run a step its peer is
+ * running -- a refused frame, a failed body -- leaves the peer's GPU spinning
+ * in a combine for rows that never come, until the transport timeout (900 s:
+ * the pair looked hung).  The failing rank sends this message on the DATA
+ * socket, idle during decode (the control socket may hold pipelined acks ahead
+ * of it); the peer's proxy peeks for it while it waits on an exchange and
+ * latches the lane's error word, which every spinning kernel watches -- the
+ * stream drains in microseconds and the drain refuses the step
+ * (pulsar_gpu_end_commands).  The message is never consumed: the pair is
+ * failed from here on.  The magic is distinct from every data-socket header. */
+static const char TP_ROW_ABORT_MAGIC[8] = { 'P', 'T', 'P', 'A', 'B', 'O', 'R', 'T' };
+typedef struct {
+    char magic[8];
+    int32_t rank;
+    char why[116];
+} tp_row_abort_msg;
+
+static void tp_row_err_latch(pulsar_tp *tp, uint32_t code) {
+    if (tp->slab && pulsar_tp_row_lane(tp) && *tp_row_err(tp) == 0) *tp_row_err(tp) = code;
+}
+
+void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why) {
+    if (!tp) return;
+    static std::atomic<bool> sent{false};
+    pulsar_tp_mark_failed(tp);
+    tp_row_err_latch(tp, 2u);
+    if (sent.exchange(true)) return;
+    fprintf(stderr, "pulsar-tp: rank %d aborts the pair's row lane: %s\n", tp->rank,
+            why ? why : "(no reason)");
+    tp_row_abort_msg m;
+    memset(&m, 0, sizeof(m));
+    memcpy(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic));
+    m.rank = tp->rank;
+    snprintf(m.why, sizeof(m.why), "%s", why ? why : "");
+    for (int i = 0; i < tp->n_peers; i++)
+        if (tp->peers[i].data_fd >= 0) (void)tp_write_full(tp->peers[i].data_fd, &m, sizeof(m));
+}
+
+/* 1 = the peer sent the abort (printed once, `why` filled). */
+static int tp_peer_aborted(pulsar_tp *tp) {
+    tp_row_abort_msg m;
+    const ssize_t n = recv(tp->data_fd, &m, sizeof(m), MSG_PEEK | MSG_DONTWAIT);
+    if (n < (ssize_t)sizeof(m) || memcmp(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic)) != 0) return 0;
+    m.why[sizeof(m.why) - 1] = '\0';
+    fprintf(stderr, "pulsar-tp: rank %d aborted the pair's row lane: %s\n", (int)m.rank, m.why);
+    return 1;
+}
+
 /* Arm the row lane's receive window at message `first`: post WINDOW
  * receives, then the ARMED handshake on the control socket (a rank that sends
  * before the peer's window is armed silently loses messages under UC).
@@ -1469,9 +1517,18 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     double t_recv = 0.0;
     if (ok && tp_rdma_drain_cq(tp) && r->recv_done >= last) { t_recv = t_posted; g_tg.early++; }
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    double next_abort_check = t_posted + 1e-3;
     while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
         if (ok && t_recv == 0.0 && r->recv_done >= last) t_recv = tp_now_sec();
+        if (ok && tp_now_sec() > next_abort_check) {
+            next_abort_check = tp_now_sec() + 1e-3;
+            if (tp_peer_aborted(tp)) {
+                tp_row_err_latch(tp, 2u);
+                pulsar_tp_mark_failed(tp);
+                ok = 0;
+            }
+        }
         if (ok && tp_now_sec() > deadline) {
             fprintf(stderr, "pulsar-tp: row lane: timeout at seq %llu (recv_done %llu, "
                             "%u sends outstanding)\n", (unsigned long long)last,
@@ -2441,7 +2498,7 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
     if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
         fprintf(stderr, "pulsar-tp: row lane refused: an earlier exchange failed "
                         "(proxy %s, device spin %s)\n",
-                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) ? "timed out" : "ok");
+                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
         return 0;
     }
     static int said = 0;
@@ -2474,7 +2531,7 @@ int pulsar_tp_row_lane_check(pulsar_tp *tp) {
         fprintf(stderr, "pulsar-tp: row lane check FAILED at a drained stream: exchange %llu "
                         "enqueued, %llu completed, proxy %s, device spin %s -- refusing\n",
                 (unsigned long long)tp->row_exch, (unsigned long long)done,
-                tp->proxy_failed.load() ? "failed" : "ok", err ? "timed out" : "ok");
+                tp->proxy_failed.load() ? "failed" : "ok", err == 2u ? "aborted" : err ? "timed out" : "ok");
         tp->failed.store(true, std::memory_order_release);
         return 0;
     }
@@ -3542,7 +3599,24 @@ int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
     return tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
 }
 
+void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation) {
+    /* A peer that failed the step too answers at once; one still running it is
+     * spinning on an exchange this rank will never join -- no step stays silent
+     * for seconds between exchanges -- so after a short wait the lane is
+     * aborted, which frees the peer's GPU and brings its (failed) ack. */
+    for (int i = 0; tp && i < tp->n_peers; i++) {
+        const int pfd = tp->peers[i].control_fd;
+        if (pfd >= 0 && !tp_wait_readable(pfd, tp_now_sec() + 5.0)) {
+            char why[160];
+            snprintf(why, sizeof(why), "this rank's %s failed and the peer did not answer within 5 s "
+                                       "(it is still running the step)", operation ? operation : "step");
+            pulsar_tp_row_lane_abort(tp, why);
+        }
+    }
+}
+
 void pulsar_tp_drain_command_acks(pulsar_tp *tp) {
+    pulsar_tp_own_step_failed(tp, "step");
     (void)tp_collect_acks(tp, 0ull, "drain", TP_ACK_DRAIN, 0ull, NULL, 0);
 }
 

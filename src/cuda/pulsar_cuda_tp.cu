@@ -41,8 +41,10 @@ static __device__ __forceinline__ uint64_t tp_globaltimer_ns(void) {
     return t;
 }
 
-/* Block-wide wait for done >= exch.  Returns false (and latches the error
- * word) when the timeout expires first. */
+/* Block-wide wait for done >= exch.  Returns false when the error word is
+ * set -- by an earlier kernel's timeout, or by the host on a row-lane abort
+ * (pulsar_tp_row_lane_abort: the peer will not run this step) -- or when the
+ * timeout expires first, which latches it. */
 static __device__ bool tp_wait_done(const uint64_t *done, uint64_t exch,
                                     uint32_t *err, uint64_t timeout_ns) {
     __shared__ int ok;
@@ -50,6 +52,10 @@ static __device__ bool tp_wait_done(const uint64_t *done, uint64_t exch,
         const uint64_t t0 = tp_globaltimer_ns();
         ok = 1;
         while (tp_ld_acquire_sys(done) < exch) {
+            if (*(volatile uint32_t *)err != 0u) {
+                ok = 0;
+                break;
+            }
             if (tp_globaltimer_ns() - t0 > timeout_ns) {
                 atomicExch(err, 1u);
                 ok = 0;
