@@ -905,6 +905,12 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
                                  uint32_t row0, uint32_t n_rows) {
     if (!g || il >= PULSAR_N_LAYER) return false;
     if (n_rows == 0u) return true;
+    /* PROBE (L239, 2026-09-23 night): the pre-merge served lane deposited nothing
+     * (gpu_graph_store_commits = !banked && no verify saves armed).  Skip under
+     * that predicate to MEASURE the per-row deposit's cost in the served lane;
+     * a served rewind across these rows then finds the ring short.  Not a
+     * landing. */
+    if (g->batch_multiseq || g->spec_comp_save_n != 0u) return true;
     /* A fused step carries rows for SEVERAL banks, so each row is deposited into
      * its own bank's ring (see above); the batched arm below is the single-bank
      * prefill case. */
