@@ -561,7 +561,8 @@ struct pulsar_tp {
 /* TEMPORARY INSTRUMENT (4g-2 step 1): see pulsar_tp.h. */
 static struct { uint64_t n; double ph[PULSAR_TP_TPH_N]; uint64_t bytes; } g_tsite[PULSAR_TP_TSITE_N];
 static struct { uint64_t n, rounds; double hdr, arm, stage, wire; uint64_t bytes; } g_tx;
-static struct { uint64_t n; double t; } g_tg;   /* the gate lane (4g-2 step 2) */
+static struct { uint64_t n; double t, post, recv, send, repost; uint64_t early, hist[6]; } g_tg;   /* the row lane (4g-2) */
+static struct { uint64_t n_ack, n_cmd; double ack, cmd; } g_ctl;   /* the control round trip per step */
 double pulsar_tp_now_sec(void);
 void pulsar_tp_timing_add(int site, int phase, double sec, uint64_t bytes) {
     if (site < 0 || site >= PULSAR_TP_TSITE_N || phase < 0 || phase >= PULSAR_TP_TPH_N) return;
@@ -581,9 +582,21 @@ void pulsar_tp_timing_report(const pulsar_tp *tp) {
                 g_tsite[s].ph[0] * 1e3, g_tsite[s].ph[1] * 1e3, g_tsite[s].ph[2] * 1e3, g_tsite[s].ph[3] * 1e3,
                 tot * 1e3, tot * 1e6 / (double)g_tsite[s].n);
     }
-    if (g_tg.n)
+    if (g_tg.n) {
         fprintf(stderr, "pulsar: tp-timing rank %d: row lane proxy: %llu exchanges, %.1f ms total, %.1f us per exchange (descriptor seen -> done)\n",
                 rank, (unsigned long long)g_tg.n, g_tg.t * 1e3, g_tg.t * 1e6 / g_tg.n);
+        const double n = (double)g_tg.n;
+        fprintf(stderr, "pulsar: tp-timing rank %d: row lane phases per exchange: post %.2f us, peer rows %.2f us, own sends %.2f us, repost %.2f us; "
+                        "peer rows already in at post: %.1f%%; peer-wait histogram <2/<5/<10/<20/<50/>=50 us: %llu/%llu/%llu/%llu/%llu/%llu\n",
+                rank, g_tg.post * 1e6 / n, g_tg.recv * 1e6 / n, g_tg.send * 1e6 / n, g_tg.repost * 1e6 / n,
+                100.0 * (double)g_tg.early / n,
+                (unsigned long long)g_tg.hist[0], (unsigned long long)g_tg.hist[1], (unsigned long long)g_tg.hist[2],
+                (unsigned long long)g_tg.hist[3], (unsigned long long)g_tg.hist[4], (unsigned long long)g_tg.hist[5]);
+    }
+    if (g_ctl.n_ack || g_ctl.n_cmd)
+        fprintf(stderr, "pulsar: tp-timing rank %d: control: leader ack-digest wait %llu x %.1f us, worker command wait %llu x %.1f us\n",
+                rank, (unsigned long long)g_ctl.n_ack, g_ctl.n_ack ? g_ctl.ack * 1e6 / g_ctl.n_ack : 0.0,
+                (unsigned long long)g_ctl.n_cmd, g_ctl.n_cmd ? g_ctl.cmd * 1e6 / g_ctl.n_cmd : 0.0);
     if (g_tx.n)
         fprintf(stderr, "pulsar: tp-timing rank %d: transport pair big-gate: %llu calls, %llu rdma rounds, "
                         "hdr-handshake %.1f ms, armed-ack %.1f ms, staging-memcpy %.1f ms, wire %.1f ms "
@@ -1421,6 +1434,7 @@ static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
  * sees done.  The window is re-posted before done is written, so the proxy is
  * idle -- and the QP quiet -- whenever the engine observes done == enqueued. */
 static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
+    const double t_first_post = tp_now_sec();
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     const uint64_t vb = tp->vec_bytes, last = first + rows - 1u;
     pthread_mutex_lock(&r->post_lock);
@@ -1445,9 +1459,13 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
                          (unsigned long long)t, strerror(errno));
         else r->send_outstanding++;
     }
+    const double t_posted = tp_now_sec();
+    double t_recv = 0.0;
+    if (ok && tp_rdma_drain_cq(tp) && r->recv_done >= last) { t_recv = t_posted; g_tg.early++; }
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
     while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && t_recv == 0.0 && r->recv_done >= last) t_recv = tp_now_sec();
         if (ok && tp_now_sec() > deadline) {
             fprintf(stderr, "pulsar-tp: row lane: timeout at seq %llu (recv_done %llu, "
                             "%u sends outstanding)\n", (unsigned long long)last,
@@ -1455,10 +1473,16 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
             ok = 0;
         }
     }
+    const double t_sent = tp_now_sec();
+    if (t_recv == 0.0) t_recv = t_sent;
     for (uint32_t k = 0; ok && k < rows; k++)
         ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = last;
     pthread_mutex_unlock(&r->post_lock);
+    const double t_end = tp_now_sec(), pw = (t_recv - t_posted) * 1e6;
+    g_tg.post += t_posted - t_first_post; g_tg.recv += t_recv - t_posted;
+    g_tg.send += t_sent - t_recv; g_tg.repost += t_end - t_sent;
+    g_tg.hist[pw < 2 ? 0 : pw < 5 ? 1 : pw < 10 ? 2 : pw < 20 ? 3 : pw < 50 ? 4 : 5]++;
     return ok;
 }
 
@@ -3444,7 +3468,10 @@ int pulsar_tp_wait_command_ack(pulsar_tp *tp, uint64_t session_id,
 int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
                                       const char *operation, uint64_t own_digest,
                                       char *err, size_t errlen) {
-    return tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
+    const double t0 = tp_now_sec();
+    const int rc = tp_collect_acks(tp, session_id, operation, TP_ACK_DIGEST, own_digest, err, errlen);
+    g_ctl.n_ack++; g_ctl.ack += tp_now_sec() - t0;
+    return rc;
 }
 
 void pulsar_tp_drain_command_acks(pulsar_tp *tp) {
@@ -3517,7 +3544,10 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     command->type = PULSAR_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
     const double deadline = tp_control_deadline(tp);
-    if (deadline > 0.0 && !tp_wait_readable(tp->control_fd, deadline)) {
+    const double t_wait0 = tp_now_sec();
+    const bool readable = deadline <= 0.0 || tp_wait_readable(tp->control_fd, deadline);
+    g_ctl.n_cmd++; g_ctl.cmd += tp_now_sec() - t_wait0;
+    if (!readable) {
         /* A silent peer is NOT the same failure as a closed one, and telling
          * them apart is the whole point of the deadline: the pair is out of
          * lockstep (or the peer is wedged), which is a refusal, not a hang. */
