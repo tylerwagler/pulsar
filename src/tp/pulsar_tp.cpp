@@ -543,6 +543,24 @@ typedef struct {
     pulsar_tp_rdma_link rdma;
 } pulsar_tp_peer;
 
+/* TEMPORARY INSTRUMENT (tp-skew, not for landing): per-exchange timing of
+ * the row lane and the idle-path counters, printed per rank at close.  The
+ * proxy fields are written by the proxy thread only and read after it is
+ * joined; the worker fields by the engine thread only. */
+#define TP_SKEW_BUCKETS 11
+typedef struct {
+    uint64_t n;                 /* row exchanges timed */
+    uint64_t peer_first;        /* peer rows already there at the first poll after our post */
+    uint64_t hist[TP_SKEW_BUCKETS]; /* post->arrive (us), when not peer_first */
+    double seen_post, post_arrive, arrive_done, seen_done, post_arrive_max;  /* seconds */
+    double cur_posted, cur_arrive;  /* the exchange in flight, for the proxy main */
+    uint64_t bulk_n;
+    uint64_t backoff_sleeps, backoff_episodes, after_backoff;
+    uint64_t worker_cmds, worker_first_poll, worker_spin_hits, worker_fallbacks;
+} tp_skew_instr;
+static const double tp_skew_edges_us[TP_SKEW_BUCKETS - 1] = {
+    5, 10, 15, 20, 30, 40, 60, 100, 200, 500 };
+
 struct pulsar_tp {
     pulsar_tp_options opt;
     int rank;                   /* 0 leader, 1 worker */
@@ -601,6 +619,7 @@ struct pulsar_tp {
     uint64_t bulk_seq = 0;          /* engine thread: bulk exchanges numbered (buffer parity) */
     uint64_t peer_bulk_base = 0;    /* the peer's bulk buffer and rkey (v14 info) */
     uint32_t peer_bulk_rkey = 0;
+    tp_skew_instr skew;             /* TEMPORARY INSTRUMENT (tp-skew) */
 };
 
 /* ------------------------------------------------------------------------
@@ -1589,8 +1608,25 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     const double t_posted = tp_now_sec();
     const double deadline = t_posted + (double)tp->timeout_sec;
     double next_abort_check = t_posted + 1e-3;
+    double t_arrive = 0.0;          /* TEMPORARY INSTRUMENT (tp-skew) */
+    bool first_poll = true;         /* TEMPORARY INSTRUMENT (tp-skew) */
     while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && t_arrive == 0.0 && r->recv_done >= last) {   /* TEMPORARY INSTRUMENT (tp-skew) */
+            t_arrive = tp_now_sec();
+            tp_skew_instr *k = &tp->skew;
+            if (first_poll) {
+                k->peer_first++;
+            } else {
+                const double us = (t_arrive - t_posted) * 1e6;
+                int b = 0;
+                while (b < TP_SKEW_BUCKETS - 1 && us >= tp_skew_edges_us[b]) b++;
+                k->hist[b]++;
+            }
+            k->post_arrive += t_arrive - t_posted;
+            if (t_arrive - t_posted > k->post_arrive_max) k->post_arrive_max = t_arrive - t_posted;
+        }
+        first_poll = false;
         if (ok && tp_now_sec() > next_abort_check) {
             next_abort_check = tp_now_sec() + 1e-3;
             if (tp_peer_aborted(tp)) {
@@ -1609,6 +1645,8 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     for (uint32_t k = 0; ok && k < rows; k++)
         ok = tp_rdma_post_gate_recv(tp, first + k + PULSAR_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = last;
+    tp->skew.cur_posted = t_posted;   /* TEMPORARY INSTRUMENT (tp-skew) */
+    tp->skew.cur_arrive = t_arrive;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
 }
@@ -1805,14 +1843,23 @@ static void *tp_row_proxy_main(void *arg) {
     std::atomic<uint64_t> *done = tp_row_done(tp);
     uint64_t last_exch = 0, next_msg = 1;
     double idle_since = tp_now_sec();
+    bool backed_off = false;    /* TEMPORARY INSTRUMENT (tp-skew) */
     while (!tp->proxy_stop.load(std::memory_order_acquire)) {
         const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
         if (e == last_exch) {
             /* Busy-poll through a decode stream; back off only once the lane
              * is truly idle (TP_PROXY_IDLE_BACKOFF_SEC). */
-            if (tp_now_sec() - idle_since > TP_PROXY_IDLE_BACKOFF_SEC) usleep(50);
+            if (tp_now_sec() - idle_since > TP_PROXY_IDLE_BACKOFF_SEC) {
+                if (!backed_off) tp->skew.backoff_episodes++;   /* TEMPORARY INSTRUMENT (tp-skew) */
+                backed_off = true;
+                tp->skew.backoff_sleeps++;
+                usleep(50);
+            }
             continue;
         }
+        const double t_seen = tp_now_sec();   /* TEMPORARY INSTRUMENT (tp-skew) */
+        if (backed_off) tp->skew.after_backoff++;
+        backed_off = false;
         if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
             /* A bulk exchange (v14): desc[1] = bytes, desc[2] low bit = the
              * receive buffer.  It takes no gate messages, so next_msg stays. */
@@ -1833,6 +1880,7 @@ static void *tp_row_proxy_main(void *arg) {
             last_exch = e;
             done->store(e, std::memory_order_release);
             idle_since = tp_now_sec();
+            tp->skew.bulk_n++;   /* TEMPORARY INSTRUMENT (tp-skew) */
             continue;
         }
         const uint64_t first = desc[1];
@@ -1853,6 +1901,10 @@ static void *tp_row_proxy_main(void *arg) {
         next_msg = first + rows;
         done->store(e, std::memory_order_release);
         idle_since = tp_now_sec();
+        tp->skew.n++;                           /* TEMPORARY INSTRUMENT (tp-skew) */
+        tp->skew.seen_post += tp->skew.cur_posted - t_seen;
+        tp->skew.arrive_done += idle_since - tp->skew.cur_arrive;
+        tp->skew.seen_done += idle_since - t_seen;
     }
     return NULL;
 }
@@ -2246,9 +2298,43 @@ static pulsar_tp *tp_alloc(void) {
     return new (raw) pulsar_tp{};
 }
 
+/* TEMPORARY INSTRUMENT (tp-skew): one block per rank, after the proxy joined. */
+static void tp_skew_print(const pulsar_tp *tp) {
+    const tp_skew_instr *k = &tp->skew;
+    const double n = k->n ? (double)k->n : 1.0;
+    const uint64_t timed = k->n - k->peer_first;
+    char hist[512];
+    size_t h = 0;
+    for (int b = 0; b < TP_SKEW_BUCKETS && h < sizeof(hist); b++)
+        h += (size_t)snprintf(hist + h, sizeof(hist) - h, b < TP_SKEW_BUCKETS - 1 ? " <%g:%llu" : " >=%g:%llu",
+                              tp_skew_edges_us[b < TP_SKEW_BUCKETS - 1 ? b : b - 1],
+                              (unsigned long long)k->hist[b]);
+    /* One fprintf per block line set: a same-process test pair must not interleave mid-line. */
+    fprintf(stderr, "pulsar-tp: TEMPORARY tp-skew instrument rank %d: %llu row exchanges, %llu bulk; "
+                    "proxy cpu %d, launch cpu %d (-1 = unpinned or no row lane)\n"
+                    "pulsar-tp:   peer-first %llu (%.1f%%: peer rows already there at our first poll -- "
+                    "this rank was late)\n"
+                    "pulsar-tp:   post->arrive us histogram of the other %llu:%s\n",
+            tp->rank, (unsigned long long)k->n, (unsigned long long)k->bulk_n,
+            tp->pin_proxy_cpu, tp->pin_launch_cpu,
+            (unsigned long long)k->peer_first, 100.0 * (double)k->peer_first / n,
+            (unsigned long long)timed, hist);
+    fprintf(stderr, "pulsar-tp:   mean us: seen->post %.2f, post->arrive %.2f (max %.1f), arrive->done %.2f, "
+                    "seen->done %.2f\n", k->seen_post / n * 1e6, k->post_arrive / n * 1e6,
+            k->post_arrive_max * 1e6, k->arrive_done / n * 1e6, k->seen_done / n * 1e6);
+    fprintf(stderr, "pulsar-tp:   proxy backoff: %llu episodes, %llu sleeps, %llu exchanges found the proxy "
+                    "backed off (after-backoff)\n", (unsigned long long)k->backoff_episodes,
+            (unsigned long long)k->backoff_sleeps, (unsigned long long)k->after_backoff);
+    fprintf(stderr, "pulsar-tp:   worker commands %llu: %llu ready at the first poll, %llu caught by the spin, "
+                    "%llu poll(-1) fallbacks\n", (unsigned long long)k->worker_cmds,
+            (unsigned long long)k->worker_first_poll, (unsigned long long)k->worker_spin_hits,
+            (unsigned long long)k->worker_fallbacks);
+}
+
 static void tp_destroy(pulsar_tp *tp) {
     if (!tp) return;
     tp_row_proxy_stop(tp);   /* before the QP it posts to goes away */
+    tp_skew_print(tp);       /* TEMPORARY INSTRUMENT (tp-skew) */
     tp_rdma_close(tp);
     /* The primary link's fds are ALSO peers[0]'s once bring-up completed, so
      * each descriptor is closed once: the primary here, and below every peer
@@ -4171,10 +4257,16 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     pfd.events = POLLIN;
     int prc;
     const double spin_until = tp_now_sec() + TP_WORKER_COMMAND_SPIN_SEC;
+    uint64_t spins = 0;   /* TEMPORARY INSTRUMENT (tp-skew) */
     do {
         pfd.revents = 0;
         prc = poll(&pfd, 1, 0);
+        spins++;
     } while ((prc == 0 && tp_now_sec() < spin_until) || (prc < 0 && errno == EINTR));
+    tp->skew.worker_cmds++;   /* TEMPORARY INSTRUMENT (tp-skew) */
+    if (prc > 0 && spins == 1) tp->skew.worker_first_poll++;
+    else if (prc > 0) tp->skew.worker_spin_hits++;
+    else tp->skew.worker_fallbacks++;
     if (prc == 0) {
         do {
             pfd.revents = 0;
