@@ -129,9 +129,10 @@ next sections.
 - [tools/imatrix/dataset/README.md](tools/imatrix/dataset/README.md): how the
   calibration prompt corpus is generated.
 - [tools/reap/README.md](tools/reap/README.md): the router audit the battery runs.
-- [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md): the verified end-to-end
-  rebuild of the serving artifact from source weights (two templates, then a
-  single quantizer pass that prunes, pre-formats and merges the drafter).
+- [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md): building the serving
+  artifact straight from the HF checkpoint with `tools/container/build.py`
+  (no GGUF), the five format decisions, and the entry-for-entry instrument
+  that proves a build against the served artifact.
 - [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
   V4 model card, with the architecture details that matter for Pulsar.
 - [tools/quality-testing/README.md](tools/quality-testing/README.md): how local

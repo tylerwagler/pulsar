@@ -898,6 +898,18 @@ cuda-mixed-prefill-gate: tests/mixed_prefill_gate
 cuda-reap-router-audit:
 	python3 tools/reap/audit_reap_router.py $(FRONTIER_MODEL)
 
+# The artifact builder's module suites (tools/container, L247), no GPU, minutes:
+# names/policy against every declaration of the served Vision-Exp artifact
+# (shard, gguf_name, layout, dims_ne), kv entry-for-entry, every producer
+# byte-identical to the served bytes.  The oracle paths live in the tests and
+# refuse when the checkpoints are not mounted; the codecs need numpy, so pass
+# the interpreter that has it (CONTAINER_PY=.../.venv/bin/python).
+CONTAINER_PY ?= python3
+.PHONY: container-tests
+container-tests:
+	cd tools/container && for t in test_names.py test_kv.py test_producers.py; do \
+	  $(CONTAINER_PY) $$t || exit 1; done
+
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
