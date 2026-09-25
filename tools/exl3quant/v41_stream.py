@@ -31,7 +31,7 @@ Output (under --out):
                                       upper triangle), fp32 sums; metadata carries the count
     exl3-kK/model-layerNN.safetensors the layer's experts at K, exllamav3 tensor format
     exl3-kK/proxy-layerNN.json        proxy_err per tensor (the K-mix ordering signal)
-    state/after.safetensors           the stream after the last completed layer
+    state/after.pt                    the stream after the last completed layer (torch.save)
     log.jsonl                         one record per completed stage
 """
 
@@ -40,6 +40,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import shutil
 import struct
 import sys
 import time
@@ -160,28 +161,54 @@ def load_into(module, sd, what):
 
 
 class EngramTable(torch.nn.Module):
-    """ParallelEngramEmbedding at world size 1, gathering its rows straight from the shard
-    (the tables are 2 x 94 GiB): e4m3 rows times their e8m0 scale per 32, as bf16."""
+    """ParallelEngramEmbedding at world size 1 over the shard's row table (2 x 94 GiB): e4m3
+    rows times their e8m0 scale per 32, as bf16.  `prefetch` reads the table ONCE, sequentially,
+    in large chunks, keeping only the rows the calibration set will look up -- random row reads
+    run at ~86 rows/s over NFS, and a layer needs millions."""
+
+    CHUNK_ROWS = 1 << 20  # 256 MiB of rows per sequential read
 
     def __init__(self, ckpt, layer, block):
         super().__init__()
-        wpath, woff, wdt, wsh = ckpt.raw(f"layers.{layer}.engram.embed.weight")
-        spath, soff, sdt, ssh = ckpt.raw(f"layers.{layer}.engram.embed.scale")
+        self.wpath, self.woff, wdt, wsh = ckpt.raw(f"layers.{layer}.engram.embed.weight")
+        self.spath, self.soff, sdt, ssh = ckpt.raw(f"layers.{layer}.engram.embed.scale")
         if wdt != "F8_E4M3" or sdt != "F8_E8M0" or ssh != [wsh[0], wsh[1] // block]:
             raise SystemExit(f"layers.{layer}.engram.embed: {wdt}{wsh} / {sdt}{ssh}")
         self.rows, self.dim, self.block = wsh[0], wsh[1], block
-        self.w = np.memmap(wpath, np.uint8, "r", offset=woff, shape=(self.rows, self.dim))
-        self.s = np.memmap(spath, np.uint8, "r", offset=soff, shape=(self.rows, self.dim // block))
+        self.ids = None
+
+    def prefetch(self, indices):
+        """Hold every row `indices` names (all the lookups this layer will make)."""
+        uniq = np.unique(indices.reshape(-1).cpu().numpy())
+        if uniq[0] < 0 or uniq[-1] >= self.rows:
+            raise SystemExit(f"engram row index out of range [0, {self.rows})")
+        sdim = self.dim // self.block
+        w = np.empty((len(uniq), self.dim), np.uint8)
+        s = np.empty((len(uniq), sdim), np.uint8)
+        with open(self.wpath, "rb") as fw, open(self.spath, "rb") as fs:
+            for c0 in range(0, self.rows, self.CHUNK_ROWS):
+                n = min(self.CHUNK_ROWS, self.rows - c0)
+                lo, hi = np.searchsorted(uniq, [c0, c0 + n])
+                if lo == hi:
+                    continue
+                pick = uniq[lo:hi] - c0
+                fw.seek(self.woff + c0 * self.dim)
+                w[lo:hi] = np.frombuffer(fw.read(n * self.dim), np.uint8).reshape(n, self.dim)[pick]
+                fs.seek(self.soff + c0 * sdim)
+                s[lo:hi] = np.frombuffer(fs.read(n * sdim), np.uint8).reshape(n, sdim)[pick]
+        self.ids = uniq
+        self.w_rows = torch.from_numpy(w).view(torch.float8_e4m3fn)
+        self.s_rows = torch.from_numpy(s).view(torch.float8_e8m0fnu)
 
     def forward(self, indices):
         flat = indices.reshape(-1).cpu().numpy()
-        if flat.min() < 0 or flat.max() >= self.rows:
-            raise SystemExit(f"engram row index out of range [0, {self.rows})")
-        uniq, inv = np.unique(flat, return_inverse=True)
-        w = torch.from_numpy(np.ascontiguousarray(self.w[uniq])).view(torch.float8_e4m3fn)
-        s = torch.from_numpy(np.ascontiguousarray(self.s[uniq])).view(torch.float8_e8m0fnu)
-        vals = (w.float().unflatten(-1, (-1, self.block)) * s.float().unsqueeze(-1)).flatten(-2).bfloat16()
-        return vals[torch.from_numpy(inv)].view(*indices.shape, self.dim).to(indices.device)
+        pos = np.searchsorted(self.ids, flat)
+        if pos.max() >= len(self.ids) or not np.array_equal(self.ids[pos], flat):
+            raise SystemExit("engram lookup of a row the prefetch did not hold")
+        pos = torch.from_numpy(pos)
+        w, s = self.w_rows[pos].float(), self.s_rows[pos].float()
+        vals = (w.unflatten(-1, (-1, self.block)) * s.unsqueeze(-1)).flatten(-2).bfloat16()
+        return vals.view(*indices.shape, self.dim).to(indices.device)
 
 
 def load_layer(ref, args, layout, ckpt, layer, dev):
@@ -412,17 +439,15 @@ class Stream:
     after: int               # last layer applied (-1: embeddings only)
 
     def save(self, path):
-        t = {"h": self.h, "pre_mix": self.pre_mix, **{f"shared.{k}": v for k, v in self.shared.items()}}
-        save_file(t, path + ".tmp", metadata={"after": str(self.after)})
+        # torch.save streams the storages; safetensors' save_file would copy the whole stream
+        # (tens of GB) into memory first
+        torch.save({"h": self.h, "pre_mix": self.pre_mix, "shared": self.shared, "after": self.after}, path + ".tmp")
         os.replace(path + ".tmp", path)
 
     @classmethod
     def load(cls, path):
-        with safe_open(path, framework="pt") as f:
-            after = int(f.metadata()["after"])
-        t = load_file(path)
-        shared = {k[len("shared."):]: v for k, v in t.items() if k.startswith("shared.")}
-        return cls(t["h"], t["pre_mix"], shared, after)
+        t = torch.load(path)
+        return cls(t["h"], t["pre_mix"], t["shared"], t["after"])
 
 
 def publishes(args, layer):
@@ -519,7 +544,13 @@ def main():
     ap.add_argument("--cols", type=int, default=2048, help="tokens per row (MiaAI: 2048)")
     ap.add_argument("--extra-corpus", action="append", default=[], help="jsonl {\"text\"} packed into more rows")
     ap.add_argument("--k", default="2,3", help="comma list of EXL3 rates; 'none' collects Hessians only")
+    ap.add_argument("--forward-only", action="store_true",
+                    help="no Hessians, no quantization: the forward and its perplexity (the gate)")
     ap.add_argument("--layers", type=int, default=N_BACKBONE, help="stop after this many backbone layers")
+    ap.add_argument("--until", default=None,
+                    help="HH:MM local: start no layer the last layer's duration says would end after it")
+    ap.add_argument("--min-free-gb", type=float, default=20.0,
+                    help="start no layer with less free disk than this under --out")
     ap.add_argument("--batch", type=int, default=8, help="rows per forward")
     ap.add_argument("--flush-rows", type=int, default=16384, help="rows per all-experts Hessian pass")
     ap.add_argument("--device", default="cuda:0", help="the forward's device")
@@ -527,7 +558,14 @@ def main():
                     help="comma list of CUDA indices the quantizer splits tiles over (default: the forward's)")
     a = ap.parse_args()
 
-    ks = [] if a.k == "none" else [int(k) for k in a.k.split(",")]
+    ks = [] if a.k == "none" or a.forward_only else [int(k) for k in a.k.split(",")]
+    deadline = None
+    if a.until:
+        hh, mm = (int(x) for x in a.until.split(":"))
+        now = time.localtime()
+        deadline = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, -1))
+        if deadline <= time.time():
+            deadline += 86400
     dev = torch.device(a.device)
     quant_devices = [int(d) for d in a.quant_devices.split(",")] if a.quant_devices else [dev.index or 0]
     if ks and (dev.type != "cuda" or quant_devices[0] != (dev.index or 0)):
@@ -562,7 +600,7 @@ def main():
     hashes = hasher(rows, 0)  # [R, S, n_engram_layers, n_hash_cols]
     del hasher
 
-    state_path = os.path.join(a.out, "state", "after.safetensors")
+    state_path = os.path.join(a.out, "state", "after.pt")
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     if os.path.exists(state_path):
         stream = Stream.load(state_path)
@@ -571,16 +609,29 @@ def main():
         h, pre_mix = embed_rows(ckpt, rows, args.hc_mult)
         stream = Stream(h, pre_mix, {}, -1)
 
+    last = None  # seconds the previous layer took, the estimate for the next
     for layer in range(stream.after + 1, a.layers):
+        if deadline is not None and last is not None and time.time() + last > deadline:
+            log(a.out, stage="stop", reason=f"layer {layer} would end after {a.until}", after=stream.after)
+            break
+        free = shutil.disk_usage(a.out).free / 1e9
+        if free < a.min_free_gb:
+            log(a.out, stage="stop", reason=f"{free:.1f} GB free under --out", after=stream.after)
+            break
         t0 = time.time()
         block, engram = load_layer(ref, args, layout, ckpt, layer, dev)
-        hess = ExpertHessians(block.ffn, dev, a.flush_rows)
-        run_layer(ref, args, block, engram, hashes, stream, layer, a.batch, dev, hess.observe)
-        hpath = os.path.join(a.out, "hessians", f"layer{layer:02d}.safetensors")
-        os.makedirs(os.path.dirname(hpath), exist_ok=True)
-        hess.save(hpath, layer)
-        t1 = time.time()
-        log(a.out, stage="forward", layer=layer, seconds=round(t1 - t0, 1), tokens=hess.count, dropped=hess.dropped)
+        if engram is not None:
+            engram.embed.prefetch(hashes[:, :, args.engram_layer_ids.index(layer)])
+            log(a.out, stage="engram", layer=layer, rows=len(engram.embed.ids), seconds=round(time.time() - t0, 1))
+        hess = None if a.forward_only else ExpertHessians(block.ffn, dev, a.flush_rows)
+        run_layer(ref, args, block, engram, hashes, stream, layer, a.batch, dev,
+                  (lambda x: None) if hess is None else hess.observe)
+        if hess is not None:
+            hpath = os.path.join(a.out, "hessians", f"layer{layer:02d}.safetensors")
+            os.makedirs(os.path.dirname(hpath), exist_ok=True)
+            hess.save(hpath, layer)
+        log(a.out, stage="forward", layer=layer, seconds=round(time.time() - t0, 1),
+            tokens=hess.count if hess else None, dropped=hess.dropped if hess else None)
         for K in ks:
             t2 = time.time()
             proxy = quantize_layer(hess, layer, K, quant_devices, os.path.join(a.out, f"exl3-k{K}"),
@@ -592,6 +643,7 @@ def main():
         if dev.type == "cuda":
             torch.cuda.empty_cache()
         stream.save(state_path)
+        last = time.time() - t0
 
     if stream.after == N_BACKBONE - 1:
         nll, n = perplexity(ref, args, ckpt, stream, rows, is_text, a.batch, dev)

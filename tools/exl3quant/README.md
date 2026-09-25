@@ -62,8 +62,13 @@ layer 1 in 290 s (random row reads over NFS), the first compressed-KV/indexer so
 in 75 s; Hessians finite and symmetric. Checkpoint tensors are cloned into host memory before
 they go to the GPU (a page-faulting mmap -> CUDA copy runs at ~5 MB/s on GB10).
 
-A killed run restarts at the layer after the last one in `$OUT/state/after.safetensors`
-(same command). `log.jsonl` has one record per layer stage; after layer 39 the run reports
+A killed run restarts at the layer after the last one in `$OUT/state/after.pt` (same
+command). `--until HH:MM` starts no layer the previous layer's duration says would end after
+that time, and `--min-free-gb` none with too little disk left -- so a box that serves by day
+(sparky) runs a few layers a night and picks up the next night. `--forward-only` skips
+Hessians and quantization: the whole forward and its perplexity, the gate before a real run.
+Engram layers first read their table once, sequentially, keeping the rows the calibration set
+looks up (random row reads over NFS run at ~86 rows/s; one pass is ~94 GiB at disk speed). `log.jsonl` has one record per layer stage; after layer 39 the run reports
 perplexity over the calibration text rows -- the end-to-end check that the streamed forward is
 the model (a broken layer shows up as a perplexity in the hundreds).
 
