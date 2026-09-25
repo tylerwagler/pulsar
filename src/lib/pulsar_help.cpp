@@ -281,7 +281,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
 
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
-    opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
+    opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 65536");
     fputc('\n', fp);

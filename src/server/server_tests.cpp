@@ -6002,7 +6002,7 @@ static void test_kv_disk_default_dir_resolution(void) {
      * basename; the .gguf extension is stripped case-insensitively. */
     setenv("XDG_CACHE_HOME", "/tmp/ds4-kvtest-xdg", 1);
     char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf");
-    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/ds4/kv-ds4flash-test"));
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-test"));
     free(d);
 
     /* The gguf/model.gguf ACTIVE-POINTER symlink must key by the versioned
@@ -6019,7 +6019,7 @@ static void test_kv_disk_default_dir_resolution(void) {
         if (fp) fclose(fp);
         TEST_ASSERT(symlink(artifact, pointer) == 0);
         d = server_default_kv_disk_dir(pointer);
-        TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/ds4/kv-ds4flash-v9-test"));
+        TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-v9-test"));
         free(d);
         unlink(pointer);
         unlink(artifact);
@@ -6031,14 +6031,14 @@ static void test_kv_disk_default_dir_resolution(void) {
     unsetenv("XDG_CACHE_HOME");
     setenv("HOME", "/tmp/ds4-kvtest-home", 1);
     d = server_default_kv_disk_dir("weird name!.GGUF");
-    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/ds4/kv-weird_name_"));
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-weird_name_"));
     free(d);
 
     /* A relative XDG_CACHE_HOME is ignored per the XDG spec (it would key
      * the cache off the current working directory). */
     setenv("XDG_CACHE_HOME", "relative-cache", 1);
     d = server_default_kv_disk_dir("x.gguf");
-    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/ds4/kv-x"));
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-x"));
     free(d);
     unsetenv("XDG_CACHE_HOME");
 
@@ -6064,8 +6064,8 @@ static void test_kv_disk_flag_matrix(void) {
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir != NULL);
         TEST_ASSERT(c.kv_disk_dir &&
-                    !strncmp(c.kv_disk_dir, "/tmp/ds4-kvtest-xdg/ds4/kv-",
-                             strlen("/tmp/ds4-kvtest-xdg/ds4/kv-")));
+                    !strncmp(c.kv_disk_dir, "/tmp/ds4-kvtest-xdg/pulsar/kv-",
+                             strlen("/tmp/ds4-kvtest-xdg/pulsar/kv-")));
         free((char *)c.kv_disk_dir);
     }
 

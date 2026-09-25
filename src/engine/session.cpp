@@ -746,6 +746,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         if (opt->tp_spill_dir && opt->tp_spill_dir[0]) e->tp_spill_dir = pulsar_strdup(opt->tp_spill_dir);
+        e->tp_build_digest = pulsar_build_digest(opt->build_id);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
         /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
          * GPU-direct through a buffer of out | in[0] | in[1], each one prefill

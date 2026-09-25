@@ -340,6 +340,57 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
          * in order, read by the worker's prefill loop, not its command loop. */
         CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 0) == 1, "verdict: send continue");
         CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 1) == 1, "verdict: send stop");
+        /* e. sync check (v16, L250): the leader's cached position + prefix
+         * digest before a sync.  The worker's verdict comes back as a plain
+         * status, and a divergence (1) is an ANSWER -- the leader invalidates
+         * and refuses the sync -- not a transport failure. */
+        const uint64_t dg = 0x0123456789abcdefull;
+        int st = -1;
+        CHECK(pulsar_tp_send_sync_check(tp, sid, 20480, dg) == 1, "sync check: send #1");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status(tp, sid, "sync check", &st, err, sizeof(err)) == 1 && st == 0,
+              "sync check: agreement (status %d): %s", st, err);
+        CHECK(pulsar_tp_send_sync_check(tp, sid, 7, dg ^ 1u) == 1, "sync check: send #2");
+        st = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status(tp, sid, "sync check", &st, err, sizeof(err)) == 1 && st == 1,
+              "sync check: divergence verdict (status %d): %s", st, err);
+        CHECK(!pulsar_tp_failed(tp), "sync check: a divergence verdict must not mark the group failed");
+        /* f. disk KV mirror (v16, L250): KVSTORE_SAVE is a verdict, KVSTORE_DROP
+         * is void -- a stray ack from the drop would shift the NEXT collect, so
+         * one more save after it proves the drop answered nothing. */
+        const char *key = "0123456789abcdef0123456789abcdef01234567";
+        for (int k = 0; k < 2; k++) {
+            CHECK(pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_KVSTORE_SAVE, sid, key, 0) == 1,
+                  "kvstore: send save #%d", k + 1);
+            st = -1;
+            err[0] = 0;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "kv cache store", &st, err, sizeof(err)) == 1 &&
+                  st == k, "kvstore: save #%d verdict (status %d): %s", k + 1, st, err);
+            if (k == 0)
+                CHECK(pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_KVSTORE_DROP, sid, key, 0) == 1,
+                      "kvstore: send drop");
+        }
+        CHECK(pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_SYNC, sid, key, 0) == 0,
+              "kvstore: the keyed sender must refuse a non-kvstore frame type");
+        CHECK(pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_KVSTORE_LOAD, sid, key, 0) == 0,
+              "kvstore: a load must go through its own sender (it carries the digest)");
+        /* g. the mirrored load (phase 2): the leader's RESULT rides the frame --
+         * token count and a full 64-bit digest -- and a miss is a plain 1. */
+        const uint64_t ldg = 0xfedcba9876543210ull;
+        CHECK(pulsar_tp_send_kvstore_load(tp, sid, key, 20480, ldg) == 1, "kvload: send");
+        st = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status(tp, sid, "kv cache load", &st, err, sizeof(err)) == 1 && st == 1,
+              "kvload: miss verdict (status %d): %s", st, err);
+        CHECK(!pulsar_tp_failed(tp), "kvload: a load miss must not mark the group failed");
+        /* h. reconcile (phase 3): void, keys back to back; an empty index too. */
+        const char two[] = "0123456789abcdef0123456789abcdef01234567"
+                           "fedcba9876543210fedcba9876543210fedcba98";
+        CHECK(pulsar_tp_send_kvstore_reconcile(tp, two, 2) == 1, "reconcile: send 2 keys");
+        CHECK(pulsar_tp_send_kvstore_reconcile(tp, NULL, 0) == 1, "reconcile: send empty index");
+        CHECK(pulsar_tp_send_kvstore_reconcile(tp, NULL, 3) == 0, "reconcile: keys missing must refuse");
+        CHECK(!pulsar_tp_failed(tp), "kvstore: a store miss must not mark the group failed");
     } else {
         pulsar_tp_command cmd;
         for (int step = 0; step < 4; step++) {
@@ -358,6 +409,60 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
         stop = -1;
         CHECK(pulsar_tp_recv_chunk_verdict(tp, sid, &stop, err, sizeof(err)) == 1 && stop == 1,
               "verdict: worker reads stop (stop %d): %s", stop, err);
+        for (int k = 0; k < 2; k++) {
+            const int want_pos = k == 0 ? 20480 : 7;
+            const uint64_t want_dg = k == 0 ? 0x0123456789abcdefull : (0x0123456789abcdefull ^ 1u);
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "sync check: worker recv #%d: %s", k + 1, err);
+            CHECK(cmd.type == PULSAR_TP_FRAME_SYNC_CHECK && cmd.session_id == sid &&
+                  cmd.value == want_pos && cmd.seq == want_dg,
+                  "sync check: worker parsed type %d session %llu pos %d digest %016llx",
+                  (int)cmd.type, (unsigned long long)cmd.session_id, cmd.value,
+                  (unsigned long long)cmd.seq);
+            pulsar_tp_command_free(&cmd);
+            CHECK(pulsar_tp_send_command_ack(tp, sid, k == 0 ? 0 : 1) == 1,
+                  "sync check: worker ack #%d", k + 1);
+        }
+        const char *key = "0123456789abcdef0123456789abcdef01234567";
+        const pulsar_tp_frame_type want[3] = { PULSAR_TP_FRAME_KVSTORE_SAVE, PULSAR_TP_FRAME_KVSTORE_DROP,
+                                               PULSAR_TP_FRAME_KVSTORE_SAVE };
+        int saves = 0;
+        for (int k = 0; k < 3; k++) {
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "kvstore: worker recv #%d: %s", k + 1, err);
+            CHECK(cmd.type == want[k] && cmd.session_id == sid && cmd.spill_key &&
+                  std::strcmp(cmd.spill_key, key) == 0 && cmd.value == 0,
+                  "kvstore: worker parsed #%d type %d key '%s'", k + 1, (int)cmd.type,
+                  cmd.spill_key ? cmd.spill_key : "(null)");
+            const bool is_save = cmd.type == PULSAR_TP_FRAME_KVSTORE_SAVE;
+            pulsar_tp_command_free(&cmd);
+            if (is_save) {
+                CHECK(pulsar_tp_send_command_ack(tp, sid, saves) == 1, "kvstore: worker ack save #%d", saves + 1);
+                saves++;
+            }
+        }
+        std::memset(&cmd, 0, sizeof(cmd));
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "kvload: worker recv: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_KVSTORE_LOAD && cmd.session_id == sid && cmd.spill_key &&
+              std::strcmp(cmd.spill_key, key) == 0 && cmd.value == 20480 &&
+              cmd.seq == 0xfedcba9876543210ull,
+              "kvload: worker parsed type %d key '%s' n %d digest %016llx", (int)cmd.type,
+              cmd.spill_key ? cmd.spill_key : "(null)", cmd.value, (unsigned long long)cmd.seq);
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 1) == 1, "kvload: worker ack miss");
+        for (int k = 0; k < 2; k++) {
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "reconcile: worker recv #%d: %s", k + 1, err);
+            const bool shape = cmd.type == PULSAR_TP_FRAME_KVSTORE_RECONCILE && cmd.spill_key &&
+                               (k == 0 ? (cmd.value == 2 &&
+                                          std::strcmp(cmd.spill_key,
+                                                      "0123456789abcdef0123456789abcdef01234567"
+                                                      "fedcba9876543210fedcba9876543210fedcba98") == 0)
+                                       : (cmd.value == 0 && cmd.spill_key[0] == '\0'));
+            CHECK(shape, "reconcile: worker parsed #%d type %d n %d", k + 1, (int)cmd.type, cmd.value);
+            pulsar_tp_command_free(&cmd);
+        }
     }
 }
 
@@ -681,6 +786,54 @@ static int run_remote_worker(const char *peer_host, int port) {
     return rc;
 }
 
+/* L250 phase 3: the worker's copy reconcile, on a real directory.  It may
+ * delete ONLY unnamed "tp-kv-<key>.payload" copies and dead writers' temps. */
+static void kv_reconcile_dir_check(void) {
+    char dir[] = "/tmp/tp-kv-reconcile-test.XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "reconcile dir: mkdtemp");
+    const char *keep = "0123456789abcdef0123456789abcdef01234567";
+    const char *orphan = "fedcba9876543210fedcba9876543210fedcba98";
+    char names[8][160];
+    std::snprintf(names[0], sizeof(names[0]), "tp-kv-%s.payload", keep);                   /* kept */
+    std::snprintf(names[1], sizeof(names[1]), "tp-kv-%s.payload", orphan);                 /* removed */
+    std::snprintf(names[2], sizeof(names[2]), "tp-%s", orphan);                            /* spill: untouched */
+    std::snprintf(names[3], sizeof(names[3]), "%s.kv", orphan);                            /* leader file: untouched */
+    std::snprintf(names[4], sizeof(names[4]), "tp-kv-%s.payload.tmp.999999999", orphan);   /* dead writer: removed */
+    std::snprintf(names[5], sizeof(names[5]), "tp-kv-%s.payload.tmp.%ld", orphan, (long)getpid()); /* live: kept */
+    std::snprintf(names[6], sizeof(names[6]), "tp-kv-%s.payload", "NOTHEX");               /* malformed: untouched */
+    std::snprintf(names[7], sizeof(names[7]), "tp-kv-%s.payload", "0123456789ABCDEF0123456789abcdef01234567"); /* uppercase: untouched */
+    for (int i = 0; i < 8; i++) {
+        char path[2048];
+        std::snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        FILE *fp = std::fopen(path, "wb");
+        CHECK(fp != NULL, "reconcile dir: create %s", names[i]);
+        if (fp) std::fclose(fp);
+    }
+    int kept = -1, removed = -1;
+    char err[256];
+    err[0] = 0;
+    CHECK(pulsar_tp_kv_reconcile_dir(dir, keep, 1, &kept, &removed, err, sizeof(err)),
+          "reconcile dir: run: %s", err);
+    CHECK(kept == 1 && removed == 2, "reconcile dir: kept %d removed %d, want 1 and 2", kept, removed);
+    const bool want[8] = { true, false, true, true, false, true, true, true };
+    for (int i = 0; i < 8; i++) {
+        char path[2048];
+        std::snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        const bool exists = access(path, F_OK) == 0;
+        CHECK(exists == want[i], "reconcile dir: %s %s", names[i], exists ? "survived, should be gone" : "removed, should survive");
+        unlink(path);
+    }
+    /* an empty index removes every copy; a missing directory is an error */
+    char k0[41];
+    CHECK(pulsar_tp_kv_blob_name(names[0], k0) && std::strcmp(k0, keep) == 0, "reconcile dir: blob name parse");
+    CHECK(!pulsar_tp_kv_blob_name(names[7], NULL), "reconcile dir: uppercase key must not parse");
+    rmdir(dir);
+    CHECK(!pulsar_tp_kv_reconcile_dir(dir, NULL, 0, &kept, &removed, err, sizeof(err)),
+          "reconcile dir: a missing directory must fail");
+    std::printf("tp_transport_test: kv reconcile dir ok\n");
+    std::fflush(stdout);   /* before the fork, or the worker prints it again */
+}
+
 int main(int argc, char **argv) {
     /* Remote mode: `tp_transport_test remote-leader [bind-host] PORT` on one
      * box and `tp_transport_test remote-worker PEER-HOST PORT` on the other
@@ -708,6 +861,14 @@ int main(int argc, char **argv) {
         const int rc = run_worker(port);
         std::fflush(stdout);
         _exit(rc != 0);
+    }
+
+    /* L250 phase 3: the reconcile's directory walk, before any rank runs (the
+     * forked worker inherits a zero failure count only if this passed). */
+    kv_reconcile_dir_check();
+    if (g_failures) {
+        std::fprintf(stderr, "tp_transport_test: FAILED (kv reconcile dir, %d failure(s))\n", g_failures);
+        return 1;
     }
 
     /* Leader side: pick a free loopback port, hand it to the forked worker. */

@@ -1796,6 +1796,7 @@ struct pulsar_engine {
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
+    uint64_t tp_build_digest;   ///< L250: FNV-1a of the build id, stamped into disk-KV copies
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
     void *tp_bulk_base;         ///< the bulk lane's buffer (host-pinned, v14), or NULL
@@ -2203,6 +2204,37 @@ typedef struct pulsar_bank_carry {
  * between them. */
 bool pulsar_session_is_mirrored(const pulsar_session *s);
 
+/** L250: identity of the session's cached state as a mirrored sync starts from
+ *  it -- FNV-1a over the checkpoint length and tokens.  The leader ships it on
+ *  SYNC_CHECK; a worker compares its own.  O(checkpoint) per sync. */
+uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s);
+
+/** L250: a worker's own copy of a disk KV cache entry, at
+ *  "<tp_spill_dir>/tp-kv-<key>.payload": this header, then the rank's own
+ *  pulsar_session::save_payload bytes.  Everything a copy must match before a
+ *  rank may load it is here: the rank and group size (a rank-0 or single-box
+ *  file never loads as rank 1), the transport protocol and the build (state
+ *  from a different build is never resumed), and the state it restores. */
+#define PULSAR_TP_KV_BLOB_MAGIC   UINT32_C(0x564B5450)   /* "PTKV" little-endian */
+#define PULSAR_TP_KV_BLOB_VERSION 1u
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t rank;
+    uint32_t n_ranks;
+    uint32_t protocol;
+    uint32_t n_tokens;        ///< checkpoint length the payload restores
+    uint64_t build_digest;    ///< pulsar_engine::tp_build_digest of the writer
+    uint64_t state_digest;    ///< pulsar_session_checkpoint_digest at save
+    uint64_t payload_bytes;   ///< bytes of save_payload output after this header
+} pulsar_tp_kv_blob_header;
+
+/** L250: a disk KV store key is exactly 40 lowercase hex characters (the
+ *  store's sha of the entry text); anything else is refused before it can
+ *  name a path. */
+bool pulsar_tp_kv_key_ok(const char *key);
+uint64_t pulsar_build_digest(const char *build_id);
+
 /** Slice 4e (L238 increment 4): the speculative round family's LOCAL
  * implementations (session_spec.cpp).  The public pulsar_session_spec_*
  * entry points (engine_api.cpp) mirror onto the pair and call these; the
@@ -2242,6 +2274,11 @@ struct pulsar_session {
      * mirrored frame carries it; see tp_session_seq above for why it is the
      * create ordinal and why a mismatch is refused. */
     uint64_t tp_session_id;
+    /** L250: true on the LEADER while a mirrored sync runs.  The workers are then
+     *  inside the same prefill, reading only chunk verdicts on the control
+     *  channel, so any other frame (a disk-KV store/drop from a mid-prefill
+     *  "continued" checkpoint) would desync them -- those ops refuse instead. */
+    bool tp_in_sync;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats

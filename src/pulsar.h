@@ -989,6 +989,36 @@ int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file 
 int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void pulsar_session_payload_file_free(pulsar_session_payload_file *payload);
+/** L250: pulsar_session_stage_payload for the disk KV cache on a TP group.  KV
+ * is replicated per rank, so every worker also writes its OWN copy of this
+ * state under its spill directory, named by `key` (the store's 40-hex sha);
+ * the leader stages in parallel.  Returns 0 only when every rank succeeded --
+ * otherwise nothing is left staged here and no worker keeps a copy, so the
+ * store is skipped (the pair is NOT failed: a full disk on one rank is a miss,
+ * not a divergence).  Without a TP group it is exactly
+ * pulsar_session_stage_payload and `key` is unused. */
+int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payload_file *out,
+                                          const char *stage_dir, const char *key,
+                                          char *err, size_t errlen);
+/** L250: the leader's entry `key` is gone (its own write failed after the
+ * workers stored, or eviction): drop every worker's copy.  Fire-and-forget; a
+ * no-op without a TP group. */
+void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key);
+/** L250 phase 2: pulsar_session_load_payload for the disk KV cache on a TP
+ * group.  This rank loads first; then every worker loads ITS copy of entry
+ * `key` and must reach the same state (checkpoint length + digest).  Returns 0
+ * only when every rank did.  On any failure the ranks may hold different
+ * state, so the caller MUST pulsar_session_invalidate (mirrored: every rank
+ * ends empty and identical), remove its entry and pulsar_session_kv_mirror_drop
+ * it -- exactly what it already does for a payload that will not load.
+ * Without a TP group it is exactly pulsar_session_load_payload. */
+int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t payload_bytes,
+                                         const char *key, char *err, size_t errlen);
+/** L250 phase 3: at bring-up, hand the workers the key of every entry this
+ * leader's disk KV cache holds (`keys`: n_keys x 40 hex, back to back); each
+ * worker deletes the copies no key names.  Fire-and-forget.  0 when sent, 1
+ * when it could not be; a no-op (0) off a TP group or on a worker. */
+int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_keys);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);

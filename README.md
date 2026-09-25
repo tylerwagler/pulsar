@@ -874,7 +874,7 @@ cache handles the active session; disk cache is the resume mechanism for
 different sessions.
 
 The disk KV cache is **on by default**. When `--kv-disk-dir` is not given, the
-server resolves `$XDG_CACHE_HOME/ds4/kv-<model>` (else `~/.cache/ds4/kv-<model>`),
+server resolves `$XDG_CACHE_HOME/pulsar/kv-<model>` (else `~/.cache/pulsar/kv-<model>`),
 where `<model>` is the symlink-resolved gguf basename — so two different model
 artifacts never share a default directory, while restarts of the same model
 find their checkpoints again. The resolved directory and disk budget are logged

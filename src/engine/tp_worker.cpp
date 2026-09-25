@@ -1,5 +1,7 @@
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
+#include <errno.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* ---------------------------------------------------------------------------
@@ -112,6 +114,117 @@ static int worker_spill_path(pulsar_engine *e, const char *key, char *out, size_
     for (const char *p = key; *p; p++) if (*p == '/' || *p == '\\') return 0;   /* a key, not a path */
     const int w = snprintf(out, outlen, "%s/tp-%s", e->tp_spill_dir, key);
     return w > 0 && (size_t)w < outlen;
+}
+
+/* L250: the worker's own copy of a disk KV cache entry the leader stored:
+ * <spill_dir>/tp-kv-<key>.payload.  Only a real store key (40 hex) names one. */
+static int worker_kv_blob_path(pulsar_engine *e, const char *key, char *out, size_t outlen) {
+    if (!e->tp_spill_dir || !pulsar_tp_kv_key_ok(key)) return 0;
+    const int w = snprintf(out, outlen, "%s/tp-kv-%s.payload", e->tp_spill_dir, key);
+    return w > 0 && (size_t)w < outlen;
+}
+
+/* mkdir -p.  The spill directory is the leader's disk-KV directory by default,
+ * which a worker never opens a cache in -- so nothing created it, and the
+ * first mirrored spill or store would fail at fopen. */
+static bool worker_mkdir_p(const char *path) {
+    if (!path || !path[0]) return false;
+    char buf[4096];
+    const size_t n = strlen(path);
+    if (n >= sizeof(buf)) return false;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i <= n; i++) {
+        if (buf[i] == '/' || buf[i] == '\0') {
+            const char saved = buf[i];
+            buf[i] = '\0';
+            if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+            buf[i] = saved;
+        }
+    }
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Write this rank's own copy: header, then save_payload, tmp + fsync + rename
+ * (the spill path's recipe), so a crash never leaves a torn copy under the key. */
+static bool worker_kv_blob_save(pulsar_engine *e, pulsar_session *s, const char *path,
+                                char *err, size_t errlen) {
+    char tmp[4700];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        snprintf(err, errlen, "cannot create %.400s: %s", tmp, strerror(errno));
+        return false;
+    }
+    pulsar_tp_kv_blob_header h;
+    memset(&h, 0, sizeof(h));
+    h.magic = PULSAR_TP_KV_BLOB_MAGIC;
+    h.version = PULSAR_TP_KV_BLOB_VERSION;
+    h.rank = (uint32_t)pulsar_tp_rank(e->tp);
+    h.n_ranks = pulsar_tp_n_ranks(e->tp);
+    h.protocol = PULSAR_TP_PROTOCOL_VERSION;
+    h.n_tokens = (uint32_t)(s->checkpoint.len > 0 ? s->checkpoint.len : 0);
+    h.build_digest = e->tp_build_digest;
+    h.state_digest = pulsar_session_checkpoint_digest(s);
+    err[0] = '\0';
+    bool ok = fwrite(&h, 1, sizeof(h), fp) == sizeof(h) && s->save_payload(fp, err, errlen) == 0;
+    const off_t end = ok ? ftello(fp) : (off_t)-1;
+    if (ok && end < (off_t)sizeof(h)) ok = false;
+    if (ok) {
+        h.payload_bytes = (uint64_t)end - sizeof(h);
+        ok = fseeko(fp, 0, SEEK_SET) == 0 && fwrite(&h, 1, sizeof(h), fp) == sizeof(h) &&
+             fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    }
+    const int saved_errno = errno;
+    if (fclose(fp) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) {
+        remove(tmp);
+        if (!err[0]) snprintf(err, errlen, "writing %.400s failed: %s", path, strerror(saved_errno ? saved_errno : errno));
+    }
+    return ok;
+}
+
+/* L250 phase 2: load this rank's own copy, but only the RIGHT one.  Every field
+ * a stale or foreign copy could get wrong is checked before a byte of payload
+ * is read, and the restored state is checked against the leader's afterwards.
+ * A partial load leaves this session in a state the leader then invalidates. */
+static bool worker_kv_blob_load(pulsar_engine *e, pulsar_session *s, const char *path,
+                                int want_tokens, uint64_t want_digest,
+                                char *err, size_t errlen) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, errlen, "no copy at %.400s: %s", path, strerror(errno));
+        return false;
+    }
+    pulsar_tp_kv_blob_header h;
+    bool ok = fread(&h, 1, sizeof(h), fp) == sizeof(h);
+    if (!ok) snprintf(err, errlen, "truncated copy header");
+    else if (h.magic != PULSAR_TP_KV_BLOB_MAGIC || h.version != PULSAR_TP_KV_BLOB_VERSION)
+        { ok = false; snprintf(err, errlen, "not a copy (magic %08x, version %u)", h.magic, h.version); }
+    else if (h.rank != (uint32_t)pulsar_tp_rank(e->tp) || h.n_ranks != pulsar_tp_n_ranks(e->tp))
+        { ok = false; snprintf(err, errlen, "copy is for rank %u/%u, this is rank %d/%u", h.rank, h.n_ranks,
+                               pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp)); }
+    else if (h.protocol != PULSAR_TP_PROTOCOL_VERSION || h.build_digest != e->tp_build_digest)
+        { ok = false; snprintf(err, errlen, "copy was written by another build (protocol %u, build %016llx)",
+                               h.protocol, (unsigned long long)h.build_digest); }
+    else if ((int)h.n_tokens != want_tokens || h.state_digest != want_digest)
+        { ok = false; snprintf(err, errlen, "copy holds %u tokens digest %016llx, the leader restored %d digest %016llx",
+                               h.n_tokens, (unsigned long long)h.state_digest, want_tokens,
+                               (unsigned long long)want_digest); }
+    if (ok) {
+        err[0] = '\0';
+        ok = s->load_payload(fp, h.payload_bytes, err, errlen) == 0;
+        if (!ok && !err[0]) snprintf(err, errlen, "payload load failed");
+    }
+    fclose(fp);
+    if (ok && (s->checkpoint.len != want_tokens || pulsar_session_checkpoint_digest(s) != want_digest)) {
+        ok = false;
+        snprintf(err, errlen, "restored %d tokens digest %016llx, the leader restored %d digest %016llx",
+                 s->checkpoint.len, (unsigned long long)pulsar_session_checkpoint_digest(s),
+                 want_tokens, (unsigned long long)want_digest);
+    }
+    return ok;
 }
 
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
@@ -257,6 +370,98 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             worker_abort_step(e, "sync", ferr);
         }
         return worker_ack(e, c->session_id, rc, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_SYNC_CHECK: {
+        /* L250: the leader's cached position + prefix digest, sent before it
+         * computes anything; this rank answers whether its own state matches.
+         * Nothing is running yet, so a mismatch is a plain refusal (the leader
+         * then invalidates every rank) -- no step to abort, the pair stays up. */
+        int status = 1;
+        if (!worker_refused(e, c, "sync check", &slot, ferr, sizeof(ferr))) {
+            const int pos = slot->s->checkpoint.len;
+            const uint64_t digest = pulsar_session_checkpoint_digest(slot->s);
+            if (pos == c->value && digest == c->seq) {
+                status = 0;
+            } else {
+                fprintf(stderr, "pulsar: tp worker: sync check: this rank's cached state differs "
+                                "from the leader's -- leader pos %d digest %016llx, this rank pos %d "
+                                "digest %016llx; refusing the sync (L250)\n",
+                        c->value, (unsigned long long)c->seq, pos, (unsigned long long)digest);
+            }
+        } else {
+            fprintf(stderr, "pulsar: tp worker: sync check refused: %s\n", ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_KVSTORE_SAVE: {
+        /* L250 phase 1: store this rank's own copy of the state the leader is
+         * staging.  A VERDICT, but a failed store is a MISS (full disk, no
+         * spill dir), never a divergence: the leader skips the entry on every
+         * rank and the pair stays up. */
+        int status = 1;
+        char path[4600];
+        if (worker_refused(e, c, "kv cache store", &slot, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache store refused: %s\n", ferr);
+        } else if (!worker_kv_blob_path(e, c->spill_key, path, sizeof(path))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache store refused: no spill directory on this rank "
+                            "(pulsar_engine_options.tp_spill_dir) or key '%s' is not a store key\n",
+                    c->spill_key ? c->spill_key : "");
+        } else if (!worker_kv_blob_save(e, slot->s, path, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache store failed: %s\n", ferr);
+        } else {
+            status = 0;
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_KVSTORE_LOAD: {
+        /* L250 phase 2: the leader loaded entry <key> and states the result;
+         * load this rank's copy and reach the same state, or answer 1 (a miss:
+         * the leader then invalidates every rank and drops the entry). */
+        int status = 1;
+        char path[4600];
+        if (worker_refused(e, c, "kv cache load", &slot, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache load refused: %s\n", ferr);
+        } else if (!worker_kv_blob_path(e, c->spill_key, path, sizeof(path))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache load refused: no spill directory on this rank "
+                            "or key '%s' is not a store key\n", c->spill_key ? c->spill_key : "");
+        } else if (!worker_kv_blob_load(e, slot->s, path, c->value, c->seq, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache load miss (%s): %s\n", c->spill_key, ferr);
+        } else {
+            status = 0;
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+
+    case PULSAR_TP_FRAME_KVSTORE_RECONCILE: {
+        /* L250 phase 3, void: the leader's disk KV index as of bring-up.
+         * Copies it does not name can never be loaded (the leader decides
+         * every load), so they only take disk -- reclaim them. */
+        if (!e->tp_spill_dir) return 1;
+        int kept = 0, removed = 0;
+        if (!pulsar_tp_kv_reconcile_dir(e->tp_spill_dir, c->spill_key ? c->spill_key : "",
+                                        (uint32_t)(c->value > 0 ? c->value : 0), &kept, &removed,
+                                        ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv cache reconcile: %s\n", ferr);
+        } else {
+            fprintf(stderr, "pulsar: tp worker: kv cache reconcile: %d cop%s kept, %d orphan%s removed "
+                            "(leader holds %d entr%s)\n",
+                    kept, kept == 1 ? "y" : "ies", removed, removed == 1 ? "" : "s",
+                    c->value, c->value == 1 ? "y" : "ies");
+        }
+        return 1;
+    }
+
+    case PULSAR_TP_FRAME_KVSTORE_DROP: {
+        /* void: the leader's entry is gone, so this rank's copy goes too. */
+        char path[4600];
+        if (worker_kv_blob_path(e, c->spill_key, path, sizeof(path)) && unlink(path) != 0 &&
+            errno != ENOENT) {
+            fprintf(stderr, "pulsar: tp worker: kv cache drop: cannot remove %s: %s\n", path, strerror(errno));
+        }
+        return 1;
     }
 
     case PULSAR_TP_FRAME_EVAL: {
@@ -614,6 +819,11 @@ int pulsar_tp_worker_run(pulsar_engine *e, char *err, size_t errlen) {
     }
     fprintf(stderr, "pulsar: TP worker rank %d/%u: driving sessions from the leader's frames\n",
             pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
+    if (e->tp_spill_dir && !worker_mkdir_p(e->tp_spill_dir)) {
+        fprintf(stderr, "pulsar: TP worker: cannot create the spill directory %s (%s); mirrored "
+                        "spills and disk KV stores will be refused on this rank\n",
+                e->tp_spill_dir, strerror(errno));
+    }
     int rc = 0;
     for (;;) {
         pulsar_tp_command c;

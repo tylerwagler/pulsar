@@ -487,8 +487,13 @@ public:
         closedir(d);
     }
 
+    /* `session` (L250): the TP group whose workers hold copies of these
+     * entries; each evicted entry's copies are dropped with it.  NULL off a
+     * store (open-time cleanup, the public evict), where there is no pair
+     * session to name -- a copy left there is an orphan no load can reach. */
     void evict(const pulsar_tokens *live, uint64_t extra_bytes,
-               const pulsar_kvstore_eviction_context *incoming) {
+               const pulsar_kvstore_eviction_context *incoming,
+               pulsar_session *session = NULL) {
         /* `live` is part of the public evict signature but has never been used
          * by the scorer (it did `(void)live` itself); the split below just moves
          * where that is visible. */
@@ -532,6 +537,7 @@ public:
             }
             pulsar_kvstore_entry e = kc_.entry[victim];
             if (unlink(e.path) == 0) {
+                if (session) pulsar_session_kv_mirror_drop(session, e.sha);   /* L250 */
                 logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
                      log_name(),
@@ -719,7 +725,8 @@ public:
 
     bool existing_compatible(const char *path, const char sha[41],
                              const char *text, size_t text_len,
-                             int model_id, int quant_bits, int ctx_size) {
+                             int model_id, int quant_bits, int ctx_size,
+                             pulsar_session *session = NULL) {
         if (access(path, F_OK) != 0) return false;
         pulsar_kvstore_entry e = {};
         if (!pulsar_kvstore_read_entry_file(path, sha, &e)) return false;
@@ -731,6 +738,7 @@ public:
         pulsar_kvstore_entry_free(&e);
         if (!compatible) {
             if (unlink(path) == 0) {
+                if (session) pulsar_session_kv_mirror_drop(session, sha);   /* L250 */
                 logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache replaced incompatible file %s",
                      log_name(), path);
@@ -853,7 +861,7 @@ public:
 
         if (existing_compatible(path, sha, text, text_len,
                                 model_id,
-                                quant_bits, pulsar_session_ctx(session))) {
+                                quant_bits, pulsar_session_ctx(session), session)) {
             rewrite_trailer(path, text, hooks);
             free(text);
             free(path);
@@ -863,8 +871,10 @@ public:
 
         pulsar_session_payload_file staged = {};
         /* Stage in the store's own dir (real disk), not /tmp (L110 F5). */
-        if (pulsar_session_stage_payload(session, &staged, kc_.dir,
-                                      save_err, sizeof(save_err)) != 0) {
+        /* L250: on a TP group every rank writes its own copy under this key;
+         * 0 only when all did.  Off a group it is plain staging. */
+        if (pulsar_session_stage_payload_mirrored(session, &staged, kc_.dir, sha,
+                                               save_err, sizeof(save_err)) != 0) {
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
                  log_name(),
@@ -893,6 +903,7 @@ public:
                  (double)est_required_bytes / (1024.0 * 1024.0),
                  (double)kc_.budget_bytes / (1024.0 * 1024.0));
             pulsar_session_payload_file_free(&staged);
+            pulsar_session_kv_mirror_drop(session, sha);   /* L250: no entry, so no copies */
             free(text);
             free(path);
             pulsar_tokens_free(&store_tokens);
@@ -906,7 +917,7 @@ public:
         incoming.quant_bits = (uint8_t)quant_bits;
         incoming.ctx_size = (uint32_t)pulsar_session_ctx(session);
         incoming.reject_different_quant = kc_.reject_different_quant;
-        evict(live_tokens, est_file_bytes, &incoming);
+        evict(live_tokens, est_file_bytes, &incoming, session);
 
         KvBuf tmpb;
         tmpb.printf("%s.tmp.%ld", path, (long)getpid());
@@ -919,6 +930,7 @@ public:
                  log_name(), tmp, strerror(errno),
                  (kv_now_sec() - save_t0) * 1000.0);
             pulsar_session_payload_file_free(&staged);
+            pulsar_session_kv_mirror_drop(session, sha);   /* L250 */
             free(tmp);
             free(text);
             free(path);
@@ -1010,6 +1022,7 @@ public:
                          (save_err[0] ? save_err : "unknown error"));
             }
             unlink(tmp);
+            pulsar_session_kv_mirror_drop(session, sha);   /* L250: the entry never landed */
         } else {
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
@@ -1092,7 +1105,11 @@ public:
         char err[160] = {};
         int loaded = 0;
         if (header_ok &&
-            pulsar_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+            /* L250: on a TP group every worker loads its own copy and must reach
+             * this rank's state; any miss lands in the failure branch below,
+             * whose mirrored invalidate + remove + drop leaves the ranks equal. */
+            pulsar_session_load_payload_mirrored(session, fp, hdr.payload_bytes, e.sha,
+                                                 err, sizeof(err)) == 0)
         {
             const pulsar_tokens *loaded_tokens = pulsar_session_tokens(session);
             const bool whole = loaded_tokens && loaded_tokens->len == (int)hdr.tokens;
@@ -1128,6 +1145,7 @@ public:
             } else {
                 pulsar_session_invalidate(session);
                 unlink(path);
+                pulsar_session_kv_mirror_drop(session, e.sha);   /* L250 */
                 logf(PULSAR_KVSTORE_LOG_KVCACHE,
                      "%s: kv cache discarded %s text-prefix payload%s%s %s",
                      log_name(),
@@ -1148,6 +1166,7 @@ public:
             if (header_ok) {
                 pulsar_session_invalidate(session);
                 unlink(path);
+                pulsar_session_kv_mirror_drop(session, e.sha);   /* L250 */
             }
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache load failed%s%s %s: %s%s load=%.1f ms",
@@ -1529,6 +1548,23 @@ void pulsar_kvstore_evict(pulsar_kvstore *kc, const pulsar_tokens *live,
                        uint64_t extra_bytes,
                        const pulsar_kvstore_eviction_context *incoming) {
     KvStore(*kc).evict(live, extra_bytes, incoming);
+}
+
+int pulsar_kvstore_keys(pulsar_kvstore *kc, char **keys) {
+    if (keys) *keys = NULL;
+    if (!kc || !kc->enabled || !keys) return -1;
+    KvStore(*kc).refresh();
+    if (kc->len <= 0) return 0;
+    char *buf = static_cast<char *>(malloc((size_t)kc->len * 40u + 1u));
+    if (!buf) return -1;
+    int n = 0;
+    for (int i = 0; i < kc->len; i++) {
+        memcpy(buf + (size_t)n * 40u, kc->entry[i].sha, 40u);
+        n++;
+    }
+    buf[(size_t)n * 40u] = '\0';
+    *keys = buf;
+    return n;
 }
 
 int pulsar_kvstore_find_text_prefix(pulsar_kvstore *kc, const char *prompt_text,

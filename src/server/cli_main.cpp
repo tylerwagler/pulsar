@@ -346,7 +346,7 @@ static const char *resolve_default_model(void) {
 /* Default directory for the disk KV cache, which is ON by default: the
  * conversation-bounce restore (sub-second vs full re-prefill TTFT) must not
  * depend on remembering --kv-disk-dir.  Placement follows XDG:
- * $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>.  The user
+ * $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>.  The user
  * cache dir is chosen over <dirname(model)>/ because the model store may be
  * read-only or a network mount, while checkpoints are latency-sensitive,
  * regenerable, per-user state.
@@ -384,11 +384,11 @@ static char *server_default_kv_disk_dir(const char *model_path) {
      * value would key the cache off whatever the process cwd happens to be). */
     const char *xdg = getenv("XDG_CACHE_HOME");
     if (xdg && xdg[0] == '/') {
-        buf_printf(&b, "%s/ds4/kv-%s", xdg, key);
+        buf_printf(&b, "%s/pulsar/kv-%s", xdg, key);
     } else {
         const char *home = getenv("HOME");
         if (!home || !home[0]) return NULL;
-        buf_printf(&b, "%s/.cache/ds4/kv-%s", home, key);
+        buf_printf(&b, "%s/.cache/pulsar/kv-%s", home, key);
     }
     return buf_take(&b);
 }
@@ -1047,6 +1047,12 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
+    /* L250: on a tensor-parallel group the disk KV cache is MIRRORED -- every
+     * store, load and removal runs on every rank against its own copy
+     * (pulsar_session_stage_payload_mirrored / load_payload_mirrored /
+     * kv_mirror_drop), and SYNC_CHECK refuses a sync whose ranks disagree
+     * instead of deadlocking.  kv_disk_dir is also the engine's tp_spill_dir
+     * (above), where each worker keeps its copies. */
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                        false /* accept cross-quant restores */, cfg.kv_cache))
@@ -1058,6 +1064,25 @@ int main(int argc, char **argv) {
                    "pulsar-server: disk KV cache disabled (directory %s unusable); "
                    "serving without disk restore",
                    cfg.kv_disk_dir);
+    }
+    /* L250 phase 3: the workers keep a copy of every entry.  A lost DROP, a
+     * crash between a worker's store and this rank's commit, or copies from
+     * another build leave copies no entry names -- never loaded (this rank
+     * decides every load), but taking disk.  Hand the workers this index once,
+     * now, before any session exists to race with. */
+    if (s.kv.enabled && pulsar_engine_is_tp(engine)) {
+        char *keys = NULL;
+        const int n = pulsar_kvstore_keys(&s.kv, &keys);
+        if (n >= 0 && pulsar_engine_kv_mirror_reconcile(engine, keys, n) == 0) {
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: disk KV mirror: the workers reconcile their copies "
+                       "against %d entr%s", n, n == 1 ? "y" : "ies");
+        } else {
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: disk KV mirror: could not hand the workers the index; "
+                       "orphan copies stay until the next start");
+        }
+        free(keys);
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);

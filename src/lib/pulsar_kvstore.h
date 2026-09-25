@@ -223,6 +223,10 @@ double pulsar_kvstore_entry_eviction_score(const pulsar_kvstore_entry *e,
 void pulsar_kvstore_evict(pulsar_kvstore *kc, const pulsar_tokens *live,
                        uint64_t extra_bytes,
                        const pulsar_kvstore_eviction_context *incoming);
+/** L250 phase 3: the key (40-hex sha) of every entry in the store, after a
+ *  fresh scan, as n x 40 chars back to back in a malloc'd buffer (*keys;
+ *  NULL when empty).  Returns n, or -1 when the store is closed. */
+int pulsar_kvstore_keys(pulsar_kvstore *kc, char **keys);
 int pulsar_kvstore_find_text_prefix(pulsar_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
 
