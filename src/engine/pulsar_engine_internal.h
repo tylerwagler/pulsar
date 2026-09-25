@@ -1565,7 +1565,7 @@ typedef struct {
      * through every prefill entry point. */
     struct pulsar_tp *tp;
     /** Monotonic prefill big-gate exchange counter (slice 4b), incremented by
-     * tp_allreduce_rows on its big-gate path: once per layer per prefill chunk
+     * gpu_graph_tp_allreduce_rows on its big-gate path: once per layer per prefill chunk
      * for the attention output and once for the FFN (4g-2).  Every rank advances it in the same
      * order from the same starting value, so the exchange seq stays in
      * lockstep (the transport uses it as a desync guard). */
@@ -1580,6 +1580,10 @@ typedef struct {
      * whole row-lane messages so the last chunk's stage reads inside it.
      * Allocated at graph init on a row-lane pair; NULL otherwise. */
     pulsar_gpu_tensor *tp_vocab_own;
+    /** The attention-input gather's packed own payload (4g-3): every row-split
+     * projection's block for one decode/verify step, PULSAR_TP_BATCH_MAX_ROWS
+     * row-lane messages.  Allocated beside tp_vocab_own. */
+    pulsar_gpu_tensor *tp_ain_own;
     /** The row lane's stage+publish ticket (one zeroed device u32): the
      * stage kernel's blocks count themselves in on it and the last one
      * publishes the descriptor and re-zeroes it.  Per graph, so two graphs
@@ -3485,6 +3489,13 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
  * the whole tensor when the range is [0, out_full), otherwise the row slice the
  * engine registered at open (pulsar_gpu_register_fp8_lt_row_slice), which the
  * backend resolves by its own offset.  Writes row_hi - row_lo columns per row. */
+/* The pair's all-reduce of `n_tokens` n_embd-wide f32 rows of `t` (gpu_prefill.cpp):
+ * the row lane at decode/verify width, the bulk lane above it, the host big gate
+ * on transports without either.  `addend` (optional) is folded in first and
+ * zeroed.  A no-op returning true when the graph has no pair. */
+bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+                                 pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
+                                 const char *what);
 bool gpu_graph_matmul_mxfp8_rows_named_tensor(
         const char             *module,
         uint32_t                il,

@@ -708,6 +708,13 @@ __global__ void moe_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t
                                                 const int32_t *selected, uint32_t pair_count,
                                                 uint32_t n_total, uint32_t oob_code);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+/** Checks a CUDA status; on failure reports @p what and returns 0.  Called
+ *  after nearly every launch, so its caller graph is past DOT_GRAPH_MAX_NODES
+ *  and is not drawn.
+ *  @param err  the CUDA status
+ *  @param what the operation, for the error message
+ *  @return 1 when @p err is cudaSuccess, else 0
+ *  \hidecallergraph */
 int cuda_ok(cudaError_t err, const char *what);
 
 /* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */

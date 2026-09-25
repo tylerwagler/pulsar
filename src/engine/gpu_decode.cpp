@@ -473,6 +473,22 @@ bool gpu_graph_dspark_draft_forward_banks(
     const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
     const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = PULSAR_N_LORA_O;
+    /* 4g-1b: the drafter's attention runs on the OWNED output groups, exactly
+     * like a target layer's (gpu_graph_encode_layer_attention_batch): q_b rows,
+     * per-head norm/rope, attention and the inverse rope over the owned heads,
+     * stage 'a' over the owned groups, stage 'b' row-parallel on its K-half with
+     * the partials summed across the pair.  One box owns every group, and every
+     * call below reduces to the whole-tensor call it replaced. */
+    const uint32_t g_lo = g->tp_group_lo, g_hi = g->tp_group_hi;
+    if (g_hi <= g_lo || g_hi > n_groups) {
+        fprintf(stderr, "pulsar: drafter: this graph owns output groups [%u,%u) of %u -- refusing\n",
+                g_lo, g_hi, n_groups);
+        return false;
+    }
+    const uint32_t own_groups = g_hi - g_lo;
+    const uint32_t own_heads = own_groups * group_heads;
+    const uint32_t h_lo = g_lo * group_heads;
+    const uint64_t q_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
 
     for (uint32_t li = 0; li < 3 && ok; li++) {
         const pulsar_layer_weights *layer = &w->layer[li];
@@ -576,11 +592,11 @@ bool gpu_graph_dspark_draft_forward_banks(
             layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_draft, q_rank);
         if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
-            g->batch_q, tensor_map_base(dspark_model, layer->attn_q_b), tensor_map_size(dspark_model, layer->attn_q_b),
-            layer->attn_q_b->abs_offset,
-            q_rank, PULSAR_N_HEAD * PULSAR_N_HEAD_DIM,
-            g->batch_qr_norm, n_draft) != 0;
+        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("dsp_attn_q_b", li, pos0, g->batch_q, dspark_model,
+                                                              layer->attn_q_b, q_rank, q_full,
+                                                              (uint64_t)h_lo * PULSAR_N_HEAD_DIM,
+                                                              (uint64_t)(h_lo + own_heads) * PULSAR_N_HEAD_DIM,
+                                                              g->batch_qr_norm, n_draft);
         /* Q norm + tail RoPE: the PROFILE picks the kernel, exactly as the
          * target's prefill does (gpu_prefill.cpp's `PULSAR_Q_HEAD_NORM ?`).
          * 0731 normalises Q per head here; V4.1 has no per-head pass (its
@@ -592,14 +608,14 @@ bool gpu_graph_dspark_draft_forward_banks(
             ok = (PULSAR_Q_HEAD_NORM
                 ? pulsar_gpu_head_rms_norm_rope_tail_tensor(
                     g->batch_q, n_draft,
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
                     pos0, 0, false,
                     (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                     PULSAR_RMS_EPS, q_pos)
                 : pulsar_gpu_rope_tail_tensor(
                     g->batch_q, n_draft,
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
                     pos0, 0, false,
                     (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
@@ -670,12 +686,12 @@ bool gpu_graph_dspark_draft_forward_banks(
                 ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                     g->batch_heads,
                     tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
-                    layer->attn_sinks->abs_offset,
+                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
                     g->batch_q, g->banks.dspark_raw[li],
                     n_draft, 0u,
                     0u, raw_cap, 0u,
                     raw_cap,
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
+                    own_heads, PULSAR_N_HEAD_DIM,
                     1,
                     meta_vis[li], meta_seq, 0, g->banks.n_banks,
                     NULL /* q pre-normed */) != 0;
@@ -683,19 +699,19 @@ bool gpu_graph_dspark_draft_forward_banks(
                 ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                     g->batch_heads,
                     tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
-                    layer->attn_sinks->abs_offset,
+                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
                     g->batch_q, g->dspark_raw_cache[li],
                     n_draft, saved_n_raw,
                     cap_raw, raw_cap, raw_start,
                     0,
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
+                    own_heads, PULSAR_N_HEAD_DIM,
                     1,
                     NULL, NULL, 0, 1,
                     NULL /* q pre-normed */) != 0;
         }
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
-                                             (uint64_t)n_draft * PULSAR_N_HEAD * PULSAR_N_HEAD_DIM, li, pos0);
+                                             (uint64_t)n_draft * own_heads * PULSAR_N_HEAD_DIM, li, pos0);
         /* Inverse-rotate the attention output's rope dims before the o
          * projection (reference: apply_rotary_emb(o, freqs_cis, inverse=True);
          * the verify/prefill path does the same via its "kqv_back" rope).
@@ -707,7 +723,7 @@ bool gpu_graph_dspark_draft_forward_banks(
          * downstream of this line computed on corrupted features. */
         if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_heads, n_draft,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+            own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, true,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
@@ -716,22 +732,36 @@ bool gpu_graph_dspark_draft_forward_banks(
          * attention stage emits the grouped encoding here, after the inverse
          * rope, and the attn-out 'a' projection reads it -- the consumer's
          * quantise-from-heads fallback is gone. */
-        if (ok) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_draft, n_groups, group_dim) != 0;
+        if (ok) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_draft, own_groups, group_dim) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
-        /* The drafter blocks are not head-split yet (4g-1b): whole tensors,
-         * every group, no gather between the two stages. */
+        /* Stage 'a' over the owned groups (the registered row slice on a TP
+         * rank), then 'b': whole on one box; on the pair row-parallel -- this
+         * rank's `low` is its owned groups' columns of 'b''s input, so it
+         * multiplies the matching registered K-half into a partial and the pair
+         * sums the partials (4g-1b, the target layers' 4g-2 shape). */
         if (ok) ok = pulsar_gpu_attention_output_a_tensor(
             g->batch_attn_low,
             tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
-            layer->attn_output_a->abs_offset,
-            group_dim, rank, n_groups,
+            layer->attn_output_a->abs_offset + (uint64_t)g_lo * rank * group_dim,
+            group_dim, rank, own_groups,
             g->batch_heads, n_draft) != 0;
-        if (ok) ok = pulsar_gpu_attention_output_b_tensor(
-            g->batch_attn_out,
-            tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
-            layer->attn_output_b->abs_offset,
-            (uint64_t)n_groups * rank, PULSAR_N_EMBD,
-            g->batch_attn_low, n_draft) != 0;
+        if (ok && own_groups != n_groups) {
+            ok = g->tp && g->tp_kslice_key &&
+                 pulsar_gpu_attention_output_b_tensor(g->batch_attn_out, g->tp_kslice_key, UINT64_MAX / 2u,
+                                                      pulsar_tp_kslice_key_offset(layer->attn_output_b),
+                                                      (uint64_t)own_groups * rank, PULSAR_N_EMBD,
+                                                      g->batch_attn_low, n_draft) != 0;
+            if (!ok) fprintf(stderr, "pulsar: drafter block %u: row-parallel stage 'b' refused (owned groups "
+                                     "[%u,%u) of %u)\n", li, g_lo, g_hi, n_groups);
+            if (ok) ok = gpu_graph_tp_allreduce_rows(g, li, n_draft, g->batch_attn_out, NULL, "drafter attention");
+        } else if (ok) {
+            ok = pulsar_gpu_attention_output_b_tensor(
+                g->batch_attn_out,
+                tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
+                layer->attn_output_b->abs_offset,
+                (uint64_t)n_groups * rank, PULSAR_N_EMBD,
+                g->batch_attn_low, n_draft) != 0;
+        }
         pulsar_gpu_mxfp8_gact_disarm();
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_out", g->batch_attn_out,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
@@ -1033,7 +1063,7 @@ bool gpu_graph_encode_output_head_batch(
  * vector and samples independently: no leader-only decision, no token
  * broadcast.  Copies only -- the assembled rows are the bytes the heads wrote.
  *
- * Two lanes, chosen by the transport (like tp_allreduce_rows):
+ * Two lanes, chosen by the transport (like gpu_graph_tp_allreduce_rows):
  *
  *  - a row-lane pair (4g-2) gathers ON THE STREAM: the slice is written to
  *    g->tp_vocab_own, scattered into its columns of `out`, and cut into

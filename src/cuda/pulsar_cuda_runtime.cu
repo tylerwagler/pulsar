@@ -141,7 +141,6 @@ static uint64_t g_model_stage_bytes;
 
 
 
-int cuda_ok(cudaError_t err, const char *what);
 
 
 static const char *cuda_model_range_ptr_from_fd(
@@ -528,6 +527,9 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
 
 
 
+/** See the declaration in pulsar_cuda_internal.h.  Doxygen 1.9.8 applies
+ *  \hidecallergraph per entity, so the definition carries it too.
+ *  \hidecallergraph */
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "pulsar: CUDA %s failed: %s\n", what, cudaGetErrorString(err));

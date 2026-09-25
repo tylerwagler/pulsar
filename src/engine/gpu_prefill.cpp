@@ -1168,9 +1168,134 @@ static bool gpu_graph_indexed_attention_span(
  * (defined with the FFN encoder below): the row lane for decode/verify rows,
  * the big gate for prefill chunks.  A non-NULL `addend` is a second partial
  * folded in first (t = t + addend, then addend = 0). */
-static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
-                              pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
-                              const char *what);
+
+
+/* 4g-3 (L241): the attention INPUT side, row-split across the pair.
+ *
+ * Every projection that reads the normed attention activation -- q_a, kv, the
+ * compressor kv + gate, the indexer's own compressor kv + gate, indexer_proj --
+ * was computed whole on BOTH ranks (~4.3 ms/token of the pair's 36).  Here each
+ * rank computes only its floor row range of each (engine open registered the
+ * MXFP8_LT slices; a bf16/f32 slice is offset arithmetic), writing every block
+ * [n_tokens][half] back to back into one packed payload (g->tp_ain_own); the
+ * payload crosses as ONE row-lane exchange (stage+publish, then the gather
+ * combine), and the combine scatters both halves of every block into the full
+ * rows the rest of the layer already reads (batch_qr, batch_kv_raw,
+ * batch_comp_kv/sc, batch_index_comp_kv/sc, batch_indexer_weights).
+ *
+ * Bit-exact: a row slice computes each output row exactly as the whole
+ * projection does (row-independent GEMVs, same activation, same weights), and
+ * the gather only copies.  The predicates that pick the blocks are the ones the
+ * later branches use to run the projections, restated at the same inputs.
+ * Decode/verify widths only (<= PULSAR_TP_BATCH_MAX_ROWS rows, the row lane);
+ * prefill keeps the duplicated GEMMs -- an extra bulk exchange per layer would
+ * cost more than the halves save there. */
+static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
+                                const pulsar_layer_weights *layer, uint32_t il, uint32_t pos0,
+                                uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
+                                const pulsar_layer_attn *attn) {
+    struct item { const pulsar_tensor *w; uint64_t out_full; pulsar_gpu_tensor *dst; const char *name; };
+    item it[PULSAR_TP_GATHER_BLOCKS_MAX];
+    uint32_t n = 0;
+    it[n++] = { layer->attn_q_a, q_rank, g->batch_qr, "attn_q_a" };
+    it[n++] = { layer->attn_kv, PULSAR_N_HEAD_DIM, g->batch_kv_raw, "attn_kv" };
+    if (ratio != 0 && pulsar_attn_owns_kv(attn->mode)) {
+        const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+        const bool indexed = pulsar_attn_runs_indexer(attn->mode);
+        const bool own = g_pulsar_shape.indexer_own_compressor && indexed;
+        if (layer->attn_compressor_kv)
+            it[n++] = { layer->attn_compressor_kv, comp_width, g->batch_comp_kv, "attn_compressor_kv" };
+        if (ratio > 1u && layer->attn_compressor_gate)
+            it[n++] = { layer->attn_compressor_gate, comp_width, g->batch_comp_sc, "attn_compressor_gate" };
+        if (own) {
+            const uint32_t index_width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+            if (layer->indexer_compressor_kv)
+                it[n++] = { layer->indexer_compressor_kv, index_width, g->batch_index_comp_kv,
+                            "indexer_compressor_kv" };
+            if (layer->indexer_compressor_gate)
+                it[n++] = { layer->indexer_compressor_gate, index_width, g->batch_index_comp_sc,
+                            "indexer_compressor_gate" };
+        }
+    }
+    if (ratio != 0 && pulsar_attn_runs_indexer(attn->mode) && layer->indexer_proj)
+        it[n++] = { layer->indexer_proj, PULSAR_N_INDEXER_HEAD, g->batch_indexer_weights, "indexer_proj" };
+
+    const int rank = pulsar_tp_rank(g->tp);
+    const uint32_t nr = pulsar_tp_n_ranks(g->tp);
+    pulsar_tp_gather_block blocks[PULSAR_TP_GATHER_BLOCKS_MAX];
+    uint64_t elem0 = 0;
+    bool ok = n <= PULSAR_TP_GATHER_BLOCKS_MAX;
+    for (uint32_t k = 0; ok && k < n; k++) {
+        const pulsar_tensor *w = it[k].w;
+        uint32_t lo = 0, hi = 0, plo = 0, phi = 0;
+        ok = w && w->dim[0] == PULSAR_N_EMBD && w->dim[1] == it[k].out_full &&
+             pulsar_tp_owned_range(rank, nr, (uint32_t)it[k].out_full, &lo, &hi) &&
+             pulsar_tp_owned_range(1 - rank, nr, (uint32_t)it[k].out_full, &plo, &phi) &&
+             hi - lo == phi - plo && hi > lo;
+        if (!ok) {
+            fprintf(stderr, "pulsar: layer %u: %s cannot be row-split for the pair (dims %llu x %llu, "
+                            "want %u x %llu) -- refusing\n", il, it[k].name,
+                    w ? (unsigned long long)w->dim[0] : 0ull, w ? (unsigned long long)w->dim[1] : 0ull,
+                    (unsigned)PULSAR_N_EMBD, (unsigned long long)it[k].out_full);
+            break;
+        }
+        const uint64_t half = hi - lo;
+        pulsar_gpu_tensor *view = pulsar_gpu_tensor_view(g->tp_ain_own, elem0 * sizeof(float),
+                                                         (uint64_t)n_tokens * half * sizeof(float));
+        ok = view != NULL;
+        if (ok) {
+            if (w->type == PULSAR_TENSOR_MXFP8_LT)
+                ok = gpu_graph_matmul_mxfp8_rows_named_tensor(it[k].name, il, pos0, view, model, w,
+                                                              PULSAR_N_EMBD, it[k].out_full, lo, hi,
+                                                              g->batch_attn_norm, n_tokens);
+            else if (w->type == PULSAR_TENSOR_BF16)
+                ok = pulsar_gpu_matmul_bf16_tensor(view, tensor_map_base(model, w), tensor_map_size(model, w),
+                                                   w->abs_offset + (uint64_t)lo * PULSAR_N_EMBD * sizeof(uint16_t),
+                                                   PULSAR_N_EMBD, half, g->batch_attn_norm, n_tokens) != 0;
+            else if (w->type == PULSAR_TENSOR_F32)
+                ok = pulsar_gpu_matmul_f32_tensor(view, tensor_map_base(model, w), tensor_map_size(model, w),
+                                                  w->abs_offset + (uint64_t)lo * PULSAR_N_EMBD * sizeof(float),
+                                                  PULSAR_N_EMBD, half, g->batch_attn_norm, n_tokens) != 0;
+            else {
+                fprintf(stderr, "pulsar: layer %u: %s has a storage type the row split does not slice "
+                                "(%u) -- refusing\n", il, it[k].name, w->type);
+                ok = false;
+            }
+        }
+        pulsar_gpu_tensor_free(view);
+        blocks[k] = { it[k].dst, elem0, half, it[k].out_full, lo, plo };
+        elem0 += (uint64_t)n_tokens * half;
+    }
+    pulsar_tp_row_lane_layout_t L;
+    pulsar_tp_row_lane_layout(g->tp, &L);
+    const uint64_t vf = L.vec_bytes / sizeof(float);
+    const uint32_t msgs = (uint32_t)((elem0 + vf - 1u) / vf);
+    if (ok && (msgs == 0 || msgs > PULSAR_TP_BATCH_MAX_ROWS)) {
+        fprintf(stderr, "pulsar: layer %u: attention-input gather of %llu floats needs %u row-lane messages "
+                        "(max %u) -- refusing\n", il, (unsigned long long)elem0, msgs,
+                (unsigned)PULSAR_TP_BATCH_MAX_ROWS);
+        ok = false;
+    }
+    uint8_t *slab = (uint8_t *)g->tp_slab_dev;
+    uint64_t first = 0, exch = 0;
+    pulsar_gpu_tensor *payload = ok ? pulsar_gpu_tensor_view(g->tp_ain_own, 0, (uint64_t)msgs * L.vec_bytes) : NULL;
+    if (ok) ok = payload && pulsar_tp_row_lane_begin(g->tp, msgs, &first, &exch) != 0;
+    if (ok) ok = pulsar_gpu_tp_stage_publish(payload, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots,
+                                             msgs, slab + L.desc_off, exch, g->tp_stage_ticket) != 0;
+    if (ok) ok = pulsar_gpu_tp_combine_gather_blocks(blocks, n, n_tokens, g->tp_ain_own, slab, L.in_off,
+                                                     L.vec_bytes, first, L.n_slots, slab + L.done_off, exch,
+                                                     slab + L.err_off, L.timeout_ns) != 0;
+    pulsar_gpu_tensor_free(payload);
+    if (!ok) fprintf(stderr, "pulsar: layer %u: attention-input row split refused (%u rows, %u blocks)\n",
+                     il, n_tokens, n);
+    static int said = 0;
+    if (ok && !said) {
+        said = 1;
+        fprintf(stderr, "pulsar: tp attention input row-split (4g-3): q_a, kv, compressor + indexer "
+                        "projections, one row-lane gather per layer\n");
+    }
+    return ok;
+}
 
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
@@ -1460,7 +1585,13 @@ bool gpu_graph_encode_layer_attention_batch(
     if (ok && attn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && attn_norm_b) pulsar_gpu_bf16_act_note(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && attn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(attn_norm_keep_from);
-    if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
+    /* 4g-3: on a row-lane pair at decode/verify width, every projection of
+     * batch_attn_norm is row-split and gathered here, and the whole-tensor
+     * calls below are skipped (tp_attn_input_split). */
+    const bool tp_ain = g->tp && n_tokens <= PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_row_lane(g->tp) &&
+                        g->tp_ain_own && g->tp_slab_dev && g->tp_stage_ticket;
+    if (ok && tp_ain) ok = tp_attn_input_split(g, model, layer, il, pos0, n_tokens, q_rank, ratio, attn);
+    if (ok && !tp_ain) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
                                                       g->batch_qr,
@@ -1475,7 +1606,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     {
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
+        if (ok && !tp_ain) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
                                                           il,
                                                           pos0,
                                                           g->batch_kv_raw,
@@ -1825,9 +1956,9 @@ bool gpu_graph_encode_layer_attention_batch(
             }
             const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
             const uint32_t index_width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->attn_compressor_kv,
+            if (ok && !tp_ain) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->attn_compressor_kv,
                                                        PULSAR_N_EMBD, comp_width, g->batch_attn_norm, n_tokens) != 0;
-            if (ok && ratio > 1u) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->attn_compressor_gate,
+            if (ok && !tp_ain && ratio > 1u) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->attn_compressor_gate,
                                                                      PULSAR_N_EMBD, comp_width, g->batch_attn_norm, n_tokens) != 0;
             if (ok) gpu_graph_debug_dump_tensor("attn_comp_kv_raw", g->batch_comp_kv,
                                                 (uint64_t)comp_width * n_tokens, il, pos0);
@@ -1835,9 +1966,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               (uint64_t)comp_width * n_tokens, il, pos0);
             /* The indexer's own projections, at its own head dim: a separate
              * compression of the same rows, over the same normed activation. */
-            if (ok && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_kv, model, layer->indexer_compressor_kv,
+            if (ok && !tp_ain && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_kv, model, layer->indexer_compressor_kv,
                                                               PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
-            if (ok && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_sc, model, layer->indexer_compressor_gate,
+            if (ok && !tp_ain && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_sc, model, layer->indexer_compressor_gate,
                                                               PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
             if (ok) ok = gpu_graph_csa2_produce(g, model, layer, il, pos0, n_tokens, mseq, comp_counts);
         } else {
@@ -1897,7 +2028,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                     PULSAR_ROPE_YARN_BETA_FAST,
                                                     PULSAR_ROPE_YARN_BETA_SLOW,
                                                     mseq ? g->batch_positions : NULL) != 0;
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_weights,
+            if (ok && !tp_ain) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_weights,
                                               model,
                                               layer->indexer_proj,
                                                      PULSAR_N_EMBD,
@@ -2396,7 +2527,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   n_tokens) != 0;
         if (!ok) fprintf(stderr, "pulsar: layer %u attention: row-parallel stage 'b' refused (owned groups "
                                  "[%u,%u) of %u)\n", il, g_lo, g_hi, n_groups_total);
-        if (ok) ok = tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, NULL, "attention");
+        if (ok) ok = gpu_graph_tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, NULL, "attention");
     } else if (ok) {
         ok = pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
                                                   tensor_map_base(model, layer->attn_output_a),
@@ -2461,7 +2592,7 @@ bool gpu_graph_encode_layer_attention_batch(
  * only when g->tp is armed; returns 0 (fail loud) on any tensor/transport
  * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
  * can move onto the registerable GB10 slab later. */
-static bool tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                               pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                               const char *what) {
     if (!g->tp) return 1;
@@ -3018,7 +3149,7 @@ bool gpu_graph_encode_layer_ffn_batch(
          * on the decode row lane inside its stage kernel, no launch of its
          * own.  Every consumer below (hc expand-add, ffn_out) then reads the
          * full sum from routed_out and +0.0f from shared_out, as before. */
-        ok = tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, g->batch_shared_out, "FFN");
+        ok = gpu_graph_tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, g->batch_shared_out, "FFN");
         if (ok && keep_ffn_out) {
             ok = gpu_graph_ensure_batch_ffn_out(g) &&
                  pulsar_gpu_add_tensor(g->batch_ffn_out,

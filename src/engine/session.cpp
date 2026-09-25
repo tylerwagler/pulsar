@@ -750,7 +750,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
          * GPU-direct through a buffer of out | in[0] | in[1], each one prefill
          * chunk of f32 rows; attach registers it beside the slab.  A chunk
-         * larger than that is cut by tp_allreduce_rows. */
+         * larger than that is cut by gpu_graph_tp_allreduce_rows. */
         if (pulsar_tp_is_rdma(e->tp) && pulsar_tp_n_ranks(e->tp) == 2) {
             const uint64_t rows = e->prefill_chunk ? e->prefill_chunk : PULSAR_PREFILL_CHUNK_DEFAULT;
             e->tp_bulk_bytes = 3u * rows * (uint64_t)PULSAR_N_EMBD * sizeof(float);
@@ -854,6 +854,33 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     return 1;
                 }
                 registered += 3;
+                /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
+                 * compressor and indexer projections, each rank its floor row
+                 * range, gathered in one row-lane exchange per layer
+                 * (tp_attn_input_split).  Only the MXFP8_LT ones need their
+                 * slice registered; a bf16/f32 slice is plain offset arithmetic. */
+                {
+                    static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
+                                                            "attn_compressor_gate", "indexer_compressor_kv",
+                                                            "indexer_compressor_gate", "indexer_proj" };
+                    const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
+                                                   L->attn_compressor_gate, L->indexer_compressor_kv,
+                                                   L->indexer_compressor_gate, L->indexer_proj };
+                    for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
+                        const pulsar_tensor *w = ain[k];
+                        if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
+                        uint32_t lo = 0, hi = 0;
+                        if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
+                            !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, w), w->abs_offset,
+                                                                  w->dim[0], w->dim[1], lo, hi)) {
+                            fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
+                                            "not be registered -- refusing\n", il, ain_name[k]);
+                            e->destroy();
+                            *out = NULL;
+                            return 1;
+                        }
+                    }
+                }
                 if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
                     fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
                                     "registered -- refusing\n", il);
@@ -881,6 +908,29 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 }
                 if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
                     fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
+                                    "registered -- refusing\n", dl);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+                registered += 3;
+                /* 4g-1b: the drafter's attention head-split exactly like a
+                 * target layer's -- attn_q_b rows and attn_output_a rows of the
+                 * owned groups, attn_output_b's K-half -- over the drafter's own
+                 * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
+                const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
+                if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
+                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_q_b),
+                                                          DL->attn_q_b->abs_offset, DL->attn_q_a->dim[1],
+                                                          q_out_full, q_lo, q_hi) ||
+                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_output_a),
+                                                          DL->attn_output_a->abs_offset, group_dim, a_out_full,
+                                                          a_lo, a_hi) ||
+                    !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->dspark_model, DL->attn_output_b),
+                                                       DL->attn_output_b->abs_offset, a_out_full,
+                                                       DL->attn_output_b->dim[1], a_lo, a_hi,
+                                                       e, pulsar_tp_kslice_key_offset(DL->attn_output_b))) {
+                    fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
                                     "registered -- refusing\n", dl);
                     e->destroy();
                     *out = NULL;
@@ -1052,6 +1102,11 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
                 (unsigned long long)bytes);
+        return false;
+    }
+    g->tp_ain_own = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_TP_BATCH_MAX_ROWS * vb);
+    if (!g->tp_ain_own) {
+        fprintf(stderr, "pulsar: tp attention-input gather scratch allocation failed\n");
         return false;
     }
     const uint32_t zero = 0u;

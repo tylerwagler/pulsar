@@ -159,6 +159,41 @@ static __global__ void tp_combine_scatter_kernel(float *dst, const uint8_t *slab
     }
 }
 
+/* The row-split gather's combine (4g-3): after the wait, payload element i
+ * belongs to the block whose [elem0, elem0 + rows*width) holds it; both the
+ * own copy (from the packed own payload) and the peer's (from the in-slot the
+ * row lane landed it in) are written to their columns of the full rows. */
+typedef struct {
+    float *dst[PULSAR_TP_GATHER_BLOCKS_MAX];
+    uint64_t elem0[PULSAR_TP_GATHER_BLOCKS_MAX + 1];
+    uint64_t width[PULSAR_TP_GATHER_BLOCKS_MAX], pitch[PULSAR_TP_GATHER_BLOCKS_MAX];
+    uint64_t own_col0[PULSAR_TP_GATHER_BLOCKS_MAX], peer_col0[PULSAR_TP_GATHER_BLOCKS_MAX];
+    uint32_t n;
+} tp_gather_blocks_t;
+
+static __global__ void tp_combine_gather_blocks_kernel(tp_gather_blocks_t B, const float *own,
+                                                       const uint8_t *slab, uint64_t in_off,
+                                                       uint64_t vec_floats, uint64_t first_msg,
+                                                       uint32_t n_slots, const uint64_t *done,
+                                                       uint64_t exch, uint32_t *err,
+                                                       uint64_t timeout_ns) {
+    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+    const uint64_t n = B.elem0[B.n];
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        uint32_t b = 0;
+        while (b + 1u < B.n && i >= B.elem0[b + 1u]) b++;
+        const uint64_t e = i - B.elem0[b];
+        const uint64_t r = e / B.width[b], c = e - r * B.width[b];
+        const uint64_t m = i / vec_floats, j = i - m * vec_floats;
+        const uint64_t slot = (first_msg + m - 1u) % n_slots;
+        const float *peer = (const float *)(slab + in_off) + slot * vec_floats;
+        float *row = B.dst[b] + r * B.pitch[b];
+        row[B.own_col0[b] + c] = own[i];
+        row[B.peer_col0[b] + c] = __ldcv(peer + j);
+    }
+}
+
 static __global__ void tp_scatter_cols_kernel(float *dst, const float *src, uint64_t n_elem,
                                               uint64_t width, uint64_t pitch, uint64_t col0) {
     for (uint64_t e = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; e < n_elem;
@@ -284,4 +319,39 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
                                               (const uint64_t *)done_dev, exch,
                                               (uint32_t *)err_dev, timeout_ns);
     return cuda_ok(cudaGetLastError(), "tp bulk combine sum launch");
+}
+
+int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, uint32_t n_blocks,
+                                        uint32_t rows, const pulsar_gpu_tensor *own,
+                                        const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
+                                        uint64_t first_msg, uint32_t n_slots, const void *done_dev,
+                                        uint64_t exch, void *err_dev, uint64_t timeout_ns) {
+    const uint64_t vf = vec_bytes / sizeof(float);
+    if (!blocks || n_blocks == 0 || n_blocks > PULSAR_TP_GATHER_BLOCKS_MAX || rows == 0 || !own ||
+        !slab_dev || !done_dev || !err_dev || vf == 0 || n_slots == 0) return 0;
+    tp_gather_blocks_t B;
+    memset(&B, 0, sizeof(B));
+    uint64_t e0 = 0;
+    for (uint32_t k = 0; k < n_blocks; k++) {
+        const pulsar_tp_gather_block *bk = &blocks[k];
+        if (!bk->dst || bk->width == 0 || bk->elem0 != e0 ||
+            bk->own_col0 + bk->width > bk->pitch || bk->peer_col0 + bk->width > bk->pitch ||
+            (uint64_t)rows * bk->pitch * sizeof(float) > bk->dst->bytes) return 0;
+        B.dst[k] = (float *)bk->dst->ptr;
+        B.elem0[k] = bk->elem0;
+        B.width[k] = bk->width;
+        B.pitch[k] = bk->pitch;
+        B.own_col0[k] = bk->own_col0;
+        B.peer_col0[k] = bk->peer_col0;
+        e0 += (uint64_t)rows * bk->width;
+    }
+    B.elem0[n_blocks] = e0;
+    B.n = n_blocks;
+    if (e0 * sizeof(float) > own->bytes) return 0;
+    tp_combine_gather_blocks_kernel<<<tp_grid(e0), 256>>>(B, (const float *)own->ptr,
+                                                          (const uint8_t *)slab_dev, in_off, vf,
+                                                          first_msg, n_slots,
+                                                          (const uint64_t *)done_dev, exch,
+                                                          (uint32_t *)err_dev, timeout_ns);
+    return cuda_ok(cudaGetLastError(), "tp combine gather blocks launch");
 }

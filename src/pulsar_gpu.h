@@ -2466,6 +2466,23 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
  * experts' flags: a set word fails the step there, by name, before any logits
  * the drained work produced are read back.  NULL disarms. */
 void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
+/* A ROW-SPLIT GATHER over several projections at once (L241 4g-3): each rank
+ * computed its row half of every block into one packed payload -- block k is
+ * [rows][width_k] at element elem0_k -- which crossed as one row-lane exchange.
+ * After the exchange this scatters BOTH halves of every block into the full
+ * destination rows: dst_k[r * pitch_k + own_col0_k + c] = own payload,
+ * dst_k[r * pitch_k + peer_col0_k + c] = the peer's (the same layout, in the
+ * row-lane in-slots).  Copies only.  Waits on the done word like the sums. */
+#define PULSAR_TP_GATHER_BLOCKS_MAX 8
+typedef struct {
+    pulsar_gpu_tensor *dst;
+    uint64_t elem0, width, pitch, own_col0, peer_col0;
+} pulsar_tp_gather_block;
+int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, uint32_t n_blocks,
+                                        uint32_t rows, const pulsar_gpu_tensor *own,
+                                        const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
+                                        uint64_t first_msg, uint32_t n_slots, const void *done_dev,
+                                        uint64_t exch, void *err_dev, uint64_t timeout_ns);
 /* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
  * `src` from src_off into the mapped bulk out-region (stream-ordered copy),
  * publish the descriptor {exch, bytes, word2 = bulk flag | buffer}, and combine

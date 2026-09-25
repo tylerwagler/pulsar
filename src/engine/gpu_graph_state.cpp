@@ -69,6 +69,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->spec_logits);
     pulsar_gpu_tensor_free(g->tp_vocab_own);
     g->tp_vocab_own = NULL;
+    pulsar_gpu_tensor_free(g->tp_ain_own);
+    g->tp_ain_own = NULL;
     pulsar_gpu_tensor_free(g->tp_stage_ticket);
     g->tp_stage_ticket = NULL;
     pulsar_gpu_tensor_free(g->dspark_main_x);
