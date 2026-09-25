@@ -4352,6 +4352,10 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
 /// @param errlen   size of `err`
 /// @return the malloc'd bytes, or NULL
 uint8_t *server_decode_image_data_url(const char *url, size_t *len_out, char *err, size_t errlen);
+/** True the first time this process sees top-level body key `key` on endpoint `api` and ignores it; false
+ *  afterwards.  The parsers log on true, so every key a client sends that pulsar does not honor is named once, on
+ *  the day a client release starts sending it, without refusing it (the gateway protocol is an open list -- L249). */
+bool api_key_first_seen(const char *api, const char *key);
 /* Attach one inline image block to `msg` and write its placeholder into `out`.
  * The single authority behind the chat `image_url` and Responses `input_image`
  * readers. */
