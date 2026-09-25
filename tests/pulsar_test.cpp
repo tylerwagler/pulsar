@@ -2569,6 +2569,19 @@ static void test_anthropic_count_tokens_parse(void) {
     TEST_ASSERT(r.prompt.len == n_one);
     request_free(&r);
 
+    /* Keys Claude Code sends that pulsar does not honor are accepted (the
+     * gateway protocol is an open list; `safeguards` is answered by the router,
+     * L249) and leave the render untouched. */
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"max_tokens\":64,"
+        "\"safeguards\":[{\"type\":\"dangerous_tool_use\","
+        "\"classifier_context\":{\"v\":1,\"permission_mode\":\"auto\"}}],"
+        "\"speed\":\"standard\",\"diagnostics\":{\"previous_message_id\":null}}",
+        128, &r, err, sizeof(err)));
+    TEST_ASSERT(r.prompt.len == n_one);
+    request_free(&r);
+
     TEST_ASSERT(parse_anthropic_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},"
         "{\"role\":\"assistant\",\"content\":\"hello there\"},"

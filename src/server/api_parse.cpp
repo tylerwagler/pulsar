@@ -2,6 +2,58 @@
 
 
 
+/* The set of ignored top-level keys already named in the log.  Keys are client
+ * input, so the set is bounded: past the cap, further new keys are not
+ * tracked, and that is said once. */
+#define API_SEEN_KEYS_MAX 256
+static pthread_mutex_t api_seen_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *api_seen_keys[API_SEEN_KEYS_MAX];
+static int api_seen_n = 0;
+static bool api_seen_full_warned = false;
+
+bool api_key_first_seen(const char *api, const char *key) {
+    char name[160];
+    snprintf(name, sizeof(name), "%s/%s", api, key);
+    bool first = false;
+    pthread_mutex_lock(&api_seen_mu);
+    int i = 0;
+    while (i < api_seen_n && strcmp(api_seen_keys[i], name)) i++;
+    if (i == api_seen_n) {
+        if (api_seen_n < API_SEEN_KEYS_MAX) {
+            api_seen_keys[api_seen_n++] = xstrdup(name);
+            first = true;
+        } else if (!api_seen_full_warned) {
+            api_seen_full_warned = true;
+            server_log(PULSAR_LOG_WARNING,
+                       "ignored-key log is full (%d keys); further new keys are not named",
+                       API_SEEN_KEYS_MAX);
+        }
+    }
+    pthread_mutex_unlock(&api_seen_mu);
+    return first;
+}
+
+/* The default arm of every top-level body parser: skip the value, and name the
+ * key in the log the first time this process ignores it.  The key is client
+ * text, so only printable ASCII reaches the log. */
+static bool skip_ignored_key(const char *api, const char *key, const char **p) {
+    if (api_key_first_seen(api, key)) {
+        char shown[65];
+        size_t n = 0;
+        for (; key[n] && n < sizeof(shown) - 1; n++) {
+            unsigned char c = (unsigned char)key[n];
+            shown[n] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+        }
+        shown[n] = '\0';
+        server_log(PULSAR_LOG_WARNING,
+                   "%s: ignoring request key \"%s\"%s (named once per process)",
+                   api, shown, key[n] ? "..." : "");
+    }
+    return json_skip_value(p);
+}
+
+
+
 /* Shared sampling-knob parsing for every request surface. Returns 1 if `key`
  * was a sampling knob and its value was consumed, 0 if it is not a sampling
  * knob (caller keeps matching), -1 on a malformed value (caller frees key and
@@ -280,7 +332,7 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
                 free(key);
                 goto bad;
             }
-        } else if (!json_skip_value(&p)) {
+        } else if (!skip_ignored_key("/v1/chat/completions", key, &p)) {
             free(key);
             goto bad;
         }
@@ -553,7 +605,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
                 free(key);
                 goto bad;
             }
-        } else if (!json_skip_value(&p)) {
+        } else if (!skip_ignored_key("/v1/messages", key, &p)) {
             free(key);
             goto bad;
         }
@@ -1678,7 +1730,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
                 request_free(r);
                 return false;
             }
-        } else if (!json_skip_value(&p)) {
+        } else if (!skip_ignored_key("/v1/responses", key, &p)) {
             free(key);
             goto bad;
         }
@@ -1943,7 +1995,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 request_free(r);
                 return false;
             }
-        } else if (!json_skip_value(&p)) {
+        } else if (!skip_ignored_key("/v1/completions", key, &p)) {
             free(key);
             goto bad;
         }

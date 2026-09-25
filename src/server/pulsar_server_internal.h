@@ -2599,7 +2599,12 @@ void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
-/* Attach one inline image block to `msg` and write its placeholder into `out`.
+/** True the first time this process sees top-level body key `key` on endpoint
+ * `api` and ignores it; false afterwards.  The parsers log on true, so every
+ * key a client sends that pulsar does not honor is named once, on the day a
+ * client release starts sending it, without refusing it (the gateway protocol
+ * is an open list -- L249). */
+bool api_key_first_seen(const char *api, const char *key);/* Attach one inline image block to `msg` and write its placeholder into `out`.
  * The single authority behind the chat `image_url` and Responses `input_image`
  * readers. */
 bool server_add_image_block(chat_msg *msg, const char *url, buf *out,

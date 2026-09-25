@@ -737,6 +737,17 @@ static void test_anthropic_usage_reports_cache_details(void) {
 
 
 
+/* L249: an ignored top-level key is named once per process per endpoint. */
+static void test_ignored_key_named_once(void) {
+    TEST_ASSERT(api_key_first_seen("/test", "zz_new_key"));
+    TEST_ASSERT(!api_key_first_seen("/test", "zz_new_key"));
+    TEST_ASSERT(api_key_first_seen("/test2", "zz_new_key"));
+    TEST_ASSERT(api_key_first_seen("/test", "zz_other_key"));
+    TEST_ASSERT(!api_key_first_seen("/test2", "zz_new_key"));
+}
+
+
+
 static void test_openai_tool_stream_sends_incremental_text(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -7971,6 +7982,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_logprob_stream_ready_watermark();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
+    test_ignored_key_named_once();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_tool_stream_truncated_call_closes_args();
