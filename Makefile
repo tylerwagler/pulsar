@@ -262,11 +262,13 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
+                 tests/exl3_dense_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
 	./tests/exl3_gemv_gate
+	./tests/exl3_dense_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -474,6 +476,34 @@ tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gem
 exl3-gemv-gate: tests/exl3_gemv_gate
 	./tests/exl3_gemv_gate
 
+# L251: the EXL3 dense-Linear arm -- the complete Linear (input rotation,
+# split-K trellis GEMV, output Hadamard + svh) at the Qwen dense shapes and a
+# DeepSeek one, K = 2..5, M = 1..16 and a 40-row prefill, graded against the
+# host authority in double; M-neutrality bit-exact; mutations; refusals.
+# Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
+# the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
+tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o Makefile \
+                       src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o
+
+.PHONY: exl3-dense-gate
+exl3-dense-gate: tests/exl3_dense_gate
+	./tests/exl3_dense_gate
+
+# L251: the dense arm on a REAL exllamav3-quantized weight, driven by
+# pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
+# exllamav3's own forward on the same activations).  Not a gate.
+tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o Makefile \
+                         src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o
+
+# L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
+# decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
+# and a streaming-read roofline, DRAM-cold, M = 1..16.  Not a gate.
+tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe
@@ -617,7 +647,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/vision_hc_gate
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -1781,6 +1811,7 @@ gates-dev:
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \

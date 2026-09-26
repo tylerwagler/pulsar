@@ -32,12 +32,10 @@
 //     touch those elements.
 
 #include "ds4_exl3_gemv.cuh"
+#include "ds4_exl3_dev.cuh"
 #include "ds4_act_block.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
-
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 
 #include <cstdio>
 
@@ -48,73 +46,6 @@ constexpr int kWarps  = 8;     ///< K split
 constexpr int kMaxK   = 5120;  ///< the activation row (V4.1 n_embd)
 constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k-tiles = 2 per warp
 constexpr int kMaxR   = 16;    ///< the widest row block
-constexpr float kInvSqrt128 = 0.08838834764831845f;
-
-template <int K2> struct Exl3Rate {
-    static constexpr int words16 = 16 * (K2 >> 1) + ((K2 & 1) ? 8 : 0);
-    static constexpr int words32 = words16 / 2;
-    static_assert(words16 % 2 == 0, "a tile is whole uint32 words");
-    /* the four states of a run lie in one 64-bit window: their span is
-     * 3K + 16 (integer K) or 2(2K+1) + 16 (half-integer K) bits, <= 32 */
-    static_assert(3 * (K2 >> 1) + 16 + 2 <= 32, "rate too wide for the 64-bit run window");
-};
-
-/** exllamav3's mul1 codebook, the device form: x * 0x83DCD12D, a dp4a byte
- *  sum onto 0x6400 (= fp16 1024 + bytesum, exact), one hfma.  Bit-identical to
- *  the host exl3_mul1_decode (both graded against the extension's table). */
-__device__ __forceinline__ float exl3_dev_mul1(uint32_t x) {
-    x *= EXL3_MUL1_MULTIPLIER;
-    const uint32_t s = __dp4a(x, 0x01010101u, 0x6400u);
-    const __half h = __ushort_as_half((unsigned short)s);
-    return __half2float(__hfma(h, __ushort_as_half(0x1eee), __ushort_as_half(0xc931)));
-}
-
-/** The four states of positions p0..p0+3 (p0 % 4 == 0) of one tile.  `w` is
- *  the tile's words as uint32 (stream bit s in w[s/32] at bit 31 - s%32, the
- *  layout the header documents); the window is the 64 bits ending at
- *  end(p0+3), wrapping to the last word when it starts before the tile. */
-template <int K2>
-__device__ __forceinline__ void exl3_dev_run4(const uint32_t *__restrict__ w, int p0, uint32_t st[4]) {
-    constexpr int nw = Exl3Rate<K2>::words32;
-    const int e3 = exl3_state_end_bit(K2, p0 + 3);
-    const int hi = (e3 - 1) >> 5;
-    const int lo = (hi + nw - 1) % nw;
-    const int s  = ((hi + 1) << 5) - e3;
-    const uint64_t v = (((uint64_t)w[lo] << 32) | (uint64_t)w[hi]) >> s;
-    st[3] = (uint32_t)v & 0xffffu;
-    st[2] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0 + 2))) & 0xffffu;
-    st[1] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0 + 1))) & 0xffffu;
-    st[0] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0))) & 0xffffu;
-}
-
-/** In-place natural-order Sylvester H128 / sqrt(128) over one 128-block held
- *  as four consecutive values per lane (lane l holds elements 4l..4l+3): two
- *  in-lane stages, then five xor-shuffle stages (the lane with the bit set
- *  takes a - b, the other a + b).  Full warp required. */
-__device__ __forceinline__ void exl3_dev_had128(float v[4]) {
-    float a, b;
-    a = v[0]; b = v[1]; v[0] = a + b; v[1] = a - b;
-    a = v[2]; b = v[3]; v[2] = a + b; v[3] = a - b;
-    a = v[0]; b = v[2]; v[0] = a + b; v[2] = a - b;
-    a = v[1]; b = v[3]; v[1] = a + b; v[3] = a - b;
-    const int lane = threadIdx.x & 31;
-#pragma unroll
-    for (int m = 1; m <= 16; m <<= 1) {
-        const bool upper = (lane & m) != 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float p = __shfl_xor_sync(0xffffffffu, v[j], m);
-            v[j] = upper ? (p - v[j]) : (v[j] + p);
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= kInvSqrt128;
-}
-
-__device__ __forceinline__ float exl3_dev_e4m3_to_f32(uint8_t bits) {
-    return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
-}
-
 /* ---------------------------------------------------------------------- */
 /* the GEMV                                                                */
 
@@ -133,7 +64,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
-    constexpr int W32 = Exl3Rate<K2>::words32;
+    constexpr int W32 = exl3dev::Rate<K2>::words32;
     __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
     __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
     __shared__ int   s_expert;
@@ -176,7 +107,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
         const int k0 = blk * 128 + grp * 32;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
-            const float v = exl3_dev_e4m3_to_f32((uint8_t)q[j]) * sc;
+            const float v = exl3dev::e4m3_to_f32((uint8_t)q[j]) * sc;
             if constexpr (PAIR) {
                 s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
                 s_x[1][k0 + j] = v * __half2float(su[k0 + j]);
@@ -191,7 +122,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
         for (int t = warp; t < 2 * n_k128; t += kWarps) {
             float *v4 = s_x[t & 1] + (t >> 1) * 128 + lane * 4;
             float v[4] = {v4[0], v4[1], v4[2], v4[3]};
-            exl3_dev_had128(v);
+            exl3dev::had128(v);
             v4[0] = v[0]; v4[1] = v[1]; v4[2] = v[2]; v4[3] = v[3];
         }
         __syncthreads();
@@ -215,8 +146,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
 #pragma unroll
         for (int a = 0; a < 4; ++a) {
             const int p0 = 32 * (c & 7) + 8 * a + 4 * (c >> 3);
-            exl3_dev_run4<K2>(wg, p0, stg[a]);
-            if constexpr (PAIR) exl3_dev_run4<K2>(wu, p0, stu[a]);
+            exl3dev::run4<K2>(wg, p0, stg[a]);
+            if constexpr (PAIR) exl3dev::run4<K2>(wu, p0, stu[a]);
         }
 #pragma unroll
         for (int a = 0; a < 4; ++a) {
@@ -224,8 +155,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
             const int r[4] = {2 * a, 2 * a + 1, 2 * a + 8, 2 * a + 9};
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                acc_g = fmaf(exl3_dev_mul1(stg[a][b]), xg[r[b]], acc_g);
-                if constexpr (PAIR) acc_u = fmaf(exl3_dev_mul1(stu[a][b]), xu[r[b]], acc_u);
+                acc_g = fmaf(exl3dev::mul1(stg[a][b]), xg[r[b]], acc_g);
+                if constexpr (PAIR) acc_u = fmaf(exl3dev::mul1(stu[a][b]), xu[r[b]], acc_u);
             }
         }
     }
@@ -267,7 +198,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
-    constexpr int W32 = Exl3Rate<K2>::words32;
+    constexpr int W32 = exl3dev::Rate<K2>::words32;
     constexpr int NV = PAIR ? 2 : 1;
     __shared__ __align__(16) float s_buf[GemvSmem<PAIR, R>::floats];
     __shared__ int s_expert[R];
@@ -338,7 +269,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 float *xu = PAIR ? s_buf + (1 * R + r) * kChunk + kk : nullptr;
 #pragma unroll
                 for (int j = 0; j < 32; ++j) {
-                    const float v = exl3_dev_e4m3_to_f32((uint8_t)q[j]) * sc;
+                    const float v = exl3dev::e4m3_to_f32((uint8_t)q[j]) * sc;
                     if constexpr (PAIR) {
                         xg[j] = v * __half2float(sg[k0 + kk + j]);
                         xu[j] = v * __half2float(su[k0 + kk + j]);
@@ -354,7 +285,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                     const int v = t & 1, blk = (t >> 1) & 1, r = t >> 2;
                     float *v4 = s_buf + (v * R + r) * kChunk + blk * 128 + lane * 4;
                     float x[4] = {v4[0], v4[1], v4[2], v4[3]};
-                    exl3_dev_had128(x);
+                    exl3dev::had128(x);
                     v4[0] = x[0]; v4[1] = x[1]; v4[2] = x[2]; v4[3] = x[3];
                 }
                 __syncthreads();
@@ -371,8 +302,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 #pragma unroll
                 for (int a = 0; a < 4; ++a) {
                     const int p0 = 32 * (c & 7) + 8 * a + 4 * (c >> 3);
-                    exl3_dev_run4<K2>(wg, p0, stg[a]);
-                    if constexpr (PAIR) exl3_dev_run4<K2>(wu, p0, stu[a]);
+                    exl3dev::run4<K2>(wg, p0, stg[a]);
+                    if constexpr (PAIR) exl3dev::run4<K2>(wu, p0, stu[a]);
                 }
                 /* decode once, apply to every row of the run */
                 float wgv[16], wuv[16];
@@ -380,8 +311,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 for (int a = 0; a < 4; ++a)
 #pragma unroll
                     for (int b = 0; b < 4; ++b) {
-                        wgv[a * 4 + b] = exl3_dev_mul1(stg[a][b]);
-                        if constexpr (PAIR) wuv[a * 4 + b] = exl3_dev_mul1(stu[a][b]);
+                        wgv[a * 4 + b] = exl3dev::mul1(stg[a][b]);
+                        if constexpr (PAIR) wuv[a * 4 + b] = exl3dev::mul1(stu[a][b]);
                     }
                 for (int r = 0; r < nr; ++r) {
                     const float *xg = s_buf + (0 * R + r) * kChunk + kk;
@@ -463,8 +394,8 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * mid_dim + col0);
     const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * mid_dim + col0);
     float g[4] = {g4.x, g4.y, g4.z, g4.w}, u[4] = {u4.x, u4.y, u4.z, u4.w};
-    exl3_dev_had128(g);
-    exl3_dev_had128(u);
+    exl3dev::had128(g);
+    exl3dev::had128(u);
     float t[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -472,7 +403,7 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
         const float yu = u[j] * __half2float(svh_u[col0 + j]);
         t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
     }
-    exl3_dev_had128(t);
+    exl3dev::had128(t);
     float a = fmaxf(fmaxf(fabsf(t[0]), fabsf(t[1])), fmaxf(fabsf(t[2]), fabsf(t[3])));
 #pragma unroll
     for (int off = 4; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
@@ -509,7 +440,7 @@ exl3_moe_sum_kernel(float *__restrict__ out,
         const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]) + mid_dim;
         const float4 z4 = *reinterpret_cast<const float4 *>(down_z + pair * out_dim + col0);
         float z[4] = {z4.x, z4.y, z4.z, z4.w};
-        exl3_dev_had128(z);
+        exl3dev::had128(z);
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[j] += z[j] * __half2float(svh_d[col0 + j]);
     }
