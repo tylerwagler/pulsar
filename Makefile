@@ -495,6 +495,13 @@ tests/qsa_layer_replay: tests/qsa_layer_replay.cu Makefile src/pulsar_gpu.h src/
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_layer_replay.cu \
 	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
+# L251 S3: the layer's decode (M = 1/4/8 at 8K/64K/256K, DRAM-cold) and prefill
+# chunk timings on GB10.  Not a gate.
+tests/qsa_attn_bench: tests/qsa_attn_bench.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_bench.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe
