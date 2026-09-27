@@ -120,6 +120,8 @@ struct Rig {
             dt_bias[h] = (float)(-5.0 + urand() * 5.0);
         }
         for (auto &v : norm_w) v = (float)(0.5 + urand());
+        bf16_round(conv_w, conv_w_b); bf16_round(A_log, A_log_b);
+        bf16_round(dt_bias, dt_bias_b); bf16_round(norm_w, norm_w_b);   /* sizes for the dalloc below */
         qkv.resize((size_t)ROWS * QKV); z.resize((size_t)ROWS * VD); a.resize((size_t)ROWS * NV); b.resize((size_t)ROWS * NV);
         std::vector<float> chs(QKV);
         for (int c = 0; c < QKV; c++) chs[c] = (float)((urand() < 0.02 ? 8.0 : 1.0) * (0.3 + urand()));
