@@ -605,9 +605,10 @@ static void section_mxfp8_linear(void) {
             CHECK(worst < 1e-4, "%d -> %d vs the same quantized operands in double: max rel %.2e", sh.in, sh.out, worst);
         }
         /* a wrong-width slot is refused, not mis-read */
-        const int bad = pulsar_qwen_mxfp8_linear_launch(&l, &xs, T, y, nullptr, 0, 0) == 0;
+        /* the SAME call with the correct slot succeeded above (`rc == 0`); a slot
+         * declaring the wrong width must be refused, not mis-read */
         pulsar_qwen_slot wrong{q, sf, kbp - 1};
-        CHECK(!bad && pulsar_qwen_mxfp8_linear_launch(&l, &wrong, T, y, nullptr, 0, 0) != 0,
+        CHECK(rc == 0 && pulsar_qwen_mxfp8_linear_launch(&l, &wrong, T, y, nullptr, 0, 0) != 0,
               "a slot of the wrong kbp is refused");
         cudaFree(dx); cudaFree(q); cudaFree(sf); cudaFree(y);
     }
