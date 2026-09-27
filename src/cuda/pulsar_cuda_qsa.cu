@@ -216,54 +216,68 @@ __global__ void __launch_bounds__(1024) qsa_prep_kernel(
 }
 
 /* ---- block scores (selecting rows only) -------------------------------------- *
- * grid (block chunk, listed row); one thread per block.  score = sum over the 4
- * heads, in head order, of relu(q_h . k) with each dot a sequential f32 FMA
- * chain over the 128 dims.  Blocks past the row's nb score -inf, which the
- * top-k never prefers to a real (>= 0) score. */
+ * grid (block chunk, row group); one thread per block.  A group is up to
+ * QSA_SCORE_ROWS consecutive listed rows of ONE sequence (a prefill run), so a
+ * chunk of block keys is read once for all of them; decode rows are groups of
+ * one.  score = sum over the 4 heads, in head order, of relu(q_h . k) with each
+ * dot a sequential f32 FMA chain over the 128 dims -- per (row, block), whatever
+ * the grouping.  Blocks past a row's nb score -inf, which the top-k never
+ * prefers to a real (>= 0) score. */
+constexpr uint32_t QSA_SCORE_ROWS = 4u;
+
+__device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t *kr) {
+    float acc[PULSAR_QSA_IDX_HEADS] = {0.f, 0.f, 0.f, 0.f};
+    for (uint32_t d2 = 0; d2 < PULSAR_QSA_IDX_DIM / 2u; d2 += 4u) {
+        const uint4 kk = *reinterpret_cast<const uint4 *>(&kr[d2]);
+        const uint32_t words[4] = {kk.x, kk.y, kk.z, kk.w};
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const float2 kf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&words[e]));
+            const uint32_t d = 2u * (d2 + (uint32_t)e);
+            #pragma unroll
+            for (int h = 0; h < PULSAR_QSA_IDX_HEADS; h++) {
+                acc[h] = __fmaf_rn(qs[h * PULSAR_QSA_IDX_DIM + d], kf.x, acc[h]);
+                acc[h] = __fmaf_rn(qs[h * PULSAR_QSA_IDX_DIM + d + 1u], kf.y, acc[h]);
+            }
+        }
+    }
+    float out = 0.f;
+    #pragma unroll
+    for (int h = 0; h < PULSAR_QSA_IDX_HEADS; h++) out = __fadd_rn(out, fmaxf(acc[h], 0.f));
+    return out;
+}
+
+/* groups[i] = (first listed row of the pass << 8) | rows; scores are indexed by
+ * the row's place in the pass. */
 __global__ void __launch_bounds__(QSA_SCORE_BLK) qsa_score_kernel(
-        const qsa_row *rows, const uint32_t *list, const float *iq, float *scores, uint32_t nb_max) {
-    __shared__ float qs[PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM];
+        const qsa_row *rows, const uint32_t *list, const uint32_t *groups, const float *iq, float *scores,
+        uint32_t nb_max) {
+    __shared__ float qs[QSA_SCORE_ROWS * PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM];
     __shared__ uint32_t ks[QSA_SCORE_BLK * QSA_BKS];
-    const uint32_t r = list[blockIdx.y];
-    const qsa_row row = rows[r];
-    for (uint32_t i = threadIdx.x; i < PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM; i += blockDim.x) {
-        qs[i] = iq[(uint64_t)r * PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM + i];
+    const uint32_t first = groups[blockIdx.y] >> 8, cnt = groups[blockIdx.y] & 0xffu;
+    constexpr uint32_t QW = PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM;
+    uint32_t nb_hi = 0;
+    for (uint32_t i = 0; i < cnt; i++) nb_hi = max(nb_hi, rows[list[first + i]].nb);
+    for (uint32_t i = threadIdx.x; i < cnt * QW; i += blockDim.x) {
+        qs[i] = iq[(uint64_t)list[first + i / QW] * QW + i % QW];
     }
     const uint32_t b0 = blockIdx.x * QSA_SCORE_BLK;
     /* coalesced: 16 B per thread per step, 16 steps per block key */
-    const uint4 *src = reinterpret_cast<const uint4 *>(row.bkey);
+    const uint4 *src = reinterpret_cast<const uint4 *>(rows[list[first]].bkey);
     for (uint32_t i = threadIdx.x; i < QSA_SCORE_BLK * 16u; i += blockDim.x) {
         const uint32_t bb = i >> 4, part = i & 15u;
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if (b0 + bb < row.nb) v = src[(uint64_t)(b0 + bb) * 16u + part];
+        if (b0 + bb < nb_hi) v = src[(uint64_t)(b0 + bb) * 16u + part];
         *reinterpret_cast<uint4 *>(&ks[bb * QSA_BKS + part * 4u]) = v;
     }
     __syncthreads();
     const uint32_t b = b0 + threadIdx.x;
     if (b >= nb_max) return;
-    float out = -INFINITY;
-    if (b < row.nb) {
-        float acc[PULSAR_QSA_IDX_HEADS] = {0.f, 0.f, 0.f, 0.f};
-        const uint32_t *kr = &ks[threadIdx.x * QSA_BKS];
-        for (uint32_t d2 = 0; d2 < PULSAR_QSA_IDX_DIM / 2u; d2 += 4u) {
-            const uint4 kk = *reinterpret_cast<const uint4 *>(&kr[d2]);
-            const uint32_t words[4] = {kk.x, kk.y, kk.z, kk.w};
-            #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const float2 kf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&words[e]));
-                const uint32_t d = 2u * (d2 + (uint32_t)e);
-                #pragma unroll
-                for (int h = 0; h < PULSAR_QSA_IDX_HEADS; h++) {
-                    acc[h] = __fmaf_rn(qs[h * PULSAR_QSA_IDX_DIM + d], kf.x, acc[h]);
-                    acc[h] = __fmaf_rn(qs[h * PULSAR_QSA_IDX_DIM + d + 1u], kf.y, acc[h]);
-                }
-            }
-        }
-        out = 0.f;
-        #pragma unroll
-        for (int h = 0; h < PULSAR_QSA_IDX_HEADS; h++) out = __fadd_rn(out, fmaxf(acc[h], 0.f));
+    for (uint32_t i = 0; i < cnt; i++) {
+        const uint32_t nb = rows[list[first + i]].nb;
+        scores[(uint64_t)(first + i) * nb_max + b] =
+                b < nb ? qsa_block_score(&qs[i * QW], &ks[threadIdx.x * QSA_BKS]) : -INFINITY;
     }
-    scores[(uint64_t)blockIdx.y * nb_max + b] = out;
 }
 
 /* ---- the selection ascending (bitonic, 512 in smem) --------------------------- */
@@ -548,6 +562,7 @@ __global__ void qsa_sel_tap_kernel(const qsa_row *rows, const uint32_t *sel, uin
 struct qsa_ws {
     qsa_row  *rows;
     uint32_t *list;
+    uint32_t *groups;
     float    *q;
     float    *iq;
     uint32_t *sel;
@@ -583,6 +598,7 @@ static qsa_ws qsa_ws_layout(uint8_t *base, uint32_t n_rows, uint32_t max_ctx) {
     auto take = [&](uint64_t bytes) { uint8_t *p = base ? base + off : nullptr; off += qsa_up(bytes); return p; };
     w.rows   = (qsa_row *)take((uint64_t)n_rows * sizeof(qsa_row));
     w.list   = (uint32_t *)take((uint64_t)n_rows * sizeof(uint32_t));
+    w.groups = (uint32_t *)take((uint64_t)n_rows * sizeof(uint32_t));
     w.q      = (float *)take((uint64_t)n_rows * PULSAR_QSA_N_HEAD * PULSAR_QSA_HEAD_DIM * sizeof(float));
     w.iq     = (float *)take((uint64_t)n_rows * PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float));
     w.sel    = (uint32_t *)take((uint64_t)n_rows * PULSAR_QSA_TOP_BLOCKS * sizeof(uint32_t));
@@ -719,8 +735,18 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         const uint32_t gn = std::min(pass_rows, n_select - g0);
         uint32_t nb_max = 0;
         for (uint32_t i = 0; i < gn; i++) nb_max = std::max(nb_max, h_rows[h_list[g0 + i]].nb);
-        dim3 grid((nb_max + QSA_SCORE_BLK - 1u) / QSA_SCORE_BLK, gn);
-        qsa_score_kernel<<<grid, QSA_SCORE_BLK>>>(ws.rows, ws.list + g0, ws.iq, ws.scores, nb_max);
+        /* row groups: consecutive listed rows of one sequence, at most QSA_SCORE_ROWS */
+        std::vector<uint32_t> grp;
+        for (uint32_t i = 0; i < gn; i++) {
+            if (!grp.empty()) {
+                const uint32_t f = grp.back() >> 8, c = grp.back() & 0xffu;
+                if (c < QSA_SCORE_ROWS && row_seq[h_list[g0 + f]] == row_seq[h_list[g0 + i]]) { grp.back()++; continue; }
+            }
+            grp.push_back((i << 8) | 1u);
+        }
+        if (!cuda_ok(cudaMemcpyAsync(ws.groups, grp.data(), grp.size() * 4u, cudaMemcpyHostToDevice), "qsa groups upload")) return 0;
+        dim3 grid((nb_max + QSA_SCORE_BLK - 1u) / QSA_SCORE_BLK, (uint32_t)grp.size());
+        qsa_score_kernel<<<grid, QSA_SCORE_BLK>>>(ws.rows, ws.list + g0, ws.groups, ws.iq, ws.scores, nb_max);
         if (!cuda_ok(cudaGetLastError(), "qsa score launch")) return 0;
         pulsar_gpu_tensor sc{}, tk{};
         sc.ptr = ws.scores; sc.bytes = (uint64_t)gn * nb_max * sizeof(float);
