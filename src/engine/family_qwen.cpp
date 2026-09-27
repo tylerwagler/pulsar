@@ -561,9 +561,12 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     }
     const uint64_t rows = max_rows;
     if (ok) {
-        st->streams  = pulsar_gpu_tensor_alloc(rows * pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE);
-        st->x        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_ACT_ELT_SIZE);
-        st->y        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_ACT_ELT_SIZE);
+        /* Tagged with their format, so a consumer derives the type from the
+         * tensor and a widening reader refuses what it cannot read. */
+        st->streams  = pulsar_gpu_tensor_alloc_elt(rows * pulsar_qwen_hc_dim(s), PULSAR_QWEN_STREAM_ELT_SIZE,
+                                                   PULSAR_QWEN_STREAM_ELT_FMT);
+        st->x        = pulsar_gpu_tensor_alloc_elt(rows * s->n_embd, PULSAR_QWEN_ACT_ELT_SIZE, PULSAR_QWEN_ACT_ELT_FMT);
+        st->y        = pulsar_gpu_tensor_alloc_elt(rows * s->n_embd, PULSAR_QWEN_ACT_ELT_SIZE, PULSAR_QWEN_ACT_ELT_FMT);
         st->logits   = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * s->n_vocab * sizeof(float));
         st->row_pos  = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
         st->row_bank = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));

@@ -254,10 +254,26 @@ static inline uint64_t pulsar_qwen_index_tail_bytes(const pulsar_qwen_shape *s) 
 static inline uint64_t pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
     return (uint64_t)pulsar_qwen_ple_conv_state_len(s) * pulsar_qwen_hc_dim(s) * sizeof(float);
 }
-/** Activation slot formats (the ops' shared contract; f32 until a producer
- * narrows one -- then the producer changes the element size here). */
-#define PULSAR_QWEN_STREAM_ELT_SIZE 4u   ///< streams [rows][n_hc][n_embd], f32
-#define PULSAR_QWEN_ACT_ELT_SIZE    4u   ///< x, y [rows][n_embd], f32
+/** THE Qwen activation format (Tyler 2026-09-27, rows/L251.md "Qwen activations
+ * are BF16, not E4M3 A8"): a family property, not a flag.  Qwen's source runs
+ * BF16 activations, so E4M3 A8 would be an added approximation (on the dense
+ * Linears the larger error term); DeepSeek keeps A8 because A8 IS its source.
+ * Every Qwen Linear input is BF16 -- there is no E4M3 activation slot in this
+ * family, and an op that wants one is a numerics change graded against the
+ * reference (rule 7), not a consumer-side convert (rule 3).  The EXL3 dense
+ * arm's prep reads BF16 into its fp16 hi/lo planes; the expert arm reads BF16.
+ * The slots between ops (x = GR read -> mixer / MoE, y = mixer / MoE -> GR
+ * write) carry this format; their producers (S4 for x, S2/S3/S4 for y) write
+ * it, and op-internal Linear inputs (out_proj, o_proj, the experts' down) follow
+ * the same rule inside each op. */
+#define PULSAR_QWEN_ACT_ELT_FMT     PULSAR_ELT_BF16
+#define PULSAR_QWEN_ACT_ELT_SIZE    2u   ///< x, y [rows][n_embd], bf16
+static_assert(PULSAR_QWEN_ACT_ELT_SIZE == 2u, "PULSAR_QWEN_ACT_ELT_FMT is bf16: 2 bytes per element");
+/** The residual streams (S4, gated residual): f32 until S4 decides its storage
+ * as their producer (the source keeps them BF16; the paper stores FP8 -- a
+ * graded change either way).  Not a Linear input. */
+#define PULSAR_QWEN_STREAM_ELT_FMT  PULSAR_ELT_F32
+#define PULSAR_QWEN_STREAM_ELT_SIZE 4u   ///< streams [rows][n_hc][n_embd]
 /** Rows the head may emit per step (the logits slab): the batched lane's bound. */
 #define PULSAR_QWEN_HEAD_ROWS_MAX   16u
 
@@ -295,8 +311,8 @@ typedef struct pulsar_qwen_state {
     pulsar_qwen_layer_state layer[PULSAR_FAMILY_MAX_LAYER];
     /* per-step activation slots (rows <= max_rows) */
     pulsar_gpu_tensor *streams;     ///< [max_rows][n_hc][n_embd] PULSAR_QWEN_STREAM_ELT_SIZE
-    pulsar_gpu_tensor *x;           ///< [max_rows][n_embd] block input (GR read -> mixer / MoE)
-    pulsar_gpu_tensor *y;           ///< [max_rows][n_embd] block output (mixer / MoE -> GR write)
+    pulsar_gpu_tensor *x;           ///< [max_rows][n_embd] PULSAR_QWEN_ACT_ELT_FMT block input (GR read -> mixer / MoE)
+    pulsar_gpu_tensor *y;           ///< [max_rows][n_embd] PULSAR_QWEN_ACT_ELT_FMT block output (mixer / MoE -> GR write)
     pulsar_gpu_tensor *logits;      ///< [PULSAR_QWEN_HEAD_ROWS_MAX][n_vocab] f32
     pulsar_gpu_tensor *row_pos;     ///< [max_rows] i32 positions
     pulsar_gpu_tensor *row_bank;    ///< [max_rows] i32 bank of each row
