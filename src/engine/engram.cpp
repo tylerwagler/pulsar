@@ -76,7 +76,6 @@ int pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t 
                              uint64_t n_rows_expected) {
     if (!t || !path) return 0;
     memset(t, 0, sizeof *t);
-    t->fd = -1;
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "pulsar: engram table %s: %s\n", path, strerror(errno));
@@ -109,20 +108,75 @@ int pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t 
         close(fd);
         return 0;
     }
-    t->fd = fd;
+    t->parts = (pulsar_engram_part *)xcalloc(1, sizeof *t->parts);
+    t->parts[0].fd = fd;
+    t->parts[0].base = PULSAR_ENGRAM_HDR_BYTES;
+    t->n_parts = 1;
+    t->rows_per_part = n_rows;
+    t->row_bytes = PULSAR_ENGRAM_ROW_BYTES;
     t->layer = layer;
     t->n_rows = n_rows;
     t->path = pulsar_strdup(path);
     return 1;
 }
 
+int pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
+                                   const char *const *paths, const uint64_t *bases,
+                                   uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows) {
+    if (!t) return 0;
+    memset(t, 0, sizeof *t);
+    if (!paths || !bases || n_parts == 0 || rows_per_part == 0 || row_bytes == 0 ||
+        n_rows == 0 || (n_rows + rows_per_part - 1) / rows_per_part != n_parts) {
+        fprintf(stderr, "pulsar: row table: %u parts of %llu rows cannot hold %llu rows -- refusing\n",
+                n_parts, (unsigned long long)rows_per_part, (unsigned long long)n_rows);
+        return 0;
+    }
+    t->parts = (pulsar_engram_part *)xcalloc(n_parts, sizeof *t->parts);
+    for (uint32_t i = 0; i < n_parts; i++) t->parts[i].fd = -1;
+    t->n_parts = n_parts;
+    t->rows_per_part = rows_per_part;
+    t->row_bytes = row_bytes;
+    t->layer = layer;
+    t->n_rows = n_rows;
+    t->path = pulsar_strdup(paths[0]);
+    for (uint32_t i = 0; i < n_parts; i++) {
+        if (!paths[i]) { pulsar_engram_table_close(t); return 0; }
+        for (uint32_t j = 0; j < i; j++)
+            if (strcmp(paths[j], paths[i]) == 0) { t->parts[i].fd = t->parts[j].fd; break; }
+        if (t->parts[i].fd < 0) {
+            t->parts[i].fd = open(paths[i], O_RDONLY | O_CLOEXEC);
+            if (t->parts[i].fd < 0) {
+                fprintf(stderr, "pulsar: row table part %u %s: %s\n", i, paths[i], strerror(errno));
+                pulsar_engram_table_close(t);
+                return 0;
+            }
+        }
+        const uint64_t rows = i + 1 < n_parts ? rows_per_part : n_rows - (uint64_t)i * rows_per_part;
+        struct stat st;
+        if (fstat(t->parts[i].fd, &st) != 0 || (uint64_t)st.st_size < bases[i] + rows * row_bytes) {
+            fprintf(stderr, "pulsar: row table part %u %s: %llu rows of %u B at offset %llu run past the file "
+                            "(%lld B) -- refusing\n", i, paths[i], (unsigned long long)rows, row_bytes,
+                    (unsigned long long)bases[i], (long long)st.st_size);
+            pulsar_engram_table_close(t);
+            return 0;
+        }
+        t->parts[i].base = bases[i];
+    }
+    return 1;
+}
+
 void pulsar_engram_table_close(pulsar_engram_table *t) {
     if (!t) return;
-    if (t->fd >= 0) close(t->fd);
+    for (uint32_t i = 0; t->parts && i < t->n_parts; i++) {
+        const int fd = t->parts[i].fd;
+        if (fd < 0) continue;
+        bool first = true;   /* parts share a file's fd: close each fd once */
+        for (uint32_t j = 0; j < i; j++) first &= t->parts[j].fd != fd;
+        if (first) close(fd);
+    }
+    free(t->parts);
     free(t->path);
-    t->fd = -1;
-    t->path = NULL;
-    t->n_rows = 0;
+    memset(t, 0, sizeof *t);
 }
 
 /* ---- the pread pool ----------------------------------------------------------
@@ -178,13 +232,16 @@ static void *engram_io_worker(void *arg) {
         uint64_t first_bad = 0;
         for (uint32_t i = i0; i < i1; i++) {
             const uint64_t r = g->rows[i];
-            unsigned char *d = g->dst + (uint64_t)i * PULSAR_ENGRAM_ROW_BYTES;
-            int ok = r < g->table->n_rows;
+            const pulsar_engram_table *tb = g->table;
+            const uint32_t rb = tb->row_bytes;
+            unsigned char *d = g->dst + (uint64_t)i * rb;
+            int ok = r < tb->n_rows;
             if (ok) {
-                const off_t off = (off_t)(PULSAR_ENGRAM_HDR_BYTES + r * PULSAR_ENGRAM_ROW_BYTES);
+                const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
+                const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
                 size_t got = 0;
-                while (ok && got < PULSAR_ENGRAM_ROW_BYTES) {
-                    const ssize_t n = pread(g->table->fd, d + got, PULSAR_ENGRAM_ROW_BYTES - got, off + (off_t)got);
+                while (ok && got < rb) {
+                    const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);
                     if (n <= 0) { if (n < 0 && errno == EINTR) continue; ok = 0; break; }
                     got += (size_t)n;
                 }
@@ -235,7 +292,7 @@ void pulsar_engram_io_destroy(pulsar_engram_io *io) {
 pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
                                                  const uint64_t *rows, uint32_t n_rows,
                                                  unsigned char *dst) {
-    if (!io || !t || t->fd < 0 || !rows || !dst || n_rows == 0) return NULL;
+    if (!io || !t || !t->parts || !rows || !dst || n_rows == 0) return NULL;
     pulsar_engram_gather *g = (pulsar_engram_gather *)xcalloc(1, sizeof *g);
     g->io = io;
     g->table = t;

@@ -482,19 +482,35 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  * A pool of pread threads (the box has no liburing) serves gathers; a gather
  * is issued ahead of the layer that needs it and waited on there, which is the
  * whole point of hashing on the host.  Open asserts the header against the
- * layout's row count; a mismatch is a wrong table, refused. */
+ * layout's row count; a mismatch is a wrong table, refused.
+ *
+ * The same pool and table serve Qwen3.8-Flash-Next's PLE n-gram table (L251,
+ * src/engine/qwen_ngram.h): 320M rows of 160 bf16 held as 128 row-contiguous
+ * tensors spread over the checkpoint's shard files.  So a table is a list of
+ * PARTS -- (file, byte offset of the part's row 0) -- of `rows_per_part` rows
+ * each (the last may be shorter), with one record size; an Engram row file is
+ * the one-part case (offset 64, 264-byte records). */
 #define PULSAR_ENGRAM_ROW_BYTES 264u
 #define PULSAR_ENGRAM_HDR_BYTES 64u
 #define PULSAR_ENGRAM_IO_THREADS 16u
 
+/** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
+typedef struct {
+    int fd;                 ///< shared by the parts that live in one file
+    uint64_t base;          ///< byte offset of the part's first row
+} pulsar_engram_part;
+
 typedef struct pulsar_engram_table {
-    int fd;                 ///< the row file, or -1 when closed
-    uint32_t layer;         ///< the model layer this table serves
-    uint64_t n_rows;        ///< rows in the file, == layout num_embeddings[hash index]
-    char *path;             ///< owned copy, for messages
+    pulsar_engram_part *parts;  ///< n_parts ranges, owned; NULL when closed
+    uint32_t n_parts;
+    uint64_t rows_per_part;     ///< rows in every part but possibly the last
+    uint32_t row_bytes;         ///< bytes per row record (and per row of a gather's dst)
+    uint32_t layer;             ///< the model layer this table serves
+    uint64_t n_rows;            ///< rows in the table, == the layout's row count
+    char *path;                 ///< owned copy of the first file's path, for messages
 } pulsar_engram_table;
 
-/** A gather in flight: `rows` row ids -> `dst` (n_rows x 264 bytes, caller-owned,
+/** A gather in flight: `rows` row ids -> `dst` (n_rows x row_bytes, caller-owned,
  * must outlive the wait).  Completion is observed with pulsar_engram_gather_wait,
  * which returns 1 when every row landed and 0 with the failure printed. */
 typedef struct pulsar_engram_gather pulsar_engram_gather;
@@ -504,6 +520,13 @@ typedef struct pulsar_engram_io pulsar_engram_io;
 
 int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t layer,
                               uint64_t n_rows_expected);
+/** A table of `n_parts` row-contiguous parts in existing files (a part's file
+ * must hold `rows_per_part` rows -- fewer for the last -- of `row_bytes` at
+ * `bases[i]`; checked against the file size).  Paths may repeat: each distinct
+ * file is opened once.  1 = open. */
+int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
+                                    const char *const *paths, const uint64_t *bases,
+                                    uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows);
 void pulsar_engram_table_close(pulsar_engram_table *t);
 pulsar_engram_io *pulsar_engram_io_create(uint32_t n_threads);
 void pulsar_engram_io_destroy(pulsar_engram_io *io);

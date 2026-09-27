@@ -228,7 +228,7 @@ static int qwen_section(void) {
                 const int pair = rp.ids_dst[col], e = rp.selected[pair];
                 dequant_expert(down[e], MID, K, k2, wd);
                 std::vector<double> z;
-                ref_gemv(wd, MID, K, apd.x.data() + (size_t)pair * MID, nullptr, false, z);
+                ref_gemv(wd, MID, K, apd.x.data() + (size_t)rp.ids_tok[col] * MID, nullptr, false, z);   /* make_acts rows are per TOKEN */
                 double sc;
                 w4 = fmax(w4, max_rel(pd, z, (size_t)pair * K, K, &sc));
             }

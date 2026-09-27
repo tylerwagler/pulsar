@@ -121,6 +121,13 @@ tests/dspark_batch_gate
 /tests/exl3_dense_gate
 /tests/exl3_dense_bench
 /tests/exl3_dense_xcheck
+/tests/engram_table_test
+/tests/qwen_ngram_test
+/tests/qwen_moe_gate
+/tests/qwen_gr_gate
+/tests/qwen_ple_gate
+/tests/qwen_xcheck
+/tests/qwen_bench
 /tests/moe_route_bounds_gate
 /tests/vision_codec_gate
 /tests/vision_hc_gate

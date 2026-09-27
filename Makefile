@@ -589,6 +589,22 @@ engram-table-check: tests/engram_table_test
 	./tests/engram_table_test tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
 	./tests/engram_table_test tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
 
+# L251 S4: Qwen3.8-Flash-Next's PLE n-gram ids vs transformers' own module, bit-exact,
+# whole-sequence and chunked (decode steps), plus the row gather over the checkpoint's
+# 128 shard tensors through the Engram pool -- HOST ONLY.  Vectors from
+# tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
+# sparky; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
+QWEN_NGRAM_VECTORS ?= /srv/models/qwen-s4/ngram-corpus.vec
+tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/engine/qwen_ngram.h \
+                       src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
+                       src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp \
+		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
+.PHONY: qwen-ngram-test
+qwen-ngram-test: tests/qwen_ngram_test
+	./tests/qwen_ngram_test tests/test-vectors/qwen-ngram-small.vec --no-rows
+	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS)
+
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
 # mode rows are checkable with no model and no device.  The arrays in the test are

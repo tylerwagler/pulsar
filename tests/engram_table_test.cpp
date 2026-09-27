@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     CHECK(!pulsar_engram_table_open(&t, path, layer + 1u, n_rows), "a wrong-layer open is refused (the message above is expected)");
     CHECK(!pulsar_engram_table_open(&t, path, layer, n_rows + 1u), "a wrong-row-count open is refused (the message above is expected)");
     if (!pulsar_engram_table_open(&t, path, layer, n_rows)) { CHECK(0, "open %s", path); return 1; }
-    CHECK(t.n_rows == n_rows && t.fd >= 0, "open: %s (%llu rows)", path, (unsigned long long)t.n_rows);
+    CHECK(t.n_rows == n_rows && t.n_parts == 1 && t.parts[0].fd >= 0 && t.row_bytes == PULSAR_ENGRAM_ROW_BYTES, "open: %s (%llu rows)", path, (unsigned long long)t.n_rows);
 
     pulsar_engram_io *io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
     if (!io) { CHECK(0, "io pool"); return 1; }
