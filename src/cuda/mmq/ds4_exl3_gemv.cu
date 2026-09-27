@@ -54,7 +54,7 @@ constexpr int kMaxR   = 16;    ///< the widest row block
  * each rotating the input by its own suh (DeepSeek's split stacks); FUSED = one
  * projection that rotates the input by its suh (Qwen's fused gate_up, whose
  * output rows are gate | up). */
-constexpr int kDown = DS4_EXL3_DOWN, kPair = DS4_EXL3_PAIR, kFused = DS4_EXL3_GATE_UP_FUSED;
+constexpr int kDown = EXL3_ARM_DOWN, kPair = EXL3_ARM_PAIR, kFused = EXL3_ARM_GATE_UP_FUSED;
 /* ---------------------------------------------------------------------- */
 /* the GEMV                                                                */
 
@@ -522,13 +522,9 @@ static void exl3_gemv_dispatch_r(int R, const dim3 &grid, const dim3 &block, cud
     }
 }
 
-/* The rates each kind instantiates -- the ones a container carries: DeepSeek's
- * split stacks at 2 / 2.5 / 3 (PAIR + DOWN), Qwen's fused gate_up and its down
- * at 4 / 5 (FUSED + DOWN).  One table; the dispatch below and the public
- * predicate both read it. */
-constexpr bool kind_has_rate(int mode, int k2) {
-    return (mode != kFused && (k2 == 4 || k2 == 5 || k2 == 6)) || (mode != kPair && (k2 == 8 || k2 == 10));
-}
+/* The rates each kind instantiates: exl3_arm_has_rate (exl3_trellis.h), the
+ * one table the binders read too. */
+constexpr bool kind_has_rate(int mode, int k2) { return exl3_arm_has_rate(mode, k2); }
 
 template <int MODE>
 static bool exl3_gemv_dispatch_k2(int k2, int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
@@ -587,7 +583,7 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
 } // namespace
 
 bool ds4_exl3_gemv_rate_supported(int kind, int k2) {
-    return (kind == kDown || kind == kPair || kind == kFused) && kind_has_rate(kind, k2);
+    return (kind == kDown || kind == kPair || kind == kFused) && exl3_arm_has_rate(kind, k2);
 }
 
 int ds4_exl3_moe_gemv_pair_launch(const void *gate_table, const void *up_table, int k2, const void *act,

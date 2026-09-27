@@ -297,7 +297,7 @@ exl3_dense_epilogue_kernel(const float *__restrict__ part, const __half *__restr
 
 } // namespace
 
-bool ds4_exl3_dense_rate_supported(int k2) { return k2 == 4 || k2 == 6 || k2 == 8 || k2 == 10; }
+bool ds4_exl3_dense_rate_supported(int k2) { return exl3_arm_has_rate(EXL3_ARM_DENSE, k2); }
 
 int ds4_exl3_dense_splits(int K, int N) {
     if (K <= 0 || N <= 0 || K % EXL3_HAD_BLOCK || N % EXL3_HAD_BLOCK) return 0;

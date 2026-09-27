@@ -230,9 +230,14 @@ static void tensor_expect_plain_layout(
  * old artifact now fails to load with a clear message instead of dispatching
  * into a reader that no longer exists. */
 static bool tensor_is_routed_expert_type(uint32_t type) {
+    /* EXL3: the rates the DeepSeek arm reads for its split gate / up stacks AND
+     * its down (exl3_arm_has_rate, the one table) -- Qwen's K = 4 / 5 stacks are
+     * the Qwen family's, and a DeepSeek artifact carrying them is refused here,
+     * at load, not by the kernel at first use. */
+    const int k2 = exl3_type_k2(type);
     return type == PULSAR_TENSOR_IQ2_XXS_MMQ_K ||
            type == PULSAR_TENSOR_CUTLASS_MXFP4 ||
-           exl3_type_k2(type) != 0;
+           (k2 != 0 && exl3_arm_has_rate(EXL3_ARM_PAIR, k2) && exl3_arm_has_rate(EXL3_ARM_DOWN, k2));
 }
 
 
@@ -1104,6 +1109,8 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_EXL3M_K2:
     case PULSAR_TENSOR_EXL3M_K2H:
     case PULSAR_TENSOR_EXL3M_K3:
+    case PULSAR_TENSOR_EXL3M_K4:
+    case PULSAR_TENSOR_EXL3M_K5:
         return true;
     default:
         return false;
@@ -1214,7 +1221,7 @@ static void e8m0_scan_blocks(
 static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
     uint64_t trellis = 0, scales = 0, stride = 0;
     if (!exl3_expert_layout(t->dim[0], t->dim[1], exl3_type_k2(t->type), &trellis, &scales, &stride)) return;
-    const uint64_t n_exp = t->dim[2];
+    const uint64_t n_exp = t->ndim >= 3 ? t->dim[2] : 1;   /* a dense Linear is one slice */
     if (n_exp == 0 || stride > t->bytes / n_exp) return;
     const uint8_t *map = t->ext_map ? t->ext_map : m->map;
     const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
@@ -1263,7 +1270,9 @@ static void weights_reject_bad_e8m0(const pulsar_model *m) {
         case PULSAR_TENSOR_EXL3M_K2:
         case PULSAR_TENSOR_EXL3M_K2H:
         case PULSAR_TENSOR_EXL3M_K3:
-            if (t->ndim < 3) break;
+        case PULSAR_TENSOR_EXL3M_K4:
+        case PULSAR_TENSOR_EXL3M_K5:
+            if (t->ndim < 2) break;
             exl3_scan_scales(m, t);
             break;
         default:

@@ -279,7 +279,7 @@ int ds4_mmq_moe_impl(
          * (the same sorted pairs and E4M3 staging feed it). */
         int             exl3_k2    = 0,
         /* L251: the EXL3 slice is a fused gate_up that rotates its own input
-         * (DS4_EXL3_GATE_UP_FUSED) rather than a down on a pre-rotated one. */
+         * (EXL3_ARM_GATE_UP_FUSED) rather than a down on a pre-rotated one. */
         bool            exl3_fused = false) {
 
     if (!W || !ids || !out_f32) {
@@ -850,7 +850,7 @@ extern "C" int ds4_exl3_moe_pair(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_pair: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }
@@ -865,7 +865,7 @@ extern "C" int ds4_exl3_moe_single(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_single: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }
@@ -879,7 +879,7 @@ extern "C" int ds4_exl3_moe_fused(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
         K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_fused: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;

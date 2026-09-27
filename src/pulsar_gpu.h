@@ -287,7 +287,7 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  *
  * A payload's storage is declared BY NAME in the container ("native" plus its
  * dtype, "mxfp8_lt", "iq2_xxs_mmq_k", "cutlass_mxfp4", "fp8_e4m3_soa_k",
- * "exl3m_k2" / "exl3m_k2h" / "exl3m_k3") and
+ * "exl3m_k2" / "exl3m_k2h" / "exl3m_k3" / "exl3m_k4" / "exl3m_k5") and
  * resolved to one of these ids exactly once, at load (st_layout_type).  The
  * numbers used to be ggml's, which meant the engine's storage vocabulary came
  * from a project it no longer speaks to -- and types it can only REFUSE (q8_0,
@@ -333,6 +333,11 @@ enum {
     PULSAR_TENSOR_EXL3M_K2 = 7,          /* K = 2   */
     PULSAR_TENSOR_EXL3M_K2H = 8,         /* K = 2.5 */
     PULSAR_TENSOR_EXL3M_K3 = 9,          /* K = 3   */
+    /* L251: Qwen3.8-Flash-Next's rates -- routed experts (fused gate_up + down)
+     * at K = 4, every EXL3-able dense Linear at K = 5 (the U-e4-d5 recipe).
+     * Same byte model; a dense Linear is the one-slice case. */
+    PULSAR_TENSOR_EXL3M_K4 = 10,         /* K = 4   */
+    PULSAR_TENSOR_EXL3M_K5 = 11,         /* K = 5   */
     PULSAR_TENSOR_TYPE_COUNT
 };
 

@@ -259,9 +259,10 @@ static int qwen_section(void) {
                   "k2=7 was accepted");
             CHECK(ds4_exl3_moe_gemv_fused_launch(sgu.table, 6, d_act, d_ids, d_bounds, d_zgu, GU, K, r.n_assign, E, 0) != 0,
                   "fused at K=3 was accepted (no container carries it)");
-            CHECK(ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, 8) && ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, 10) &&
-                  !ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, 8) && !ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, 6) &&
-                  ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, 6) && !ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, 7),
+            CHECK(ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, 8) && ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, 10) &&
+                  !ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, 8) && !ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, 6) &&
+                  ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, 6) && !ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, 7) &&
+                  !ds4_exl3_gemv_rate_supported(EXL3_ARM_DENSE, 8),
                   "the per-kind rate table");
             printf("  refusals: K=704, k2=7, fused at K=3 -- refused; the per-kind rate table holds\n");
         }

@@ -222,7 +222,31 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
     case PULSAR_TENSOR_EXL3M_K2:  return 4;
     case PULSAR_TENSOR_EXL3M_K2H: return 5;
     case PULSAR_TENSOR_EXL3M_K3:  return 6;
+    case PULSAR_TENSOR_EXL3M_K4:  return 8;
+    case PULSAR_TENSOR_EXL3M_K5:  return 10;
     default:                      return 0;
+    }
+}
+
+/**
+ * The EXL3 arms and the rates each reads -- the ONE table, used by the CUDA
+ * arms' dispatch (mmq/ds4_exl3_gemv.cu, which instantiates exactly these) and
+ * by the binders that admit a container's tensors (a rate no arm reads is
+ * refused at load, not at first use):
+ *   DOWN   a routed down on the fold's pre-rotated mid: 2, 2.5, 3 (DeepSeek /
+ *          V4.1) and 4, 5 (Qwen3.8-Flash-Next)
+ *   PAIR   split gate / up stacks, each rotating its own input (DeepSeek): 2, 2.5, 3
+ *   GATE_UP_FUSED   one [in -> 2 mid] gate | up slice (Qwen): 4, 5
+ *   DENSE  the dense-Linear arm (mmq/ds4_exl3_dense.cuh): 2, 3, 4, 5
+ */
+enum { EXL3_ARM_DOWN = 0, EXL3_ARM_PAIR = 1, EXL3_ARM_GATE_UP_FUSED = 2, EXL3_ARM_DENSE = 3 };
+EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
+    switch (arm) {
+    case EXL3_ARM_DOWN:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10;
+    case EXL3_ARM_PAIR:          return k2 == 4 || k2 == 5 || k2 == 6;
+    case EXL3_ARM_GATE_UP_FUSED: return k2 == 8 || k2 == 10;
+    case EXL3_ARM_DENSE:         return k2 == 4 || k2 == 6 || k2 == 8 || k2 == 10;
+    default:                     return false;
     }
 }
 

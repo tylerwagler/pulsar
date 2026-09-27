@@ -17,15 +17,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** The GEMV kinds.  DOWN: one projection whose input the fold already rotated.
- *  PAIR: gate and up from two slices (DeepSeek's split stacks), each rotating
- *  the input by its own suh.  GATE_UP_FUSED: one [in -> 2 mid] slice whose
- *  output rows are gate | up (Qwen3.8-Flash-Next, L251), rotating the input by
- *  its suh. */
-enum { DS4_EXL3_DOWN = 0, DS4_EXL3_PAIR = 1, DS4_EXL3_GATE_UP_FUSED = 2 };
+#include "engine/exl3_trellis.h"   /* EXL3_ARM_*: the kinds and their rates */
 
-/** True when the kind instantiates rate `k2` (half-bit units): PAIR and DOWN
- *  at K = 2, 2.5, 3 (DeepSeek / V4.1), GATE_UP_FUSED and DOWN at 4, 5 (Qwen). */
+/** The GEMV kinds are exl3_trellis.h's arms: EXL3_ARM_DOWN (one projection
+ *  whose input the fold already rotated), EXL3_ARM_PAIR (gate and up from two
+ *  slices -- DeepSeek's split stacks -- each rotating the input by its own suh),
+ *  EXL3_ARM_GATE_UP_FUSED (one [in -> 2 mid] slice whose output rows are
+ *  gate | up -- Qwen3.8-Flash-Next, L251 -- rotating the input by its suh).
+ *  True when the kind instantiates rate `k2` (exl3_arm_has_rate, the one table). */
 bool ds4_exl3_gemv_rate_supported(int kind, int k2);
 
 /** gate/up: out_gate / out_up [n_assign][M] f32 = the UNROTATED z of each

@@ -158,7 +158,7 @@ int ds4_exl3_moe_single(
     const void    * act_sf,
     int             act_kbp);
 
-/* L251: the fused gate_up twin (DS4_EXL3_GATE_UP_FUSED): one [trellis, scales]
+/* L251: the fused gate_up twin (EXL3_ARM_GATE_UP_FUSED): one [trellis, scales]
  * table whose slice is [K -> M = 2 mid], gate rows then up rows; the input is
  * rotated in-kernel by the slice's suh.  out = the unrotated z per pair; the
  * fused fold (ds4_exl3_moe_fold_fused_launch) takes it from there. */
