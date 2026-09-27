@@ -2216,6 +2216,19 @@ tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(C
 tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
+# BF16 streamed reference.  Needs a real container and the anchors on disk:
+#   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
+QWEN_REF_MODEL ?= $(HOME)/qwen-container
+QWEN_REF_DIR   ?= $(HOME)/ref-qwen38fn
+tests/qwen_ref_gate.o: tests/qwen_ref_gate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_ref_gate: tests/qwen_ref_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: qwen-ref-gate
+qwen-ref-gate: tests/qwen_ref_gate
+	@./tests/qwen_ref_gate $(QWEN_REF_MODEL) $(QWEN_REF_DIR)
+
 tests/vision_layout_gate: tests/vision_layout_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
