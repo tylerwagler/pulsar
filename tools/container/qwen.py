@@ -20,7 +20,13 @@ What the container holds (the loader's contract, published in pulsar-notes resea
     `entry_name` (the per-expert name with "{e}") and `layer`, because the DeepSeek rule the engine derives names
     by (`layers.%d.ffn.experts.%llu.%s.weight` from `blk.N.`) does not describe these names.
   * gguf_name == the HF name (dense) / the HF stack name `...mlp.experts.<part>` (families): the Qwen family binds
-    by the checkpoint's own names -- no second name table.
+    by the checkpoint's own names -- no second name table.  A family materialises as one tensor of dims
+    dims_per_expert_ne + [n_experts] = the HF stack shape reversed.
+  * pulsar.kv (S1's contract, src/engine/family_qwen.h section 2): general.architecture = "qwen4_exp"; the HF
+    text_config VERBATIM under `qwen4_exp.` (config_kvs); the PLE int64 buffers as u64 arrays
+    qwen4_exp.ple_{layer_multipliers,ngram_heads_vocab_sizes,ngram_heads_offsets}; the builder's own facts under
+    `pulsar.*` (recipe + sha256, sources, expert_gate_up, mtp/vision presence, the PLE row file's name, rows,
+    record bytes, dtype and SHA-256); the tokenizer from the checkpoint's own files.
   * layouts: bf16 (native), mxfp8_lt (U8, E4M3 [out][in] + swizzled E8M0, padded per bytes_for), exl3m_k4 /
     exl3m_k5 (U8 [trellis | suh | svh], dims_ne [in, out]).  Declared shapes are the SOURCE shapes (no reshapes).
   * shards: `vision` (primary: pulsar.kv + the vision tower, BF16 native), `layers.0..47`, `top` (embed, head,
@@ -29,9 +35,11 @@ What the container holds (the loader's contract, published in pulsar-notes resea
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import struct
 
 from hf_source import EXL3_MUL1  # noqa: F401  (the codebook the EXL3 sources are checked against)
 import kv as KV
@@ -65,7 +73,7 @@ class Recipe:
         for pat, fmt in self.rows:
             if fmt not in FORMATS:
                 raise SystemExit(f"{path}: row {pat!r} names format {fmt!r} ({sorted(FORMATS)})")
-        self.sha256 = __import__("hashlib").sha256(open(path, "rb").read()).hexdigest()
+        self.sha256 = hashlib.sha256(open(path, "rb").read()).hexdigest()
 
     def resolve(self, names):
         """name -> format for every checkpoint name, refusing unnamed / doubly-named tensors and dead rows."""
@@ -231,16 +239,55 @@ def _plan_experts(hf, src, recipe, stack_name, layout, shard):
 # ---------------------------------------------------------------------------
 # pulsar.kv
 # ---------------------------------------------------------------------------
+def config_kvs(prefix, value, out):
+    """The HF text_config -> (key, type, value) triples, mechanically (S1's contract, family_qwen.h section 2):
+    every key verbatim under `prefix`, nested dicts flattened with '.', None and empty lists skipped (nothing to
+    type); bool -> bool, int -> u32 (u64 past 2^32, i64 if negative), float -> f32, str -> string, a list of str
+    -> string array, a list of non-negative int -> u32 array (u64 past 2^32).  Anything else refuses."""
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            config_kvs(f"{prefix}.{k}", v, out)
+    elif isinstance(value, bool):
+        out.append((prefix, "bool", value))
+    elif isinstance(value, int):
+        out.append((prefix, "u32" if 0 <= value <= 0xFFFFFFFF else "u64" if value >= 0 else "i64", value))
+    elif isinstance(value, float):
+        out.append((prefix, "f32", value))
+    elif isinstance(value, str):
+        out.append((prefix, "string", value))
+    elif isinstance(value, list):
+        if not value:
+            return
+        if all(isinstance(v, str) for v in value):
+            out.append((prefix, "array", ("string", list(value))))
+        elif all(isinstance(v, int) and not isinstance(v, bool) for v in value) and min(value) >= 0:
+            out.append((prefix, "array", ("u64" if max(value) > 0xFFFFFFFF else "u32", list(value))))
+        else:
+            raise SystemExit(f"{prefix}: unsupported list {value!r}")
+    else:
+        raise SystemExit(f"{prefix}: unsupported config value {value!r}")
+
+
+# the three int64 buffers HF keeps under ple.ple_embedding: config, not weights (S1's contract names)
+PLE_BUFFERS = {"layer_multipliers": "ple_layer_multipliers",
+               "ngram_heads_vocab_sizes": "ple_ngram_heads_vocab_sizes",
+               "ngram_heads_offsets": "ple_ngram_heads_offsets"}
+
+
 def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
-    c = hf.config                       # text_config merged by HFCheckpoint
-    top = c["top_level"]
-    rp = c["rope_parameters"]
-    A = "qwen4_exp"
-    L = int(c["num_hidden_layers"])
-    types = list(c["layer_types"])
+    """pulsar.kv for qwen4_exp: `general.*`; the text_config verbatim under `qwen4_exp.` (config_kvs); the PLE
+    buffers as u64 arrays; the builder's own facts under `pulsar.*` (recipe, sources, the PLE row file the
+    table must match); the tokenizer from the checkpoint's own files."""
+    top = hf.config["top_level"]
+    text = top["text_config"]
+    A = FAMILY
+    L = int(text["num_hidden_layers"])
+    types = list(text["layer_types"])
     if len(types) != L or set(types) - {"linear_attention", "full_attention"}:
         raise SystemExit(f"layer_types: {len(types)} entries of {sorted(set(types))} for {L} layers")
-    ple_ids = list(c["ple_layer_ids"])
+    ple_ids = list(text["ple_layer_ids"])
     if len(ple_ids) != 1:
         raise SystemExit(f"ple_layer_ids {ple_ids}: one PLE layer expected")
     ple_layer = ple_ids[0] - 1          # 1-based in the config
@@ -248,74 +295,41 @@ def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
         raise SystemExit("the PLE row file is part of the model: pass --ple-rows MANIFEST (ple_rows.py build)")
     man = json.load(open(ple_manifest))
     pre = f"{PFX}layers.{ple_layer}.ple.ple_embedding."
-
-    def i64(name):
-        import struct
-        raw = hf.raw(name)
-        return list(struct.unpack(f"<{len(raw) // 8}q", raw))
-    offsets, sizes, mult = i64(pre + "ngram_heads_offsets"), i64(pre + "ngram_heads_vocab_sizes"), i64(pre + "layer_multipliers")
-    for k, v in (("head_offsets", offsets), ("head_vocab_sizes", sizes), ("layer_multipliers", mult),
-                 ("layer", ple_layer)):
-        if man.get(k) != v:
-            raise SystemExit(f"{ple_manifest}: {k} {man.get(k)} is not the checkpoint's {v} -- a different table")
-    eos = c["eos_token_id"]
     kvs = [
         ("general.architecture", "string", A),
         ("general.type", "string", "model"),
         ("general.name", "string", "Qwen3.8-Flash-Next"),
+    ]
+    config_kvs(A, text, kvs)
+    bufs = {}
+    for hf_key, key in PLE_BUFFERS.items():
+        name = pre + hf_key
+        if hf.dtype(name) != "I64":
+            raise SystemExit(f"{name}: dtype {hf.dtype(name)}, expected I64")
+        raw = hf.raw(name)
+        vals = list(struct.unpack(f"<{len(raw) // 8}q", raw))
+        if min(vals) < 0:
+            raise SystemExit(f"{name}: a negative value; the contract carries these as u64")
+        bufs[hf_key] = vals
+        kvs.append((f"{A}.{key}", "array", ("u64", vals)))
+    for mk, hk in (("head_offsets", "ngram_heads_offsets"), ("head_vocab_sizes", "ngram_heads_vocab_sizes"),
+                   ("layer_multipliers", "layer_multipliers")):
+        if man.get(mk) != bufs[hk]:
+            raise SystemExit(f"{ple_manifest}: {mk} {man.get(mk)} is not the checkpoint's {bufs[hk]} -- a different table")
+    if man.get("layer") != ple_layer:
+        raise SystemExit(f"{ple_manifest}: layer {man.get('layer')}; the checkpoint's PLE layer is {ple_layer} -- a different table")
+    kvs += [
         ("pulsar.recipe", "string", recipe.name),
         ("pulsar.recipe.sha256", "string", recipe.sha256),
-        (f"{A}.block_count", "u32", L),
-        (f"{A}.context_length", "u32", c["max_position_embeddings"]),
-        (f"{A}.embedding_length", "u32", c["hidden_size"]),
-        (f"{A}.vocab_size", "u32", c["vocab_size"]),
-        (f"{A}.layer_types", "array", ("string", types)),
-        (f"{A}.attention.layer_norm_rms_epsilon", "f32", c["rms_norm_eps"]),
-        (f"{A}.attention.head_count", "u32", c["num_attention_heads"]),
-        (f"{A}.attention.head_count_kv", "u32", c["num_key_value_heads"]),
-        (f"{A}.attention.key_length", "u32", c["head_dim"]),
-        (f"{A}.attention.value_length", "u32", c["head_dim"]),
-        (f"{A}.attention.output_gate", "string", c["output_gate_type"]),
-        (f"{A}.rope.freq_base", "f32", rp["rope_theta"]),
-        (f"{A}.rope.partial_rotary_factor", "f32", rp["partial_rotary_factor"]),
-        (f"{A}.rope.dimension_count", "u32", int(round(c["head_dim"] * rp["partial_rotary_factor"]))),
-        (f"{A}.rope.mrope_section", "array", ("u32", list(rp["mrope_section"]))),
-        (f"{A}.rope.mrope_interleaved", "bool", bool(rp["mrope_interleaved"])),
-        (f"{A}.rope.type", "string", rp["rope_type"]),
-        (f"{A}.indexer.head_count", "u32", c["indexer_n_heads"]),
-        (f"{A}.indexer.head_count_kv", "u32", c["indexer_kv_heads"]),
-        (f"{A}.indexer.key_length", "u32", c["indexer_head_dim"]),
-        (f"{A}.indexer.compress_ratio", "u32", c["indexer_compress_ratio"]),
-        (f"{A}.indexer.token_budget", "u32", c["indexer_budget"]),
-        (f"{A}.linear.key_head_count", "u32", c["linear_num_key_heads"]),
-        (f"{A}.linear.value_head_count", "u32", c["linear_num_value_heads"]),
-        (f"{A}.linear.key_length", "u32", c["linear_key_head_dim"]),
-        (f"{A}.linear.value_length", "u32", c["linear_value_head_dim"]),
-        (f"{A}.linear.conv_kernel", "u32", c["linear_conv_kernel_dim"]),
-        (f"{A}.linear.state_dtype", "string", c["mamba_ssm_dtype"]),
-        (f"{A}.hyper_connection.count", "u32", c["hc_count"]),
-        (f"{A}.hyper_connection.lowrank", "u32", c["hc_lowrank"]),
-        (f"{A}.expert_count", "u32", c["num_experts"]),
-        (f"{A}.expert_used_count", "u32", c["num_experts_per_tok"]),
-        (f"{A}.expert_feed_forward_length", "u32", c["moe_intermediate_size"]),
-        (f"{A}.expert_shared_feed_forward_length", "u32", c["shared_expert_intermediate_size"]),
-        (f"{A}.expert_gate_up", "string", recipe.gate_up),
-        (f"{A}.ple.layer", "u32", ple_layer),
-        (f"{A}.ple.embedding_length", "u32", c["ple_embed_dim"]),
-        (f"{A}.ple.conv_kernel", "u32", c["ple_conv_kernel_size"]),
-        (f"{A}.ple.ngram_size", "u32", c["ngram_size"]),
-        (f"{A}.ple.heads_per_ngram", "u32", c["heads_per_ngram"]),
-        (f"{A}.ple.eos_token_id", "u32", eos[0] if isinstance(eos, list) else eos),
-        (f"{A}.ple.head_offsets", "array", ("u64", offsets)),
-        (f"{A}.ple.head_vocab_sizes", "array", ("u64", sizes)),
-        (f"{A}.ple.layer_multipliers", "array", ("i64", mult)),
-        (f"{A}.ple.rows.file", "string", os.path.basename(ple_manifest)[:-len(".json")] + ".rows"),
-        (f"{A}.ple.rows.n_rows", "u64", man["n_rows"]),
-        (f"{A}.ple.rows.row_bytes", "u32", man["row_bytes"]),
-        (f"{A}.ple.rows.value_dtype", "string", man["value_dtype"]),
-        (f"{A}.ple.rows.sha256", "string", man["sha256"]),
-        (f"{A}.mtp.present", "bool", False),
-        (f"{A}.vision.present", "bool", "vision_config" in top),
+        ("pulsar.expert_gate_up", "string", recipe.gate_up),
+        ("pulsar.mtp_present", "bool", False),
+        ("pulsar.vision_present", "bool", "vision_config" in top),
+        ("pulsar.ple_rows.file", "string", os.path.basename(ple_manifest)[:-len(".json")] + ".rows"),
+        ("pulsar.ple_rows.layer", "u32", man["layer"]),
+        ("pulsar.ple_rows.n_rows", "u64", man["n_rows"]),
+        ("pulsar.ple_rows.row_bytes", "u32", man["row_bytes"]),
+        ("pulsar.ple_rows.value_dtype", "string", man["value_dtype"]),
+        ("pulsar.ple_rows.sha256", "string", man["sha256"]),
         ("general.sampling.top_p", "f32", hf.generation_config.get("top_p", 1.0)),
         ("general.sampling.top_k", "u32", hf.generation_config.get("top_k", 0)),
         ("general.sampling.temp", "f32", hf.generation_config.get("temperature", 1.0)),
@@ -328,7 +342,7 @@ def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):
-        raise SystemExit("duplicate kv key")
+        raise SystemExit("duplicate kv key: " + ", ".join(sorted(k for k in set(keys) if keys.count(k) > 1)))
     return out
 
 

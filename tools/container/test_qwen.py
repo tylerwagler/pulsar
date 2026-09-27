@@ -314,10 +314,14 @@ def main():
             (n,) = struct.unpack("<Q", f.read(8))
             meta = json.loads(f.read(n))["__metadata__"]
         kv = {e["key"]: e["value"] for e in json.loads(meta["pulsar.kv"])}
-        check(kv["general.architecture"] == "qwen4_exp" and kv["qwen4_exp.block_count"] == L
-              and kv["qwen4_exp.ple.layer"] == 1 and kv["qwen4_exp.mtp.present"] is False
+        check(kv["general.architecture"] == "qwen4_exp" and kv["qwen4_exp.num_hidden_layers"] == L
+              and kv["qwen4_exp.ple_layer_ids"]["v"] == [2] and kv["pulsar.ple_rows.layer"] == 1
+              and kv["qwen4_exp.rope_parameters.mrope_section"]["v"] == [11, 11, 10]
+              and kv["qwen4_exp.ple_ngram_heads_offsets"]["v"] == [0, 101, 204, 311]
+              and kv["qwen4_exp.ple_layer_multipliers"]["__array__"] == "u64"
+              and kv["pulsar.mtp_present"] is False
               and kv["qwen4_exp.layer_types"]["v"][3] == "full_attention",
-              "pulsar.kv carries the family, the layer plan, the PLE table facts")
+              "pulsar.kv: the family, text_config verbatim (flattened), the PLE buffers as u64, the row-file facts")
         with open(os.path.join(o1, "model-00003-of-00006.safetensors"), "rb") as f:   # layers.1
             (n,) = struct.unpack("<Q", f.read(8))
             h = json.loads(f.read(n))
