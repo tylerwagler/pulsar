@@ -57,6 +57,17 @@ def layout_of(name):
         return 'exl3m_k5'
     if '.layers.' in name and ('.input_mix_weight_down.' in name or '.input_mix_weight_up.' in name):
         return 'mxfp8_lt'
+    # S2's and S3's tensors, same authority (format-maps/qwen38fn-u-e4-d5.json):
+    # every EXL3-able dense Linear is exl3m_k5, the DeltaNet a/b and the indexer's
+    # index_qk_proj are mxfp8_lt, and the norms / conv1d / A_log / dt_bias stay
+    # bf16.  Without these the fixture left them bf16 and the EXL3 arm refused the
+    # step with "k2=0 is not an EXL3 layout" (2026-09-27).
+    if any(x in name for x in ('.linear_attn.in_proj_qkv.', '.linear_attn.in_proj_z.', '.linear_attn.out_proj.',
+                               '.self_attn.q_proj.', '.self_attn.k_proj.', '.self_attn.v_proj.', '.self_attn.o_proj.')):
+        return 'exl3m_k5'
+    if any(x in name for x in ('.linear_attn.in_proj_a.', '.linear_attn.in_proj_b.',
+                               '.self_attn.indexer.index_qk_proj.')):
+        return 'mxfp8_lt'
     return 'bf16'
 
 
