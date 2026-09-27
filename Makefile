@@ -518,6 +518,13 @@ tests/qwen_s4_gate: tests/qwen_s4_gate.cu $(QWEN_S4_HDRS) $(CUDA_OBJS) $(CUTLASS
 qwen-s4-gate: tests/qwen_s4_gate
 	./tests/qwen_s4_gate
 
+# L251 S4: the same launchers on REAL weights, driven by tools/qwen/s4_xcheck.py
+# (which compares them with transformers' modules and exllamav3's reconstruct).
+# Not a gate.
+tests/qwen_xcheck: tests/qwen_xcheck.cu $(QWEN_S4_HDRS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qwen_xcheck.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe
