@@ -129,6 +129,9 @@ tests/dspark_batch_gate
 /tests/qwen_ple_gate
 /tests/qwen_xcheck
 /tests/qwen_bench
+/tests/gdn_gate
+/tests/gdn_bench
+/tests/libpulsar_gdn.so
 /tests/moe_route_bounds_gate
 /tests/vision_codec_gate
 /tests/vision_hc_gate
