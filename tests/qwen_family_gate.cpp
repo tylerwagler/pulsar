@@ -90,12 +90,13 @@ static void host_part(const char *dir) {
           "PLE tables: odd multipliers, table 0 of %llu rows (> %llu), offsets contiguous",
           w ? (unsigned long long)w->ple_head_vocab[0] : 0ull, (unsigned long long)s->ngram_vocab_base);
 
-    /* The step refuses at the first op in forward order: with S4's ops present,
-     * gdn at layer 0 (S2). */
+    /* The op table is COMPLETE: S2's gdn and S3's qsa landed 2026-09-27, so the
+     * driver has no op left to name.  (A step still refuses -- the synthetic
+     * fixture's tensors are not the recipe's formats -- but no longer for a
+     * missing op; the probes below keep the walk's order honest.) */
     uint32_t at = 0;
     const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(&g_qwen_ops, p, s, &at);
-    check(miss == PULSAR_QWEN_OP_GDN && at == 0, "first missing op: %s at layer %u (owner %s)", pulsar_qwen_op_name(miss),
-          at, pulsar_qwen_op_owner(miss));
+    check(miss == PULSAR_QWEN_OP_COUNT, "the op table is complete: no missing op (got %s)", pulsar_qwen_op_name(miss));
     /* The walk's order is the forward's: with only embed present the next is
      * gr_read at layer 0; with every op but qsa present it is qsa at layer 3. */
     pulsar_qwen_ops probe;
