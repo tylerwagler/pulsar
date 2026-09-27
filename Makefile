@@ -487,6 +487,14 @@ tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/p
 qsa-attn-gate: tests/qsa_attn_gate
 	./tests/qsa_attn_gate
 
+# L251 S3: replay one real attention layer's captured projections through the
+# same entry point, for the offline grade against transformers (see the tool's
+# header).  Not a gate by itself: the grade lives with the capture script.
+tests/qsa_layer_replay: tests/qsa_layer_replay.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_layer_replay.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe
