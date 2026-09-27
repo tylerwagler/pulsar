@@ -258,6 +258,11 @@ extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const puls
     return ds4_exl3_dense_launch(l->w, l->k2, x->q, x->sf, y, rows, l->in, l->out, ws, ws_bytes, stream);
 }
 
+/* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh
+ * (g++ does not know __host__/__device__).  One authority: these delegate. */
+int pulsar_gpu_mx_kbp(int in_dim) { return pulsar_mx_kbp(in_dim); }
+size_t pulsar_gpu_mx_sf_slab_bytes(int rows, int kbp) { return pulsar_mx_sf_slab_bytes(rows, kbp); }
+
 extern "C" int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, const uint16_t *shared_gate_w,
                                          int T, int hidden, int n_expert, int top_k,
                                          float *logits, int32_t *selected, float *weights, float *sgate,

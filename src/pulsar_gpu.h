@@ -843,6 +843,15 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch);
 
+/** The MX slab geometry, host-side.  A producer that hands a kernel a RAW A8
+ *  output slot (pulsar_gdn_call::out_e4m3 / out_scale / out_kbp) sizes its
+ *  scratch with these instead of spelling the geometry: `in_dim` -> the blocks
+ *  per row (padded to 4), and `rows` x that -> the E8M0 scale-slab bytes.
+ *  One authority: both delegate to src/cuda/pulsar_cuda_mx.cuh, which an engine
+ *  TU (compiled by g++) cannot include. */
+int pulsar_gpu_mx_kbp(int in_dim);
+size_t pulsar_gpu_mx_sf_slab_bytes(int rows, int kbp);
+
 /** GROUPED activation slots for the attn-output "a" projection (batch_heads).
  * Reserves per-group E4M3 data plus a per-group swizzled E8M0 scale slab and
  * zeroes the scales, so the attention epilogue and rope_tail can emit the
