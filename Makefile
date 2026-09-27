@@ -474,6 +474,19 @@ tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gem
 exl3-gemv-gate: tests/exl3_gemv_gate
 	./tests/exl3_gemv_gate
 
+# L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
+# double host reference -- cache encode, top-512 selection incl. exact ties,
+# output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
+# needs a device.  Links the PRODUCTION objects.
+tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                     $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_gate.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: qsa-attn-gate
+qsa-attn-gate: tests/qsa_attn_gate
+	./tests/qsa_attn_gate
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe
