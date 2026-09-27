@@ -189,8 +189,12 @@ qwen_gr_mid_kernel(const float *__restrict__ part, __nv_fp8_e4m3 *__restrict__ a
     }
 }
 
-/* 4. up + gate + mean: one warp per stream, lane = channel; the weight row
- * stays in registers across the CTA's tokens. */
+/* 4. up + gate + mean: one warp per stream, lane = channel, kUpTB tokens per
+ * CTA.  The k loop is outermost: each 32-block of the lane's W_up row is
+ * loaded once and applied to every token of the CTA (a token's z still sums
+ * its blocks in order 0..9, so the row arithmetic does not depend on T); the
+ * gated products go to shared memory and one warp per token takes the stream
+ * mean and emits the row. */
 __global__ void __launch_bounds__(32 * kS)
 qwen_gr_up_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsf,
                   const uint8_t *__restrict__ aq, const uint8_t *__restrict__ asf, int a_kbp,
@@ -199,38 +203,45 @@ qwen_gr_up_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict__ ws
                   __nv_bfloat16 *__restrict__ x_out, __nv_fp8_e4m3 *__restrict__ xq, unsigned char *__restrict__ xsf,
                   int x_kbp) {
     constexpr int NB = kR / 32;
-    __shared__ float prod[kS][32];
+    __shared__ float prod[kUpTB][kS][32];
     const int s = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int c = blockIdx.x * 32 + lane;
     const int row = s * kH + c;
     const int w_kbp = pulsar_mx_kbp(kR);
-    uint4 w[2 * NB];
-    unsigned sw[NB];
+    const int t0 = blockIdx.y * kUpTB, nt = min(kUpTB, T - t0);
     const uint4 *wp = reinterpret_cast<const uint4 *>(wq + (size_t)row * kR);
+    float z[kUpTB];
 #pragma unroll
-    for (int i = 0; i < 2 * NB; ++i) w[i] = wp[i];
+    for (int tt = 0; tt < kUpTB; ++tt) z[tt] = 0.0f;
+    for (int b = 0; b < NB; ++b) {
+        const uint4 w0 = wp[2 * b], w1 = wp[2 * b + 1];
+        const unsigned sw = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
 #pragma unroll
-    for (int b = 0; b < NB; ++b) sw[b] = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
-    const float w1 = 1.0f + bf2f(norm_w[row]);
-    const int t0 = blockIdx.y * kUpTB, t1 = min(T, t0 + kUpTB);
-    for (int t = t0; t < t1; ++t) {
-        const uint4 *ap = reinterpret_cast<const uint4 *>(aq + (size_t)t * kR);
-        float z = 0.0f;
-#pragma unroll
-        for (int b = 0; b < NB; ++b)
-            z = fmaf(e4m3_dot32(w[2 * b], w[2 * b + 1], ap[2 * b], ap[2 * b + 1]),
-                     mx_scale2(sw[b], asf[pulsar_mx_sfoff(t, b, a_kbp)]), z);
-        const float g = 1.0f / (1.0f + expf(-z));
-        const float xn = bf2f(streams[(size_t)t * kHC + row]) * rstd[t * kS + s] * w1;
-        prod[s][lane] = g * xn;
-        __syncthreads();
-        if (s == 0) {
-            const float v = (((prod[0][lane] + prod[1][lane]) + prod[2][lane]) + prod[3][lane]) * (1.0f / kS);
-            const __nv_bfloat16 vb = __float2bfloat16(v);
-            x_out[(size_t)t * kH + c] = vb;
-            pulsar_mx_emit_block(bf2f(vb), (uint32_t)c, (uint32_t)t, (uint32_t)kH, x_kbp, xq, xsf);
+        for (int tt = 0; tt < kUpTB; ++tt) {
+            if (tt < nt) {
+                const int t = t0 + tt;
+                const uint4 *ap = reinterpret_cast<const uint4 *>(aq + (size_t)t * kR) + 2 * b;
+                z[tt] = fmaf(e4m3_dot32(w0, w1, ap[0], ap[1]), mx_scale2(sw, asf[pulsar_mx_sfoff(t, b, a_kbp)]), z[tt]);
+            }
         }
-        __syncthreads();
+    }
+    const float w1n = 1.0f + bf2f(norm_w[row]);
+#pragma unroll
+    for (int tt = 0; tt < kUpTB; ++tt) {
+        if (tt < nt) {
+            const int t = t0 + tt;
+            const float g = 1.0f / (1.0f + expf(-z[tt]));
+            const float xn = bf2f(streams[(size_t)t * kHC + row]) * rstd[t * kS + s] * w1n;
+            prod[tt][s][lane] = g * xn;
+        }
+    }
+    __syncthreads();
+    for (int tt = s; tt < nt; tt += kS) {                 /* whole warps: tt depends on the warp only */
+        const int t = t0 + tt;
+        const float v = (((prod[tt][0][lane] + prod[tt][1][lane]) + prod[tt][2][lane]) + prod[tt][3][lane]) * (1.0f / kS);
+        const __nv_bfloat16 vb = __float2bfloat16(v);
+        x_out[(size_t)t * kH + c] = vb;
+        pulsar_mx_emit_block(bf2f(vb), (uint32_t)c, (uint32_t)t, (uint32_t)kH, x_kbp, xq, xsf);
     }
 }
 
