@@ -262,7 +262,7 @@ def cmd_moe(a, tool):
     N = X.shape[0]
     rows = torch.linspace(0, N - 1, a.rows).long()
     experts = sorted(set(topk[rows].flatten().tolist()))
-    log(f"moe: {a.rows} rows, {len(experts)} distinct experts, K gate/up {a.k_expert} down {a.k_expert}, shared {a.k_shared}")
+    log(f"moe: {a.rows} rows, {len(experts)} distinct experts, K gate/up {a.k_expert} down {a.k_down or a.k_expert}, shared {a.k_shared}")
     p = PFX + "layers.12.mlp."
     gu = W.get(p + "experts.gate_up_proj", "cpu")                   # [512, 1280, 2560]
     dn = W.get(p + "experts.down_proj", "cpu")                      # [512, 2560, 640]
@@ -276,7 +276,7 @@ def cmd_moe(a, tool):
         wgu, wd = gu[e].to(DEV), dn[e].to(DEV)                     # gate_up FUSED [1280, 2560], as the container
         mid = F.silu(Xe @ wgu[:640].float().T) * (Xe @ wgu[640:].float().T)
         lgu_, pgu_ = quantize(wgu, Xe, a.k_expert, 1000 + e)
-        ld_, pd_ = quantize(wd, mid, a.k_expert, 3000 + e)
+        ld_, pd_ = quantize(wd, mid, a.k_down or a.k_expert, 3000 + e)
         q[e] = (lgu_, ld_)
         if i % 10 == 0:
             log(f"  expert {e}: {len(ridx)} fit rows, proxy err gate_up {pgu_:.4f} down {pd_:.4f} ({time.time() - t0:.0f}s)")
@@ -288,7 +288,7 @@ def cmd_moe(a, tool):
     qsd, _ = quantize(sd_w, smid, a.k_shared, 13)
     log(f"moe: quantized {2 * len(experts) + 3} matrices in {time.time() - t0:.0f}s")
 
-    d = os.path.join(a.out, f"moe-K{a.k_expert}")
+    d = os.path.join(a.out, f"moe-K{a.k_expert}" + (f"-D{a.k_down}" if a.k_down else ""))
     os.makedirs(d, exist_ok=True)
     xr = X[rows]
     tofile(xr, f"{d}/x.bin")
@@ -303,7 +303,8 @@ def cmd_moe(a, tool):
     for lin, name in ((qsg, "gate"), (qsu, "up"), (qsd, "down")):
         open(f"{d}/shared_{name}.bin", "wb").write(lin.slice_bytes())
     k2 = 2 * a.k_expert
-    run_tool(["moe", d, a.rows, k2, k2, 2 * a.k_shared, 2 * a.k_shared, 2 * a.k_shared], tool)
+    k2d = 2 * (a.k_down or a.k_expert)
+    run_tool(["moe", d, a.rows, k2, k2d, 2 * a.k_shared, 2 * a.k_shared, 2 * a.k_shared], tool)
     out = torch.from_numpy(np.fromfile(f"{d}/out.bin", dtype=np.float32).reshape(a.rows, 2560)).double()
     sel = torch.from_numpy(np.fromfile(f"{d}/sel.bin", dtype=np.int32).reshape(a.rows, 10)).long()
     wts = torch.from_numpy(np.fromfile(f"{d}/wts.bin", dtype=np.float32).reshape(a.rows, 10)).double()
@@ -344,15 +345,15 @@ def cmd_moe(a, tool):
         hf = blk(xr.to(DEV).view(1, a.rows, 2560)).view(a.rows, 2560).double()
     out = out.to(DEV)
     m1 = torch.from_numpy(np.fromfile(f"{d}/out_m1.bin", dtype=np.float32).reshape(a.rows, 2560)).double().to(DEV)
-    res = {"K_expert": a.k_expert, "K_shared": a.k_shared, "rows": a.rows, "experts": len(experts),
+    res = {"K_expert": a.k_expert, "K_down": a.k_down or a.k_expert, "K_shared": a.k_shared, "rows": a.rows, "experts": len(experts),
            "routing_equals_source": same_route,
            "dev_vs_emu": relF(out, emu), "dev_vs_emu_rows_max": float(rows_relF(out, emu).max()),
            "dev_m1_vs_batch_bit_equal": bool((m1 == out).all()),
            "dev_vs_hf": relF(out, hf), "recon_vs_hf": relF(rec, hf), "emu_vs_recon": relF(emu, rec),
            "hf_vs_fp64_source": None}
-    log(f"moe K={a.k_expert}: routing == source {same_route}; dev vs emu (exllamav3 reconstruct + the A8 points, fp64) "
+    log(f"moe K={a.k_expert}/D{a.k_down or a.k_expert}: routing == source {same_route}; dev vs emu (exllamav3 reconstruct + the A8 points, fp64) "
         f"{res['dev_vs_emu']:.2e} (worst row {res['dev_vs_emu_rows_max']:.2e}); M=1 rows bit-equal {res['dev_m1_vs_batch_bit_equal']}")
-    log(f"moe K={a.k_expert}: dev vs HF bf16 block {res['dev_vs_hf']:.3e}; recon (quant only) vs HF {res['recon_vs_hf']:.3e}; "
+    log(f"moe K={a.k_expert}/D{a.k_down or a.k_expert}: dev vs HF bf16 block {res['dev_vs_hf']:.3e}; recon (quant only) vs HF {res['recon_vs_hf']:.3e}; "
         f"A8 alone (emu vs recon) {res['emu_vs_recon']:.3e}")
     json.dump(res, open(f"{d}/moe.json", "w"), indent=1)
     return res["dev_vs_emu"] < 1e-5 and res["dev_m1_vs_batch_bit_equal"]
@@ -595,6 +596,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows", type=int, default=8)
     ap.add_argument("--k-expert", type=int, default=4)
+    # 0 = same as --k-expert.  The probe that isolates the K4 dev-vs-emu gap: quantize the
+    # two expert projections at DIFFERENT K and see which one the error follows (a rate-
+    # specific defect in one arm shows up as the gap tracking that projection's K).
+    ap.add_argument("--k-down", type=int, default=0)
     ap.add_argument("--k-shared", type=int, default=5)
     ap.add_argument("--k-dense", type=int, default=5)
     ap.add_argument("--n-seq", type=int, default=6)
