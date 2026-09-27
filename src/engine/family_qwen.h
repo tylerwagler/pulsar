@@ -239,10 +239,14 @@ static inline uint64_t pulsar_qwen_gdn_state_bytes(const pulsar_qwen_shape *s) {
 static inline uint64_t pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
     return (uint64_t)(s->gdn_conv_kernel - 1u) * pulsar_qwen_gdn_conv_dim(s) * sizeof(float);
 }
-/** S3: one token's K and V for one QSA layer: n_head_kv x head_dim E4M3 each,
- * plus one f32 scale per (head, K|V).  2 x 2 x 256 + 4 x 4 = 1040 B. */
+/** S3: one token's K and V for one QSA layer: n_head_kv x head_dim E4M3 each
+ * (K post-norm post-RoPE, V raw), then one E8M0 byte per 32 elements -- 8 per
+ * head, 2 x 2 x 8 = 32 B.  2 x 2 x 256 + 32 = **1056 B**, the kernel's
+ * PULSAR_QSA_KV_TOKEN_BYTES.  (This said 1040 -- it charged a f32 per (head,
+ * K|V) instead of head_dim/32 scale bytes; the kernel refused every sequence's
+ * cache as "short" until it was corrected, 2026-09-27.) */
 static inline uint64_t pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
-    return 2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * sizeof(float);
+    return 2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * (s->head_dim / 32ull);
 }
 /** S3: one pooled indexer key block (idx_block tokens, post-norm, post-RoPE),
  * bf16 [idx_n_head_kv][idx_head_dim] = 256 B per 4 tokens. */
