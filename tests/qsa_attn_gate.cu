@@ -267,12 +267,14 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     pulsar_gpu_tensor_read(d.slot_sc, 0, sc.data(), sc.size());
     for (uint32_t i = 0; i < n; i++) {
         RowOut &o = outs[rs[i]][rp[i]];
-        o.hash = fnv(&sel[(size_t)i * TOPB], TOPB * 4, fnv(&tap[(size_t)i * OUT], OUT * 4));
+        std::vector<uint8_t> srow(&slot[(size_t)i * OUT], &slot[(size_t)i * OUT] + OUT);
+        for (uint32_t kb = 0; kb < KBP_OUT; kb++) srow.push_back(sc[pulsar_mx_sfoff((int)i, (int)kb, (int)KBP_OUT)]);
+        /* the hash covers everything a row emits: the f32 tap, the selection, and the E4M3 slot + its scales */
+        o.hash = fnv(srow.data(), srow.size(), fnv(&sel[(size_t)i * TOPB], TOPB * 4, fnv(&tap[(size_t)i * OUT], OUT * 4)));
         if (keep(rs[i], rp[i])) {
             o.out.assign(&tap[(size_t)i * OUT], &tap[(size_t)i * OUT] + OUT);
             o.sel.assign(&sel[(size_t)i * TOPB], &sel[(size_t)i * TOPB] + TOPB);
-            o.slot.assign(&slot[(size_t)i * OUT], &slot[(size_t)i * OUT] + OUT);
-            for (uint32_t kb = 0; kb < KBP_OUT; kb++) o.slot.push_back(sc[pulsar_mx_sfoff((int)i, (int)kb, (int)KBP_OUT)]);
+            o.slot = srow;
         }
     }
 }
