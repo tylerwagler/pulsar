@@ -101,7 +101,8 @@ void free_seq(pulsar_qsa_seq &s) {
 }
 
 bool fwd(Layer &L, std::vector<pulsar_qsa_seq> &seqs, const std::vector<uint32_t> &rs, const std::vector<uint32_t> &rp) {
-    pulsar_qsa_layer lw{L.norm[0], L.norm[1], L.norm[2], L.norm[3]};
+    pulsar_qsa_layer lw{pulsar_gpu_tensor_device_ptr(L.norm[0]), pulsar_gpu_tensor_device_ptr(L.norm[1]),
+                        pulsar_gpu_tensor_device_ptr(L.norm[2]), pulsar_gpu_tensor_device_ptr(L.norm[3])};
     pulsar_qsa_io io{};
     io.qg = L.qg; io.k = L.k; io.v = L.v; io.idx = L.idx;
     io.out_e4m3 = P(L.slot);

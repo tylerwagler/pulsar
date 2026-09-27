@@ -2567,10 +2567,14 @@ typedef struct {
 
 /** The layer's four norm weights, f32, as stored in the checkpoint (w, not 1 + w). */
 typedef struct {
-    const pulsar_gpu_tensor *q_norm;      /**< 256 */
-    const pulsar_gpu_tensor *k_norm;      /**< 256 */
-    const pulsar_gpu_tensor *idx_q_norm;  /**< 128 */
-    const pulsar_gpu_tensor *idx_k_norm;  /**< 128 */
+    /* Raw device pointers, f32 -- the shape S2's pulsar_gdn_weights uses, so a
+     * family op can pass wptr()-resolved weights straight in (an engine op
+     * cannot name pulsar_gpu_tensor's fields, and has no tensor to wrap).  The
+     * binder guarantees the widths: 256 / 256 / 128 / 128. */
+    const void *q_norm;      /**< [256] f32, as stored (w, not 1 + w) */
+    const void *k_norm;      /**< [256] */
+    const void *idx_q_norm;  /**< [128] */
+    const void *idx_k_norm;  /**< [128] */
 } pulsar_qsa_layer;
 
 typedef struct {

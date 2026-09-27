@@ -246,7 +246,8 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     pulsar_gpu_tensor_fill_f32(d.slot_sc, 0.f, pulsar_gpu_tensor_bytes(d.slot_sc) / 4);
     std::vector<pulsar_qsa_seq> sd;
     for (auto &s : seqs) sd.push_back(s.desc());
-    pulsar_qsa_layer L{d.qn, d.kn, d.iqn, d.ikn};
+    pulsar_qsa_layer L{pulsar_gpu_tensor_device_ptr(d.qn), pulsar_gpu_tensor_device_ptr(d.kn),
+                       pulsar_gpu_tensor_device_ptr(d.iqn), pulsar_gpu_tensor_device_ptr(d.ikn)};
     pulsar_qsa_io io{};
     io.qg = d.qg; io.k = d.k; io.v = d.v; io.idx = d.idx;
     io.out_e4m3 = pulsar_gpu_tensor_device_ptr(d.slot);

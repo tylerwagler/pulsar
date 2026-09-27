@@ -721,10 +721,7 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         return qsa_refuse("a NULL argument or zero rows");
     }
     if (n_rows > 65535u) return qsa_refuse("more than 65535 rows in one call (the grid's row dimension)");
-    if (!layer->q_norm || layer->q_norm->bytes < PULSAR_QSA_HEAD_DIM * 4u ||
-        !layer->k_norm || layer->k_norm->bytes < PULSAR_QSA_HEAD_DIM * 4u ||
-        !layer->idx_q_norm || layer->idx_q_norm->bytes < PULSAR_QSA_IDX_DIM * 4u ||
-        !layer->idx_k_norm || layer->idx_k_norm->bytes < PULSAR_QSA_IDX_DIM * 4u) {
+    if (!layer->q_norm || !layer->k_norm || !layer->idx_q_norm || !layer->idx_k_norm) {
         return qsa_refuse("a norm weight is missing or short");
     }
     const uint64_t R = n_rows;
@@ -806,12 +803,12 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
     pulsar_qsa_inv_freq(tab.inv);
 
     qsa_block_keys_kernel<<<(n_rows + 7u) / 8u, 256>>>(ws.rows, n_rows, (const float *)io->idx->ptr,
-                                                       (const float *)layer->idx_k_norm->ptr, tab);
+                                                       (const float *)layer->idx_k_norm, tab);
     if (!cuda_ok(cudaGetLastError(), "qsa block keys launch")) return 0;
     qsa_prep_kernel<<<n_rows, 1024>>>(ws.rows, (const float *)io->qg->ptr, (const float *)io->k->ptr,
                                       (const float *)io->v->ptr, (const float *)io->idx->ptr,
-                                      (const float *)layer->q_norm->ptr, (const float *)layer->k_norm->ptr,
-                                      (const float *)layer->idx_q_norm->ptr, tab, ws.q, ws.iq);
+                                      (const float *)layer->q_norm, (const float *)layer->k_norm,
+                                      (const float *)layer->idx_q_norm, tab, ws.q, ws.iq);
     if (!cuda_ok(cudaGetLastError(), "qsa prep launch")) return 0;
 
     uint32_t nb_call = 0;

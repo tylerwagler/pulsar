@@ -70,7 +70,8 @@ struct Replay {
         up(idx, in.idx, PULSAR_QSA_IDX_IN);
         std::vector<uint32_t> rs(n, 0), rp(n);
         for (uint32_t i = 0; i < n; i++) rp[i] = p0 + i;
-        pulsar_qsa_layer L{norm[0], norm[1], norm[2], norm[3]};
+        pulsar_qsa_layer L{pulsar_gpu_tensor_device_ptr(norm[0]), pulsar_gpu_tensor_device_ptr(norm[1]),
+                           pulsar_gpu_tensor_device_ptr(norm[2]), pulsar_gpu_tensor_device_ptr(norm[3])};
         pulsar_qsa_io io{};
         io.qg = qg; io.k = k; io.v = v; io.idx = idx;
         io.out_e4m3 = pulsar_gpu_tensor_device_ptr(slot);
