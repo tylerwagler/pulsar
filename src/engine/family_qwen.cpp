@@ -116,7 +116,7 @@ static bool qwen_op_present(const pulsar_qwen_ops *ops, pulsar_qwen_op_id op) {
  * first of them that is missing (PULSAR_QWEN_OP_COUNT: none).  The walk is the
  * driver's own order (qwen_forward), so the refusal names exactly the op the
  * step would have reached first. */
-static pulsar_qwen_op_id qwen_first_missing_op(const pulsar_qwen_ops *ops, const pulsar_layer_plan *plan,
+pulsar_qwen_op_id pulsar_qwen_first_missing_op(const pulsar_qwen_ops *ops, const pulsar_layer_plan *plan,
                                                const pulsar_qwen_shape *shape, uint32_t *at_layer) {
     *at_layer = UINT32_MAX;
     if (!qwen_op_present(ops, PULSAR_QWEN_OP_EMBED)) return PULSAR_QWEN_OP_EMBED;
@@ -487,7 +487,7 @@ static bool qwen_family_after_gpu(pulsar_engine *e) {
         snprintf(dst + n, 256 - n, "%s%s", n ? " " : "", pulsar_qwen_op_name((pulsar_qwen_op_id)op));
     }
     uint32_t at = 0;
-    const pulsar_qwen_op_id first = qwen_first_missing_op(&g_qwen_ops, &e->plan, &g_qwen_shape, &at);
+    const pulsar_qwen_op_id first = pulsar_qwen_first_missing_op(&g_qwen_ops, &e->plan, &g_qwen_shape, &at);
     fprintf(stderr, "pulsar: %s ops present: [%s]; missing: [%s]%s%s\n", PULSAR_QWEN_ARCH,
             have, missing, first == PULSAR_QWEN_OP_COUNT ? "" : "; a step refuses at ",
             first == PULSAR_QWEN_OP_COUNT ? "" : pulsar_qwen_op_name(first));
@@ -661,15 +661,23 @@ static void qwen_session_destroy(pulsar_session *s) {
     free(s);
 }
 
+uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
+                                 uint32_t n_banks, uint32_t ctx, uint32_t max_rows,
+                                 uint64_t *managed_bytes) {
+    pulsar_gpu_tensor_dry_begin();
+    pulsar_qwen_state *st = qwen_state_alloc(s, plan, n_banks, ctx, max_rows);
+    uint64_t bytes = 0, managed = 0;
+    pulsar_gpu_tensor_dry_end(&bytes, &managed);
+    const bool ok = st != NULL;
+    qwen_state_free(st);
+    if (managed_bytes) *managed_bytes = ok ? managed : 0;
+    return ok ? bytes : 0;
+}
+
 static uint64_t qwen_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
-    pulsar_gpu_tensor_dry_begin();
-    pulsar_qwen_state *st = qwen_state_alloc(&g_qwen_shape, &e->plan, (uint32_t)n_banks,
-                                             (uint32_t)ctx_size, qwen_prefill_cap(e, ctx_size));
-    uint64_t bytes = 0;
-    pulsar_gpu_tensor_dry_end(&bytes, NULL);
-    qwen_state_free(st);
-    return st ? bytes : 0;
+    return pulsar_qwen_state_price(&g_qwen_shape, &e->plan, (uint32_t)n_banks, (uint32_t)ctx_size,
+                                   qwen_prefill_cap(e, ctx_size), NULL);
 }
 
 /* ---- the step driver ------------------------------------------------------------ */
@@ -682,7 +690,7 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
     pulsar_engine *e = s->engine;
     const pulsar_qwen_ops *ops = &g_qwen_ops;
     uint32_t at = 0;
-    const pulsar_qwen_op_id miss = qwen_first_missing_op(ops, &e->plan, &g_qwen_shape, &at);
+    const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(ops, &e->plan, &g_qwen_shape, &at);
     if (miss != PULSAR_QWEN_OP_COUNT) {
         char where[48] = "";
         if (at != UINT32_MAX) snprintf(where, sizeof(where), " at layer %u (%s)", at,
