@@ -16,13 +16,14 @@
  *   (pulsar_gpu_indexer_topk_tensor -- the engine's top-512, reused as is)
  *   qsa_sel_sort    the 512 selected blocks ascending, so every row attends in
  *                   token order
- *   qsa_attn_split  (split of 128 listed tokens, KV head, row): the 12 GQA query
- *                   heads against the split's FP8 K/V -> an unnormalised partial
+ *   qsa_attn_split  (split of 64 listed tokens, KV head, row): the 12 GQA query
+ *                   heads against the split's FP8 K/V on the tensor cores -> an
+ *                   unnormalised partial
  *   qsa_combine     fold the splits IN ORDER, divide, times sigmoid(gate), emit
  *                   the o_proj E4M3 slot (and the f32 tap when asked)
  *
  * ONE ARITHMETIC PER ROW.  Nothing a row computes depends on what else is in
- * the call: splits are 128 LISTED tokens whatever the batch, the fold order is
+ * the call: splits are 64 LISTED tokens whatever the batch, the fold order is
  * the split order, the score of (row, block) is one thread's fixed-order dot,
  * and the engine's top-k is a strict total order on (score, index).  So decode
  * (one row per sequence) and chunked prefill (a run of rows) give identical
@@ -35,8 +36,7 @@
 
 namespace {
 
-constexpr uint32_t QSA_SPLIT       = 128u;   /* listed tokens per attention split */
-constexpr uint32_t QSA_TILE        = 32u;    /* tokens per smem tile */
+constexpr uint32_t QSA_SPLIT       = 64u;    /* listed tokens per attention split */
 constexpr uint32_t QSA_GQA         = PULSAR_QSA_N_HEAD / PULSAR_QSA_N_KV;
 constexpr uint32_t QSA_BUDGET      = PULSAR_QSA_TOP_BLOCKS * PULSAR_QSA_BLOCK;   /* 2048 */
 constexpr uint32_t QSA_MAX_LISTED  = QSA_BUDGET + PULSAR_QSA_BLOCK - 1u;         /* 2051 */
@@ -44,7 +44,6 @@ constexpr uint32_t QSA_MAX_SPLITS  = (QSA_MAX_LISTED + QSA_SPLIT - 1u) / QSA_SPL
 constexpr uint32_t QSA_ATT_GROUP   = 256u;   /* rows per attention pass (bounds the partials) */
 constexpr uint64_t QSA_SCORE_BUDGET = 64ull << 20;   /* bytes of scores per selection pass */
 constexpr uint32_t QSA_SCORE_BLK   = 128u;   /* blocks per score CTA */
-constexpr uint32_t QSA_KS          = PULSAR_QSA_HEAD_DIM + 4u;   /* smem row pitch (floats) */
 constexpr uint32_t QSA_BKS         = PULSAR_QSA_IDX_DIM / 2u + 4u;  /* bkey smem pitch (u32 of bf16x2) */
 
 static_assert(QSA_GQA == 12u, "GQA ratio");
@@ -301,48 +300,75 @@ __device__ __forceinline__ uint32_t qsa_listed_token(const qsa_row &row, const u
     return row.nb * PULSAR_QSA_BLOCK + (j - QSA_BUDGET);
 }
 
-/* Dequantise one 32-token tile of K or V rows for KV head g into smem f32.
- * Thread (token tt, 32-element block cb) walks its 8 words starting at word cb,
- * so the 8 threads of a quarter-warp store to 8 different bank groups. */
-__device__ __forceinline__ void qsa_load_tile(float *dst, const uint8_t *kv, const uint32_t *toks,
-                                              uint32_t n, uint32_t data_off, uint32_t scale_off) {
-    if (threadIdx.x >= QSA_TILE * 8u) return;
-    const uint32_t tt = threadIdx.x >> 3, cb = threadIdx.x & 7u;   /* token, 32-elem block */
-    float *o = dst + tt * QSA_KS + cb * 32u;
-    if (tt >= n) {
-        #pragma unroll
-        for (int wi = 0; wi < 8; wi++) {
-            *reinterpret_cast<float4 *>(o + (((uint32_t)wi + cb) & 7u) * 4u) = make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        return;
-    }
-    const uint8_t *rec = kv + (uint64_t)toks[tt] * PULSAR_QSA_KV_TOKEN_BYTES;
-    const uint32_t *w32 = reinterpret_cast<const uint32_t *>(rec + data_off + cb * 32u);
-    const float sc = exp2f((float)((int)rec[scale_off + cb] - 127));
-    #pragma unroll
-    for (int wi = 0; wi < 8; wi++) {
-        const uint32_t k = ((uint32_t)wi + cb) & 7u;
-        const uint32_t word = w32[k];
-        float f[4];
-        #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            __nv_fp8_e4m3 q;
-            *reinterpret_cast<uint8_t *>(&q) = (uint8_t)(word >> (8 * e));
-            f[e] = __fmul_rn((float)q, sc);
-        }
-        *reinterpret_cast<float4 *>(o + k * 4u) = make_float4(f[0], f[1], f[2], f[3]);
-    }
+/* ---- attention partials on the tensor cores ----------------------------------- *
+ * grid (split, KV head, row in group); 4 warps.  One split = 64 LISTED tokens of
+ * one row against the 12 GQA query heads of KV head g (MMA rows 12..15 are zero).
+ *
+ * f32-class arithmetic on f16 MMAs (m16n8k16, f32 accumulate):
+ *   - K and V come from E4M3, which f16 holds exactly; the E8M0 scales stay out
+ *     of the f16 operands and are applied in f32: QK is summed per 32-dim scale
+ *     block and each block's partial is scaled into the score; for PV the V
+ *     scale of (token, dim block) is folded into P before the split.
+ *   - every f32 operand (q, and P times the V scale) enters as an f16 hi + lo
+ *     pair, two MMAs -- ~22 significant bits, graded against double by the gate.
+ * The split's softmax is its own: m = max over the split, p = 2^(s - m),
+ * l = sum p in a fixed order; the fold in qsa_combine_kernel merges splits in
+ * split order.  Nothing here depends on the batch, so decode == prefill. */
+constexpr uint32_t QSA_TPITCH = PULSAR_QSA_HEAD_DIM + 16u;   /* bytes per smem K/V row */
+constexpr uint32_t QSA_SPITCH = QSA_SPLIT + 4u;              /* floats per score row */
+static_assert(QSA_SPLIT == 64u, "the warp layout below tiles 64 tokens: 4 warps x 2 n-tiles (QK), 4 k-steps (PV)");
+
+__device__ __forceinline__ void qsa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                        uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+/* f32 pair -> (hi, lo) packed f16x2 words: hi = f16(x), lo = f16(x - hi). */
+__device__ __forceinline__ void qsa_split2(float x0, float x1, uint32_t &hi, uint32_t &lo) {
+    const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
+    const __half l0 = __float2half_rn(__fsub_rn(x0, __half2float(h0)));
+    const __half l1 = __float2half_rn(__fsub_rn(x1, __half2float(h1)));
+    const __half2 H = __halves2half2(h0, h1), L = __halves2half2(l0, l1);
+    hi = *reinterpret_cast<const uint32_t *>(&H);
+    lo = *reinterpret_cast<const uint32_t *>(&L);
+}
+/* two E4M3 bytes (low byte = first element) -> packed f16x2, exact */
+__device__ __forceinline__ uint32_t qsa_e4m3x2(uint16_t two) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)two, __NV_E4M3);
+    uint32_t u;
+    memcpy(&u, &h, 4);
+    return u;
 }
 
-/* ---- attention partials ------------------------------------------------------ *
- * grid (split, KV head, row in group); 12 warps = the 12 query heads of the KV
- * head.  Online softmax over the split's tokens in list order; writes the
- * split's (m, l) and its UNNORMALISED accumulator (base-2 exponent domain). */
-__global__ void __launch_bounds__(QSA_GQA * 32) qsa_attn_split_kernel(
+/* One K or V tile (64 listed tokens, KV head g) into smem as raw E4M3 plus its
+ * 8 scales per token; rows past n are zero (their scores are masked). */
+__device__ __forceinline__ void qsa_load_tile(uint8_t *td, float *tsc, const uint8_t *kv, const uint32_t *toks,
+                                              uint32_t n, uint32_t data_off, uint32_t scale_off) {
+    const uint32_t t = threadIdx.x >> 1, half = threadIdx.x & 1u;     /* 128 threads: 2 per token */
+    uint4 *dst = reinterpret_cast<uint4 *>(td + t * QSA_TPITCH + half * 128u);
+    if (t >= n) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) dst[i] = make_uint4(0u, 0u, 0u, 0u);
+        if (!half) for (int b = 0; b < 8; b++) tsc[t * 8u + b] = 0.f;
+        return;
+    }
+    const uint8_t *rec = kv + (uint64_t)toks[t] * PULSAR_QSA_KV_TOKEN_BYTES;
+    const uint4 *src = reinterpret_cast<const uint4 *>(rec + data_off + half * 128u);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) dst[i] = src[i];
+    if (!half) for (int b = 0; b < 8; b++) tsc[t * 8u + b] = exp2f((float)((int)rec[scale_off + b] - 127));
+}
+
+__global__ void __launch_bounds__(128) qsa_attn_split_kernel(
         const qsa_row *rows, uint32_t row0, const uint32_t *sel, const float *q,
         float *part, float2 *ml) {
     __shared__ __align__(16) float qs[QSA_GQA * PULSAR_QSA_HEAD_DIM];
-    __shared__ __align__(16) float ts[QSA_TILE * QSA_KS];
+    __shared__ __align__(16) uint8_t td[QSA_SPLIT * QSA_TPITCH];
+    __shared__ float tsc[QSA_SPLIT * 8u];
+    __shared__ float ss[16 * QSA_SPITCH];          /* scores, then P */
+    __shared__ float sml[16 * 2];
     __shared__ uint32_t toks[QSA_SPLIT];
     const uint32_t s = blockIdx.x, g = blockIdx.y, rg = blockIdx.z, r = row0 + rg;
     const qsa_row row = rows[r];
@@ -350,60 +376,133 @@ __global__ void __launch_bounds__(QSA_GQA * 32) qsa_attn_split_kernel(
     if (j0 >= row.n_list) return;
     const uint32_t n = min(QSA_SPLIT, row.n_list - j0);
     const uint32_t *rsel = sel + (uint64_t)r * PULSAR_QSA_TOP_BLOCKS;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) toks[i] = qsa_listed_token(row, rsel, j0 + i);
+    if (threadIdx.x < n) toks[threadIdx.x] = qsa_listed_token(row, rsel, j0 + threadIdx.x);
     const float *qsrc = q + ((uint64_t)r * PULSAR_QSA_N_HEAD + g * QSA_GQA) * PULSAR_QSA_HEAD_DIM;
-    for (uint32_t i = threadIdx.x; i < QSA_GQA * PULSAR_QSA_HEAD_DIM; i += blockDim.x) qs[i] = qsrc[i];
+    for (uint32_t i = threadIdx.x; i < QSA_GQA * PULSAR_QSA_HEAD_DIM / 4u; i += blockDim.x) {
+        reinterpret_cast<float4 *>(qs)[i] = reinterpret_cast<const float4 *>(qsrc)[i];
+    }
+    __syncthreads();
+    qsa_load_tile(td, tsc, row.kv, toks, n, qsa_k_data(g), qsa_k_scale(g));
     __syncthreads();
 
-    const uint32_t h = threadIdx.x >> 5;
-    const uint32_t lane = threadIdx.x & 31u;
-    /* scores in the base-2 domain: (q . k) / sqrt(256) * log2(e) */
-    const float sc = 0.0625f * 1.4426950408889634f;
-    float m = -INFINITY, l = 0.f;
-    float acc[8];
-    #pragma unroll
-    for (int k = 0; k < 8; k++) acc[k] = 0.f;
-    const float4 *q4 = reinterpret_cast<const float4 *>(&qs[h * PULSAR_QSA_HEAD_DIM]);
+    const uint32_t w = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const uint32_t gr = lane >> 2, c = lane & 3u;     /* fragment row group, column pair */
+    const bool row_hi_live = gr + 8u < QSA_GQA;       /* MMA rows 8..15 hold heads 8..11 then padding */
 
-    for (uint32_t t0 = 0; t0 < n; t0 += QSA_TILE) {
-        const uint32_t nt = min(QSA_TILE, n - t0);
-        qsa_load_tile(ts, row.kv, toks + t0, nt, qsa_k_data(g), qsa_k_scale(g));
-        __syncthreads();
-        float sv = -INFINITY;
-        if (lane < nt) {
-            const float4 *k4 = reinterpret_cast<const float4 *>(&ts[lane * QSA_KS]);
-            float d = 0.f;
-            for (uint32_t i = 0; i < PULSAR_QSA_HEAD_DIM / 4u; i++) {
-                const float4 a = q4[i], b = k4[i];
-                d = __fmaf_rn(a.x, b.x, d);
-                d = __fmaf_rn(a.y, b.y, d);
-                d = __fmaf_rn(a.z, b.z, d);
-                d = __fmaf_rn(a.w, b.w, d);
-            }
-            sv = __fmul_rn(d, sc);
-        }
-        const float mn = fmaxf(m, qsa_warp_max(sv));
-        const float corr = exp2f(__fsub_rn(m, mn));
-        const float p = exp2f(__fsub_rn(sv, mn));
-        l = __fadd_rn(__fmul_rn(l, corr), qsa_warp_sum(p));
-        m = mn;
-        __syncthreads();                       /* every warp is done with K */
-        qsa_load_tile(ts, row.kv, toks + t0, nt, qsa_v_data(g), qsa_v_scale(g));
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < 8; k++) acc[k] = __fmul_rn(acc[k], corr);
-        for (uint32_t t = 0; t < nt; t++) {
-            const float pt = __shfl_sync(0xffffffffu, p, (int)t);
-            const float *vr = &ts[t * QSA_KS + lane];
+    /* ---- S = Q K^T: warp w owns tokens 16w .. 16w+15 (two n-tiles) */
+    {
+        float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        for (uint32_t b = 0; b < 8u; b++) {
+            float pb[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
             #pragma unroll
-            for (int k = 0; k < 8; k++) acc[k] = __fmaf_rn(pt, vr[32 * k], acc[k]);
+            for (uint32_t kk = 0; kk < 2u; kk++) {
+                const uint32_t d0 = b * 32u + kk * 16u;
+                const float *q0 = &qs[gr * PULSAR_QSA_HEAD_DIM + d0 + 2u * c];
+                const float *q1 = &qs[(row_hi_live ? gr + 8u : gr) * PULSAR_QSA_HEAD_DIM + d0 + 2u * c];
+                uint32_t ah[4], al[4];
+                qsa_split2(q0[0], q0[1], ah[0], al[0]);
+                qsa_split2(row_hi_live ? q1[0] : 0.f, row_hi_live ? q1[1] : 0.f, ah[1], al[1]);
+                qsa_split2(q0[8], q0[9], ah[2], al[2]);
+                qsa_split2(row_hi_live ? q1[8] : 0.f, row_hi_live ? q1[9] : 0.f, ah[3], al[3]);
+                #pragma unroll
+                for (uint32_t nt = 0; nt < 2u; nt++) {
+                    const uint8_t *kr = td + (w * 16u + nt * 8u + gr) * QSA_TPITCH + d0 + 2u * c;
+                    const uint32_t b0 = qsa_e4m3x2(*reinterpret_cast<const uint16_t *>(kr));
+                    const uint32_t b1 = qsa_e4m3x2(*reinterpret_cast<const uint16_t *>(kr + 8));
+                    qsa_mma(pb[nt], ah[0], ah[1], ah[2], ah[3], b0, b1);
+                    qsa_mma(pb[nt], al[0], al[1], al[2], al[3], b0, b1);
+                }
+            }
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 2u; nt++) {
+                const uint32_t t0 = w * 16u + nt * 8u + 2u * c;
+                const float s0 = tsc[t0 * 8u + b], s1 = tsc[(t0 + 1u) * 8u + b];
+                acc[nt][0] = __fmaf_rn(pb[nt][0], s0, acc[nt][0]);
+                acc[nt][1] = __fmaf_rn(pb[nt][1], s1, acc[nt][1]);
+                acc[nt][2] = __fmaf_rn(pb[nt][2], s0, acc[nt][2]);
+                acc[nt][3] = __fmaf_rn(pb[nt][3], s1, acc[nt][3]);
+            }
         }
-        __syncthreads();                       /* every warp is done with V */
+        /* scores in the base-2 domain: (q . k) / sqrt(256) * log2(e); masked past n */
+        const float scl = 0.0625f * 1.4426950408889634f;
+        #pragma unroll
+        for (uint32_t nt = 0; nt < 2u; nt++) {
+            const uint32_t t0 = w * 16u + nt * 8u + 2u * c;
+            ss[gr * QSA_SPITCH + t0]             = t0 < n ? __fmul_rn(acc[nt][0], scl) : -INFINITY;
+            ss[gr * QSA_SPITCH + t0 + 1u]        = t0 + 1u < n ? __fmul_rn(acc[nt][1], scl) : -INFINITY;
+            ss[(gr + 8u) * QSA_SPITCH + t0]      = t0 < n ? __fmul_rn(acc[nt][2], scl) : -INFINITY;
+            ss[(gr + 8u) * QSA_SPITCH + t0 + 1u] = t0 + 1u < n ? __fmul_rn(acc[nt][3], scl) : -INFINITY;
+        }
     }
-    const uint64_t slot = ((uint64_t)rg * PULSAR_QSA_N_HEAD + g * QSA_GQA + h) * QSA_MAX_SPLITS + s;
-    if (lane == 0) ml[slot] = make_float2(m, l);
+    __syncthreads();                              /* K is dead: V may land in td */
+    qsa_load_tile(td, tsc, row.kv, toks, n, qsa_v_data(g), qsa_v_scale(g));
+
+    /* ---- the split's softmax: head h = tid / 8, 8 tokens per thread, fixed order */
+    {
+        const uint32_t h = threadIdx.x >> 3, sub = threadIdx.x & 7u;
+        float *sr = &ss[h * QSA_SPITCH + sub * 8u];
+        float m = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) m = fmaxf(m, sr[i]);
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float l = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float p = exp2f(__fsub_rn(sr[i], m));
+            sr[i] = p;
+            l = __fadd_rn(l, p);
+        }
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) l = __fadd_rn(l, __shfl_xor_sync(0xffffffffu, l, o));
+        if (sub == 0) { sml[h * 2] = m; sml[h * 2 + 1] = l; }
+    }
+    __syncthreads();
+
+    /* ---- O = P V: warp w owns dim blocks 2w, 2w+1 (4 n-tiles each); the V
+     * scale of (token, block) rides in the A operand */
+    const uint64_t slot0 = ((uint64_t)rg * PULSAR_QSA_N_HEAD + g * QSA_GQA) * QSA_MAX_SPLITS + s;
     #pragma unroll
-    for (int k = 0; k < 8; k++) part[slot * PULSAR_QSA_HEAD_DIM + lane + 32 * k] = acc[k];
+    for (uint32_t bb = 0; bb < 2u; bb++) {
+        const uint32_t b = 2u * w + bb;
+        float o[4][4];
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QSA_SPLIT / 16u; ks++) {
+            const uint32_t t0 = ks * 16u + 2u * c;
+            const float v00 = tsc[t0 * 8u + b], v01 = tsc[(t0 + 1u) * 8u + b];
+            const float v10 = tsc[(t0 + 8u) * 8u + b], v11 = tsc[(t0 + 9u) * 8u + b];
+            const float *p0 = &ss[gr * QSA_SPITCH + t0];
+            const float *p1 = &ss[(gr + 8u) * QSA_SPITCH + t0];
+            uint32_t ah[4], al[4];
+            qsa_split2(__fmul_rn(p0[0], v00), __fmul_rn(p0[1], v01), ah[0], al[0]);
+            qsa_split2(row_hi_live ? __fmul_rn(p1[0], v00) : 0.f, row_hi_live ? __fmul_rn(p1[1], v01) : 0.f, ah[1], al[1]);
+            qsa_split2(__fmul_rn(p0[8], v10), __fmul_rn(p0[9], v11), ah[2], al[2]);
+            qsa_split2(row_hi_live ? __fmul_rn(p1[8], v10) : 0.f, row_hi_live ? __fmul_rn(p1[9], v11) : 0.f, ah[3], al[3]);
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                const uint8_t *vc = td + b * 32u + nt * 8u + gr;
+                const uint32_t b0 = qsa_e4m3x2((uint16_t)(vc[t0 * QSA_TPITCH] | (vc[(t0 + 1u) * QSA_TPITCH] << 8)));
+                const uint32_t b1 = qsa_e4m3x2((uint16_t)(vc[(t0 + 8u) * QSA_TPITCH] | (vc[(t0 + 9u) * QSA_TPITCH] << 8)));
+                qsa_mma(o[nt], ah[0], ah[1], ah[2], ah[3], b0, b1);
+                qsa_mma(o[nt], al[0], al[1], al[2], al[3], b0, b1);
+            }
+        }
+        #pragma unroll
+        for (uint32_t nt = 0; nt < 4u; nt++) {
+            const uint32_t d = b * 32u + nt * 8u + 2u * c;
+            float *o0 = &part[(slot0 + (uint64_t)gr * QSA_MAX_SPLITS) * PULSAR_QSA_HEAD_DIM + d];
+            *reinterpret_cast<float2 *>(o0) = make_float2(o[nt][0], o[nt][1]);
+            if (row_hi_live) {
+                float *o1 = &part[(slot0 + (uint64_t)(gr + 8u) * QSA_MAX_SPLITS) * PULSAR_QSA_HEAD_DIM + d];
+                *reinterpret_cast<float2 *>(o1) = make_float2(o[nt][2], o[nt][3]);
+            }
+        }
+    }
+    if (threadIdx.x < QSA_GQA) {
+        ml[slot0 + (uint64_t)threadIdx.x * QSA_MAX_SPLITS] = make_float2(sml[threadIdx.x * 2], sml[threadIdx.x * 2 + 1]);
+    }
 }
 
 /* ---- fold + gate + o_proj slot ------------------------------------------------ *
@@ -639,7 +738,7 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         for (uint32_t i = 0; i < gn; i++) {
             ns_max = std::max(ns_max, (h_rows[r0 + i].n_list + QSA_SPLIT - 1u) / QSA_SPLIT);
         }
-        qsa_attn_split_kernel<<<dim3(ns_max, PULSAR_QSA_N_KV, gn), QSA_GQA * 32>>>(ws.rows, r0, ws.sel, ws.q,
+        qsa_attn_split_kernel<<<dim3(ns_max, PULSAR_QSA_N_KV, gn), 128>>>(ws.rows, r0, ws.sel, ws.q,
                                                                                   ws.part, ws.ml);
         if (!cuda_ok(cudaGetLastError(), "qsa attention split launch")) return 0;
         qsa_combine_kernel<<<dim3(gn, PULSAR_QSA_N_HEAD), PULSAR_QSA_HEAD_DIM>>>(
