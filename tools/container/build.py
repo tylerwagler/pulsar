@@ -33,6 +33,7 @@ import names as N          # noqa: E402
 import policy as P         # noqa: E402
 import producers as PR     # noqa: E402
 import kv as KV            # noqa: E402
+import qwen as Q           # noqa: E402
 
 ALIGN = 32
 NATIVE_DTYPES = {'bf16': 'BF16', 'f32': 'F32', 'i32': 'I32'}
@@ -294,6 +295,25 @@ def write_index(out_dir):
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+def make_plan(args):
+    """The family's plan, chosen by the checkpoint's model_type (config.json) -- the one authority for which
+    table applies; a Qwen-only flag on a DeepSeek build (or the reverse) refuses."""
+    hf = HFCheckpoint(args.hf)
+    if Q.is_qwen(hf):
+        if args.format_map or args.exl3_layers or args.reap_map or args.mxfp8_scale != 'rederive':
+            raise SystemExit('qwen4_exp: --format-map / --exl3-layers / --reap-map / --mxfp8-scale are DeepSeek '
+                             'options; the recipe (--recipe) names every tensor')
+        if not args.recipe:
+            raise SystemExit('qwen4_exp: pass --recipe (tools/container/format-maps/qwen38fn-*.json)')
+        exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
+        exl3_experts = Exl3Checkpoint(args.exl3_experts) if args.exl3_experts else None
+        return Q.plan(hf, exl3, exl3_experts, Q.Recipe(args.recipe), args.tokenizer or args.hf, args.ple_rows)
+    if args.recipe or args.exl3_experts or args.ple_rows:
+        raise SystemExit('--recipe / --exl3-experts / --ple-rows are qwen4_exp options')
+    hf, exl3, layers, overrides = load_sources(args)
+    return plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+
+
 def load_sources(args):
     hf = HFCheckpoint(args.hf)
     exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
@@ -309,8 +329,7 @@ def load_sources(args):
 
 
 def cmd_plan(args):
-    hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    shape, order, files, shards, consumed = make_plan(args)
     print(f'model: {shape}; shards {len(order)}; source tensors consumed but not written: {consumed}')
     tot = 0
     for s in order:
@@ -322,14 +341,13 @@ def cmd_plan(args):
             lay[e['layout']] = lay.get(e['layout'], 0) + 1
         print(f'  {files[s]}  {s:10s} {len(p["entries"]):6d} tensors  {len(p["experts"]):2d} families  {b / 1e9:8.3f} GB  {dict(sorted(lay.items()))}')
     print(f'total {tot / 1e9:.2f} GB')
-    if exl3:
-        print(f'exl3 experts from {exl3.dir}: layers {sorted(layers)}')
+    if args.exl3:
+        print(f'exl3 from {args.exl3}' + (f'; layers {args.exl3_layers}' if args.exl3_layers else ''))
     return 0
 
 
 def cmd_emit(args):
-    hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    shape, order, files, shards, consumed = make_plan(args)
     todo = order if args.all else [args.shard]
     os.makedirs(args.out, exist_ok=True)
     import time
@@ -349,11 +367,13 @@ def cmd_verify(args):
     """Against the HF SOURCE, not an intermediate: structure and alignment, every
     native span byte-equal, every produced payload re-produced and compared,
     every EXL3 slice equal to its source ranges, the declared byte model equal
-    to the span, expert families contiguous."""
-    hf, exl3, layers, overrides = load_sources(args)
-    shape, order, files, shards, consumed = plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
+    to the span, expert families contiguous.  --roundtrip adds the fidelity
+    half: every BF16-sourced mxfp8_lt entry decoded and held to the format's
+    own rounding bound against its BF16 source (qwen4_exp)."""
+    shape, order, files, shards, consumed = make_plan(args)
     todo = order if args.all else [args.shard]
     failing = 0
+    rt_worst = {}
     for s in todo:
         path = os.path.join(args.out, files[s])
         hdr, meta, buf_off, size = read_shard(path)
@@ -395,6 +415,12 @@ def cmd_verify(args):
                 else:
                     n_bad += 1
                     print(f'  BYTES DIFFER {name} ({e["layout"]})')
+                if args.roundtrip and e.get('bf16_src'):
+                    over, rel = mxfp8_roundtrip(hf_of(args), e['bf16_src'], got)
+                    rt_worst[name] = rel
+                    if over:
+                        n_bad += 1
+                        print(f'  ROUNDTRIP {name}: {over} elements outside the E4M3 rounding bound')
         for name in want:
             if name not in hdr:
                 missing += 1
@@ -409,10 +435,14 @@ def cmd_verify(args):
         contig_bad = 0
         for fam in experts:
             gname = fam['gguf_name']
-            ns, lay = ('layers', gname.split('.')[1]) if gname.startswith('blk.') else ('mtp', gname.split('.')[1])
+            if 'entry_name' in fam:           # qwen4_exp: the family names its own entries
+                entry = fam['entry_name']
+            else:                             # DeepSeek: the engine's derivation (safetensors.cpp)
+                ns, lay = ('layers', gname.split('.')[1]) if gname.startswith('blk.') else ('mtp', gname.split('.')[1])
+                entry = f'{ns}.{lay}.ffn.experts.{{e}}.{fam["part"]}.weight'
             first = None
             for e in range(fam['n_experts']):
-                h = hdr.get(f'{ns}.{lay}.ffn.experts.{e}.{fam["part"]}.weight')
+                h = hdr.get(entry.replace('{e}', str(e)))
                 if not h:
                     contig_bad += 1
                     break
@@ -428,8 +458,44 @@ def cmd_verify(args):
         failing += 0 if ok else 1
         print(f'{files[s]}  {s:10s} structure={structure} misaligned={misaligned} tensors {n_ok}/{n_ok + n_bad} '
               f'unexpected={unexpected} missing={missing} decl_bad={decl_bad} contiguity_bad={contig_bad} -> {"PASS" if ok else "FAIL"}', flush=True)
+    if args.roundtrip:
+        if rt_worst:
+            w = max(rt_worst, key=rt_worst.get)
+            print(f'roundtrip: {len(rt_worst)} mxfp8_lt entries decoded within the E4M3 bound; '
+                  f'worst relative Frobenius error {rt_worst[w]:.3e} ({w})')
+        else:
+            print('roundtrip: no BF16-sourced mxfp8_lt entries in the checked shards')
     print(f'shards checked: {len(todo)}  failing: {failing}')
     return 1 if failing else 0
+
+
+_HF = {}
+
+
+def hf_of(args):
+    if args.hf not in _HF:
+        _HF[args.hf] = HFCheckpoint(args.hf)
+    return _HF[args.hf]
+
+
+def mxfp8_roundtrip(hf, src_name, payload):
+    """Decode an mxfp8_lt payload and hold every element to E4M3's rounding bound against the BF16 source:
+    with x = w / 2^s (s the group's E8M0 exponent), |q - w| <= 2^(floor(log2|x|) - 4) * 2^s for |x| >= 2^-6
+    (half the 3-bit mantissa spacing), <= 2^-10 * 2^s below it (half the subnormal step).  Returns (elements
+    outside the bound, relative Frobenius error)."""
+    import numpy as np
+    out, inp = hf.shape(src_name)
+    w = (np.frombuffer(hf.raw(src_name), dtype='<u2').astype(np.uint32) << 16).view(np.float32).reshape(out, inp)
+    q = PR.mxfp8_lt_decode(payload, out, inp)
+    kb = inp // 32
+    s = PR.unswizzle_sf(np.frombuffer(payload, dtype=np.uint8, offset=out * inp), out, kb).astype(np.int32) - 127
+    s = np.repeat(s, 32, axis=1)
+    x = np.abs(np.ldexp(w, -s))
+    e = np.floor(np.log2(np.where(x > 0, x, 1.0))).astype(np.int32)
+    bound = np.where(x >= 2.0 ** -6, np.ldexp(1.0, e - 4 + s), np.ldexp(1.0, s - 10))
+    over = int((np.abs(q.astype(np.float64) - w) > bound).sum())
+    rel = float(np.linalg.norm(q.astype(np.float64) - w) / max(np.linalg.norm(w.astype(np.float64)), 1e-30))
+    return over, rel
 
 
 def cmd_audit(args):
@@ -450,6 +516,9 @@ def cmd_audit(args):
             kv_shards += 1
         names_ = set(hdr) | set(json.loads(md.get('pulsar.tensors', '{}')))
         for e in json.loads(md.get('pulsar.experts', '[]')):
+            if 'entry_name' in e:
+                names_ |= {e['entry_name'].replace('{e}', str(x)) for x in range(e['n_experts'])}
+                continue
             ns = 'layers' if e['gguf_name'].startswith('blk.') else 'mtp'
             lay = e['gguf_name'].split('.')[1]
             names_ |= {f'{ns}.{lay}.ffn.experts.{x}.{e["part"]}.weight' for x in range(e['n_experts'])}
@@ -480,6 +549,12 @@ def main():
                            help='FP8 dense -> mxfp8_lt: re-derive the per-32 E8M0 (byte-identical to the archived codec) or broadcast the source block scale')
             p.add_argument('--tokenizer', metavar='DIR', help='tokenizer files (default: the HF dir)')
             p.add_argument('--reap-map', metavar='JSON')
+            p.add_argument('--recipe', metavar='JSON', help='qwen4_exp: the per-tensor format map (format-maps/qwen38fn-*.json)')
+            p.add_argument('--exl3-experts', metavar='DIR', help='qwen4_exp: a separate EXL3 checkpoint for the routed experts only')
+            p.add_argument('--ple-rows', metavar='MANIFEST', help='qwen4_exp: the PLE row file manifest (ple_rows.py build)')
+        if name == 'verify':
+            p.add_argument('--roundtrip', action='store_true',
+                           help='also decode every BF16-sourced mxfp8_lt entry and hold it to the E4M3 rounding bound')
         if name != 'plan':
             p.add_argument('--out', required=True)
         if name in ('emit', 'verify'):

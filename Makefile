@@ -908,13 +908,15 @@ cuda-reap-router-audit:
 # The artifact builder's module suites (tools/container, L247), no GPU, minutes:
 # names/policy against every declaration of the served Vision-Exp artifact
 # (shard, gguf_name, layout, dims_ne), kv entry-for-entry, every producer
-# byte-identical to the served bytes.  The oracle paths live in the tests and
+# byte-identical to the served bytes; the qwen4_exp family (L251) end to end on a
+# synthetic miniature checkpoint (recipe refusals, emit twice byte-identical,
+# verify --roundtrip, the PLE row file).  The oracle paths live in the tests and
 # refuse when the checkpoints are not mounted; the codecs need numpy, so pass
 # the interpreter that has it (CONTAINER_PY=.../.venv/bin/python).
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_names.py test_kv.py test_producers.py; do \
+	cd tools/container && for t in test_names.py test_kv.py test_producers.py test_qwen.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run

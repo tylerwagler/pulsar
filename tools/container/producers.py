@@ -310,6 +310,40 @@ def _quantize_fp8_e4m3_planes(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return (scale_exp + 127).astype(np.uint8), codes
 
 
+def mxfp8_lt_from_bf16(w_bf16: bytes, out: int, inp: int) -> bytes:
+    """HF BF16 [out, in] -> the engine's `mxfp8_lt` bytes, quantised by the same codec as every other E4M3
+    weight the builder writes (`_quantize_fp8_e4m3_planes` == ds4q_quantize_fp8_e4m3: per-32 group along `in`,
+    E8M0 = floor(log2 amax) - 7, so the group max lands in [128, 256) and nothing saturates; E4M3 RNE).
+    Layout: E4M3 codes row-major [out][in], then the swizzled E8M0 plane zero-padded to rup(out,128) x
+    rup(in/32,4) -- the padding `bytes_for` models.  Unlike the FP8-source `mxfp8_lt`, the 128-alignment is
+    NOT required of the data plane (Qwen's gated-residual low-rank [320, 10240] / [10240, 320] and DeltaNet
+    a/b [48, 2560] are not tiled by 128); only in % 32 is.
+
+    The L251 full-model KL graded these tensors with `qwen_screen.mxfp8_qdq` (floor(log2 amax) - 8, clamp at
+    448): one binade lower, so a group whose max is in [1.75, 2) x 2^e saturates there.  Ours is pulsar's
+    weight codec -- one authority for E4M3 weights; the difference is recorded in the S6 notes."""
+    if inp % 32:
+        raise ValueError(f"mxfp8_lt_from_bf16: in={inp} is not divisible by 32")
+    if len(w_bf16) != out * inp * 2:
+        raise ValueError(f"mxfp8_lt_from_bf16: weight holds {len(w_bf16)} bytes, [{out}, {inp}] bf16 needs {out * inp * 2}")
+    bf = np.frombuffer(w_bf16, dtype="<u2").reshape(out, inp)
+    f32 = (bf.astype(np.uint32) << np.uint32(16)).view(np.float32)
+    if not np.isfinite(f32).all():
+        raise ValueError("mxfp8_lt_from_bf16: non-finite weight in the source")
+    sc, codes = _quantize_fp8_e4m3_planes(f32)
+    return codes.tobytes() + swizzle_sf(sc, out, inp // 32).tobytes()
+
+
+def mxfp8_lt_decode(buf: bytes, out: int, inp: int) -> np.ndarray:
+    """The f32 [out, in] values an `mxfp8_lt` tensor holds (E4M3 x 2^(E8M0 - 127)); the round-trip check's decoder."""
+    kb_n = inp // 32
+    codes = np.frombuffer(buf, dtype=np.uint8, count=out * inp).reshape(out, inp)
+    sf = np.frombuffer(buf, dtype=np.uint8, offset=out * inp)
+    scale = unswizzle_sf(sf, out, kb_n).astype(np.int32) - 127
+    v = E4M3_VALUE[codes].reshape(out, kb_n, 32)
+    return np.ldexp(v, scale[:, :, None]).reshape(out, inp).astype(np.float32)
+
+
 def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
     """The drafter's markov_w2: HF BF16 [rows, cols] -> transposed k-major
     [cols][rows] (dsq_generate.c:269-283: out[c*rows + r] = in[r*cols + c]),
@@ -334,7 +368,9 @@ def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
 # --------------------------------------------------------------------------
 
 _NATIVE_DTYPE_LAYOUT = {"F32": "f32", "I32": "i32", "BF16": "bf16"}
-_EXL3_K2 = {"exl3m_k2": 4, "exl3m_k2h": 5, "exl3m_k3": 6}
+# twice the rate K (exl3m_k2h is K = 2.5).  k4 / k5 are the Qwen lane's rates (L251: routed experts K4,
+# EXL3-able dense Linears K5); every rate has the same [trellis | suh | svh] byte model.
+_EXL3_K2 = {"exl3m_k2": 4, "exl3m_k2h": 5, "exl3m_k3": 6, "exl3m_k4": 8, "exl3m_k5": 10}
 EXL3_HAD_BLOCK = 128
 
 

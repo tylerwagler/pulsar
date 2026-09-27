@@ -1,0 +1,73 @@
+{
+  "recipe": "U-e4-d5",
+  "model_type": "qwen4_exp",
+  "about": "Qwen3.8-Flash-Next, the L251 uniform recipe: routed experts EXL3 K4 (gate_up fused), every EXL3-able dense Linear EXL3 K5, gated-residual low-rank + DeltaNet a/b + QSA indexer MXFP8 (mxfp8_lt), embed / head / top-level mixer / router / norms / gates BF16. Full-model KL vs BF16 9.28e-2/token (pulsar-notes research/l251/full-kl). Every checkpoint tensor must match exactly one row; a row that matches nothing is refused too.",
+  "formats": {
+    "bf16": "the checkpoint's BF16 bytes, verbatim",
+    "mxfp8_lt": "producers.mxfp8_lt_from_bf16: per-32 E8M0 + E4M3 RNE from the BF16 source",
+    "exl3m_k4": "the EXL3 source checkpoint's trellis | suh | svh at K = 4, verbatim",
+    "exl3m_k5": "the EXL3 source checkpoint's trellis | suh | svh at K = 5, verbatim",
+    "ple_rows": "not a container tensor: the n-gram table rows live in the PLE row file (ple_rows.py); pulsar.kv names it",
+    "kv": "not a container tensor: a small I64 table carried as a pulsar.kv array",
+    "omit": "not in this container: no lane consumes it yet (MTP drafter); a later recipe names its formats"
+  },
+  "expert_gate_up": "fused",
+  "rows": [
+    ["lm_head.weight", "bf16"],
+    ["model.language_model.embed_tokens.weight", "bf16"],
+    ["model.language_model.hyper_connection_mixer.hc_norm.weight", "bf16"],
+    ["model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", "bf16"],
+    ["model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", "bf16"],
+
+    ["model.language_model.layers.*.attn_hyper_connection.block_inject_weight.weight", "bf16"],
+    ["model.language_model.layers.*.attn_hyper_connection.hc_norm.weight", "bf16"],
+    ["model.language_model.layers.*.attn_hyper_connection.input_mix_weight_down.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.attn_hyper_connection.input_mix_weight_up.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.mlp_hyper_connection.block_inject_weight.weight", "bf16"],
+    ["model.language_model.layers.*.mlp_hyper_connection.hc_norm.weight", "bf16"],
+    ["model.language_model.layers.*.mlp_hyper_connection.input_mix_weight_down.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.mlp_hyper_connection.input_mix_weight_up.weight", "mxfp8_lt"],
+
+    ["model.language_model.layers.*.linear_attn.A_log", "bf16"],
+    ["model.language_model.layers.*.linear_attn.conv1d.weight", "bf16"],
+    ["model.language_model.layers.*.linear_attn.dt_bias", "bf16"],
+    ["model.language_model.layers.*.linear_attn.in_proj_a.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.linear_attn.in_proj_b.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.linear_attn.in_proj_qkv.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.linear_attn.in_proj_z.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.linear_attn.norm.weight", "bf16"],
+    ["model.language_model.layers.*.linear_attn.out_proj.weight", "exl3m_k5"],
+
+    ["model.language_model.layers.*.self_attn.q_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.self_attn.k_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.self_attn.v_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.self_attn.o_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.self_attn.q_norm.weight", "bf16"],
+    ["model.language_model.layers.*.self_attn.k_norm.weight", "bf16"],
+    ["model.language_model.layers.*.self_attn.indexer.index_qk_proj.weight", "mxfp8_lt"],
+    ["model.language_model.layers.*.self_attn.indexer.q_layernorm.weight", "bf16"],
+    ["model.language_model.layers.*.self_attn.indexer.k_layernorm.weight", "bf16"],
+
+    ["model.language_model.layers.*.mlp.gate.weight", "bf16"],
+    ["model.language_model.layers.*.mlp.experts.gate_up_proj", "exl3m_k4"],
+    ["model.language_model.layers.*.mlp.experts.down_proj", "exl3m_k4"],
+    ["model.language_model.layers.*.mlp.shared_expert.gate_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.mlp.shared_expert.up_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.mlp.shared_expert.down_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.mlp.shared_expert_gate.weight", "bf16"],
+
+    ["model.language_model.layers.*.ple.key_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.ple.value_proj.weight", "exl3m_k5"],
+    ["model.language_model.layers.*.ple.conv1d.weight", "bf16"],
+    ["model.language_model.layers.*.ple.norm_conv.weight", "bf16"],
+    ["model.language_model.layers.*.ple.norm_key.weight", "bf16"],
+    ["model.language_model.layers.*.ple.norm_query.weight", "bf16"],
+    ["model.language_model.layers.*.ple.ple_embedding.layer_multipliers", "kv"],
+    ["model.language_model.layers.*.ple.ple_embedding.ngram_heads_offsets", "kv"],
+    ["model.language_model.layers.*.ple.ple_embedding.ngram_heads_vocab_sizes", "kv"],
+    ["model.language_model.layers.*.ple.ple_embedding.ngram_embedding.shard_*.weight", "ple_rows"],
+
+    ["model.visual.*", "bf16"],
+    ["mtp.*", "omit"]
+  ]
+}

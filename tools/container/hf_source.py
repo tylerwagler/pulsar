@@ -97,6 +97,9 @@ class HFCheckpoint:
 # every load.
 # ---------------------------------------------------------------------------
 EXL3_LAYOUT = {32: 'exl3m_k2', 40: 'exl3m_k2h', 48: 'exl3m_k3'}
+# exllamav3's mul1 codebook multiplier (exl3_lib/quantize.py codebook_mul1_mult; the device decode's
+# EXL3_MUL1_MULTIPLIER): the `.mul1` marker a tensor carries names the codebook it was encoded with.
+EXL3_MUL1 = 0x83DCD12D
 
 
 def exl3_expert_bytes(k, n, words):
@@ -114,6 +117,7 @@ class Exl3Checkpoint:
     def __init__(self, hf_dir):
         self.dir = hf_dir
         self.entries = {}
+        self._fh = {}
         shards = sorted(f for f in os.listdir(hf_dir)
                         if f.startswith('model-') and f.endswith('.safetensors'))
         if not shards:
@@ -137,7 +141,15 @@ class Exl3Checkpoint:
     def expert(self, layer, e, part, k, n):
         """The three source ranges of one expert-projection and the words per
         tile, after every refusal the format allows."""
-        key = f'layers.{layer}.ffn.experts.{e}.{part}'
+        return self.linear(f'layers.{layer}.ffn.experts.{e}.{part}', k, n, EXL3_LAYOUT)
+
+    def has_linear(self, key):
+        return f'{key}.trellis' in self.entries
+
+    def linear(self, key, k, n, rates):
+        """One EXL3 Linear `key` (the name minus `.trellis` etc.): its [trellis | suh | svh]
+        source ranges and the words per 16x16 tile, refused unless the rate is in `rates`
+        ({words: layout}) and every byte count matches the layout."""
         if f'{key}.mcg' in self.entries:
             raise SystemExit(f'{key}: mcg codebook -- pulsar reads the mul1 codebook only')
         for sub in ('trellis', 'suh', 'svh', 'mul1'):
@@ -149,9 +161,19 @@ class Exl3Checkpoint:
         if tdt != 'I16' or len(tsh) != 3 or tsh[0] != k // 16 or tsh[1] != n // 16:
             raise SystemExit(f'{key}.trellis: dtype {tdt} shape {tsh}, expected I16 [{k // 16}, {n // 16}, words]')
         words = tsh[2]
-        if words not in EXL3_LAYOUT:
-            raise SystemExit(f'{key}.trellis: {words} words per tile is not a rate pulsar reads '
-                             f'({sorted(EXL3_LAYOUT)})')
+        if words not in rates:
+            raise SystemExit(f'{key}.trellis: {words} words per tile is not a rate pulsar reads here '
+                             f'({sorted(rates)})')
+        mp, mo, mn, mdt, msh = self.entries[f'{key}.mul1']
+        if mdt != 'I32' or mn != 4:
+            raise SystemExit(f'{key}.mul1: {mdt} {msh}, expected one I32 marker')
+        fh = self._fh.get(mp)
+        if fh is None:
+            fh = self._fh[mp] = open(mp, 'rb')
+        fh.seek(mo)
+        (mul1,) = struct.unpack('<I', fh.read(4))
+        if mul1 != EXL3_MUL1:
+            raise SystemExit(f'{key}.mul1: codebook multiplier {mul1:#010x}, pulsar reads {EXL3_MUL1:#010x} only')
         if udt != 'F16' or ush != [k] or vdt != 'F16' or vsh != [n]:
             raise SystemExit(f'{key}: suh {udt}{ush} / svh {vdt}{vsh}, expected F16 [{k}] / F16 [{n}]')
         trellis, scales = exl3_expert_bytes(k, n, words)
