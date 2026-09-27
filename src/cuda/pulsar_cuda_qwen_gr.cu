@@ -435,3 +435,29 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
     qwen_gr_write_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((__nv_bfloat16 *)streams, out, inj, T);
     return launch_ok("write") ? 0 : -3;
 }
+
+/* L251 S1/S2/S3: the plain MXFP8 dense Linear the recipe's mxfp8_lt tensors need
+ * (GDN in_proj_a / _b, the indexer's index_qk_proj).  It IS the W_down arithmetic
+ * above with n_split = 1: the split-K kernel's `part` buffer is then exactly
+ * y [T][out] (index (t * 1 + 0) * out + row), so there is no reduction pass and
+ * no workspace.  Split-K would only add partials to sum; with one split the row's
+ * 80 blocks are walked by one warp in order. */
+extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const pulsar_qwen_slot *x, int rows,
+                                               float *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    (void)ws;
+    (void)ws_bytes;
+    if (!l || !l->w || !l->sf || !x || !x->q || !x->sf || rows <= 0 || l->in <= 0 || l->out <= 0 ||
+        l->in % 32 != 0 || x->kbp != pulsar_mx_kbp(l->in)) {
+        fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs an E4M3 slot of width %d (kbp %d) -- refusing\n",
+                l ? l->in : -1, l ? l->out : -1, l ? l->in : -1, pulsar_mx_kbp(l ? l->in : 32));
+        return -1;
+    }
+    const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
+    qwen_gr_down_kernel<true><<<grid, 256, 0, stream>>>(l->w, l->sf, x->q, x->sf, x->kbp, l->out, l->in, rows, 1, y);
+    const cudaError_t qe = cudaGetLastError();
+    if (qe != cudaSuccess) {
+        fprintf(stderr, "pulsar: qwen mxfp8 linear launch: %s\n", cudaGetErrorString(qe));
+        return -1;
+    }
+    return 0;
+}

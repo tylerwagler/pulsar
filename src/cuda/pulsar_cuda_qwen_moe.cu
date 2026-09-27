@@ -255,6 +255,15 @@ extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const puls
         fprintf(stderr, "pulsar: qwen linear: no weight or no E4M3 slot of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
+    if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
+        if (!l->sf) {
+            fprintf(stderr, "pulsar: qwen linear: a %d->%d tensor is neither EXL3 nor mxfp8_lt -- refusing\n",
+                    l->in, l->out);
+            return -1;
+        }
+        const pulsar_qwen_lowrank lr{l->w, l->sf, l->out, l->in};
+        return pulsar_qwen_mxfp8_linear_launch(&lr, x, rows, y, ws, ws_bytes, stream);
+    }
     return ds4_exl3_dense_launch(l->w, l->k2, x->q, x->sf, y, rows, l->in, l->out, ws, ws_bytes, stream);
 }
 

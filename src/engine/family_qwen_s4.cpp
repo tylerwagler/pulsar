@@ -129,6 +129,9 @@ bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int 
     l->k2 = exl3_type_k2(t->type);
     l->in = in;
     l->out = out;
+    /* mxfp8_lt: E4M3 [out][in] then the swizzled E8M0 plane (k2 stays 0, which
+     * is how the launcher knows).  EXL3 carries its scales inside the slice. */
+    l->sf = (t->type == PULSAR_TENSOR_MXFP8_LT) ? (const uint8_t *)l->w + (uint64_t)out * in : NULL;
     return l->w != NULL;
 }
 

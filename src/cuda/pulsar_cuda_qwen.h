@@ -96,9 +96,19 @@ typedef struct {
  *  in verbatim), run by the EXL3 dense arm (mmq/ds4_exl3_dense.cuh). */
 typedef struct {
     const void *w;
-    int k2;          /**< rate in half-bit units, 4..10 */
+    const uint8_t *sf;   /**< the mxfp8_lt E8M0 plane (NULL for EXL3): the
+                          *  recipe's dense tier is MIXED, so the arm follows
+                          *  k2 -- 0 means mxfp8_lt, 4..10 an EXL3 rate. */
+    int k2;          /**< rate in half-bit units, 4..10; 0 = mxfp8_lt */
     int in, out;
 } pulsar_qwen_linear;
+
+/** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
+ *  ([out][in] E4M3 then the swizzled E8M0 plane) and x an E4M3 slot of width
+ *  `l->in`.  The same arithmetic the GR arm's W_down uses (split-K, one warp per
+ *  output row, ordered); no workspace. */
+int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const pulsar_qwen_slot *x, int rows, float *y,
+                                    void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** A weight's device pointer: the engine's model-range cache for the span
  *  [offset, offset + bytes) of `model_map` (cuda_model_range_ptr). */
