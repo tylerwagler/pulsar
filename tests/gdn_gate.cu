@@ -90,9 +90,10 @@ __global__ void ref_emit_kernel(const float *x, int rows, int kbp, __nv_fp8_e4m3
 
 struct Rig {
     static const int ROWS = 512, SLOTS = 20;
-    std::vector<float> conv_w, A_log, dt_bias, norm_w;
+    std::vector<float> conv_w, A_log, dt_bias, norm_w;      /* the REFERENCE values (bf16-rounded) */
+    std::vector<uint16_t> conv_w_b, A_log_b, dt_bias_b, norm_w_b;
     std::vector<float> qkv, z, a, b;
-    float *d_conv_w, *d_A_log, *d_dt_bias, *d_norm_w;
+    uint16_t *d_conv_w, *d_A_log, *d_dt_bias, *d_norm_w;
     float *d_qkv, *d_z, *d_a, *d_b;
     float *d_cs, *d_rs;                       /* state pools */
     int32_t *d_slot;
@@ -108,6 +109,17 @@ struct Rig {
             dt_bias[h] = (float)(-5.0 + urand() * 5.0);
         }
         for (auto &v : norm_w) v = (float)(0.5 + urand());
+        /* The container stores these four bf16 and the kernel widens them, so
+         * round the host values HERE (RNE) and let the reference read the same
+         * widened numbers -- otherwise the gate would compare two models. */
+        auto round4 = [](std::vector<float> &v, std::vector<uint16_t> &b) {
+            b.resize(v.size());
+            for (size_t i = 0; i < v.size(); i++) {
+                uint32_t u; memcpy(&u, &v[i], 4); u = (u + 0x8000u) & 0xFFFF0000u;
+                memcpy(&v[i], &u, 4); b[i] = (uint16_t)(u >> 16);
+            }
+        };
+        round4(conv_w, conv_w_b); round4(A_log, A_log_b); round4(dt_bias, dt_bias_b); round4(norm_w, norm_w_b);
         qkv.resize((size_t)ROWS * QKV); z.resize((size_t)ROWS * VD); a.resize((size_t)ROWS * NV); b.resize((size_t)ROWS * NV);
         std::vector<float> chs(QKV);
         for (int c = 0; c < QKV; c++) chs[c] = (float)((urand() < 0.02 ? 8.0 : 1.0) * (0.3 + urand()));
@@ -115,7 +127,7 @@ struct Rig {
         for (auto &v : z) v = (float)(nrand() * 1.5);
         for (auto &v : a) v = (float)(nrand() * 1.5);
         for (auto &v : b) v = (float)(nrand() * 1.5);
-        d_conv_w = dalloc<float>(conv_w.size()); d_A_log = dalloc<float>(NV); d_dt_bias = dalloc<float>(NV); d_norm_w = dalloc<float>(128);
+        d_conv_w = dalloc<uint16_t>(conv_w_b.size()); d_A_log = dalloc<uint16_t>(NV); d_dt_bias = dalloc<uint16_t>(NV); d_norm_w = dalloc<uint16_t>(128);
         upload_weights();
         d_qkv = dalloc<float>(qkv.size()); d_z = dalloc<float>(z.size()); d_a = dalloc<float>(a.size()); d_b = dalloc<float>(b.size());
         h2d(d_qkv, qkv.data(), qkv.size()); h2d(d_z, z.data(), z.size()); h2d(d_a, a.data(), a.size()); h2d(d_b, b.data(), b.size());
@@ -128,8 +140,8 @@ struct Rig {
         d_q = dalloc<__nv_fp8_e4m3>((size_t)ROWS * VD); d_s = dalloc<unsigned char>(slab);
     }
     void upload_weights() {
-        h2d(d_conv_w, conv_w.data(), conv_w.size()); h2d(d_A_log, A_log.data(), (size_t)NV);
-        h2d(d_dt_bias, dt_bias.data(), (size_t)NV); h2d(d_norm_w, norm_w.data(), (size_t)128);
+        h2d(d_conv_w, conv_w_b.data(), conv_w_b.size()); h2d(d_A_log, A_log_b.data(), (size_t)NV);
+        h2d(d_dt_bias, dt_bias_b.data(), (size_t)NV); h2d(d_norm_w, norm_w_b.data(), (size_t)128);
     }
     pulsar_gdn_weights weights() const { return {d_conv_w, d_A_log, d_dt_bias, d_norm_w}; }
     gdn_ref_weights ref_weights() const { return {conv_w.data(), A_log.data(), dt_bias.data(), norm_w.data()}; }

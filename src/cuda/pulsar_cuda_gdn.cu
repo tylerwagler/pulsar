@@ -35,9 +35,9 @@ __global__ void __launch_bounds__(128)
 gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
                      const float *__restrict__ a, int ld_a,
                      const float *__restrict__ b, int ld_b,
-                     const float *__restrict__ conv_w,
-                     const float *__restrict__ A_log,
-                     const float *__restrict__ dt_bias,
+                     const uint16_t *__restrict__ conv_w,
+                     const uint16_t *__restrict__ A_log,
+                     const uint16_t *__restrict__ dt_bias,
                      int seq_rows,
                      const int32_t *__restrict__ row_slot,
                      float *__restrict__ conv_state,
@@ -54,7 +54,12 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
     const int T    = seq_rows;
     float *cs = conv_state + (size_t)row_slot[r0] * PULSAR_GDN_CONV_STATE_FLOATS;
 
-    const float4 cw = reinterpret_cast<const float4 *>(conv_w)[ch];
+    /* bf16 -> f32 is a left shift of the 16 stored bits (exact). */
+    const uint2 cwr = reinterpret_cast<const uint2 *>(conv_w)[ch];
+    const float4 cw = make_float4(__uint_as_float((uint32_t)(uint16_t)cwr.x << 16),
+                                  __uint_as_float(cwr.x & 0xFFFF0000u),
+                                  __uint_as_float((uint32_t)(uint16_t)cwr.y << 16),
+                                  __uint_as_float(cwr.y & 0xFFFF0000u));
     const bool is_qk = head < 2 * NK;
     const bool is_q  = head < NK;
     const int  hv    = head - 2 * NK;        /* V head for the gate columns */
@@ -111,9 +116,9 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
             /* decay in DOUBLE: it multiplies the state every token, so its
              * error compounds over the head's memory (~1/(1-decay) tokens, 5e4
              * at the slowest heads); fast-math __expf is ~2 ulp.  48 per row. */
-            const double sp_in = (double)(a[(size_t)row * ld_a + hv] + dt_bias[hv]);
+            const double sp_in = (double)(a[(size_t)row * ld_a + hv] + __uint_as_float((uint32_t)dt_bias[hv] << 16));
             const double sp = sp_in > 20.0 ? sp_in : log1p(exp(sp_in));      /* F.softplus */
-            gb[(size_t)row * GB + hv]      = (float)exp(-exp((double)A_log[hv]) * sp);
+            gb[(size_t)row * GB + hv]      = (float)exp(-exp((double)__uint_as_float((uint32_t)A_log[hv] << 16)) * sp);
             gb[(size_t)row * GB + NV + hv] = 1.f / (1.f + __expf(-b[(size_t)row * ld_b + hv]));
         }
         #pragma unroll
@@ -162,7 +167,7 @@ __global__ void __cluster_dims__(1, 1, VQ) __launch_bounds__(256)
 gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const float *__restrict__ gb,
                       const float *__restrict__ z, int ld_z,
-                      const float *__restrict__ norm_w,
+                      const uint16_t *__restrict__ norm_w,
                       int seq_rows,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
@@ -194,7 +199,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
     #pragma unroll
     for (int i = 0; i < RPW; i++) s[i] = S[(w * RPW + i) * DV + col];
 
-    const float nw = norm_w[col];
+    const float nw = __uint_as_float((uint32_t)norm_w[col] << 16);
     int par = 0, tpar = 0;
 
     for (int t0 = 0; t0 < T; t0 += T2) {
@@ -298,7 +303,7 @@ extern "C" size_t pulsar_gdn_scratch_bytes(int rows) {
 extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaStream_t stream) {
     if (!w || !c) return refuse("null weights or call");
     if (!w->conv_w || !w->A_log || !w->dt_bias || !w->norm_w) return refuse("a weight pointer is null");
-    if (!aligned16(w->conv_w) || !aligned16(w->norm_w)) return refuse("conv_w / norm_w not 16-byte aligned");
+    if (((uintptr_t)w->conv_w & 7u) != 0) return refuse("conv_w not 8-byte aligned (a bf16 uint2 row)");
     if (c->n_seq < 1 || c->seq_rows < 1 || (int64_t)c->n_seq * c->seq_rows > (1 << 24))
         return refuse("n_seq / seq_rows out of range");
     const int rows = c->n_seq * c->seq_rows;

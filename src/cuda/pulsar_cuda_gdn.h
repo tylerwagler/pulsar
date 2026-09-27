@@ -77,10 +77,13 @@ enum {
 /** One layer's non-Linear parameters, all f32 on the device (the checkpoint's
  *  bf16 values widen exactly). */
 typedef struct {
-    const float *conv_w;   /**< [10240][4], tap 3 multiplies the current token */
-    const float *A_log;    /**< [48] */
-    const float *dt_bias;  /**< [48] */
-    const float *norm_w;   /**< [128], the gated norm's weight (used as is, no 1+w) */
+    /* bf16 -- the container's storage for these four (the graded recipe's `bf16`
+     * class), widened in the kernels: a consumer reads the producer's format
+     * (rule 3), so there is no f32 copy and no per-step conversion. */
+    const uint16_t *conv_w;   /**< [10240][4], tap 3 multiplies the current token */
+    const uint16_t *A_log;    /**< [48] */
+    const uint16_t *dt_bias;  /**< [48] */
+    const uint16_t *norm_w;   /**< [128], the gated norm's weight (used as is, no 1+w) */
 } pulsar_gdn_weights;
 
 /** One call: n_seq sequences of seq_rows consecutive rows each (rows =
