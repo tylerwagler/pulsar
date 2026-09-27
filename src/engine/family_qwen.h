@@ -397,6 +397,10 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
 bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
 uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows);
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt);
+/** Called by the step driver after every forward that got past its op check:
+ *  waits out a PLE gather a failed step left in flight, and after a completed
+ *  step reads (and clears) the MoE non-finite flag.  Returns ok && no NaN. */
+bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok);
 void pulsar_qwen_s4_unload(pulsar_qwen_weights *w);
 
 /** Name and owner of an op, for the refusal line ("gdn", "S2 work/l251-gdn"). */

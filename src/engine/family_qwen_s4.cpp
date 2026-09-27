@@ -260,6 +260,11 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     const uint32_t n = st->n_rows;
     for (uint32_t r = 0; r < n; r++)
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+    /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
+    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
+    const uint32_t zero = 0;
+    if (!moe_sc || !pulsar_gpu_tensor_write(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+        return fail("could not clear the MoE non-finite flag");
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
     const pulsar_tensor *te = st->w->token_embd;
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
@@ -290,6 +295,25 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     io->pending = pulsar_engram_gather_start(io->io, &io->table, io->ids, n * PULSAR_QWEN_NGRAM_COLS, io->rows);
     io->pending_n = n;
     return io->pending != NULL || fail("the PLE gather did not start");
+}
+
+bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
+    pulsar_qwen_ple_io *io = st->w->ple_io;
+    if (io && io->pending) {                 /* a step that failed before layer 1 */
+        (void)pulsar_engram_gather_wait(io->pending);
+        io->pending = NULL;
+    }
+    if (!ok) return false;
+    pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
+    uint32_t nf = 0;
+    if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
+        return fail("could not read the MoE non-finite flag");
+    if (nf) {
+        fprintf(stderr, "pulsar: %s: the MoE output of layer %u went non-finite (code 0x%08x) -- refusing the step\n",
+                PULSAR_QWEN_ARCH, nf & 0xffffffu, nf);
+        return false;
+    }
+    return true;
 }
 
 bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {

@@ -728,6 +728,18 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
     if (ok && head_n) ok = ops->head(&st, head_row0, head_n);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
+    /* S4's step end: settles a PLE gather a failed step left in flight and, on a
+     * completed step, reads the MoE non-finite flag (rule 9: a NaN names its layer) */
+    ok = pulsar_qwen_s4_step_end(&st, ok);
+    if (!ok) {
+        /* the step may have advanced any of its banks' state (n-gram context, conv,
+         * recurrent) before it failed: those banks start over, and bank 0's
+         * checkpoint no longer describes its state */
+        for (uint32_t r = 0; r < n_rows; r++)
+            if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &e->plan, (uint32_t)bank[r]))
+                fprintf(stderr, "pulsar: %s: could not clear bank %d after a failed step\n", PULSAR_QWEN_ARCH, bank[r]);
+        s->checkpoint_valid = false;
+    }
     if (ok && head_n)
         ok = pulsar_gpu_tensor_read(s->qwen->logits, 0, logits_out,
                                     (uint64_t)head_n * g_qwen_shape.n_vocab * sizeof(float)) != 0;
