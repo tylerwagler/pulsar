@@ -191,6 +191,14 @@ def cmd_router(a, tool):
     res = {"rows": N, "set_equal": int(set_ok.sum()), "order_equal": int(order_ok.sum()), "mismatch": []}
     wr_d = wr.to(DEV)
     n_logit_diff, n_hf_redo_bad = 0, 0
+    # The capture came from the source's LARGE-BATCH bf16 GEMM, so the boundary classification below
+    # must recompute with the SAME batch shape.  A per-row (M=1) F.linear picks a different cuBLAS
+    # accumulation and lands on the other side of a rank-10/11 pair separated by <= 1 bf16 ulp, which
+    # made the tool call its own disagreement with the capture "UNEXPLAINED" (2026-09-27: 8 of 145,172
+    # rows, all rank-10/11, all exactly 1 ulp apart; the kernel's selection is the exact top-10 of the
+    # kernel's own logits, and the same rows flip in this file's own M=1 vs M=8192 recompute).
+    bad_hl = {}
+    bad_set = set(bad.tolist())
     for c0 in range(0, N, 8192):
         xs = X[c0:c0 + 8192].to(DEV)
         hl = F.linear(xs, wr_d)                                      # bf16, as the source
@@ -199,13 +207,14 @@ def cmd_router(a, tool):
         n_hf_redo_bad += int((hi.cpu() != topk[c0:c0 + 8192]).any(-1).sum())
         ours = lg[c0:c0 + 8192, :512].to(DEV).to(torch.bfloat16)
         n_logit_diff += int((ours != hl).sum())
+        for r in bad_set.intersection(range(c0, min(c0 + 8192, N))):
+            bad_hl[r] = hl[r - c0].float().cpu()
     res["hf_recompute_rows_differing_from_capture"] = n_hf_redo_bad
     res["bf16_logits_differing_from_source"] = n_logit_diff
     log(f"router: the source's F.linear recomputed here reproduces the capture on all but {n_hf_redo_bad} rows; "
         f"{n_logit_diff:,} of {N * 512:,} bf16 logits differ from the source's (f32 order vs cuBLAS)")
     for r in bad.tolist():
-        xs = X[r:r + 1].to(DEV)
-        hl = F.linear(xs, wr_d)[0].float().cpu()
+        hl = bad_hl[r]                                               # the source's arithmetic, batched as captured
         ours = lg[r, :512].to(torch.bfloat16).float()
         hp = torch.softmax(hl, -1)
         srt = hp.sort(descending=True)
@@ -399,8 +408,12 @@ def cmd_capture(a, tool):
     emb = W.get(f"{PFX}embed_tokens.weight")
     rotary = M.Qwen4ExpTextRotaryEmbedding(config=cfg).to(DEV)
     l0, l1 = build_layer(cfg, W, 0), build_layer(cfg, W, 1)
+    # assign=True, like build_layer: the module's params must BE the checkpoint's tensors (bf16) rather
+    # than bf16 values copied into default f32 params -- the streams here are bf16 and the first Linear
+    # otherwise dies with "mat1 and mat2 must have the same dtype".  cmd_gr documents the same fact:
+    # MXFP8 at every per-layer site, bf16 at the top-level mixer.
     mixer = M.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
-    mixer.load_state_dict(W.prefixed(f"{PFX}hyper_connection_mixer."), strict=True)
+    mixer.load_state_dict(W.prefixed(f"{PFX}hyper_connection_mixer."), strict=True, assign=True)
     mixer = mixer.to(DEV).eval()
     cap = {k: [] for k in ("ids", "l1_in", "emb", "ple_out", "gr_x", "gr_inj", "mix_x", "seqlen")}
     for ids in seqs:
