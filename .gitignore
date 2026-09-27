@@ -123,7 +123,7 @@ tests/dspark_batch_gate
 /tests/exl3_dense_xcheck
 /tests/engram_table_test
 /tests/qwen_ngram_test
-/tests/qwen_moe_gate
+/tests/qwen_s4_gate
 /tests/qwen_gr_gate
 /tests/qwen_ple_gate
 /tests/qwen_xcheck

@@ -54,20 +54,6 @@ static uint32_t rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= 
 static double rndu(void) { return ((double)rnd() + 0.5) / 4294967296.0; }
 static double rndn(void) { return sqrt(-2.0 * log(rndu())) * cos(6.283185307179586 * rndu()); }
 
-/* round-to-nearest-even onto the finite E4M3 grid, saturating (the device's
- * cvt.rn.satfinite): positive codes 0x00..0x7e are increasing in value, and a
- * tie picks the even code, whose mantissa LSB is 0 */
-static uint8_t f64_to_e4m3(double v) {
-    const uint8_t sign = v < 0 ? 0x80 : 0;
-    const double a = fabs(v);
-    int lo = 0, hi = 0x7e;
-    if (a >= exl3t_e4m3_to_f64(0x7e)) return sign | 0x7e;
-    while (hi - lo > 1) { const int mid = (lo + hi) / 2; if (exl3t_e4m3_to_f64((uint8_t)mid) <= a) lo = mid; else hi = mid; }
-    const double dl = a - exl3t_e4m3_to_f64((uint8_t)lo), dh = exl3t_e4m3_to_f64((uint8_t)hi) - a;
-    const int code = dl < dh ? lo : dh < dl ? hi : ((lo & 1) ? hi : lo);
-    return sign | (uint8_t)code;
-}
-
 /* The weight: one [trellis | suh | svh] slice. */
 struct weight {
     int K, N, k2;
@@ -111,7 +97,7 @@ static slot make_slot(int rows, int K) {
             se = std::max(-127, std::min(127, se));
             s.sf[pulsar_mx_sfoff(r, g, s.kbp)] = (uint8_t)(se + 127);
             for (int j = 0; j < 32; j++) {
-                const uint8_t b = f64_to_e4m3(v[g * 32 + j] * ldexp(1.0, -se));
+                const uint8_t b = exl3t_f64_to_e4m3(v[g * 32 + j] * ldexp(1.0, -se));
                 s.q[(size_t)r * K + g * 32 + j] = b;
                 s.x[(size_t)r * K + g * 32 + j] = exl3t_e4m3_to_f64(b) * ldexp(1.0, se);
             }

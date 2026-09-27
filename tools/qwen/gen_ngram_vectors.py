@@ -97,6 +97,9 @@ def main():
     seqs = [tok(t, add_special_tokens=False)["input_ids"] for t in texts]
     if a.small:
         seqs = [s[:300] for s in seqs]
+    # packed documents: corpus texts joined by EOS, so the reset is exercised mid-sequence on real text
+    seqs += [seqs[i % len(seqs)][:200] + [eos] + seqs[(i + 1) % len(seqs)][:150] + [eos, eos] +
+             seqs[(i + 2) % len(seqs)][:100] for i in range(3)]
     seqs += [[eos, 11, 22, 33], [5, eos, eos, 7, 8, eos, 9, 10, 11], [100, 200, eos], [eos], [eos, eos, eos, 42],
              [cfg.vocab_size - 1, 0, 1, eos, cfg.vocab_size - 1]]
     n_eos = sum(s.count(eos) for s in seqs)
@@ -129,7 +132,7 @@ def main():
         rnd = random.Random(251)
         pick = sorted(set(rnd.sample(ids.tolist(), min(a.n_check, len(ids)))) |
                       {i * rows_per_part for i in range(len(parts))} |
-                      {min((i + 1) * rows_per_part, n_rows) - 1 for i in range(len(parts))})
+                      {min((i + 1) * rows_per_part, n_rows) - 1 for i in range(len(parts))}) if a.n_check else []
         f.write(struct.pack("<I", len(pick)))
         by_part = {}
         for r in pick:

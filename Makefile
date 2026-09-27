@@ -504,6 +504,20 @@ tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OB
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
+# L251 S4: Qwen3.8-Flash-Next's router, MoE block (EXL3 routed + shared), Gated
+# Residual and PLE injection -- the production objects vs the double references in
+# tests/qwen_ref.h, model-free: decisions, ties, NaN routing, M-neutrality, the
+# PLE conv state carried (batch == single-token steps), mutations.  Pass the served
+# arch: make qwen-s4-gate CUDA_ARCH=sm_120f.
+QWEN_S4_HDRS = tests/qwen_ref.h tests/exl3_dense_ref.h src/cuda/pulsar_cuda_qwen.h src/cuda/pulsar_cuda_mx.cuh \
+               src/engine/exl3_trellis.h
+tests/qwen_s4_gate: tests/qwen_s4_gate.cu $(QWEN_S4_HDRS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qwen_s4_gate.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+.PHONY: qwen-s4-gate
+qwen-s4-gate: tests/qwen_s4_gate
+	./tests/qwen_s4_gate
+
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
 # the device packer writes; this binary pins the geometry and the recipe

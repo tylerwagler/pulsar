@@ -24,6 +24,20 @@ static inline double exl3t_e4m3_to_f64(uint8_t b) {
     return s ? -v : v;
 }
 
+/* round-to-nearest-even onto the finite E4M3 grid, saturating (the device's
+ * cvt.rn.satfinite): positive codes 0x00..0x7e are increasing in value, and a
+ * tie picks the even code, whose mantissa LSB is 0 */
+static inline uint8_t exl3t_f64_to_e4m3(double v) {
+    const uint8_t sign = v < 0 ? 0x80 : 0;
+    const double a = fabs(v);
+    int lo = 0, hi = 0x7e;
+    if (a >= exl3t_e4m3_to_f64(0x7e)) return sign | 0x7e;
+    while (hi - lo > 1) { const int mid = (lo + hi) / 2; if (exl3t_e4m3_to_f64((uint8_t)mid) <= a) lo = mid; else hi = mid; }
+    const double dl = a - exl3t_e4m3_to_f64((uint8_t)lo), dh = exl3t_e4m3_to_f64((uint8_t)hi) - a;
+    const int code = dl < dh ? lo : dh < dl ? hi : ((lo & 1) ? hi : lo);
+    return sign | (uint8_t)code;
+}
+
 /** The slice's layout, or exit: a fixture with a bad shape is a test bug. */
 static inline void exl3t_layout(int K, int N, int k2, uint64_t *trellis, uint64_t *stride) {
     uint64_t scales = 0;
