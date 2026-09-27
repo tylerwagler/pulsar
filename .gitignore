@@ -45,6 +45,7 @@ __pycache__/
 /tests/tp_slab_gpu_probe
 /tests/tp_dmabuf_probe
 /tests/multiseq_frontier_gate
+/tests/qwen_family_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate
 /tests/accounting_gate

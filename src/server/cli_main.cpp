@@ -565,6 +565,14 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return wrc;
     }
+    /* A family whose tokenizer and chat renderer this build does not carry
+     * cannot take a request: refused at startup, by name (L251). */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: the %s family has no tokenizer or chat "
+                   "renderer in this build -- refusing to serve", pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged

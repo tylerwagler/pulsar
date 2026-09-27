@@ -603,6 +603,28 @@ tests/exl3_dequant_gate: tests/exl3_dequant_gate.cpp src/engine/exl3_trellis.h \
 exl3-dequant-gate: tests/exl3_dequant_gate
 	./tests/exl3_dequant_gate tests/test-vectors/exl3
 
+# L251 S1: the Qwen4-exp family skeleton -- load, layer plan, weight bind,
+# session-state sizing at the 1.5-2M-token target, and the by-name refusal of
+# every step -- over ZERO-WEIGHT containers made from the HF checkpoint's own
+# headers and config (tests/qwen_family_container.py: sparse files, no weight
+# byte is read), plus four mutants the loader must refuse by name.
+# qwen-family-gate-device adds a real session on the GPU (the battery's entry).
+QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
+QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
+.PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
+qwen-family-containers:
+	@test -f $(QWEN_HF_DIR)/model.safetensors.index.json || { \
+	  echo "REFUSING: QWEN_HF_DIR=$(QWEN_HF_DIR) is not the Qwen3.8-Flash-Next HF checkpoint (headers + config are read)"; exit 1; }
+	@mkdir -p $(QWEN_GATE_DIR) && \
+	python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/good.safetensors && \
+	for m in arch shape tensor layer-type; do \
+	  python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/$$m.safetensors --mutate $$m || exit 1; \
+	done
+qwen-family-gate: tests/qwen_family_gate qwen-family-containers
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors; exit $$rc
+qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors; exit $$rc
+
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
 # a gather of the fixture's ids from the row file must return the fixture's bytes.
@@ -1612,7 +1634,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 \
+	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1793,7 +1815,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -1808,6 +1830,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
+	        src/engine/family*|tests/qwen_family*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
@@ -1835,6 +1858,7 @@ gates-dev:
 	if [ -z "$$sel" ]; then printf '  runner sub-gates: (none -- all coverage for this path set is in the targets below)\n'; \
 	else printf '  runner sub-gates: %s\n' "$$(echo $$sel | tr ' ' ',')"; fi; \
 	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
+	if [ $$family -eq 1 ]; then printf '  qwen-family-gate-device: selected (the family interface)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -1858,6 +1882,9 @@ gates-dev:
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$family -eq 1 ]; then \
+	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
@@ -1983,6 +2010,9 @@ tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_intern
 
 tests/vision_visible_gate.o: tests/vision_visible_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_visible_gate.cpp
+
+tests/qwen_family_gate.o: tests/qwen_family_gate.cpp src/engine/pulsar_engine_internal.h src/engine/family.h src/engine/family_qwen.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/qwen_family_gate.cpp
 
 tests/vision_layout_gate.o: tests/vision_layout_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_layout_gate.cpp
@@ -2122,6 +2152,9 @@ tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_layout_gate: tests/vision_layout_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -2336,7 +2369,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/qwen_family_gate tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

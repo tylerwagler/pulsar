@@ -1707,6 +1707,15 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return wrc;
     }
+    /* Everything but --inspect takes text; a family whose tokenizer this build
+     * does not carry is refused here, by name (L251). */
+    if (!cfg.inspect && !pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar: the %s family has no tokenizer or chat renderer in this build; "
+                        "only --inspect runs -- refusing\n", pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return 1;
+    }
     if (!cfg.inspect) {
         char ctxmem_line[256];
         fprintf(stderr, "%s\n",

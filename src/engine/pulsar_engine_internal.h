@@ -736,6 +736,22 @@ typedef struct {
     uint64_t kv_size;               ///< length of that buffer
 } pulsar_model;
 
+/* The model-family interface (L251 S1): the family descriptor, the layer plan,
+ * and the Qwen4-exp family's shape/weights/state/op contract. */
+#include "family.h"
+#include "family_qwen.h"
+static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
+              "a layer plan must hold every layer a DeepSeek profile can have");
+
+/* The DeepSeek family's entries (family_deepseek.cpp points at them; bodies in
+ * session.cpp, where pulsar_engine::open and pulsar_session::create kept them
+ * until L251). */
+bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
+bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
+int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
+void pulsar_ds4_session_destroy(pulsar_session *s);
+uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
+
 /** A GGUF metadata array left UNPARSED: its type, length, and where its
  * elements start. Reading an array means walking the file from `data_pos`, and
  * most arrays are never read at all. */
@@ -1801,6 +1817,15 @@ struct pulsar_vocab {
  * immutable after open() except the cumulative metrics counters -- which is
  * what makes concurrent sessions safe against a single engine. */
 struct pulsar_engine {
+    /** The model family, chosen once at open from `general.architecture`
+     * (pulsar_family_for_model) and never switched; generic code reaches the
+     * family's session operations through it (family.h). */
+    const pulsar_family *family;
+    /** The family's layer plan, built by family->load: THE authority for which
+     * op runs at layer il.  DeepSeek: n_layer x PULSAR_LAYER_DS4_BLOCK. */
+    pulsar_layer_plan plan;
+    /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
+    pulsar_qwen_weights *qwen_weights;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids
@@ -2302,7 +2327,8 @@ struct pulsar_session {
      *  channel, so any other frame (a disk-KV store/drop from a mid-prefill
      *  "continued" checkpoint) would desync them -- those ops refuse instead. */
     bool tp_in_sync;
-    pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
+    pulsar_gpu_graph graph;   ///< the DeepSeek family's device state (KV, scratch, bank views); untouched on a Qwen session
+    pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
     /** Reused working set for the sampled speculative acceptance walk's
@@ -2865,6 +2891,7 @@ void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
                                   uint64_t *stride);
 pulsar_cursor cursor_at(const pulsar_model *m, uint64_t pos);
 bool model_get_u32(const pulsar_model *m, const char *key, uint32_t *out);
+bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out);
 bool model_get_u64_compat(const pulsar_model *m, const char *key, uint64_t *out);
 bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out);
 bool model_get_bool(const pulsar_model *m, const char *key, bool *out);

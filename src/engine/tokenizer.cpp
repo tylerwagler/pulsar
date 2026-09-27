@@ -781,7 +781,25 @@ static void encode_chat_prompt(
 
 
 
+/* The tokenizer and chat entries serve a family that declares a tokenizer
+ * (family.h PULSAR_FAMILY_CAP_CHAT).  These entries return no error, so a
+ * family without one ends the process here, by name, instead of tokenizing
+ * with an empty vocabulary; the front ends refuse such an engine at startup
+ * (pulsar_engine_has_tokenizer) before they can reach this. */
+static void tokenizer_require(const pulsar_engine *e, const char *op) {
+    if (pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return;
+    fprintf(stderr, "pulsar: %s has no tokenizer in this build -- exiting\n", e->family->name);
+    exit(1);
+}
+
+bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
+    return !e || (e->family->caps & PULSAR_FAMILY_CAP_CHAT) != 0;
+}
+
+
+
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    tokenizer_require(e, "pulsar_tokenize_text");
     e->vocab.bpe_tokenize_text(text ? text : "", out);
 }
 
@@ -898,12 +916,14 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
 }
 
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    tokenizer_require(e, "pulsar_tokenize_rendered_chat");
     e->vocab.tokenize_rendered_chat_vocab(text, out);
 }
 
 void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
                                          pulsar_tokens *out) {
+    tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
     if (!n_spans || !spans) { pulsar_tokenize_rendered_chat(e, text, out); return; }
     e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
 }
@@ -933,6 +953,7 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 
 
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens) {
+    tokenizer_require(e, "pulsar_chat_begin");
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
@@ -944,6 +965,7 @@ void pulsar_encode_chat_prompt(
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out) {
+    tokenizer_require(e, "pulsar_encode_chat_prompt");
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
@@ -951,6 +973,7 @@ void pulsar_encode_chat_prompt(
 
 void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
                                 pulsar_think_mode think_mode) {
+    tokenizer_require(e, "pulsar_chat_append_lead_in");
     encode_chat_lead_in(&e->vocab, has_system, think_mode, tokens);
 }
 
@@ -993,6 +1016,7 @@ size_t pulsar_tool_result_escape(const char *s,
 
 
 void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content) {
+    tokenizer_require(e, "pulsar_chat_append_message");
     pulsar_vocab *vocab = &e->vocab;
     const bool v41 = pulsar_engine_chat_v41(e);
     if (!role) role = "user";
@@ -1044,6 +1068,7 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
 
 
 void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    tokenizer_require(e, "pulsar_chat_append_assistant_prefix");
     chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
     chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
                           e->vocab.think_start_id : e->vocab.think_end_id);
@@ -1146,6 +1171,7 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
+    tokenizer_require(e, "pulsar_token_text");
     return vocab_token_text(&e->vocab, token, len);
 }
 
@@ -1183,18 +1209,21 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 int pulsar_token_eos(pulsar_engine *e) {
+    tokenizer_require(e, "pulsar_token_eos");
     return e->vocab.eos_id;
 }
 
 
 
 int pulsar_token_user(pulsar_engine *e) {
+    tokenizer_require(e, "pulsar_token_user");
     return e->vocab.user_id;
 }
 
 
 
 int pulsar_token_assistant(pulsar_engine *e) {
+    tokenizer_require(e, "pulsar_token_assistant");
     return e->vocab.assistant_id;
 }
 

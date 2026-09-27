@@ -97,6 +97,32 @@ typedef struct {
 
 typedef struct pulsar_engine pulsar_engine;
 typedef struct pulsar_session pulsar_session;
+typedef struct pulsar_family pulsar_family;
+
+/** The model family the loaded artifact belongs to (L251): chosen once at
+ * pulsar_engine_open from the artifact's `general.architecture`, never
+ * switched.  Values are stable. */
+typedef enum {
+    PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
+    PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
+} pulsar_family_id;
+
+/** The conversation format a front end must render for the loaded model: the
+ * chat template, the reasoning-effort spelling, and the tool-call syntax all
+ * follow it.  One fact with one authority (the family); a renderer that has
+ * no arm for a format refuses it. */
+typedef enum {
+    PULSAR_CHAT_DS4_V4  = 0,  ///< DeepSeek V4 (0731) template
+    PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
+    PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
+} pulsar_chat_format;
+
+/** The speculative drafter a family's artifacts carry. */
+typedef enum {
+    PULSAR_DRAFTER_NONE   = 0,
+    PULSAR_DRAFTER_DSPARK = 1,  ///< DeepSeek's DSpark (merged `dspark.*` tensors)
+    PULSAR_DRAFTER_MTP    = 2,  ///< Qwen's multi-token-prediction block (`mtp.*`)
+} pulsar_drafter_kind;
 
 typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*pulsar_session_cancel_fn)(void *ud);
@@ -226,6 +252,17 @@ const char *pulsar_engine_model_name(pulsar_engine *e);
  * Follows the loaded profile (pulsar_shape::variant); an engine-less caller
  * reads as V4.1, the compile-time default profile. */
 bool pulsar_engine_chat_v41(const pulsar_engine *e);
+/** The loaded model's family (L251).  An engine-less caller reads DeepSeek. */
+pulsar_family_id pulsar_engine_family(const pulsar_engine *e);
+/** The loaded model's conversation format (the family's answer; for DeepSeek
+ * it follows the shape profile exactly like pulsar_engine_chat_v41). */
+pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e);
+/** Printable family name ("DeepSeek V4", "Qwen4-exp"). */
+const char *pulsar_engine_family_name(const pulsar_engine *e);
+/** Does the loaded family carry a tokenizer and chat renderer in this build?
+ * A front end that takes text refuses an engine without one at startup; the
+ * tokenizer entries themselves end the process by name if reached anyway. */
+bool pulsar_engine_has_tokenizer(const pulsar_engine *e);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open.
