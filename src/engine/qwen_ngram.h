@@ -27,9 +27,17 @@
  * The layout (multipliers, primes, offsets) is the checkpoint's own buffers
  * (`ple_embedding.layer_multipliers`, `ngram_heads_vocab_sizes`,
  * `ngram_heads_offsets`), carried by the artifact -- the engine never
- * recomputes them.  The rows are read with the Engram pool
- * (pulsar_engram_table_open_parts): 128 row-contiguous bf16 parts, 320 B per
- * row, 16 rows per token = the 2560-wide embedding in head order. */
+ * recomputes them.  The rows are read with the Engram pool from the ROW FILE
+ * the container builder writes (tools/container/ple_rows.py, L251 S6): the
+ * checkpoint's 128 row-contiguous bf16 parts concatenated in order behind L242's
+ * 64-byte PENGRAM1 header at version 2 --
+ *
+ *   0 "PENGRAM1" | 8 u32 version 2 | 12 u32 layer | 16 u64 n_rows | 24 u32 row_bytes 320
+ *   28 u32 dim 160 | 32 u32 n_scale 0 | 36 u32 value_dtype 1 (bf16) | 40 u32 n_heads 16
+ *   44 u32 rows_per_part | 48.. zero
+ *
+ * 320 B per row, 16 rows per token = the 2560-wide embedding in head order.
+ * (The Engram v1 reader refuses a v2 file by version, and this one a v1.) */
 #ifndef PULSAR_QWEN_NGRAM_H
 #define PULSAR_QWEN_NGRAM_H
 
@@ -58,6 +66,17 @@ typedef struct {
  *  every head range inside the table, EOS a token).  1 = usable; 0 with the
  *  broken invariant printed. */
 int  pulsar_qwen_ngram_layout_check(const pulsar_qwen_ngram_layout *L);
+
+#define PULSAR_QWEN_NGRAM_FILE_VERSION 2u
+#define PULSAR_QWEN_NGRAM_DTYPE_BF16   1u
+
+struct pulsar_engram_table;
+
+/** Open the PLE row file for `layer`, asserting its header against the layout
+ *  (rows, record, heads) and its size; one part of the Engram pool's table.
+ *  1 = open; 0 with the mismatch printed. */
+int  pulsar_qwen_ngram_table_open(struct pulsar_engram_table *t, const char *path, uint32_t layer,
+                                  const pulsar_qwen_ngram_layout *L);
 
 /** A new sequence: EOS, EOS. */
 void pulsar_qwen_ngram_ctx_init(const pulsar_qwen_ngram_layout *L, pulsar_qwen_ngram_ctx *ctx);

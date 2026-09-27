@@ -13,11 +13,13 @@
  *      state really is the last two tokens;
  *   3. mutation: a multiplier off by 2 must change the ids (the comparison is live);
  *   4. refusals: an even multiplier and a broken head range are refused by the check;
- *   5. rows (when the parts' files are readable): the engine's pread pool over the 128
- *      parts returns the checkpoint's bytes for every sampled row, including the first
- *      and last row of every part; a row past the table fails the gather by name.
+ *   5. rows: the engine's pread pool returns the checkpoint's bytes for every sampled
+ *      row (including the first and last row of every part) -- over the checkpoint's 128
+ *      shard parts in place, or with --rowfile over the container builder's PENGRAM1 v2
+ *      row file (header asserted against the layout; a v1 header and a wrong layer are
+ *      refused); a row past the table fails the gather by name.
  *
- * usage: qwen_ngram_test VECTORS [--no-rows] */
+ * usage: qwen_ngram_test VECTORS [--no-rows | --rowfile PATH] */
 #include "pulsar_engine_internal.h"
 #include "qwen_ngram.h"
 
@@ -45,6 +47,7 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s VECTORS [--no-rows]\n", argv[0]); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
     const bool rows_part = !(argc > 2 && strcmp(argv[2], "--no-rows") == 0);
+    const char *rowfile = (argc > 3 && strcmp(argv[2], "--rowfile") == 0) ? argv[3] : NULL;
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror(argv[1]); return 2; }
     reader r;
@@ -157,10 +160,18 @@ int main(int argc, char **argv) {
         std::vector<const char *> pp(n_parts);
         for (uint32_t i = 0; i < n_parts; i++) pp[i] = paths[i].c_str();
         pulsar_engram_table t;
-        if (!pulsar_engram_table_open_parts(&t, 1u, n_parts, pp.data(), bases.data(), rows_per_part,
-                                            PULSAR_QWEN_NGRAM_ROW_BYTES, L.n_rows)) {
-            CHECK(0, "open the %u table parts (first %s)", n_parts, pp[0]);
+        if (rowfile) {
+            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, 2u, &L), "the row file opened as layer 2 is refused (message above expected)");
+            pulsar_qwen_ngram_layout L2 = L;
+            L2.n_rows += 128;
+            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, 1u, &L2), "a layout with another row count is refused (message above expected)");
+        }
+        if (rowfile ? !pulsar_qwen_ngram_table_open(&t, rowfile, 1u, &L)
+                    : !pulsar_engram_table_open_parts(&t, 1u, n_parts, pp.data(), bases.data(), rows_per_part,
+                                                      PULSAR_QWEN_NGRAM_ROW_BYTES, L.n_rows)) {
+            CHECK(0, "open the table (%s)", rowfile ? rowfile : pp[0]);
         } else {
+            printf("        rows via %s\n", rowfile ? "the PENGRAM1 v2 row file" : "the checkpoint's 128 shard parts");
             std::vector<uint64_t> ids(n_check);
             std::vector<unsigned char> want((size_t)n_check * PULSAR_QWEN_NGRAM_ROW_BYTES);
             for (uint32_t i = 0; i < n_check; i++) {
@@ -183,7 +194,7 @@ int main(int argc, char **argv) {
             size_t rb = 0;
             for (uint32_t i = 0; i < n_check; i++)
                 rb += memcmp(dst.data() + (size_t)i * 320, want.data() + (size_t)i * 320, 320) != 0;
-            CHECK(ok && rb == 0, "rows: %u sampled rows (every part's first and last included) gathered over %u parts: %zu differ",
+            CHECK(ok && rb == 0, "rows: %u sampled rows (every source part's first and last included; %u parts in the source): %zu differ",
                   n_check, n_parts, rb);
             const uint64_t past = L.n_rows;
             const int bad_ok = pulsar_engram_gather_wait(pulsar_engram_gather_start(io, &t, &past, 1, dst.data()));

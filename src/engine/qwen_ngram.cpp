@@ -5,6 +5,11 @@
 #include "qwen_ngram.h"
 #include "pulsar_engine_internal.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 int pulsar_qwen_ngram_layout_check(const pulsar_qwen_ngram_layout *L) {
     if (!L || L->vocab == 0 || L->eos < 0 || (uint32_t)L->eos >= L->vocab || L->n_rows == 0) {
         fprintf(stderr, "pulsar: qwen n-gram layout: empty vocab or an EOS outside it -- refusing\n");
@@ -28,6 +33,44 @@ int pulsar_qwen_ngram_layout_check(const pulsar_qwen_ngram_layout *L) {
         }
     }
     return 1;
+}
+
+int pulsar_qwen_ngram_table_open(pulsar_engram_table *t, const char *path, uint32_t layer,
+                                 const pulsar_qwen_ngram_layout *L) {
+    if (!t || !path || !L) return 0;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "pulsar: qwen n-gram rows %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    unsigned char hdr[PULSAR_ENGRAM_HDR_BYTES];
+    const bool got = pread(fd, hdr, sizeof hdr, 0) == (ssize_t)sizeof hdr;
+    struct stat st;
+    const bool sized = fstat(fd, &st) == 0;
+    close(fd);
+    uint32_t version = 0, file_layer = 0, row_bytes = 0, dim = 0, n_scale = 0, dtype = 0, n_heads = 0;
+    uint64_t n_rows = 0;
+    if (got) {
+        memcpy(&version, hdr + 8, 4); memcpy(&file_layer, hdr + 12, 4); memcpy(&n_rows, hdr + 16, 8);
+        memcpy(&row_bytes, hdr + 24, 4); memcpy(&dim, hdr + 28, 4); memcpy(&n_scale, hdr + 32, 4);
+        memcpy(&dtype, hdr + 36, 4); memcpy(&n_heads, hdr + 40, 4);   /* 44: rows_per_part, the source's split -- one file here */
+    }
+    const uint64_t want = PULSAR_ENGRAM_HDR_BYTES + L->n_rows * PULSAR_QWEN_NGRAM_ROW_BYTES;
+    if (!got || !sized || memcmp(hdr, "PENGRAM1", 8) != 0 || version != PULSAR_QWEN_NGRAM_FILE_VERSION ||
+        file_layer != layer || n_rows != L->n_rows || row_bytes != PULSAR_QWEN_NGRAM_ROW_BYTES ||
+        dim * 2u != PULSAR_QWEN_NGRAM_ROW_BYTES || n_scale != 0 || dtype != PULSAR_QWEN_NGRAM_DTYPE_BF16 ||
+        n_heads != PULSAR_QWEN_NGRAM_COLS || (uint64_t)st.st_size != want) {
+        fprintf(stderr, "pulsar: qwen n-gram rows %s: header says %.8s v%u layer %u rows %llu record %u (dim %u, "
+                        "%u scales, dtype %u) heads %u, size %lld; this model wants PENGRAM1 v%u layer %u rows %llu "
+                        "record %u bf16 heads %u size %llu -- refusing\n",
+                path, got ? (const char *)hdr : "?", version, file_layer, (unsigned long long)n_rows, row_bytes, dim,
+                n_scale, dtype, n_heads, sized ? (long long)st.st_size : -1LL, PULSAR_QWEN_NGRAM_FILE_VERSION, layer,
+                (unsigned long long)L->n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, PULSAR_QWEN_NGRAM_COLS,
+                (unsigned long long)want);
+        return 0;
+    }
+    const uint64_t base = PULSAR_ENGRAM_HDR_BYTES;
+    return pulsar_engram_table_open_parts(t, layer, 1, &path, &base, L->n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, L->n_rows);
 }
 
 void pulsar_qwen_ngram_ctx_init(const pulsar_qwen_ngram_layout *L, pulsar_qwen_ngram_ctx *ctx) {

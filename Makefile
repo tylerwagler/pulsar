@@ -622,6 +622,9 @@ engram-table-check: tests/engram_table_test
 # tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
 # sparky; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
 QWEN_NGRAM_VECTORS ?= /srv/models/qwen-s4/ngram-corpus.vec
+# the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
+# checkpoint's shard parts named in the vectors instead
+QWEN_NGRAM_ROWFILE ?=
 tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/engine/qwen_ngram.h \
                        src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
                        src/engine/pulsar_engine_internal.h
@@ -630,7 +633,7 @@ tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/e
 .PHONY: qwen-ngram-test
 qwen-ngram-test: tests/qwen_ngram_test
 	./tests/qwen_ngram_test tests/test-vectors/qwen-ngram-small.vec --no-rows
-	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS)
+	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS) $(if $(QWEN_NGRAM_ROWFILE),--rowfile $(QWEN_NGRAM_ROWFILE),)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
