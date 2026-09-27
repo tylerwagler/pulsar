@@ -2,36 +2,35 @@
  * and the collapse-only top-level mixer.  Source: transformers'
  * Qwen4ExpTextGatedResidual; contracts in pulsar_cuda_qwen.h.
  *
- * The read, per token (4 streams x 2560, bf16 storage):
+ * The read, per token (4 streams x 2560, bf16 storage), three launches:
  *   1. norm    xn_s = x_s * rsqrt(mean(x_s^2) + eps) * (1 + w_s)   one CTA per
- *              (stream, token); xn leaves as E4M3 (the W_down input) and the
- *              per-stream rstd is kept, so later kernels recompute xn with the
- *              same three operations instead of storing it; the inject dot
- *              W_inj . xn is taken here on the f32 xn as per-stream partials
- *   2. down    d = W_down xn (320 x 10240, MXFP8), split-K in 5 fixed splits
- *   3. mid     a = silu(d / 4) -> E4M3 (the W_up input); inj = 2 sigmoid(z / 4)
- *              with z the partials summed in stream order
- *   4. up      for each channel c, the four rows s * 2560 + c of W_up
- *              (10240 x 320, MXFP8) in one CTA: g_s = sigmoid(W_up a),
- *              x = (g_0 xn_0 + g_1 xn_1 + g_2 xn_2 + g_3 xn_3) / 4, rounded to
- *              bf16 (the source's `mixed_input` dtype), emitted as the block
- *              input's bf16 row AND its E4M3 encoding (one value, the encoding
- *              of the bf16 value)
+ *              (stream, token); xn leaves in the format W_down reads and the
+ *              per-stream rstd is kept, so the last kernel recomputes xn with
+ *              the same three operations instead of storing it; the inject
+ *              dot W_inj . xn is taken here on the f32 xn as per-stream partials
+ *   2. down    d = W_down xn (320 x 10240), split-K in 5 fixed splits
+ *   3. up      mid: a = silu(d / 4) in shared memory, in the format W_up reads
+ *              (each CTA derives it for its tokens), inj = 2 sigmoid(z / 4) with
+ *              z the partials summed in stream order; then for each channel c
+ *              the four rows s * 2560 + c of W_up (10240 x 320) in one CTA:
+ *              g_s = sigmoid(W_up a), x = (g_0 xn_0 + g_1 xn_1 + g_2 xn_2 +
+ *              g_3 xn_3) / 4, rounded to bf16 (the source's `mixed_input`
+ *              dtype), emitted as the block input's bf16 row AND (when a slot
+ *              is given) its E4M3 encoding -- one value, the encoding of the bf16
  * The write: streams_s += out * inj_s, f32 math, one bf16 rounding.
  *
  * Two low-rank weight formats (pulsar_qwen_lowrank): MXFP8 at every per-layer
- * site (xn and a leave as E4M3, the products are exact, the sums f32) and BF16
- * at the top-level mixer, as the graded recipe stores it (xn and a leave as
- * bf16 -- the source's own dtype there -- and the GEMVs are bf16 x bf16 into
- * f32).  One template parameter, W8, picks the pair; the norm, the gate, the
- * mean and the emit are one code.
+ * site (xn and a are E4M3, the products are exact, the sums f32) and BF16 at
+ * the top-level mixer, as the graded recipe stores it (xn and a are bf16 --
+ * the source's own dtype there -- and the GEMVs are bf16 x bf16 into f32).
+ * One template parameter, W8, picks the pair; the norm, the gate, the mean
+ * and the emit are one code.
  *
- * Fusion.  The paper runs the read and the write as one kernel each; here the
- * read is four launches (the two low-rank GEMVs need the whole token row and
- * the whole weight, which one CTA cannot hold).  The down GEMV is the byte
- * cost (3.3 MB of MXFP8 per site); the rest is small.  Fusing the write with
- * the next site's norm (they touch the same row back to back) is the obvious
- * next step once a caller exists to measure it in.
+ * Fusion.  The paper runs the read and the write as one kernel each; the read
+ * here is three launches because the two low-rank GEMVs need the whole token
+ * row and the whole weight, which one CTA cannot hold.  The down GEMV is the
+ * byte cost (3.3 MB of MXFP8 per site).  Fusing the write with the next site's
+ * norm (they touch the same row back to back) is the next step, measured in.
  */
 #include "pulsar_cuda_qwen.h"
 #include "pulsar_cuda_mx.cuh"
@@ -214,47 +213,63 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
     }
 }
 
-/* 3. a = silu(d / 4) -> the format W_up reads; inj = 2 sigmoid(z / 4) */
-template <bool W8>
-__global__ void __launch_bounds__(kR)
-qwen_gr_mid_kernel(const float *__restrict__ part, __nv_fp8_e4m3 *__restrict__ aq, unsigned char *__restrict__ asf,
-                   int a_kbp, __nv_bfloat16 *__restrict__ ab, const float *__restrict__ injp, float *__restrict__ inj) {
-    const int t = blockIdx.x, r = threadIdx.x;
-    float d = 0.0f;
-#pragma unroll
-    for (int sp = 0; sp < kDownSplit; ++sp) d += part[((size_t)t * kDownSplit + sp) * kR + r];
-    const float z = d * (1.0f / kS);
-    const float a = z / (1.0f + expf(-z));
-    if constexpr (W8) pulsar_mx_emit_block(a, (uint32_t)r, (uint32_t)t, (uint32_t)kR, a_kbp, aq, asf);
-    else ab[(size_t)t * kR + r] = __float2bfloat16(a);
-    if (injp && r < kS) {
-        float zi = 0.0f;
-#pragma unroll
-        for (int s = 0; s < kS; ++s) zi += injp[((size_t)t * kS + s) * kS + r];
-        inj[t * kS + r] = 2.0f / (1.0f + expf(-zi * (1.0f / kS)));
-    }
-}
-
-/* 4. up + gate + mean: one warp per stream, lane = channel, kUpTB tokens per
- * CTA.  The k loop is outermost: each 32-block of the lane's W_up row is
- * loaded once and applied to every token of the CTA (a token's z still sums
- * its blocks in order 0..9, so the row arithmetic does not depend on T); the
- * gated products go to shared memory and one warp per token takes the stream
- * mean and emits the row. */
+/* 3. mid + up + gate + mean: one warp per stream, lane = channel, kUpTB
+ * tokens per CTA.
+ *   mid  a = silu(d / 4), d = the down's splits summed in split order, for the
+ *        CTA's tokens, in shared memory -- in the format W_up reads (E4M3 per
+ *        32 by the one producer encoder, or bf16).  Every CTA derives the same
+ *        a (320 values a token: cheaper than a launch and a round trip);
+ *        CTA x == 0 also finalises inj = 2 sigmoid(z / 4) from the norm's
+ *        per-stream partials, in stream order.
+ *   up   the k loop is outermost: each 32-block of the lane's W_up row is
+ *        loaded once and applied to every token of the CTA (a token's z sums
+ *        its blocks in order 0..9, so the row arithmetic does not depend on T);
+ *        the gated products go to shared memory and one warp per token takes
+ *        the stream mean and emits the row. */
 template <bool W8>
 __global__ void __launch_bounds__(32 * kS)
 qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
-                  const void *__restrict__ av, const uint8_t *__restrict__ asf, int a_kbp,
+                  const float *__restrict__ part, const float *__restrict__ injp, float *__restrict__ inj,
                   const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat16 *__restrict__ norm_w,
                   const float *__restrict__ rstd, int T,
                   __nv_bfloat16 *__restrict__ x_out, __nv_fp8_e4m3 *__restrict__ xq, unsigned char *__restrict__ xsf,
                   int x_kbp) {
     constexpr int NB = kR / 32;
     __shared__ float prod[kUpTB][kS][32];
+    __shared__ __align__(16) uint8_t s_a[kUpTB][W8 ? kR : 2 * kR];   /* a: E4M3 codes or bf16 */
+    __shared__ unsigned char s_asf[kUpTB][NB];                       /* a's E8M0 per 32 (W8) */
     const int s = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int c = blockIdx.x * 32 + lane;
     const int row = s * kH + c;
     const int t0 = blockIdx.y * kUpTB, nt = min(kUpTB, T - t0);
+    /* mid: warp s takes the (token, 32-group) pairs s, s + 4, ...; lane = element */
+    for (int g = s; g < nt * NB; g += kS) {
+        const int tt = g / NB, b = g % NB, r = b * 32 + lane;
+        float d = 0.0f;
+#pragma unroll
+        for (int sp = 0; sp < kDownSplit; ++sp) d += part[((size_t)(t0 + tt) * kDownSplit + sp) * kR + r];
+        const float zz = d * (1.0f / kS);
+        const float av = zz / (1.0f + expf(-zz));
+        if constexpr (W8) {
+            float am = fabsf(av);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            const int se = pulsar_mx_shared_exp(am);
+            const __nv_fp8_e4m3 q = pulsar_mx_encode(av, se);
+            s_a[tt][r] = *reinterpret_cast<const uint8_t *>(&q);
+            if (lane == 0) s_asf[tt][b] = pulsar_mx_scale_byte(se);
+        } else {
+            reinterpret_cast<__nv_bfloat16 *>(s_a[tt])[r] = __float2bfloat16(av);
+        }
+    }
+    if (injp && blockIdx.x == 0 && (int)threadIdx.x < nt * kS) {
+        const int tt = threadIdx.x / kS, j = threadIdx.x % kS, t = t0 + tt;
+        float zi = 0.0f;
+#pragma unroll
+        for (int ss = 0; ss < kS; ++ss) zi += injp[((size_t)t * kS + ss) * kS + j];
+        inj[t * kS + j] = 2.0f / (1.0f + expf(-zi * (1.0f / kS)));
+    }
+    __syncthreads();
     float z[kUpTB];
 #pragma unroll
     for (int tt = 0; tt < kUpTB; ++tt) z[tt] = 0.0f;
@@ -267,9 +282,8 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
 #pragma unroll
             for (int tt = 0; tt < kUpTB; ++tt) {
                 if (tt < nt) {
-                    const int t = t0 + tt;
-                    const uint4 *ap = reinterpret_cast<const uint4 *>((const uint8_t *)av + (size_t)t * kR) + 2 * b;
-                    z[tt] = fmaf(e4m3_dot32(w0, w1, ap[0], ap[1]), mx_scale2(sw, asf[pulsar_mx_sfoff(t, b, a_kbp)]), z[tt]);
+                    const uint4 *ap = reinterpret_cast<const uint4 *>(s_a[tt]) + 2 * b;
+                    z[tt] = fmaf(e4m3_dot32(w0, w1, ap[0], ap[1]), mx_scale2(sw, s_asf[tt][b]), z[tt]);
                 }
             }
         }
@@ -279,9 +293,7 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
             const uint4 w = wp[ci];
 #pragma unroll
             for (int tt = 0; tt < kUpTB; ++tt)
-                if (tt < nt)
-                    z[tt] = bf16_dot8(w, reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)av + (size_t)(t0 + tt) * kR)[ci],
-                                      z[tt]);
+                if (tt < nt) z[tt] = bf16_dot8(w, reinterpret_cast<const uint4 *>(s_a[tt])[ci], z[tt]);
         }
     }
     const float w1n = 1.0f + bf2f(norm_w[row]);
@@ -314,7 +326,7 @@ __global__ void qwen_gr_write_kernel(__nv_bfloat16 *__restrict__ streams, const 
 }
 
 struct gr_ws {
-    uint8_t *xn, *xn_sf, *a, *a_sf;   /* xn / a: E4M3 (W8) or bf16 -- sized for bf16 */
+    uint8_t *xn, *xn_sf;              /* xn: E4M3 (W8) or bf16 -- sized for bf16 */
     float *rstd, *injp, *part;
 };
 
@@ -330,8 +342,6 @@ static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
     gr_ws m{};
     m.xn    = (uint8_t *)take((size_t)T * kHC * 2);
     m.xn_sf = (uint8_t *)take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kHC)));
-    m.a     = (uint8_t *)take((size_t)T * kR * 2);
-    m.a_sf  = (uint8_t *)take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kR)));
     m.rstd  = (float *)take((size_t)T * kS * 4);
     m.injp  = (float *)take((size_t)T * kS * kS * 4);
     m.part  = (float *)take((size_t)T * kDownSplit * kR * 4);
@@ -357,16 +367,15 @@ extern "C" size_t pulsar_qwen_gr_workspace_bytes(int T) {
 template <bool W8>
 static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
                             const pulsar_qwen_slot *x, float *inj, const gr_ws &m, cudaStream_t stream) {
-    const int xn_kbp = pulsar_mx_kbp(kHC), a_kbp = pulsar_mx_kbp(kR);
+    const int xn_kbp = pulsar_mx_kbp(kHC);
     qwen_gr_norm_kernel<W8><<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
         (__nv_fp8_e4m3 *)m.xn, m.xn_sf, xn_kbp, (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
     qwen_gr_down_kernel<W8><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
         w->down.w, w->down.sf, m.xn, m.xn_sf, xn_kbp, kR, kHC, T, kDownSplit, m.part);
-    qwen_gr_mid_kernel<W8><<<T, kR, 0, stream>>>(m.part, (__nv_fp8_e4m3 *)m.a, m.a_sf, a_kbp, (__nv_bfloat16 *)m.a,
-                                                 w->inject ? m.injp : nullptr, inj);
     qwen_gr_up_kernel<W8><<<dim3(kH / 32, (T + kUpTB - 1) / kUpTB), 32 * kS, 0, stream>>>(
-        w->up.w, w->up.sf, m.a, m.a_sf, a_kbp, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
+        w->up.w, w->up.sf, m.part, w->inject ? m.injp : nullptr, inj, (const __nv_bfloat16 *)streams,
+        (const __nv_bfloat16 *)w->norm_w,
         m.rstd, T, (__nv_bfloat16 *)x_bf16, x ? (__nv_fp8_e4m3 *)x->q : nullptr, x ? x->sf : nullptr,
         x ? x->kbp : 0);
 }
@@ -407,10 +416,9 @@ extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uin
                 w8 ? "MXFP8 (E4M3 act)" : "BF16 (bf16 act)", kDownSplit, w8 ? "MXFP8" : "BF16",
                 x ? " + E4M3" : "");
     }
-    if (w8) {
-        cudaMemsetAsync(m.xn_sf, 0, pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kHC)), stream);
-        cudaMemsetAsync(m.a_sf, 0, pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kR)), stream);
-    }
+    /* xn's scale slab needs no clearing: the norm writes every (row, block) the down
+     * GEMV reads (rows < T, all 320 blocks); only the x slot, read by other
+     * consumers over its padded slab, is cleared */
     if (x) cudaMemsetAsync(x->sf, 0, pulsar_mx_sf_slab_bytes(T, x->kbp), stream);   /* this launcher is the slot's producer */
     if (w8) gr_read_kernels<true>(w, streams, T, x_bf16, x, inj, m, stream);
     else    gr_read_kernels<false>(w, streams, T, x_bf16, x, inj, m, stream);
