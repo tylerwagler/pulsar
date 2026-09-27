@@ -37,7 +37,7 @@ CALIB = "/srv/models/calib-qwen38-v1.jsonl"
 ACT = "/srv/models/qwen38fn-act-L12"
 CAP = "/srv/models/qwen-s4/cap-l1"
 PFX = "model.language_model."
-DEV = torch.device("cuda:0")
+DEV = torch.device(os.environ.get("QWEN_S4_DEV", "cuda:0"))   # cpu only for a dry run of the python side
 LOGF = None
 
 
