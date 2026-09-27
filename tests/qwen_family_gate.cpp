@@ -173,10 +173,15 @@ static void gpu_part(const char *dir) {
     int toks[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     pulsar_tokens prompt = { toks, 8, 8 };
     char err[256] = "";
-    check(pulsar_session_sync(sess, &prompt, err, sizeof(err)) != 0, "sync refused: %s", err);
-    check(pulsar_session_pos(sess) == 0, "the refused prefill committed nothing (pos %d)", pulsar_session_pos(sess));
+    /* The forward RUNS now: every op is implemented (S2's gdn, S3's qsa, S4's
+     * six) and the fixture carries the recipe's tensor formats, so the 8-token
+     * prefill commits, the bank's position advances, and eval emits logits.
+     * The fixture's weights are ZEROS: this proves the wiring and the buffer
+     * shapes run end to end, NOT the numbers (the reference gate grades those). */
+    check(pulsar_session_sync(sess, &prompt, err, sizeof(err)) == 0, "prefill ran: %s", err);
+    check(pulsar_session_pos(sess) == 8, "the prefill committed 8 positions (pos %d)", pulsar_session_pos(sess));
     err[0] = '\0';
-    check(pulsar_session_eval(sess, 1, err, sizeof(err)) != 0, "eval refused: %s", err);
+    check(pulsar_session_eval(sess, 1, err, sizeof(err)) == 0, "eval ran: %s", err);
     pulsar_multiseq_req row = { 0u, 0, 1 };
     float *logits = (float *)xmalloc(248320u * sizeof(float));
     err[0] = '\0';
