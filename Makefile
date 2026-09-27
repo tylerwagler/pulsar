@@ -556,6 +556,8 @@ QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 .PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
 qwen-family-containers:
+	@test -f $(QWEN_HF_DIR)/model.safetensors.index.json || { \
+	  echo "REFUSING: QWEN_HF_DIR=$(QWEN_HF_DIR) is not the Qwen3.8-Flash-Next HF checkpoint (headers + config are read)"; exit 1; }
 	@mkdir -p $(QWEN_GATE_DIR) && \
 	python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/good.safetensors && \
 	for m in arch shape tensor layer-type; do \

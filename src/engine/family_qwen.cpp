@@ -774,6 +774,10 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
         while (common < s->checkpoint.len && common < prompt->len &&
                s->checkpoint.v[common] == prompt->v[common]) common++;
     }
+    /* bank_pos[0] is the state's authority; the checkpoint must agree with it
+     * to be continued (a batched step on bank 0 moves the state, not the
+     * checkpoint, and clears checkpoint_valid). */
+    if (s->checkpoint_valid && s->qwen->bank_pos[0] != (uint32_t)s->checkpoint.len) s->checkpoint_valid = false;
     const bool extends = s->checkpoint_valid && common == s->checkpoint.len && common < prompt->len;
     if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len) return 0;
     uint32_t start = 0;
@@ -839,9 +843,12 @@ static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq
     }
     if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, n, 0, n, logits)) {
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return -1;
+        return 1;
     }
-    for (uint32_t i = 0; i < n; i++) s->qwen->bank_pos[reqs[i].bank]++;
+    for (uint32_t i = 0; i < n; i++) {
+        s->qwen->bank_pos[reqs[i].bank]++;
+        if (reqs[i].bank == 0) s->checkpoint_valid = false;   /* bank 0 moved past the checkpoint */
+    }
     return 0;
 }
 
@@ -852,10 +859,14 @@ static int qwen_session_decode_mixed(pulsar_session *, const pulsar_multiseq_req
     return 1;
 }
 
+/* Every bank starts over: its position AND its recurrent state (a bank at
+ * position 0 with an advanced state would decode on stale state). */
 static void qwen_session_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    for (uint32_t b = 0; b < s->qwen->n_banks; b++) s->qwen->bank_pos[b] = 0;
+    for (uint32_t b = 0; b < s->qwen->n_banks; b++)
+        if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, b))
+            fprintf(stderr, "pulsar: %s: invalidate could not clear bank %u's state\n", PULSAR_QWEN_ARCH, b);
 }
 
 static const pulsar_family_session_ops k_qwen_session_ops = {
