@@ -557,6 +557,33 @@ tests/gdn_bench: tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_c
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
+# L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
+# double host reference -- cache encode, top-512 selection incl. exact ties,
+# output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
+# needs a device.  Links the PRODUCTION objects.
+tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                     $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_gate.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: qsa-attn-gate
+qsa-attn-gate: tests/qsa_attn_gate
+	./tests/qsa_attn_gate
+
+# L251 S3: replay one real attention layer's captured projections through the
+# same entry point, for the offline grade against transformers (see the tool's
+# header).  Not a gate by itself: the grade lives with the capture script.
+tests/qsa_layer_replay: tests/qsa_layer_replay.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_layer_replay.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+# L251 S3: the layer's decode (M = 1/4/8 at 8K/64K/256K, DRAM-cold) and prefill
+# chunk timings on GB10.  Not a gate.
+tests/qsa_attn_bench: tests/qsa_attn_bench.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_bench.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row

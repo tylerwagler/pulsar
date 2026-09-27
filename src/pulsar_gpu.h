@@ -2499,4 +2499,99 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
                                    uint64_t bytes, const void *done_dev, uint64_t exch,
                                    void *err_dev, uint64_t timeout_ns);
 
+/* ---- Qwen3.8-Flash-Next full attention + QSA (L251 stream S3) ----------------
+ * One of the 12 full-attention layers (3, 7, ..., 47) between its Linears: the
+ * caller runs q_proj / k_proj / v_proj / index_qk_proj (f32 outputs) and o_proj
+ * (which reads the E4M3 slot this emits).  Semantics are transformers
+ * `qwen4_exp` (Qwen4ExpTextAttention + Qwen4ExpTextQSAIndexer), text positions
+ * only (the three mRoPE rows equal, so interleaved mRoPE is plain RoPE):
+ *   q_proj row = 24 heads x [256 query | 256 sigmoid output gate] (per head)
+ *   q/k RMSNorm per head (weight applied as 1 + w), partial RoPE on dims 0..63
+ *   (rotate_half pairs (i, i+32), angle = f32(pos) * f32 inv_freq[i]), GQA 12:1
+ *   indexer: 4 q heads x 128 + 1 raw key x 128; keys mean-pooled over aligned
+ *   blocks of 4 BEFORE the norm, then RMSNorm, then RoPE at the block start;
+ *   score(block) = sum_h relu(q_h . k_block); a query at position p sees
+ *   n = p + 1 tokens, nb = n / 4 complete blocks: nb <= 512 attends to every
+ *   token; else the top 512 blocks (ties: lower block index) + the n % 4 tail.
+ *   (HF divides the score by sqrt(128): a positive constant, ranking unchanged.)
+ *
+ * KV cache per sequence per layer (the caller allocates; S1 owns the policy):
+ *   kv    cap x 1056 B per token: K h0 | K h1 | V h0 | V h1 (256 E4M3 each,
+ *         post-norm post-RoPE K, raw V), then 4 x 8 E8M0 scales in the same
+ *         order -- one power-of-two scale per 32 elements (the MX rule of
+ *         pulsar_cuda_mx.cuh, the Engram row's scale granularity)
+ *   bkey  cap/4 x 128 bf16: each COMPLETE block's pooled, normed, roped key --
+ *         what the scorer reads; raw per-token indexer keys are not kept
+ *   stage 4 x 128 f32: the raw indexer keys of the open (incomplete) block
+ * KV/token/layer = 1056 + 64 (bkey) B; 12 layers = 13.1 KiB/token. */
+enum {
+    PULSAR_QSA_N_HEAD     = 24,
+    PULSAR_QSA_N_KV       = 2,
+    PULSAR_QSA_HEAD_DIM   = 256,
+    PULSAR_QSA_ROT_DIM    = 64,
+    PULSAR_QSA_Q_IN       = 12288,   /* q_proj width: 24 x (256 + 256) */
+    PULSAR_QSA_KV_IN      = 512,     /* k_proj / v_proj width */
+    PULSAR_QSA_OUT_DIM    = 6144,    /* o_proj input */
+    PULSAR_QSA_IDX_HEADS  = 4,
+    PULSAR_QSA_IDX_DIM    = 128,
+    PULSAR_QSA_IDX_IN     = 640,     /* index_qk_proj width: 4 x 128 q + 128 k */
+    PULSAR_QSA_BLOCK      = 4,       /* indexer_compress_ratio */
+    PULSAR_QSA_TOP_BLOCKS = 512,     /* indexer_budget / indexer_compress_ratio */
+    PULSAR_QSA_KV_TOKEN_BYTES = 1056,
+    PULSAR_QSA_BKEY_BYTES = 256,
+    PULSAR_QSA_STAGE_BYTES = 2048
+};
+#define PULSAR_QSA_ROPE_THETA 10000000.0
+#define PULSAR_QSA_RMS_EPS    1e-6f
+
+/** The RoPE inverse frequencies, f32, as transformers computes them
+ * (1 / theta^(2i/64)); the ONE table the kernels and the gates use. */
+void pulsar_qsa_inv_freq(float inv_freq[PULSAR_QSA_ROT_DIM / 2]);
+
+/** One sequence's cache for ONE attention layer (layout above). */
+typedef struct {
+    pulsar_gpu_tensor *kv;
+    pulsar_gpu_tensor *bkey;
+    pulsar_gpu_tensor *stage;
+    uint32_t cap;              /**< token capacity, a multiple of 4 */
+} pulsar_qsa_seq;
+
+/** The layer's four norm weights, f32, as stored in the checkpoint (w, not 1 + w). */
+typedef struct {
+    const pulsar_gpu_tensor *q_norm;      /**< 256 */
+    const pulsar_gpu_tensor *k_norm;      /**< 256 */
+    const pulsar_gpu_tensor *idx_q_norm;  /**< 128 */
+    const pulsar_gpu_tensor *idx_k_norm;  /**< 128 */
+} pulsar_qsa_layer;
+
+typedef struct {
+    const pulsar_gpu_tensor *qg;    /**< f32 [n_rows][12288] q_proj output */
+    const pulsar_gpu_tensor *k;     /**< f32 [n_rows][512] k_proj output */
+    const pulsar_gpu_tensor *v;     /**< f32 [n_rows][512] v_proj output */
+    const pulsar_gpu_tensor *idx;   /**< f32 [n_rows][640] index_qk_proj output */
+    void *out_e4m3;                 /**< o_proj A8 slot: E4M3 [n_rows][6144] ... */
+    void *out_scale;                /**< ... and its swizzled E8M0 slab (zeroed by the slot) */
+    int   out_sf_pitch;             /**< the slot's KBp */
+    /** Observation taps for gates; NULL in the lane.  out_f32 = the gated
+     * attention output the slot encodes; sel = each row's selected blocks,
+     * ascending, or all 0xffffffff for a row that attends to every token. */
+    pulsar_gpu_tensor *tap_out_f32; /**< f32 [n_rows][6144] */
+    pulsar_gpu_tensor *tap_sel;     /**< u32 [n_rows][512] */
+} pulsar_qsa_io;
+
+/** Workspace for a call of up to n_rows rows whose positions are < max_ctx. */
+uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx);
+
+/** Run the layer's attention for n_rows rows.  Row r is the token at position
+ * row_pos[r] of sequence row_seq[r].  Each sequence's rows form ONE contiguous
+ * run of consecutive positions, and the run starts at the sequence's frontier
+ * (every earlier position was written by an earlier call).  The same rows give
+ * the same bytes whatever else is in the batch and however a prompt is chunked
+ * (decode == prefill; tests/qsa_attn_gate).  Refuses (returns 0, says why) on
+ * any violated precondition. */
+int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
+                           const pulsar_qsa_seq *seqs, uint32_t n_seqs,
+                           const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
+                           const pulsar_qsa_io *io, pulsar_gpu_tensor *workspace);
+
 #endif
