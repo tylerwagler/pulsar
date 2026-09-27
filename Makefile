@@ -262,11 +262,13 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
+                 tests/gdn_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
 	./tests/exl3_gemv_gate
+	./tests/gdn_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -473,6 +475,32 @@ tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gem
 .PHONY: exl3-gemv-gate
 exl3-gemv-gate: tests/exl3_gemv_gate
 	./tests/exl3_gemv_gate
+
+# L251: the Gated DeltaNet kernels (Qwen3.8-Flash-Next) -- conv + gates + the
+# delta-rule recurrence + gated RMSNorm between the block's projections.  Vs the
+# double host authority; decode == prefill, chunk and batch neutrality
+# bit-exact; the A8 slot vs the canonical encoder; mutations; refusals.  Links
+# the PRODUCTION object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
+src/cuda/pulsar_cuda_gdn.o: src/cuda/pulsar_cuda_gdn.h
+tests/gdn_gate: tests/gdn_gate.cu tests/gdn_ref.h src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_cuda_gdn.h \
+                src/cuda/pulsar_cuda_mx.cuh Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gdn_gate.cu src/cuda/pulsar_cuda_gdn.o
+
+.PHONY: gdn-gate
+gdn-gate: tests/gdn_gate
+	./tests/gdn_gate
+
+# L251: the GDN microbenchmark -- decode steps at 1/4/8/16 sequences, DRAM-cold
+# (state slots rotated past L2), prefill throughput, and a streaming-copy
+# roofline measured in the same process.  Not a gate.
+tests/gdn_bench: tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_cuda_gdn.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o
+
+# L251: the same TU as a shared object for the real-weight harness in
+# pulsar-notes research/l251/gdn/ (ctypes from torch, against transformers'
+# own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
+tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
@@ -1717,7 +1745,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; gdn=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -1733,6 +1761,7 @@ gates-dev:
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
+	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -1748,6 +1777,7 @@ gates-dev:
 	        engine) for g in $(GATES_DEV_ENGINE); do add $$g; done ;; \
 	        vision) for g in $(GATES_DEV_VISION); do add $$g; done ;; \
 	        exl3) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
+	        gdn) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
@@ -1778,6 +1808,9 @@ gates-dev:
 	           vision-visible-gate vision-placeholder-gate; do \
 	    $(MAKE) --no-print-directory $$h CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	  done; \
+	fi; \
+	if [ $$gdn -eq 1 ]; then \
+	  $(MAKE) --no-print-directory gdn-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
