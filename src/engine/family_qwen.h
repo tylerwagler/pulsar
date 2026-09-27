@@ -377,7 +377,7 @@ typedef struct {
     bool (*head)(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
     /** Bytes of scratch op `op` needs at max_rows rows (0 = none).  Called
      * once per session create; NULL = the op needs none. */
-    uint64_t (*scratch_bytes)(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows);
+    uint64_t (*scratch_bytes)(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx);
 } pulsar_qwen_ops;
 
 /** THE op table.  Defined in family_qwen.cpp; each stream fills its entries
@@ -399,7 +399,8 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
 /* S2's op, landed on the integration branch in family_qwen_s4.cpp (see the note
  * there); moves to family_qwen_s2.cpp when S2 rebases. */
 bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il);
-uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows);
+bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il);
+uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx);
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt);
 /** Called by the step driver after every forward that got past its op check:
  *  waits out a PLE gather a failed step left in flight, and after a completed

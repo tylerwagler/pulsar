@@ -170,6 +170,42 @@ gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     return g;
 }
 
+/* L251 S3: the QSA op's scratch.  qg/k/v/idx hold the four f32 projections (the
+ * op hands the kernel VIEWS of them, because pulsar_qsa_io wants tensors and the
+ * scratch IS one); a8/a8_sf are the o_proj A8 slot the kernel emits; ws is
+ * pulsar_gpu_qsa_forward's workspace; lin_ws is the shared dense workspace. */
+struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+
+uint64_t qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
+    const int H = (int)s->n_embd;
+    const int dims[5][2] = {{H, PULSAR_QSA_Q_IN}, {H, PULSAR_QSA_KV_IN}, {H, PULSAR_QSA_KV_IN},
+                            {H, PULSAR_QSA_IDX_IN}, {PULSAR_QSA_OUT_DIM, H}};
+    uint64_t m = 0;
+    for (int i = 0; i < 5; i++) {
+        pulsar_qwen_linear l{};
+        l.in = dims[i][0]; l.out = dims[i][1];
+        const uint64_t b = a256(pulsar_qwen_linear_workspace_bytes(&l, (int)rows));
+        if (b > m) m = b;
+    }
+    return m;
+}
+
+qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) {
+    qsa_scratch g{};
+    uint64_t o = 0;
+    g.qg  = o; o += a256((uint64_t)rows * PULSAR_QSA_Q_IN * sizeof(float));
+    g.k   = o; o += a256((uint64_t)rows * PULSAR_QSA_KV_IN * sizeof(float));
+    g.v   = o; o += a256((uint64_t)rows * PULSAR_QSA_KV_IN * sizeof(float));
+    g.idx = o; o += a256((uint64_t)rows * PULSAR_QSA_IDX_IN * sizeof(float));
+    g.a8    = o; o += a256((uint64_t)rows * PULSAR_QSA_OUT_DIM);
+    g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp(PULSAR_QSA_OUT_DIM)));
+    g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
+    g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
+    g.total = o;
+    (void)s;
+    return g;
+}
+
 } // namespace
 
 /* ======================================================================== */
@@ -280,14 +316,15 @@ void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
     w->ple_io = NULL;
 }
 
-uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows) {
+uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx) {
     switch (op) {
     case PULSAR_QWEN_OP_EMBED:   return (uint64_t)max_rows * sizeof(int32_t);
     case PULSAR_QWEN_OP_PLE:     return ple_layout(max_rows).total;
     case PULSAR_QWEN_OP_GR_READ: return gr_layout(max_rows).total;
     case PULSAR_QWEN_OP_MOE:     return moe_layout(max_rows).total;
     case PULSAR_QWEN_OP_HEAD:    return head_layout().total;
-    case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;   /* S2's op; S3 chains QSA in */
+    case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;
+    case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, ctx).total;
     default:                     return 0;   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
     }
 }
@@ -573,4 +610,96 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_qwen_slot oslot = {(uint8_t *)(base + g.a8), (uint8_t *)(base + g.a8_sf), c.out_kbp};
     return pulsar_qwen_linear_launch(&out, &oslot, (int)n, (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
            fail("the GDN out_proj launch failed");
+}
+
+/* ======================================================================== */
+/* L251 S3's op: the Qwen full-attention + QSA layer.  On the integration branch
+ * it lives in this TU for the same reason the gdn op does; split into
+ * family_qwen_s3.cpp when S3 rebases.  The kernel is src/cuda/pulsar_cuda_qsa.cu.
+ *
+ * x (bf16 + its armed E4M3 slot) -> q_proj / k_proj / v_proj / index_qk_proj
+ * through the EXL3 dense arm -> pulsar_gpu_qsa_forward (appends K/V + the pooled
+ * block keys to the bank's caches and EMITS the A8 slot) -> o_proj -> y f32.
+ * The four norms are bf16 (the recipe's format; the kernel widens). */
+bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
+    const pulsar_qwen_shape *s = st->shape;
+    const uint32_t n = st->n_rows;
+    const int H = (int)s->n_embd;
+    const pulsar_qwen_layer_weights &L = layer_w(st, il);
+    const pulsar_tensor *nrm[4] = {L.attn_q_norm, L.attn_k_norm, L.idx_q_norm, L.idx_k_norm};
+    for (int i = 0; i < 4; i++)
+        if (!admit(nrm[i], nrm[i]->type == PULSAR_TENSOR_BF16, "bf16 (the QSA kernel's norm dtype)")) return false;
+    pulsar_qwen_linear q, k, v, ix, out;
+    if (!linear_dev(st, L.attn_q, H, PULSAR_QSA_Q_IN,   "qwen QSA q_proj", &q) ||
+        !linear_dev(st, L.attn_k, H, PULSAR_QSA_KV_IN,  "qwen QSA k_proj", &k) ||
+        !linear_dev(st, L.attn_v, H, PULSAR_QSA_KV_IN,  "qwen QSA v_proj", &v) ||
+        !linear_dev(st, L.idx_qk, H, PULSAR_QSA_IDX_IN, "qwen QSA index_qk_proj", &ix) ||
+        !linear_dev(st, L.attn_o, PULSAR_QSA_OUT_DIM, H, "qwen QSA o_proj", &out)) return false;
+    const void *xq = NULL, *xsf = NULL;
+    int xkbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(st->st->x, n, (uint64_t)H, &xq, &xsf, &xkbp))
+        return fail("the QSA op found no E4M3 slot for its input (the GR read is its producer)");
+    const pulsar_qwen_slot xin = {(uint8_t *)xq, (uint8_t *)xsf, xkbp};
+    pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_QSA];
+    if (!sc) return fail("no QSA scratch");
+    const qsa_scratch g = qsa_layout(s, st->st->max_rows, st->st->ctx);
+    void *linws = (uint8_t *)dptr(sc) + g.lin_ws;
+
+    /* pulsar_qsa_io wants tensors for the four projections; the scratch IS a
+     * tensor, so hand it views (and free them on every exit). */
+    pulsar_gpu_tensor *vq = scratch_view(st, PULSAR_QWEN_OP_QSA, g.qg, (uint64_t)n * PULSAR_QSA_Q_IN * 4);
+    pulsar_gpu_tensor *vk = scratch_view(st, PULSAR_QWEN_OP_QSA, g.k, (uint64_t)n * PULSAR_QSA_KV_IN * 4);
+    pulsar_gpu_tensor *vv = scratch_view(st, PULSAR_QWEN_OP_QSA, g.v, (uint64_t)n * PULSAR_QSA_KV_IN * 4);
+    pulsar_gpu_tensor *vi = scratch_view(st, PULSAR_QWEN_OP_QSA, g.idx, (uint64_t)n * PULSAR_QSA_IDX_IN * 4);
+    pulsar_gpu_tensor *views[64 * 3 + 4];
+    int nv = 0;
+    if (vq) views[nv++] = vq;
+    if (vk) views[nv++] = vk;
+    if (vv) views[nv++] = vv;
+    if (vi) views[nv++] = vi;
+    auto drop = [&]() { for (int i = 0; i < nv; i++) pulsar_gpu_tensor_free(views[i]); };
+
+    const uint32_t nb = st->st->n_banks;
+    if (nv != 4 || nb == 0 || nb > 64) { drop(); return fail("the QSA op needs 4 projection views and 1..64 banks"); }
+    bool ok = pulsar_qwen_linear_launch(&q,  &xin, (int)n, (float *)dptr(vq), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&k,  &xin, (int)n, (float *)dptr(vk), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&v,  &xin, (int)n, (float *)dptr(vv), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&ix, &xin, (int)n, (float *)dptr(vi), linws, g.lin_ws_bytes, 0) == 0;
+    if (!ok) { drop(); return fail("a QSA projection launch failed"); }
+
+    /* the per-bank cache views: bank-major, at the sizes family_qwen.h owns */
+    const uint64_t kvb = pulsar_qwen_kv_row_bytes(s);
+    const uint64_t ikb = pulsar_qwen_index_row_bytes(s);
+    const uint64_t itb = pulsar_qwen_index_tail_bytes(s);
+    const uint64_t nblk = ((uint64_t)st->st->ctx + s->idx_block - 1u) / s->idx_block;
+    pulsar_qsa_seq seqs[64];
+    for (uint32_t b = 0; ok && b < nb; b++) {
+        seqs[b].kv    = pulsar_gpu_tensor_view(st->st->layer[il].kv,       b * st->st->ctx * kvb, st->st->ctx * kvb);
+        seqs[b].bkey  = pulsar_gpu_tensor_view(st->st->layer[il].idx_keys, b * nblk * ikb, nblk * ikb);
+        seqs[b].stage = pulsar_gpu_tensor_view(st->st->layer[il].idx_tail, b * itb, itb);
+        seqs[b].cap   = st->st->ctx;
+        views[nv++] = seqs[b].kv; views[nv++] = seqs[b].bkey; views[nv++] = seqs[b].stage;
+        ok = seqs[b].kv && seqs[b].bkey && seqs[b].stage;
+    }
+    if (!ok) { drop(); return fail("a QSA bank cache view failed"); }
+
+    const pulsar_qsa_layer layer = {(const uint16_t *)wptr(st, L.attn_q_norm,  "qwen QSA q_norm"),
+                                    (const uint16_t *)wptr(st, L.attn_k_norm,  "qwen QSA k_norm"),
+                                    (const uint16_t *)wptr(st, L.idx_q_norm,   "qwen QSA idx_q_norm"),
+                                    (const uint16_t *)wptr(st, L.idx_k_norm,   "qwen QSA idx_k_norm")};
+    pulsar_qsa_io io{};
+    io.qg = vq; io.k = vk; io.v = vv; io.idx = vi;
+    io.out_e4m3 = (uint8_t *)dptr(sc) + g.a8;
+    io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
+    io.out_sf_pitch = pulsar_gpu_mx_kbp(PULSAR_QSA_OUT_DIM);
+    io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
+    const int rc = ok ? pulsar_gpu_qsa_forward(&layer, seqs, nb,
+                                               (const uint32_t *)dptr(st->st->row_bank),
+                                               (const uint32_t *)dptr(st->st->row_pos), n, &io,
+                                               scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes)) : -1;
+    drop();
+    if (rc != 1) return fail("pulsar_gpu_qsa_forward refused the step");
+    const pulsar_qwen_slot oslot = {(uint8_t *)dptr(sc) + g.a8, (uint8_t *)dptr(sc) + g.a8_sf, io.out_sf_pitch};
+    return pulsar_qwen_linear_launch(&out, &oslot, (int)n, (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+           fail("the QSA o_proj launch failed");
 }

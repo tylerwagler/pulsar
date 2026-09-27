@@ -60,7 +60,7 @@ const pulsar_qwen_ops g_qwen_ops = {
     /* .ple           = */ pulsar_qwen_s4_ple,        /* S4 work/l251-moe */
     /* .gr_read       = */ pulsar_qwen_s4_gr_read,    /* S4 work/l251-moe */
     /* .gdn           = */ pulsar_qwen_s2_gdn,
-    /* .qsa           = */ NULL,   /* S3 work/l251-attn */
+    /* .qsa           = */ pulsar_qwen_s3_qsa,
     /* .gr_write      = */ pulsar_qwen_s4_gr_write,   /* S4 work/l251-moe */
     /* .moe           = */ pulsar_qwen_s4_moe,        /* S4 work/l251-moe */
     /* .head          = */ pulsar_qwen_s4_head,       /* S4 work/l251-moe */
@@ -572,7 +572,7 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     }
     for (int op = 0; ok && op < PULSAR_QWEN_OP_COUNT; op++) {
         const uint64_t b = g_qwen_ops.scratch_bytes
-                               ? g_qwen_ops.scratch_bytes((pulsar_qwen_op_id)op, s, max_rows) : 0;
+                               ? g_qwen_ops.scratch_bytes((pulsar_qwen_op_id)op, s, max_rows, ctx) : 0;
         if (b) ok = (st->scratch[op] = pulsar_gpu_tensor_alloc(b)) != NULL;
     }
     st->ngram_ctx = (int32_t *)xcalloc((size_t)n_banks * (s->ngram_size - 1u), sizeof(int32_t));
