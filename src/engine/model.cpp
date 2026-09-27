@@ -88,7 +88,7 @@ static pulsar_kv *model_find_kv(const pulsar_model *m, const char *key) {
 
 
 
-static bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out) {
+bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out) {
     pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != PULSAR_META_STRING) return false;
     pulsar_cursor c = cursor_at(m, kv->value_pos);
