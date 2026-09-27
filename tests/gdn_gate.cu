@@ -88,6 +88,17 @@ __global__ void ref_emit_kernel(const float *x, int rows, int kbp, __nv_fp8_e4m3
     if (row < rows) pulsar_mx_emit_block(x[(size_t)row * VD + col], (uint32_t)col, (uint32_t)row, VD, kbp, data, scale);
 }
 
+/* bf16 round (RNE) in place, keeping a uint16 copy: the container stores these
+ * four tensors bf16 and the kernel widens them, so both the kernel input and
+ * the double reference must read the rounded values. */
+static void bf16_round(std::vector<float> &v, std::vector<uint16_t> &b) {
+    b.resize(v.size());
+    for (size_t i = 0; i < v.size(); i++) {
+        uint32_t u; memcpy(&u, &v[i], 4); u = (u + 0x8000u) & 0xFFFF0000u;
+        memcpy(&v[i], &u, 4); b[i] = (uint16_t)(u >> 16);
+    }
+}
+
 struct Rig {
     static const int ROWS = 512, SLOTS = 20;
     std::vector<float> conv_w, A_log, dt_bias, norm_w;      /* the REFERENCE values (bf16-rounded) */
@@ -109,17 +120,6 @@ struct Rig {
             dt_bias[h] = (float)(-5.0 + urand() * 5.0);
         }
         for (auto &v : norm_w) v = (float)(0.5 + urand());
-        /* The container stores these four bf16 and the kernel widens them, so
-         * round the host values HERE (RNE) and let the reference read the same
-         * widened numbers -- otherwise the gate would compare two models. */
-        auto round4 = [](std::vector<float> &v, std::vector<uint16_t> &b) {
-            b.resize(v.size());
-            for (size_t i = 0; i < v.size(); i++) {
-                uint32_t u; memcpy(&u, &v[i], 4); u = (u + 0x8000u) & 0xFFFF0000u;
-                memcpy(&v[i], &u, 4); b[i] = (uint16_t)(u >> 16);
-            }
-        };
-        round4(conv_w, conv_w_b); round4(A_log, A_log_b); round4(dt_bias, dt_bias_b); round4(norm_w, norm_w_b);
         qkv.resize((size_t)ROWS * QKV); z.resize((size_t)ROWS * VD); a.resize((size_t)ROWS * NV); b.resize((size_t)ROWS * NV);
         std::vector<float> chs(QKV);
         for (int c = 0; c < QKV; c++) chs[c] = (float)((urand() < 0.02 ? 8.0 : 1.0) * (0.3 + urand()));
@@ -139,7 +139,12 @@ struct Rig {
         slab = pulsar_mx_sf_slab_bytes(ROWS, kbp);
         d_q = dalloc<__nv_fp8_e4m3>((size_t)ROWS * VD); d_s = dalloc<unsigned char>(slab);
     }
+    /* Round in place and refresh the bf16 copy on EVERY upload, so a mutation
+     * of the f32 vector reaches the kernel AND the reference sees the same
+     * widened value.  (The container stores these four bf16; the kernel widens.) */
     void upload_weights() {
+        bf16_round(conv_w, conv_w_b); bf16_round(A_log, A_log_b);
+        bf16_round(dt_bias, dt_bias_b); bf16_round(norm_w, norm_w_b);
         h2d(d_conv_w, conv_w_b.data(), conv_w_b.size()); h2d(d_A_log, A_log_b.data(), (size_t)NV);
         h2d(d_dt_bias, dt_bias_b.data(), (size_t)NV); h2d(d_norm_w, norm_w_b.data(), (size_t)128);
     }
