@@ -17,6 +17,7 @@
 #include "exl3_trellis.h"
 #include "qwen_ngram.h"
 #include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_gdn.h"
 
 #include <sys/stat.h>
 
@@ -131,6 +132,44 @@ bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int 
     return l->w != NULL;
 }
 
+/* L251 S2: the Gated DeltaNet op's scratch.  qkv/z/a/b hold the four f32
+ * projections; `ws` is pulsar_gdn_forward's own scratch; a8/a8_sf are the A8
+ * output slot the kernel emits and out_proj then reads -- sized with the
+ * host-side geometry helpers, because pulsar_cuda_mx.cuh cannot be included
+ * here (g++ does not know __host__/__device__).  `lin_ws` is ONE dense-arm
+ * workspace shared by the five launches (they serialize on the stream). */
+struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, lin_ws, lin_ws_bytes, total; };
+
+uint64_t gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
+    const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
+    const int VT = (int)pulsar_qwen_gdn_v_total(s), NV = (int)s->gdn_n_v_head;
+    const int dims[5][2] = {{H, CD}, {H, VT}, {H, NV}, {H, NV}, {VT, H}};
+    uint64_t m = 0;
+    for (int i = 0; i < 5; i++) {
+        pulsar_qwen_linear l{};
+        l.in = dims[i][0]; l.out = dims[i][1];
+        const uint64_t b = a256(pulsar_qwen_linear_workspace_bytes(&l, (int)rows));
+        if (b > m) m = b;
+    }
+    return m;
+}
+
+gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
+    const uint64_t CD = pulsar_qwen_gdn_conv_dim(s), VT = pulsar_qwen_gdn_v_total(s), NV = s->gdn_n_v_head;
+    gdn_scratch g{};
+    uint64_t o = 0;
+    g.qkv = o; o += a256((uint64_t)rows * CD * sizeof(float));
+    g.z   = o; o += a256((uint64_t)rows * VT * sizeof(float));
+    g.a   = o; o += a256((uint64_t)rows * NV * sizeof(float));
+    g.b   = o; o += a256((uint64_t)rows * NV * sizeof(float));
+    g.ws  = o; g.ws_bytes = a256((uint64_t)pulsar_gdn_scratch_bytes((int)rows)); o += g.ws_bytes;
+    g.a8    = o; o += a256((uint64_t)rows * VT);                                          /* E4M3 codes */
+    g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp((int)VT)));
+    g.lin_ws = o; g.lin_ws_bytes = gdn_lin_ws(s, rows); o += g.lin_ws_bytes;
+    g.total = o;
+    return g;
+}
+
 } // namespace
 
 /* ======================================================================== */
@@ -241,13 +280,14 @@ void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
     w->ple_io = NULL;
 }
 
-uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *, uint32_t max_rows) {
+uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows) {
     switch (op) {
     case PULSAR_QWEN_OP_EMBED:   return (uint64_t)max_rows * sizeof(int32_t);
     case PULSAR_QWEN_OP_PLE:     return ple_layout(max_rows).total;
     case PULSAR_QWEN_OP_GR_READ: return gr_layout(max_rows).total;
     case PULSAR_QWEN_OP_MOE:     return moe_layout(max_rows).total;
     case PULSAR_QWEN_OP_HEAD:    return head_layout().total;
+    case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;   /* S2's op; S3 chains QSA in */
     default:                     return 0;   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
     }
 }
@@ -466,4 +506,71 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
         pulsar_gpu_tensor_free(xkey);
     }
     return ok || fail("the head (mixer + lm_head) failed");
+}
+
+/* ======================================================================== */
+/* L251 S2's op: the Gated DeltaNet block.  On the integration branch it lives
+ * in this TU because it needs the weight / scratch helpers above (wptr,
+ * linear_dev, dptr, fail, gdn_layout); split into family_qwen_s2.cpp when S2
+ * rebases on the family interface.  The kernel is src/cuda/pulsar_cuda_gdn.cu.
+ *
+ * x (bf16 + its armed E4M3 slot) -> in_proj_qkv / _z / _a / _b through the EXL3
+ * dense arm -> pulsar_gdn_forward (the recurrence; it EMITS the A8 slot) ->
+ * out_proj -> y f32.  The four kernel weights are bf16, the container's
+ * storage; the kernel widens them (rule 3). */
+bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
+    const pulsar_qwen_shape *s = st->shape;
+    const uint32_t n = st->n_rows;
+    const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
+    const int VT = (int)pulsar_qwen_gdn_v_total(s), NV = (int)s->gdn_n_v_head;
+    const pulsar_qwen_layer_weights &L = layer_w(st, il);
+    const pulsar_tensor *gw4[4] = {L.gdn_conv, L.gdn_a_log, L.gdn_dt_bias, L.gdn_norm};
+    for (int i = 0; i < 4; i++)
+        if (!admit(gw4[i], gw4[i]->type == PULSAR_TENSOR_BF16, "bf16 (the GDN kernel's weight dtype)")) return false;
+    pulsar_qwen_linear qkv, zz, aa, bb, out;
+    if (!linear_dev(st, L.gdn_in_qkv, H,  CD, "qwen GDN in_proj_qkv", &qkv) ||
+        !linear_dev(st, L.gdn_in_z,   H,  VT, "qwen GDN in_proj_z",   &zz)  ||
+        !linear_dev(st, L.gdn_in_a,   H,  NV, "qwen GDN in_proj_a",   &aa)  ||
+        !linear_dev(st, L.gdn_in_b,   H,  NV, "qwen GDN in_proj_b",   &bb)  ||
+        !linear_dev(st, L.gdn_out,    VT, H,  "qwen GDN out_proj",    &out)) return false;
+    const void *xq = NULL, *xsf = NULL;
+    int kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(st->st->x, n, (uint64_t)H, &xq, &xsf, &kbp))
+        return fail("the GDN op found no E4M3 slot for its input (the GR read is its producer)");
+    const pulsar_qwen_slot xin = {(uint8_t *)xq, (uint8_t *)xsf, kbp};
+    pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GDN];
+    if (!sc) return fail("no GDN scratch");
+    uint8_t *base = (uint8_t *)dptr(sc);
+    const gdn_scratch g = gdn_layout(s, st->st->max_rows);
+    void *linws = base + g.lin_ws;
+    if (pulsar_qwen_linear_launch(&qkv, &xin, (int)n, (float *)(base + g.qkv), linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&zz,  &xin, (int)n, (float *)(base + g.z),   linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&aa,  &xin, (int)n, (float *)(base + g.a),   linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&bb,  &xin, (int)n, (float *)(base + g.b),   linws, g.lin_ws_bytes, 0) != 0)
+        return fail("a GDN projection launch failed");
+    pulsar_gdn_weights gw;
+    gw.conv_w  = (const uint16_t *)wptr(st, L.gdn_conv,    "qwen GDN conv1d");
+    gw.A_log   = (const uint16_t *)wptr(st, L.gdn_a_log,   "qwen GDN A_log");
+    gw.dt_bias = (const uint16_t *)wptr(st, L.gdn_dt_bias, "qwen GDN dt_bias");
+    gw.norm_w  = (const uint16_t *)wptr(st, L.gdn_norm,    "qwen GDN norm");
+    if (!gw.conv_w || !gw.A_log || !gw.dt_bias || !gw.norm_w) return false;
+    pulsar_gdn_call c{};
+    const bool prefill = st->mode == PULSAR_QWEN_STEP_PREFILL;
+    c.n_seq = prefill ? 1 : (int)n;                 /* DECODE: one row per bank; PREFILL: one sequence */
+    c.seq_rows = prefill ? (int)n : 1;
+    c.row_slot = (const int32_t *)dptr(st->st->row_bank);
+    c.conv_state = (float *)dptr(st->st->layer[il].gdn_conv);
+    c.rec_state  = (float *)dptr(st->st->layer[il].gdn_state);
+    c.qkv = (const float *)(base + g.qkv); c.ld_qkv = CD;
+    c.z   = (const float *)(base + g.z);   c.ld_z   = VT;
+    c.a   = (const float *)(base + g.a);   c.ld_a   = NV;
+    c.b   = (const float *)(base + g.b);   c.ld_b   = NV;
+    c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
+    c.out_f32 = NULL;                               /* the A8 slot is the consumer's input, not f32 */
+    c.out_e4m3 = base + g.a8; c.out_scale = base + g.a8_sf;
+    c.out_kbp = pulsar_gpu_mx_kbp(VT);
+    if (pulsar_gdn_forward(&gw, &c, 0) != 0) return fail("pulsar_gdn_forward failed");
+    const pulsar_qwen_slot oslot = {(uint8_t *)(base + g.a8), (uint8_t *)(base + g.a8_sf), c.out_kbp};
+    return pulsar_qwen_linear_launch(&out, &oslot, (int)n, (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+           fail("the GDN out_proj launch failed");
 }

@@ -395,6 +395,10 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
 bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
 bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
 bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
+
+/* S2's op, landed on the integration branch in family_qwen_s4.cpp (see the note
+ * there); moves to family_qwen_s2.cpp when S2 rebases. */
+bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il);
 uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows);
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt);
 /** Called by the step driver after every forward that got past its op check:
