@@ -109,7 +109,7 @@ __device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, uint32_t po
 /* One warp, one head of NJ*32 elements: lane l holds x[l + 32 j].  RMSNorm with
  * weight (1 + w), then RoPE on the pair (x[l], x[l + 32]) -- lane l's j = 0, 1. */
 template <int NJ>
-__device__ __forceinline__ void qsa_norm_rope(float (&x)[NJ], const float *w, float c, float s) {
+__device__ __forceinline__ void qsa_norm_rope(float (&x)[NJ], const uint16_t *w, float c, float s) {
     const int lane = threadIdx.x & 31;
     float ss = 0.f;
     #pragma unroll
@@ -117,7 +117,8 @@ __device__ __forceinline__ void qsa_norm_rope(float (&x)[NJ], const float *w, fl
     ss = qsa_warp_sum(ss);
     const float r = rsqrtf(__fadd_rn(__fdiv_rn(ss, (float)(NJ * 32)), PULSAR_QSA_RMS_EPS));
     #pragma unroll
-    for (int j = 0; j < NJ; j++) x[j] = __fmul_rn(__fmul_rn(x[j], r), __fadd_rn(1.0f, w[lane + 32 * j]));
+    for (int j = 0; j < NJ; j++)   /* bf16 -> f32 is a left shift of the stored bits */
+        x[j] = __fmul_rn(__fmul_rn(x[j], r), __fadd_rn(1.0f, __uint_as_float((uint32_t)w[lane + 32 * j] << 16)));
     const float x0 = x[0], x1 = x[1];
     x[0] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
     x[1] = __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s));
@@ -137,7 +138,7 @@ __device__ __forceinline__ void qsa_emit_row(const float (&x)[8], uint8_t *data,
 
 /* ---- block keys ------------------------------------------------------------- */
 __global__ void qsa_block_keys_kernel(const qsa_row *rows, uint32_t n_rows, const float *idx,
-                                      const float *kw, qsa_rope_tab tab) {
+                                      const uint16_t *kw, qsa_rope_tab tab) {
     const uint32_t r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= n_rows) return;
     const qsa_row row = rows[r];
@@ -167,7 +168,7 @@ __global__ void qsa_block_keys_kernel(const qsa_row *rows, uint32_t n_rows, cons
  * (warp 28 also stages the raw indexer key). */
 __global__ void __launch_bounds__(1024) qsa_prep_kernel(
         const qsa_row *rows, const float *qg, const float *kin, const float *vin, const float *idx,
-        const float *qw, const float *kw, const float *iqw, qsa_rope_tab tab,
+        const uint16_t *qw, const uint16_t *kw, const uint16_t *iqw, qsa_rope_tab tab,
         float *q_out, float *iq_out) {
     const uint32_t r = blockIdx.x;
     const qsa_row row = rows[r];
@@ -803,12 +804,12 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
     pulsar_qsa_inv_freq(tab.inv);
 
     qsa_block_keys_kernel<<<(n_rows + 7u) / 8u, 256>>>(ws.rows, n_rows, (const float *)io->idx->ptr,
-                                                       (const float *)layer->idx_k_norm, tab);
+                                                       layer->idx_k_norm, tab);
     if (!cuda_ok(cudaGetLastError(), "qsa block keys launch")) return 0;
     qsa_prep_kernel<<<n_rows, 1024>>>(ws.rows, (const float *)io->qg->ptr, (const float *)io->k->ptr,
                                       (const float *)io->v->ptr, (const float *)io->idx->ptr,
-                                      (const float *)layer->q_norm, (const float *)layer->k_norm,
-                                      (const float *)layer->idx_q_norm, tab, ws.q, ws.iq);
+                                      layer->q_norm, layer->k_norm,
+                                      layer->idx_q_norm, tab, ws.q, ws.iq);
     if (!cuda_ok(cudaGetLastError(), "qsa prep launch")) return 0;
 
     uint32_t nb_call = 0;

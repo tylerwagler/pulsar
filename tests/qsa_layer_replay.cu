@@ -70,8 +70,8 @@ struct Replay {
         up(idx, in.idx, PULSAR_QSA_IDX_IN);
         std::vector<uint32_t> rs(n, 0), rp(n);
         for (uint32_t i = 0; i < n; i++) rp[i] = p0 + i;
-        pulsar_qsa_layer L{pulsar_gpu_tensor_device_ptr(norm[0]), pulsar_gpu_tensor_device_ptr(norm[1]),
-                           pulsar_gpu_tensor_device_ptr(norm[2]), pulsar_gpu_tensor_device_ptr(norm[3])};
+        pulsar_qsa_layer L{(const uint16_t *)pulsar_gpu_tensor_device_ptr(norm[0]), (const uint16_t *)pulsar_gpu_tensor_device_ptr(norm[1]),
+                           (const uint16_t *)pulsar_gpu_tensor_device_ptr(norm[2]), (const uint16_t *)pulsar_gpu_tensor_device_ptr(norm[3])};
         pulsar_qsa_io io{};
         io.qg = qg; io.k = k; io.v = v; io.idx = idx;
         io.out_e4m3 = pulsar_gpu_tensor_device_ptr(slot);
@@ -123,8 +123,13 @@ int main(int argc, char **argv) {
     const uint32_t off[5] = {0, PULSAR_QSA_HEAD_DIM, 2 * PULSAR_QSA_HEAD_DIM, 2 * PULSAR_QSA_HEAD_DIM + PULSAR_QSA_IDX_DIM,
                              2 * PULSAR_QSA_HEAD_DIM + 2 * PULSAR_QSA_IDX_DIM};
     for (int i = 0; i < 4; i++) {
-        R.norm[i] = pulsar_gpu_tensor_alloc((off[i + 1] - off[i]) * 4);
-        pulsar_gpu_tensor_write(R.norm[i], 0, nf + off[i], (off[i + 1] - off[i]) * 4);
+        const uint32_t n = off[i + 1] - off[i];      /* the container stores the norms bf16 */
+        std::vector<uint16_t> b16(n);
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t u; memcpy(&u, nf + off[i] + j, 4); b16[j] = (uint16_t)((u + 0x8000u) >> 16);
+        }
+        R.norm[i] = pulsar_gpu_tensor_alloc((uint64_t)n * 2);
+        pulsar_gpu_tensor_write(R.norm[i], 0, b16.data(), (uint64_t)n * 2);
     }
     const uint32_t cap = (T + 3u) & ~3u;
     R.seq = {alloc0((uint64_t)cap * PULSAR_QSA_KV_TOKEN_BYTES), alloc0((uint64_t)(cap / 4) * PULSAR_QSA_BKEY_BYTES),

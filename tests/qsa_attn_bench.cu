@@ -80,8 +80,10 @@ Layer make_layer(uint32_t rows, uint32_t max_ctx) {
     L.ws = alloc(pulsar_gpu_qsa_workspace_bytes(rows, max_ctx));
     const uint32_t w[4] = {PULSAR_QSA_HEAD_DIM, PULSAR_QSA_HEAD_DIM, PULSAR_QSA_IDX_DIM, PULSAR_QSA_IDX_DIM};
     for (int i = 0; i < 4; i++) {
-        L.norm[i] = alloc(w[i] * 4);
-        fill_f32<<<1, 256>>>((float *)P(L.norm[i]), w[i], 10 + i);
+        L.norm[i] = alloc(w[i] * 2);                 /* the container stores the norms bf16 */
+        { std::vector<uint16_t> b16(w[i]);
+          for (uint32_t j = 0; j < w[i]; j++) b16[j] = (uint16_t)((uint32_t)(float)(10 + i) >> 16);
+          pulsar_gpu_tensor_write(L.norm[i], 0, b16.data(), (uint64_t)w[i] * 2); }
     }
     return L;
 }
@@ -101,8 +103,8 @@ void free_seq(pulsar_qsa_seq &s) {
 }
 
 bool fwd(Layer &L, std::vector<pulsar_qsa_seq> &seqs, const std::vector<uint32_t> &rs, const std::vector<uint32_t> &rp) {
-    pulsar_qsa_layer lw{pulsar_gpu_tensor_device_ptr(L.norm[0]), pulsar_gpu_tensor_device_ptr(L.norm[1]),
-                        pulsar_gpu_tensor_device_ptr(L.norm[2]), pulsar_gpu_tensor_device_ptr(L.norm[3])};
+    pulsar_qsa_layer lw{(const uint16_t *)pulsar_gpu_tensor_device_ptr(L.norm[0]), (const uint16_t *)pulsar_gpu_tensor_device_ptr(L.norm[1]),
+                        (const uint16_t *)pulsar_gpu_tensor_device_ptr(L.norm[2]), (const uint16_t *)pulsar_gpu_tensor_device_ptr(L.norm[3])};
     pulsar_qsa_io io{};
     io.qg = L.qg; io.k = L.k; io.v = L.v; io.idx = L.idx;
     io.out_e4m3 = P(L.slot);

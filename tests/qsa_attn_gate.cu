@@ -70,7 +70,10 @@ struct Rng {
 
 enum { FIX_A = 0, FIX_T = 1, FIX_B = 2 };
 
-struct Norms { float q[HD], k[HD], iq[ID], ik[ID]; };
+/* The CONTAINER stores the norms bf16 (format-maps/qwen38fn-u-e4-d5.json); the
+ * f32 arrays are the double reference and are rounded in place, so the kernel
+ * and the reference read the same values. */
+struct Norms { float q[HD], k[HD], iq[ID], ik[ID]; uint16_t q16[HD], k16[HD], iq16[ID], ik16[ID]; };
 Norms g_norm;
 float g_pattern[24][ID];
 
@@ -80,6 +83,14 @@ void gen_norms() {
     for (uint32_t i = 0; i < HD; i++) g_norm.k[i] = 0.3f * r.n();
     for (uint32_t i = 0; i < ID; i++) g_norm.iq[i] = 0.3f * r.n();
     for (uint32_t i = 0; i < ID; i++) g_norm.ik[i] = 0.3f * r.n();
+    auto r16 = [](float *f, uint16_t *b, int n) {
+        for (int i = 0; i < n; i++) {
+            uint32_t u; memcpy(&u, &f[i], 4); u = (u + 0x8000u) & 0xFFFF0000u;
+            memcpy(&f[i], &u, 4); b[i] = (uint16_t)(u >> 16);
+        }
+    };
+    r16(g_norm.q, g_norm.q16, HD); r16(g_norm.k, g_norm.k16, HD);
+    r16(g_norm.iq, g_norm.iq16, ID); r16(g_norm.ik, g_norm.ik16, ID);
     for (int p = 0; p < 24; p++) for (uint32_t d = 0; d < ID; d++) g_pattern[p][d] = d < 64 ? 0.f : r.n();
 }
 
@@ -184,10 +195,10 @@ void dev_init(uint32_t max_rows, uint32_t max_ctx) {
     d.tap = zeros((uint64_t)max_rows * OUT * 4);
     d.sel = zeros((uint64_t)max_rows * TOPB * 4);
     d.ws = zeros(pulsar_gpu_qsa_workspace_bytes(max_rows, max_ctx));
-    d.qn = upload(g_norm.q, sizeof g_norm.q);
-    d.kn = upload(g_norm.k, sizeof g_norm.k);
-    d.iqn = upload(g_norm.iq, sizeof g_norm.iq);
-    d.ikn = upload(g_norm.ik, sizeof g_norm.ik);
+    d.qn = upload(g_norm.q16, HD * 2);
+    d.kn = upload(g_norm.k16, HD * 2);
+    d.iqn = upload(g_norm.iq16, ID * 2);
+    d.ikn = upload(g_norm.ik16, ID * 2);
 }
 
 Seq make_seq(int fix, uint32_t T) {
@@ -246,8 +257,8 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     pulsar_gpu_tensor_fill_f32(d.slot_sc, 0.f, pulsar_gpu_tensor_bytes(d.slot_sc) / 4);
     std::vector<pulsar_qsa_seq> sd;
     for (auto &s : seqs) sd.push_back(s.desc());
-    pulsar_qsa_layer L{pulsar_gpu_tensor_device_ptr(d.qn), pulsar_gpu_tensor_device_ptr(d.kn),
-                       pulsar_gpu_tensor_device_ptr(d.iqn), pulsar_gpu_tensor_device_ptr(d.ikn)};
+    pulsar_qsa_layer L{(const uint16_t *)pulsar_gpu_tensor_device_ptr(d.qn), (const uint16_t *)pulsar_gpu_tensor_device_ptr(d.kn),
+                       (const uint16_t *)pulsar_gpu_tensor_device_ptr(d.iqn), (const uint16_t *)pulsar_gpu_tensor_device_ptr(d.ikn)};
     pulsar_qsa_io io{};
     io.qg = d.qg; io.k = d.k; io.v = d.v; io.idx = d.idx;
     io.out_e4m3 = pulsar_gpu_tensor_device_ptr(d.slot);

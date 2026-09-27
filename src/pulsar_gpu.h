@@ -2571,10 +2571,10 @@ typedef struct {
      * family op can pass wptr()-resolved weights straight in (an engine op
      * cannot name pulsar_gpu_tensor's fields, and has no tensor to wrap).  The
      * binder guarantees the widths: 256 / 256 / 128 / 128. */
-    const void *q_norm;      /**< [256] f32, as stored (w, not 1 + w) */
-    const void *k_norm;      /**< [256] */
-    const void *idx_q_norm;  /**< [128] */
-    const void *idx_k_norm;  /**< [128] */
+    const uint16_t *q_norm;      /**< [256] bf16, as stored (w, not 1 + w) */
+    const uint16_t *k_norm;      /**< [256] bf16 */
+    const uint16_t *idx_q_norm;  /**< [128] bf16 */
+    const uint16_t *idx_k_norm;  /**< [128] bf16 */
 } pulsar_qsa_layer;
 
 typedef struct {
