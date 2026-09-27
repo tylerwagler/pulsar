@@ -696,9 +696,13 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
     io.out_sf_pitch = pulsar_gpu_mx_kbp(PULSAR_QSA_OUT_DIM);
     io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
+    /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
+     * the host to build its row list.  The step already carries them as `bank` /
+     * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing
+     * the device row_bank here segfaulted the host walk, 18:56.) */
     const int rc = ok ? pulsar_gpu_qsa_forward(&layer, seqs, nb,
-                                               (const uint32_t *)dptr(st->st->row_bank),
-                                               (const uint32_t *)dptr(st->st->row_pos), n, &io,
+                                               (const uint32_t *)st->bank,
+                                               (const uint32_t *)st->pos, n, &io,
                                                scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes)) : -1;
     drop();
     if (rc != 1) return fail("pulsar_gpu_qsa_forward refused the step");
