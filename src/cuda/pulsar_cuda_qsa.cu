@@ -457,17 +457,28 @@ struct qsa_ws {
     float    *part;
     float2   *ml;
     uint64_t  bytes;
-    uint32_t  score_rows;   /* rows per selection pass */
+    uint64_t  score_cap;    /* bytes of the scores buffer */
+    uint32_t  topk_rows;    /* rows the top-k buffer holds */
 };
+
+/* Rows per selection pass for blocks-per-row nb: the scores stay inside the
+ * budget, and one row always fits. */
+static uint32_t qsa_score_rows(uint32_t n_rows, uint32_t nb) {
+    return (uint32_t)std::min<uint64_t>(n_rows, std::max<uint64_t>(1u, QSA_SCORE_BUDGET / ((uint64_t)nb * sizeof(float))));
+}
 
 static uint64_t qsa_up(uint64_t x) { return (x + 255u) & ~255ull; }
 
 static qsa_ws qsa_ws_layout(uint8_t *base, uint32_t n_rows, uint32_t max_ctx) {
     qsa_ws w{};
+    /* Sized for EVERY call with positions < max_ctx: a pass at nb blocks takes
+     * qsa_score_rows(nb) rows, so the scores peak at the widest nb and the
+     * top-k rows at the narrowest selecting nb (513). */
     const uint32_t nb_max = max_ctx / PULSAR_QSA_BLOCK;
     const bool selects = nb_max > PULSAR_QSA_TOP_BLOCKS;
-    const uint64_t score_row_bytes = (uint64_t)nb_max * sizeof(float);
-    w.score_rows = selects ? (uint32_t)std::min<uint64_t>(n_rows, std::max<uint64_t>(1u, QSA_SCORE_BUDGET / score_row_bytes)) : 0u;
+    w.score_cap = selects ? std::max<uint64_t>(std::min<uint64_t>((uint64_t)n_rows * nb_max * sizeof(float), QSA_SCORE_BUDGET),
+                                               (uint64_t)nb_max * sizeof(float)) : 0u;
+    w.topk_rows = selects ? qsa_score_rows(n_rows, PULSAR_QSA_TOP_BLOCKS + 1u) : 0u;
     const uint32_t att_rows = std::min(n_rows, QSA_ATT_GROUP);
     uint64_t off = 0;
     auto take = [&](uint64_t bytes) { uint8_t *p = base ? base + off : nullptr; off += qsa_up(bytes); return p; };
@@ -476,8 +487,8 @@ static qsa_ws qsa_ws_layout(uint8_t *base, uint32_t n_rows, uint32_t max_ctx) {
     w.q      = (float *)take((uint64_t)n_rows * PULSAR_QSA_N_HEAD * PULSAR_QSA_HEAD_DIM * sizeof(float));
     w.iq     = (float *)take((uint64_t)n_rows * PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float));
     w.sel    = (uint32_t *)take((uint64_t)n_rows * PULSAR_QSA_TOP_BLOCKS * sizeof(uint32_t));
-    w.scores = (float *)take((uint64_t)w.score_rows * score_row_bytes);
-    w.topk   = (uint32_t *)take((uint64_t)w.score_rows * PULSAR_QSA_TOP_BLOCKS * sizeof(uint32_t));
+    w.scores = (float *)take(w.score_cap);
+    w.topk   = (uint32_t *)take((uint64_t)w.topk_rows * PULSAR_QSA_TOP_BLOCKS * sizeof(uint32_t));
     w.part   = (float *)take((uint64_t)att_rows * PULSAR_QSA_N_HEAD * QSA_MAX_SPLITS * PULSAR_QSA_HEAD_DIM * sizeof(float));
     w.ml     = (float2 *)take((uint64_t)att_rows * PULSAR_QSA_N_HEAD * QSA_MAX_SPLITS * sizeof(float2));
     w.bytes  = off;
@@ -602,8 +613,11 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                                       (const float *)layer->idx_q_norm->ptr, tab, ws.q, ws.iq);
     if (!cuda_ok(cudaGetLastError(), "qsa prep launch")) return 0;
 
-    for (uint32_t g0 = 0; g0 < n_select; g0 += ws.score_rows) {
-        const uint32_t gn = std::min(ws.score_rows, n_select - g0);
+    uint32_t nb_call = 0;
+    for (uint32_t r : h_list) nb_call = std::max(nb_call, h_rows[r].nb);
+    const uint32_t pass_rows = n_select ? qsa_score_rows(n_select, nb_call) : 0u;
+    for (uint32_t g0 = 0; g0 < n_select; g0 += pass_rows) {
+        const uint32_t gn = std::min(pass_rows, n_select - g0);
         uint32_t nb_max = 0;
         for (uint32_t i = 0; i < gn; i++) nb_max = std::max(nb_max, h_rows[h_list[g0 + i]].nb);
         dim3 grid((nb_max + QSA_SCORE_BLK - 1u) / QSA_SCORE_BLK, gn);
