@@ -268,6 +268,7 @@ static void section_gr(void) {
     std::vector<float> out((size_t)T * H);
     for (auto &v : out) v = (float)(rndn() * 0.5);
     float *dout = up(out);
+    CK(cudaMemcpy(inj, I.data(), I.size() * 4, cudaMemcpyHostToDevice));   /* the T = 1 run above overwrote row 0's */
     rc = pulsar_qwen_gr_write_launch(dst, dout, inj, T, 0);
     const auto ST2 = down(dst, (size_t)T * HC);
     size_t wr_bad = 0, wr_exact = 0;
@@ -287,21 +288,24 @@ static void section_gr(void) {
     size_t moved_u = 0, moved_d = 0;
     {
         pulsar_qwen_gr_weights wx = w;
-        std::vector<uint8_t> q = g.up_w.q;
-        q[(size_t)(2 * H + 77) * R + 5] ^= 0x08;
-        wx.up.q = up(q);
+        /* one 32-block scale of one W_up row x 8 (a single code is below the bf16
+         * resolution of the gated mean) */
+        std::vector<uint8_t> sf = g.up_w.sf;
+        sf[pulsar_mx_sfoff(2 * H + 77, 1, pulsar_mx_kbp(R))] += 3;
+        wx.up.sf = up(sf);
         pulsar_qwen_gr_read_launch(&wx, dst, T, xo, &xs, inj, ws, wsb, 0);
         const auto XX = down(xo, (size_t)T * H);
         for (size_t i = 0; i < XX.size(); i++) moved_u += XX[i] != X[i];
         wx = w;
-        q = g.down_w.q;
-        q[(size_t)11 * HC + 4000] ^= 0x08;
-        wx.down.q = up(q);
+        sf = g.down_w.sf;
+        sf[pulsar_mx_sfoff(11, 125, pulsar_mx_kbp(HC))] += 4;
+        wx.down.sf = up(sf);
         pulsar_qwen_gr_read_launch(&wx, dst, T, xo, &xs, inj, ws, wsb, 0);
         const auto XY = down(xo, (size_t)T * H);
         for (size_t i = 0; i < XY.size(); i++) moved_d += XY[i] != X[i];
     }
-    CHECK(moved_u > 0 && moved_d > 0, "mutations: a W_up code moved %zu outputs, a W_down code moved %zu", moved_u, moved_d);
+    CHECK(moved_u > 0 && moved_d > 0, "mutations: one W_up block scale x8 moved %zu outputs, one W_down block scale x16 moved %zu",
+          moved_u, moved_d);
 }
 
 /* ======================================================================== */
