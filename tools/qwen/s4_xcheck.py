@@ -439,13 +439,14 @@ def mxfp8_lt_bytes(w):
     return codes.tobytes() + swizzle_sf(sc, out, inp // 32).tobytes(), dec.reshape(out, inp)
 
 
-def gr_fp64(h, norm_w, wd, wu, wi, a8):
-    """the GR read in fp64 (with the device's A8 points when a8)"""
+def gr_fp64(h, norm_w, wd, wu, wi, a8, bf16_acts=False):
+    """the GR read in fp64 (with the device's A8 points when a8, its bf16 activation roundings when bf16_acts)"""
     x = h.double().view(*h.shape[:-1], 4, 2560)
     xn = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)).flatten(-2) * (1.0 + norm_w.double())
-    xin = e4m3_dec(xn) if a8 else xn
+    rnd = (lambda v: v.to(torch.bfloat16).double()) if bf16_acts else (lambda v: v)
+    xin = e4m3_dec(xn) if a8 else rnd(xn)
     a_ = F.silu(xin @ wd.T / 4)
-    ain = e4m3_dec(a_) if a8 else a_
+    ain = e4m3_dec(a_) if a8 else rnd(a_)
     g = torch.sigmoid(ain @ wu.T)
     mixed = (g.view(*g.shape[:-1], 4, 2560) * xn.view(*xn.shape[:-1], 4, 2560)).mean(-2)
     inj = 2 * torch.sigmoid(xn @ wi.double().T / 4) if wi is not None else None
@@ -462,8 +463,16 @@ def cmd_gr(a, tool):
         d = os.path.join(a.out, f"gr-{site}")
         os.makedirs(d, exist_ok=True)
         norm = W.get(pfx + "hc_norm.weight", "cpu")
-        down_b, wd = mxfp8_lt_bytes(W.get(pfx + "input_mix_weight_down.weight", "cpu"))
-        up_b, wu = mxfp8_lt_bytes(W.get(pfx + "input_mix_weight_up.weight", "cpu"))
+        # the container's formats (tools/container/format-maps, the graded U-e4-d5 recipe): MXFP8 at every
+        # per-layer site, bf16 at the top-level mixer
+        bf16w = hf_inj is None
+        if bf16w:
+            wdb, wub = W.get(pfx + "input_mix_weight_down.weight", "cpu"), W.get(pfx + "input_mix_weight_up.weight", "cpu")
+            down_b, wd = wdb.contiguous().view(torch.int16).numpy().tobytes(), wdb.double()
+            up_b, wu = wub.contiguous().view(torch.int16).numpy().tobytes(), wub.double()
+        else:
+            down_b, wd = mxfp8_lt_bytes(W.get(pfx + "input_mix_weight_down.weight", "cpu"))
+            up_b, wu = mxfp8_lt_bytes(W.get(pfx + "input_mix_weight_up.weight", "cpu"))
         tofile(h, f"{d}/streams.bin"); tofile(norm, f"{d}/norm.bin")
         open(f"{d}/down.bin", "wb").write(down_b); open(f"{d}/up.bin", "wb").write(up_b)
         wi = None
@@ -472,13 +481,14 @@ def cmd_gr(a, tool):
             tofile(wi, f"{d}/inject.bin")
         elif os.path.exists(f"{d}/inject.bin"):
             os.remove(f"{d}/inject.bin")
-        run_tool(["gr", d, N], tool)
+        run_tool(["gr", d, N] + (["bf16"] if bf16w else []), tool)
         x = torch.from_numpy(np.fromfile(f"{d}/x.bin", dtype=np.int16).reshape(N, 2560)).view(torch.bfloat16).double()
         inj = torch.from_numpy(np.fromfile(f"{d}/inj.bin", dtype=np.float32).reshape(N, 4)).double()
         refx = torch.from_numpy(np.fromfile(f"{d}/ref_x.bin", dtype=np.float64).reshape(-1, 2560))
         nr = refx.shape[0]
         hfx = torch.load(f"{CAP}/{hf_x}.pt").double()
-        e_mx, e_inj = gr_fp64(h.to(DEV), norm.to(DEV), wd.to(DEV), wu.to(DEV), wi.to(DEV) if wi is not None else None, True)
+        e_mx, e_inj = gr_fp64(h.to(DEV), norm.to(DEV), wd.to(DEV), wu.to(DEV), wi.to(DEV) if wi is not None else None,
+                              not bf16w, bf16_acts=bf16w)
         s_mx, _ = gr_fp64(h.to(DEV), norm.to(DEV), W.get(pfx + "input_mix_weight_down.weight").double(),
                           W.get(pfx + "input_mix_weight_up.weight").double(), None, False)
         res = {"site": site, "rows": N,

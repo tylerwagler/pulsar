@@ -199,8 +199,8 @@ static gr_host make_gr(void) {
     g.up_w.encode(wu, HC, R);
     return g;
 }
-static pulsar_qwen_gr_weights dev_gr(const gr_host &g, bool with_inject) {
-    pulsar_qwen_gr_weights w;
+static pulsar_qwen_gr_dev dev_gr(const gr_host &g, bool with_inject) {
+    pulsar_qwen_gr_dev w;
     w.norm_w = up(g.norm);
     w.down = {up(g.down_w.q), up(g.down_w.sf), R, HC};
     w.up = {up(g.up_w.q), up(g.up_w.sf), HC, R};
@@ -213,7 +213,7 @@ static void section_gr(void) {
     const int T = 6;
     gr_host g = make_gr();
     std::vector<uint16_t> st = rnd_act(T, HC, 0.8);
-    pulsar_qwen_gr_weights w = dev_gr(g, true);
+    pulsar_qwen_gr_dev w = dev_gr(g, true);
     uint16_t *dst = up(st), *xo = (uint16_t *)dalloc((size_t)T * H * 2);
     pulsar_qwen_slot xs = {(uint8_t *)dalloc((size_t)T * H), (uint8_t *)dalloc(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(H))), pulsar_mx_kbp(H)};
     float *inj = (float *)dalloc((size_t)T * S * 4);
@@ -259,11 +259,38 @@ static void section_gr(void) {
     CHECK(rc == 0 && memcmp(X1.data(), &X[(size_t)3 * H], H * 2) == 0 && memcmp(I1.data(), &I[3 * S], S * 4) == 0,
           "T = 1 row bit-identical to the T = %d batch's row (block input + inj)", T);
     /* the mixer: no inject */
-    pulsar_qwen_gr_weights wm = w;
+    pulsar_qwen_gr_dev wm = w;
     wm.inject = nullptr;
     rc = pulsar_qwen_gr_read_launch(&wm, dst, T, xo, &xs, nullptr, ws, wsb, 0);
     const auto XM = down(xo, (size_t)T * H);
     CHECK(rc == 0 && memcmp(XM.data(), X.data(), X.size() * 2) == 0, "the mixer (no inject) reads the same block input");
+    /* the mixer as the graded recipe stores it: BF16 low-rank weights (bf16
+     * activations into bf16 GEMVs), no inject */
+    {
+        const auto wdb = rnd_bf((size_t)R * HC, 0.01), wub = rnd_bf((size_t)HC * R, 0.08);
+        pulsar_qwen_gr_dev wb = w;
+        wb.inject = nullptr;
+        wb.down = {up(wdb), nullptr, R, HC};
+        wb.up = {up(wub), nullptr, HC, R};
+        rc = pulsar_qwen_gr_read_launch(&wb, dst, T, xo, nullptr, nullptr, ws, wsb, 0);
+        const auto XB = down(xo, (size_t)T * H);
+        double wu_ = 0;
+        size_t ob = 0;
+        for (int t = 0; t < T; t++) {
+            const gr_out o = gr_read_bf16(&st[(size_t)t * HC], g.norm.data(), wdb.data(), wub.data(), nullptr);
+            for (int c = 0; c < H; c++) {
+                const double u = bf_ulps(bf(XB[(size_t)t * H + c]), o.x[c]);
+                wu_ = fmax(wu_, u);
+                ob += u > 1.0;
+            }
+        }
+        CHECK(rc == 0 && ob <= (size_t)(T * H) / 5000 && wu_ <= 4.0,
+              "the BF16 mixer (bf16 low-rank, no E4M3 slot): %zu of %d beyond 1 bf16 ulp (worst %.2f ulp)", ob, T * H, wu_);
+        pulsar_qwen_gr_dev wmix = wb;
+        wmix.up = {up(g.up_w.q), up(g.up_w.sf), HC, R};
+        CHECK(pulsar_qwen_gr_read_launch(&wmix, dst, T, xo, nullptr, nullptr, ws, wsb, 0) != 0,
+              "a BF16 W_down paired with an MXFP8 W_up is refused");
+    }
     /* the write */
     std::vector<float> out((size_t)T * H);
     for (auto &v : out) v = (float)(rndn() * 0.5);
@@ -287,7 +314,7 @@ static void section_gr(void) {
     CK(cudaMemcpy(dst, st.data(), st.size() * 2, cudaMemcpyHostToDevice));
     size_t moved_u = 0, moved_d = 0;
     {
-        pulsar_qwen_gr_weights wx = w;
+        pulsar_qwen_gr_dev wx = w;
         /* one 32-block scale of one W_up row x 8 (a single code is below the bf16
          * resolution of the gated mean) */
         std::vector<uint8_t> sf = g.up_w.sf;
@@ -312,7 +339,7 @@ static void section_gr(void) {
 static void section_ple(void) {
     printf("C. PLE injection (3 sequences, 2 batches, conv state carried)\n");
     const linear key = make_linear(H, HC, 10), value = make_linear(H, H, 8);
-    pulsar_qwen_ple_weights w;
+    pulsar_qwen_ple_dev w;
     w.key_proj = dev_linear(key);
     w.value_proj = dev_linear(value);
     const auto nk = rnd_bf(HC, 0.1), nq = rnd_bf(HC, 0.1), nc = rnd_bf(HC, 0.1), cw = rnd_bf((size_t)HC * 4, 0.4);
@@ -334,9 +361,11 @@ static void section_ple(void) {
             sf[q] = r; sr[q] = rows[q];
             for (int j = 0; j < rows[q]; j++, r++) { rs[r] = q; rj[r] = j; }
         }
-        pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), n_seq};
+        std::vector<int32_t> sb(n_seq);
+        for (int q = 0; q < n_seq; q++) sb[q] = q;
+        pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq};
         uint16_t *de = up(emb_out), *ds = up(st_out);
-        const size_t wsb = pulsar_qwen_ple_workspace_bytes(&w, T);
+        const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
         void *ws = dalloc(wsb);
         const int rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pr, state, ws, wsb, 0);
         CHECK(rc == 0, "launch T=%d", T);
@@ -376,9 +405,11 @@ static void section_ple(void) {
         sf[q] = r; sr[q] = rowsB[q];
         for (int j = 0; j < rowsB[q]; j++, r++) { rs[r] = q; rj[r] = j; }
     }
-    pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), n_seq};
+    std::vector<int32_t> sb(n_seq);
+    for (int q = 0; q < n_seq; q++) sb[q] = q;
+    pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq};
     uint16_t *de = up(emb2), *ds = up(st2);
-    const size_t wsb = pulsar_qwen_ple_workspace_bytes(&w, T);
+    const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
     void *ws = dalloc(wsb);
     int rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pr, state, ws, wsb, 0);
     const auto batch_out = down(ds, (size_t)T * HC);
@@ -393,10 +424,9 @@ static void section_ple(void) {
             if (next[q] >= rowsB[q]) continue;
             any = true;
             const int row = sf[q] + next[q]++;
-            const std::vector<int32_t> one_s = {q}, one_j = {0}, f1(n_seq, 0), r1 = [&] { std::vector<int32_t> v(n_seq, 0); v[q] = 1; return v; }();
-            /* only sequence q has a row: the others' seq_rows = 0 keep their state (the kernel
-             * rewrites their 9 slots from themselves) */
-            pulsar_qwen_rows p1 = {up(one_s), up(one_j), up(f1), up(r1), n_seq};
+            /* a decode step of sequence q alone: one row, one sequence, owning slot q */
+            const std::vector<int32_t> zero = {0}, one = {1}, bank = {q};
+            pulsar_qwen_rows p1 = {up(zero), up(zero), up(zero), up(one), up(bank), 1};
             rc |= pulsar_qwen_ple_launch(&w, de + (size_t)row * H, ds + (size_t)row * HC, 1, &p1, state, ws, wsb, 0);
         }
     }
@@ -410,7 +440,7 @@ static void section_ple(void) {
     CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
     std::vector<uint16_t> cw2 = cw;
     cw2[(size_t)5000 * 4 + 1] = to_bf(bf(cw2[(size_t)5000 * 4 + 1]) + 0.5);
-    pulsar_qwen_ple_weights wm = w;
+    pulsar_qwen_ple_dev wm = w;
     wm.conv_w = up(cw2);
     rc = pulsar_qwen_ple_launch(&wm, de, ds, T, &pr, state, ws, wsb, 0);
     const auto mut = down(ds, (size_t)T * HC);
@@ -437,7 +467,7 @@ static void section_moe(void) {
         for (int e = 0; e < E; e++) { t[2 * e] = base[e % P]; t[2 * e + 1] = (const uint8_t *)base[e % P] + trellis; }
         return (const void *const *)up(t);
     };
-    pulsar_qwen_moe_weights w;
+    pulsar_qwen_moe_dev w;
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
@@ -450,7 +480,7 @@ static void section_moe(void) {
     uint16_t *dx = up(x);
     float *out = (float *)dalloc((size_t)T * H * 4);
     uint32_t *nf = (uint32_t *)dalloc(4);
-    const size_t wsb = pulsar_qwen_moe_workspace_bytes(&w, T);
+    const size_t wsb = pulsar_qwen_moe_workspace_bytes(T);
     void *ws = dalloc(wsb);
     int rc = pulsar_qwen_moe_launch(&w, dx, &xs.s, T, out, ws, wsb, nf, 0x7351u, 0);
     CHECK(rc == 0, "launch T=%d (workspace %.1f MB)", T, wsb / 1e6);

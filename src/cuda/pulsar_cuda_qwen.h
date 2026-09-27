@@ -34,7 +34,14 @@
 #ifndef PULSAR_CUDA_QWEN_H
 #define PULSAR_CUDA_QWEN_H
 
+#ifdef __CUDACC__
 #include <cuda_runtime.h>
+#else
+/* The engine's family ops (src/engine/family_qwen_s4.cpp) call these
+ * launchers from a CUDA-free TU: the runtime's own typedef is all they need
+ * (they pass 0, the per-thread default stream the engine runs on). */
+typedef struct CUstream_st *cudaStream_t;
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -71,15 +78,18 @@ typedef struct {
     int      kbp;
 } pulsar_qwen_slot;
 
-/** An MXFP8 weight in the engine's pre-stored layout (MXFP8_LT): [out][in]
- *  E4M3 row-major plus one E8M0 byte per (row, 32 inputs) at
- *  pulsar_mx_sfoff(row, k / 32, pulsar_mx_kbp(in)) over a slab of
- *  pulsar_mx_sf_slab_bytes(out, kbp) bytes. */
+/** A gated-residual low-rank weight, [out][in] row-major, in one of the two
+ *  formats the recipe stores them in:
+ *    MXFP8_LT (sf != NULL): E4M3 codes then one E8M0 byte per (row, 32 inputs)
+ *      at pulsar_mx_sfoff(row, k / 32, pulsar_mx_kbp(in)) -- every per-layer site;
+ *    BF16     (sf == NULL): the top-level mixer (the graded recipe keeps it bf16).
+ *  The activation each one reads follows its format (rule 3): E4M3 per 32 for
+ *  MXFP8, bf16 for BF16 -- the read emits the one its weights take. */
 typedef struct {
-    const uint8_t *q;
+    const void *w;
     const uint8_t *sf;
     int out, in;
-} pulsar_qwen_mx8;
+} pulsar_qwen_lowrank;
 
 /** A dense Linear in the EXL3 format: one [trellis | suh | svh] slice in
  *  exl3_expert_layout's byte model (so an exllamav3 checkpoint's tensors copy
@@ -89,6 +99,20 @@ typedef struct {
     int k2;          /**< rate in half-bit units, 4..10 */
     int in, out;
 } pulsar_qwen_linear;
+
+/** A weight's device pointer: the engine's model-range cache for the span
+ *  [offset, offset + bytes) of `model_map` (cuda_model_range_ptr). */
+const void *pulsar_qwen_weight_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+
+/** The device table of [trellis, scales] pointer pairs over an EXL3 expert
+ *  stack (exl3_expert_table): n_expert slices of `stride` bytes, the scales
+ *  plane at `split` into each. */
+const void *const *pulsar_qwen_expert_table(const void *stack, uint32_t n_expert, uint64_t stride, uint64_t split);
+
+/** tokens (device i32 [T]) -> streams bf16 [T][4][2560]: each token's
+ *  embed_tokens row (bf16 [n_vocab][2560]) repeated into the 4 streams. */
+int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
+                             cudaStream_t stream);
 
 /** Workspace bytes pulsar_qwen_linear_launch needs for `rows` rows. */
 size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l, int rows);
@@ -120,17 +144,18 @@ typedef struct {
     const void *const *down_table;   /**< down_proj 640 -> 2560 */
     int k2_gate_up, k2_down;         /**< routed rates (half-bit units) */
     pulsar_qwen_linear shared_gate, shared_up, shared_down;
-} pulsar_qwen_moe_weights;
+} pulsar_qwen_moe_dev;
 
-/** Workspace bytes for T rows (everything but the MMQ drivers' own arena). */
-size_t pulsar_qwen_moe_workspace_bytes(const pulsar_qwen_moe_weights *w, int T);
+/** Workspace bytes for T rows (everything but the MMQ drivers' own arena):
+ *  a function of the shape alone. */
+size_t pulsar_qwen_moe_workspace_bytes(int T);
 
 /** The MoE block: out [T][2560] f32 = sum over the top-10 (slot order) of
  *  w_k * down_k(silu(gate_k x) * up_k x) + sigmoid(w_sg . x) * shared(x).
  *  `x_bf16` is the block input row and `x` its E4M3 slot (both from the GR
  *  read).  Non-finite outputs record `nf_code` in *nf_flag (first writer
  *  wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ); refuses without them. */
-int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
+int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
                            int T, float *out, void *ws, size_t ws_bytes,
                            uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream);
 
@@ -139,18 +164,19 @@ int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const uint16_t *x_b
 
 typedef struct {
     const uint16_t *norm_w;   /**< hc_norm.weight bf16 [10240]; applied as (1 + w) */
-    pulsar_qwen_mx8 down;     /**< input_mix_weight_down [320][10240] */
-    pulsar_qwen_mx8 up;       /**< input_mix_weight_up [10240][320] */
+    pulsar_qwen_lowrank down; /**< input_mix_weight_down [320][10240] */
+    pulsar_qwen_lowrank up;   /**< input_mix_weight_up [10240][320]; the same format as down */
     const uint16_t *inject;   /**< block_inject_weight bf16 [4][10240]; NULL = the mixer (no write) */
-} pulsar_qwen_gr_weights;
+} pulsar_qwen_gr_dev;
 
 size_t pulsar_qwen_gr_workspace_bytes(int T);
 
 /** The read: xn = grouped RMSNorm(streams) (1 + w); x = mean_s(sigmoid(W_up
- *  silu(W_down xn / 4)) (.) xn) -> x_bf16 [T][2560] and its E4M3 slot `x`;
- *  when the site has a write, inj [T][4] = 2 sigmoid(W_inj xn / 4).
+ *  silu(W_down xn / 4)) (.) xn) -> x_bf16 [T][2560] and, when `x` is given,
+ *  its E4M3 slot (the mixer before the bf16 head has no A8 consumer and
+ *  passes NULL); when the site has a write, inj [T][4] = 2 sigmoid(W_inj xn / 4).
  *  streams bf16 [T][4][2560]. */
-int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_weights *w, const uint16_t *streams, int T,
+int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
                                uint16_t *x_bf16, const pulsar_qwen_slot *x, float *inj,
                                void *ws, size_t ws_bytes, cudaStream_t stream);
 
@@ -167,27 +193,29 @@ typedef struct {
     const uint16_t *norm_query;      /**< bf16 [10240] */
     const uint16_t *norm_conv;       /**< bf16 [10240] */
     const uint16_t *conv_w;          /**< conv1d.weight bf16 [10240][1][4] */
-} pulsar_qwen_ple_weights;
+} pulsar_qwen_ple_dev;
 
 /** Where each batch row sits: rows of one sequence are consecutive and in time
- *  order.  row_seq[r] = the sequence, row_j[r] = its index among that
- *  sequence's rows in this batch; seq_first[q] / seq_rows[q] = the rows of
- *  sequence q (n_seq sequences).  All device arrays. */
+ *  order.  row_seq[r] = the row's sequence q in [0, n_seq), row_j[r] = its
+ *  index among that sequence's rows in this batch; seq_first[q] / seq_rows[q]
+ *  = the rows of sequence q, seq_bank[q] = the conv-state slot it owns (the
+ *  session's bank).  All device arrays. */
 typedef struct {
-    const int32_t *row_seq, *row_j, *seq_first, *seq_rows;
+    const int32_t *row_seq, *row_j, *seq_first, *seq_rows, *seq_bank;
     int n_seq;
 } pulsar_qwen_rows;
 
-size_t pulsar_qwen_ple_workspace_bytes(const pulsar_qwen_ple_weights *w, int T);
+/** Workspace bytes for T rows: a function of the shape alone. */
+size_t pulsar_qwen_ple_workspace_bytes(int T);
 
 /** The PLE injection for T rows: `emb` bf16 [T][2560] = the 16 gathered table
  *  rows per token (head order); streams bf16 [T][4][2560] updated in place:
  *    k = norm_key(key_proj e), q_s = norm_query(stream_s), v = value_proj e,
  *    gate_s = signed-sqrt(<k_s, q_s> / sqrt(2560)), gv_s = sigmoid(gate_s) v,
  *    stream_s += gv_s + silu(conv_dil3(norm_conv(gv)))
- *  conv_state f32 [n_seq][9][10240] (oldest first) is read for taps before
- *  the batch and advanced by it. */
-int pulsar_qwen_ple_launch(const pulsar_qwen_ple_weights *w, const uint16_t *emb, uint16_t *streams, int T,
+ *  conv_state f32 [banks][9][10240] (oldest first; slot seq_bank[q] for
+ *  sequence q) is read for taps before the batch and advanced by it. */
+int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16_t *emb, uint16_t *streams, int T,
                            const pulsar_qwen_rows *rows, float *conv_state,
                            void *ws, size_t ws_bytes, cudaStream_t stream);
 

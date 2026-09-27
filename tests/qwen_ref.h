@@ -155,6 +155,43 @@ inline gr_out gr_read(const uint16_t *streams, const uint16_t *norm_w, const mx8
     return o;
 }
 
+/** the read with BF16 low-rank weights (the top-level mixer): xn and a are
+ *  rounded to bf16 where the device writes them as the bf16 GEMVs' inputs */
+inline gr_out gr_read_bf16(const uint16_t *streams, const uint16_t *norm_w, const uint16_t *wd, const uint16_t *wu,
+                           const uint16_t *inject) {
+    std::vector<double> xn(HC), xnb(HC);
+    for (int s = 0; s < S; s++) {
+        double ss = 0;
+        for (int c = 0; c < H; c++) { const double v = bf(streams[s * H + c]); ss += v * v; }
+        const double r = 1.0 / sqrt(ss / H + EPS);
+        for (int c = 0; c < H; c++) xn[s * H + c] = bf(streams[s * H + c]) * r * (1.0 + bf(norm_w[s * H + c]));
+    }
+    for (int k = 0; k < HC; k++) xnb[k] = bf_round(xn[k]);
+    gr_out o;
+    for (int j = 0; j < S; j++) {
+        double z = 0;
+        if (inject) for (int k = 0; k < HC; k++) z += bf(inject[(size_t)j * HC + k]) * xn[k];
+        o.inj[j] = 2.0 * sigmoid(z / S);
+    }
+    std::vector<double> ab(R);
+    for (int r = 0; r < R; r++) {
+        double d = 0;
+        for (int k = 0; k < HC; k++) d += bf(wd[(size_t)r * HC + k]) * xnb[k];
+        ab[r] = bf_round(silu(d / S));
+    }
+    o.x.assign(H, 0.0);
+    for (int c = 0; c < H; c++) {
+        double acc = 0;
+        for (int s = 0; s < S; s++) {
+            double z = 0;
+            for (int k = 0; k < R; k++) z += bf(wu[(size_t)(s * H + c) * R + k]) * ab[k];
+            acc += sigmoid(z) * xn[s * H + c];
+        }
+        o.x[c] = acc / S;
+    }
+    return o;
+}
+
 /* ---- the dense Linear (EXL3) ---------------------------------------------- */
 
 struct linear {

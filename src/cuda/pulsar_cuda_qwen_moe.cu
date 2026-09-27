@@ -205,10 +205,10 @@ struct moe_ws {
 };
 
 /* The one layout of the MoE workspace: sizing and carving are the same walk. */
-static size_t moe_ws_layout(const pulsar_qwen_moe_weights *w, int T, void *base, size_t cap, moe_ws *o) {
+static size_t moe_ws_layout(int T, void *base, size_t cap, moe_ws *o) {
     ws_bump b{(uint8_t *)base, base ? cap : (size_t)-1, 0, false};
     const size_t pairs = (size_t)T * kTopK;
-    const int mid = PULSAR_QWEN_EXPERT_MID, smid = w->shared_gate.out;
+    const int mid = PULSAR_QWEN_EXPERT_MID, smid = PULSAR_QWEN_SHARED_MID;
     moe_ws m{};
     m.logits = (float *)b.take((size_t)T * (kE + 1) * 4);
     m.sel    = (int32_t *)b.take(pairs * 4);
@@ -223,10 +223,9 @@ static size_t moe_ws_layout(const pulsar_qwen_moe_weights *w, int T, void *base,
     m.h_q    = (uint8_t *)b.take((size_t)T * smid);
     m.h_sf   = (uint8_t *)b.take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(smid)));
     m.ys     = (float *)b.take((size_t)T * kH * 4);
-    size_t lb = pulsar_qwen_linear_workspace_bytes(&w->shared_gate, T);
-    const size_t lu = pulsar_qwen_linear_workspace_bytes(&w->shared_up, T);
-    const size_t ld = pulsar_qwen_linear_workspace_bytes(&w->shared_down, T);
-    lb = lb > lu ? lb : lu;
+    /* the dense arm's workspace is a function of (rows, in, out) alone */
+    size_t lb = ds4_exl3_dense_workspace_bytes(T, kH, smid);
+    const size_t ld = ds4_exl3_dense_workspace_bytes(T, smid, kH);
     lb = lb > ld ? lb : ld;
     m.lin = b.take(lb);
     m.lin_bytes = lb;
@@ -280,12 +279,11 @@ extern "C" int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t 
     return launch_ok("router") ? 0 : -3;
 }
 
-extern "C" size_t pulsar_qwen_moe_workspace_bytes(const pulsar_qwen_moe_weights *w, int T) {
-    if (!w || T <= 0) return 0;
-    return moe_ws_layout(w, T, nullptr, 0, nullptr);
+extern "C" size_t pulsar_qwen_moe_workspace_bytes(int T) {
+    return T > 0 ? moe_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
-extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
+extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
                                       int T, float *out, void *ws, size_t ws_bytes,
                                       uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
     if (!w || !x_bf16 || !x || !x->q || !x->sf || !out || !nf_flag || T <= 0 ||
@@ -307,9 +305,9 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const ui
     return -1;
 #else
     moe_ws m;
-    if (!ws || moe_ws_layout(w, T, ws, ws_bytes, &m) == 0) {
+    if (!ws || moe_ws_layout(T, ws, ws_bytes, &m) == 0) {
         fprintf(stderr, "pulsar: qwen MoE: workspace %zu B < %zu B for %d rows -- refusing\n",
-                ws_bytes, pulsar_qwen_moe_workspace_bytes(w, T), T);
+                ws_bytes, pulsar_qwen_moe_workspace_bytes(T), T);
         return -1;
     }
     static int mmq_ready = -1;

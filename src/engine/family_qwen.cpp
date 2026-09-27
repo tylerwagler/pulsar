@@ -56,15 +56,15 @@ pulsar_qwen_shape g_qwen_shape = PULSAR_QWEN_SHAPE_FLASH_NEXT;
 /* THE op table.  Every entry is NULL until its stream lands it; a stream fills
  * its own entries here and nothing else. */
 const pulsar_qwen_ops g_qwen_ops = {
-    /* .embed         = */ NULL,   /* S4 work/l251-moe */
-    /* .ple           = */ NULL,   /* S4 work/l251-moe */
-    /* .gr_read       = */ NULL,   /* S4 work/l251-moe */
+    /* .embed         = */ pulsar_qwen_s4_embed,      /* S4 work/l251-moe */
+    /* .ple           = */ pulsar_qwen_s4_ple,        /* S4 work/l251-moe */
+    /* .gr_read       = */ pulsar_qwen_s4_gr_read,    /* S4 work/l251-moe */
     /* .gdn           = */ NULL,   /* S2 work/l251-gdn */
     /* .qsa           = */ NULL,   /* S3 work/l251-attn */
-    /* .gr_write      = */ NULL,   /* S4 work/l251-moe */
-    /* .moe           = */ NULL,   /* S4 work/l251-moe */
-    /* .head          = */ NULL,   /* S4 work/l251-moe */
-    /* .scratch_bytes = */ NULL,
+    /* .gr_write      = */ pulsar_qwen_s4_gr_write,   /* S4 work/l251-moe */
+    /* .moe           = */ pulsar_qwen_s4_moe,        /* S4 work/l251-moe */
+    /* .head          = */ pulsar_qwen_s4_head,       /* S4 work/l251-moe */
+    /* .scratch_bytes = */ pulsar_qwen_s4_scratch_bytes,   /* S4's ops; S2 / S3 chain theirs in */
 };
 
 const char *pulsar_qwen_op_name(pulsar_qwen_op_id op) {
@@ -469,6 +469,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
         fprintf(stderr, "pulsar: %s: the artifact does not bind -- refusing\n", PULSAR_QWEN_ARCH);
         return false;
     }
+    if (!pulsar_qwen_s4_load(e, opt)) return false;
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u; the tokenizer "
                     "and renderer are not implemented (S5)\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
@@ -562,8 +563,8 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     const uint64_t rows = max_rows;
     if (ok) {
         st->streams  = pulsar_gpu_tensor_alloc(rows * pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE);
-        st->x        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_ACT_ELT_SIZE);
-        st->y        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_ACT_ELT_SIZE);
+        st->x        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_X_ELT_SIZE);
+        st->y        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_Y_ELT_SIZE);
         st->logits   = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * s->n_vocab * sizeof(float));
         st->row_pos  = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
         st->row_bank = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));

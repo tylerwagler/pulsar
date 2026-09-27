@@ -210,6 +210,9 @@ typedef struct {
     uint64_t ple_multipliers[PULSAR_QWEN_MAX_NGRAM];       ///< [ngram_size]
     uint64_t ple_head_vocab[PULSAR_QWEN_MAX_NGRAM_HEADS];  ///< table size (a prime) per n-gram head
     uint64_t ple_head_offset[PULSAR_QWEN_MAX_NGRAM_HEADS]; ///< first row of each head's table
+    /** S4: the PLE row file (the container's pulsar.ple_rows.*), its pread pool
+     * and the host gather in flight; opened by pulsar_qwen_s4_load. */
+    struct pulsar_qwen_ple_io *ple_io;
 } pulsar_qwen_weights;
 
 /* ---- 4. Session state -------------------------------------------------------
@@ -254,10 +257,23 @@ static inline uint64_t pulsar_qwen_index_tail_bytes(const pulsar_qwen_shape *s) 
 static inline uint64_t pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
     return (uint64_t)pulsar_qwen_ple_conv_state_len(s) * pulsar_qwen_hc_dim(s) * sizeof(float);
 }
-/** Activation slot formats (the ops' shared contract; f32 until a producer
- * narrows one -- then the producer changes the element size here). */
-#define PULSAR_QWEN_STREAM_ELT_SIZE 4u   ///< streams [rows][n_hc][n_embd], f32
-#define PULSAR_QWEN_ACT_ELT_SIZE    4u   ///< x, y [rows][n_embd], f32
+/** Activation slot formats (the ops' shared contract; each set by the stream
+ * that PRODUCES the slot).
+ *   streams  bf16 [rows][n_hc][n_embd] -- S4 (embed, PLE, GR write): the
+ *            source's residual dtype and the DeepSeek lane's (pulsar_hc_t):
+ *            bf16 storage, f32 math, one rounding per write.
+ *   x        bf16 [rows][n_embd] -- S4 (GR read): the block input rounded to
+ *            bf16 as the source rounds `mixed_input`; the bf16-weight readers
+ *            (router, shared-expert gate) read it here.  ITS E4M3 ENCODING is
+ *            emitted by the same producer into the activation cache slot of `x`
+ *            (pulsar_gpu_mxfp8_act_cache_e4m3_slot, armed + noted, f32 plane
+ *            noted skipped): every A8 consumer -- EXL3 dense / MXFP8 Linears of
+ *            GDN, QSA, the MoE -- reads it with pulsar_gpu_mxfp8_act_cache_get_e4m3
+ *            and never encodes x itself (rule 3).
+ *   y        f32 [rows][n_embd] -- written by GDN / QSA / MoE, read by GR write. */
+#define PULSAR_QWEN_STREAM_ELT_SIZE 2u   ///< streams, bf16
+#define PULSAR_QWEN_X_ELT_SIZE      2u   ///< x, bf16 (+ the armed E4M3 slot)
+#define PULSAR_QWEN_Y_ELT_SIZE      4u   ///< y, f32
 /** Rows the head may emit per step (the logits slab): the batched lane's bound. */
 #define PULSAR_QWEN_HEAD_ROWS_MAX   16u
 
@@ -367,6 +383,21 @@ typedef struct {
 /** THE op table.  Defined in family_qwen.cpp; each stream fills its entries
  * there when its op lands (and deletes nothing else). */
 extern const pulsar_qwen_ops g_qwen_ops;
+
+/* ---- S4's ops (src/engine/family_qwen_s4.cpp) --------------------------------
+ * embed, PLE, the gated-residual read / write, the MoE block and the head
+ * (mixer + lm_head), their scratch, and at load: the admission of every tensor
+ * those ops read (by layout -- a format no arm reads is refused at load) and the
+ * PLE row file. */
+bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st);
+bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
+bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
+bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
+uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows);
+bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt);
+void pulsar_qwen_s4_unload(pulsar_qwen_weights *w);
 
 /** Name and owner of an op, for the refusal line ("gdn", "S2 work/l251-gdn"). */
 const char *pulsar_qwen_op_name(pulsar_qwen_op_id op);

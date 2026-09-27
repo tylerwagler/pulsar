@@ -18,6 +18,7 @@
  */
 #include "pulsar_cuda_qwen.h"
 #include "pulsar_cuda_mx.cuh"
+#include "mmq/ds4_exl3_dense.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -114,9 +115,9 @@ __global__ void __launch_bounds__(kThreads)
 qwen_ple_conv_kernel(const float *__restrict__ gvn, const float *__restrict__ value, const float *__restrict__ sig,
                      const __nv_bfloat16 *__restrict__ conv_w, const float *__restrict__ state,
                      const int32_t *__restrict__ row_seq, const int32_t *__restrict__ row_j,
-                     __nv_bfloat16 *__restrict__ streams) {
+                     const int32_t *__restrict__ seq_bank, __nv_bfloat16 *__restrict__ streams) {
     const int ch = blockIdx.x * kThreads + threadIdx.x, t = blockIdx.y;
-    const int seq = row_seq[t], j = row_j[t];
+    const int seq = seq_bank[row_seq[t]], j = row_j[t];
     const int s = ch / kH, c = ch % kH;
     float y = 0.0f;
 #pragma unroll
@@ -133,9 +134,10 @@ qwen_ple_conv_kernel(const float *__restrict__ gvn, const float *__restrict__ va
 
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_state_kernel(const float *__restrict__ gvn, const int32_t *__restrict__ seq_first,
-                      const int32_t *__restrict__ seq_rows, float *__restrict__ state) {
-    const int ch = blockIdx.x * kThreads + threadIdx.x, q = blockIdx.y;
-    const int f = seq_first[q], n = seq_rows[q];
+                      const int32_t *__restrict__ seq_rows, const int32_t *__restrict__ seq_bank,
+                      float *__restrict__ state) {
+    const int ch = blockIdx.x * kThreads + threadIdx.x;
+    const int f = seq_first[blockIdx.y], n = seq_rows[blockIdx.y], q = seq_bank[blockIdx.y];
     float nv[kState];
 #pragma unroll
     for (int i = 0; i < kState; ++i) {
@@ -153,7 +155,7 @@ struct ple_ws {
     size_t lin_bytes;
 };
 
-static size_t ple_ws_layout(const pulsar_qwen_ple_weights *w, int T, void *base, size_t cap, ple_ws *o) {
+static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
     size_t used = 0;
     bool failed = false;
     auto take = [&](size_t bytes) -> void * {
@@ -169,8 +171,8 @@ static size_t ple_ws_layout(const pulsar_qwen_ple_weights *w, int T, void *base,
     m.value = (float *)take((size_t)T * kH * 4);
     m.gvn   = (float *)take((size_t)T * kHC * 4);
     m.sig   = (float *)take((size_t)T * kS * 4);
-    const size_t lk = pulsar_qwen_linear_workspace_bytes(&w->key_proj, T);
-    const size_t lv = pulsar_qwen_linear_workspace_bytes(&w->value_proj, T);
+    const size_t lk = ds4_exl3_dense_workspace_bytes(T, kH, kHC);   /* a function of (rows, in, out) alone */
+    const size_t lv = ds4_exl3_dense_workspace_bytes(T, kH, kH);
     m.lin_bytes = lk > lv ? lk : lv;
     m.lin = take(m.lin_bytes);
     if (o) *o = m;
@@ -188,15 +190,15 @@ static bool launch_ok(const char *what) {
 
 } // namespace
 
-extern "C" size_t pulsar_qwen_ple_workspace_bytes(const pulsar_qwen_ple_weights *w, int T) {
-    return (w && T > 0) ? ple_ws_layout(w, T, nullptr, 0, nullptr) : 0;
+extern "C" size_t pulsar_qwen_ple_workspace_bytes(int T) {
+    return T > 0 ? ple_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
-extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_weights *w, const uint16_t *emb, uint16_t *streams, int T,
+extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16_t *emb, uint16_t *streams, int T,
                                       const pulsar_qwen_rows *rows, float *conv_state,
                                       void *ws, size_t ws_bytes, cudaStream_t stream) {
     if (!w || !emb || !streams || T <= 0 || !rows || !rows->row_seq || !rows->row_j || !rows->seq_first ||
-        !rows->seq_rows || rows->n_seq <= 0 || !conv_state || !w->norm_key || !w->norm_query || !w->norm_conv ||
+        !rows->seq_rows || !rows->seq_bank || rows->n_seq <= 0 || !conv_state || !w->norm_key || !w->norm_query || !w->norm_conv ||
         !w->conv_w) {
         fprintf(stderr, "pulsar: qwen PLE: a null input -- refusing\n");
         return -1;
@@ -207,9 +209,9 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_weights *w, const ui
         return -1;
     }
     ple_ws m;
-    if (!ws || ple_ws_layout(w, T, ws, ws_bytes, &m) == 0) {
+    if (!ws || ple_ws_layout(T, ws, ws_bytes, &m) == 0) {
         fprintf(stderr, "pulsar: qwen PLE: workspace %zu B < %zu B for %d rows -- refusing\n",
-                ws_bytes, pulsar_qwen_ple_workspace_bytes(w, T), T);
+                ws_bytes, pulsar_qwen_ple_workspace_bytes(T), T);
         return -1;
     }
     static int announced = 0;
@@ -232,8 +234,8 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_weights *w, const ui
         (const __nv_bfloat16 *)w->norm_query, (const __nv_bfloat16 *)w->norm_conv, m.gvn, m.sig);
     qwen_ple_conv_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
         m.gvn, m.value, m.sig, (const __nv_bfloat16 *)w->conv_w, conv_state, rows->row_seq, rows->row_j,
-        (__nv_bfloat16 *)streams);
+        rows->seq_bank, (__nv_bfloat16 *)streams);
     qwen_ple_state_kernel<<<dim3(kHC / kThreads, rows->n_seq), kThreads, 0, stream>>>(
-        m.gvn, rows->seq_first, rows->seq_rows, conv_state);
+        m.gvn, rows->seq_first, rows->seq_rows, rows->seq_bank, conv_state);
     return launch_ok("inject") ? 0 : -3;
 }

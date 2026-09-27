@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
         tdv[2 * e] = ed + e * ed_stride; tdv[2 * e + 1] = ed + e * ed_stride + td;
     }
     const void *const *dtg = (const void *const *)up(tgv), *const *dtd = (const void *const *)up(tdv);
-    std::vector<pulsar_qwen_moe_weights> mw(RR);
+    std::vector<pulsar_qwen_moe_dev> mw(RR);
     for (int i = 0; i < RR; i++) {
         mw[i].router_w = wr[i]; mw[i].shared_gate_w = wsg[i];
         mw[i].gate_up_table = dtg; mw[i].down_table = dtd;
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
         mw[i].shared_up = {shu + i * sg_stride, 10, H, MID};
         mw[i].shared_down = {shd + i * sd_stride, 10, MID, H};
     }
-    const size_t mws = pulsar_qwen_moe_workspace_bytes(&mw[0], 128);
+    const size_t mws = pulsar_qwen_moe_workspace_bytes(128);
     void *mwsp = dz(mws);
     float *out = (float *)dz((size_t)128 * H * 4), *lg = (float *)dz((size_t)128 * (E + 1) * 4);
     float *rw = (float *)dz(128 * TOPK * 4), *rs = (float *)dz(128 * 4);
@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
         float *y1 = (float *)dz((size_t)T * MID * 4), *y2 = (float *)dz((size_t)T * H * 4);
         pulsar_qwen_slot hq = slot_for(std::vector<uint16_t>((size_t)T * MID, 0x3f00), T, MID);
         const double t_shared = time_calls(iters, [&](int i) {
-            const pulsar_qwen_moe_weights &m = mw[i % RR];
+            const pulsar_qwen_moe_dev &m = mw[i % RR];
             pulsar_qwen_linear_launch(&m.shared_gate, &xslot[i % NX], T, y1, lw, lws, 0);
             pulsar_qwen_linear_launch(&m.shared_up, &xslot[i % NX], T, y1, lw, lws, 0);
             pulsar_qwen_linear_launch(&m.shared_down, &hq, T, y2, lw, lws, 0);
@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
 
     /* ---- Gated Residual */
     const int RG = 16;
-    std::vector<pulsar_qwen_gr_weights> gw(RG);
+    std::vector<pulsar_qwen_gr_dev> gw(RG);
     const size_t dq = (size_t)R * HC, dsf = pulsar_mx_sf_slab_bytes(R, pulsar_mx_kbp(HC));
     const size_t uq = (size_t)HC * R, usf = pulsar_mx_sf_slab_bytes(HC, pulsar_mx_kbp(R));
     for (int i = 0; i < RG; i++) {
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
             pulsar_qwen_gr_read_launch(&gw[i % RG], streams[i % NX], T, xo, &xq, inj, gwsp, gws, 0);
         });
         const double t_mix = time_calls(iters, [&](int i) {
-            pulsar_qwen_gr_weights m = gw[i % RG];
+            pulsar_qwen_gr_dev m = gw[i % RG];
             m.inject = nullptr;
             pulsar_qwen_gr_read_launch(&m, streams[i % NX], T, xo, &xq, nullptr, gwsp, gws, 0);
         });
@@ -252,7 +252,7 @@ int main(int argc, char **argv) {
     const int RP = 6;
     size_t k_stride = 0, v_stride = 0;
     uint8_t *kp = exl3_slices(H, HC, 10, RP, &k_stride), *vp = exl3_slices(H, H, 10, RP, &v_stride);
-    std::vector<pulsar_qwen_ple_weights> pw(RP);
+    std::vector<pulsar_qwen_ple_dev> pw(RP);
     for (int i = 0; i < RP; i++) {
         pw[i].key_proj = {kp + i * k_stride, 10, H, HC};
         pw[i].value_proj = {vp + i * v_stride, 10, H, H};
@@ -272,8 +272,10 @@ int main(int argc, char **argv) {
         std::vector<int32_t> rs(T), rj(T), sf(n_seq), sr(n_seq);
         for (int r = 0; r < T; r++) { rs[r] = chunk ? 0 : r; rj[r] = chunk ? r : 0; }
         for (int q = 0; q < n_seq; q++) { sf[q] = chunk ? 0 : q; sr[q] = chunk ? T : 1; }
-        pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), n_seq};
-        const size_t pws = pulsar_qwen_ple_workspace_bytes(&pw[0], T);
+        std::vector<int32_t> sb(n_seq);
+        for (int q = 0; q < n_seq; q++) sb[q] = q;
+        pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq};
+        const size_t pws = pulsar_qwen_ple_workspace_bytes(T);
         void *pwsp = dz(pws);
         const double t_ple = time_calls(iters, [&](int i) {
             pulsar_qwen_ple_launch(&pw[i % RP], embs[i % NX], streams[i % NX], T, &pr, state, pwsp, pws, 0);

@@ -12,9 +12,10 @@
  *       x.bin, wr.bin, wsg.bin, experts.idx (u32 n, u32 ids[n]), exp_gate_up.bin (n FUSED
  *       [2560 -> 1280] slices) / exp_down.bin (n slices), shared_gate.bin / shared_up.bin / shared_down.bin
  *       -> out.bin f32 [N][2560], sel.bin, wts.bin, sgate.bin, out_m1.bin (each row alone)
- *   qwen_xcheck gr DIR N
+ *   qwen_xcheck gr DIR N [bf16]
  *       streams.bin bf16 [N][10240], norm.bin bf16 [10240], down.bin / up.bin (MXFP8_LT:
- *       codes then the swizzled E8M0 slab), inject.bin bf16 [4][10240] (absent = the mixer)
+ *       codes then the swizzled E8M0 slab; with `bf16`, plain bf16 [out][in] -- the
+ *       mixer's recipe format), inject.bin bf16 [4][10240] (absent = the mixer)
  *       -> x.bin bf16 [N][2560], inj.bin f32 [N][4], ref_x.bin f64 [min(N,16)][2560], ref_inj.bin
  *   qwen_xcheck ple DIR N k2_key k2_value
  *       emb.bin bf16 [N][2560], streams.bin bf16 [N][10240], seqs.bin (i32 n_seq, i32 len[n_seq];
@@ -149,7 +150,7 @@ static int do_moe(int N, int k2gu, int k2d, int k2sg, int k2su, int k2sd) {
         tg[2 * e] = deg + (size_t)s * sgu;  tg[2 * e + 1] = deg + (size_t)s * sgu + tgu;
         tdn[2 * e] = ded + (size_t)s * sd;  tdn[2 * e + 1] = ded + (size_t)s * sd + td;
     }
-    pulsar_qwen_moe_weights w;
+    pulsar_qwen_moe_dev w;
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
     w.gate_up_table = (const void *const *)up(tg);
@@ -173,7 +174,7 @@ static int do_moe(int N, int k2gu, int k2d, int k2sg, int k2su, int k2sd) {
     spill("sgate.bin", down(rs, N).data(), (size_t)N * 4);
     float *out = (float *)dalloc((size_t)N * H * 4);
     uint32_t *nf = (uint32_t *)dalloc(4);
-    const size_t wsb = pulsar_qwen_moe_workspace_bytes(&w, N);
+    const size_t wsb = pulsar_qwen_moe_workspace_bytes(N);
     void *ws = dalloc(wsb);
     if (pulsar_qwen_moe_launch(&w, dx, &xs, N, out, ws, wsb, nf, 0x7351u, 0)) return 1;
     const auto O = down(out, (size_t)N * H);
@@ -204,16 +205,29 @@ static mx8 load_mx8(const char *name, int out, int in) {
     return m;
 }
 
-static int do_gr(int N) {
+static int do_gr(int N, bool bf16w) {
     const auto st = slurp<uint16_t>("streams.bin", (size_t)N * HC), norm = slurp<uint16_t>("norm.bin", HC);
-    const mx8 dn = load_mx8("down.bin", R, HC), upw = load_mx8("up.bin", HC, R);
+    mx8 dn, upw;
+    std::vector<uint16_t> dnb, upb;
+    if (bf16w) {
+        dnb = slurp<uint16_t>("down.bin", (size_t)R * HC);
+        upb = slurp<uint16_t>("up.bin", (size_t)HC * R);
+    } else {
+        dn = load_mx8("down.bin", R, HC);
+        upw = load_mx8("up.bin", HC, R);
+    }
     const bool site = exists("inject.bin");
     std::vector<uint16_t> inj_w;
     if (site) inj_w = slurp<uint16_t>("inject.bin", (size_t)S * HC);
-    pulsar_qwen_gr_weights w;
+    pulsar_qwen_gr_dev w;
     w.norm_w = up(norm);
-    w.down = {up(dn.q), up(dn.sf), R, HC};
-    w.up = {up(upw.q), up(upw.sf), HC, R};
+    if (bf16w) {
+        w.down = {up(dnb), nullptr, R, HC};
+        w.up = {up(upb), nullptr, HC, R};
+    } else {
+        w.down = {up(dn.q), up(dn.sf), R, HC};
+        w.up = {up(upw.q), up(upw.sf), HC, R};
+    }
     w.inject = site ? up(inj_w) : nullptr;
     uint16_t *dst = up(st), *xo = (uint16_t *)dalloc((size_t)N * H * 2);
     pulsar_qwen_slot xs = {(uint8_t *)dalloc((size_t)N * H), (uint8_t *)dalloc(pulsar_mx_sf_slab_bytes(N, pulsar_mx_kbp(H))), pulsar_mx_kbp(H)};
@@ -228,13 +242,14 @@ static int do_gr(int N) {
     const int nr = std::min(N, 16);
     std::vector<double> rx((size_t)nr * H), ri((size_t)nr * S);
     for (int t = 0; t < nr; t++) {
-        const gr_out o = gr_read(&st[(size_t)t * HC], norm.data(), dn, upw, site ? inj_w.data() : nullptr);
+        const gr_out o = bf16w ? gr_read_bf16(&st[(size_t)t * HC], norm.data(), dnb.data(), upb.data(), site ? inj_w.data() : nullptr)
+                               : gr_read(&st[(size_t)t * HC], norm.data(), dn, upw, site ? inj_w.data() : nullptr);
         std::copy(o.x.begin(), o.x.end(), rx.begin() + (size_t)t * H);
         for (int j = 0; j < S; j++) ri[(size_t)t * S + j] = o.inj[j];
     }
     spill("ref_x.bin", rx.data(), rx.size() * 8);
     spill("ref_inj.bin", ri.data(), ri.size() * 8);
-    printf("gr: %d rows (%s), host reference for %d\n", N, site ? "site" : "mixer", nr);
+    printf("gr: %d rows (%s, %s low-rank), host reference for %d\n", N, site ? "site" : "mixer", bf16w ? "bf16" : "MXFP8", nr);
     return 0;
 }
 
@@ -247,7 +262,7 @@ static int do_ple(int N, int k2k, int k2v) {
     const linear key = load_linear("key.bin", H, HC, k2k), value = load_linear("value.bin", H, H, k2v);
     const auto nk = slurp<uint16_t>("norm_key.bin", HC), nq = slurp<uint16_t>("norm_query.bin", HC),
                nc = slurp<uint16_t>("norm_conv.bin", HC), cw = slurp<uint16_t>("conv.bin", (size_t)HC * 4);
-    pulsar_qwen_ple_weights w;
+    pulsar_qwen_ple_dev w;
     w.key_proj = dev_linear(key); w.value_proj = dev_linear(value);
     w.norm_key = up(nk); w.norm_query = up(nq); w.norm_conv = up(nc); w.conv_w = up(cw);
     std::vector<int32_t> rs(N), rj(N), sf(n_seq), sr(n_seq);
@@ -257,10 +272,12 @@ static int do_ple(int N, int k2k, int k2v) {
         for (int j = 0; j < seqs[1 + q]; j++, r++) { if (r >= N) { fprintf(stderr, "seqs exceed N\n"); return 2; } rs[r] = q; rj[r] = j; }
     }
     if (r != N) { fprintf(stderr, "seqs cover %d of %d rows\n", r, N); return 2; }
-    pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), n_seq};
+    std::vector<int32_t> sb(n_seq);
+    for (int q = 0; q < n_seq; q++) sb[q] = q;                  /* sequence q owns conv-state slot q */
+    pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq};
     float *state = (float *)dalloc((size_t)n_seq * PULSAR_QWEN_PLE_STATE * HC * 4);
     uint16_t *de = up(emb), *ds = up(st);
-    const size_t wsb = pulsar_qwen_ple_workspace_bytes(&w, N);
+    const size_t wsb = pulsar_qwen_ple_workspace_bytes(N);
     void *ws = dalloc(wsb);
     if (pulsar_qwen_ple_launch(&w, de, ds, N, &pr, state, ws, wsb, 0)) return 1;
     const auto O = down(ds, (size_t)N * HC);
@@ -284,7 +301,7 @@ int main(int argc, char **argv) {
     if (!pulsar_gpu_init()) { fprintf(stderr, "no GPU\n"); return 2; }
     if (mode == "router") return do_router(N);
     if (mode == "moe" && argc == 9) return do_moe(N, atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), atoi(argv[7]), atoi(argv[8]));
-    if (mode == "gr") return do_gr(N);
+    if (mode == "gr") return do_gr(N, argc > 4 && std::string(argv[4]) == "bf16");
     if (mode == "ple" && argc == 6) return do_ple(N, atoi(argv[4]), atoi(argv[5]));
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;

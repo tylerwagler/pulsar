@@ -1091,6 +1091,7 @@ void pulsar_engine::destroy() {
         e->tp_bulk_bytes = 0;
     }
     weights_free(&e->weights);
+    if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
     free(e->qwen_weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)

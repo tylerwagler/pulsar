@@ -617,13 +617,13 @@ qwen-family-containers:
 	  echo "REFUSING: QWEN_HF_DIR=$(QWEN_HF_DIR) is not the Qwen3.8-Flash-Next HF checkpoint (headers + config are read)"; exit 1; }
 	@mkdir -p $(QWEN_GATE_DIR) && \
 	python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/good.safetensors && \
-	for m in arch shape tensor layer-type; do \
+	for m in arch shape tensor layer-type s4-format ple-rows; do \
 	  python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/$$m.safetensors --mutate $$m || exit 1; \
 	done
 qwen-family-gate: tests/qwen_family_gate qwen-family-containers
-	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors; exit $$rc
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
 qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
-	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors; exit $$rc
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
 
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):

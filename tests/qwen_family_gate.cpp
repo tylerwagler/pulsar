@@ -90,11 +90,12 @@ static void host_part(const char *dir) {
           "PLE tables: odd multipliers, table 0 of %llu rows (> %llu), offsets contiguous",
           w ? (unsigned long long)w->ple_head_vocab[0] : 0ull, (unsigned long long)s->ngram_vocab_base);
 
-    /* The step refuses at the first op in forward order: today embed (S4). */
+    /* The step refuses at the first op in forward order: with S4's ops present,
+     * gdn at layer 0 (S2). */
     uint32_t at = 0;
     const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(&g_qwen_ops, p, s, &at);
-    check(miss == PULSAR_QWEN_OP_EMBED, "first missing op: %s (owner %s)", pulsar_qwen_op_name(miss),
-          pulsar_qwen_op_owner(miss));
+    check(miss == PULSAR_QWEN_OP_GDN && at == 0, "first missing op: %s at layer %u (owner %s)", pulsar_qwen_op_name(miss),
+          at, pulsar_qwen_op_owner(miss));
     /* The walk's order is the forward's: with only embed present the next is
      * gr_read at layer 0; with every op but qsa present it is qsa at layer 3. */
     pulsar_qwen_ops probe;
@@ -129,7 +130,7 @@ static void host_part(const char *dir) {
     }
     pulsar_engine_close(e);
 
-    static const char *const mutants[] = { "arch", "shape", "tensor", "layer-type" };
+    static const char *const mutants[] = { "arch", "shape", "tensor", "layer-type", "s4-format", "ple-rows" };
     for (size_t i = 0; i < sizeof(mutants) / sizeof(mutants[0]); i++) {
         snprintf(path, sizeof(path), "%s/%s.safetensors", dir, mutants[i]);
         fprintf(stderr, "qwen-family gate: mutant '%s' (the loader must refuse it by name):\n", mutants[i]);
