@@ -17,9 +17,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** True when `k2` is a rate the arm instantiates: K = 2, 2.5, 3 (DeepSeek /
- *  V4.1) and 4, 5 (Qwen3.8-Flash-Next, L251). */
-bool ds4_exl3_gemv_rate_supported(int k2);
+/** The GEMV kinds.  DOWN: one projection whose input the fold already rotated.
+ *  PAIR: gate and up from two slices (DeepSeek's split stacks), each rotating
+ *  the input by its own suh.  GATE_UP_FUSED: one [in -> 2 mid] slice whose
+ *  output rows are gate | up (Qwen3.8-Flash-Next, L251), rotating the input by
+ *  its suh. */
+enum { DS4_EXL3_DOWN = 0, DS4_EXL3_PAIR = 1, DS4_EXL3_GATE_UP_FUSED = 2 };
+
+/** True when the kind instantiates rate `k2` (half-bit units): PAIR and DOWN
+ *  at K = 2, 2.5, 3 (DeepSeek / V4.1), GATE_UP_FUSED and DOWN at 4, 5 (Qwen). */
+bool ds4_exl3_gemv_rate_supported(int kind, int k2);
 
 /** gate/up: out_gate / out_up [n_assign][M] f32 = the UNROTATED z of each
  *  assignment (the fold applies svh and the output Hadamard).  The input
@@ -60,6 +67,38 @@ int ds4_exl3_moe_gemv_pair_launch_rows(
     int             rows_per_block,
     cudaStream_t    stream);
 
+/** fused gate_up: out [n_assign][M] f32 = the UNROTATED z of the one [K -> M]
+ *  slice (M = 2 mid: gate rows then up rows), the input rotated in-kernel by
+ *  the slice's suh.  Same contract as the pair launch otherwise. */
+int ds4_exl3_moe_gemv_fused_launch(
+    const void    * table,
+    int             k2,
+    const void    * act,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    float         * out,
+    int             M,
+    int             K,
+    int64_t         n_assign,
+    int             n_experts,
+    cudaStream_t    stream);
+
+/** The fused launch with the row block pinned (1, 4 or 16); the gate uses it
+ *  to prove every row block bit-identical, the arm never calls it. */
+int ds4_exl3_moe_gemv_fused_launch_rows(
+    const void    * table,
+    int             k2,
+    const void    * act,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    float         * out,
+    int             M,
+    int             K,
+    int64_t         n_assign,
+    int             n_experts,
+    int             rows_per_block,
+    cudaStream_t    stream);
+
 /** down: out [n_assign][M] f32 = the UNROTATED z_d; the input (mid) arrives
  *  pre-rotated by the fold, so nothing is rotated here. */
 int ds4_exl3_moe_gemv_single_launch(
@@ -88,6 +127,25 @@ int ds4_exl3_moe_fold_launch(
     const float   * weights,
     const void    * gate_table,
     const void    * up_table,
+    const void    * down_table,
+    int             in_dim,
+    int             mid_dim,
+    int64_t         pairs,
+    float           clamp,
+    void          * mid_q,
+    void          * mid_sf,
+    int             mid_kbp,
+    cudaStream_t    stream);
+
+/** The fold over a FUSED gate_up: gate_up_z [pairs][2 mid] (gate columns
+ *  0..mid-1, up columns mid..2 mid-1), svh of the one gate_up slice (gate's at
+ *  suh + in_dim, up's at suh + in_dim + mid); otherwise the same arithmetic and
+ *  the same E4M3 mid as ds4_exl3_moe_fold_launch. */
+int ds4_exl3_moe_fold_fused_launch(
+    const float   * gate_up_z,
+    const int32_t * selected,
+    const float   * weights,
+    const void    * gate_up_table,
     const void    * down_table,
     int             in_dim,
     int             mid_dim,

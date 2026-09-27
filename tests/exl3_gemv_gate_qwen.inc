@@ -1,29 +1,27 @@
 /* exl3_gemv_gate, L251 section: Qwen3.8-Flash-Next's routed experts -- 512
- * experts x top-10, in 2560, mid 640 (gate/up 2560 -> 640 each, down
- * 640 -> 2560), rates K = 4 and 5.  The down's K = 640 = 5 x 128 is the arm's
+ * experts x top-10, in 2560, mid 640, gate_up FUSED (one [2560 -> 1280] slice
+ * per expert, gate rows then up rows, as the container carries it) and down
+ * 640 -> 2560, rates K = 4 and 5.  The down's K = 640 = 5 x 128 is the arm's
  * K % 256 == 128 tail: the last staging pass of every row is one Hadamard
  * block.  Graded like the V4.1 sections (host authority + double), plus the
  * row-block identity on the tail, a mutation and the refusals.  Included by
  * tests/exl3_gemv_gate.cu and run AFTER the V4.1 sections, so their random
  * draws -- and the byte hashes they print -- do not move. */
 
-static void grade_pair(const char *what, const routing &r, const acts &a, int K, int M, int k2,
-                       const std::vector<expert_blob> &gate, const std::vector<expert_blob> &up,
-                       const std::vector<float> &zg, const std::vector<float> &zu, int n_check) {
+/* one projection per assignment: z = W_hat^T H(suh x) of a [K -> M] slice */
+static void grade_fused(const char *what, const routing &r, const acts &a, int K, int M, int k2,
+                        const std::vector<expert_blob> &ex, const std::vector<float> &z_dev, int n_check) {
     double worst = 0, scale = 0;
-    std::vector<double> wg, wu;
+    std::vector<double> w;
     int checked = 0;
     for (int col = 0; col < r.n_assign && checked < n_check; col++, checked++) {
         const int pair = r.ids_dst[col], e = r.selected[pair], t = r.ids_tok[col];
-        dequant_expert(gate[e], K, M, k2, wg);
-        dequant_expert(up[e], K, M, k2, wu);
+        dequant_expert(ex[e], K, M, k2, w);
         std::vector<double> z;
         double s;
-        ref_gemv(wg, K, M, a.x.data() + (size_t)t * K, gate[e].suh(), true, z);
-        worst = fmax(worst, max_rel(zg, z, (size_t)pair * M, M, &s));
+        ref_gemv(w, K, M, a.x.data() + (size_t)t * K, ex[e].suh(), true, z);
+        worst = fmax(worst, max_rel(z_dev, z, (size_t)pair * M, M, &s));
         scale = fmax(scale, s);
-        ref_gemv(wu, K, M, a.x.data() + (size_t)t * K, up[e].suh(), true, z);
-        worst = fmax(worst, max_rel(zu, z, (size_t)pair * M, M, &s));
     }
     CHECK(worst < 2e-5, "Qwen %s K=%g: max rel %.3e vs the host authority (limit 2e-5)", what, k2 / 2.0, worst);
     printf("  Qwen %s K=%g: %d of %d assignments x %d outputs, max rel %.2e (|z| up to %.3g)\n",
@@ -69,17 +67,17 @@ static acts restage_mid(const routing &r, const std::vector<uint8_t> &mq, const 
 }
 
 static int qwen_section(void) {
-    const int K = 2560, MID = 640, E = 16, n_tok = 3, n_slot = 10;
-    printf("exl3-gemv-gate (L251 Qwen): %d -> %d -> %d, top-%d of %d experts, K = 4 and 5\n", K, MID, K, n_slot, E);
+    const int K = 2560, MID = 640, GU = 2 * MID, E = 16, n_tok = 3, n_slot = 10;
+    printf("exl3-gemv-gate (L251 Qwen): fused gate_up %d -> %d, down %d -> %d, top-%d of %d experts, K = 4 and 5\n",
+           K, GU, MID, K, n_slot, E);
     const routing r = make_routing(n_tok, n_slot, E);
     const acts a = make_acts(r, K);
     int32_t *d_ids = to_dev(r.ids_dst), *d_bounds = to_dev(r.bounds), *d_sel = to_dev(r.selected);
     float *d_w = to_dev(r.weights);
     const block_mx_act_mmq *d_act = (const block_mx_act_mmq *)to_dev(a.raw);
-    float *d_zg = nullptr, *d_zu = nullptr, *d_zd = nullptr, *d_out = nullptr;
+    float *d_zgu = nullptr, *d_zd = nullptr, *d_out = nullptr;
     uint32_t *d_nf = nullptr;
-    CUDA_OK(cudaMalloc((void **)&d_zg, (size_t)r.n_assign * MID * sizeof(float)));
-    CUDA_OK(cudaMalloc((void **)&d_zu, (size_t)r.n_assign * MID * sizeof(float)));
+    CUDA_OK(cudaMalloc((void **)&d_zgu, (size_t)r.n_assign * GU * sizeof(float)));
     CUDA_OK(cudaMalloc((void **)&d_zd, (size_t)r.n_assign * K * sizeof(float)));
     CUDA_OK(cudaMalloc((void **)&d_out, (size_t)n_tok * K * sizeof(float)));
     CUDA_OK(cudaMalloc((void **)&d_nf, sizeof(uint32_t)));
@@ -90,28 +88,23 @@ static int qwen_section(void) {
     CUDA_OK(cudaMalloc((void **)&d_msf, sf_bytes));
 
     for (int k2 : {8, 10}) {
-        std::vector<expert_blob> gate, up, down;
-        for (int e = 0; e < E; e++) {
-            gate.push_back(make_expert(K, MID, k2));
-            up.push_back(make_expert(K, MID, k2));
-            down.push_back(make_expert(MID, K, k2));
-        }
-        dev_stack sg, su, sd;
-        if (upload_stack(gate, sg) || upload_stack(up, su) || upload_stack(down, sd)) return 1;
+        std::vector<expert_blob> gu, down;
+        for (int e = 0; e < E; e++) { gu.push_back(make_expert(K, GU, k2)); down.push_back(make_expert(MID, K, k2)); }
+        dev_stack sgu, sd;
+        if (upload_stack(gu, sgu) || upload_stack(down, sd)) return 1;
 
-        /* gate/up */
-        int rc = ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, k2, d_act, d_ids, d_bounds, d_zg, d_zu,
-                                               MID, K, r.n_assign, E, 0);
-        CHECK(rc == 0, "Qwen pair launch k2=%d rc=%d", k2, rc);
-        const std::vector<float> zg = from_dev(d_zg, (size_t)r.n_assign * MID);
-        const std::vector<float> zu = from_dev(d_zu, (size_t)r.n_assign * MID);
-        grade_pair("gate/up GEMV", r, a, K, MID, k2, gate, up, zg, zu, r.n_assign);
+        /* fused gate_up */
+        int rc = ds4_exl3_moe_gemv_fused_launch(sgu.table, k2, d_act, d_ids, d_bounds, d_zgu, GU, K, r.n_assign, E, 0);
+        CHECK(rc == 0, "Qwen fused launch k2=%d rc=%d", k2, rc);
+        const std::vector<float> zgu = from_dev(d_zgu, (size_t)r.n_assign * GU);
+        grade_fused("fused gate_up GEMV", r, a, K, GU, k2, gu, zgu, r.n_assign);
 
-        /* the fold: no clamp (Qwen's SwiGLU is plain silu(g) * u), the router
-         * weight folded in, the down input rotation, the E4M3 emit */
+        /* the fused fold: gate = z[0, 640), up = z[640, 1280), svh from the one plane;
+         * no clamp (Qwen's SwiGLU is plain silu(g) * u), the router weight folded in,
+         * the down input rotation, the E4M3 emit */
         CUDA_OK(cudaMemset(d_msf, 0, sf_bytes));
-        rc = ds4_exl3_moe_fold_launch(d_zg, d_zu, d_sel, d_w, sg.table, su.table, sd.table, K, MID, r.n_assign,
-                                      0.0f, d_mq, d_msf, kbp, 0);
+        rc = ds4_exl3_moe_fold_fused_launch(d_zgu, d_sel, d_w, sgu.table, sd.table, K, MID, r.n_assign,
+                                            0.0f, d_mq, d_msf, kbp, 0);
         CHECK(rc == 0, "Qwen fold rc=%d", rc);
         CUDA_OK(cudaDeviceSynchronize());
         std::vector<uint8_t> mq((size_t)r.n_assign * MID), msf(sf_bytes);
@@ -121,12 +114,12 @@ static int qwen_section(void) {
         for (int pair = 0; pair < r.n_assign; pair++) {
             const int e = r.selected[pair];
             std::vector<double> g(MID), u(MID), t(MID);
-            for (int n = 0; n < MID; n++) { g[n] = zg[(size_t)pair * MID + n]; u[n] = zu[(size_t)pair * MID + n]; }
+            for (int n = 0; n < MID; n++) { g[n] = zgu[(size_t)pair * GU + n]; u[n] = zgu[(size_t)pair * GU + MID + n]; }
             had_blocks(g);
             had_blocks(u);
             for (int n = 0; n < MID; n++) {
-                const float yg = (float)(g[n] * exl3_f16_to_f32(gate[e].svh(K)[n]));
-                const float yu = (float)(u[n] * exl3_f16_to_f32(up[e].svh(K)[n]));
+                const float yg = (float)(g[n] * exl3_f16_to_f32(gu[e].svh(K)[n]));
+                const float yu = (float)(u[n] * exl3_f16_to_f32(gu[e].svh(K)[MID + n]));
                 t[n] = (double)swiglu_host(yg, yu, r.weights[pair], 0.0f) * exl3_f16_to_f32(down[e].suh()[n]);
             }
             had_blocks(t);
@@ -140,8 +133,8 @@ static int qwen_section(void) {
                 }
             }
         }
-        CHECK(n_bad == 0, "Qwen fold K=%g: %zu mid values outside one E4M3 ulp", k2 / 2.0, n_bad);
-        printf("  Qwen fold K=%g: %d pairs x %d, %zu outside one E4M3 ulp of the host chain\n",
+        CHECK(n_bad == 0, "Qwen fused fold K=%g: %zu mid values outside one E4M3 ulp", k2 / 2.0, n_bad);
+        printf("  Qwen fused fold K=%g: %d pairs x %d, %zu outside one E4M3 ulp of the host chain\n",
                k2 / 2.0, r.n_assign, MID, n_bad);
 
         /* down 640 -> 2560: the K % 256 == 128 tail, on the fold's own mid */
@@ -186,36 +179,42 @@ static int qwen_section(void) {
         printf("  Qwen sum K=%g: %d tokens x %d over %d slots, max rel %.2e\n", k2 / 2.0, n_tok, K, n_slot, sworst);
 
         /* the row block on the tail: a prefill-like routing (40 tokens x 10 of 16
-         * experts = 400 assignments, ~25 rows per expert) through a 640-in pair
-         * (in = the down's K, so every row ends in the one-block pass): R = 1, 4
-         * and 16 bit-identical, 24 assignments graded against the host. */
+         * experts = 400 assignments, ~25 rows per expert) through a 640-in fused
+         * slice (in = the down's K, so every row ends in the one-block pass): R = 1,
+         * 4 and 16 bit-identical, 24 assignments graded against the host; the fused
+         * launch at 2560-in with R = 4 as well. */
         {
             const routing rp = make_routing(40, 10, E);
             const acts ap = make_acts(rp, MID);
-            std::vector<expert_blob> tg, tu;
-            for (int e = 0; e < E; e++) { tg.push_back(make_expert(MID, MID, k2)); tu.push_back(make_expert(MID, MID, k2)); }
-            dev_stack stg, stu;
-            if (upload_stack(tg, stg) || upload_stack(tu, stu)) return 1;
+            std::vector<expert_blob> tg;
+            for (int e = 0; e < E; e++) tg.push_back(make_expert(MID, GU, k2));
+            dev_stack stg;
+            if (upload_stack(tg, stg)) return 1;
             const block_mx_act_mmq *d_ap = (const block_mx_act_mmq *)to_dev(ap.raw);
             int32_t *d_pids = to_dev(rp.ids_dst), *d_pb = to_dev(rp.bounds);
-            float *d_pz = nullptr, *d_pu = nullptr;
-            CUDA_OK(cudaMalloc((void **)&d_pz, (size_t)rp.n_assign * MID * sizeof(float)));
-            CUDA_OK(cudaMalloc((void **)&d_pu, (size_t)rp.n_assign * MID * sizeof(float)));
-            std::vector<float> ref_z, ref_u;
+            float *d_pz = nullptr;
+            CUDA_OK(cudaMalloc((void **)&d_pz, (size_t)rp.n_assign * GU * sizeof(float)));
+            std::vector<float> ref_z;
             size_t diff = 0;
             for (int Rb : {1, 4, 16}) {
-                rc = ds4_exl3_moe_gemv_pair_launch_rows(stg.table, stu.table, k2, d_ap, d_pids, d_pb, d_pz, d_pu,
-                                                        MID, MID, rp.n_assign, E, Rb, 0);
+                rc = ds4_exl3_moe_gemv_fused_launch_rows(stg.table, k2, d_ap, d_pids, d_pb, d_pz, GU, MID, rp.n_assign, E, Rb, 0);
                 CHECK(rc == 0, "Qwen tail rows R=%d rc=%d", Rb, rc);
-                const std::vector<float> z = from_dev(d_pz, (size_t)rp.n_assign * MID);
-                const std::vector<float> u = from_dev(d_pu, (size_t)rp.n_assign * MID);
-                if (Rb == 1) { ref_z = z; ref_u = u; continue; }
-                for (size_t i = 0; i < z.size(); i++) diff += (z[i] != ref_z[i]) || (u[i] != ref_u[i]);
+                const std::vector<float> z = from_dev(d_pz, (size_t)rp.n_assign * GU);
+                if (Rb == 1) { ref_z = z; continue; }
+                for (size_t i = 0; i < z.size(); i++) diff += z[i] != ref_z[i];
             }
             CHECK(diff == 0, "Qwen tail: R=4/16 differ from R=1 in %zu outputs", diff);
-            grade_pair("640-in pair on the tail (R=1)", rp, ap, MID, MID, k2, tg, tu, ref_z, ref_u, 24);
+            grade_fused("640-in fused slice on the tail (R=1)", rp, ap, MID, GU, k2, tg, ref_z, 24);
             printf("  Qwen tail row block R=1/4/16 on %d assignments: %s\n", rp.n_assign, diff ? "DIFFER" : "bit-identical");
-            /* the single (down) launch at 400 assignments takes R = 4: graded too */
+            /* the 2560-in fused launch at 400 assignments takes R = 4 */
+            const acts ak = make_acts(rp, K);
+            const block_mx_act_mmq *d_ak = (const block_mx_act_mmq *)to_dev(ak.raw);
+            float *d_kz = nullptr;
+            CUDA_OK(cudaMalloc((void **)&d_kz, (size_t)rp.n_assign * GU * sizeof(float)));
+            rc = ds4_exl3_moe_gemv_fused_launch(sgu.table, k2, d_ak, d_pids, d_pb, d_kz, GU, K, rp.n_assign, E, 0);
+            CHECK(rc == 0, "Qwen fused at 400 assignments rc=%d", rc);
+            grade_fused("fused gate_up at 400 assignments (R=4 rows)", rp, ak, K, GU, k2, gu, from_dev(d_kz, (size_t)rp.n_assign * GU), 24);
+            /* the down at 400 assignments takes R = 4 on the tail */
             const acts apd = make_acts(rp, MID);
             const block_mx_act_mmq *d_apd = (const block_mx_act_mmq *)to_dev(apd.raw);
             float *d_pd = nullptr;
@@ -234,13 +233,13 @@ static int qwen_section(void) {
             }
             CHECK(w4 < 2e-5, "Qwen down at 400 assignments (R=4): max rel %.3e", w4);
             printf("  Qwen down GEMV K=%g at %d assignments (R=4 rows, tail): max rel %.2e on 24\n", k2 / 2.0, rp.n_assign, w4);
-            cudaFree((void *)d_ap); cudaFree((void *)d_apd); cudaFree(d_pids); cudaFree(d_pb);
-            cudaFree(d_pz); cudaFree(d_pu); cudaFree(d_pd);
-            cudaFree(stg.arena); cudaFree((void *)stg.table); cudaFree(stu.arena); cudaFree((void *)stu.table);
+            cudaFree((void *)d_ap); cudaFree((void *)d_ak); cudaFree((void *)d_apd); cudaFree(d_pids); cudaFree(d_pb);
+            cudaFree(d_pz); cudaFree(d_kz); cudaFree(d_pd);
+            cudaFree(stg.arena); cudaFree((void *)stg.table);
         }
 
         if (k2 == 10) {
-            /* mutation: one flipped trellis bit of a down expert must move z_d */
+            /* mutation: one flipped trellis bit of expert 0's down must move z_d */
             const bool expert0_used = r.bounds[1] > r.bounds[0];
             CHECK(expert0_used, "Qwen mutation fixture: expert 0 unrouted, the mutation would prove nothing");
             uint8_t byte = 0;
@@ -253,19 +252,23 @@ static int qwen_section(void) {
             for (size_t i = 0; i < zd.size(); i++) moved += zd[i] != zd2[i];
             CHECK(moved > 0, "Qwen mutation: a flipped bit in expert 0's down did not move z_d");
             printf("  Qwen mutation: one flipped down bit moved %zu outputs\n", moved);
-            /* refusals: a K that is not a 128 multiple, a rate with no instance */
+            /* refusals: a K that is not a 128 multiple; a rate a kind does not instantiate */
             CHECK(ds4_exl3_moe_gemv_single_launch(sd.table, k2, d_am, d_ids, d_bounds, d_zd, K, 704, r.n_assign, E, 0) != 0,
                   "K=704 was accepted");
             CHECK(ds4_exl3_moe_gemv_single_launch(sd.table, 7, d_am, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E, 0) != 0,
                   "k2=7 was accepted");
-            CHECK(!ds4_exl3_gemv_rate_supported(7) && !ds4_exl3_gemv_rate_supported(12) &&
-                  ds4_exl3_gemv_rate_supported(8) && ds4_exl3_gemv_rate_supported(10), "rate predicate");
+            CHECK(ds4_exl3_moe_gemv_fused_launch(sgu.table, 6, d_act, d_ids, d_bounds, d_zgu, GU, K, r.n_assign, E, 0) != 0,
+                  "fused at K=3 was accepted (no container carries it)");
+            CHECK(ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, 8) && ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, 10) &&
+                  !ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, 8) && !ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, 6) &&
+                  ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, 6) && !ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, 7),
+                  "the per-kind rate table");
+            printf("  refusals: K=704, k2=7, fused at K=3 -- refused; the per-kind rate table holds\n");
         }
         cudaFree((void *)d_am);
-        cudaFree(sg.arena); cudaFree((void *)sg.table); cudaFree(su.arena); cudaFree((void *)su.table);
-        cudaFree(sd.arena); cudaFree((void *)sd.table);
+        cudaFree(sgu.arena); cudaFree((void *)sgu.table); cudaFree(sd.arena); cudaFree((void *)sd.table);
     }
     cudaFree(d_ids); cudaFree(d_bounds); cudaFree(d_sel); cudaFree(d_w); cudaFree((void *)d_act);
-    cudaFree(d_zg); cudaFree(d_zu); cudaFree(d_zd); cudaFree(d_out); cudaFree(d_nf); cudaFree(d_mq); cudaFree(d_msf);
+    cudaFree(d_zgu); cudaFree(d_zd); cudaFree(d_out); cudaFree(d_nf); cudaFree(d_mq); cudaFree(d_msf);
     return 0;
 }

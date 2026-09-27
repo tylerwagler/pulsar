@@ -277,7 +277,10 @@ int ds4_mmq_moe_impl(
         /* L245: 0 = the IQ2 D2R arm over x_soa; a rate in half-bit units
          * (4/5/6) = the EXL3 trellis GEMV over the [trellis, scales] table W
          * (the same sorted pairs and E4M3 staging feed it). */
-        int             exl3_k2    = 0) {
+        int             exl3_k2    = 0,
+        /* L251: the EXL3 slice is a fused gate_up that rotates its own input
+         * (DS4_EXL3_GATE_UP_FUSED) rather than a down on a pre-rotated one. */
+        bool            exl3_fused = false) {
 
     if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -477,8 +480,10 @@ int ds4_mmq_moe_impl(
      * One path, one activation format, every batch size. */
     {
         const int rc = exl3_k2
-            ? ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                              out_f32, M, K, ne_get_rows, n_experts, stream)
+            ? (exl3_fused ? ds4_exl3_moe_gemv_fused_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
+                                                           out_f32, M, K, ne_get_rows, n_experts, stream)
+                          : ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
+                                                            out_f32, M, K, ne_get_rows, n_experts, stream))
             : ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
@@ -845,7 +850,7 @@ extern "C" int ds4_exl3_moe_pair(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_pair: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }
@@ -860,11 +865,26 @@ extern "C" int ds4_exl3_moe_single(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_DOWN, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_single: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }
     return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
                             M, K, n_tokens, n_experts, n_expert_used, stream,
                             NULL, 0, act_q, act_sf, act_kbp, k2);
+}
+
+extern "C" int ds4_exl3_moe_fused(
+        const void * table, int k2, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream,
+        const void * act_q, const void * act_sf, int act_kbp) {
+    if (!ds4_exl3_gemv_rate_supported(DS4_EXL3_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
+        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_fused: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_impl("ds4_exl3_moe_fused", table, ids, out,
+                            M, K, n_tokens, n_experts, n_expert_used, stream,
+                            NULL, 0, act_q, act_sf, act_kbp, k2, true);
 }

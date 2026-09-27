@@ -421,12 +421,12 @@ static void section_ple(void) {
 
 /* ======================================================================== */
 static void section_moe(void) {
-    printf("D. MoE block (512 experts over an aliased pool of 12; gate/up K=4, down K=5; shared K=5/5/4)\n");
+    printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
     const int P = 12, T = 5;
-    std::vector<linear> pg, pu, pd;
-    for (int i = 0; i < P; i++) { pg.push_back(make_linear(H, MID, 8)); pu.push_back(make_linear(H, MID, 8)); pd.push_back(make_linear(MID, H, 10)); }
+    std::vector<linear> pgu, pd;
+    for (int i = 0; i < P; i++) { pgu.push_back(make_linear(H, 2 * MID, 8)); pd.push_back(make_linear(MID, H, 10)); }
     std::vector<expert> ex(E);
-    for (int e = 0; e < E; e++) ex[e] = {&pg[e % P], &pu[e % P], &pd[e % P]};
+    for (int e = 0; e < E; e++) ex[e] = {&pgu[e % P], &pd[e % P]};
     const linear sg = make_linear(H, MID, 10), su = make_linear(H, MID, 10), sd = make_linear(MID, H, 8);
     auto table = [&](std::vector<linear> &pool) {
         std::vector<const void *> t(2 * E);
@@ -441,7 +441,7 @@ static void section_moe(void) {
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
-    w.gate_table = table(pg); w.up_table = table(pu); w.down_table = table(pd);
+    w.gate_up_table = table(pgu); w.down_table = table(pd);
     w.k2_gate_up = 8; w.k2_down = 10;
     w.shared_gate = dev_linear(sg); w.shared_up = dev_linear(su); w.shared_down = dev_linear(sd);
     const auto x = rnd_act(T, H, 0.7);

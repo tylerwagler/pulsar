@@ -5,12 +5,14 @@
  *
  *   router     logits = W_r x in f32 (bf16 x bf16, fixed order), rounded to
  *              bf16; softmax; top-10 by probability; renormalised; bf16
- *   routed     the L245 EXL3 arm (ds4_exl3_moe_pair / fold / single / sum):
- *              gate/up GEMV with the in-kernel input rotation, the fold (no
- *              clamp; the router weight folded into the mid before its E4M3
- *              encode, as on DeepSeek), the down on the fold's pre-rotated
- *              mid (640 = 5 x 128, the arm's K % 128 tail), the slot-ordered
- *              sum with the output rotation
+ *   routed     the L245 EXL3 arm with Qwen's FUSED gate_up (one [2560 -> 1280]
+ *              slice per expert, gate rows then up rows, one suh -- the layout
+ *              the graded quant produced and the container carries):
+ *              ds4_exl3_moe_fused (one GEMV, the input rotated in-kernel), the
+ *              fused fold (no clamp; the router weight folded into the mid
+ *              before its E4M3 encode, as on DeepSeek), the down on the fold's
+ *              pre-rotated mid (640 = 5 x 128, the arm's K % 128 tail), the
+ *              slot-ordered sum with the output rotation
  *   shared     the EXL3 dense arm on the same E4M3 slot (gate, up), SwiGLU
  *              encoded by its producer, the dense down
  *   out        routed + sigmoid(w_sg . x) * shared -- in that order
@@ -195,7 +197,7 @@ struct ws_bump {
 };
 
 struct moe_ws {
-    float *logits, *wts, *sgate, *gate_z, *up_z, *down_z, *yg, *yu, *ys;
+    float *logits, *wts, *sgate, *gu_z, *down_z, *yg, *yu, *ys;
     int32_t *sel;
     uint8_t *mid_q, *mid_sf, *h_q, *h_sf;
     void *lin;
@@ -212,8 +214,7 @@ static size_t moe_ws_layout(const pulsar_qwen_moe_weights *w, int T, void *base,
     m.sel    = (int32_t *)b.take(pairs * 4);
     m.wts    = (float *)b.take(pairs * 4);
     m.sgate  = (float *)b.take((size_t)T * 4);
-    m.gate_z = (float *)b.take(pairs * mid * 4);
-    m.up_z   = (float *)b.take(pairs * mid * 4);
+    m.gu_z   = (float *)b.take(pairs * 2 * mid * 4);
     m.mid_q  = (uint8_t *)b.take(pairs * mid);
     m.mid_sf = (uint8_t *)b.take(pulsar_mx_sf_slab_bytes((int)pairs, pulsar_mx_kbp(mid)));
     m.down_z = (float *)b.take(pairs * kH * 4);
@@ -288,7 +289,7 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const ui
                                       int T, float *out, void *ws, size_t ws_bytes,
                                       uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
     if (!w || !x_bf16 || !x || !x->q || !x->sf || !out || !nf_flag || T <= 0 ||
-        !w->gate_table || !w->up_table || !w->down_table || x->kbp != pulsar_mx_kbp(kH)) {
+        !w->gate_up_table || !w->down_table || x->kbp != pulsar_mx_kbp(kH)) {
         fprintf(stderr, "pulsar: qwen MoE: a null input or a slot that is not %d wide -- refusing\n", kH);
         return -1;
     }
@@ -325,7 +326,7 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const ui
     if (!announced) {
         announced = 1;
         fprintf(stderr, "pulsar: L251 qwen MoE = bf16 router softmax top-%d of %d + EXL3 routed trellis GEMV "
-                        "(gate/up K=%g, down K=%g) + EXL3 dense shared expert (K=%g/%g/%g), sigmoid-gated\n",
+                        "(fused gate_up K=%g, down K=%g) + EXL3 dense shared expert (K=%g/%g/%g), sigmoid-gated\n",
                 kTopK, kE, w->k2_gate_up / 2.0, w->k2_down / 2.0, w->shared_gate.k2 / 2.0,
                 w->shared_up.k2 / 2.0, w->shared_down.k2 / 2.0);
     }
@@ -338,11 +339,11 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_weights *w, const ui
     /* routed: the L245 arm's four launches */
     const int mid_kbp = pulsar_mx_kbp(mid);
     cudaMemsetAsync(m.mid_sf, 0, pulsar_mx_sf_slab_bytes((int)pairs, mid_kbp), stream);
-    rc = ds4_exl3_moe_pair(w->gate_table, w->up_table, w->k2_gate_up, m.sel, m.gate_z, m.up_z,
-                           mid, kH, T, kE, kTopK, stream, x->q, x->sf, x->kbp);
-    if (rc) { fprintf(stderr, "pulsar: qwen MoE gate/up declined (rc=%d) -- no fallback\n", rc); return -1; }
-    rc = ds4_exl3_moe_fold_launch(m.gate_z, m.up_z, m.sel, m.wts, w->gate_table, w->up_table, w->down_table,
-                                  kH, mid, pairs, 0.0f, m.mid_q, m.mid_sf, mid_kbp, stream);
+    rc = ds4_exl3_moe_fused(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK, stream,
+                            x->q, x->sf, x->kbp);
+    if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
+    rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
+                                        kH, mid, pairs, 0.0f, m.mid_q, m.mid_sf, mid_kbp, stream);
     if (rc) return -1;
     rc = ds4_exl3_moe_single(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
                              stream, m.mid_q, m.mid_sf, mid_kbp);

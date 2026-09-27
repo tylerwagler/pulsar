@@ -139,23 +139,21 @@ int main(int argc, char **argv) {
     size_t sg_stride = 0, sd_stride = 0, eg_stride = 0, ed_stride = 0;
     uint8_t *shg = exl3_slices(H, MID, 10, RR, &sg_stride), *shu = exl3_slices(H, MID, 10, RR, &sg_stride);
     uint8_t *shd = exl3_slices(MID, H, 10, RR, &sd_stride);
-    uint8_t *eg = exl3_slices(H, MID, 8, E, &eg_stride), *eu = exl3_slices(H, MID, 8, E, &eg_stride);
+    uint8_t *eg = exl3_slices(H, 2 * MID, 8, E, &eg_stride);
     uint8_t *ed = exl3_slices(MID, H, 8, E, &ed_stride);
     uint64_t tg = 0, td = 0, sc = 0, st = 0;
-    exl3_expert_layout(H, MID, 8, &tg, &sc, &st);
+    exl3_expert_layout(H, 2 * MID, 8, &tg, &sc, &st);
     exl3_expert_layout(MID, H, 8, &td, &sc, &st);
-    std::vector<const void *> tgv(2 * E), tuv(2 * E), tdv(2 * E);
+    std::vector<const void *> tgv(2 * E), tdv(2 * E);
     for (int e = 0; e < E; e++) {
         tgv[2 * e] = eg + e * eg_stride; tgv[2 * e + 1] = eg + e * eg_stride + tg;
-        tuv[2 * e] = eu + e * eg_stride; tuv[2 * e + 1] = eu + e * eg_stride + tg;
         tdv[2 * e] = ed + e * ed_stride; tdv[2 * e + 1] = ed + e * ed_stride + td;
     }
-    const void *const *dtg = (const void *const *)up(tgv), *const *dtu = (const void *const *)up(tuv),
-                      *const *dtd = (const void *const *)up(tdv);
+    const void *const *dtg = (const void *const *)up(tgv), *const *dtd = (const void *const *)up(tdv);
     std::vector<pulsar_qwen_moe_weights> mw(RR);
     for (int i = 0; i < RR; i++) {
         mw[i].router_w = wr[i]; mw[i].shared_gate_w = wsg[i];
-        mw[i].gate_table = dtg; mw[i].up_table = dtu; mw[i].down_table = dtd;
+        mw[i].gate_up_table = dtg; mw[i].down_table = dtd;
         mw[i].k2_gate_up = 8; mw[i].k2_down = 8;
         mw[i].shared_gate = {shg + i * sg_stride, 10, H, MID};
         mw[i].shared_up = {shu + i * sg_stride, 10, H, MID};
@@ -169,8 +167,8 @@ int main(int argc, char **argv) {
     uint32_t *nf = (uint32_t *)dz(4);
     const double router_bytes = (double)(E + 1) * H * 2;
     const double shared_bytes = 2.0 * sg_stride + sd_stride;
-    printf("\nrouter (bf16 %d x %d = %.2f MB) | MoE block (experts K=4 %.2f MB each x3, shared K=5 %.2f MB, router)\n",
-           E, H, router_bytes / 1e6, eg_stride / 1e6, shared_bytes / 1e6);
+    printf("\nrouter (bf16 %d x %d = %.2f MB) | MoE block (experts K=4: gate_up %.2f MB + down %.2f MB, shared K=5 %.2f MB, router)\n",
+           E, H, router_bytes / 1e6, eg_stride / 1e6, ed_stride / 1e6, shared_bytes / 1e6);
     printf("%5s | %-18s | %-18s | %-12s | %-22s | %s\n", "T", "router", "shared (3 dense)", "experts hit", "MoE block", "routed alone (block - router - shared)");
     for (int T : widths) {
         const double t_router = time_calls(iters, [&](int i) {
@@ -198,8 +196,8 @@ int main(int argc, char **argv) {
         const double t_moe = time_calls(iters, [&](int i) {
             pulsar_qwen_moe_launch(&mw[i % RR], xdev[i % NX], &xslot[i % NX], T, out, mwsp, mws, nf, 1u, 0);
         });
-        const double moe_bytes = router_bytes + shared_bytes + hit * (2.0 * eg_stride + ed_stride);
-        const double routed_bytes = hit * (2.0 * eg_stride + ed_stride);
+        const double moe_bytes = router_bytes + shared_bytes + hit * ((double)eg_stride + ed_stride);
+        const double routed_bytes = hit * ((double)eg_stride + ed_stride);
         const double t_routed = t_moe - t_router - t_shared;
         printf("%5d | %7.1f (%5.0f)    | %7.1f (%5.0f)    | %6.1f       | %8.1f (%5.0f GB/s)  | %7.1f us (%5.0f GB/s over %.1f MB)\n",
                T, t_router, router_bytes / t_router / 1e3, t_shared, shared_bytes / t_shared / 1e3, hit, t_moe,

@@ -205,13 +205,22 @@ static uint64_t fnv64(const std::vector<float> &v) {
     for (size_t i = 0; i < v.size() * sizeof(float); i++) { h ^= b[i]; h *= 1099511628211ull; }
     return h;
 }
+static uint64_t fnv64b(const std::vector<uint8_t> &v) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
+    return h;
+}
 static float swiglu_host(float g, float u, float wv, float clamp) {
     if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
     const float s = g / (1.0f + expf(-g));
     return s * u * wv;
 }
 
+/* EXL3_GATE_V41_ONLY builds the V4.1 sections alone -- against an older kernel
+ * TU, to diff the byte hashes they print across a kernel change. */
+#ifndef EXL3_GATE_V41_ONLY
 #include "exl3_gemv_gate_qwen.inc"
+#endif
 
 int main(void) {
     const int K = 5120, M = 2304;      /* the V4.1 expert: in 5120, mid 2304 */
@@ -319,7 +328,8 @@ int main(void) {
                 }
             }
             CHECK(n_bad == 0, "fold: %zu of %zu mid values outside one E4M3 ulp of the host chain", n_bad, (size_t)r.n_assign * M);
-            printf("  fold: %d pairs x %d, worst |err|/amax %.2e, %zu outside tolerance\n", r.n_assign, M, fold_worst, n_bad);
+            printf("  fold: %d pairs x %d, worst |err|/amax %.2e, %zu outside tolerance; bytes fnv %016llx\n",
+                   r.n_assign, M, fold_worst, n_bad, (unsigned long long)(fnv64b(mq) ^ (fnv64b(msf) * 3u)));
 
             /* 4. the sum on random z_d [pair][K] (out_dim = K here) */
             std::vector<float> zd((size_t)r.n_assign * K);
@@ -559,7 +569,9 @@ int main(void) {
         }
         cudaFree(sg.arena); cudaFree((void *)sg.table); cudaFree(su.arena); cudaFree((void *)su.table);
     }
+#ifndef EXL3_GATE_V41_ONLY
     if (qwen_section()) g_fail = 1;
+#endif
     printf(g_fail ? "EXL3-GEMV GATE FAIL\n" : "EXL3-GEMV GATE PASS\n");
     return g_fail;
 }

@@ -115,8 +115,8 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
 typedef struct {
     const uint16_t *router_w;        /**< bf16 [512][2560] */
     const uint16_t *shared_gate_w;   /**< bf16 [2560] */
-    const void *const *gate_table;   /**< exl3_expert_table pairs [512][2]: gate_proj 2560 -> 640 */
-    const void *const *up_table;     /**< up_proj 2560 -> 640 */
+    const void *const *gate_up_table;/**< exl3_expert_table pairs [512][2]: the FUSED gate_up 2560 -> 1280
+                                          (output rows 0..639 gate, 640..1279 up -- the container's layout) */
     const void *const *down_table;   /**< down_proj 640 -> 2560 */
     int k2_gate_up, k2_down;         /**< routed rates (half-bit units) */
     pulsar_qwen_linear shared_gate, shared_up, shared_down;

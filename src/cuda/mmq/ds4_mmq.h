@@ -158,6 +158,25 @@ int ds4_exl3_moe_single(
     const void    * act_sf,
     int             act_kbp);
 
+/* L251: the fused gate_up twin (DS4_EXL3_GATE_UP_FUSED): one [trellis, scales]
+ * table whose slice is [K -> M = 2 mid], gate rows then up rows; the input is
+ * rotated in-kernel by the slice's suh.  out = the unrotated z per pair; the
+ * fused fold (ds4_exl3_moe_fold_fused_launch) takes it from there. */
+int ds4_exl3_moe_fused(
+    const void    * table,
+    int             k2,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
+
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
     const int32_t * ids,

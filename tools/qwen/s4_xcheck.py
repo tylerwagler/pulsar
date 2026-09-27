@@ -264,21 +264,20 @@ def cmd_moe(a, tool):
         ridx = (topk == e).any(-1).nonzero().flatten()
         ridx = ridx[torch.randperm(len(ridx), generator=torch.Generator().manual_seed(e))[:fit_cap]]
         Xe = X[ridx].to(DEV).float()
-        wg, wu, wd = gu[e, :640].to(DEV), gu[e, 640:].to(DEV), dn[e].to(DEV)
-        mid = (F.silu(Xe @ wg.float().T) * (Xe @ wu.float().T))
-        lg_, pg_ = quantize(wg, Xe, a.k_expert, 1000 + e)
-        lu_, pu_ = quantize(wu, Xe, a.k_expert, 2000 + e)
+        wgu, wd = gu[e].to(DEV), dn[e].to(DEV)                     # gate_up FUSED [1280, 2560], as the container
+        mid = F.silu(Xe @ wgu[:640].float().T) * (Xe @ wgu[640:].float().T)
+        lgu_, pgu_ = quantize(wgu, Xe, a.k_expert, 1000 + e)
         ld_, pd_ = quantize(wd, mid, a.k_expert, 3000 + e)
-        q[e] = (lg_, lu_, ld_)
+        q[e] = (lgu_, ld_)
         if i % 10 == 0:
-            log(f"  expert {e}: {len(ridx)} fit rows, proxy err {pg_:.4f}/{pu_:.4f}/{pd_:.4f} ({time.time() - t0:.0f}s)")
+            log(f"  expert {e}: {len(ridx)} fit rows, proxy err gate_up {pgu_:.4f} down {pd_:.4f} ({time.time() - t0:.0f}s)")
     Xs = X[torch.randperm(N, generator=torch.Generator().manual_seed(7))[:8192]].to(DEV).float()
     sg_w, su_w, sd_w = (W.get(p + f"shared_expert.{n}.weight") for n in ("gate_proj", "up_proj", "down_proj"))
     smid = F.silu(Xs @ sg_w.float().T) * (Xs @ su_w.float().T)
     qsg, _ = quantize(sg_w, Xs, a.k_shared, 11)
     qsu, _ = quantize(su_w, Xs, a.k_shared, 12)
     qsd, _ = quantize(sd_w, smid, a.k_shared, 13)
-    log(f"moe: quantized {3 * len(experts) + 3} matrices in {time.time() - t0:.0f}s")
+    log(f"moe: quantized {2 * len(experts) + 3} matrices in {time.time() - t0:.0f}s")
 
     d = os.path.join(a.out, f"moe-K{a.k_expert}")
     os.makedirs(d, exist_ok=True)
@@ -288,7 +287,7 @@ def cmd_moe(a, tool):
     tofile(W.get(p + "shared_expert_gate.weight", "cpu").reshape(-1), f"{d}/wsg.bin")
     with open(f"{d}/experts.idx", "wb") as f:
         f.write(struct.pack(f"<I{len(experts)}I", len(experts), *experts))
-    for j, name in enumerate(("gate", "up", "down")):
+    for j, name in enumerate(("gate_up", "down")):
         with open(f"{d}/exp_{name}.bin", "wb") as f:
             for e in experts:
                 f.write(q[e][j].slice_bytes())
@@ -312,13 +311,15 @@ def cmd_moe(a, tool):
     src_v = src_v / src_v.sum(-1, keepdim=True)
     for r in range(a.rows):
         for k in range(10):
-            lg_, lu_, ld_ = q[int(sel[r, k])]
-            v = F.silu(lg_(x8[r:r + 1])) * lu_(x8[r:r + 1]) * float(wts[r, k])
+            lgu_, ld_ = q[int(sel[r, k])]
+            z = lgu_(x8[r:r + 1])
+            v = F.silu(z[:, :640]) * z[:, 640:] * float(wts[r, k])
             t = e4m3_dec(had(ld_.suh * v))
             emu[r] += (ld_.svh * had(t @ ld_.wtr))[0]
         for k in range(10):                                         # recon: the source's semantics, no A8
-            lg_, lu_, ld_ = q[int(src_i[r, k])]
-            rec[r] += (ld_(F.silu(lg_(x[r:r + 1])) * lu_(x[r:r + 1])) * float(src_v[r, k]))[0]
+            lgu_, ld_ = q[int(src_i[r, k])]
+            z = lgu_(x[r:r + 1])
+            rec[r] += (ld_(F.silu(z[:, :640]) * z[:, 640:]) * float(src_v[r, k]))[0]
     hs = qsd(e4m3_dec(F.silu(qsg(x8)) * qsu(x8)))
     emu += sgt.to(DEV)[:, None] * hs
     sgl = torch.sigmoid((x @ W.get(p + "shared_expert_gate.weight").double().T))

@@ -213,7 +213,8 @@ inline void ple_token(const uint16_t *emb, const linear &key, const linear &valu
 
 /* ---- MoE ------------------------------------------------------------------ */
 
-struct expert { const linear *gate, *up, *down; };
+/** one routed expert: the FUSED gate_up [2560 -> 1280] (gate rows then up rows) and the down */
+struct expert { const linear *gate_up, *down; };
 
 /** the block for one token given the routing (sel, w, sgate -- the device's);
  *  x = the decoded E4M3 block input */
@@ -221,11 +222,11 @@ inline void moe_token(const double *x, const int32_t *sel, const double *w, doub
                       const std::vector<expert> &experts, const linear &sg, const linear &su, const linear &sd,
                       double *out) {
     std::fill(out, out + H, 0.0);
-    std::vector<double> yg(MID), yu(MID), t(MID), td(MID), y(H);
+    std::vector<double> ygu(2 * MID), t(MID), td(MID), y(H);
     for (int k = 0; k < TOPK; k++) {
         const expert &ex = experts[sel[k]];
-        ex.gate->run(x, yg.data());
-        ex.up->run(x, yu.data());
+        ex.gate_up->run(x, ygu.data());
+        const double *yg = ygu.data(), *yu = ygu.data() + MID;
         /* the fold: v = silu(g) u w (the router weight folded in before the encode,
          * as the device does), then the down input's rotation t = H(v suh_d), E4M3;
          * the down GEMV takes t as it is (pre-rotated) and the sum applies H + svh */

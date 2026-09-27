@@ -48,6 +48,13 @@ constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k
                                ///< the last pass of a K % 256 == 128 row (Qwen's expert down, 640)
                                ///< is one block, 8 k-tiles = 1 per warp -- the same k order
 constexpr int kMaxR   = 16;    ///< the widest row block
+
+/* What an instance computes (DS4_EXL3_* in the header): DOWN = one projection
+ * of an input the fold already rotated; PAIR = gate and up from two slices,
+ * each rotating the input by its own suh (DeepSeek's split stacks); FUSED = one
+ * projection that rotates the input by its suh (Qwen's fused gate_up, whose
+ * output rows are gate | up). */
+constexpr int kDown = DS4_EXL3_DOWN, kPair = DS4_EXL3_PAIR, kFused = DS4_EXL3_GATE_UP_FUSED;
 /* ---------------------------------------------------------------------- */
 /* the GEMV                                                                */
 
@@ -56,7 +63,7 @@ constexpr int kMaxR   = 16;    ///< the widest row block
  * the chunked multi-row body pays 68.  Bit-identical to the multi-row form
  * (the gate proves R = 1 / 4 / 16 equal), kept because a decode step is one
  * assignment per CTA and the barriers are its whole difference. */
-template <bool PAIR, int K2>
+template <int MODE, int K2>
 __global__ void __launch_bounds__(kRows * kWarps)
 exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
@@ -66,6 +73,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
+    constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
     __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
@@ -113,6 +121,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
             if constexpr (PAIR) {
                 s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
                 s_x[1][k0 + j] = v * __half2float(su[k0 + j]);
+            } else if constexpr (ROT) {
+                s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
             } else {
                 s_x[0][k0 + j] = v;
             }
@@ -123,6 +133,15 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
         /* H128 per 128-block, per projection: one warp per (block, projection). */
         for (int t = warp; t < 2 * n_k128; t += kWarps) {
             float *v4 = s_x[t & 1] + (t >> 1) * 128 + lane * 4;
+            float v[4] = {v4[0], v4[1], v4[2], v4[3]};
+            exl3dev::had128(v);
+            v4[0] = v[0]; v4[1] = v[1]; v4[2] = v[2]; v4[3] = v[3];
+        }
+        __syncthreads();
+    } else if constexpr (ROT) {
+        /* H128 per 128-block of the one projection */
+        for (int t = warp; t < n_k128; t += kWarps) {
+            float *v4 = s_x[0] + t * 128 + lane * 4;
             float v[4] = {v4[0], v4[1], v4[2], v4[3]};
             exl3dev::had128(v);
             v4[0] = v[0]; v4[1] = v[1]; v4[2] = v[2]; v4[3] = v[3];
@@ -190,7 +209,7 @@ struct GemvSmem {
     static_assert(floats * 4 <= 40 * 1024, "the GEMV's shared buffer must stay under the static limit");
 };
 
-template <bool PAIR, int K2, int R>
+template <int MODE, int K2, int R>
 __global__ void __launch_bounds__(kRows * kWarps)
 exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
@@ -200,6 +219,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
+    constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     constexpr int NV = PAIR ? 2 : 1;
     __shared__ __align__(16) float s_buf[GemvSmem<PAIR, R>::floats];
@@ -277,6 +297,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                     if constexpr (PAIR) {
                         xg[j] = v * __half2float(sg[k0 + kk + j]);
                         xu[j] = v * __half2float(su[k0 + kk + j]);
+                    } else if constexpr (ROT) {
+                        xg[j] = v * __half2float(sg[k0 + kk + j]);
                     } else {
                         xg[j] = v;
                     }
@@ -289,6 +311,17 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                     const int v = t & 1, blk = (t >> 1) & 1, r = t >> 2;
                     if (blk >= nblk) continue;
                     float *v4 = s_buf + (v * R + r) * kChunk + blk * 128 + lane * 4;
+                    float x[4] = {v4[0], v4[1], v4[2], v4[3]};
+                    exl3dev::had128(x);
+                    v4[0] = x[0]; v4[1] = x[1]; v4[2] = x[2]; v4[3] = x[3];
+                }
+                __syncthreads();
+            } else if constexpr (ROT) {
+                /* H128 per 128-block, per row, of the one projection */
+                for (int t = warp; t < nr * 2; t += kWarps) {
+                    const int blk = t & 1, r = t >> 1;
+                    if (blk >= nblk) continue;
+                    float *v4 = s_buf + r * kChunk + blk * 128 + lane * 4;
                     float x[4] = {v4[0], v4[1], v4[2], v4[3]};
                     exl3dev::had128(x);
                     v4[0] = x[0]; v4[1] = x[1]; v4[2] = x[2]; v4[3] = x[3];
@@ -371,10 +404,12 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 __global__ void __launch_bounds__(256)
 exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      const float *__restrict__ up_z,
+                     int z_stride,
                      const int32_t *__restrict__ selected,
                      const float *__restrict__ weights,
                      const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
+                     int up_svh_off,
                      const void *__restrict__ down_table,
                      int in_dim, int mid_dim, int64_t pairs, float clamp,
                      __nv_fp8_e4m3 *__restrict__ mid_q,
@@ -393,12 +428,12 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     const void *const *pd = reinterpret_cast<const void *const *>(down_table);
     /* gate/up scales: suh[in_dim] | svh[mid_dim]; down scales: suh[mid_dim] | svh[out] */
     const __half *svh_g = reinterpret_cast<const __half *>(pg[2 * (size_t)e + 1]) + in_dim;
-    const __half *svh_u = reinterpret_cast<const __half *>(pu[2 * (size_t)e + 1]) + in_dim;
+    const __half *svh_u = reinterpret_cast<const __half *>(pu[2 * (size_t)e + 1]) + up_svh_off;
     const __half *suh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]);
     const int col0 = blk * 128 + lane * 4;
     const float wv = weights[pair];
-    const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * mid_dim + col0);
-    const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * mid_dim + col0);
+    const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * z_stride + col0);
+    const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * z_stride + col0);
     float g[4] = {g4.x, g4.y, g4.z, g4.w}, u[4] = {u4.x, u4.y, u4.z, u4.w};
     exl3dev::had128(g);
     exl3dev::had128(u);
@@ -467,32 +502,55 @@ static int exl3_rows_per_block(int64_t n_assign) {
     return kMaxR;
 }
 
-template <bool PAIR, int K2, int R>
+template <int MODE, int K2, int R>
 static void exl3_gemv_kernel_launch(const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                     const void *gt, const void *ut, const block_mx_act_mmq *a,
                                     const int32_t *ids_dst, const int32_t *expert_bounds,
                                     float *og, float *ou, int M, int K, int n_assign, int E) {
-    exl3_moe_gemv_kernel<PAIR, K2, R><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E);
+    exl3_moe_gemv_kernel<MODE, K2, R><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E);
 }
 
-template <bool PAIR, int K2>
+template <int MODE, int K2>
 static void exl3_gemv_dispatch_r(int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                  const void *gt, const void *ut, const block_mx_act_mmq *a,
                                  const int32_t *ids_dst, const int32_t *expert_bounds,
                                  float *og, float *ou, int M, int K, int n_assign, int E) {
     switch (R) {
-    case 1:  exl3_moe_gemv_kernel_r1<PAIR, K2><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    case 4:  exl3_gemv_kernel_launch<PAIR, K2, 4>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    default: exl3_gemv_kernel_launch<PAIR, K2, kMaxR>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 1:  exl3_moe_gemv_kernel_r1<MODE, K2><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 4:  exl3_gemv_kernel_launch<MODE, K2, 4>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
+    default: exl3_gemv_kernel_launch<MODE, K2, kMaxR>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
     }
 }
 
-template <bool PAIR>
+/* The rates each kind instantiates -- the ones a container carries: DeepSeek's
+ * split stacks at 2 / 2.5 / 3 (PAIR + DOWN), Qwen's fused gate_up and its down
+ * at 4 / 5 (FUSED + DOWN).  One table; the dispatch below and the public
+ * predicate both read it. */
+constexpr bool kind_has_rate(int mode, int k2) {
+    return (mode != kFused && (k2 == 4 || k2 == 5 || k2 == 6)) || (mode != kPair && (k2 == 8 || k2 == 10));
+}
+
+template <int MODE>
+static bool exl3_gemv_dispatch_k2(int k2, int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
+                                  const void *gt, const void *ut, const block_mx_act_mmq *a,
+                                  const int32_t *ids_dst, const int32_t *expert_bounds,
+                                  float *og, float *ou, int M, int K, int n_assign, int E) {
+    if constexpr (kind_has_rate(MODE, 4)) if (k2 == 4) { exl3_gemv_dispatch_r<MODE, 4>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 5)) if (k2 == 5) { exl3_gemv_dispatch_r<MODE, 5>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 6)) if (k2 == 6) { exl3_gemv_dispatch_r<MODE, 6>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 8)) if (k2 == 8) { exl3_gemv_dispatch_r<MODE, 8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 10)) if (k2 == 10) { exl3_gemv_dispatch_r<MODE, 10>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    return false;
+}
+
+template <int MODE>
 int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
                      const int32_t *ids_dst, const int32_t *expert_bounds,
                      float *og, float *ou, int M, int K, int64_t n_assign, int E,
                      int rows_per_block, cudaStream_t stream) {
-    const char *tag = PAIR ? "ds4_exl3_moe_gemv_pair_launch" : "ds4_exl3_moe_gemv_single_launch";
+    constexpr bool PAIR = MODE == kPair;
+    const char *tag = MODE == kPair ? "ds4_exl3_moe_gemv_pair_launch"
+                    : MODE == kFused ? "ds4_exl3_moe_gemv_fused_launch" : "ds4_exl3_moe_gemv_single_launch";
     if (!gt || (PAIR && !ut) || !act || !ids_dst || !expert_bounds || !og || (PAIR && !ou) ||
         M <= 0 || K <= 0 || n_assign <= 0 || E <= 0) {
         fprintf(stderr, "%s: null pointer or bad shape\n", tag);
@@ -512,14 +570,10 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
     const dim3 grid((unsigned)(M / kRows), (unsigned)((n_assign + R - 1) / R), 1);
     const dim3 block(kRows, kWarps, 1);
     const block_mx_act_mmq *a = (const block_mx_act_mmq *)act;
-    switch (k2) {
-    case 4: exl3_gemv_dispatch_r<PAIR, 4>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 5: exl3_gemv_dispatch_r<PAIR, 5>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 6: exl3_gemv_dispatch_r<PAIR, 6>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 8: exl3_gemv_dispatch_r<PAIR, 8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 10: exl3_gemv_dispatch_r<PAIR, 10>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    default:
-        fprintf(stderr, "%s: rate k2=%d has no instance (2, 2.5, 3, 4, 5) -- refusing\n", tag, k2);
+    if (!exl3_gemv_dispatch_k2<MODE>(k2, R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K,
+                                     (int)n_assign, E)) {
+        fprintf(stderr, "%s: rate k2=%d has no instance for this kind (split gate/up and DeepSeek's down: "
+                        "2, 2.5, 3; fused gate_up and Qwen's down: 4, 5) -- refusing\n", tag, k2);
         return -1;
     }
     const cudaError_t err = cudaGetLastError();
@@ -532,30 +586,48 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
 
 } // namespace
 
-bool ds4_exl3_gemv_rate_supported(int k2) { return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10; }
+bool ds4_exl3_gemv_rate_supported(int kind, int k2) {
+    return (kind == kDown || kind == kPair || kind == kFused) && kind_has_rate(kind, k2);
+}
 
 int ds4_exl3_moe_gemv_pair_launch(const void *gate_table, const void *up_table, int k2, const void *act,
                                   const int32_t *ids_dst, const int32_t *expert_bounds,
                                   float *out_gate, float *out_up, int M, int K, int64_t n_assign,
                                   int n_experts, cudaStream_t stream) {
-    return exl3_gemv_launch<true>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
-                                  out_gate, out_up, M, K, n_assign, n_experts, 0, stream);
+    return exl3_gemv_launch<kPair>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
+                                   out_gate, out_up, M, K, n_assign, n_experts, 0, stream);
 }
 
 int ds4_exl3_moe_gemv_single_launch(const void *table, int k2, const void *act,
                                     const int32_t *ids_dst, const int32_t *expert_bounds,
                                     float *out, int M, int K, int64_t n_assign,
                                     int n_experts, cudaStream_t stream) {
-    return exl3_gemv_launch<false>(table, nullptr, k2, act, ids_dst, expert_bounds,
+    return exl3_gemv_launch<kDown>(table, nullptr, k2, act, ids_dst, expert_bounds,
                                    out, nullptr, M, K, n_assign, n_experts, 0, stream);
+}
+
+int ds4_exl3_moe_gemv_fused_launch(const void *table, int k2, const void *act,
+                                   const int32_t *ids_dst, const int32_t *expert_bounds,
+                                   float *out, int M, int K, int64_t n_assign,
+                                   int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kFused>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                    out, nullptr, M, K, n_assign, n_experts, 0, stream);
+}
+
+int ds4_exl3_moe_gemv_fused_launch_rows(const void *table, int k2, const void *act,
+                                        const int32_t *ids_dst, const int32_t *expert_bounds,
+                                        float *out, int M, int K, int64_t n_assign,
+                                        int n_experts, int rows_per_block, cudaStream_t stream) {
+    return exl3_gemv_launch<kFused>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                    out, nullptr, M, K, n_assign, n_experts, rows_per_block, stream);
 }
 
 int ds4_exl3_moe_gemv_pair_launch_rows(const void *gate_table, const void *up_table, int k2, const void *act,
                                        const int32_t *ids_dst, const int32_t *expert_bounds,
                                        float *out_gate, float *out_up, int M, int K, int64_t n_assign,
                                        int n_experts, int rows_per_block, cudaStream_t stream) {
-    return exl3_gemv_launch<true>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
-                                  out_gate, out_up, M, K, n_assign, n_experts, rows_per_block, stream);
+    return exl3_gemv_launch<kPair>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
+                                   out_gate, out_up, M, K, n_assign, n_experts, rows_per_block, stream);
 }
 
 int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32_t *selected,
@@ -570,11 +642,35 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
-        gate_z, up_z, selected, weights, gate_table, up_table, down_table, in_dim, mid_dim, pairs,
+        gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
         clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: launch failed: %s\n", cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *selected, const float *weights,
+                                   const void *gate_up_table, const void *down_table, int in_dim, int mid_dim,
+                                   int64_t pairs, float clamp, void *mid_q, void *mid_sf, int mid_kbp,
+                                   cudaStream_t stream) {
+    if (!gate_up_z || !selected || !weights || !gate_up_table || !down_table || !mid_q || !mid_sf || pairs <= 0 ||
+        in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
+        fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: null pointer or bad shape (mid_dim %% 128)\n");
+        return -1;
+    }
+    /* gate = rows 0..mid-1 of the fused output, up = rows mid..2 mid-1; the scales
+     * plane is suh [in_dim] | svh [2 mid], so up's svh starts at in_dim + mid */
+    const int64_t tasks = pairs * (mid_dim >> 7);
+    const unsigned blocks = (unsigned)((tasks + 7) / 8);
+    exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
+        gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
+        down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: launch failed: %s\n", cudaGetErrorString(err));
         return -3;
     }
     return 0;

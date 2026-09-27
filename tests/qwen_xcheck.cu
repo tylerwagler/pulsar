@@ -9,8 +9,8 @@
  *       x.bin bf16 [N][2560], wr.bin bf16 [512][2560], wsg.bin bf16 [2560]
  *       -> sel.bin i32 [N][10], wts.bin f32 [N][10], sgate.bin f32 [N], logits.bin f32 [N][513]
  *   qwen_xcheck moe DIR N k2_gate_up k2_down k2_sg k2_su k2_sd
- *       x.bin, wr.bin, wsg.bin, experts.idx (u32 n, u32 ids[n]), exp_gate.bin / exp_up.bin /
- *       exp_down.bin (n slices each), shared_gate.bin / shared_up.bin / shared_down.bin
+ *       x.bin, wr.bin, wsg.bin, experts.idx (u32 n, u32 ids[n]), exp_gate_up.bin (n FUSED
+ *       [2560 -> 1280] slices) / exp_down.bin (n slices), shared_gate.bin / shared_up.bin / shared_down.bin
  *       -> out.bin f32 [N][2560], sel.bin, wts.bin, sgate.bin, out_m1.bin (each row alone)
  *   qwen_xcheck gr DIR N
  *       streams.bin bf16 [N][10240], norm.bin bf16 [10240], down.bin / up.bin (MXFP8_LT:
@@ -134,28 +134,25 @@ static int do_moe(int N, int k2gu, int k2d, int k2sg, int k2su, int k2sd) {
     const auto idx = slurp_all<uint32_t>("experts.idx");
     const uint32_t n = idx.at(0);
     if (idx.size() != 1 + (size_t)n) { fprintf(stderr, "experts.idx: count %u vs %zu ids\n", n, idx.size() - 1); return 2; }
-    const size_t sgu = slice_bytes(H, MID, k2gu), sd = slice_bytes(MID, H, k2d);
-    const auto eg = slurp<uint8_t>("exp_gate.bin", n * sgu), eu = slurp<uint8_t>("exp_up.bin", n * sgu),
-               ed = slurp<uint8_t>("exp_down.bin", n * sd);
-    uint8_t *deg = up(eg), *deu = up(eu), *ded = up(ed);
+    const size_t sgu = slice_bytes(H, 2 * MID, k2gu), sd = slice_bytes(MID, H, k2d);
+    const auto eg = slurp<uint8_t>("exp_gate_up.bin", n * sgu), ed = slurp<uint8_t>("exp_down.bin", n * sd);
+    uint8_t *deg = up(eg), *ded = up(ed);
     /* unquantized experts point at a poisoned slot: the tool refuses a routing that reaches one */
     std::vector<int> slot_of_expert(E, -1);
     for (uint32_t i = 0; i < n; i++) slot_of_expert.at(idx[1 + i]) = (int)i;
     uint64_t tgu = 0, sgu2 = 0, td = 0, sd2 = 0;
-    exl3t_layout(H, MID, k2gu, &tgu, &sgu2);
+    exl3t_layout(H, 2 * MID, k2gu, &tgu, &sgu2);
     exl3t_layout(MID, H, k2d, &td, &sd2);
-    std::vector<const void *> tg(2 * E), tu(2 * E), tdn(2 * E);
+    std::vector<const void *> tg(2 * E), tdn(2 * E);
     for (int e = 0; e < E; e++) {
         const int s = slot_of_expert[e] < 0 ? 0 : slot_of_expert[e];
         tg[2 * e] = deg + (size_t)s * sgu;  tg[2 * e + 1] = deg + (size_t)s * sgu + tgu;
-        tu[2 * e] = deu + (size_t)s * sgu;  tu[2 * e + 1] = deu + (size_t)s * sgu + tgu;
         tdn[2 * e] = ded + (size_t)s * sd;  tdn[2 * e + 1] = ded + (size_t)s * sd + td;
     }
     pulsar_qwen_moe_weights w;
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
-    w.gate_table = (const void *const *)up(tg);
-    w.up_table = (const void *const *)up(tu);
+    w.gate_up_table = (const void *const *)up(tg);
     w.down_table = (const void *const *)up(tdn);
     w.k2_gate_up = k2gu; w.k2_down = k2d;
     const linear shg = load_linear("shared_gate.bin", H, PULSAR_QWEN_SHARED_MID, k2sg),
