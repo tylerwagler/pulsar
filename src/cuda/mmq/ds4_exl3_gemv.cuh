@@ -17,7 +17,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** True when `k2` is a rate the arm instantiates (2, 2.5, 3). */
+/** True when `k2` is a rate the arm instantiates: K = 2, 2.5, 3 (DeepSeek /
+ *  V4.1) and 4, 5 (Qwen3.8-Flash-Next, L251). */
 bool ds4_exl3_gemv_rate_supported(int k2);
 
 /** gate/up: out_gate / out_up [n_assign][M] f32 = the UNROTATED z of each

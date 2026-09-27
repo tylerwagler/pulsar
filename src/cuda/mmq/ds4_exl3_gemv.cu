@@ -20,7 +20,7 @@
 //     16 weights of a k-tile as FOUR runs of four consecutive positions
 //     (positions 32(c%8) + 8a + 4(c/8) + b, rows 2a + {0,1,8,9}); one run is
 //     two uint32 loads and one 64-bit funnel window (the four states span at
-//     most 3K+16 bits, <= 26 for the rates here) -- exllamav3's dq4 pattern.
+//     most 3K+16 bits, <= 31 for the rates here) -- exllamav3's dq4 pattern.
 //     A warp's two n-tiles are 192 contiguous bytes per k-tile at K=3.
 //   * the input rotation for gate/up: suh is per expert-projection and sits
 //     INSIDE the Hadamard, so it cannot be hoisted before routing; the kernel
@@ -44,7 +44,9 @@ namespace {
 constexpr int kRows   = 32;    ///< output rows per CTA = one warp's lanes = two n-tiles
 constexpr int kWarps  = 8;     ///< K split
 constexpr int kMaxK   = 5120;  ///< the activation row (V4.1 n_embd)
-constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k-tiles = 2 per warp
+constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k-tiles = 2 per warp;
+                               ///< the last pass of a K % 256 == 128 row (Qwen's expert down, 640)
+                               ///< is one block, 8 k-tiles = 1 per warp -- the same k order
 constexpr int kMaxR   = 16;    ///< the widest row block
 /* ---------------------------------------------------------------------- */
 /* the GEMV                                                                */
@@ -225,7 +227,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 
     /* the reduction view of the shared buffer: [warp][lane][r][v] */
     float *s_red = s_buf;
-    const int n_chunk = K / kChunk;
+    const int n_chunk = (K + kChunk - 1) / kChunk;
     const int ntn = M >> 4;                              /* n-tiles per k-tile row */
     const int nt  = (blockIdx.x << 1) + (lane >> 4);
     const int c   = lane & 15;
@@ -253,6 +255,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 
         for (int kc = 0; kc < n_chunk; ++kc) {
             const int k0 = kc * kChunk;
+            const int nblk = min(2, (K - k0) >> 7);           /* Hadamard blocks in this pass: 2, or 1 at a 128 tail */
             /* stage this chunk of each row's activation as f32 -- for gate/up
              * already multiplied by each projection's suh.  block i of the row
              * holds k in [128 i, 128 i + 128) as 4 groups of 32 E4M3 under one
@@ -260,6 +263,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
             __syncthreads();                                   /* the previous pass's readers are done */
             for (int i = tid; i < nr * 8; i += kRows * kWarps) {
                 const int r = i >> 3, g8 = i & 7;
+                if ((g8 >> 2) >= nblk) continue;               /* past a 128 tail: nothing to stage */
                 const int blk = (k0 >> 7) + (g8 >> 2), grp = g8 & 3;
                 const block_mx_act_mmq &b = act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)(col0 + r0 + r)];
                 const float sc = exp2f(b.d4[grp] - 127.0f);
@@ -283,6 +287,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 /* H128 per 128-block, per row, per projection: one warp per task */
                 for (int t = warp; t < nr * 2 * 2; t += kWarps) {
                     const int v = t & 1, blk = (t >> 1) & 1, r = t >> 2;
+                    if (blk >= nblk) continue;
                     float *v4 = s_buf + (v * R + r) * kChunk + blk * 128 + lane * 4;
                     float x[4] = {v4[0], v4[1], v4[2], v4[3]};
                     exl3dev::had128(x);
@@ -294,6 +299,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
             /* this warp's two k-tiles of the chunk: the same k order a row alone takes */
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
+                if (half >= nblk) break;                       /* a 128 tail is one k-tile per warp */
                 const int kt = (k0 >> 4) + half * kWarps + warp;
                 const int kk = (half * kWarps + warp) * 16;    /* the tile's k inside the chunk */
                 const uint32_t *wg = tg + ((size_t)kt * (size_t)ntn + (size_t)nt) * W32;
@@ -492,9 +498,9 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
         fprintf(stderr, "%s: null pointer or bad shape\n", tag);
         return -1;
     }
-    if (M % kRows || K % kChunk || K > kMaxK || n_assign > INT32_MAX) {
+    if (M % kRows || K % EXL3_HAD_BLOCK || K > kMaxK || n_assign > INT32_MAX) {
         fprintf(stderr, "%s: shape M=%d K=%d n_assign=%lld outside the arm's contract "
-                        "(M %% 32, K %% 256, K <= %d) -- refusing\n",
+                        "(M %% 32, K %% 128, K <= %d) -- refusing\n",
                 tag, M, K, (long long)n_assign, kMaxK);
         return -1;
     }
@@ -510,8 +516,10 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
     case 4: exl3_gemv_dispatch_r<PAIR, 4>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
     case 5: exl3_gemv_dispatch_r<PAIR, 5>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
     case 6: exl3_gemv_dispatch_r<PAIR, 6>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
+    case 8: exl3_gemv_dispatch_r<PAIR, 8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
+    case 10: exl3_gemv_dispatch_r<PAIR, 10>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
     default:
-        fprintf(stderr, "%s: rate k2=%d has no instance (2, 2.5, 3) -- refusing\n", tag, k2);
+        fprintf(stderr, "%s: rate k2=%d has no instance (2, 2.5, 3, 4, 5) -- refusing\n", tag, k2);
         return -1;
     }
     const cudaError_t err = cudaGetLastError();
@@ -524,7 +532,7 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
 
 } // namespace
 
-bool ds4_exl3_gemv_rate_supported(int k2) { return k2 == 4 || k2 == 5 || k2 == 6; }
+bool ds4_exl3_gemv_rate_supported(int k2) { return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10; }
 
 int ds4_exl3_moe_gemv_pair_launch(const void *gate_table, const void *up_table, int k2, const void *act,
                                   const int32_t *ids_dst, const int32_t *expert_bounds,

@@ -21,6 +21,7 @@
 #include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 #include "ds4_exl3_gemv.cuh"
+#include "engine/exl3_trellis.h"   /* EXL3_HAD_BLOCK: the EXL3 arm's K granule */
 
 #include <cstdio>
 #include <cstdlib>
@@ -244,6 +245,12 @@ extern "C" int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_exper
 //   3. the D2R expert matmul with ids_dst + expert_bounds.
 // ----------------------------------------------------------------------------
 
+/* The K granule each expert arm reads: the IQ2 D2R kernels walk 256-value
+ * super-blocks; the EXL3 trellis GEMV walks 128-value Hadamard blocks (Qwen's
+ * expert down is 640 = 5 x 128).  The E4M3 staging below is 128-block
+ * granular either way. */
+static inline int moe_k_granule(int exl3_k2) { return exl3_k2 ? EXL3_HAD_BLOCK : 256; }
+
 namespace {
 
 int ds4_mmq_moe_impl(
@@ -281,8 +288,8 @@ int ds4_mmq_moe_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+    if (K % moe_k_granule(exl3_k2) != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, moe_k_granule(exl3_k2));
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -389,7 +396,7 @@ int ds4_mmq_moe_impl(
         d2r_iq2s_cc = cc;
         d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = ((x_soa != nullptr || exl3_k2 != 0) && K % 256 == 0 && d2r_iq2s_avail != 0);
+    const bool d2r_iq2 = ((x_soa != nullptr || exl3_k2 != 0) && K % moe_k_granule(exl3_k2) == 0 && d2r_iq2s_avail != 0);
 
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
@@ -419,9 +426,9 @@ int ds4_mmq_moe_impl(
      * error that says which precondition broke. */
     if (!d2r_iq2) {
         fprintf(stderr,
-                "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%256=%d avail=%d) -- "
+                "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
                 "refusing to run these expert activations in another format\n",
-                tag, (const void *)x_soa, (int)K, (int)(K % 256), d2r_iq2s_avail);
+                tag, (const void *)x_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2s_avail);
         return -1;
     }
     if (!act_q || !act_sf) {
@@ -540,8 +547,8 @@ int ds4_mmq_moe_pair_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+    if (K % moe_k_granule(exl3_k2) != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, moe_k_granule(exl3_k2));
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -646,7 +653,7 @@ int ds4_mmq_moe_pair_impl(
         d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
     const bool d2r_iq2 = ((xa_soa != nullptr && xb_soa != nullptr) || exl3_k2 != 0) &&
-                         K % 256 == 0 && d2r_iq2_avail != 0;
+                         K % moe_k_granule(exl3_k2) == 0 && d2r_iq2_avail != 0;
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -662,9 +669,9 @@ int ds4_mmq_moe_pair_impl(
         /* E4M3 or nothing -- same requirement as the single-tensor impl. */
         if (!d2r_iq2) {
             fprintf(stderr,
-                    "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%256=%d avail=%d) -- "
+                    "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
                     "refusing to run these expert activations in another format\n",
-                    tag, (const void *)xa_soa, (int)K, (int)(K % 256), d2r_iq2_avail);
+                    tag, (const void *)xa_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2_avail);
             return -1;
         }
         if (!src1_e4m3) return -1;   /* take() latches */
@@ -838,7 +845,7 @@ extern "C" int ds4_exl3_moe_pair(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_pair: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }
@@ -853,7 +860,7 @@ extern "C" int ds4_exl3_moe_single(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+    if (!ds4_exl3_gemv_rate_supported(k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_exl3_moe_single: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
         return -1;
     }

@@ -467,7 +467,7 @@ tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
 # -- graded against the host authority (exl3_trellis.h + double arithmetic)
 # on random tiles at the V4.1 expert shape, plus the arm's GB/s.  Model-free;
 # needs a device.  Includes the kernel TU directly, as the table gate does.
-tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
+tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu tests/exl3_gemv_gate_qwen.inc Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
                       src/cuda/mmq/ds4_exl3_gemv.cuh src/cuda/mmq/ds4_act_block.cuh \
                       src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -Isrc/cuda/mmq -o $@ $<

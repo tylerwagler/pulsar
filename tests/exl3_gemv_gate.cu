@@ -196,11 +196,22 @@ static double max_rel(const std::vector<float> &got, const std::vector<double> &
     *scale_out = sc;
     return sc > 0 ? mx / sc : mx;
 }
+/* FNV-1a over a float buffer's bytes: the DeepSeek sections print it so a
+ * change to the kernel TU can be proven byte-neutral on the V4.1 shapes by
+ * diffing two gate logs (the L251 K % 128 tail and K = 4 / 5 instances). */
+static uint64_t fnv64(const std::vector<float> &v) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *b = (const uint8_t *)v.data();
+    for (size_t i = 0; i < v.size() * sizeof(float); i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 static float swiglu_host(float g, float u, float wv, float clamp) {
     if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
     const float s = g / (1.0f + expf(-g));
     return s * u * wv;
 }
+
+#include "exl3_gemv_gate_qwen.inc"
 
 int main(void) {
     const int K = 5120, M = 2304;      /* the V4.1 expert: in 5120, mid 2304 */
@@ -255,7 +266,8 @@ int main(void) {
             worst = fmax(worst, max_rel(zu, z, (size_t)pair * M, M, &s));
         }
         CHECK(worst < 2e-5, "pair GEMV K=%g: max rel error %.3e vs the host authority (limit 2e-5)", k2 / 2.0, worst);
-        printf("  pair GEMV K=%g: %d assignments x %d outputs, max rel %.2e (|z| up to %.3g)\n", k2 / 2.0, r.n_assign, M, worst, scale);
+        printf("  pair GEMV K=%g: %d assignments x %d outputs, max rel %.2e (|z| up to %.3g); bytes fnv %016llx\n",
+               k2 / 2.0, r.n_assign, M, worst, scale, (unsigned long long)(fnv64(zg) ^ (fnv64(zu) * 3u)));
 
         if (k2 == 6) {
             /* 3. the fold, on this K=3 gate/up and a K=3 down */
@@ -388,7 +400,8 @@ int main(void) {
                     double s; dworst = fmax(dworst, max_rel(zdown, z, (size_t)pair * K, K, &s)); dscale = fmax(dscale, s);
                 }
                 CHECK(dworst < 2e-5, "down GEMV: max rel %.3e (limit 2e-5)", dworst);
-                printf("  down GEMV K=3: %d assignments x %d outputs, max rel %.2e (|z| up to %.3g)\n", r.n_assign, K, dworst, dscale);
+                printf("  down GEMV K=3: %d assignments x %d outputs, max rel %.2e (|z| up to %.3g); bytes fnv %016llx\n",
+                       r.n_assign, K, dworst, dscale, (unsigned long long)fnv64(zdown));
 
                 /* 6. the numbers, on a stack that does NOT fit in L2 (GB10: 24 MiB):
                  * 12 experts, 12 assignments to 12 distinct experts (two decode
@@ -546,6 +559,7 @@ int main(void) {
         }
         cudaFree(sg.arena); cudaFree((void *)sg.table); cudaFree(su.arena); cudaFree((void *)su.table);
     }
+    if (qwen_section()) g_fail = 1;
     printf(g_fail ? "EXL3-GEMV GATE FAIL\n" : "EXL3-GEMV GATE PASS\n");
     return g_fail;
 }
