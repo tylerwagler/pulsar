@@ -28,6 +28,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 namespace {
 
@@ -357,6 +358,29 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
     rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
                                         kH, mid, pairs, 0.0f, m.mid_q, m.mid_sf, mid_kbp, stream);
     if (rc) return -1;
+    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's A8 output -- the down GEMV's input --
+     * so the xcheck can compare the DEVICE's own codes against its emulation's per element.  The
+     * one place those may legitimately differ is an E4M3 rounding TIE: the fold's terms are ~0.03
+     * and its input ~5.9e-05, so the fold's fp32-vs-fp64 difference (~1e-8 absolute) is ~1.7e-4
+     * RELATIVE, and scaled by 2^19 that is ~3e-3 -- enough to choose the other code wherever a
+     * value lands within ~1e-5 of a midpoint, which an E4M3 code comparison can see and an
+     * absolute epsilon on the output cannot.  Armed only by the env var; nothing runs and nothing
+     * allocates when it is unset. */
+    { const char *sp = getenv("PULSAR_MOE_SPILL_MID");
+      if (sp && sp[0] && T > 1) {   /* the batch call; the M=1 loop would overwrite it */
+          const size_t nq = (size_t)pairs * (size_t)mid;
+          const size_t ns = pulsar_mx_sf_slab_bytes((int)pairs, mid_kbp);
+          uint8_t *hq = (uint8_t *)malloc(nq), *hs = (uint8_t *)malloc(ns);
+          cudaStreamSynchronize(stream);
+          if (hq && hs && cudaMemcpy(hq, m.mid_q, nq, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                          cudaMemcpy(hs, m.mid_sf, ns, cudaMemcpyDeviceToHost) == cudaSuccess) {
+              char fp[1024]; FILE *f;
+              snprintf(fp, sizeof(fp), "%s.mid_q.bin", sp);  f = fopen(fp, "wb"); if (f) { fwrite(hq, 1, nq, f); fclose(f); }
+              snprintf(fp, sizeof(fp), "%s.mid_sf.bin", sp); f = fopen(fp, "wb"); if (f) { fwrite(hs, 1, ns, f); fclose(f); }
+          }
+          free(hq); free(hs);
+      }
+    }
     rc = ds4_exl3_moe_single(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
                              stream, m.mid_q, m.mid_sf, mid_kbp);
     if (rc) { fprintf(stderr, "pulsar: qwen MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
