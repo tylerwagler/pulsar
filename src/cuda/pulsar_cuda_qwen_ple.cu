@@ -53,17 +53,6 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
     return s;
 }
 
-/* the gathered rows' producer: bf16 -> E4M3 slot */
-__global__ void __launch_bounds__(kThreads)
-qwen_ple_emit_kernel(const __nv_bfloat16 *__restrict__ emb, __nv_fp8_e4m3 *__restrict__ q,
-                     unsigned char *__restrict__ sf, int kbp) {
-    const int t = blockIdx.x;
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int c = (int)threadIdx.x + kThreads * j;
-        pulsar_mx_emit_block(bf2f(emb[(size_t)t * kH + c]), (uint32_t)c, (uint32_t)t, (uint32_t)kH, kbp, q, sf);
-    }
-}
 
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_gate_kernel(const float *__restrict__ key, const float *__restrict__ value,
@@ -149,7 +138,6 @@ qwen_ple_state_kernel(const float *__restrict__ gvn, const int32_t *__restrict__
 }
 
 struct ple_ws {
-    uint8_t *eq, *esf;
     float *key, *value, *gvn, *sig;
     void *lin;
     size_t lin_bytes;
@@ -165,8 +153,6 @@ static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
         return base ? (uint8_t *)base + off : nullptr;
     };
     ple_ws m{};
-    m.eq    = (uint8_t *)take((size_t)T * kH);
-    m.esf   = (uint8_t *)take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kH)));
     m.key   = (float *)take((size_t)T * kHC * 4);
     m.value = (float *)take((size_t)T * kH * 4);
     m.gvn   = (float *)take((size_t)T * kHC * 4);
@@ -221,13 +207,11 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16
                         "signed-sqrt stream gate, dilated conv (%d taps x %d, f32 state)\n",
                 w->key_proj.k2 / 2.0, w->value_proj.k2 / 2.0, kTaps, kDil);
     }
-    const int kbp = pulsar_mx_kbp(kH);
-    cudaMemsetAsync(m.esf, 0, pulsar_mx_sf_slab_bytes(T, kbp), stream);
-    qwen_ple_emit_kernel<<<T, kThreads, 0, stream>>>((const __nv_bfloat16 *)emb, (__nv_fp8_e4m3 *)m.eq, m.esf, kbp);
-    if (!launch_ok("emit")) return -3;
-    const pulsar_qwen_slot e = {m.eq, m.esf, kbp};
-    int rc = pulsar_qwen_linear_launch(&w->key_proj, &e, T, m.key, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_qwen_linear_launch(&w->value_proj, &e, T, m.value, m.lin, m.lin_bytes, stream);
+    /* L251 / ac69748f: the gathered rows ARE bf16, so the key/value projections read them directly
+     * and the E4M3 emit step (which existed only to build the A8 slot) is gone.  The bf16 row is the
+     * one activation encoding, emitted by whatever produced `emb` (rule 3). */
+    int rc = pulsar_qwen_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
+    if (!rc) rc = pulsar_qwen_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     qwen_ple_gate_kernel<<<dim3(kS, T), kThreads, 0, stream>>>(
         m.key, m.value, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_key,

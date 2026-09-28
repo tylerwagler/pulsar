@@ -553,16 +553,9 @@ int main(void) {
 /* G. The MXFP8 dense Linear -- the recipe's mxfp8_lt tier (GDN in_proj_a / _b
  * and the indexer's index_qk_proj).  pulsar_qwen_mxfp8_linear_launch is a thin
  * wrapper over the GR arm's W_down, so this grades its NUMBERS: the reference
- * decodes the same quantized weight (mx8) and the same emitted E4M3 activation
- * slot, so only the accumulation order can differ. */
-__global__ void qwen_g_emit_slot(const uint16_t *__restrict__ x, int rows, int in, int kbp,
-                                 uint8_t *__restrict__ q, uint8_t *__restrict__ sf) {
-    const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows || c >= in) return;
-    const uint16_t h = x[(size_t)r * in + c];
-    pulsar_mx_emit_block(__bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&h)),
-                         (uint32_t)c, (uint32_t)r, (uint32_t)in, kbp, (__nv_fp8_e4m3 *)q, sf);
-}
+ * decodes the same quantized weight (mx8) and reads the SAME bf16 activation rows, so only the
+ * accumulation order can differ.  L251 / ac69748f: the activation is bf16, so there is no E4M3
+ * slot to emit and no per-32 block scale to fold in -- this is the W8A16 shape. */
 
 static void section_mxfp8_linear(void) {
     printf("G. MXFP8 dense Linear (mxfp8_lt: in_proj_a 2560->48, index_qk_proj 2560->640)\n");
@@ -574,42 +567,31 @@ static void section_mxfp8_linear(void) {
         mx8 w;
         w.encode(wd, sh.out, sh.in);
         const std::vector<uint16_t> act = rnd_act(T, sh.in, 0.7);
-        const int kbp = pulsar_mx_kbp(sh.in);
-        uint16_t *dx = up(act);
-        uint8_t *q = (uint8_t *)dalloc((size_t)T * sh.in);
-        const size_t sfb = pulsar_mx_sf_slab_bytes(T, kbp);
-        uint8_t *sf = (uint8_t *)dalloc(sfb);
-        qwen_g_emit_slot<<<dim3((sh.in + 255) / 256, T), 256>>>(dx, T, sh.in, kbp, q, sf);
-        const cudaError_t ee = cudaDeviceSynchronize();
-        CHECK(ee == cudaSuccess, "%d -> %d: emit the E4M3 slot (%s)", sh.in, sh.out, cudaGetErrorString(ee));
+        uint16_t *dx = up(act);                       /* the bf16 rows ARE the activation */
         float *y = (float *)dalloc((size_t)T * sh.out * 4);
         pulsar_qwen_lowrank l{up(w.q), up(w.sf), sh.out, sh.in};
-        pulsar_qwen_slot xs{q, sf, kbp};
-        const int rc = pulsar_qwen_mxfp8_linear_launch(&l, &xs, T, y, nullptr, 0, 0);
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&l, dx, T, y, nullptr, 0, 0);
         CHECK(rc == 0, "%d -> %d launch", sh.in, sh.out);
         if (rc == 0) {
             const auto Y = down(y, (size_t)T * sh.out);
-            const auto AQ = down(q, (size_t)T * sh.in);
-            const auto ASF = down(sf, sfb);
+            const auto AX = down(dx, (size_t)T * sh.in);
             double worst = 0;
             for (int t = 0; t < T; t++)
                 for (int o = 0; o < sh.out; o++) {
                     double ref = 0;
                     for (int k = 0; k < sh.in; k++)
-                        ref += w.at(o, k) * exl3t_e4m3_to_f64(AQ[(size_t)t * sh.in + k]) *
-                               ldexp(1.0, (int)ASF[pulsar_mx_sfoff(t, k / 32, kbp)] - 127);
+                        ref += w.at(o, k) * bf(AX[(size_t)t * sh.in + k]);
                     const double got = Y[(size_t)t * sh.out + o];
                     const double d = ref != 0 ? fabs(got - ref) / fabs(ref) : fabs(got);
                     if (d > worst) worst = d;
                 }
             CHECK(worst < 1e-4, "%d -> %d vs the same quantized operands in double: max rel %.2e", sh.in, sh.out, worst);
         }
-        /* a wrong-width slot is refused, not mis-read */
-        /* the SAME call with the correct slot succeeded above (`rc == 0`); a slot
-         * declaring the wrong width must be refused, not mis-read */
-        pulsar_qwen_slot wrong{q, sf, kbp - 1};
-        CHECK(rc == 0 && pulsar_qwen_mxfp8_linear_launch(&l, &wrong, T, y, nullptr, 0, 0) != 0,
-              "a slot of the wrong kbp is refused");
-        cudaFree(dx); cudaFree(q); cudaFree(sf); cudaFree(y);
+        /* a missing activation is refused, not mis-read.  The old negative control was a slot
+         * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so
+         * the control moves to the refusal the arm still has. */
+        CHECK(rc == 0 && pulsar_qwen_mxfp8_linear_launch(&l, nullptr, T, y, nullptr, 0, 0) != 0,
+              "a null activation is refused");
+        cudaFree(dx); cudaFree(y);
     }
 }
