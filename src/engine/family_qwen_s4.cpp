@@ -327,7 +327,7 @@ uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_sh
     case PULSAR_QWEN_OP_MOE:     return moe_layout(max_rows).total;
     case PULSAR_QWEN_OP_HEAD:    return head_layout().total;
     case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;
-    case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, ctx).total;
+    case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, pulsar_qwen_qsa_cap(s, ctx)).total;
     default:                     return 0;   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
     }
 }

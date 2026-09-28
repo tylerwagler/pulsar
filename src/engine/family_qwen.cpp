@@ -537,7 +537,7 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
                                            uint32_t n_banks, uint32_t ctx, uint32_t max_rows) {
     pulsar_qwen_state *st = (pulsar_qwen_state *)xcalloc(1, sizeof(*st));
     st->n_banks = n_banks;
-    st->ctx = ctx;
+    st->ctx = pulsar_qwen_qsa_cap(s, ctx);   /* a whole number of indexer blocks; see the helper */
     st->max_rows = max_rows;
     bool ok = true;
     const uint64_t nb = n_banks;

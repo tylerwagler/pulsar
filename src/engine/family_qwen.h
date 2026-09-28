@@ -248,6 +248,17 @@ static inline uint64_t pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
 static inline uint64_t pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
     return 2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * (s->head_dim / 32ull);
 }
+/** S3: the per-bank QSA cache capacity for a requested context of `ctx` tokens.
+ *  The indexer pools idx_block tokens into ONE key block (the kernel's name for
+ *  the same fact is PULSAR_QSA_BLOCK), so the cache -- and the `cap` handed to
+ *  the kernel -- must be a whole number of blocks; the partial tail block is
+ *  never addressed.  A session is sized in raw tokens (a depth+margin is not
+ *  block-aligned), so this rounding is what keeps the ring legal: rounding HERE,
+ *  once, keeps qwen_state_alloc's two allocations, the per-bank views, the op's
+ *  scratch reservation and `seqs[b].cap` all derived from the same number. */
+static inline uint32_t pulsar_qwen_qsa_cap(const pulsar_qwen_shape *s, uint32_t ctx) {
+    return (ctx + s->idx_block - 1u) / s->idx_block * s->idx_block;
+}
 /** S3: one pooled indexer key block (idx_block tokens, post-norm, post-RoPE),
  * bf16 [idx_n_head_kv][idx_head_dim] = 256 B per 4 tokens. */
 static inline uint64_t pulsar_qwen_index_row_bytes(const pulsar_qwen_shape *s) {
