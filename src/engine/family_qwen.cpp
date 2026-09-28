@@ -548,9 +548,12 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
             L->gdn_conv  = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_gdn_conv_bytes(s));
             ok = L->gdn_state && L->gdn_conv;
         } else {
-            /* Demand-paged: a bank pays for the KV it touches. */
-            L->kv       = pulsar_gpu_tensor_alloc_managed(nb * ctx * pulsar_qwen_kv_row_bytes(s));
-            L->idx_keys = pulsar_gpu_tensor_alloc_managed(nb * qwen_ceil_div(ctx, s->idx_block) *
+            /* Demand-paged: a bank pays for the KV it touches.  Sized from st->ctx, NOT the raw
+             * parameter: st->ctx is the block-rounded QSA capacity (see pulsar_qwen_qsa_cap), and
+             * the op views exactly st->ctx tokens per bank -- allocating the raw ctx made the KV
+             * view overshoot its tensor and the op refused with "a QSA bank cache view failed". */
+            L->kv       = pulsar_gpu_tensor_alloc_managed(nb * st->ctx * pulsar_qwen_kv_row_bytes(s));
+            L->idx_keys = pulsar_gpu_tensor_alloc_managed(nb * qwen_ceil_div(st->ctx, s->idx_block) *
                                                           pulsar_qwen_index_row_bytes(s));
             L->idx_tail = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(s));
             ok = L->kv && L->idx_keys && L->idx_tail;
