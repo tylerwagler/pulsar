@@ -203,20 +203,27 @@ int main(int argc, char **argv) {
             double sref = 0, seng = 0;
             for (int j = 0; j < W; j++) { sref += exp((double)rr[j] - mref); seng += exp((double)row[j] - meng); }
             double kl = 0, mx = 0;
+            uint64_t he = 1469598103934665603ull, hr = 1469598103934665603ull;
             for (int j = 0; j < W; j++) {
                 const double pr = exp((double)rr[j] - mref) / sref, pe = exp((double)row[j] - meng) / seng;
                 if (pr > 0 && pe > 0) kl += pr * log(pr / pe);
                 const double dd = fabs((double)rr[j] - (double)row[j]);
                 if (dd > mx) mx = dd;
+                uint32_t be, br;
+                memcpy(&be, &row[j], 4); he = (he ^ be) * 1099511628211ull;
+                memcpy(&br, &rr[j], 4);  hr = (hr ^ br) * 1099511628211ull;
             }
             if (kl > worst_kl) worst_kl = kl;
             if (mx > worst_mx) worst_mx = mx;
             graded++;
-            if (am == recs[k].argmax) {
-                am_ok++;
-            } else {
-                printf("      d=%-6d engine argmax %d, reference %d\n", d, am, recs[k].argmax);
-            }
+            /* ALWAYS one line per depth.  Two depths sharing `fnv eng` means the session
+             * never advanced -- prefix reuse handed back the same row -- which a bare
+             * argmax count hides completely (it reads as a near miss instead of a stall). */
+            printf("      d=%-6d eng %7d @ %9.4f | ref %7d @ %9.4f | KL %.3e max %.3e | fnv %016llx eng / %016llx ref%s\n",
+                   d, am, (double)row[am], ram, (double)rr[ram], kl, mx,
+                   (unsigned long long)he, (unsigned long long)hr,
+                   (am == recs[k].argmax) ? "" : "   <-- ARGMAX MISMATCH");
+            if (am == recs[k].argmax) am_ok++;
         }
         check(graded == nr && am_ok == nr, "%s: argmax matches at %d / %d depths", prompts[i], am_ok, nr);
         printf("      %s: worst KL(ref||engine) %.3e, worst max|logit diff| %.3e over %d depths\n",
