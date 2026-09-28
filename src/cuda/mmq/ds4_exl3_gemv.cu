@@ -75,7 +75,10 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      int M, int K, int n_assign, int E) {
     constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
-    /* !A8: the activation is row-major bf16 -- the same pointer reinterpreted, so no new argument. */
+    /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
+     * argument reinterpreted, so no launch signature changed -- and ids_dst[col] is the destination
+     * TOKEN (see the output scatter below), so the token's row is addressed directly and the E4M3
+     * gather/encode step that builds the A8 blocks is not needed at all on this path. */
     const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
     __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
     __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
@@ -123,7 +126,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             const float v = A8 ? (exl3dev::e4m3_to_f32((uint8_t)bp->qs[grp * 32 + j]) * sc)
-                               : __bfloat162float(xb[(size_t)col * (size_t)K + (size_t)k0 + (size_t)j]);
+                               : __bfloat162float(xb[(size_t)ids_dst[col] * (size_t)K
+                                                     + (size_t)k0 + (size_t)j]);
             if constexpr (PAIR) {
                 s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
                 s_x[1][k0 + j] = v * __half2float(su[k0 + j]);
@@ -227,7 +231,10 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      int M, int K, int n_assign, int E) {
     constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
-    /* !A8: the activation is row-major bf16 -- the same pointer reinterpreted, so no new argument. */
+    /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
+     * argument reinterpreted, so no launch signature changed -- and ids_dst[col] is the destination
+     * TOKEN (see the output scatter below), so the token's row is addressed directly and the E4M3
+     * gather/encode step that builds the A8 blocks is not needed at all on this path. */
     const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
     constexpr int NV = PAIR ? 2 : 1;
     __shared__ __align__(16) float s_buf[GemvSmem<PAIR, R>::floats];
@@ -305,7 +312,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 for (int j = 0; j < 32; ++j) {
                     const float v = A8
                         ? (exl3dev::e4m3_to_f32((uint8_t)q[j]) * sc)
-                        : __bfloat162float(xb[(size_t)arow * (size_t)K + (size_t)k0 + (size_t)kk + (size_t)j]);
+                        : __bfloat162float(xb[(size_t)ids_dst[arow] * (size_t)K
+                                             + (size_t)k0 + (size_t)kk + (size_t)j]);
                     if constexpr (PAIR) {
                         xg[j] = v * __half2float(sg[k0 + kk + j]);
                         xu[j] = v * __half2float(su[k0 + kk + j]);
