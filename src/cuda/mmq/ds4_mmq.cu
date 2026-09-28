@@ -280,7 +280,11 @@ int ds4_mmq_moe_impl(
         int             exl3_k2    = 0,
         /* L251: the EXL3 slice is a fused gate_up that rotates its own input
          * (EXL3_ARM_GATE_UP_FUSED) rather than a down on a pre-rotated one. */
-        bool            exl3_fused = false) {
+        bool            exl3_fused = false,
+        /* L251 / ac69748f: true = the activation is the Qwen family's row-major bf16, not an E4M3
+         * slot.  There is nothing to encode, so the D2R precondition, the memset and the whole
+         * gather are skipped and the gemv indexes the token's row through ids_src1 instead. */
+        bool            act_bf16   = false) {
 
     if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -289,6 +293,11 @@ int ds4_mmq_moe_impl(
     if (M <= 0 || K <= 0 || n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0) {
         fprintf(stderr, "%s: bad shape M=%d K=%d ntok=%d nexp=%d nused=%d\n",
                 tag, M, K, n_tokens, n_experts, n_expert_used);
+        return -1;
+    }
+    if (act_bf16 && exl3_k2 == 0) {
+        fprintf(stderr, "%s: act_bf16 needs the EXL3 arm (k2=%d) -- the bf16 activation is the Qwen "
+                        "family's and the IQ2 D2R arm is E4M3-only\n", tag, exl3_k2);
         return -1;
     }
     if (K % moe_k_granule(exl3_k2) != 0) {
@@ -427,30 +436,40 @@ int ds4_mmq_moe_impl(
      * version of exactly it is what once hid the down conversion for two days.
      * Fail closed instead: one activation format, every batch size, or an
      * error that says which precondition broke. */
-    if (!d2r_iq2) {
-        fprintf(stderr,
-                "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
-                "refusing to run these expert activations in another format\n",
-                tag, (const void *)x_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2s_avail);
-        return -1;
-    }
-    if (!act_q || !act_sf) {
-        fprintf(stderr, "%s: no producer E4M3 for the activation (K=%d rows=%lld) -- the "
-                        "encode-from-f32 staging was deleted (L158); refusing\n",
-                tag, (int)K, (long long)ne_get_rows);
-        return -1;
-    }
-    cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_act, stream);
-    ds4_gather_mmq_e4m3_cuda(
-        act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3_p,
-        /*ne00=*/K, s11_src, s12_src, s13_src,
-        /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-        /*n_expert_used=*/0, /*scatter=*/false, stream);
+    if (act_bf16) {
+        /* One format, and on this path it is bf16: nothing is staged, nothing is encoded, and the
+         * activation buffer the caller handed over IS what the gemv reads. */
+        if (!act_q) {
+            fprintf(stderr, "%s: no bf16 activation (K=%d rows=%lld) -- refusing\n",
+                    tag, (int)K, (long long)ne_get_rows);
+            return -1;
+        }
+    } else {
+        if (!d2r_iq2) {
+            fprintf(stderr,
+                    "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
+                    "refusing to run these expert activations in another format\n",
+                    tag, (const void *)x_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2s_avail);
+            return -1;
+        }
+        if (!act_q || !act_sf) {
+            fprintf(stderr, "%s: no producer E4M3 for the activation (K=%d rows=%lld) -- the "
+                            "encode-from-f32 staging was deleted (L158); refusing\n",
+                    tag, (int)K, (long long)ne_get_rows);
+            return -1;
+        }
+        cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_act, stream);
+        ds4_gather_mmq_e4m3_cuda(
+            act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3_p,
+            /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            /*n_expert_used=*/0, /*scatter=*/false, stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: ds4_gather_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
-        return -3;
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: ds4_gather_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
+            return -3;
+        }
     }
 
     // 3. Build mmq_args for the MoE path.
@@ -480,10 +499,17 @@ int ds4_mmq_moe_impl(
      * One path, one activation format, every batch size. */
     {
         const int rc = exl3_k2
-            ? (exl3_fused ? ds4_exl3_moe_gemv_fused_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                                           out_f32, M, K, ne_get_rows, n_experts, stream)
-                          : ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                                            out_f32, M, K, ne_get_rows, n_experts, stream))
+            ? (act_bf16
+               ? (exl3_fused ? ds4_exl3_moe_gemv_fused_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
+                                                                   expert_bounds, out_f32, M, K, ne_get_rows,
+                                                                   n_experts, stream)
+                             : ds4_exl3_moe_gemv_single_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
+                                                                    expert_bounds, out_f32, M, K, ne_get_rows,
+                                                                    n_experts, stream))
+               : (exl3_fused ? ds4_exl3_moe_gemv_fused_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
+                                                              out_f32, M, K, ne_get_rows, n_experts, stream)
+                             : ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
+                                                               out_f32, M, K, ne_get_rows, n_experts, stream)))
             : ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
@@ -872,6 +898,37 @@ extern "C" int ds4_exl3_moe_single(
     return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
                             M, K, n_tokens, n_experts, n_expert_used, stream,
                             NULL, 0, act_q, act_sf, act_kbp, k2);
+}
+
+/* L251 / ac69748f: the same two arms over the Qwen family's row-major bf16 activation.  Separate
+ * entry points rather than a flag, which is upstream's own shape (exl3_gemv / exl3_gemv_int8).  The
+ * activation is [n_tokens, K] bf16 and the gemv addresses each assignment's row through ids_src1. */
+extern "C" int ds4_exl3_moe_fused_bf16(
+        const void * table, int k2, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream, const void * act_bf16) {
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
+        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_fused_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_impl("ds4_exl3_moe_fused_bf16", table, ids, out,
+                            M, K, n_tokens, n_experts, n_expert_used, stream,
+                            NULL, 0, act_bf16, NULL, 0, k2, true, true);
+}
+
+extern "C" int ds4_exl3_moe_single_bf16(
+        const void * table, int k2, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream, const void * act_bf16) {
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, k2) || M <= 0 || K <= 0 ||
+        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_single_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_impl("ds4_exl3_moe_single_bf16", table, ids, out,
+                            M, K, n_tokens, n_experts, n_expert_used, stream,
+                            NULL, 0, act_bf16, NULL, 0, k2, false, true);
 }
 
 extern "C" int ds4_exl3_moe_fused(
