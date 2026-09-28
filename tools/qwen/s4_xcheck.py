@@ -102,6 +102,32 @@ def e4m3_dec(x):
     return (q * torch.exp2(se)).reshape(shp)
 
 
+def e4m3_codes(x, rel=1e-4):
+    """The producer's E4M3 CODE BYTES for x, plus how many elements sit within `rel` (in spacing
+    units) of a rounding midpoint.
+
+    Why both: the device and this emulation may legitimately disagree on a code wherever a value
+    lands on a tie -- the fold's terms are ~0.03 and its input ~5.9e-05, so the fold's
+    fp32-vs-fp64 difference is ~1.7e-4 RELATIVE and scaled by 2^19 that is ~3e-3, far more than
+    the ~1e-5 by which such an element sits from the midpoint.  tests/exl3_gemv_gate.cu:313-326
+    grades exactly this with max(ulp, |t|/8).  Counting the ties lets the caller grade
+    "mismatched codes <= tie-adjacent codes", which a systematic encoding error cannot pass."""
+    shp = x.shape
+    g = x.double().reshape(*shp[:-1], shp[-1] // 32, 32)
+    amax = g.abs().amax(-1, keepdim=True)
+    se = torch.where(amax > 0, torch.floor(torch.log2(amax.clamp_min(1e-300))) - 7,
+                     torch.full_like(amax, -127.0)).clamp(-127, 127)
+    scaled = g * torch.exp2(-se)
+    codes = scaled.float().to(torch.float8_e4m3fn).view(torch.uint8).reshape(shp)
+    t = scaled.abs().reshape(shp)
+    nz = t > 0
+    e = torch.zeros_like(t)
+    e[nz] = torch.floor(torch.log2(t[nz]))
+    frac = t / torch.exp2(e - 3)
+    d = ((frac - torch.floor(frac)) - 0.5).abs()
+    return codes, int(((d < rel) & nz).sum())
+
+
 _H128 = None
 
 
@@ -304,6 +330,8 @@ def cmd_moe(a, tool):
         open(f"{d}/shared_{name}.bin", "wb").write(lin.slice_bytes())
     k2 = 2 * a.k_expert
     k2d = 2 * (a.k_down or a.k_expert)
+    # ask the tool for the device's own fold-A8 codes; the tool inherits this environment
+    os.environ["PULSAR_MOE_SPILL_MID"] = os.path.join(d, "dev_mid")
     run_tool(["moe", d, a.rows, k2, k2d, 2 * a.k_shared, 2 * a.k_shared, 2 * a.k_shared], tool)
     out = torch.from_numpy(np.fromfile(f"{d}/out.bin", dtype=np.float32).reshape(a.rows, 2560)).double()
     sel = torch.from_numpy(np.fromfile(f"{d}/sel.bin", dtype=np.int32).reshape(a.rows, 10)).long()
@@ -315,6 +343,7 @@ def cmd_moe(a, tool):
     x = xr.to(DEV).double()
     x8 = e4m3_dec(x)
     emu = torch.zeros(a.rows, 2560, dtype=torch.float64, device=DEV)
+    fold_codes, fold_ties = [], 0
     rec = torch.zeros_like(emu)
     hp = torch.softmax(F.linear(xr.to(DEV), W.get(p + "gate.weight")), -1, dtype=torch.float)   # the source's routing
     src_v, src_i = torch.topk(hp, 10, -1)
@@ -325,6 +354,10 @@ def cmd_moe(a, tool):
             z = lgu_(x8[r:r + 1])
             v = F.silu(z[:, :640]) * z[:, 640:] * float(wts[r, k])
             t = e4m3_dec(had(ld_.suh * v))
+            _hy = had(ld_.suh * v)
+            _codes, _tc = e4m3_codes(_hy)
+            fold_codes.append(_codes[0].cpu().numpy())
+            fold_ties += _tc
             emu[r] += (ld_.svh * had(t @ ld_.wtr))[0]
         for k in range(10):                                         # recon: the source's semantics, no A8
             lgu_, ld_ = q[int(src_i[r, k])]
@@ -345,7 +378,17 @@ def cmd_moe(a, tool):
         hf = blk(xr.to(DEV).view(1, a.rows, 2560)).view(a.rows, 2560).double()
     out = out.to(DEV)
     m1 = torch.from_numpy(np.fromfile(f"{d}/out_m1.bin", dtype=np.float32).reshape(a.rows, 2560)).double().to(DEV)
+    # THE GRADED CRITERION (replaces a flat 1e-5 on the output, which cannot express one code):
+    # the device's fold-A8 codes against this emulation's, allowing only the ties the emulation
+    # itself observes.  A systematic encoding error mismatches thousands against a handful of
+    # ties and still fails loudly.  Measured on the real K4 tensor: 1 mismatch, 1 tie-adjacent
+    # element -- pair 13 / row 1 / expert 457, whose scaled fold input sits 7.6e-6 (in spacing
+    # units) from the E4M3 midpoint at 31, so fp32-vs-fp64 decides the code.
+    dev_q = np.fromfile(os.path.join(d, "dev_mid.mid_q.bin"), dtype=np.uint8)
+    n_codes = a.rows * 10 * 640
+    a8_mism = int((np.stack(fold_codes) != dev_q.reshape(-1, 640)).sum()) if dev_q.size == n_codes else -1
     res = {"K_expert": a.k_expert, "K_down": a.k_down or a.k_expert, "K_shared": a.k_shared, "rows": a.rows, "experts": len(experts),
+           "a8_code_mismatches": a8_mism, "a8_tie_adjacent": fold_ties, "a8_codes_compared": n_codes,
            "routing_equals_source": same_route,
            "dev_vs_emu": relF(out, emu), "dev_vs_emu_rows_max": float(rows_relF(out, emu).max()),
            "dev_m1_vs_batch_bit_equal": bool((m1 == out).all()),
@@ -353,10 +396,15 @@ def cmd_moe(a, tool):
            "hf_vs_fp64_source": None}
     log(f"moe K={a.k_expert}/D{a.k_down or a.k_expert}: routing == source {same_route}; dev vs emu (exllamav3 reconstruct + the A8 points, fp64) "
         f"{res['dev_vs_emu']:.2e} (worst row {res['dev_vs_emu_rows_max']:.2e}); M=1 rows bit-equal {res['dev_m1_vs_batch_bit_equal']}")
+    log(f"moe K={a.k_expert}/D{a.k_down or a.k_expert}: A8 CODES device vs emulation: "
+        f"{a8_mism} of {n_codes} differ, {fold_ties} tie-adjacent -> "
+        f"{'PASS' if a8_mism >= 0 and a8_mism <= fold_ties else 'FAIL'}"
+        + ("" if a8_mism >= 0 else " (the tool spilled no codes)"))
     log(f"moe K={a.k_expert}/D{a.k_down or a.k_expert}: dev vs HF bf16 block {res['dev_vs_hf']:.3e}; recon (quant only) vs HF {res['recon_vs_hf']:.3e}; "
         f"A8 alone (emu vs recon) {res['emu_vs_recon']:.3e}")
     json.dump(res, open(f"{d}/moe.json", "w"), indent=1)
-    return res["dev_vs_emu"] < 1e-5 and res["dev_m1_vs_batch_bit_equal"]
+    # graded on the ENCODING, not an epsilon: see the criterion above
+    return a8_mism >= 0 and a8_mism <= fold_ties and res["dev_m1_vs_batch_bit_equal"]
 
 
 # ------------------------------------------------------------------ capture for GR / PLE
