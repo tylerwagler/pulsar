@@ -257,6 +257,27 @@ int main(int argc, char **argv) {
                    d, am, (double)row[am], ram, (double)rr[ram], kl, slope, icept, resid,
                    (unsigned long long)he, (unsigned long long)hr,
                    (am == recs[k].argmax) ? "" : "   <-- ARGMAX MISMATCH");
+            /* The top 5 of each row, token by token.  A uniform scale keeps the SAME
+             * tokens on top with proportional values; a structural difference puts
+             * different tokens there.  The whole-row fit cannot tell those apart because
+             * 248k near-zero tails outvote the handful of entries that decide the
+             * distribution, which is exactly what the sub-1 slopes above are. */
+            int et[5], rt[5];
+            for (int q = 0; q < 5; q++) {
+                int be = -1, br = -1;
+                for (int j = 0; j < W; j++) {
+                    bool ue = false, ur = false;
+                    for (int z = 0; z < q; z++) { if (et[z] == j) ue = true; if (rt[z] == j) ur = true; }
+                    if (!ue && (be < 0 || row[j] > row[be])) be = j;
+                    if (!ur && (br < 0 || rr[j] > rr[br])) br = j;
+                }
+                et[q] = be; rt[q] = br;
+            }
+            printf("               eng top5");
+            for (int q = 0; q < 5; q++) printf(" %d@%.3f", et[q], (double)row[et[q]]);
+            printf("\n               ref top5");
+            for (int q = 0; q < 5; q++) printf(" %d@%.3f", rt[q], (double)rr[rt[q]]);
+            printf("\n");
             if (am == recs[k].argmax) am_ok++;
         }
         check(graded == nr && am_ok == nr, "%s: argmax matches at %d / %d depths", prompts[i], am_ok, nr);
