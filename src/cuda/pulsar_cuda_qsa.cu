@@ -20,7 +20,7 @@
  *                   heads against the split's FP8 K/V on the tensor cores -> an
  *                   unnormalised partial
  *   qsa_combine     fold the splits IN ORDER, divide, times sigmoid(gate), emit
- *                   the o_proj E4M3 slot (and the f32 tap when asked)
+ *                   the o_proj BF16 input (and the f32 tap when asked)
  *
  * ONE ARITHMETIC PER ROW.  Nothing a row computes depends on what else is in
  * the call: splits are 64 LISTED tokens whatever the batch, the fold order is
@@ -401,7 +401,7 @@ __device__ __forceinline__ void qsa_load_tile(uint8_t *td, float *tsc, const uin
 template <bool FOLD>
 __global__ void __launch_bounds__(128) qsa_attn_kernel(
         const qsa_row *rows, uint32_t row0, const uint32_t *sel, const float *q, const float *qg,
-        float *part, float2 *ml, __nv_fp8_e4m3 *out, unsigned char *out_scale, int kbp, float *tap) {
+        float *part, float2 *ml, __nv_bfloat16 *out, float *tap) {
     __shared__ __align__(16) float qs[QSA_GQA * PULSAR_QSA_HEAD_DIM];
     __shared__ __align__(16) uint8_t td[QSA_SPLIT * QSA_TPITCH];
     __shared__ float tsc[QSA_SPLIT * 8u];
@@ -573,49 +573,35 @@ __global__ void __launch_bounds__(128) qsa_attn_kernel(
     }
     if constexpr (FOLD) {
 
-        /* ---- the epilogue in place: gate, the f32 tap, and the o_proj E4M3 slot.  A
-         * 32-dim MX block of one head lives in the 4 lanes of a quad (8 values each). */
+        /* ---- the epilogue in place: gate, the f32 tap, and the o_proj BF16 input */
         #pragma unroll
         for (uint32_t hh = 0; hh < 2u; hh++) {
-            const bool live = hh == 0u || row_hi_live;   /* quad-uniform; dead quads still shuffle */
+            if (hh == 1u && !row_hi_live) break;
             const uint32_t head = g * QSA_GQA + gr + 8u * hh;
-            const float *gate = qg + (uint64_t)r * PULSAR_QSA_Q_IN + (uint64_t)(live ? head : 0u) * 2u * PULSAR_QSA_HEAD_DIM
+            const float *gate = qg + (uint64_t)r * PULSAR_QSA_Q_IN + (uint64_t)head * 2u * PULSAR_QSA_HEAD_DIM
                                 + PULSAR_QSA_HEAD_DIM;
             #pragma unroll
             for (uint32_t bb = 0; bb < 2u; bb++) {
                 const uint32_t b = 2u * w + bb;
-                float y[4][2];
-                float amax = 0.f;
                 #pragma unroll
                 for (uint32_t nt = 0; nt < 4u; nt++) {
                     const uint32_t d = b * 32u + nt * 8u + 2u * c;
-                    y[nt][0] = live ? qsa_gated(FA[bb][nt][2 * hh], FL[hh], gate[d]) : 0.f;
-                    y[nt][1] = live ? qsa_gated(FA[bb][nt][2 * hh + 1], FL[hh], gate[d + 1u]) : 0.f;
-                    amax = fmaxf(amax, fmaxf(fabsf(y[nt][0]), fabsf(y[nt][1])));
+                    const float y0 = qsa_gated(FA[bb][nt][2 * hh], FL[hh], gate[d]);
+                    const float y1 = qsa_gated(FA[bb][nt][2 * hh + 1], FL[hh], gate[d + 1u]);
+                    const uint64_t at = (uint64_t)r * PULSAR_QSA_OUT_DIM + head * PULSAR_QSA_HEAD_DIM + d;
+                    *reinterpret_cast<__nv_bfloat162 *>(&out[at]) = __floats2bfloat162_rn(y0, y1);
+                    if (tap) *reinterpret_cast<float2 *>(&tap[at]) = make_float2(y0, y1);
                 }
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-                const int se = pulsar_mx_shared_exp(amax);
-                if (!live) continue;
-                const uint32_t col0 = head * PULSAR_QSA_HEAD_DIM + b * 32u;
-                #pragma unroll
-                for (uint32_t nt = 0; nt < 4u; nt++) {
-                    const uint32_t col = col0 + nt * 8u + 2u * c;
-                    out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = pulsar_mx_encode(y[nt][0], se);
-                    out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col + 1u] = pulsar_mx_encode(y[nt][1], se);
-                    if (tap) *reinterpret_cast<float2 *>(&tap[(uint64_t)r * PULSAR_QSA_OUT_DIM + col]) = make_float2(y[nt][0], y[nt][1]);
-                }
-                if (c == 0u) out_scale[pulsar_mx_sfoff((int)r, (int)(col0 >> 5), kbp)] = pulsar_mx_scale_byte(se);
             }
         }
     }
 }
 
-/* ---- fold + gate + o_proj slot for the split schedule ------------------------ *
+/* ---- fold + gate + o_proj input for the split schedule ------------------------ *
  * grid (row in group, query head); thread = dim. */
 __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
         const qsa_row *rows, uint32_t row0, const float *part, const float2 *ml, const float *qg,
-        __nv_fp8_e4m3 *out, unsigned char *out_scale, int kbp, float *tap) {
+        __nv_bfloat16 *out, float *tap) {
     const uint32_t rg = blockIdx.x, h = blockIdx.y, d = threadIdx.x, r = row0 + rg;
     const qsa_row row = rows[r];
     const uint32_t ns = (row.n_list + QSA_SPLIT - 1u) / QSA_SPLIT;
@@ -628,8 +614,8 @@ __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
     const float y = qsa_gated(A, L, qg[(uint64_t)r * PULSAR_QSA_Q_IN + (uint64_t)h * 2u * PULSAR_QSA_HEAD_DIM
                                        + PULSAR_QSA_HEAD_DIM + d]);
     const uint32_t col = h * PULSAR_QSA_HEAD_DIM + d;
+    out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = __float2bfloat16_rn(y);
     if (tap) tap[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = y;
-    pulsar_mx_emit_block(y, col, r, PULSAR_QSA_OUT_DIM, kbp, out, out_scale);
 }
 
 __global__ void qsa_sel_tap_kernel(const qsa_row *rows, const uint32_t *sel, uint32_t *tap, uint32_t n_rows) {
@@ -732,8 +718,8 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         !io->v || io->v->bytes < R * PULSAR_QSA_KV_IN * 4u || !io->idx || io->idx->bytes < R * PULSAR_QSA_IDX_IN * 4u) {
         return qsa_refuse("a projection input is missing or shorter than n_rows rows");
     }
-    if (!io->out_e4m3 || !io->out_scale || io->out_sf_pitch != pulsar_mx_kbp(PULSAR_QSA_OUT_DIM)) {
-        return qsa_refuse("no o_proj E4M3 slot (or its scale pitch is not the 6144-wide KBp)");
+    if (!io->out || io->out->bytes < R * PULSAR_QSA_OUT_DIM * 2u) {
+        return qsa_refuse("no o_proj BF16 input buffer of n_rows x 6144");
     }
     if ((io->tap_out_f32 && io->tap_out_f32->bytes < R * PULSAR_QSA_OUT_DIM * 4u) ||
         (io->tap_sel && io->tap_sel->bytes < R * PULSAR_QSA_TOP_BLOCKS * 4u)) {
@@ -845,22 +831,21 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
     }
 
     {
-        __nv_fp8_e4m3 *o8 = (__nv_fp8_e4m3 *)io->out_e4m3;
-        unsigned char *osc = (unsigned char *)io->out_scale;
+        __nv_bfloat16 *ob = (__nv_bfloat16 *)io->out->ptr;
         float *tap = io->tap_out_f32 ? (float *)io->tap_out_f32->ptr : nullptr;
         const float *qg = (const float *)io->qg->ptr;
         if (n_rows >= QSA_FOLD_ROWS) {
             qsa_attn_kernel<true><<<dim3(1, PULSAR_QSA_N_KV, n_rows), 128>>>(ws.rows, 0, ws.sel, ws.q, qg, nullptr,
-                                                                            nullptr, o8, osc, io->out_sf_pitch, tap);
+                                                                            nullptr, ob, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa attention (fold) launch")) return 0;
         } else {
             uint32_t ns_max = 0;
             for (uint32_t i = 0; i < n_rows; i++) ns_max = std::max(ns_max, (h_rows[i].n_list + QSA_SPLIT - 1u) / QSA_SPLIT);
             qsa_attn_kernel<false><<<dim3(ns_max, PULSAR_QSA_N_KV, n_rows), 128>>>(ws.rows, 0, ws.sel, ws.q, qg, ws.part,
-                                                                                  ws.ml, o8, osc, io->out_sf_pitch, tap);
+                                                                                  ws.ml, ob, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa attention (split) launch")) return 0;
             qsa_combine_kernel<<<dim3(n_rows, PULSAR_QSA_N_HEAD), PULSAR_QSA_HEAD_DIM>>>(
-                    ws.rows, 0, ws.part, ws.ml, qg, o8, osc, io->out_sf_pitch, tap);
+                    ws.rows, 0, ws.part, ws.ml, qg, ob, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa combine launch")) return 0;
         }
     }

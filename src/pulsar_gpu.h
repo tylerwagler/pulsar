@@ -2497,7 +2497,8 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
 /* ---- Qwen3.8-Flash-Next full attention + QSA (L251 stream S3) ----------------
  * One of the 12 full-attention layers (3, 7, ..., 47) between its Linears: the
  * caller runs q_proj / k_proj / v_proj / index_qk_proj (f32 outputs) and o_proj
- * (which reads the E4M3 slot this emits).  Semantics are transformers
+ * (which reads the BF16 activation this emits -- Qwen activations are BF16, the
+ * source's own format; L251, Tyler 2026-09-27).  Semantics are transformers
  * `qwen4_exp` (Qwen4ExpTextAttention + Qwen4ExpTextQSAIndexer), text positions
  * only (the three mRoPE rows equal, so interleaved mRoPE is plain RoPE):
  *   q_proj row = 24 heads x [256 query | 256 sigmoid output gate] (per head)
@@ -2564,11 +2565,9 @@ typedef struct {
     const pulsar_gpu_tensor *k;     /**< f32 [n_rows][512] k_proj output */
     const pulsar_gpu_tensor *v;     /**< f32 [n_rows][512] v_proj output */
     const pulsar_gpu_tensor *idx;   /**< f32 [n_rows][640] index_qk_proj output */
-    void *out_e4m3;                 /**< o_proj A8 slot: E4M3 [n_rows][6144] ... */
-    void *out_scale;                /**< ... and its swizzled E8M0 slab (zeroed by the slot) */
-    int   out_sf_pitch;             /**< the slot's KBp */
+    pulsar_gpu_tensor *out;         /**< o_proj input: BF16 [n_rows][6144], the gated attention output */
     /** Observation taps for gates; NULL in the lane.  out_f32 = the gated
-     * attention output the slot encodes; sel = each row's selected blocks,
+     * attention output before its BF16 rounding; sel = each row's selected blocks,
      * ascending, or all 0xffffffff for a row that attends to every token. */
     pulsar_gpu_tensor *tap_out_f32; /**< f32 [n_rows][6144] */
     pulsar_gpu_tensor *tap_sel;     /**< u32 [n_rows][512] */
