@@ -313,3 +313,21 @@ above carry pulsar-only additions that are **purely additive** (new symbols and
 one new dispatch branch); re-apply them after any re-sync.
 `gguf-tools/d2r_iq2_single_launch.inc` and `gguf-tools/patch_iq2_d2r_single.py`
 reproduce both mechanically.
+
+## Local modifications: `ds4_mmq.cu` (L251 / `ac69748f`)
+
+Recorded for the next upstream sync.  One change, additive and defaulted off:
+
+* **`ds4_mmq_moe_impl` gained a trailing `bool act_bf16 = false`.**  With it false nothing differs.  With it
+  true the function refuses a bf16 activation on the IQ2 arm by name, **skips** the D2R precondition, the
+  `src1_e4m3_p` memset and the whole `ds4_gather_mmq_e4m3_cuda` gather (bf16 has nothing to encode), and calls
+  `ds4_exl3_moe_gemv_{fused,single}_bf16_launch` with `ids_src1` — the source row, not `ids_dst`, which is the
+  flat output row.  Two public wrappers were added beside the A8 ones: `ds4_exl3_moe_fused_bf16` and
+  `ds4_exl3_moe_single_bf16`.
+
+  Reason: the contract `ac69748f` says the Qwen family has no E4M3 activation slot.  Keeping the gather would
+  have meant encoding a format the family does not use, and reading it back through `ids_dst` would have been
+  silently wrong for every slot past the first.
+
+**On re-sync:** if upstream changes the activation staging or the `mm_ids_helper` contract, re-apply this on top
+rather than merging it; the guard's shape (refuse, do not fall back) is the part that matters.
