@@ -104,6 +104,49 @@ __device__ __forceinline__ float mx_scale2(unsigned sw, unsigned sx) {
     return exp2f((float)((int)sw + (int)sx - 254));
 }
 
+/* One E8M0 byte as its scale: 2^(b-127).  mx_scale2's single-operand form. */
+__device__ __forceinline__ float mx_scale1(unsigned sb) {
+    return exp2f((float)((int)sb - 127));
+}
+
+/* 32 E4M3 weight codes against 32 BF16 activations (L251 / ac69748f, the W8A16 shape).
+ * The W8 weights arrive exactly as they do in e4m3_dot32 above (2 uint4 = 32 bytes = 32 codes);
+ * the activation is the block input's bf16 row, so 32 of them are 4 uint4 (2 bf16 per uint32).
+ * The scale is the weight's E8M0 alone -- bf16 carries its own exponent, so there is no second
+ * block scale to fold in.  The E4M3 decode is the same `__nv_cvt_fp8x2_to_halfraw2` the A8 path
+ * uses, so the weights are read bit-identically to W8A8; only the activation operand changed. */
+__device__ __forceinline__ float e4m3_bf16_dot32(const uint4 &w0, const uint4 &w1,
+                                                const uint4 &b0, const uint4 &b1,
+                                                const uint4 &b2, const uint4 &b3) {
+    const uint32_t *wa = reinterpret_cast<const uint32_t *>(&w0);
+    const uint32_t *wb = reinterpret_cast<const uint32_t *>(&w1);
+    const uint32_t *xa = reinterpret_cast<const uint32_t *>(&b0);
+    const uint32_t *xb = reinterpret_cast<const uint32_t *>(&b1);
+    const uint32_t *xc = reinterpret_cast<const uint32_t *>(&b2);
+    const uint32_t *xd = reinterpret_cast<const uint32_t *>(&b3);
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        /* weight word i holds E4M3 codes [4i, 4i+4); the matching bf16 are words 2i and 2i+1 */
+        const uint32_t wv = i < 4 ? wa[i] : wb[i - 4];
+        const int j = 2 * i;
+        const uint32_t xv = j < 4 ? xa[j] : (j < 8 ? xb[j - 4] : (j < 12 ? xc[j - 8] : xd[j - 12]));
+        const uint32_t yv = (j + 1) < 4 ? xa[j + 1] : ((j + 1) < 8 ? xb[j + 1 - 4]
+                          : ((j + 1) < 12 ? xc[j + 1 - 8] : xd[j + 1 - 12]));
+        const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xv));
+        const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&yv));
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const __half2_raw wr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(wv >> (16 * h)), __NV_E4M3);
+            const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wr));
+            const float2 af = h == 0 ? a0 : a1;
+            s = fmaf(wf.x, af.x, s);
+            s = fmaf(wf.y, af.y, s);
+        }
+    }
+    return s;
+}
+
 /* The block reduction every kernel here uses: warp xor tree, then the warps
  * in order.  `red` holds one float per warp. */
 __device__ __forceinline__ float block_sum(float v, float *red) {
@@ -161,7 +204,7 @@ qwen_gr_norm_kernel(const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat
  * MXFP8: 32-blocks, (W_row,blk . x_t,blk) 2^(sw + sx); BF16: 8-element chunks.
  * One warp per row; lane l takes the split's blocks (chunks) l, l + 32, ... in
  * order; the xor tree sums lanes.  Row arithmetic is independent of T. */
-template <bool W8>
+template <bool W8, bool A8 = W8>
 __global__ void __launch_bounds__(256)
 qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                     const void *__restrict__ xv, const uint8_t *__restrict__ xsf, int x_kbp,
@@ -174,7 +217,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
     float acc[kDownTB];
 #pragma unroll
     for (int tt = 0; tt < kDownTB; ++tt) acc[tt] = 0.0f;
-    if constexpr (W8) {
+    if constexpr (W8 && A8) {
         const uint8_t *wq = (const uint8_t *)wv, *xq = (const uint8_t *)xv;
         const int nblk = in / 32, per = nblk / n_split, b0 = split * per;
         const int w_kbp = pulsar_mx_kbp(in);
@@ -189,6 +232,27 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
                     const uint4 *xp = reinterpret_cast<const uint4 *>(xq + (size_t)t * in + (size_t)b * 32);
                     const float d = e4m3_dot32(w0, w1, xp[0], xp[1]);
                     acc[tt] = fmaf(d, mx_scale2(sw, xsf[pulsar_mx_sfoff(t, b, x_kbp)]), acc[tt]);
+                }
+            }
+        }
+    } else if constexpr (W8) {
+        /* W8A16 (L251 / ac69748f): mxfp8_lt weights against the block input's bf16 row.  The weights
+         * are read bit-identically to the W8A8 branch above; the activation is bf16, so 32 of them
+         * need 4 uint4 instead of 2 -- that asymmetry is the whole difference. */
+        const uint8_t *wq = (const uint8_t *)wv;
+        const __nv_bfloat16 *xb = (const __nv_bfloat16 *)xv;
+        const int nblk = in / 32, per = nblk / n_split, b0 = split * per;
+        const int w_kbp = pulsar_mx_kbp(in);
+        for (int b = b0 + lane; b < b0 + per; b += 32) {
+            const uint4 *wp = reinterpret_cast<const uint4 *>(wq + (size_t)row * in + (size_t)b * 32);
+            const uint4 w0 = wp[0], w1 = wp[1];
+            const float wsc = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
+#pragma unroll
+            for (int tt = 0; tt < kDownTB; ++tt) {
+                if (tt < nt) {
+                    const int t = t0 + tt;
+                    const uint4 *xp = reinterpret_cast<const uint4 *>(xb + (size_t)t * in + (size_t)b * 32);
+                    acc[tt] = fmaf(e4m3_bf16_dot32(w0, w1, xp[0], xp[1], xp[2], xp[3]), wsc, acc[tt]);
                 }
             }
         }
@@ -459,10 +523,8 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
      * garbage, which is precisely what VENDOR.md warns about ("compiling is not evidence of
      * correctness").  Refuse by name until the W8A16 branch is built; the engine's rule is one path or
      * an error, never a second format chosen silently. */
-    fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs the W8A16 arm (mxfp8_lt weights x bf16 "
-                    "activation), which is NOT built yet -- refusing (L251/ac69748f)\n",
-            l->in, l->out);
-    return -1;   /* no unreachable arm kept alive below this: rule 2 */
+    const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
+    qwen_gr_down_kernel<true, false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
     const cudaError_t qe = cudaGetLastError();
     if (qe != cudaSuccess) {
         fprintf(stderr, "pulsar: qwen mxfp8 linear launch: %s\n", cudaGetErrorString(qe));
