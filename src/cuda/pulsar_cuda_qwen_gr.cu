@@ -298,8 +298,10 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                   __nv_bfloat16 *__restrict__ x_out) {
     constexpr int NB = kR / 32;
     __shared__ float prod[kUpTB][kS][32];
-    __shared__ __align__(16) uint8_t s_a[kUpTB][W8 ? kR : 2 * kR];   /* a: E4M3 codes or bf16 */
-    __shared__ unsigned char s_asf[kUpTB][NB];                       /* a's E8M0 per 32 (W8) */
+    /* L251 / ac69748f: `a` is bf16 whatever W_up's WEIGHT format is -- this was the last op-internal
+     * E4M3 activation in the read.  W8 now means E4M3 weights against a bf16 activation, the same
+     * W8A16 shape the down already uses, so e4m3_bf16_dot32 serves here too. */
+    __shared__ __align__(16) uint8_t s_a[kUpTB][2 * kR];
     const int s = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int c = blockIdx.x * 32 + lane;
     const int row = s * kH + c;
@@ -312,17 +314,7 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         for (int sp = 0; sp < kDownSplit; ++sp) d += part[((size_t)(t0 + tt) * kDownSplit + sp) * kR + r];
         const float zz = d * (1.0f / kS);
         const float av = zz / (1.0f + expf(-zz));
-        if constexpr (W8) {
-            float am = fabsf(av);
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-            const int se = pulsar_mx_shared_exp(am);
-            const __nv_fp8_e4m3 q = pulsar_mx_encode(av, se);
-            s_a[tt][r] = *reinterpret_cast<const uint8_t *>(&q);
-            if (lane == 0) s_asf[tt][b] = pulsar_mx_scale_byte(se);
-        } else {
-            reinterpret_cast<__nv_bfloat16 *>(s_a[tt])[r] = __float2bfloat16(av);
-        }
+        reinterpret_cast<__nv_bfloat16 *>(s_a[tt])[r] = __float2bfloat16(av);
     }
     if (injp && blockIdx.x == 0 && (int)threadIdx.x < nt * kS) {
         const int tt = threadIdx.x / kS, j = threadIdx.x % kS, t = t0 + tt;
@@ -344,8 +336,11 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
 #pragma unroll
             for (int tt = 0; tt < kUpTB; ++tt) {
                 if (tt < nt) {
-                    const uint4 *ap = reinterpret_cast<const uint4 *>(s_a[tt]) + 2 * b;
-                    z[tt] = fmaf(e4m3_dot32(w0, w1, ap[0], ap[1]), mx_scale2(sw, s_asf[tt][b]), z[tt]);
+                    /* 32 bf16 activations are FOUR uint4 where 32 E4M3 were two, and the weight's
+                     * E8M0 is the only scale left to apply (bf16 carries its own exponent). */
+                    const uint4 *ap = reinterpret_cast<const uint4 *>(s_a[tt]) + 4 * b;
+                    z[tt] = fmaf(e4m3_bf16_dot32(w0, w1, ap[0], ap[1], ap[2], ap[3]),
+                                 mx_scale1(sw), z[tt]);
                 }
             }
         }

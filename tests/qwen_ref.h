@@ -128,7 +128,10 @@ inline gr_out gr_read(const uint16_t *streams, const uint16_t *norm_w, const mx8
         const double r = 1.0 / sqrt(ss / H + EPS);
         for (int c = 0; c < H; c++) xn[s * H + c] = bf(streams[s * H + c]) * r * (1.0 + bf(norm_w[s * H + c]));
     }
-    mx_encode_row(xn.data(), HC, 0, pulsar_mx_kbp(HC), nullptr, nullptr, xnd.data());
+    /* L251 / ac69748f: the read emits bf16 now, not an E4M3 slot, so the reference rounds to
+     * bf16.  Keeping the E4M3 round-trip here modelled the old kernel and would fail a correct
+     * one by ~2.4% -- which is exactly what it did before this line changed. */
+    for (int k = 0; k < HC; k++) xnd[k] = bf_round(xn[k]);
     gr_out o;
     for (int j = 0; j < S; j++) {
         double z = 0;
@@ -141,7 +144,7 @@ inline gr_out gr_read(const uint16_t *streams, const uint16_t *norm_w, const mx8
         for (int k = 0; k < HC; k++) d += down.at(r, k) * xnd[k];
         a[r] = silu(d / S);
     }
-    mx_encode_row(a.data(), R, 0, pulsar_mx_kbp(R), nullptr, nullptr, ad.data());
+    for (int r = 0; r < R; r++) ad[r] = bf_round(a[r]);   /* bf16, as the up kernel writes it */
     o.x.assign(H, 0.0);
     for (int c = 0; c < H; c++) {
         double acc = 0;
@@ -216,7 +219,8 @@ inline void ple_token(const uint16_t *emb, const linear &key, const linear &valu
                       std::vector<std::vector<double>> &hist) {
     std::vector<double> e(H), ed(H), k(HC), v(H);
     for (int c = 0; c < H; c++) e[c] = bf(emb[c]);
-    mx_encode_row(e.data(), H, 0, pulsar_mx_kbp(H), nullptr, nullptr, ed.data());
+    /* L251 / ac69748f: the PLE's gathered rows are bf16 and its projections read them directly. */
+    for (int k = 0; k < H; k++) ed[k] = bf_round(e[k]);
     key.run(ed.data(), k.data());
     value.run(ed.data(), v.data());
     std::vector<double> gv(HC), gvn(HC);
@@ -272,7 +276,8 @@ inline void moe_token(const double *x, const int32_t *sel, const double *w, doub
         const uint16_t *suh = (const uint16_t *)(ex.down->bytes.data() + trellis);
         for (int n = 0; n < MID; n++) t[n] = silu(yg[n]) * yu[n] * w[k] * exl3_f16_to_f32(suh[n]);
         for (int i = 0; i < MID; i += 128) exl3_had128(t.data() + i);
-        mx_encode_row(t.data(), MID, 0, pulsar_mx_kbp(MID), nullptr, nullptr, td.data());
+        /* L251 / ac69748f: the fold emits bf16, not an E4M3 slot. */
+        for (int k = 0; k < MID; k++) td[k] = bf_round(t[k]);
         /* y = svh H(W^T td): the down's reference minus its input rotation */
         std::vector<double> z(H, 0.0);
         for (int kk = 0; kk < MID; kk++)
@@ -285,7 +290,8 @@ inline void moe_token(const double *x, const int32_t *sel, const double *w, doub
     sg.run(x, hg.data());
     su.run(x, hu.data());
     for (int n = 0; n < sg.out; n++) h[n] = silu(hg[n]) * hu[n];
-    mx_encode_row(h.data(), sg.out, 0, pulsar_mx_kbp(sg.out), nullptr, nullptr, hd.data());
+    /* L251 / ac69748f: the shared expert's SwiGLU emits bf16. */
+    for (int k = 0; k < sg.out; k++) hd[k] = bf_round(h[k]);
     sd.run(hd.data(), ys.data());
     for (int o = 0; o < H; o++) out[o] += sgate * ys[o];
 }
