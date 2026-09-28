@@ -643,6 +643,16 @@ int ds4_exl3_moe_gemv_fused_bf16_launch(const void *table, int k2, const void *a
                                            out, nullptr, M, K, n_assign, n_experts, 0, stream);
 }
 
+/* The down arm over the same bf16 activation.  Its input is the FOLD's output, which is an op-internal
+ * Linear activation and so follows the same rule -- bf16, not an E4M3 slot. */
+int ds4_exl3_moe_gemv_single_bf16_launch(const void *table, int k2, const void *act,
+                                         const int32_t *ids_dst, const int32_t *expert_bounds,
+                                         float *out, int M, int K, int64_t n_assign,
+                                         int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kDown, false>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                          out, nullptr, M, K, n_assign, n_experts, 0, stream);
+}
+
 int ds4_exl3_moe_gemv_fused_launch_rows(const void *table, int k2, const void *act,
                                         const int32_t *ids_dst, const int32_t *expert_bounds,
                                         float *out, int M, int K, int64_t n_assign,
