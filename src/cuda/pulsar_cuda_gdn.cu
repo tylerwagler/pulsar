@@ -1,6 +1,7 @@
 /* Gated DeltaNet kernels (L251, Qwen3.8-Flash-Next) -- the contract, the
  * reference math and the state layout are in pulsar_cuda_gdn.h. */
 #include "pulsar_cuda_gdn.h"
+#include <cuda_bf16.h>
 #include "pulsar_cuda_mx.cuh"
 
 #include <cooperative_groups.h>
@@ -172,6 +173,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
                       float *__restrict__ out_f32,
+                      __nv_bfloat16 *__restrict__ out_bf16,
                       __nv_fp8_e4m3 *__restrict__ out_q,
                       unsigned char *__restrict__ out_s, int kbp) {
     __shared__ float4 sq[T2][DK / 4], sk[T2][DK / 4];
@@ -275,6 +277,9 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
             const float zz = z[(size_t)row * ld_z + h * DV + col];
             const float y = nw * (so[j][lane] * inv) * (1.f / (1.f + __expf(-zz)));
             if (out_f32) out_f32[(size_t)row * VDIM + h * DV + col] = y;
+            /* L251 / ac69748f: the GDN output's bf16 row is what the out_proj reads, so the op
+             * emits it here rather than an E4M3 slot (rule 3: the producer decides the format). */
+            if (out_bf16) out_bf16[(size_t)row * VDIM + h * DV + col] = __float2bfloat16(y);
             if (out_q) pulsar_mx_emit_block(y, (uint32_t)(h * DV + col), (uint32_t)row, VDIM, kbp, out_q, out_s);
         }
         tpar ^= 1;
@@ -314,7 +319,9 @@ extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_
     if (c->ld_qkv < QKV || c->ld_z < VDIM || c->ld_a < NV || c->ld_b < NV || (c->ld_qkv & 3) || (c->ld_z & 3))
         return refuse("an input pitch is short or not a multiple of 4 floats");
     if (!c->scratch || c->scratch_bytes < pulsar_gdn_scratch_bytes(rows)) return refuse("scratch missing or short");
-    if (!c->out_f32 && !c->out_e4m3) return refuse("no output (out_f32 and out_e4m3 both NULL)");
+    if (!c->out_f32 && !c->out_e4m3 && !c->out_bf16)
+        return refuse("no output (out_f32, out_e4m3 and out_bf16 all NULL)");
+    if (c->out_bf16 && ((uintptr_t)c->out_bf16 & 1u)) return refuse("out_bf16 not 2-byte aligned");
     if (c->out_f32 && !aligned16(c->out_f32)) return refuse("out_f32 not 16-byte aligned");
     if (c->out_e4m3 && (!c->out_scale || c->out_kbp != pulsar_mx_kbp(VDIM) || ((uintptr_t)c->out_e4m3 & 3u)))
         return refuse("A8 slot: scale missing, kbp != pulsar_mx_kbp(6144), or data not 4-byte aligned");
@@ -328,7 +335,8 @@ extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_
         c->seq_rows, c->row_slot, c->conv_state, qkvn, gb, tiles);
     gdn_recur_norm_kernel<<<dim3((unsigned)c->n_seq, NV, VQ), 256, 0, stream>>>(
         qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->row_slot, c->rec_state,
-        c->out_f32, static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
+        c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
+        static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "pulsar: gdn: launch failed: %s\n", cudaGetErrorString(e));

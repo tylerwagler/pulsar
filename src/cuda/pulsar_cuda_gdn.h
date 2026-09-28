@@ -114,6 +114,8 @@ typedef struct {
     void          *scratch;           /**< >= pulsar_gdn_scratch_bytes(rows) */
     size_t         scratch_bytes;
     float         *out_f32;           /**< [rows][6144] or NULL */
+    void          *out_bf16;          /**< bf16 [rows][6144] or NULL -- what the Qwen out_proj reads
+                                       *   (L251 / ac69748f: no E4M3 activation slot) */
     void          *out_e4m3;          /**< A8 slot data [rows][6144] or NULL */
     void          *out_scale;         /**< A8 slot ue8m0 scales (zeroed by the slot owner) */
     int            out_kbp;           /**< must equal pulsar_mx_kbp(6144) = 192 */
