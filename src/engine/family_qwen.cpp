@@ -733,9 +733,20 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
          * of to "the model".  The dump helpers re-check the arming themselves
          * (PULSAR_CUDA_GRAPH_DUMP_PREFIX, plus _LAYER/_NAME/_POS), so an unarmed run
          * does no work and allocates nothing. */
-        if (ok) gpu_graph_debug_dump_hc_tensor("qwen_h", s->qwen->streams,
-                                              (uint64_t)n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
+        if (ok && gpu_graph_debug_dump_enabled()) {
+            /* Only the LAST row of the step: the reference tap keeps one position
+             * (10240 f32 = 40 KB), so dumping the whole [n_rows][n_hc][n_embd] stream
+             * buffer would write gigabytes for one comparable number.  The stream is
+             * bf16, hence the ELT size in the byte offset, and the dump helper widens. */
+            const uint64_t hcb = (uint64_t)pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
+            pulsar_gpu_tensor *tap = pulsar_gpu_tensor_view(s->qwen->streams,
+                                                            (uint64_t)(n_rows - 1) * hcb, hcb);
+            if (tap) {
+                gpu_graph_debug_dump_hc_tensor("qwen_h", tap, pulsar_qwen_hc_dim(&g_qwen_shape),
                                               il, (uint32_t)pos[n_rows - 1]);
+                pulsar_gpu_tensor_free(tap);
+            }
+        }
     }
     if (ok && head_n) ok = ops->head(&st, head_row0, head_n);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
