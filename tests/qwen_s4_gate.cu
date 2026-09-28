@@ -96,22 +96,9 @@ static double bf_ulps(double got, double want) {
     const double ulp = a > 0 ? ldexp(1.0, (int)floor(log2(a)) - 7) : ldexp(1.0, -133);
     return fabs(got - want) / ulp;
 }
-/* an A8 slot on the device for rows of n from host bf16 rows (the producer encoding) */
-struct dslot { pulsar_qwen_slot s; };
-static dslot make_dslot(const std::vector<uint16_t> &rows, int T, int n, std::vector<double> *dec) {
-    const int kbp = pulsar_mx_kbp(n);
-    std::vector<uint8_t> q((size_t)T * n), sf(pulsar_mx_sf_slab_bytes(T, kbp), 0);
-    std::vector<double> v(n), d(n);
-    if (dec) dec->assign((size_t)T * n, 0.0);
-    for (int r = 0; r < T; r++) {
-        for (int k = 0; k < n; k++) v[k] = bf(rows[(size_t)r * n + k]);
-        mx_encode_row(v.data(), n, r, kbp, q.data() + (size_t)r * n, sf.data(), d.data());
-        if (dec) std::copy(d.begin(), d.end(), dec->begin() + (size_t)r * n);
-    }
-    dslot s;
-    s.s.q = up(q); s.s.sf = up(sf); s.s.kbp = kbp;
-    return s;
-}
+/* L251 / ac69748f: make_dslot and its dslot wrapper are DELETED, not updated.  They built the A8
+ * slot a consumer would read; this family has no E4M3 activation slot, the MoE reads the bf16 rows
+ * directly, and the reference activation is the bf16 value rather than a decoded E4M3 code. */
 
 /* ======================================================================== */
 static void section_mxfp8_linear(void);   /* defined at the end */
@@ -216,18 +203,16 @@ static void section_gr(void) {
     std::vector<uint16_t> st = rnd_act(T, HC, 0.8);
     pulsar_qwen_gr_dev w = dev_gr(g, true);
     uint16_t *dst = up(st), *xo = (uint16_t *)dalloc((size_t)T * H * 2);
-    pulsar_qwen_slot xs = {(uint8_t *)dalloc((size_t)T * H), (uint8_t *)dalloc(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(H))), pulsar_mx_kbp(H)};
+    /* L251 / ac69748f: the read emits bf16 only -- there is no E4M3 slot to allocate, arm or grade. */
     float *inj = (float *)dalloc((size_t)T * S * 4);
     const size_t wsb = pulsar_qwen_gr_workspace_bytes(T);
     void *ws = dalloc(wsb);
-    int rc = pulsar_qwen_gr_read_launch(&w, dst, T, xo, &xs, inj, ws, wsb, 0);
+    int rc = pulsar_qwen_gr_read_launch(&w, dst, T, xo, inj, ws, wsb, 0);
     CHECK(rc == 0, "read launch T=%d", T);
     const auto X = down(xo, (size_t)T * H);
     const auto I = down(inj, (size_t)T * S);
-    const auto XQ = down(xs.q, (size_t)T * H);
-    const auto XSF = down(xs.sf, pulsar_mx_sf_slab_bytes(T, xs.kbp));
     double worst_ulp = 0, inj_rel = 0;
-    size_t over1 = 0, slot_bad = 0, med_n = 0;
+    size_t over1 = 0, med_n = 0;
     double med_sum = 0;
     for (int t = 0; t < T; t++) {
         const gr_out o = gr_read(&st[(size_t)t * HC], g.norm.data(), g.down_w, g.up_w, g.inject.data());
@@ -239,22 +224,15 @@ static void section_gr(void) {
             med_n++;
         }
         for (int j = 0; j < S; j++) inj_rel = fmax(inj_rel, fabs(I[t * S + j] - o.inj[j]) / o.inj[j]);
-        /* the slot must be the producer encoding of the device's own bf16 row */
-        std::vector<double> v(H);
-        std::vector<uint8_t> q(H), sf(pulsar_mx_sf_slab_bytes(1, xs.kbp));
-        for (int c = 0; c < H; c++) v[c] = bf(X[(size_t)t * H + c]);
-        mx_encode_row(v.data(), H, 0, xs.kbp, q.data(), sf.data(), nullptr);
-        for (int c = 0; c < H; c++) slot_bad += q[c] != XQ[(size_t)t * H + c];
-        for (int b = 0; b < H / 32; b++) slot_bad += sf[pulsar_mx_sfoff(0, b, xs.kbp)] != XSF[pulsar_mx_sfoff(t, b, xs.kbp)];
     }
     CHECK(over1 <= (size_t)(T * H) / 5000 && worst_ulp <= 4.0,
-          "block input vs double: %zu of %d beyond 1 bf16 ulp (worst %.2f ulp; E4M3 boundary flips of xn / a allowed at 2e-4)",
+          "block input vs double: %zu of %d beyond 1 bf16 ulp (worst %.2f ulp; the read rounds to bf16 once, "
+          "and the W8 path's internal a is still E4M3 -- see the row)",
           over1, T * H, worst_ulp);
     printf("        mean |rel| %.2e\n", med_sum / med_n);
     CHECK(inj_rel < 1e-5, "inj = 2 sigmoid(W_inj xn / 4): max rel %.2e", inj_rel);
-    CHECK(slot_bad == 0, "the E4M3 slot is the producer encoding of the bf16 row: %zu bytes differ", slot_bad);
     /* neutrality */
-    rc = pulsar_qwen_gr_read_launch(&w, dst + (size_t)3 * HC, 1, xo, &xs, inj, ws, wsb, 0);
+    rc = pulsar_qwen_gr_read_launch(&w, dst + (size_t)3 * HC, 1, xo, inj, ws, wsb, 0);
     const auto X1 = down(xo, H);
     const auto I1 = down(inj, S);
     CHECK(rc == 0 && memcmp(X1.data(), &X[(size_t)3 * H], H * 2) == 0 && memcmp(I1.data(), &I[3 * S], S * 4) == 0,
@@ -262,7 +240,7 @@ static void section_gr(void) {
     /* the mixer: no inject */
     pulsar_qwen_gr_dev wm = w;
     wm.inject = nullptr;
-    rc = pulsar_qwen_gr_read_launch(&wm, dst, T, xo, &xs, nullptr, ws, wsb, 0);
+    rc = pulsar_qwen_gr_read_launch(&wm, dst, T, xo, nullptr, ws, wsb, 0);
     const auto XM = down(xo, (size_t)T * H);
     CHECK(rc == 0 && memcmp(XM.data(), X.data(), X.size() * 2) == 0, "the mixer (no inject) reads the same block input");
     /* the mixer as the graded recipe stores it: BF16 low-rank weights (bf16
@@ -273,7 +251,7 @@ static void section_gr(void) {
         wb.inject = nullptr;
         wb.down = {up(wdb), nullptr, R, HC};
         wb.up = {up(wub), nullptr, HC, R};
-        rc = pulsar_qwen_gr_read_launch(&wb, dst, T, xo, nullptr, nullptr, ws, wsb, 0);
+        rc = pulsar_qwen_gr_read_launch(&wb, dst, T, xo, nullptr, ws, wsb, 0);
         const auto XB = down(xo, (size_t)T * H);
         double wu_ = 0;
         size_t ob = 0;
@@ -294,7 +272,7 @@ static void section_gr(void) {
               "of xn / a allowed at 1e-3)", ob, T * H, wu_);
         pulsar_qwen_gr_dev wmix = wb;
         wmix.up = {up(g.up_w.q), up(g.up_w.sf), HC, R};
-        CHECK(pulsar_qwen_gr_read_launch(&wmix, dst, T, xo, nullptr, nullptr, ws, wsb, 0) != 0,
+        CHECK(pulsar_qwen_gr_read_launch(&wmix, dst, T, xo, nullptr, ws, wsb, 0) != 0,
               "a BF16 W_down paired with an MXFP8 W_up is refused");
     }
     /* the write */
@@ -326,14 +304,14 @@ static void section_gr(void) {
         std::vector<uint8_t> sf = g.up_w.sf;
         sf[pulsar_mx_sfoff(2 * H + 77, 1, pulsar_mx_kbp(R))] += 3;
         wx.up.sf = up(sf);
-        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, &xs, inj, ws, wsb, 0);
+        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, inj, ws, wsb, 0);
         const auto XX = down(xo, (size_t)T * H);
         for (size_t i = 0; i < XX.size(); i++) moved_u += XX[i] != X[i];
         wx = w;
         sf = g.down_w.sf;
         sf[pulsar_mx_sfoff(11, 125, pulsar_mx_kbp(HC))] += 4;
         wx.down.sf = up(sf);
-        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, &xs, inj, ws, wsb, 0);
+        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, inj, ws, wsb, 0);
         const auto XY = down(xo, (size_t)T * H);
         for (size_t i = 0; i < XY.size(); i++) moved_d += XY[i] != X[i];
     }
@@ -485,14 +463,16 @@ static void section_moe(void) {
     w.k2_gate_up = 8; w.k2_down = 10;
     w.shared_gate = dev_linear(sg); w.shared_up = dev_linear(su); w.shared_down = dev_linear(sd);
     const auto x = rnd_act(T, H, 0.7);
-    std::vector<double> xd;
-    const dslot xs = make_dslot(x, T, H, &xd);
+    /* L251 / ac69748f: the MoE reads the bf16 rows directly -- there is no A8 slot, so the
+     * reference's activation is the bf16 VALUE, not a decoded E4M3 code. */
+    std::vector<double> xd((size_t)T * H);
+    for (size_t i = 0; i < xd.size(); i++) xd[i] = bf(x[i]);
     uint16_t *dx = up(x);
     float *out = (float *)dalloc((size_t)T * H * 4);
     uint32_t *nf = (uint32_t *)dalloc(4);
     const size_t wsb = pulsar_qwen_moe_workspace_bytes(T);
     void *ws = dalloc(wsb);
-    int rc = pulsar_qwen_moe_launch(&w, dx, &xs.s, T, out, ws, wsb, nf, 0x7351u, 0);
+    int rc = pulsar_qwen_moe_launch(&w, dx, T, out, ws, wsb, nf, 0x7351u, 0);
     CHECK(rc == 0, "launch T=%d (workspace %.1f MB)", T, wsb / 1e6);
     const auto O = down(out, (size_t)T * H);
     const auto NF = down(nf, 1);
@@ -528,10 +508,8 @@ static void section_moe(void) {
     CHECK(rows_f32 >= T - 1 && frob_worst < 1e-3, "out vs double: %d of %d rows at f32 order (< 1e-5), worst row rel "
           "Frobenius %.2e, max |err| / max|ref| %.2e", rows_f32, T, frob_worst, worst);
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
-    /* the T = 1 run reads row 0 of the slot, so hand it row 2's slot row */
-    std::vector<uint16_t> x2(x.begin() + 2 * H, x.begin() + 3 * H);
-    const dslot xs2 = make_dslot(x2, 1, H, nullptr);
-    rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, &xs2.s, 1, out, ws, wsb, nf, 0x7351u, 0);
+    /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
+    rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, 1, out, ws, wsb, nf, 0x7351u, 0);
     const auto O1 = down(out, H);
     CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d batch's row", T);
 }
