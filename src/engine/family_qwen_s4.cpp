@@ -180,7 +180,7 @@ g.total = o;
  * op hands the kernel VIEWS of them, because pulsar_qsa_io wants tensors and the
  * scratch IS one); a8/a8_sf are the o_proj A8 slot the kernel emits; ws is
  * pulsar_gpu_qsa_forward's workspace; lin_ws is the shared dense workspace. */
-struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
 
 uint64_t qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd;
@@ -207,7 +207,10 @@ qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) 
     g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp(PULSAR_QSA_OUT_DIM)));
     g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
-    g.total = o;
+        /* L251 / ac69748f: the o_proj's bf16 row.  bf16 is 2 bytes where the A8 slot is 1, so this
+     * take is twice the width of a8. */
+    g.obf16 = o; o += a256((uint64_t)rows * PULSAR_QSA_OUT_DIM * sizeof(uint16_t));
+g.total = o;
     (void)s;
     return g;
 }
@@ -450,7 +453,6 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
 
 bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side) {
     const uint32_t n = st->n_rows;
-    const int H = (int)st->shape->n_embd;
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
     pulsar_qwen_gr_dev w;
     if (!gr_dev(st, side == PULSAR_QWEN_GR_ATTN ? L.gr_attn : L.gr_mlp, &w)) return false;
@@ -684,7 +686,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                                     (const uint16_t *)wptr(st, L.idx_k_norm,   "qwen QSA idx_k_norm")};
     pulsar_qsa_io io{};
     io.qg = vq; io.k = vk; io.v = vv; io.idx = vi;
-    io.out_e4m3 = (uint8_t *)dptr(sc) + g.a8;
+    io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16;      /* L251 / ac69748f: bf16, not the A8 slot */
+    io.out_e4m3 = NULL;
     io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
     io.out_sf_pitch = pulsar_gpu_mx_kbp(PULSAR_QSA_OUT_DIM);
     io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
@@ -698,7 +701,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                                                scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes)) : -1;
     drop();
     if (rc != 1) return fail("pulsar_gpu_qsa_forward refused the step");
-    const pulsar_qwen_slot oslot = {(uint8_t *)dptr(sc) + g.a8, (uint8_t *)dptr(sc) + g.a8_sf, io.out_sf_pitch};
-    return pulsar_qwen_linear_launch(&out, &oslot, (int)n, (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+    return pulsar_qwen_linear_launch(&out, (const uint16_t *)((uint8_t *)dptr(sc) + g.obf16), (int)n,
+                                     (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
            fail("the QSA o_proj launch failed");
 }

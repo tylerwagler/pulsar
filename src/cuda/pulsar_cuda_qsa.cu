@@ -402,7 +402,8 @@ __device__ __forceinline__ void qsa_load_tile(uint8_t *td, float *tsc, const uin
 template <bool FOLD>
 __global__ void __launch_bounds__(128) qsa_attn_kernel(
         const qsa_row *rows, uint32_t row0, const uint32_t *sel, const float *q, const float *qg,
-        float *part, float2 *ml, __nv_fp8_e4m3 *out, unsigned char *out_scale, int kbp, float *tap) {
+        float *part, float2 *ml, __nv_bfloat16 *out_bf16, __nv_fp8_e4m3 *out, unsigned char *out_scale,
+        int kbp, float *tap) {
     __shared__ __align__(16) float qs[QSA_GQA * PULSAR_QSA_HEAD_DIM];
     __shared__ __align__(16) uint8_t td[QSA_SPLIT * QSA_TPITCH];
     __shared__ float tsc[QSA_SPLIT * 8u];
@@ -602,11 +603,18 @@ __global__ void __launch_bounds__(128) qsa_attn_kernel(
                 #pragma unroll
                 for (uint32_t nt = 0; nt < 4u; nt++) {
                     const uint32_t col = col0 + nt * 8u + 2u * c;
-                    out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = pulsar_mx_encode(y[nt][0], se);
-                    out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col + 1u] = pulsar_mx_encode(y[nt][1], se);
+                    if (out) {
+                        out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = pulsar_mx_encode(y[nt][0], se);
+                        out[(uint64_t)r * PULSAR_QSA_OUT_DIM + col + 1u] = pulsar_mx_encode(y[nt][1], se);
+                    }
+                    /* L251 / ac69748f: bf16 is what the o_proj reads; the E4M3 slot is optional now. */
+                    if (out_bf16) {
+                        out_bf16[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = __float2bfloat16(y[nt][0]);
+                        out_bf16[(uint64_t)r * PULSAR_QSA_OUT_DIM + col + 1u] = __float2bfloat16(y[nt][1]);
+                    }
                     if (tap) *reinterpret_cast<float2 *>(&tap[(uint64_t)r * PULSAR_QSA_OUT_DIM + col]) = make_float2(y[nt][0], y[nt][1]);
                 }
-                if (c == 0u) out_scale[pulsar_mx_sfoff((int)r, (int)(col0 >> 5), kbp)] = pulsar_mx_scale_byte(se);
+                if (c == 0u && out_scale) out_scale[pulsar_mx_sfoff((int)r, (int)(col0 >> 5), kbp)] = pulsar_mx_scale_byte(se);
             }
         }
     }
@@ -616,7 +624,7 @@ __global__ void __launch_bounds__(128) qsa_attn_kernel(
  * grid (row in group, query head); thread = dim. */
 __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
         const qsa_row *rows, uint32_t row0, const float *part, const float2 *ml, const float *qg,
-        __nv_fp8_e4m3 *out, unsigned char *out_scale, int kbp, float *tap) {
+        __nv_bfloat16 *out_bf16, __nv_fp8_e4m3 *out, unsigned char *out_scale, int kbp, float *tap) {
     const uint32_t rg = blockIdx.x, h = blockIdx.y, d = threadIdx.x, r = row0 + rg;
     const qsa_row row = rows[r];
     const uint32_t ns = (row.n_list + QSA_SPLIT - 1u) / QSA_SPLIT;
@@ -630,7 +638,8 @@ __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
                                        + PULSAR_QSA_HEAD_DIM + d]);
     const uint32_t col = h * PULSAR_QSA_HEAD_DIM + d;
     if (tap) tap[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = y;
-    pulsar_mx_emit_block(y, col, r, PULSAR_QSA_OUT_DIM, kbp, out, out_scale);
+    if (out) pulsar_mx_emit_block(y, col, r, PULSAR_QSA_OUT_DIM, kbp, out, out_scale);
+    if (out_bf16) out_bf16[(uint64_t)r * PULSAR_QSA_OUT_DIM + col] = __float2bfloat16(y);
 }
 
 __global__ void qsa_sel_tap_kernel(const qsa_row *rows, const uint32_t *sel, uint32_t *tap, uint32_t n_rows) {
@@ -730,8 +739,9 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         !io->v || io->v->bytes < R * PULSAR_QSA_KV_IN * 4u || !io->idx || io->idx->bytes < R * PULSAR_QSA_IDX_IN * 4u) {
         return qsa_refuse("a projection input is missing or shorter than n_rows rows");
     }
-    if (!io->out_e4m3 || !io->out_scale || io->out_sf_pitch != pulsar_mx_kbp(PULSAR_QSA_OUT_DIM)) {
-        return qsa_refuse("no o_proj E4M3 slot (or its scale pitch is not the 6144-wide KBp)");
+    if (!io->out_bf16 && !io->out_e4m3) return qsa_refuse("no o_proj output (out_bf16 and out_e4m3 both NULL)");
+    if (io->out_e4m3 && (!io->out_scale || io->out_sf_pitch != pulsar_mx_kbp(PULSAR_QSA_OUT_DIM))) {
+        return qsa_refuse("an o_proj E4M3 slot needs its scale plane and the 6144-wide KBp");
     }
     if ((io->tap_out_f32 && io->tap_out_f32->bytes < R * PULSAR_QSA_OUT_DIM * 4u) ||
         (io->tap_sel && io->tap_sel->bytes < R * PULSAR_QSA_TOP_BLOCKS * 4u)) {
@@ -844,21 +854,22 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
 
     {
         __nv_fp8_e4m3 *o8 = (__nv_fp8_e4m3 *)io->out_e4m3;
+        __nv_bfloat16 *obf = (__nv_bfloat16 *)io->out_bf16;
         unsigned char *osc = (unsigned char *)io->out_scale;
         float *tap = io->tap_out_f32 ? (float *)io->tap_out_f32->ptr : nullptr;
         const float *qg = (const float *)io->qg->ptr;
         if (n_rows >= QSA_FOLD_ROWS) {
             qsa_attn_kernel<true><<<dim3(1, PULSAR_QSA_N_KV, n_rows), 128>>>(ws.rows, 0, ws.sel, ws.q, qg, nullptr,
-                                                                            nullptr, o8, osc, io->out_sf_pitch, tap);
+                                                                            nullptr, obf, o8, osc, io->out_sf_pitch, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa attention (fold) launch")) return 0;
         } else {
             uint32_t ns_max = 0;
             for (uint32_t i = 0; i < n_rows; i++) ns_max = std::max(ns_max, (h_rows[i].n_list + QSA_SPLIT - 1u) / QSA_SPLIT);
             qsa_attn_kernel<false><<<dim3(ns_max, PULSAR_QSA_N_KV, n_rows), 128>>>(ws.rows, 0, ws.sel, ws.q, qg, ws.part,
-                                                                                  ws.ml, o8, osc, io->out_sf_pitch, tap);
+                                                                                  ws.ml, obf, o8, osc, io->out_sf_pitch, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa attention (split) launch")) return 0;
             qsa_combine_kernel<<<dim3(n_rows, PULSAR_QSA_N_HEAD), PULSAR_QSA_HEAD_DIM>>>(
-                    ws.rows, 0, ws.part, ws.ml, qg, o8, osc, io->out_sf_pitch, tap);
+                    ws.rows, 0, ws.part, ws.ml, qg, obf, o8, osc, io->out_sf_pitch, tap);
             if (!cuda_ok(cudaGetLastError(), "qsa combine launch")) return 0;
         }
     }

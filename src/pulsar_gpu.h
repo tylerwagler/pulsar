@@ -2582,6 +2582,8 @@ typedef struct {
     const pulsar_gpu_tensor *k;     /**< f32 [n_rows][512] k_proj output */
     const pulsar_gpu_tensor *v;     /**< f32 [n_rows][512] v_proj output */
     const pulsar_gpu_tensor *idx;   /**< f32 [n_rows][640] index_qk_proj output */
+    void *out_bf16;                 /**< o_proj bf16 [n_rows][6144] -- what the Qwen o_proj reads
+                                     *   (L251 / ac69748f: no E4M3 activation slot) */
     void *out_e4m3;                 /**< o_proj A8 slot: E4M3 [n_rows][6144] ... */
     void *out_scale;                /**< ... and its swizzled E8M0 slab (zeroed by the slot) */
     int   out_sf_pitch;             /**< the slot's KBp */
