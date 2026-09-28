@@ -317,7 +317,7 @@ int main(int argc, char **argv) {
                     if (p > 0) H -= p * log(p);
                 }
                 printf("               eng p_top1 %.4f H %.4f  ||  ref p_top1 %.4f H %.4f   (eng_top %.3f vs ref_top %.3f)\n",
-                       pe_top, H, recs[k].p_top1, recs[k].entropy_nats,
+                       pe_top, H, recs[k].p_top1, recs[k].entropy,
                        (double)row[am], (double)rr[ram]);
             }
             if (g_dump) {
