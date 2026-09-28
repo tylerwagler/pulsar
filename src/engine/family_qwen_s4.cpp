@@ -141,7 +141,7 @@ bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int 
  * host-side geometry helpers, because pulsar_cuda_mx.cuh cannot be included
  * here (g++ does not know __host__/__device__).  `lin_ws` is ONE dense-arm
  * workspace shared by the five launches (they serialize on the stream). */
-struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, lin_ws, lin_ws_bytes, total; };
+struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, obf16, lin_ws, lin_ws_bytes, total; };
 
 uint64_t gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
@@ -169,7 +169,10 @@ gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     g.a8    = o; o += a256((uint64_t)rows * VT);                                          /* E4M3 codes */
     g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp((int)VT)));
     g.lin_ws = o; g.lin_ws_bytes = gdn_lin_ws(s, rows); o += g.lin_ws_bytes;
-    g.total = o;
+        /* L251 / ac69748f: the GDN output's bf16 row -- what the out_proj reads.  bf16 is 2 bytes
+     * per element where the A8 slot was 1, so this take is twice the width of a8. */
+    g.obf16 = o; o += a256((uint64_t)rows * VT * sizeof(uint16_t));
+g.total = o;
     return g;
 }
 
@@ -599,12 +602,11 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     c.a   = (const float *)(base + g.a);   c.ld_a   = NV;
     c.b   = (const float *)(base + g.b);   c.ld_b   = NV;
     c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
-    c.out_f32 = NULL;                               /* the A8 slot is the consumer's input, not f32 */
-    c.out_e4m3 = base + g.a8; c.out_scale = base + g.a8_sf;
-    c.out_kbp = pulsar_gpu_mx_kbp(VT);
+    c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
+    c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */
     if (pulsar_gdn_forward(&gw, &c, 0) != 0) return fail("pulsar_gdn_forward failed");
-    const pulsar_qwen_slot oslot = {(uint8_t *)(base + g.a8), (uint8_t *)(base + g.a8_sf), c.out_kbp};
-    return pulsar_qwen_linear_launch(&out, &oslot, (int)n, (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+    return pulsar_qwen_linear_launch(&out, (const uint16_t *)(base + g.obf16), (int)n,
+                                     (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
            fail("the GDN out_proj launch failed");
 }
 
