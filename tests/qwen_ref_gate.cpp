@@ -30,6 +30,8 @@
 static int g_fail = 0;
 /* PULSAR_REF_FRESH=1: grade each depth in a FRESH session (see the depth loop). */
 static int g_fresh = 0;
+/* PULSAR_REF_DUMP=<dir>: write each engine logits row as f32 [W] there. */
+static const char *g_dump = NULL;
 
 static void check(bool ok, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -102,7 +104,9 @@ int main(int argc, char **argv) {
         prompts[np++] = "story";
     }
     g_fresh = getenv("PULSAR_REF_FRESH") != NULL;
+    g_dump  = getenv("PULSAR_REF_DUMP");
     if (g_fresh) printf("      (PULSAR_REF_FRESH: every depth is graded in a fresh session)\n");
+    if (g_dump)  printf("      (PULSAR_REF_DUMP: engine rows -> %s)\n", g_dump);
 
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -302,6 +306,26 @@ int main(int argc, char **argv) {
             printf("               eng d=%-6d best matches ref[%d] d=%-6d KL %.3e%s\n",
                    d, bestk, recs[bestk].depth, bestkl,
                    (recs[bestk].depth == d) ? "" : "   <-- SHIFTED CONTEXT");
+            /* CONFIDENCE, engine beside the anchor's recorded value.  The engine collapsing
+             * to a delta on <|im_end|> while the reference is at p_top1 0.35-0.69 is the
+             * defect in one number, and the anchors already carry the reference's side. */
+            {
+                const double pe_top = exp((double)row[am] - meng) / seng;
+                double H = 0;
+                for (int j = 0; j < W; j++) {
+                    const double p = exp((double)row[j] - meng) / seng;
+                    if (p > 0) H -= p * log(p);
+                }
+                printf("               eng p_top1 %.4f H %.4f  ||  ref p_top1 %.4f H %.4f   (eng_top %.3f vs ref_top %.3f)\n",
+                       pe_top, H, recs[k].p_top1, recs[k].entropy_nats,
+                       (double)row[am], (double)rr[ram]);
+            }
+            if (g_dump) {
+                char fp2[1200];
+                snprintf(fp2, sizeof(fp2), "%s/%s.d%d.eng.f32", g_dump, prompts[i], d);
+                FILE *f2 = fopen(fp2, "wb");
+                if (f2) { fwrite(row, sizeof(float), (size_t)W, f2); fclose(f2); }
+            }
             if (am == recs[k].argmax) am_ok++;
         }
         check(graded == nr && am_ok == nr, "%s: argmax matches at %d / %d depths", prompts[i], am_ok, nr);
