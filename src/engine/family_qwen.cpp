@@ -734,18 +734,16 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
          * (PULSAR_CUDA_GRAPH_DUMP_PREFIX, plus _LAYER/_NAME/_POS), so an unarmed run
          * does no work and allocates nothing. */
         if (ok && gpu_graph_debug_dump_enabled()) {
-            /* Only the LAST row of the step: the reference tap keeps one position
-             * (10240 f32 = 40 KB), so dumping the whole [n_rows][n_hc][n_embd] stream
-             * buffer would write gigabytes for one comparable number.  The stream is
-             * bf16, hence the ELT size in the byte offset, and the dump helper widens. */
-            const uint64_t hcb = (uint64_t)pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
-            pulsar_gpu_tensor *tap = pulsar_gpu_tensor_view(s->qwen->streams,
-                                                            (uint64_t)(n_rows - 1) * hcb, hcb);
-            if (tap) {
-                gpu_graph_debug_dump_hc_tensor("qwen_h", tap, pulsar_qwen_hc_dim(&g_qwen_shape),
-                                              il, (uint32_t)pos[n_rows - 1]);
-                pulsar_gpu_tensor_free(tap);
-            }
+            /* The WHOLE step's streams ([n_rows][n_hc][n_embd], bf16 -> widened f32).  The
+             * last row alone is enough to compare stream error, but the layer-correctness
+             * test needs every position: it feeds the engine's stream at layer L into the
+             * REFERENCE's layer L+1 and compares with the engine's L+1, which isolates a
+             * layer's own arithmetic from the error it inherited.  Volume is the caller's
+             * problem -- filter with PULSAR_CUDA_GRAPH_DUMP_LAYER/_POS, since the dump
+             * helper synchronizes mid-graph. */
+            gpu_graph_debug_dump_hc_tensor("qwen_h", s->qwen->streams,
+                                          (uint64_t)n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
+                                          il, (uint32_t)pos[n_rows - 1]);
         }
     }
     if (ok && head_n) ok = ops->head(&st, head_row0, head_n);
