@@ -453,8 +453,16 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
                 l ? l->in : -1, l ? l->out : -1, l ? l->in : -1);
         return -1;
     }
-    const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
-    qwen_gr_down_kernel<false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
+    /* FAIL CLOSED (L251).  This is a W8A16 shape -- mxfp8_lt (E4M3 + E8M0) weights against a bf16
+     * activation -- and the arm does NOT exist yet: qwen_gr_down_kernel<W8=false> reads its WEIGHT as
+     * bf16 (:196), so handing it mxfp8 weights would read E4M3 bytes as bf16 and produce plausible
+     * garbage, which is precisely what VENDOR.md warns about ("compiling is not evidence of
+     * correctness").  Refuse by name until the W8A16 branch is built; the engine's rule is one path or
+     * an error, never a second format chosen silently. */
+    fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs the W8A16 arm (mxfp8_lt weights x bf16 "
+                    "activation), which is NOT built yet -- refusing (L251/ac69748f)\n",
+            l->in, l->out);
+    return -1;   /* no unreachable arm kept alive below this: rule 2 */
     const cudaError_t qe = cudaGetLastError();
     if (qe != cudaSuccess) {
         fprintf(stderr, "pulsar: qwen mxfp8 linear launch: %s\n", cudaGetErrorString(qe));
