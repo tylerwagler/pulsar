@@ -147,7 +147,10 @@ int main(int argc, char **argv) {
             if (pulsar_session_eval(sess, 1, err, sizeof(err)) != 0) {
                 check(false, "%s d=%d eval: %s", prompts[i], d, err); break;
             }
-            if (pulsar_session_copy_logits(sess, row, W) != 0) {
+            /* copy_logits returns the number of logits WRITTEN and 0 on error -- the
+             * opposite convention to set_logits (0 on success).  Checking `!= 0` here
+             * flagged a perfectly good 248320-logit copy as a failure. */
+            if (pulsar_session_copy_logits(sess, row, W) != W) {
                 check(false, "%s d=%d copy_logits", prompts[i], d); break;
             }
             int am = 0;
