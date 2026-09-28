@@ -175,6 +175,14 @@ int main(int argc, char **argv) {
         float *row = (float *)xmalloc(sizeof(float) * (size_t)W);
         int am_ok = 0, graded = 0;
         double worst_kl = 0, worst_mx = 0;
+        /* Decision-region statistics.  `worst_kl` and `worst_mx` are both dominated by the
+         * 248k near-zero tail and so measure nothing that decides a token; what decides one
+         * is the deviation among the entries actually in contention, against the margin it
+         * had to survive.  A mismatch where |dev@ref| >= the reference's own top1-top2
+         * margin is the quantization moving the contending logits past that margin -- which
+         * is arithmetic, not a defect -- and one where it is smaller is structure. */
+        double dev_sum = 0, dev_max = 0, marg_min = 1e30;
+        int explained = 0, mismatches = 0;
         for (int k = 0; k < nr; k++) {
             const int d = recs[k].depth;
             if (d <= 0 || d > n_tok) { check(false, "%s: depth %d out of range (n_tok %d)", prompts[i], d, n_tok); break; }
@@ -216,9 +224,10 @@ int main(int argc, char **argv) {
             for (int j = 1; j < W; j++) if (rr[j] > rr[ram]) ram = j;
             if (ram != recs[k].argmax)
                 printf("      d=%-6d note: ref.bin argmax %d, the json says %d\n", d, ram, recs[k].argmax);
-            double mref = rr[0], meng = row[0];
+            double mref = rr[0], meng = row[0], mref2 = -INFINITY;
             for (int j = 0; j < W; j++) {
-                if (rr[j] > mref) mref = rr[j];
+                if (rr[j] > mref) { mref2 = mref; mref = rr[j]; }
+                else if (rr[j] > mref2) mref2 = rr[j];
                 if (row[j] > meng) meng = row[j];
             }
             double sref = 0, seng = 0;
@@ -236,6 +245,12 @@ int main(int argc, char **argv) {
             }
             if (kl > worst_kl) worst_kl = kl;
             if (mx > worst_mx) worst_mx = mx;
+            const double dev = (double)row[ram] - (double)rr[ram];   /* engine at the REFERENCE's argmax */
+            const double marg = mref - mref2;                        /* the margin that entry had to survive */
+            dev_sum += fabs(dev);
+            if (fabs(dev) > dev_max) dev_max = fabs(dev);
+            if (marg < marg_min) marg_min = marg;
+            if (am != recs[k].argmax) { mismatches++; if (fabs(dev) >= marg) explained++; }
             graded++;
             /* Least-squares fit row ~ slope*rr + intercept, and the max residual after
              * removing it.  A constant offset is softmax-invariant (harmless, and it is
@@ -257,8 +272,8 @@ int main(int argc, char **argv) {
             /* ALWAYS one line per depth.  Two depths sharing `fnv eng` means the session
              * never advanced -- prefix reuse handed back the same row -- which a bare
              * argmax count hides completely (it reads as a near miss instead of a stall). */
-            printf("      d=%-6d eng %7d @ %9.4f | ref %7d @ %9.4f | KL %.3e | fit x%.4f %+.3f resid %.3e | fnv %016llx/%016llx%s\n",
-                   d, am, (double)row[am], ram, (double)rr[ram], kl, slope, icept, resid,
+            printf("      d=%-6d eng %7d @ %9.4f | ref %7d @ %9.4f | KL %.3e | dev@ref %+.4f marg %.4f | fit x%.4f %+.3f resid %.3e | fnv %016llx/%016llx%s\n",
+                   d, am, (double)row[am], ram, (double)rr[ram], kl, dev, marg, slope, icept, resid,
                    (unsigned long long)he, (unsigned long long)hr,
                    (am == recs[k].argmax) ? "" : "   <-- ARGMAX MISMATCH");
             /* The top 5 of each row, token by token.  A uniform scale keeps the SAME
@@ -331,6 +346,17 @@ int main(int argc, char **argv) {
         check(graded == nr && am_ok == nr, "%s: argmax matches at %d / %d depths", prompts[i], am_ok, nr);
         printf("      %s: worst KL(ref||engine) %.3e, worst max|logit diff| %.3e over %d depths\n",
                prompts[i], worst_kl, worst_mx, graded);
+        /* The two numbers above cannot tell a defect from a quantized engine: `worst_mx` is the
+         * 248k tail, and a KL is a whole-row average.  These two can.  `|dev@ref|` is the
+         * engine's error at the reference's own argmax; `marg` is the top1-top2 margin that
+         * entry had to survive.  A mismatch with |dev@ref| >= marg is the quantization moving
+         * the contending logits past the margin (arithmetic, and the same thing the quantized
+         * model does to itself); one with |dev@ref| < marg is structure the quantization does
+         * not explain.  Compare against the independently measured U-e4-d5 budget: 9.7%
+         * perplexity inflation, top-1 agreement with BF16 0.93528, mean |dev@ref| 8.35. */
+        printf("      %s: decision-region |dev@ref| mean %.3f max %.3f; ref top1-t2 margin min %.3f; "
+               "%d of %d argmax mismatches have |dev@ref| >= margin\n",
+               prompts[i], graded ? dev_sum / graded : 0.0, dev_max, marg_min, explained, mismatches);
         free(row);
         pulsar_session_free(sess);
         free(tb); free(rb); free(recs);
