@@ -69,6 +69,14 @@ int ds4_exl3_moe_gemv_pair_launch_rows(
 /** fused gate_up: out [n_assign][M] f32 = the UNROTATED z of the one [K -> M]
  *  slice (M = 2 mid: gate rows then up rows), the input rotated in-kernel by
  *  the slice's suh.  Same contract as the pair launch otherwise. */
+/* L251 / ac69748f: the same fused gate_up arm over a BF16 activation.  The Qwen family has no E4M3
+ * activation slot, so its routed experts read row-major bf16. */
+int ds4_exl3_moe_gemv_fused_bf16_launch(
+        const void *table, int k2, const void *act,
+        const int32_t *ids_dst, const int32_t *expert_bounds,
+        float *out, int M, int K, int64_t n_assign,
+        int n_experts, cudaStream_t stream);
+
 int ds4_exl3_moe_gemv_fused_launch(
     const void    * table,
     int             k2,
