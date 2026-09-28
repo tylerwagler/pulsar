@@ -5,7 +5,7 @@ Status of the two-Spark TP effort, kept in-repo as the decision record. The
 from dev; nothing unique lost) — `dev` is the single active line, so read
 `origin/dev` for any engine analysis. All TP code lives only inside dev's
 history.
-Source of truth for scope decisions: `~/Projects/pulsar-notes/plans/102-tensor-parallel-two-sparks.md`
+Source of truth for scope decisions: `~/Projects/AI/pulsar/notes/plans/102-tensor-parallel-two-sparks.md`
 (private) + ledger L102. This file is the public, in-tree pointer that code
 comments can cite (like the Lnnn tags elsewhere).
 
