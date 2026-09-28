@@ -74,33 +74,39 @@ static weight make_weight(int K, int N, int k2) {
     for (int i = 0; i < N; i++) s[K + i] = exl3_f32_to_f16((float)((0.75 + 0.5 * rndu()) * ((rnd() & 1) ? 1.0 : -1.0)));
     return w;
 }
-/* The activation slot: E4M3 [rows][K] + the swizzled ue8m0 slab, and x decoded. */
+/* The activation: BF16 rows [rows][K], and x is the same value read back.
+ *
+ * L251 / ac69748f: this was an E4M3 slot -- codes plus a swizzled ue8m0 slab -- and both sides of
+ * the comparison used the DECODED code.  The dense arm reads bf16 now, so the slot is gone and the
+ * reference's activation is the bf16 VALUE.  The rounding goes through __float2bfloat16 rather than
+ * a hand-rolled bit trick, so the reference cannot drift from what the kernel does. */
 struct slot {
-    int rows, K, kbp;
-    std::vector<uint8_t> q, sf;
+    int rows, K;
+    std::vector<uint16_t> q;      /* bf16 bit patterns, [rows][K] */
     std::vector<double> x;
 };
+static uint16_t bf16_bits(double v) {
+    const __nv_bfloat16 b = __float2bfloat16((float)v);
+    uint16_t u = 0;
+    std::memcpy(&u, &b, sizeof(u));
+    return u;
+}
+static double bf16_back(uint16_t u) {
+    __nv_bfloat16 b;
+    std::memcpy(&b, &u, sizeof(u));
+    return (double)__bfloat162float(b);
+}
 static slot make_slot(int rows, int K) {
-    slot s; s.rows = rows; s.K = K; s.kbp = pulsar_mx_kbp(K);
+    slot s; s.rows = rows; s.K = K;
     s.q.assign((size_t)rows * K, 0);
-    s.sf.assign(pulsar_mx_sf_slab_bytes(rows, s.kbp), 0);
     s.x.assign((size_t)rows * K, 0.0);
     std::vector<double> chan(K);
     for (int k = 0; k < K; k++) chan[k] = (rnd() % 64 == 0) ? 12.0 : 1.0;    /* a few outlier channels */
     for (int r = 0; r < rows; r++) {
-        std::vector<double> v(K);
-        for (int k = 0; k < K; k++) v[k] = rndn() * chan[k] * 0.7;
-        for (int g = 0; g < K / 32; g++) {
-            double amax = 0;
-            for (int j = 0; j < 32; j++) amax = fmax(amax, fabs(v[g * 32 + j]));
-            int se = amax > 0 ? (int)floor(log2(amax)) - 7 : -127;    /* pulsar_mx_shared_exp */
-            se = std::max(-127, std::min(127, se));
-            s.sf[pulsar_mx_sfoff(r, g, s.kbp)] = (uint8_t)(se + 127);
-            for (int j = 0; j < 32; j++) {
-                const uint8_t b = exl3t_f64_to_e4m3(v[g * 32 + j] * ldexp(1.0, -se));
-                s.q[(size_t)r * K + g * 32 + j] = b;
-                s.x[(size_t)r * K + g * 32 + j] = exl3t_e4m3_to_f64(b) * ldexp(1.0, se);
-            }
+        for (int k = 0; k < K; k++) {
+            const uint16_t b = bf16_bits(rndn() * chan[k] * 0.7);
+            s.q[(size_t)r * K + k] = b;
+            s.x[(size_t)r * K + k] = bf16_back(b);
         }
     }
     return s;
@@ -126,26 +132,26 @@ static void grade(const std::vector<float> &got, const std::vector<double> &want
 }
 
 struct dev {
-    uint8_t *w = nullptr, *q = nullptr, *sf = nullptr;
+    uint8_t *w = nullptr;             /* the trellis weights */
+    uint8_t *q = nullptr;             /* the bf16 activation rows (2 bytes per element) */
     float *y = nullptr, *ws = nullptr;
     size_t ws_bytes = 0;
 };
 static void upload(const weight &w, const slot &s, int max_rows, dev &d) {
     CUDA_OK(cudaMalloc((void **)&d.w, w.stride));
     CUDA_OK(cudaMemcpy(d.w, w.bytes.data(), w.stride, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMalloc((void **)&d.q, s.q.size()));
-    CUDA_OK(cudaMemcpy(d.q, s.q.data(), s.q.size(), cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMalloc((void **)&d.sf, s.sf.size()));
-    CUDA_OK(cudaMemcpy(d.sf, s.sf.data(), s.sf.size(), cudaMemcpyHostToDevice));
+    const size_t qb = s.q.size() * sizeof(uint16_t);
+    CUDA_OK(cudaMalloc((void **)&d.q, qb));
+    CUDA_OK(cudaMemcpy(d.q, s.q.data(), qb, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMalloc((void **)&d.y, (size_t)max_rows * w.N * sizeof(float)));
     d.ws_bytes = ds4_exl3_dense_workspace_bytes(max_rows, w.K, w.N);
     CUDA_OK(cudaMalloc((void **)&d.ws, d.ws_bytes));
 }
-static void release(dev &d) { cudaFree(d.w); cudaFree(d.q); cudaFree(d.sf); cudaFree(d.y); cudaFree(d.ws); d = dev(); }
+static void release(dev &d) { cudaFree(d.w); cudaFree(d.q); cudaFree(d.y); cudaFree(d.ws); d = dev(); }
 
 static int run(const dev &d, int k2, int M, int K, int N, std::vector<float> &y) {
     CUDA_OK(cudaMemset(d.y, 0xff, (size_t)M * N * sizeof(float)));      /* NaN canary: every output must be written */
-    const int rc = ds4_exl3_dense_launch(d.w, k2, d.q, d.sf, d.y, M, K, N, d.ws, d.ws_bytes, 0);
+    const int rc = ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0);
     if (rc) return rc;
     CUDA_OK(cudaDeviceSynchronize());
     y.resize((size_t)M * N);
@@ -239,10 +245,10 @@ int main(void) {
 
                 /* 5. refusals */
                 void *ws = d.ws;
-                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.sf, d.y, 16, K + 64, N, ws, d.ws_bytes, 0) == -1, "K %% 128 accepted");
-                CHECK(ds4_exl3_dense_launch(d.w, 5, d.q, d.sf, d.y, 16, K, N, ws, d.ws_bytes, 0) == -1, "rate 2.5 accepted");
-                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.sf, d.y, 16, K, N, ws, d.ws_bytes - 4, 0) == -1, "short workspace accepted");
-                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.sf, d.y, 0, K, N, ws, d.ws_bytes, 0) == -1, "M = 0 accepted");
+                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.y, 16, K + 64, N, ws, d.ws_bytes, 0) == -1, "K %% 128 accepted");
+                CHECK(ds4_exl3_dense_launch(d.w, 5, d.q, d.y, 16, K, N, ws, d.ws_bytes, 0) == -1, "rate 2.5 accepted");
+                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.y, 16, K, N, ws, d.ws_bytes - 4, 0) == -1, "short workspace accepted");
+                CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.y, 0, K, N, ws, d.ws_bytes, 0) == -1, "M = 0 accepted");
                 CHECK(ds4_exl3_dense_workspace_bytes(16, K + 64, N) == 0, "workspace sized for a refused shape");
                 printf("  refusals: K %% 128, rate 2.5, short workspace, M = 0 -- all refused\n");
             }
