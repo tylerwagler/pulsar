@@ -2229,6 +2229,20 @@ tests/qwen_ref_gate: tests/qwen_ref_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 qwen-ref-gate: tests/qwen_ref_gate
 	@./tests/qwen_ref_gate $(QWEN_REF_MODEL) $(QWEN_REF_DIR)
 
+# L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out (the family has
+# no tokenizer or renderer yet, S5, so the CLI's text path refuses by design).  Decode the emitted
+# ids with qwen_generate_decode.py.  Needs a real container and a prompt's tokens.bin on disk.
+QWEN_GEN_MODEL  ?= $(HOME)/qwen-container
+QWEN_GEN_TOKENS ?= $(HOME)/ref-qwen38fn/code.tokens.bin
+QWEN_GEN_N      ?= 32
+tests/qwen_generate.o: tests/qwen_generate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: qwen-generate
+qwen-generate: tests/qwen_generate
+	@./tests/qwen_generate $(QWEN_GEN_MODEL) $(QWEN_GEN_TOKENS) $(QWEN_GEN_N) /tmp/qwen-gen-ids.bin
+
 tests/vision_layout_gate: tests/vision_layout_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 

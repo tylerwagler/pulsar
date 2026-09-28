@@ -1,0 +1,136 @@
+/* L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out.
+ *
+ * The reference gate proves FORWARDS: one row per recorded depth, graded against anchors.  This
+ * proves the lane PRODUCES TOKENS, walking the same session lane the gate walks -- sync() to
+ * extend the prefix by one, eval() for the last position, copy_logits(), argmax.
+ *
+ * It exists because the family has no tokenizer or renderer yet (S5), so the CLI's text path
+ * refuses by design ("only --inspect runs").  Feeding ids and printing ids keeps S5 out of the
+ * measurement; `qwen_generate_decode.py` then decodes the emitted ids with the reference
+ * tokenizer, which is the only way to ask whether the generation is coherent.
+ *
+ *   ./tests/qwen_generate <container> <tokens.bin> <n_predict> [out.bin]
+ *
+ * out.bin is the PROMPT'S ids followed by the generated ones, as int32 LE, so a caller can
+ * decode the whole thing in one pass.  Not part of the battery: it needs a real container and
+ * a tokens.bin on disk.
+ *
+ * NOTE ON WHAT THIS MEASURES: the engine's prefill quantizes activations to MXFP8 (A8) and the
+ * container's weights are EXL3, so a greedy stream here is NOT expected to equal the BF16
+ * source's.  That divergence is the lane's precision, not a defect -- see rows/L251.md.
+ */
+#include "pulsar.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) { fprintf(stderr, "qwen-generate: out of memory\n"); exit(2); }
+    return p;
+}
+
+static unsigned char *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    const long sz = ftell(f);
+    if (sz <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    unsigned char *b = (unsigned char *)xmalloc((size_t)sz);
+    if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(b); return NULL; }
+    fclose(f);
+    *n = (size_t)sz;
+    return b;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <container> <tokens.bin> <n_predict> [out.bin]\n", argv[0]);
+        return 2;
+    }
+    const int n_predict = atoi(argv[3]);
+    if (n_predict <= 0) { fprintf(stderr, "qwen-generate: n_predict must be > 0\n"); return 2; }
+
+    size_t tn = 0;
+    unsigned char *tb = slurp(argv[2], &tn);
+    if (!tb || tn % sizeof(int32_t) != 0) {
+        fprintf(stderr, "qwen-generate: %s is not a non-empty int32 array\n", argv[2]);
+        return 2;
+    }
+    const int n_tok = (int)(tn / sizeof(int32_t));
+
+    pulsar_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = argv[1];
+    opt.backend = PULSAR_BACKEND_CUDA;
+    pulsar_engine *e = NULL;
+    if (pulsar_engine_open(&e, &opt) != 0) {
+        fprintf(stderr, "qwen-generate: %s did not open\n", argv[1]);
+        return 2;
+    }
+    const int W = pulsar_engine_logits_width(e);
+
+    /* One slot per prompt token, one per generated token, a little headroom for the
+     * allocator's own rounding -- the gate sizes its session the same way. */
+    const int cap = n_tok + n_predict + 8;
+    pulsar_session *sess = NULL;
+    if (pulsar_session_create(&sess, e, cap) != 0) {
+        fprintf(stderr, "qwen-generate: session of %d tokens refused\n", cap);
+        return 2;
+    }
+
+    int32_t *ids = (int32_t *)xmalloc(sizeof(int32_t) * (size_t)cap);
+    memcpy(ids, tb, tn);
+    free(tb);
+    float *row = (float *)xmalloc(sizeof(float) * (size_t)W);
+
+    printf("qwen-generate: %s, prompt %d tokens, width %d, greedy %d tokens\n",
+           argv[1], n_tok, W, n_predict);
+    printf("tokens:");
+    fflush(stdout);
+
+    int T = n_tok, generated = 0;
+    for (int i = 0; i < n_predict; i++) {
+        /* Extend the prefix by one each step: sync() reuses the existing graph state, so this
+         * is the session lane's decode, not a fresh prefill of the whole prompt. */
+        pulsar_tokens t = { ids, T, T };
+        char err[256] = "";
+        if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
+            break;
+        }
+        err[0] = '\0';
+        if (pulsar_session_eval(sess, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nqwen-generate: eval at %d tokens: %s\n", T, err);
+            break;
+        }
+        /* copy_logits returns the count WRITTEN (0 on error), the opposite of set_logits. */
+        if (pulsar_session_copy_logits(sess, row, W) != W) {
+            fprintf(stderr, "\nqwen-generate: copy_logits at %d tokens\n", T);
+            break;
+        }
+        int am = 0;
+        for (int j = 1; j < W; j++) if (row[j] > row[am]) am = j;
+        ids[T++] = am;
+        generated++;
+        printf(" %d", am);
+        fflush(stdout);
+    }
+    printf("\n");
+
+    if (argc > 4) {
+        FILE *f = fopen(argv[4], "wb");
+        if (!f) { fprintf(stderr, "qwen-generate: cannot write %s\n", argv[4]); return 1; }
+        const size_t n = (size_t)T * sizeof(int32_t);
+        if (fwrite(ids, 1, n, f) != n) { fclose(f); fprintf(stderr, "qwen-generate: short write\n"); return 1; }
+        fclose(f);
+        printf("qwen-generate: %d ids (prompt %d + generated %d) -> %s\n",
+               T, n_tok, generated, argv[4]);
+    }
+
+    pulsar_session_free(sess);
+    free(ids);
+    free(row);
+    return 0;
+}
