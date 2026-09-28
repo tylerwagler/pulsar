@@ -204,7 +204,7 @@ struct ws_bump {
 struct moe_ws {
     float *logits, *wts, *sgate, *gu_z, *down_z, *yg, *yu, *ys;
     int32_t *sel;
-    uint8_t *mid_q, *mid_sf, *h_x;   /* h_x: the shared expert's bf16 SwiGLU row (ac69748f) */
+    uint8_t *mid_x, *h_x;           /* the routed fold's and the shared SwiGLU's bf16 rows (ac69748f) */
     void *lin;
     size_t lin_bytes;
 };
@@ -220,8 +220,7 @@ static size_t moe_ws_layout(int T, void *base, size_t cap, moe_ws *o) {
     m.wts    = (float *)b.take(pairs * 4);
     m.sgate  = (float *)b.take((size_t)T * 4);
     m.gu_z   = (float *)b.take(pairs * 2 * mid * 4);
-    m.mid_q  = (uint8_t *)b.take(pairs * mid);
-    m.mid_sf = (uint8_t *)b.take(pulsar_mx_sf_slab_bytes((int)pairs, pulsar_mx_kbp(mid)));
+    m.mid_x  = (uint8_t *)b.take((size_t)pairs * mid * 2);   /* bf16: no per-32 block, no scale slab */
     m.down_z = (float *)b.take(pairs * kH * 4);
     m.yg     = (float *)b.take((size_t)T * smid * 4);
     m.yu     = (float *)b.take((size_t)T * smid * 4);
@@ -303,11 +302,11 @@ extern "C" size_t pulsar_qwen_moe_workspace_bytes(int T) {
     return T > 0 ? moe_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
-extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
+extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
                                       int T, float *out, void *ws, size_t ws_bytes,
                                       uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
-    if (!w || !x_bf16 || !x || !x->q || !x->sf || !out || !nf_flag || T <= 0 ||
-        !w->gate_up_table || !w->down_table || x->kbp != pulsar_mx_kbp(kH)) {
+    if (!w || !x_bf16 || !out || !nf_flag || T <= 0 ||
+        !w->gate_up_table || !w->down_table) {
         fprintf(stderr, "pulsar: qwen MoE: a null input or a slot that is not %d wide -- refusing\n", kH);
         return -1;
     }
@@ -354,40 +353,35 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
                                        m.logits, m.sel, m.wts, m.sgate, stream);
     if (rc) return rc;
 
-    /* routed: the L245 arm's four launches */
-    const int mid_kbp = pulsar_mx_kbp(mid);
-    cudaMemsetAsync(m.mid_sf, 0, pulsar_mx_sf_slab_bytes((int)pairs, mid_kbp), stream);
-    rc = ds4_exl3_moe_fused(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK, stream,
-                            x->q, x->sf, x->kbp);
+    /* Routed: the four launches, all on the block input's bf16 row and the fold's bf16 output.
+     * L251 / ac69748f: there is no E4M3 activation slot in this family, so nothing here stages or
+     * encodes one -- the fused arm reads x_bf16 by ids_src1, and the fold hands the down arm bf16. */
+    rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK,
+                                 stream, x_bf16);
     if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
     rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
-                                        kH, mid, pairs, 0.0f, m.mid_q, m.mid_sf, mid_kbp, stream);
+                                        kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
     if (rc) return -1;
-    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's A8 output -- the down GEMV's input --
-     * so the xcheck can compare the DEVICE's own codes against its emulation's per element.  The
-     * one place those may legitimately differ is an E4M3 rounding TIE: the fold's terms are ~0.03
-     * and its input ~5.9e-05, so the fold's fp32-vs-fp64 difference (~1e-8 absolute) is ~1.7e-4
-     * RELATIVE, and scaled by 2^19 that is ~3e-3 -- enough to choose the other code wherever a
-     * value lands within ~1e-5 of a midpoint, which an E4M3 code comparison can see and an
-     * absolute epsilon on the output cannot.  Armed only by the env var; nothing runs and nothing
-     * allocates when it is unset. */
+    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down GEMV's input --
+     * so the xcheck can compare the DEVICE's own values against its emulation's per element.  Under
+     * bf16 there are no codes and no per-32 scale to differ on, so the comparison is now on the value
+     * itself; the dump is 2 bytes per element where the A8 pair was 1 plus its slab.  Armed only by
+     * the env var; nothing runs and nothing allocates when it is unset. */
     { const char *sp = getenv("PULSAR_MOE_SPILL_MID");
       if (sp && sp[0] && T > 1) {   /* the batch call; the M=1 loop would overwrite it */
-          const size_t nq = (size_t)pairs * (size_t)mid;
-          const size_t ns = pulsar_mx_sf_slab_bytes((int)pairs, mid_kbp);
-          uint8_t *hq = (uint8_t *)malloc(nq), *hs = (uint8_t *)malloc(ns);
+          const size_t nb = (size_t)pairs * (size_t)mid * 2u;
+          uint8_t *hb = (uint8_t *)malloc(nb);
           cudaStreamSynchronize(stream);
-          if (hq && hs && cudaMemcpy(hq, m.mid_q, nq, cudaMemcpyDeviceToHost) == cudaSuccess &&
-                          cudaMemcpy(hs, m.mid_sf, ns, cudaMemcpyDeviceToHost) == cudaSuccess) {
-              char fp[1024]; FILE *f;
-              snprintf(fp, sizeof(fp), "%s.mid_q.bin", sp);  f = fopen(fp, "wb"); if (f) { fwrite(hq, 1, nq, f); fclose(f); }
-              snprintf(fp, sizeof(fp), "%s.mid_sf.bin", sp); f = fopen(fp, "wb"); if (f) { fwrite(hs, 1, ns, f); fclose(f); }
+          if (hb && cudaMemcpy(hb, m.mid_x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+              char fp[1024];
+              snprintf(fp, sizeof(fp), "%s.mid_x.bin", sp);
+              FILE *f = fopen(fp, "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); }
           }
-          free(hq); free(hs);
+          free(hb);
       }
     }
-    rc = ds4_exl3_moe_single(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
-                             stream, m.mid_q, m.mid_sf, mid_kbp);
+    rc = ds4_exl3_moe_single_bf16(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
+                                  stream, m.mid_x);
     if (rc) { fprintf(stderr, "pulsar: qwen MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
     rc = ds4_exl3_moe_sum_launch(out, m.down_z, m.sel, w->down_table, mid, kH, kTopK, T, nf_flag, nf_code, stream);
     if (rc) return -1;

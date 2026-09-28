@@ -166,7 +166,10 @@ size_t pulsar_qwen_moe_workspace_bytes(int T);
  *  `x_bf16` is the block input row and `x` its E4M3 slot (both from the GR
  *  read).  Non-finite outputs record `nf_code` in *nf_flag (first writer
  *  wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ); refuses without them. */
-int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16, const pulsar_qwen_slot *x,
+/* L251 / ac69748f: x_bf16 only.  There is no E4M3 activation slot in this family, so the MoE takes
+ * the block input's bf16 row and nothing else -- the routed arm reads it by ids_src1 and the shared
+ * expert reads it directly. */
+int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
                            int T, float *out, void *ws, size_t ws_bytes,
                            uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream);
 

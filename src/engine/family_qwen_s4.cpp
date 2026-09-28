@@ -503,16 +503,14 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &w.shared_up) ||
         !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &w.shared_down))
         return false;
-    const void *xq = NULL, *xsf = NULL;
-    int kbp = 0;
-    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(st->st->x, n, (uint64_t)H, &xq, &xsf, &kbp))
-        return fail("the MoE found no E4M3 slot for its input (the GR read is its producer)");
-    const pulsar_qwen_slot x = {(uint8_t *)xq, (uint8_t *)xsf, kbp};
+    /* L251 / ac69748f: there is no E4M3 activation slot in this family.  The MoE reads the block
+     * input's bf16 row directly -- the routed arm by ids_src1 and the shared expert as a plain row --
+     * so unlike the GDN and QSA ops there is nothing here to fetch, arm or encode. */
     const moe_scratch m = moe_layout(st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     if (!sc) return fail("no MoE scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
-    return pulsar_qwen_moe_launch(&w, (const uint16_t *)dptr(st->st->x), &x, (int)n, (float *)dptr(st->st->y),
+    return pulsar_qwen_moe_launch(&w, (const uint16_t *)dptr(st->st->x), (int)n, (float *)dptr(st->st->y),
                                   base + m.ws, m.ws_bytes, (uint32_t *)(base + m.nf), 0x51000000u | il, 0) == 0;
 }
 
