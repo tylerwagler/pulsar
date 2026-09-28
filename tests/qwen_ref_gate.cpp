@@ -278,6 +278,30 @@ int main(int argc, char **argv) {
             printf("\n               ref top5");
             for (int q = 0; q < 5; q++) printf(" %d@%.3f", rt[q], (double)rr[rt[q]]);
             printf("\n");
+            /* WHICH reference depth does this engine row actually look like?  The engine
+             * predicts <|im_end|> several tokens before the reference does in `story`, so
+             * the fault could be a SHIFTED CONTEXT (positions/prefix) rather than a
+             * slightly different model -- and those need different fixes.  Grading the
+             * engine's row against every recorded reference row separates them: a row
+             * that best matches a different depth is a shift, not a numerical drift. */
+            int bestk = -1;
+            double bestkl = 0;
+            for (int k2 = 0; k2 < nr; k2++) {
+                const float *r2 = ref + (size_t)k2 * (size_t)W;
+                double m2 = r2[0];
+                for (int j = 1; j < W; j++) if (r2[j] > m2) m2 = r2[j];
+                double s2 = 0;
+                for (int j = 0; j < W; j++) s2 += exp((double)r2[j] - m2);
+                double q = 0;
+                for (int j = 0; j < W; j++) {
+                    const double pr = exp((double)r2[j] - m2) / s2, pe = exp((double)row[j] - meng) / seng;
+                    if (pr > 0 && pe > 0) q += pr * log(pr / pe);
+                }
+                if (bestk < 0 || q < bestkl) { bestkl = q; bestk = k2; }
+            }
+            printf("               eng d=%-6d best matches ref[%d] d=%-6d KL %.3e%s\n",
+                   d, bestk, recs[bestk].depth, bestkl,
+                   (recs[bestk].depth == d) ? "" : "   <-- SHIFTED CONTEXT");
             if (am == recs[k].argmax) am_ok++;
         }
         check(graded == nr && am_ok == nr, "%s: argmax matches at %d / %d depths", prompts[i], am_ok, nr);
