@@ -233,11 +233,28 @@ int main(int argc, char **argv) {
             if (kl > worst_kl) worst_kl = kl;
             if (mx > worst_mx) worst_mx = mx;
             graded++;
+            /* Least-squares fit row ~ slope*rr + intercept, and the max residual after
+             * removing it.  A constant offset is softmax-invariant (harmless, and it is
+             * what makes the engine's top logit look "too high" while KL stays ~0); a
+             * slope != 1 is a real temperature/scale defect; a large residual is
+             * structure.  Fitting says which, instead of reading the raw max diff. */
+            double mr = 0, me = 0;
+            for (int j = 0; j < W; j++) { mr += rr[j]; me += row[j]; }
+            mr /= W; me /= W;
+            double sxy = 0, sxx = 0;
+            for (int j = 0; j < W; j++) { const double dx = rr[j] - mr; sxy += dx * (row[j] - me); sxx += dx * dx; }
+            const double slope = sxx > 0 ? sxy / sxx : 1.0;
+            const double icept = me - slope * mr;
+            double resid = 0;
+            for (int j = 0; j < W; j++) {
+                const double e = fabs((double)row[j] - (slope * (double)rr[j] + icept));
+                if (e > resid) resid = e;
+            }
             /* ALWAYS one line per depth.  Two depths sharing `fnv eng` means the session
              * never advanced -- prefix reuse handed back the same row -- which a bare
              * argmax count hides completely (it reads as a near miss instead of a stall). */
-            printf("      d=%-6d eng %7d @ %9.4f | ref %7d @ %9.4f | KL %.3e max %.3e | fnv %016llx eng / %016llx ref%s\n",
-                   d, am, (double)row[am], ram, (double)rr[ram], kl, mx,
+            printf("      d=%-6d eng %7d @ %9.4f | ref %7d @ %9.4f | KL %.3e | fit x%.4f %+.3f resid %.3e | fnv %016llx/%016llx%s\n",
+                   d, am, (double)row[am], ram, (double)rr[ram], kl, slope, icept, resid,
                    (unsigned long long)he, (unsigned long long)hr,
                    (am == recs[k].argmax) ? "" : "   <-- ARGMAX MISMATCH");
             if (am == recs[k].argmax) am_ok++;
