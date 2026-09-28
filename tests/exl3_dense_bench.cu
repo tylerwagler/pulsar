@@ -122,11 +122,22 @@ int main(int argc, char **argv) {
         /* the activation: 16 rows of f32 the bench produces, armed as the A8
          * slot by the engine's own producer-side encoder */
         pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * K * 4);
+        /* L251 / ac69748f: the EXL3 dense arm reads BF16 and there is no f32 -> bf16 activation
+         * encoder, so the harness carries its own bf16 activation BESIDE the f32 one the MXFP8 arm
+         * needs.  Filled from the same values through __float2bfloat16, so both arms still see
+         * identical rows -- which is the whole point of this comparison. */
+        pulsar_gpu_tensor *xb = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * K * 2);
         pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * N * 4);
         {
             std::vector<float> h((size_t)kMaxRows * K);
             for (auto &v : h) v = ((float)(rnd() >> 8) / 16777216.0f - 0.5f) * 4.0f;
             pulsar_gpu_tensor_write(x, 0, h.data(), h.size() * 4);
+            std::vector<uint16_t> hb(h.size());
+            for (size_t i = 0; i < h.size(); i++) {
+                const __nv_bfloat16 b = __float2bfloat16(h[i]);
+                std::memcpy(&hb[i], &b, sizeof(uint16_t));
+            }
+            pulsar_gpu_tensor_write(xb, 0, hb.data(), hb.size() * 2);
         }
         float *d_y = nullptr, *d_ws = nullptr;
         const size_t ws_bytes = ds4_exl3_dense_workspace_bytes(kMaxRows, K, N);
@@ -198,11 +209,12 @@ int main(int argc, char **argv) {
         for (int M : widths) {
             if (only_m && M != only_m) continue;
             if (!pulsar_gpu_mxfp8_act_cache_encode_f32(x, M, K)) { fprintf(stderr, "act encode refused\n"); return 2; }
-            const void *xq = nullptr, *xs = nullptr;
-            int kbp = 0;
-            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, M, K, &xq, &xs, &kbp) || kbp != KBp) {
-                fprintf(stderr, "no E4M3 slot for (%d, %d) -- refusing\n", M, K); return 2;
+            /* L251 / ac69748f: the EXL3 arm takes the bf16 plane, not an E4M3 slot. */
+            void *xq = nullptr;
+            if (!pulsar_gpu_bf16_act_slot(xb, M, K, &xq) || !xq) {
+                fprintf(stderr, "no bf16 activation for (%d, %d) -- refusing\n", M, K); return 2;
             }
+            pulsar_gpu_bf16_act_note(xb, M, K);
             /* MXFP8: decode rows up to the decode cap, prefill rows past it */
             const bool prefill = M > 16;
             const int n_it = prefill ? (iters + 9) / 10 : iters;
@@ -216,12 +228,12 @@ int main(int argc, char **argv) {
             if (!f8_ok) { fprintf(stderr, "MXFP8 GEMV refused at M=%d\n", M); return 2; }
             printf("%-22s %-11s %4d | %9.2f %8.1f %7.1f %6.2f | %.1f\n", sh.what, prefill ? "MXFP8 pf" : "MXFP8", M, f8_bytes / 1e6, t_f8,
                    f8_bytes / (t_f8 * 1e-6) / 1e9, t_f8 / roof_f8, roof_f8);
-            /* EXL3 at every rate, from the same slot */
+            /* EXL3 at every rate, from the same rows (bf16) */
             for (size_t j = 0; j < sets.size(); j++) {
                 const exl3_set &s = sets[j];
                 bool ok = true;
                 const double t = time_calls(n_it, [&](int i) {
-                    if (ds4_exl3_dense_launch(s.arena + (size_t)(i % s.n) * s.stride, s.k2, xq, xs, d_y, M, K, N,
+                    if (ds4_exl3_dense_launch(s.arena + (size_t)(i % s.n) * s.stride, s.k2, xq, d_y, M, K, N,
                                               d_ws, ws_bytes, cudaStreamPerThread)) ok = false;
                 });
                 if (!ok) { fprintf(stderr, "EXL3 arm refused\n"); return 2; }
@@ -237,7 +249,8 @@ int main(int argc, char **argv) {
         for (int r = 0; r < n_f8; r++) { pulsar_gpu_tensor_free(f8d[r]); pulsar_gpu_tensor_free(f8s[r]); }
         cudaFree(d_y); cudaFree(d_ws);
         pulsar_gpu_act_slot_drop(x);
-        pulsar_gpu_tensor_free(x); pulsar_gpu_tensor_free(out);
+        pulsar_gpu_act_slot_drop(xb);
+        pulsar_gpu_tensor_free(x); pulsar_gpu_tensor_free(xb); pulsar_gpu_tensor_free(out);
     }
     return 0;
 }
