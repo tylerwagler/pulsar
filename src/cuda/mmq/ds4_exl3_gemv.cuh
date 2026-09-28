@@ -149,7 +149,8 @@ int ds4_exl3_moe_fold_launch(
     void          * mid_q,
     void          * mid_sf,
     int             mid_kbp,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    void          * mid_bf16 = nullptr);
 
 /** The fold over a FUSED gate_up: gate_up_z [pairs][2 mid] (gate columns
  *  0..mid-1, up columns mid..2 mid-1), svh of the one gate_up slice (gate's at
@@ -168,7 +169,8 @@ int ds4_exl3_moe_fold_fused_launch(
     void          * mid_q,
     void          * mid_sf,
     int             mid_kbp,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    void          * mid_bf16 = nullptr);
 
 /** The EXL3 sum: out[tok][o] = sum over slots (in slot order) of
  *  svh_d * H(z_d[pair]) -- the down projection's output rotation folded into

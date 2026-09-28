@@ -442,6 +442,7 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      int in_dim, int mid_dim, int64_t pairs, float clamp,
                      __nv_fp8_e4m3 *__restrict__ mid_q,
                      unsigned char *__restrict__ mid_sf,
+                     __nv_bfloat16 *__restrict__ mid_bf16,   /* the format the down arm reads */
                      int mid_kbp) {
     const int64_t task = ((int64_t)blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
     const int n_blk = mid_dim >> 7;
@@ -477,13 +478,24 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
 #pragma unroll
     for (int off = 4; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
     const int se = pulsar_mx_shared_exp(a);
-    __nv_fp8_e4m3 *dst = mid_q + (size_t)pair * mid_dim + col0;
-    dst[0] = pulsar_mx_encode(t[0], se);
-    dst[1] = pulsar_mx_encode(t[1], se);
-    dst[2] = pulsar_mx_encode(t[2], se);
-    dst[3] = pulsar_mx_encode(t[3], se);
-    if ((lane & 7) == 0)
-        mid_sf[pulsar_mx_sfoff((int)pair, col0 >> 5, mid_kbp)] = pulsar_mx_scale_byte(se);
+    if (mid_q) {
+        __nv_fp8_e4m3 *dst = mid_q + (size_t)pair * mid_dim + col0;
+        dst[0] = pulsar_mx_encode(t[0], se);
+        dst[1] = pulsar_mx_encode(t[1], se);
+        dst[2] = pulsar_mx_encode(t[2], se);
+        dst[3] = pulsar_mx_encode(t[3], se);
+        if ((lane & 7) == 0)
+            mid_sf[pulsar_mx_sfoff((int)pair, col0 >> 5, mid_kbp)] = pulsar_mx_scale_byte(se);
+    }
+    /* L251 / ac69748f: bf16 carries its own exponent, so there is no per-32 block and no scale byte.
+     * The fold's output is an op-internal Linear activation, so it follows the family's rule. */
+    if (mid_bf16) {
+        __nv_bfloat16 *d16 = mid_bf16 + (size_t)pair * mid_dim + col0;
+        d16[0] = __float2bfloat16(t[0]);
+        d16[1] = __float2bfloat16(t[1]);
+        d16[2] = __float2bfloat16(t[2]);
+        d16[3] = __float2bfloat16(t[3]);
+    }
 }
 
 /* One warp per (token, 128-block of out); slots summed in order. */
@@ -686,9 +698,9 @@ int ds4_exl3_moe_gemv_pair_launch_rows(const void *gate_table, const void *up_ta
 int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32_t *selected,
                              const float *weights, const void *gate_table, const void *up_table,
                              const void *down_table, int in_dim, int mid_dim, int64_t pairs,
-                             float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream) {
+                             float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream, void *mid_bf16) {
     if (!gate_z || !up_z || !selected || !weights || !gate_table || !up_table || !down_table ||
-        !mid_q || !mid_sf || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
+        (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: null pointer or bad shape (mid_dim %% 128)\n");
         return -1;
     }
@@ -696,7 +708,7 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
         gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
-        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
+        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: launch failed: %s\n", cudaGetErrorString(err));
@@ -708,8 +720,8 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
 int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *selected, const float *weights,
                                    const void *gate_up_table, const void *down_table, int in_dim, int mid_dim,
                                    int64_t pairs, float clamp, void *mid_q, void *mid_sf, int mid_kbp,
-                                   cudaStream_t stream) {
-    if (!gate_up_z || !selected || !weights || !gate_up_table || !down_table || !mid_q || !mid_sf || pairs <= 0 ||
+                                   cudaStream_t stream, void *mid_bf16) {
+    if (!gate_up_z || !selected || !weights || !gate_up_table || !down_table || (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 ||
         in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
         fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: null pointer or bad shape (mid_dim %% 128)\n");
         return -1;
@@ -720,7 +732,7 @@ int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *select
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
         gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
-        down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
+        down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: launch failed: %s\n", cudaGetErrorString(err));
