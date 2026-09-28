@@ -163,15 +163,19 @@ qwen_router_topk_kernel(const float *__restrict__ logits, int T, int32_t *__rest
     }
 }
 
-/* The shared expert's SwiGLU, encoded where it is produced (rule 3). */
+/* The shared expert's SwiGLU, emitted in the format its consumer reads (rule 3).  L251 / ac69748f:
+ * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
+ * exponent, so there is no per-32 block and no scale slab any more. */
 __global__ void __launch_bounds__(256)
 qwen_swiglu_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, int D,
-                        __nv_fp8_e4m3 *__restrict__ q, unsigned char *__restrict__ sf, int kbp) {
+                        __nv_bfloat16 *__restrict__ xb) {
     const int t = blockIdx.x;
     for (int c0 = 0; c0 < D; c0 += 256) {
         const int c = c0 + (int)threadIdx.x;
-        const float v = c < D ? pulsar_swiglu_elem(g[(size_t)t * D + c], u[(size_t)t * D + c], 1.0f, 0.0f) : 0.0f;
-        pulsar_mx_emit_block(v, (uint32_t)c, (uint32_t)t, (uint32_t)D, kbp, q, sf);
+        if (c < D) {
+            xb[(size_t)t * D + c] = __float2bfloat16(pulsar_swiglu_elem(
+                g[(size_t)t * D + c], u[(size_t)t * D + c], 1.0f, 0.0f));
+        }
     }
 }
 
@@ -200,7 +204,7 @@ struct ws_bump {
 struct moe_ws {
     float *logits, *wts, *sgate, *gu_z, *down_z, *yg, *yu, *ys;
     int32_t *sel;
-    uint8_t *mid_q, *mid_sf, *h_q, *h_sf;
+    uint8_t *mid_q, *mid_sf, *h_x;   /* h_x: the shared expert's bf16 SwiGLU row (ac69748f) */
     void *lin;
     size_t lin_bytes;
 };
@@ -221,8 +225,7 @@ static size_t moe_ws_layout(int T, void *base, size_t cap, moe_ws *o) {
     m.down_z = (float *)b.take(pairs * kH * 4);
     m.yg     = (float *)b.take((size_t)T * smid * 4);
     m.yu     = (float *)b.take((size_t)T * smid * 4);
-    m.h_q    = (uint8_t *)b.take((size_t)T * smid);
-    m.h_sf   = (uint8_t *)b.take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(smid)));
+    m.h_x    = (uint8_t *)b.take((size_t)T * smid * 2);   /* bf16: no per-32 block, no scale slab */
     m.ys     = (float *)b.take((size_t)T * kH * 4);
     /* the dense arm's workspace is a function of (rows, in, out) alone */
     size_t lb = ds4_exl3_dense_workspace_bytes(T, kH, smid);
@@ -390,15 +393,12 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
     if (rc) return -1;
 
     /* shared: gate + up on the same slot, the SwiGLU producer, down */
-    rc = pulsar_qwen_linear_launch(&w->shared_gate, x, T, m.yg, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_qwen_linear_launch(&w->shared_up, x, T, m.yu, m.lin, m.lin_bytes, stream);
+    rc = pulsar_qwen_linear_launch(&w->shared_gate, x_bf16, T, m.yg, m.lin, m.lin_bytes, stream);
+    if (!rc) rc = pulsar_qwen_linear_launch(&w->shared_up, x_bf16, T, m.yu, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
-    const int h_kbp = pulsar_mx_kbp(smid);
-    cudaMemsetAsync(m.h_sf, 0, pulsar_mx_sf_slab_bytes(T, h_kbp), stream);
-    qwen_swiglu_emit_kernel<<<T, 256, 0, stream>>>(m.yg, m.yu, smid, (__nv_fp8_e4m3 *)m.h_q, m.h_sf, h_kbp);
+    qwen_swiglu_emit_kernel<<<T, 256, 0, stream>>>(m.yg, m.yu, smid, (__nv_bfloat16 *)m.h_x);
     if (!launch_ok("shared swiglu")) return -3;
-    const pulsar_qwen_slot h = {m.h_q, m.h_sf, h_kbp};
-    rc = pulsar_qwen_linear_launch(&w->shared_down, &h, T, m.ys, m.lin, m.lin_bytes, stream);
+    rc = pulsar_qwen_linear_launch(&w->shared_down, (const uint16_t *)m.h_x, T, m.ys, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     const size_t n = (size_t)T * kH;
     qwen_shared_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, m.ys, m.sgate, T);
