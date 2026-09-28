@@ -250,10 +250,12 @@ extern "C" size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l
     return ds4_exl3_dense_workspace_bytes(rows, l->in, l->out);
 }
 
-extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const pulsar_qwen_slot *x, int rows, float *y,
+extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const uint16_t *x_bf16, int rows, float *y,
                                          void *ws, size_t ws_bytes, cudaStream_t stream) {
-    if (!l || !l->w || !x || !x->q || !x->sf || x->kbp != pulsar_mx_kbp(l->in)) {
-        fprintf(stderr, "pulsar: qwen linear: no weight or no E4M3 slot of width %d -- refusing\n", l ? l->in : -1);
+    /* L251 / ac69748f: the reader takes the block input's bf16 row.  There is no E4M3 activation slot in
+     * this family, so a missing activation is an error -- never a reason to reach for another format. */
+    if (!l || !l->w || !x_bf16 || rows <= 0) {
+        fprintf(stderr, "pulsar: qwen linear: no weight or no bf16 activation of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
@@ -263,9 +265,9 @@ extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const puls
             return -1;
         }
         const pulsar_qwen_lowrank lr{l->w, l->sf, l->out, l->in};
-        return pulsar_qwen_mxfp8_linear_launch(&lr, x, rows, y, ws, ws_bytes, stream);
+        return pulsar_qwen_mxfp8_linear_launch(&lr, x_bf16, rows, y, ws, ws_bytes, stream);
     }
-    return ds4_exl3_dense_launch(l->w, l->k2, x->q, x->sf, y, rows, l->in, l->out, ws, ws_bytes, stream);
+    return ds4_exl3_dense_launch(l->w, l->k2, x_bf16, y, rows, l->in, l->out, ws, ws_bytes, stream);
 }
 
 /* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh

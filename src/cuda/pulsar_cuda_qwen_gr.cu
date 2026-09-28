@@ -442,18 +442,19 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
  * y [T][out] (index (t * 1 + 0) * out + row), so there is no reduction pass and
  * no workspace.  Split-K would only add partials to sum; with one split the row's
  * 80 blocks are walked by one warp in order. */
-extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const pulsar_qwen_slot *x, int rows,
+extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows,
                                                float *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
     (void)ws;
     (void)ws_bytes;
-    if (!l || !l->w || !l->sf || !x || !x->q || !x->sf || rows <= 0 || l->in <= 0 || l->out <= 0 ||
-        l->in % 32 != 0 || x->kbp != pulsar_mx_kbp(l->in)) {
-        fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs an E4M3 slot of width %d (kbp %d) -- refusing\n",
-                l ? l->in : -1, l ? l->out : -1, l ? l->in : -1, pulsar_mx_kbp(l ? l->in : 32));
+    /* L251 / ac69748f: the bf16 activation, so the W8=false arm of the same kernel.  The E4M3 slot and
+     * its per-32 scales are gone; the weight stays mxfp8_lt (E4M3 + E8M0), which is the weight tier. */
+    if (!l || !l->w || !l->sf || !x_bf16 || rows <= 0 || l->in <= 0 || l->out <= 0 || l->in % 32 != 0) {
+        fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs a bf16 activation of width %d -- refusing\n",
+                l ? l->in : -1, l ? l->out : -1, l ? l->in : -1);
         return -1;
     }
     const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
-    qwen_gr_down_kernel<true><<<grid, 256, 0, stream>>>(l->w, l->sf, x->q, x->sf, x->kbp, l->out, l->in, rows, 1, y);
+    qwen_gr_down_kernel<false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
     const cudaError_t qe = cudaGetLastError();
     if (qe != cudaSuccess) {
         fprintf(stderr, "pulsar: qwen mxfp8 linear launch: %s\n", cudaGetErrorString(qe));

@@ -5,20 +5,20 @@
 //
 // The weight is one [trellis | suh | svh] slice in the byte model of
 // exl3_expert_layout(K, N, k2) -- the same slice a routed expert-projection is,
-// so a checkpoint's tensors copy in verbatim.  The activation is the dense
-// lane's A8 slot, exactly what the MXFP8 GEMV reads: E4M3 row-major [M][K] plus
-// one ue8m0 byte per 32 at pulsar_mx_sfoff(row, k/32, pulsar_mx_kbp(K)).
+// so a checkpoint's tensors copy in verbatim.  The activation is the block
+// input's bf16 row -- the family's `x` -- and NOT an A8 slot (L251 / ac69748f:
+// there is no E4M3 activation slot in this family).
 //
 // Where the two rotations go:
 //   * INPUT (suh, then H128): the arm's first kernel applies them in f32 to the
-//     slot's decoded rows, once per (row, 128-block), into its workspace.  That
-//     is a multiplication by part of W, not an activation re-encode: the slot's
-//     E4M3 bytes stay the one activation encoding.  It is not hoisted into the
-//     producer because suh is per Linear and one activation feeds several
-//     Linears (Qwen's DeltaNet in_proj_qkv / _z / _b / _a, an attention's
-//     q / k / v): a pre-rotated slot per consumer would be several encodings of
-//     one value, and E4M3 of H(suh * x) is a different quantization than the A8
-//     contract's E4M3 of x.  The rotated rows are held as a power-of-two
+//     block input's bf16 rows, once per (row, 128-block), into its workspace.
+//     That is a multiplication by part of W, not an activation re-encode: the
+//     bf16 row IS the one activation encoding, read as bf16 (rule 3).  It is not
+//     hoisted into the producer because suh is per Linear and one activation
+//     feeds several Linears (Qwen's DeltaNet in_proj_qkv / _z / _b / _a, an
+//     attention's q / k / v): a pre-rotated copy per consumer would duplicate one
+//     value several times, and it is not the value the producer emitted.  The
+//     rotated rows are held as a power-of-two
 //     prescale and an fp16 hi + lo pair (~22 significant bits) because that is
 //     the operand the tensor cores take; the products with the (fp16-exact)
 //     weight are exact, so the arm is f32-class -- graded against the host
@@ -60,7 +60,8 @@ size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 int ds4_exl3_dense_splits(int K, int N);
 
 /** y [M][N] f32 = the complete Linear.  `w` is the [trellis | suh | svh] slice
- *  (16-byte aligned), `xq` / `sx` the E4M3 slot of the M rows.  K % 128 == 0,
+ *  (16-byte aligned), `xb` the bf16 block input of the M rows (8-byte aligned,
+ *  the uint2 row loads).  K % 128 == 0,
  *  N % 128 == 0, M >= 1, k2 a supported rate, `workspace` (16-byte aligned) at
  *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Three kernels per 128-row
  *  slab on `stream`; refuses (returns -1) on any contract violation, -3 on a
@@ -68,8 +69,7 @@ int ds4_exl3_dense_splits(int K, int N);
 int ds4_exl3_dense_launch(
     const void   * w,
     int            k2,
-    const void   * xq,
-    const void   * sx,
+    const void   * xb,
     float        * y,
     int            M,
     int            K,

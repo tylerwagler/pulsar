@@ -38,6 +38,7 @@
 #include "engine/exl3_trellis.h"
 
 #include <cstdio>
+#include <cuda_bf16.h>
 
 namespace {
 
@@ -107,7 +108,7 @@ __device__ __forceinline__ int tile_chunk(int row, int half) { return row * 2 + 
 
 /* 1. PREP: one warp per (row, 128-block) of the slab; lane l owns k = 4l..4l+3. */
 __global__ void __launch_bounds__(256)
-exl3_dense_prep_kernel(const __half *__restrict__ suh, const uint8_t *__restrict__ xq, const uint8_t *__restrict__ sx,
+exl3_dense_prep_kernel(const __half *__restrict__ suh, const __nv_bfloat16 *__restrict__ xb,
                        __half *__restrict__ xhi, __half *__restrict__ xlo, float *__restrict__ inv,
                        int x_row0, int rows, int K) {
     const int64_t task = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -116,17 +117,23 @@ exl3_dense_prep_kernel(const __half *__restrict__ suh, const uint8_t *__restrict
     const int m = (int)(task / blocks), blk = (int)(task - (int64_t)m * blocks);
     const int lane = threadIdx.x & 31;
     const int k = blk * EXL3_HAD_BLOCK + lane * 4;
-    const int row = x_row0 + m;                            /* the slot's row */
-    const uint32_t q = *reinterpret_cast<const uint32_t *>(xq + (size_t)row * (size_t)K + (size_t)k);
-    const uint32_t sb = sx[pulsar_mx_sfoff(row, k >> 5, pulsar_mx_kbp(K))];
+    const int row = x_row0 + m;                            /* the block input's row */
+    /* L251 / ac69748f: the activation is the block input's bf16 row, NOT an A8 slot.  bf16 carries
+     * its own exponent, so the E4M3 decode and the per-32 E8M0 block scale that stood here are gone
+     * (rule 3: the producer emits bf16, the consumer reads bf16).  Everything downstream -- suh,
+     * H128, the power-of-two prescale and the fp16 hi + lo split -- is unchanged: that is the
+     * tensor-core operand the rest of the arm already takes. */
+    const uint2 xw = *reinterpret_cast<const uint2 *>(xb + (size_t)row * (size_t)K + (size_t)k);
+    const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.x));
+    const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.y));
+    const float xv[4] = {b01.x, b01.y, b23.x, b23.y};
     const uint2 su2 = *reinterpret_cast<const uint2 *>(suh + k);
-    const float sc = __int_as_float((int)(sb << 23));      /* ue8m0 -> 2^(b-127), the MXFP8 GEMV's form */
     const __half2 s01 = *reinterpret_cast<const __half2 *>(&su2.x);
     const __half2 s23 = *reinterpret_cast<const __half2 *>(&su2.y);
     const float su[4] = {__low2float(s01), __high2float(s01), __low2float(s23), __high2float(s23)};
     float v[4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) v[e] = exl3dev::e4m3_to_f32((uint8_t)(q >> (8 * e))) * sc * su[e];
+    for (int e = 0; e < 4; ++e) v[e] = xv[e] * su[e];
     exl3dev::had128(v);
     float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
@@ -310,11 +317,11 @@ size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N) {
     return Workspace(S, M < kSlabRows ? M : kSlabRows, K, N).bytes;
 }
 
-int ds4_exl3_dense_launch(const void *w, int k2, const void *xq, const void *sx, float *y,
+int ds4_exl3_dense_launch(const void *w, int k2, const void *xb, float *y,
                           int M, int K, int N, void *workspace, size_t workspace_bytes, cudaStream_t stream) {
     const char *tag = "ds4_exl3_dense_launch";
     uint64_t trellis_bytes = 0, scale_bytes = 0, stride = 0;
-    if (!w || !xq || !sx || !y || !workspace || M <= 0) {
+    if (!w || !xb || !y || !workspace || M <= 0) {
         fprintf(stderr, "%s: null pointer or M=%d -- refusing\n", tag, M);
         return -1;
     }
@@ -327,8 +334,8 @@ int ds4_exl3_dense_launch(const void *w, int k2, const void *xq, const void *sx,
         fprintf(stderr, "%s: rate k2=%d has no instance (K = 2, 3, 4, 5) -- refusing\n", tag, k2);
         return -1;
     }
-    if ((uintptr_t)w % 16 || (uintptr_t)xq % 16 || (uintptr_t)y % 16 || (uintptr_t)workspace % 16) {
-        fprintf(stderr, "%s: w / xq / y / workspace must be 16-byte aligned -- refusing\n", tag);
+    if ((uintptr_t)w % 16 || (uintptr_t)xb % 8 || (uintptr_t)y % 16 || (uintptr_t)workspace % 16) {
+        fprintf(stderr, "%s: w / y / workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
         return -1;
     }
     const size_t need = ds4_exl3_dense_workspace_bytes(M, K, N);
@@ -340,7 +347,7 @@ int ds4_exl3_dense_launch(const void *w, int k2, const void *xq, const void *sx,
     const uint32_t *t = static_cast<const uint32_t *>(w);
     const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w) + trellis_bytes);
     const __half *svh = suh + K;
-    const uint8_t *q = static_cast<const uint8_t *>(xq), *s = static_cast<const uint8_t *>(sx);
+    const __nv_bfloat16 *xb16 = static_cast<const __nv_bfloat16 *>(xb);
     uint8_t *ws = static_cast<uint8_t *>(workspace);
     const dim3 block(kOut, kWarps, 1);
     /* rows past a slab of kSlabRows go through the same three kernels slab by
@@ -353,7 +360,7 @@ int ds4_exl3_dense_launch(const void *w, int k2, const void *xq, const void *sx,
         __half *xhi = reinterpret_cast<__half *>(ws + L.hi), *xlo = reinterpret_cast<__half *>(ws + L.lo);
         float *inv = reinterpret_cast<float *>(ws + L.inv);
         const int64_t prep_tasks = (int64_t)rows * (K / EXL3_HAD_BLOCK);
-        exl3_dense_prep_kernel<<<(unsigned)((prep_tasks + 7) / 8), 256, 0, stream>>>(suh, q, s, xhi, xlo, inv, m0, rows, K);
+        exl3_dense_prep_kernel<<<(unsigned)((prep_tasks + 7) / 8), 256, 0, stream>>>(suh, xb16, xhi, xlo, inv, m0, rows, K);
         const dim3 grid((unsigned)(N / kOut), (unsigned)S, (unsigned)((rows + kRows - 1) / kRows));
         switch (k2) {
         case 4:  exl3_dense_gemv_kernel<4><<<grid, block, 0, stream>>>(t, xhi, xlo, inv, part, rows, K, N, S); break;

@@ -104,10 +104,11 @@ typedef struct {
 } pulsar_qwen_linear;
 
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
- *  ([out][in] E4M3 then the swizzled E8M0 plane) and x an E4M3 slot of width
- *  `l->in`.  The same arithmetic the GR arm's W_down uses (split-K, one warp per
- *  output row, ordered); no workspace. */
-int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const pulsar_qwen_slot *x, int rows, float *y,
+ *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
+ *  of width `l->in` -- there is no E4M3 activation slot in this family (L251 /
+ *  ac69748f).  The same arithmetic the GR arm's W_down uses (split-K, one warp
+ *  per output row, ordered); no workspace. */
+int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
                                     void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** A weight's device pointer: the engine's model-range cache for the span
@@ -126,8 +127,8 @@ int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T
 
 /** Workspace bytes pulsar_qwen_linear_launch needs for `rows` rows. */
 size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l, int rows);
-/** y [rows][out] f32 = the complete Linear of the E4M3 rows in `x`. */
-int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const pulsar_qwen_slot *x, int rows, float *y,
+/** y [rows][out] f32 = the complete Linear of the bf16 rows in `x_bf16`. */
+int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const uint16_t *x_bf16, int rows, float *y,
                               void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /* ======================================================================== */
