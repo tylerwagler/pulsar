@@ -501,11 +501,17 @@ static void section_moe(void) {
         rows_f32 += sqrt(num / den) < 1e-5;
         printf("        row %d: rel Frobenius %.2e\n", t, sqrt(num / den));
     }
-    /* f32 order everywhere, except where an E4M3 encoding (the fold's mid, the shared
-     * expert's h) sees the device's f32 value and the double reference on two sides of a
-     * rounding tie -- a ~0.1-per-run event whose one flipped element moves its row by
-     * ~1e-4: at most one such row, and none past 1e-3 */
-    CHECK(rows_f32 >= T - 1 && frob_worst < 1e-3, "out vs double: %d of %d rows at f32 order (< 1e-5), worst row rel "
+    /* f32 order for most rows, except where a ROUNDING TIE at the fold's mid or the shared
+     * expert's h sees the device's f32 value and the double reference on two sides of a
+     * boundary: one flipped element moves its row off f32 order.
+     *
+     * L251 / ac69748f RE-DERIVED this bar rather than inheriting it.  The tie step was E4M3;
+     * it is now bf16 for both intermediates.  Measured on the bf16 build: 3 of 5 rows at f32
+     * order with worst 2.30e-05 -- so the absolute bound is TIGHTENED 10x here (1e-3 -> 1e-4,
+     * still 4x clear of the measured value and 1000x below the 2.5e-02 a real format error
+     * produced on this very line before the references were fixed), while the f32-order count
+     * allows the two tie-affected rows.  The count is a proxy; the bound is the check. */
+    CHECK(rows_f32 >= T - 2 && frob_worst < 1e-4, "out vs double: %d of %d rows at f32 order (< 1e-5), worst row rel "
           "Frobenius %.2e, max |err| / max|ref| %.2e", rows_f32, T, frob_worst, worst);
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
     /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
