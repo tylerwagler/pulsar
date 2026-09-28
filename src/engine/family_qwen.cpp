@@ -727,6 +727,15 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
         if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_MLP);
         if (ok) ok = ops->moe(&st, il);
         if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_MLP);
+        /* Diagnostic tap: the HC streams after layer il -- `n_hc` x n_embd f32 per row,
+         * the same quantity the streamed reference keeps in `hs` ([seq, hc_count,
+         * n_embd]).  It is how a reference-gate miss gets attributed to a layer instead
+         * of to "the model".  The dump helpers re-check the arming themselves
+         * (PULSAR_CUDA_GRAPH_DUMP_PREFIX, plus _LAYER/_NAME/_POS), so an unarmed run
+         * does no work and allocates nothing. */
+        if (ok) gpu_graph_debug_dump_hc_tensor("qwen_h", s->qwen->streams,
+                                              (uint64_t)n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
+                                              il, (uint32_t)pos[n_rows - 1]);
     }
     if (ok && head_n) ok = ops->head(&st, head_row0, head_n);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
