@@ -28,6 +28,8 @@
 #define QWEN_REF_HDR 88u
 
 static int g_fail = 0;
+/* PULSAR_REF_FRESH=1: grade each depth in a FRESH session (see the depth loop). */
+static int g_fresh = 0;
 
 static void check(bool ok, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -99,6 +101,8 @@ int main(int argc, char **argv) {
         prompts[np++] = "code";
         prompts[np++] = "story";
     }
+    g_fresh = getenv("PULSAR_REF_FRESH") != NULL;
+    if (g_fresh) printf("      (PULSAR_REF_FRESH: every depth is graded in a fresh session)\n");
 
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -170,6 +174,19 @@ int main(int argc, char **argv) {
         for (int k = 0; k < nr; k++) {
             const int d = recs[k].depth;
             if (d <= 0 || d > n_tok) { check(false, "%s: depth %d out of range (n_tok %d)", prompts[i], d, n_tok); break; }
+            /* PULSAR_REF_FRESH=1 grades every depth in a FRESH session, so the same
+             * depth is reached by one sync from empty instead of by prefix reuse.
+             * A depth that is right fresh and wrong reused (or the reverse) LOCALIZES
+             * the fault to the reuse path rather than to the forward -- which is the
+             * question when one depth of a run disagrees and its neighbours do not. */
+            if (g_fresh && k > 0) {
+                pulsar_session_free(sess);
+                sess = NULL;
+                if (pulsar_session_create(&sess, e, maxd + 64) != 0) {
+                    check(false, "%s: fresh session of %d tokens", prompts[i], maxd + 64);
+                    break;
+                }
+            }
             pulsar_tokens t = { (int *)toks, d, d };
             char err[256] = "";
             if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
