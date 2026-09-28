@@ -568,20 +568,18 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
         !linear_dev(st, L.gdn_in_a,   H,  NV, "qwen GDN in_proj_a",   &aa)  ||
         !linear_dev(st, L.gdn_in_b,   H,  NV, "qwen GDN in_proj_b",   &bb)  ||
         !linear_dev(st, L.gdn_out,    VT, H,  "qwen GDN out_proj",    &out)) return false;
-    const void *xq = NULL, *xsf = NULL;
-    int kbp = 0;
-    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(st->st->x, n, (uint64_t)H, &xq, &xsf, &kbp))
-        return fail("the GDN op found no E4M3 slot for its input (the GR read is its producer)");
-    const pulsar_qwen_slot xin = {(uint8_t *)xq, (uint8_t *)xsf, kbp};
+    /* L251 / ac69748f: the block input is bf16 and there is no E4M3 activation slot in this family, so
+     * these projections read the bf16 row its producer emitted (rule 3). */
+    const uint16_t *xin = (const uint16_t *)dptr(st->st->x);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GDN];
     if (!sc) return fail("no GDN scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
     const gdn_scratch g = gdn_layout(s, st->st->max_rows);
     void *linws = base + g.lin_ws;
-    if (pulsar_qwen_linear_launch(&qkv, &xin, (int)n, (float *)(base + g.qkv), linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_qwen_linear_launch(&zz,  &xin, (int)n, (float *)(base + g.z),   linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_qwen_linear_launch(&aa,  &xin, (int)n, (float *)(base + g.a),   linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_qwen_linear_launch(&bb,  &xin, (int)n, (float *)(base + g.b),   linws, g.lin_ws_bytes, 0) != 0)
+    if (pulsar_qwen_linear_launch(&qkv, xin, (int)n, (float *)(base + g.qkv), linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&zz,  xin, (int)n, (float *)(base + g.z),   linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&aa,  xin, (int)n, (float *)(base + g.a),   linws, g.lin_ws_bytes, 0) != 0 ||
+        pulsar_qwen_linear_launch(&bb,  xin, (int)n, (float *)(base + g.b),   linws, g.lin_ws_bytes, 0) != 0)
         return fail("a GDN projection launch failed");
     pulsar_gdn_weights gw;
     gw.conv_w  = (const uint16_t *)wptr(st, L.gdn_conv,    "qwen GDN conv1d");
@@ -633,11 +631,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         !linear_dev(st, L.attn_v, H, PULSAR_QSA_KV_IN,  "qwen QSA v_proj", &v) ||
         !linear_dev(st, L.idx_qk, H, PULSAR_QSA_IDX_IN, "qwen QSA index_qk_proj", &ix) ||
         !linear_dev(st, L.attn_o, PULSAR_QSA_OUT_DIM, H, "qwen QSA o_proj", &out)) return false;
-    const void *xq = NULL, *xsf = NULL;
-    int xkbp = 0;
-    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(st->st->x, n, (uint64_t)H, &xq, &xsf, &xkbp))
-        return fail("the QSA op found no E4M3 slot for its input (the GR read is its producer)");
-    const pulsar_qwen_slot xin = {(uint8_t *)xq, (uint8_t *)xsf, xkbp};
+    /* L251 / ac69748f: bf16, as above -- the QSA projections read the block input directly. */
+    const uint16_t *xin = (const uint16_t *)dptr(st->st->x);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_QSA];
     if (!sc) return fail("no QSA scratch");
     const qsa_scratch g = qsa_layout(s, st->st->max_rows, st->st->ctx);
@@ -659,10 +654,10 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
 
     const uint32_t nb = st->st->n_banks;
     if (nv != 4 || nb == 0 || nb > 64) { drop(); return fail("the QSA op needs 4 projection views and 1..64 banks"); }
-    bool ok = pulsar_qwen_linear_launch(&q,  &xin, (int)n, (float *)dptr(vq), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_qwen_linear_launch(&k,  &xin, (int)n, (float *)dptr(vk), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_qwen_linear_launch(&v,  &xin, (int)n, (float *)dptr(vv), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_qwen_linear_launch(&ix, &xin, (int)n, (float *)dptr(vi), linws, g.lin_ws_bytes, 0) == 0;
+    bool ok = pulsar_qwen_linear_launch(&q,  xin, (int)n, (float *)dptr(vq), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&k,  xin, (int)n, (float *)dptr(vk), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&v,  xin, (int)n, (float *)dptr(vv), linws, g.lin_ws_bytes, 0) == 0 &&
+              pulsar_qwen_linear_launch(&ix, xin, (int)n, (float *)dptr(vi), linws, g.lin_ws_bytes, 0) == 0;
     if (!ok) { drop(); return fail("a QSA projection launch failed"); }
 
     /* the per-bank cache views: bank-major, at the sizes family_qwen.h owns */
