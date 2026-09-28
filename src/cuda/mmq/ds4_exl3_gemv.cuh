@@ -73,14 +73,14 @@ int ds4_exl3_moe_gemv_pair_launch_rows(
  * activation slot, so its routed experts read row-major bf16. */
 int ds4_exl3_moe_gemv_fused_bf16_launch(
         const void *table, int k2, const void *act,
-        const int32_t *ids_dst, const int32_t *expert_bounds,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
         float *out, int M, int K, int64_t n_assign,
         int n_experts, cudaStream_t stream);
 
 /* The down arm over the same bf16 activation (its input is the fold's output). */
 int ds4_exl3_moe_gemv_single_bf16_launch(
         const void *table, int k2, const void *act,
-        const int32_t *ids_dst, const int32_t *expert_bounds,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
         float *out, int M, int K, int64_t n_assign,
         int n_experts, cudaStream_t stream);
 

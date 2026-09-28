@@ -69,6 +69,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
                      const block_mx_act_mmq *__restrict__ act,
                      const int32_t *__restrict__ ids_dst,
+                     const int32_t *__restrict__ ids_src,   /* !A8: the SOURCE token row per assignment */
                      const int32_t *__restrict__ expert_bounds,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
@@ -76,9 +77,12 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
     constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
-     * argument reinterpreted, so no launch signature changed -- and ids_dst[col] is the destination
-     * TOKEN (see the output scatter below), so the token's row is addressed directly and the E4M3
-     * gather/encode step that builds the A8 blocks is not needed at all on this path. */
+     * argument reinterpreted, so the pointer cost no new argument -- but the ROW did.  ids_src[col] is
+     * the SOURCE token (mm_ids_helper: ids_src1 = it*sis1, sis1 = 1); ids_dst[col] is the flat
+     * (token*n_slots + slot) OUTPUT row the scatter below writes to.  Confusing the two reads the wrong
+     * token for every slot past the first and yields plausible garbage, so the bf16 path takes the
+     * source map explicitly.  With it the token's row is addressed directly, and the E4M3 gather/encode
+     * that builds the A8 blocks is not needed at all on this path. */
     const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
     __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
     __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
@@ -126,7 +130,7 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             const float v = A8 ? (exl3dev::e4m3_to_f32((uint8_t)bp->qs[grp * 32 + j]) * sc)
-                               : __bfloat162float(xb[(size_t)ids_dst[col] * (size_t)K
+                               : __bfloat162float(xb[(size_t)ids_src[col] * (size_t)K
                                                      + (size_t)k0 + (size_t)j]);
             if constexpr (PAIR) {
                 s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
@@ -225,6 +229,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
                      const block_mx_act_mmq *__restrict__ act,
                      const int32_t *__restrict__ ids_dst,
+                     const int32_t *__restrict__ ids_src,   /* !A8: the SOURCE token row per assignment */
                      const int32_t *__restrict__ expert_bounds,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
@@ -232,9 +237,12 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
     constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
-     * argument reinterpreted, so no launch signature changed -- and ids_dst[col] is the destination
-     * TOKEN (see the output scatter below), so the token's row is addressed directly and the E4M3
-     * gather/encode step that builds the A8 blocks is not needed at all on this path. */
+     * argument reinterpreted, so the pointer cost no new argument -- but the ROW did.  ids_src[col] is
+     * the SOURCE token (mm_ids_helper: ids_src1 = it*sis1, sis1 = 1); ids_dst[col] is the flat
+     * (token*n_slots + slot) OUTPUT row the scatter below writes to.  Confusing the two reads the wrong
+     * token for every slot past the first and yields plausible garbage, so the bf16 path takes the
+     * source map explicitly.  With it the token's row is addressed directly, and the E4M3 gather/encode
+     * that builds the A8 blocks is not needed at all on this path. */
     const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
     constexpr int NV = PAIR ? 2 : 1;
     __shared__ __align__(16) float s_buf[GemvSmem<PAIR, R>::floats];
@@ -312,7 +320,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 for (int j = 0; j < 32; ++j) {
                     const float v = A8
                         ? (exl3dev::e4m3_to_f32((uint8_t)q[j]) * sc)
-                        : __bfloat162float(xb[(size_t)ids_dst[arow] * (size_t)K
+                        : __bfloat162float(xb[(size_t)ids_src[arow] * (size_t)K
                                              + (size_t)k0 + (size_t)kk + (size_t)j]);
                     if constexpr (PAIR) {
                         xg[j] = v * __half2float(sg[k0 + kk + j]);
@@ -525,20 +533,20 @@ static int exl3_rows_per_block(int64_t n_assign) {
 template <int MODE, int K2, int R, bool A8 = true>
 static void exl3_gemv_kernel_launch(const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                     const void *gt, const void *ut, const block_mx_act_mmq *a,
-                                    const int32_t *ids_dst, const int32_t *expert_bounds,
+                                    const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                     float *og, float *ou, int M, int K, int n_assign, int E) {
-    exl3_moe_gemv_kernel<MODE, K2, R, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E);
+    exl3_moe_gemv_kernel<MODE, K2, R, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E);
 }
 
 template <int MODE, int K2, bool A8 = true>
 static void exl3_gemv_dispatch_r(int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                  const void *gt, const void *ut, const block_mx_act_mmq *a,
-                                 const int32_t *ids_dst, const int32_t *expert_bounds,
+                                 const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                  float *og, float *ou, int M, int K, int n_assign, int E) {
     switch (R) {
-    case 1:  exl3_moe_gemv_kernel_r1<MODE, K2, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    case 4:  exl3_gemv_kernel_launch<MODE, K2, 4, A8>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    default: exl3_gemv_kernel_launch<MODE, K2, kMaxR, A8>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 1:  exl3_moe_gemv_kernel_r1<MODE, K2, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 4:  exl3_gemv_kernel_launch<MODE, K2, 4, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
+    default: exl3_gemv_kernel_launch<MODE, K2, kMaxR, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
     }
 }
 
@@ -549,13 +557,13 @@ constexpr bool kind_has_rate(int mode, int k2) { return exl3_arm_has_rate(mode, 
 template <int MODE, bool A8 = true>
 static bool exl3_gemv_dispatch_k2(int k2, int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                   const void *gt, const void *ut, const block_mx_act_mmq *a,
-                                  const int32_t *ids_dst, const int32_t *expert_bounds,
+                                  const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                   float *og, float *ou, int M, int K, int n_assign, int E) {
-    if constexpr (kind_has_rate(MODE, 4)) if (k2 == 4) { exl3_gemv_dispatch_r<MODE, 4, A8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
-    if constexpr (kind_has_rate(MODE, 5)) if (k2 == 5) { exl3_gemv_dispatch_r<MODE, 5, A8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
-    if constexpr (kind_has_rate(MODE, 6)) if (k2 == 6) { exl3_gemv_dispatch_r<MODE, 6, A8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
-    if constexpr (kind_has_rate(MODE, 8)) if (k2 == 8) { exl3_gemv_dispatch_r<MODE, 8, A8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
-    if constexpr (kind_has_rate(MODE, 10)) if (k2 == 10) { exl3_gemv_dispatch_r<MODE, 10, A8>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 4)) if (k2 == 4) { exl3_gemv_dispatch_r<MODE, 4, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 5)) if (k2 == 5) { exl3_gemv_dispatch_r<MODE, 5, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 6)) if (k2 == 6) { exl3_gemv_dispatch_r<MODE, 6, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 8)) if (k2 == 8) { exl3_gemv_dispatch_r<MODE, 8, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 10)) if (k2 == 10) { exl3_gemv_dispatch_r<MODE, 10, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
     return false;
 }
 
@@ -563,13 +571,19 @@ template <int MODE, bool A8 = true>
 int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
                      const int32_t *ids_dst, const int32_t *expert_bounds,
                      float *og, float *ou, int M, int K, int64_t n_assign, int E,
-                     int rows_per_block, cudaStream_t stream) {
+                     int rows_per_block, cudaStream_t stream,
+                     const int32_t *ids_src = nullptr) {   /* only read when A8 == false */
     constexpr bool PAIR = MODE == kPair;
     const char *tag = MODE == kPair ? "ds4_exl3_moe_gemv_pair_launch"
                     : MODE == kFused ? "ds4_exl3_moe_gemv_fused_launch" : "ds4_exl3_moe_gemv_single_launch";
     if (!gt || (PAIR && !ut) || !act || !ids_dst || !expert_bounds || !og || (PAIR && !ou) ||
         M <= 0 || K <= 0 || n_assign <= 0 || E <= 0) {
         fprintf(stderr, "%s: null pointer or bad shape\n", tag);
+        return -1;
+    }
+    if (!A8 && !ids_src) {
+        fprintf(stderr, "%s: the bf16 activation needs the SOURCE row map (ids_src) -- refusing, because "
+                        "ids_dst is the flat output row and would read the wrong token\n", tag);
         return -1;
     }
     if (M % kRows || K % EXL3_HAD_BLOCK || K > kMaxK || n_assign > INT32_MAX) {
@@ -586,7 +600,7 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
     const dim3 grid((unsigned)(M / kRows), (unsigned)((n_assign + R - 1) / R), 1);
     const dim3 block(kRows, kWarps, 1);
     const block_mx_act_mmq *a = (const block_mx_act_mmq *)act;
-    if (!exl3_gemv_dispatch_k2<MODE, A8>(k2, R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K,
+    if (!exl3_gemv_dispatch_k2<MODE, A8>(k2, R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K,
                                      (int)n_assign, E)) {
         fprintf(stderr, "%s: rate k2=%d has no instance for this kind (split gate/up and DeepSeek's down: "
                         "2, 2.5, 3; fused gate_up and Qwen's down: 4, 5) -- refusing\n", tag, k2);
@@ -636,21 +650,21 @@ int ds4_exl3_moe_gemv_fused_launch(const void *table, int k2, const void *act,
  * separate entry point rather than a flag on the A8 one, which is upstream's own shape for this
  * (exl3_gemv and exl3_gemv_int8 are two entry points, not one with a switch). */
 int ds4_exl3_moe_gemv_fused_bf16_launch(const void *table, int k2, const void *act,
-                                        const int32_t *ids_dst, const int32_t *expert_bounds,
+                                        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                         float *out, int M, int K, int64_t n_assign,
                                         int n_experts, cudaStream_t stream) {
     return exl3_gemv_launch<kFused, false>(table, nullptr, k2, act, ids_dst, expert_bounds,
-                                           out, nullptr, M, K, n_assign, n_experts, 0, stream);
+                                           out, nullptr, M, K, n_assign, n_experts, 0, stream, ids_src);
 }
 
 /* The down arm over the same bf16 activation.  Its input is the FOLD's output, which is an op-internal
  * Linear activation and so follows the same rule -- bf16, not an E4M3 slot. */
 int ds4_exl3_moe_gemv_single_bf16_launch(const void *table, int k2, const void *act,
-                                         const int32_t *ids_dst, const int32_t *expert_bounds,
+                                         const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                          float *out, int M, int K, int64_t n_assign,
                                          int n_experts, cudaStream_t stream) {
     return exl3_gemv_launch<kDown, false>(table, nullptr, k2, act, ids_dst, expert_bounds,
-                                          out, nullptr, M, K, n_assign, n_experts, 0, stream);
+                                          out, nullptr, M, K, n_assign, n_experts, 0, stream, ids_src);
 }
 
 int ds4_exl3_moe_gemv_fused_launch_rows(const void *table, int k2, const void *act,
