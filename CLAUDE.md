@@ -15,4 +15,4 @@ Read `docs/ENGINEERING-RULES.md` before changing engine code. The short form:
 
 Two tiers, chosen by the paths (ENGINEERING-RULES §10): `make gates` is the full battery (every release-blocking gate, ~20 min) and runs ONCE per landing series, on the last sha whose numeric paths (`src/engine`, `src/cuda`, `src/server`, `src/tp`) changed. `make gates-dev` is the iteration tier — a fast subset selected from the touched paths — and it is the landing tier for everything after that battery that cannot move a number (refusal paths, tests, tools, docs, Makefile recipes). A measurement someone is waiting on goes ahead of a battery in the GPU queue.
 
-Process context lives in `~/Projects/pulsar-notes` (private): `OPEN-REGISTER.md` is the live index, `rows/Lnnn.md` are append-only. Check the register before proposing work.
+Process context lives in `~/Projects/AI/pulsar/notes` (private): `OPEN-REGISTER.md` is the live index, `rows/Lnnn.md` are append-only. Check the register before proposing work.
