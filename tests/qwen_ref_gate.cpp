@@ -4,7 +4,7 @@
  *
  * The anchors (qwen_anchors.py, the BF16 streamed source) record, per prompt,
  *   <P>.tokens.bin  i32 [n]              the exact prompt tokens
- *   <P>.ref.bin     f32 [n_rows][W]      reference logits, in the json's row order
+ *   <P>.ref.bin     88-byte DS4PFXG1 header + f32 [n_rows][W]  reference logits, in the json's row order
  *   <P>.ref.json    {"width":W, "rows":[{"depth":d,"argmax_id":i,"entropy_nats":e,"p_top1":p}, ...]}
  * The engine is fed tokens[0:depth] for every recorded depth in ASCENDING order
  * (the family's prefix reuse carries the session forward), and its last row is
@@ -20,6 +20,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Bytes before <P>.ref.bin's first logit row: magic "DS4PFXG1"[8], u32 version,
+ * u32 n_rows, u64 width, u64 prompt_fnv, the per-depth frames and the build_ref
+ * string, zero-padded.  The producer is qwen_anchors.py; this gate checks the
+ * magic, the version and the width rather than trusting the offset. */
+#define QWEN_REF_HDR 88u
 
 static int g_fail = 0;
 
@@ -120,9 +126,35 @@ int main(int argc, char **argv) {
 
         const int32_t *toks = (const int32_t *)tb;
         const int n_tok = (int)(tn / sizeof(int32_t));
-        const float *ref = (const float *)rb;
-        const int n_ref = (int)(rn / (sizeof(float) * (size_t)W));
+        /* ref.bin is NOT a bare f32 array: it opens with an 88-byte DS4PFXG1
+         * header -- magic[8], u32 version, u32 n_rows, u64 width, u64 prompt_fnv,
+         * then the per-depth frames and the build_ref string, padded.  Reading it
+         * as rows from byte 0 shifts every reference row by 22 floats, which made
+         * this gate report argmax mismatch against its OWN anchors on nearly every
+         * depth (and a 2e+33 max|logit diff| against header bytes).  Parse it, so
+         * the instrument proves it is reading the shape it claims. */
+        const float *ref = NULL;
+        int n_ref = 0;
+        if (!rb || rn < QWEN_REF_HDR || memcmp(rb, "DS4PFXG1", 8) != 0) {
+            check(false, "%s: ref.bin has no DS4PFXG1 header", prompts[i]);
+        } else {
+            uint32_t ver = 0, hrows = 0;
+            uint64_t hw = 0;
+            memcpy(&ver, rb + 8, 4);
+            memcpy(&hrows, rb + 12, 4);
+            memcpy(&hw, rb + 16, 8);
+            n_ref = (int)((rn - QWEN_REF_HDR) / (sizeof(float) * (size_t)W));
+            if (ver != 2 || hw != (uint64_t)W || n_ref < (int)hrows) {
+                check(false, "%s: ref.bin header says v%u width %llu rows %u; parsing to %d rows of %d",
+                      prompts[i], ver, (unsigned long long)hw, hrows, n_ref, W);
+                n_ref = 0;
+            } else {
+                n_ref = (int)hrows;
+                ref = (const float *)(rb + QWEN_REF_HDR);
+            }
+        }
         check(n_ref == nr, "%s: ref.bin holds %d rows == the json's %d", prompts[i], n_ref, nr);
+        if (!ref) { free(tb); free(rb); free(recs); continue; }
 
         int maxd = 0;
         for (int k = 0; k < nr; k++) if (recs[k].depth > maxd) maxd = recs[k].depth;
