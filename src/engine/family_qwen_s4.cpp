@@ -455,18 +455,13 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GR_READ];
     if (!sc) return fail("no GR scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
-    /* the block input's A8 encoding goes to x's activation-cache slot (family_qwen.h s4) */
-    void *xq = NULL, *xsf = NULL;
-    int kbp = 0;
+    /* L251 / ac69748f: the block input is bf16 and there is no E4M3 activation slot in this family, so the
+     * read emits the bf16 row and nothing else -- no slot, no arming, no notes.  `nullptr` is the read's
+     * documented "no slot" form, so the mxfp8 W_down weights are still read by the same arm. */
     pulsar_gpu_tensor *x = st->st->x;
-    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(x, n, (uint64_t)H, &xq, &xsf, &kbp)) return false;
-    const pulsar_qwen_slot slot = {(uint8_t *)xq, (uint8_t *)xsf, kbp};
-    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->st->streams), (int)n, (uint16_t *)dptr(x), &slot,
+    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->st->streams), (int)n, (uint16_t *)dptr(x), nullptr,
                                    (float *)(base + g.inj[side]), base + g.ws, g.ws_bytes, 0))
         return false;
-    pulsar_gpu_mxfp8_act_cache_arm(x, n, (uint64_t)H);
-    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-    pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n);   /* x holds the bf16 row, not f32 */
     return true;
 }
 
