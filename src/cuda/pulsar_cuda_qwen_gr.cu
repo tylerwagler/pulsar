@@ -161,12 +161,12 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
     return s;
 }
 
-/* 1. norm (+ the inject partials); xn leaves in the format W_down reads */
-template <bool W8>
+/* 1. norm (+ the inject partials); xn leaves in bf16, whatever W_down's WEIGHT format is (L251 /
+ * ac69748f: there is no E4M3 activation slot in this family, and the read's own activation is an
+ * op-internal one, so it follows the family's rule too -- W8 weights against bf16 is the W8A16 arm). */
 __global__ void __launch_bounds__(kNormThreads)
 qwen_gr_norm_kernel(const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat16 *__restrict__ norm_w,
                     const __nv_bfloat16 *__restrict__ inject,
-                    __nv_fp8_e4m3 *__restrict__ xq, unsigned char *__restrict__ xsf, int kbp,
                     __nv_bfloat16 *__restrict__ xb,
                     float *__restrict__ rstd, float *__restrict__ injp) {
     __shared__ float red[kNormThreads / 32];
@@ -183,8 +183,7 @@ qwen_gr_norm_kernel(const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat
     for (int j = 0; j < kNormPer; ++j) {
         const int c = tid + kNormThreads * j;
         const float xn = x[j] * r * (1.0f + bf2f(norm_w[s * kH + c]));
-        if constexpr (W8) pulsar_mx_emit_block(xn, (uint32_t)(s * kH + c), (uint32_t)t, (uint32_t)kHC, kbp, xq, xsf);
-        else xb[(size_t)t * kHC + s * kH + c] = __float2bfloat16(xn);
+        xb[(size_t)t * kHC + s * kH + c] = __float2bfloat16(xn);
         if (inject) {
 #pragma unroll
             for (int o = 0; o < kS; ++o) io[o] = fmaf(bf2f(inject[(size_t)o * kHC + s * kH + c]), xn, io[o]);
@@ -296,8 +295,7 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                   const float *__restrict__ part, const float *__restrict__ injp, float *__restrict__ inj,
                   const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat16 *__restrict__ norm_w,
                   const float *__restrict__ rstd, int T,
-                  __nv_bfloat16 *__restrict__ x_out, __nv_fp8_e4m3 *__restrict__ xq, unsigned char *__restrict__ xsf,
-                  int x_kbp) {
+                  __nv_bfloat16 *__restrict__ x_out) {
     constexpr int NB = kR / 32;
     __shared__ float prod[kUpTB][kS][32];
     __shared__ __align__(16) uint8_t s_a[kUpTB][W8 ? kR : 2 * kR];   /* a: E4M3 codes or bf16 */
@@ -375,8 +373,7 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         const int t = t0 + tt;
         const float v = (((prod[tt][0][lane] + prod[tt][1][lane]) + prod[tt][2][lane]) + prod[tt][3][lane]) * (1.0f / kS);
         const __nv_bfloat16 vb = __float2bfloat16(v);
-        x_out[(size_t)t * kH + c] = vb;
-        if (xq) pulsar_mx_emit_block(bf2f(vb), (uint32_t)c, (uint32_t)t, (uint32_t)kH, x_kbp, xq, xsf);   /* warp-uniform */
+        x_out[(size_t)t * kH + c] = vb;   /* bf16 is the one encoding -- no E4M3 slot to fill */
     }
 }
 
@@ -390,7 +387,7 @@ __global__ void qwen_gr_write_kernel(__nv_bfloat16 *__restrict__ streams, const 
 }
 
 struct gr_ws {
-    uint8_t *xn, *xn_sf;              /* xn: E4M3 (W8) or bf16 -- sized for bf16 */
+    uint8_t *xn;                      /* the norm's bf16 activation row (L251 / ac69748f) */
     float *rstd, *injp, *part;
 };
 
@@ -405,7 +402,6 @@ static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
     };
     gr_ws m{};
     m.xn    = (uint8_t *)take((size_t)T * kHC * 2);
-    m.xn_sf = (uint8_t *)take(pulsar_mx_sf_slab_bytes(T, pulsar_mx_kbp(kHC)));
     m.rstd  = (float *)take((size_t)T * kS * 4);
     m.injp  = (float *)take((size_t)T * kS * kS * 4);
     m.part  = (float *)take((size_t)T * kDownSplit * kR * 4);
@@ -430,26 +426,25 @@ extern "C" size_t pulsar_qwen_gr_workspace_bytes(int T) {
 
 template <bool W8>
 static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
-                            const pulsar_qwen_slot *x, float *inj, const gr_ws &m, cudaStream_t stream) {
-    const int xn_kbp = pulsar_mx_kbp(kHC);
-    qwen_gr_norm_kernel<W8><<<dim3(kS, T), kNormThreads, 0, stream>>>(
+                            float *inj, const gr_ws &m, cudaStream_t stream) {
+    qwen_gr_norm_kernel<<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
-        (__nv_fp8_e4m3 *)m.xn, m.xn_sf, xn_kbp, (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
-    qwen_gr_down_kernel<W8><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
-        w->down.w, w->down.sf, m.xn, m.xn_sf, xn_kbp, kR, kHC, T, kDownSplit, m.part);
+        (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
+    /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm. */
+    qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
+        w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
     qwen_gr_up_kernel<W8><<<dim3(kH / 32, (T + kUpTB - 1) / kUpTB), 32 * kS, 0, stream>>>(
         w->up.w, w->up.sf, m.part, w->inject ? m.injp : nullptr, inj, (const __nv_bfloat16 *)streams,
         (const __nv_bfloat16 *)w->norm_w,
-        m.rstd, T, (__nv_bfloat16 *)x_bf16, x ? (__nv_fp8_e4m3 *)x->q : nullptr, x ? x->sf : nullptr,
-        x ? x->kbp : 0);
+        m.rstd, T, (__nv_bfloat16 *)x_bf16);
 }
 
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
-                                          uint16_t *x_bf16, const pulsar_qwen_slot *x, float *inj,
+                                          uint16_t *x_bf16, float *inj,
                                           void *ws, size_t ws_bytes, cudaStream_t stream) {
     if (!w || !w->norm_w || !w->down.w || !w->up.w || !streams || T <= 0 ||
-        !x_bf16 || (x && (!x->q || !x->sf || x->kbp != pulsar_mx_kbp(kH))) || (w->inject && !inj)) {
-        fprintf(stderr, "pulsar: qwen GR read: a null input, or a block-input slot that is not %d wide -- refusing\n", kH);
+        !x_bf16 || (w->inject && !inj)) {
+        fprintf(stderr, "pulsar: qwen GR read: a null input -- refusing\n");
         return -1;
     }
     if ((w->down.sf == nullptr) != (w->up.sf == nullptr)) {
@@ -476,16 +471,13 @@ extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uin
     if (!announced[w8]) {
         announced[w8] = 1;
         fprintf(stderr, "pulsar: L251 qwen GR read = grouped norm -> %s W_down (split-K %d) -> silu/4 -> %s W_up "
-                        "sigmoid gate, stream mean -> bf16 row%s; streams bf16\n",
-                w8 ? "MXFP8 (E4M3 act)" : "BF16 (bf16 act)", kDownSplit, w8 ? "MXFP8" : "BF16",
-                x ? " + E4M3" : "");
+                        "sigmoid gate, stream mean -> bf16 row; streams bf16, activation bf16\n",
+                w8 ? "MXFP8" : "BF16", kDownSplit, w8 ? "MXFP8" : "BF16");
     }
-    /* xn's scale slab needs no clearing: the norm writes every (row, block) the down
-     * GEMV reads (rows < T, all 320 blocks); only the x slot, read by other
-     * consumers over its padded slab, is cleared */
-    if (x) cudaMemsetAsync(x->sf, 0, pulsar_mx_sf_slab_bytes(T, x->kbp), stream);   /* this launcher is the slot's producer */
-    if (w8) gr_read_kernels<true>(w, streams, T, x_bf16, x, inj, m, stream);
-    else    gr_read_kernels<false>(w, streams, T, x_bf16, x, inj, m, stream);
+    /* L251 / ac69748f: there is no scale slab to clear and no slot to fill -- xn is bf16, so the
+     * norm writes every element the down GEMV reads and nothing else owns this buffer. */
+    if (w8) gr_read_kernels<true>(w, streams, T, x_bf16, inj, m, stream);
+    else    gr_read_kernels<false>(w, streams, T, x_bf16, inj, m, stream);
     return launch_ok("read") ? 0 : -3;
 }
 

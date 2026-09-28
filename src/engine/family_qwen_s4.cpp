@@ -464,7 +464,7 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
      * read emits the bf16 row and nothing else -- no slot, no arming, no notes.  `nullptr` is the read's
      * documented "no slot" form, so the mxfp8 W_down weights are still read by the same arm. */
     pulsar_gpu_tensor *x = st->st->x;
-    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->st->streams), (int)n, (uint16_t *)dptr(x), nullptr,
+    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->st->streams), (int)n, (uint16_t *)dptr(x),
                                    (float *)(base + g.inj[side]), base + g.ws, g.ws_bytes, 0))
         return false;
     return true;
@@ -530,7 +530,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     void *xb = NULL;
     bool ok = xkey && pulsar_gpu_bf16_act_slot(xkey, n, (uint64_t)H, &xb);
     const uint16_t *streams = (const uint16_t *)dptr(st->st->streams) + (size_t)row0 * pulsar_qwen_hc_dim(s);
-    ok = ok && pulsar_qwen_gr_read_launch(&w, streams, (int)n, (uint16_t *)xb, NULL, NULL, base + h.ws, h.ws_bytes, 0) == 0;
+    ok = ok && pulsar_qwen_gr_read_launch(&w, streams, (int)n, (uint16_t *)xb, NULL, base + h.ws, h.ws_bytes, 0) == 0;
     if (ok) {
         pulsar_gpu_bf16_act_note(xkey, n, (uint64_t)H);
         const pulsar_decode_rows_scope rows(n);   /* the head's rows are decode rows: the M-independent arms */

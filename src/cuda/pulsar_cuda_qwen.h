@@ -190,8 +190,10 @@ size_t pulsar_qwen_gr_workspace_bytes(int T);
  *  its E4M3 slot (the mixer before the bf16 head has no A8 consumer and
  *  passes NULL); when the site has a write, inj [T][4] = 2 sigmoid(W_inj xn / 4).
  *  streams bf16 [T][4][2560]. */
+/* L251 / ac69748f: x_bf16 only.  The read emits bf16 inside and out -- there is no E4M3 activation
+ * slot in this family for it to fill. */
 int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
-                               uint16_t *x_bf16, const pulsar_qwen_slot *x, float *inj,
+                               uint16_t *x_bf16, float *inj,
                                void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** The write: streams[t][s] += out[t] * inj[t][s] (f32 math, one bf16 rounding). */
