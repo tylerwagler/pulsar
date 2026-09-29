@@ -133,10 +133,15 @@ int main(int argc, char **argv) {
             printf(" | margin %.4f", (double)(row[best[0]] - row[best[1]]));
             fflush(stdout);
         }
+        /* L251: STOP on the model's own turn terminator.  Without this the test samples PAST
+         * <|im_end|> and what looks like degenerate repetition is the harness refusing to let the
+         * model stop -- the model's natural continuation of a finished turn IS another terminator. */
+        const bool stop = (am == 248046 /* <|im_end|> */ || am == 248044 /* <|endoftext|> */);
         ids[T++] = am;
         generated++;
         printf(" %d", am);
         fflush(stdout);
+        if (stop) { printf(" <stop:%d>", am); fflush(stdout); break; }
     }
     printf("\n");
 
