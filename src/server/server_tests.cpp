@@ -6354,34 +6354,77 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
     }
     const int pool = 4;
     /* nothing to decode: idle */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 0, 0) == 0);
     /* four spec decoders: spec lane */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 3);
     /* one non-spec slot among four drags the group to plain */
     g[2].dspark_spec_enabled = false;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
     g[2].dspark_spec_enabled = true;
     /* a slot with no gen state likewise */
     slots[3].gen = NULL;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
     slots[3].gen = &g[3];
     /* a plain batch in flight locks the lane even when all spec */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 1) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 1) == 2);
     /* ...and a decoder that has joined the plain lane says so itself */
     g[1].batch_active = true;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
     g[1].batch_active = false;
     /* no drafter: plain */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 4, 0) == 2);
     /* L118 batch of one: a solo spec decoder is lane 3, solo plain lane 2 */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 0) == 3);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 1, 0) == 2);
-    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 1) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 1, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 1, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 1, 1) == 2);
     /* no pool: idle with no decoders, else the retired classic code 1 */
-    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 1, 0) == 1);
-    TEST_ASSERT(server_pick_decode_lane(0, false, dec, 4, 0) == 1);
+    TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 1, 0) == 1);
+    TEST_ASSERT(server_pick_decode_lane(0, false, false, dec, 4, 0) == 1);
+}
+
+/* L251 -- lane 4 (family-spec): a family with its own speculative generate
+ * takes EXACTLY ONE decoder, not in a plain batch, speculation allowed for
+ * its request, whose resolved decode sampling is greedy; anything else keeps
+ * the existing lanes. */
+static void test_l251_lane_select_family_spec_solo_greedy(void) {
+    job jobs[2];
+    memset(jobs, 0, sizeof jobs);           /* temperature 0, think off: greedy */
+    gen_state g[2];
+    memset(g, 0, sizeof g);
+    session_slot slots[2];
+    memset(slots, 0, sizeof slots);
+    session_slot *dec[2];
+    for (int i = 0; i < 2; i++) {
+        g[i].j = &jobs[i];
+        g[i].dspark_spec_enabled = true;
+        slots[i].gen = &g[i];
+        dec[i] = &slots[i];
+    }
+    const int pool = 2;
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 0, 0) == 0);
+    /* one greedy decoder: lane 4 */
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 4);
+    /* the family flag off (--no-dspark, or DeepSeek): plain */
+    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 1, 0) == 2);
+    /* two decoders: plain batched, even when both are greedy */
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 2, 0) == 2);
+    /* sampled: plain */
+    jobs[0].req.temperature = 0.7f;
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
+    jobs[0].req.temperature = 0.0f;
+    /* logprobs (speculation off for the request): plain */
+    g[0].dspark_spec_enabled = false;
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
+    g[0].dspark_spec_enabled = true;
+    /* a decoder that joined the plain lane stays there */
+    g[0].batch_active = true;
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
+    g[0].batch_active = false;
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 1) == 2);
+    /* no pool: the gather loop's impossible shape, as before */
+    TEST_ASSERT(server_pick_decode_lane(0, false, true, dec, 1, 0) == 1);
 }
 
 /* Geometric survival for one bank: np pendings at per-position confidence c,
@@ -8067,6 +8110,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_bank_floor_exempts_first_bank();
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
+    test_l251_lane_select_family_spec_solo_greedy();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

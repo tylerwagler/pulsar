@@ -647,13 +647,17 @@ bool server::send_metrics(int fd) {
      * the batched quanta (lane 3 spec-batched, or lane 2 plain-batched when a
      * slot cannot speculate). The classic "spec" lane (1) is retired; its
      * label is kept so scrapers' label sets stay stable, it just never reads
-     * 1. spec_decode_* counters advance on "spec-batched". The
-     * pulsar:spec_max_live gauge is deleted with its scheduler knob. */
-    static const char *const lane_names[] = { "idle", "spec", "batched", "spec-batched" };
-    const int lane = (decode_lane >= 0 && decode_lane <= 3) ? decode_lane : 0;
+     * 1. spec_decode_* counters advance on "spec-batched". L251 lane 4
+     * "family-spec": one greedy decoder on a family with its own speculative
+     * generate (Qwen MTP). The pulsar:spec_max_live gauge is deleted with its
+     * scheduler knob. */
+    static const char *const lane_names[] = { "idle", "spec", "batched", "spec-batched",
+                                              "family-spec" };
+    const int n_lanes = (int)(sizeof lane_names / sizeof lane_names[0]);
+    const int lane = (decode_lane >= 0 && decode_lane < n_lanes) ? decode_lane : 0;
     buf_puts(&b, "# HELP pulsar:decode_lane Active decode lane (state set; spec_decode_* advance on \"spec-batched\").\n");
     buf_puts(&b, "# TYPE pulsar:decode_lane gauge\n");
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < n_lanes; i++)
         buf_printf(&b, "pulsar:decode_lane{lane=\"%s\"} %d\n", lane_names[i], i == lane ? 1 : 0);
 
     /* Request latency. These are the per-request numbers the response body

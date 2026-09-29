@@ -577,10 +577,18 @@ int main(int argc, char **argv) {
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
      * into the main artifact), so the state is logged here, never at parse. */
+    /* L251: a family with its own speculative generate (Qwen's MTP) serves it
+     * on decode lane 4 -- one greedy decoder at a time; --no-dspark turns the
+     * lane off like the DSpark one. */
+    const bool family_spec = pulsar_engine_drafter(engine) == PULSAR_DRAFTER_MTP && !cfg.engine.dspark_disable;
     if (pulsar_engine_has_dspark(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
                    pulsar_engine_dspark_draft_tokens(engine));
+    } else if (family_spec) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: %s speculative decoding (MTP drafter) for a solo greedy decoder",
+                   pulsar_engine_family_name(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");
@@ -847,6 +855,7 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    s.family_spec = family_spec;
     /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
      * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
      * clamps kstep to 1 and the step exceeds the chunk cap on every quantum

@@ -950,6 +950,10 @@ int pulsar_session_prefill_cap(pulsar_session *s);
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
 bool pulsar_engine_has_dspark(pulsar_engine *e);
+/** The speculative drafter the OPENED engine actually carries: DSPARK when its dspark.* drafter loaded,
+ *  MTP when a Qwen artifact carries the mtp.* layer (the sidecar shard; served by the family's own
+ *  pulsar_session_generate_speculative, greedy), NONE otherwise. */
+pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
 /** ONE authority for the marginal wall cost of one spec-decode verify row
  * (ms): L214's pinned-width refit of the yield-quench step model

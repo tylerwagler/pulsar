@@ -303,6 +303,13 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); e->dump_tokens(tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
+pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) {
+    if (!e) return PULSAR_DRAFTER_NONE;
+    if (e->has_dspark()) return PULSAR_DRAFTER_DSPARK;
+    if (e->family->id == PULSAR_FAMILY_ID_QWEN4_EXP && e->qwen_weights && e->qwen_weights->mtp.present)
+        return PULSAR_DRAFTER_MTP;
+    return PULSAR_DRAFTER_NONE;
+}
 
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }

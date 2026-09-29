@@ -1364,6 +1364,16 @@ struct server {
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
+    /** L251: the loaded family decodes speculatively through its OWN
+     * pulsar_session_generate_speculative (Qwen's MTP; not the DSpark round
+     * API, which stays DeepSeek-only) and --no-dspark did not turn it off.
+     * Arms decode lane 4 (worker_family_spec_quantum). Set once at startup
+     * from pulsar_engine_family; the engine exposes no query for "this
+     * family has its own speculative generate AND its drafter is loaded", so
+     * an artifact without the MTP sidecar fails its greedy solo decodes by
+     * the engine's own name ("needs the MTP layer") -- start such a model
+     * with --no-dspark. */
+    bool         family_spec;
     /** Deep-concurrent guard for the fused lane: when the aggregate committed
      * depth (sum of committed_pos) of the active decode set exceeds this many
      * rows, worker_find_fuse_prefill refuses to fuse — the decode step is
@@ -1500,7 +1510,8 @@ struct server {
      * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
      * sequentially in one worker. */
     float   *lane_logits;
-    /** Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
+    /** Which decode lane the scheduler is on: 0 idle, 1 spec (retired), 2
+     * batched, 3 spec-batched, 4 family-spec (server_pick_decode_lane). The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
      * this" from "no speculative decoding ran at all". */
@@ -2119,6 +2130,15 @@ struct server {
      * ghosts).
      */
     void worker_spec_batched_quantum(session_slot **dec, int n);
+    /** L251 lane 4: ONE greedy decoder on a family with its own speculative
+     * generate (family_spec).  Makes the slot's bank live, runs
+     * pulsar_session_generate_speculative for up to a quantum of tokens (the
+     * engine commits them into the bank's checkpoint and leaves its logits
+     * fresh), and emits each through gen_emit_token.  Tokens committed but
+     * not emitted (a stop string, a failed client write) cannot be rewound
+     * on a recurrent state: the bank's view is invalidated instead, so the
+     * next sync prefills it cold. */
+    void worker_family_spec_quantum(session_slot *sl);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
      * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
      * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays

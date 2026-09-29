@@ -392,6 +392,7 @@ typedef struct pulsar_qwen_state {
     uint64_t mtp_probe_n, mtp_probe_hit;   ///< PULSAR_QWEN_MTP_PROBE counters (qwen_session_eval)
     pulsar_qwen_spec_capture spec;  ///< the verify capture (mtp only)
     uint64_t spec_rounds, spec_drafted, spec_kept;   ///< speculation counters, printed at session destroy
+    float *spec_logits;             ///< host [DRAFT_MAX + 1][n_vocab]: a round's verify / draft rows (mtp only)
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
     uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds

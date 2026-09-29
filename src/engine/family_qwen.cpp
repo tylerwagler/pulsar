@@ -609,6 +609,7 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     pulsar_gpu_tensor_free(st->mtp_ws);
     pulsar_gpu_tensor_free(st->mtp_pend);
     free(st->mtp_pend_pos);
+    free(st->spec_logits);
     pulsar_gpu_tensor_free(st->spec.gdn_rec);
     pulsar_gpu_tensor_free(st->spec.gdn_conv);
     pulsar_gpu_tensor_free(st->spec.ple);
@@ -681,6 +682,7 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     }
     st->mtp_pend_pos = (uint32_t *)xmalloc(n_banks * sizeof(uint32_t));
     for (uint32_t b = 0; b < n_banks; b++) st->mtp_pend_pos[b] = UINT32_MAX;
+    if (mtp) st->spec_logits = (float *)xmalloc((size_t)(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) * s->n_vocab * sizeof(float));
     if (ok && mtp) {
         /* the verify capture: per-row recurrent states of ONE bank, each QSA layer's stage + raw keys */
         pulsar_qwen_spec_capture &sp = st->spec;
@@ -1278,7 +1280,7 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
     const uint32_t V = sh->n_vocab, il_mtp = e->plan.n_layer;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
-    float *L = (float *)xmalloc((size_t)(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) * V * sizeof(float));
+    float *L = q->spec_logits;                           /* (DRAFT_MAX + 1) rows, allocated with the MTP state */
     const int cap = max_tokens < accepted_cap ? max_tokens : accepted_cap;
     int n_out = 0, rc = 0;
     int32_t x = (int32_t)qwen_argmax(s->logits, V);
@@ -1370,7 +1372,12 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         if (stop_tok >= 0) { if (n_out < cap) accepted[n_out++] = stop_tok; break; }
         x = (int32_t)qwen_argmax(s->logits, V);
     }
-    free(L);
+    if (rc < 0) {
+        /* a failed round may have moved the bank's state past what the host view says (a half-applied
+         * repair, a dropped pending row): nothing on this bank is continued -- the next sync prefills */
+        s->checkpoint_valid = false;
+        s->checkpoint.len = 0;
+    }
     q->logits_fresh = rc == 0;
     q->spec_rounds += rounds;
     q->spec_drafted += drafted;

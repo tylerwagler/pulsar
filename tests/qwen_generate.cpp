@@ -71,6 +71,7 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
+    if (getenv("QWEN_SPEC_K")) opt.dspark_draft_tokens = atoi(getenv("QWEN_SPEC_K"));   /* the MTP draft depth */
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0) {
         fprintf(stderr, "qwen-generate: %s did not open\n", argv[1]);
