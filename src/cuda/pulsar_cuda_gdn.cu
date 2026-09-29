@@ -141,6 +141,23 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
     }
 }
 
+/* ---- the verify capture (L251 MTP): the conv state after each row r < T - 1 of ONE sequence --------
+ * The state after row r is the inputs at call-relative positions r - 2, r - 1, r, reaching into the
+ * OLD state for negative positions -- the same rule the conv kernel's advance applies to the whole
+ * call.  Launched before that kernel, so the old state is still in the pool.  grid (T - 1, 80). */
+__global__ void __launch_bounds__(128)
+gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, const int32_t *__restrict__ row_slot,
+                     const float *__restrict__ conv_state, float *__restrict__ conv_rows) {
+    const int r = blockIdx.x, ch = blockIdx.y * 128 + threadIdx.x;
+    const float *cs = conv_state + (size_t)row_slot[0] * PULSAR_GDN_CONV_STATE_FLOATS;
+    float *dst = conv_rows + (size_t)r * PULSAR_GDN_CONV_STATE_FLOATS;
+    #pragma unroll
+    for (int j = 0; j < 3; j++) {
+        const int p = r - 2 + j;
+        dst[j * QKV + ch] = p >= 0 ? qkv[(size_t)p * ld_qkv + ch] : cs[(3 + p) * QKV + ch];
+    }
+}
+
 /* ---- kernel 2: recurrence + gated RMSNorm + the out_proj activation ---------
  * A cluster of 4 CTAs per (sequence, V head); CTA r owns columns v = 32r..32r+31.
  * 256 threads: warp w owns state rows k = 16w..16w+15, lane l owns column
@@ -172,6 +189,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       int seq_rows,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
+                      float *__restrict__ rec_rows,
                       float *__restrict__ out_f32,
                       __nv_bfloat16 *__restrict__ out_bf16,
                       __nv_fp8_e4m3 *__restrict__ out_q,
@@ -253,6 +271,11 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
             if (w == 0) so[j][lane] = fmaf(d, KQ, dec * acc.y);
             #pragma unroll
             for (int i = 0; i < RPW; i++) s[i] = fmaf(kr[i], d, dec * s[i]);
+            if (rec_rows && t0 + j < T - 1) {               /* the verify capture: S after this row */
+                float *R = rec_rows + (size_t)(t0 + j) * PULSAR_GDN_REC_STATE_FLOATS + (size_t)h * DK * DV;
+                #pragma unroll
+                for (int i = 0; i < RPW; i++) R[(w * RPW + i) * DV + col] = s[i];
+            }
             par ^= 1;
         }
         __syncthreads();                                   /* so[] complete */
@@ -329,12 +352,17 @@ extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_
     float *qkvn = static_cast<float *>(c->scratch);
     float *gb   = qkvn + (size_t)rows * QKV;
     const int tiles = (c->seq_rows + T1 - 1) / T1;
+    if ((c->conv_rows == nullptr) != (c->rec_rows == nullptr) || (c->conv_rows && c->n_seq != 1))
+        return refuse("the verify capture needs both row buffers and one sequence");
+    if (c->conv_rows && c->seq_rows > 1)
+        gdn_conv_rows_kernel<<<dim3((unsigned)(c->seq_rows - 1), CONV_HEADS), 128, 0, stream>>>(
+            c->qkv, c->ld_qkv, c->row_slot, c->conv_state, c->conv_rows);
 
     gdn_conv_prep_kernel<<<dim3((unsigned)(c->n_seq * tiles), CONV_HEADS), 128, 0, stream>>>(
         c->qkv, c->ld_qkv, c->a, c->ld_a, c->b, c->ld_b, w->conv_w, w->A_log, w->dt_bias,
         c->seq_rows, c->row_slot, c->conv_state, qkvn, gb, tiles);
     gdn_recur_norm_kernel<<<dim3((unsigned)c->n_seq, NV, VQ), 256, 0, stream>>>(
-        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->row_slot, c->rec_state,
+        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->row_slot, c->rec_state, c->rec_rows,
         c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
         static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
     const cudaError_t e = cudaGetLastError();

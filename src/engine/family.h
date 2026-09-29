@@ -111,6 +111,12 @@ typedef struct {
                         uint32_t max_head_runs, char *err, size_t errlen);
     /** Forget the session's state (the next sync prefills cold). */
     void (*invalidate)(pulsar_session *s);
+    /** The family's OWN speculative generate (pulsar_session_generate_speculative's contract), or
+     *  NULL = the DSpark path (session_spec.cpp, under PULSAR_FAMILY_CAP_SPEC).  Qwen's MTP drafter
+     *  (L251) implements only this entry, not the round API, so it does not declare CAP_SPEC. */
+    int (*generate_speculative)(pulsar_session *s, float temperature, int top_k, float top_p, float min_p,
+                                uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap,
+                                char *err, size_t errlen);
 } pulsar_family_session_ops;
 
 /** A family's own bank pool (L251): the server's per-bank bookkeeping for a

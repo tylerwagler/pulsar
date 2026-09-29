@@ -471,7 +471,8 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     const pulsar_qwen_rows rows = {(const int32_t *)(base + p.row_seq), (const int32_t *)(base + p.row_j),
                                    (const int32_t *)(base + p.seq_first), (const int32_t *)(base + p.seq_rows),
-                                   (const int32_t *)(base + p.seq_bank), (int)n_seq};
+                                   (const int32_t *)(base + p.seq_bank), (int)n_seq,
+                                   st->verify ? (float *)dptr(st->st->spec.ple) : NULL};
     return pulsar_qwen_ple_launch(&w, (const uint16_t *)(base + p.emb), (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(st->st->layer[il].ple_conv), base + p.ws, p.ws_bytes, 0) == 0;
 }
@@ -632,6 +633,56 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
            fail("the MTP combine failed");
 }
 
+/* L251 MTP: roll a verify step back to its first `keep` rows (family_qwen.h).  Every copy is on the
+ * stream after the step, so it lands after the step's own writes. */
+bool pulsar_qwen_s4_spec_rollback(const pulsar_qwen_step *v, uint32_t keep) {
+    const uint32_t R = v->n_rows;
+    if (keep == 0 || keep > R) return fail("a rollback keeps 1 .. the step's rows");
+    if (keep == R) return true;
+    pulsar_qwen_state *q = v->st;
+    const pulsar_qwen_spec_capture &sp = q->spec;
+    const pulsar_qwen_shape *s = v->shape;
+    const uint64_t b = (uint64_t)v->bank[0];
+    const uint32_t p0 = (uint32_t)v->pos[0], pnext = p0 + keep;
+    const uint64_t gsb = pulsar_qwen_gdn_state_bytes(s), gcb = pulsar_qwen_gdn_conv_bytes(s);
+    const uint64_t pcb = pulsar_qwen_ple_conv_bytes(s), itb = pulsar_qwen_index_tail_bytes(s);
+    const uint64_t kb = PULSAR_QSA_IDX_DIM * sizeof(float);
+    const uint64_t key_off = (uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < v->plan->n_layer; il++) {
+        pulsar_qwen_layer_state &L = q->layer[il];
+        const uint64_t o = sp.ord[il];
+        if (v->plan->kind[il] == PULSAR_LAYER_QWEN_GDN) {
+            const uint64_t slot = o * PULSAR_QWEN_SPEC_DRAFT_MAX + (keep - 1u);
+            ok = pulsar_gpu_tensor_copy_async(L.gdn_state, b * gsb, sp.gdn_rec, slot * gsb, gsb) != 0 &&
+                 pulsar_gpu_tensor_copy_async(L.gdn_conv, b * gcb, sp.gdn_conv, slot * gcb, gcb) != 0;
+        } else {
+            /* the stage as the step found it, then the kept rows of the block that is open at pnext */
+            ok = pulsar_gpu_tensor_copy_async(L.idx_tail, b * itb, sp.qsa_stage, o * itb, itb) != 0;
+            const uint32_t blk0 = pnext / s->idx_block * s->idx_block;
+            for (uint32_t pp = blk0 > p0 ? blk0 : p0; ok && pp < pnext; pp++) {
+                const uint64_t src = (o * (PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) + (pp - p0)) * PULSAR_QSA_IDX_IN * sizeof(float);
+                ok = pulsar_gpu_tensor_copy_async(L.idx_tail, b * itb + (pp % s->idx_block) * kb, sp.qsa_keys,
+                                                  src + key_off, kb) != 0;
+            }
+        }
+        if (ok && il == s->ple_layer)
+            ok = pulsar_gpu_tensor_copy_async(L.ple_conv, b * pcb, sp.ple, (uint64_t)(keep - 1u) * pcb, pcb) != 0;
+    }
+    if (!ok) return fail("a verify rollback copy failed");
+    /* the n-gram context: the one before the step, advanced over the kept tokens */
+    pulsar_qwen_ple_io *io = v->w->ple_io;
+    if (!io) return fail("no PLE row file is open");
+    const uint32_t nc = s->ngram_size - 1u;
+    pulsar_qwen_ngram_ctx ctx = {{sp.ngram_before[0], sp.ngram_before[1]}};
+    uint64_t ids[(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) * PULSAR_QWEN_NGRAM_COLS];
+    pulsar_qwen_ngram_rows(&io->layout, &ctx, v->tokens, (int)keep, ids);
+    int32_t *ctx_b = q->ngram_ctx + b * nc;
+    ctx_b[0] = ctx.prev[0];
+    ctx_b[1] = ctx.prev[1];
+    return true;
+}
+
 /* ======================================================================== */
 /* L251 S2's op: the Gated DeltaNet block.  On the integration branch it lives
  * in this TU because it needs the weight / scratch helpers above (wptr,
@@ -690,6 +741,12 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
     c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */
+    if (st->verify) {                               /* L251 MTP: the per-row states a rollback copies back */
+        const pulsar_qwen_spec_capture &sp = st->st->spec;
+        const size_t slot = (size_t)sp.ord[il] * PULSAR_QWEN_SPEC_DRAFT_MAX;
+        c.conv_rows = (float *)dptr(sp.gdn_conv) + slot * PULSAR_GDN_CONV_STATE_FLOATS;
+        c.rec_rows  = (float *)dptr(sp.gdn_rec) + slot * PULSAR_GDN_REC_STATE_FLOATS;
+    }
     if (pulsar_gdn_forward(&gw, &c, 0) != 0) return fail("pulsar_gdn_forward failed");
     return pulsar_qwen_linear_launch(&out, (const uint16_t *)(base + g.obf16), (int)n,
                                      (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
@@ -763,6 +820,17 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         ok = seqs[b].kv && seqs[b].bkey && seqs[b].stage;
     }
     if (!ok) { drop(); return fail("a QSA bank cache view failed"); }
+    if (st->verify) {
+        /* L251 MTP: the bank's index stage BEFORE this step and the rows' index projections (the raw
+         * key rides in each), for pulsar_qwen_s4_spec_rollback */
+        const pulsar_qwen_spec_capture &sp = st->st->spec;
+        const uint64_t o = sp.ord[il];
+        ok = pulsar_gpu_tensor_copy_async(sp.qsa_stage, o * itb, st->st->layer[il].idx_tail,
+                                          (uint64_t)st->bank[0] * itb, itb) != 0 &&
+             pulsar_gpu_tensor_copy_async(sp.qsa_keys, o * (PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) * PULSAR_QSA_IDX_IN * 4u,
+                                          vi, 0, (uint64_t)n * PULSAR_QSA_IDX_IN * 4u) != 0;
+        if (!ok) { drop(); return fail("the verify capture of a QSA layer failed"); }
+    }
 
     const pulsar_qsa_layer layer = {(const uint16_t *)wptr(st, L.attn_q_norm,  "qwen QSA q_norm"),
                                     (const uint16_t *)wptr(st, L.attn_k_norm,  "qwen QSA k_norm"),

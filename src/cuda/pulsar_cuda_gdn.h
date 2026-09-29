@@ -119,6 +119,13 @@ typedef struct {
     void          *out_e4m3;          /**< A8 slot data [rows][6144] or NULL */
     void          *out_scale;         /**< A8 slot ue8m0 scales (zeroed by the slot owner) */
     int            out_kbp;           /**< must equal pulsar_mx_kbp(6144) = 192 */
+    /** L251 MTP verify: the state AFTER each row r < seq_rows - 1 of a one-sequence call (the last
+     *  row's is the pool's), so a rejected draft rolls back by copying row r's back.  Both NULL
+     *  (every other call) or both set with n_seq == 1:
+     *    conv_rows [seq_rows - 1][PULSAR_GDN_CONV_STATE_FLOATS], rec_rows [seq_rows - 1][PULSAR_GDN_REC_STATE_FLOATS].
+     *  The arithmetic is unchanged -- the kernels only also store what they hold. */
+    float         *conv_rows;
+    float         *rec_rows;
 } pulsar_gdn_call;
 
 /** Scratch bytes a call of up to `rows` rows needs: f32 q^ k^ v [rows][10240] and

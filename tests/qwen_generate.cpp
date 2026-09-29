@@ -229,6 +229,41 @@ int main(int argc, char **argv) {
                generated > 1 ? (generated - 1) / t_decode : 0.0,
                generated > 1 ? 1e3 * t_decode / (generated - 1) : 0.0);
 
+    /* SPEC MODE (QWEN_SPEC set, a container with the MTP sidecar): re-sync the same prompt and generate
+     * the same count through pulsar_session_generate_speculative (greedy).  Its tokens must BE the
+     * greedy run's above -- the verify rows take the decode-width kernels -- and the speed is the
+     * point.  Timed like decode: every token after the first (which both runs read off the sync). */
+    const char *spec_env = getenv("QWEN_SPEC");
+    if (spec_env && spec_env[0] && generated > 0) {
+        char err[256] = "";
+        pulsar_tokens t = { ids, n_tok, n_tok };
+        if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qwen-generate: SPEC re-sync: %s\n", err);
+            return 1;
+        }
+        int *out = (int *)malloc((size_t)n_predict * sizeof(int));
+        uint64_t rng = 1;
+        const double t0 = now_s();
+        const int n = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated, 248046, out,
+                                                          generated, err, sizeof(err));
+        const double dt = now_s() - t0;
+        if (n < 0) {
+            fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
+            return 1;
+        }
+        int same = 0;
+        while (same < n && same < generated && out[same] == ids[n_tok + same]) same++;
+        printf("qwen-generate: SPEC %d tokens in %.3f s = %.2f tok/s (%.1f ms/token after the first); identical to "
+               "greedy for %d of %d\n", n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0, same,
+               n < generated ? n : generated);
+        if (same < (n < generated ? n : generated)) {
+            printf("qwen-generate: SPEC diverges at token %d: greedy %d, spec %d\n", same, ids[n_tok + same], out[same]);
+            free(out);
+            return 3;
+        }
+        free(out);
+    }
+
     if (argc > 4) {
         FILE *f = fopen(argv[4], "wb");
         if (!f) { fprintf(stderr, "qwen-generate: cannot write %s\n", argv[4]); return 1; }

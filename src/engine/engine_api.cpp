@@ -1164,6 +1164,10 @@ static int tp_spec_route(pulsar_session *s, const char *operation, pulsar_tp **t
 }
 
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    /* a family with its own speculative generate (Qwen's MTP, L251) takes it here; the rest is DSpark's */
+    if (s && s->engine->family->session->generate_speculative)
+        return s->engine->family->session->generate_speculative(s, temperature, top_k, top_p, min_p, rng, max_tokens,
+                                                                eos_token, accepted, accepted_cap, err, errlen);
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return 0;
     pulsar_tp *tp = NULL;
