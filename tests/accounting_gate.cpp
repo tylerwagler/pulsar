@@ -1,10 +1,13 @@
 /* Tier-2 ACCOUNTING-EXACTNESS gate (task #55 overcommit/preemption, increment 1).
  *
- * Proves the exact-frontier touched-KV number (pulsar_session_touched_kv_bytes /
- * gpu_graph_touched_kv_bytes) that the increment-2 eviction guard will TRIGGER
- * on can be trusted: it must track the REAL physical footprint of the
- * demand-paged comp/index caches, measured independently via cudaMemGetInfo
- * (pulsar_gpu_mem_info) on GB10 unified memory.
+ * Proves the touched-KV number (pulsar_session_touched_kv_bytes /
+ * gpu_graph_touched_kv_bytes: each bank's RESIDENT high-water rows) that the
+ * increment-2 eviction guard TRIGGERS on and the server budgets with can be
+ * trusted: it must track the REAL physical footprint of the demand-paged
+ * comp/index caches, measured independently via cudaMemGetInfo
+ * (pulsar_gpu_mem_info) on GB10 unified memory -- growing with a fill, holding
+ * still through a rewind (no page is freed) and a regrow over the same rows,
+ * and falling only when the bank's physical is freed (the RECLAIM check).
  *
  * METHOD.  A pooled session (comp/index are cudaMallocManaged, physical on
  * touch — PULSAR_MSEQ_BANKS>=2) has bank 0 prefilled through INCREASING fill
@@ -259,6 +262,58 @@ int GATE_ENTRY(int argc, char **argv) {
 
         free_prev = free_now;
         touched_prev = touched;
+    }
+
+    /* REWIND-KEEPS-PAGES (2026-09-29): a rewind lowers the frontier and frees no
+     * page, so touched must not move -- it is the resident high-water, not the
+     * frontier.  Counting the frontier here is what let the pair's books read a
+     * 1M-token pool 17% used on a box with 4 GiB left.  Then re-prefill over the
+     * same rows: they land on pages already counted, so touched stays put again
+     * (the high-water never double-counts a regrown row). */
+    if (!fail && n_levels >= 2) {
+        const int top = levels[n_levels - 1];
+        int cut = (top / 4) & ~4095;
+        if (cut < 4096) cut = 4096;
+        if (cut < top) {
+            (void)pulsar_gpu_synchronize();
+            uint64_t f_a = 0, t_a = 0;
+            pulsar_gpu_mem_info(&f_a, &t_a);
+            const uint64_t touched_a = pulsar_session_touched_kv_bytes(s);
+            pulsar_session_rewind(s, cut);
+            gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+            (void)pulsar_gpu_synchronize();
+            uint64_t f_b = 0;
+            pulsar_gpu_mem_info(&f_b, &t_a);
+            const uint64_t touched_b = pulsar_session_touched_kv_bytes(s);
+            const int64_t phys_moved = (int64_t)f_b - (int64_t)f_a;   /* > 0: pages returned */
+            const int64_t tol = (int64_t)(768ull * 1024 * 1024);      /* the growth check's noise floor */
+            const int rewind_ok = touched_b == touched_a && phys_moved <= tol && phys_moved >= -tol;
+            if (!rewind_ok) fail = 1;
+            fprintf(stderr,
+                    "accounting_gate: REWIND %d -> %d: touched %.3f -> %.3f GiB, physical returned "
+                    "%.1f MiB (tol %.0f MiB) -> %s\n",
+                    top, cut, (double)touched_a / GIB, (double)touched_b / GIB,
+                    (double)phys_moved / (1024.0 * 1024.0), (double)tol / (1024.0 * 1024.0),
+                    rewind_ok ? "OK (resident rows still counted)"
+                              : (touched_b < touched_a ? "UNDERCOUNT (frontier, not resident)" : "MISMATCH"));
+            pulsar_tokens p;
+            memset(&p, 0, sizeof(p));
+            p.v = toks;
+            p.len = p.cap = top;
+            char err[256];
+            if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
+                fprintf(stderr, "accounting_gate: re-prefill to %d failed: %s\n", top, err);
+                fail = 1;
+            } else {
+                gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+                const uint64_t touched_c = pulsar_session_touched_kv_bytes(s);
+                const int regrow_ok = touched_c == touched_a;
+                if (!regrow_ok) fail = 1;
+                fprintf(stderr, "accounting_gate: REGROW %d -> %d: touched %.3f GiB (was %.3f) -> %s\n",
+                        cut, top, (double)touched_c / GIB, (double)touched_a / GIB,
+                        regrow_ok ? "OK (no double count)" : "MISMATCH");
+            }
+        }
     }
 
     /* Absolute never-overcount check: the final frontier-sum must not exceed the

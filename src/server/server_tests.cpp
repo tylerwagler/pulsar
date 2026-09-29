@@ -6280,27 +6280,66 @@ static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
 /* L179 branch 14 -- provision_bank's MemAvailable floor. Invariant: the FIRST
  * bank (n_provisioned == 0) is never floor-refused, at any gauge reading
  * including an unreadable one (a first-bank refusal is a worker hard-spin);
- * from the second bank on, avail == 0 fails closed and the box must hold
- * marginal + PULSAR_SERVER_MEM_FLOOR_BYTES (same boundary as
- * server_mem_floor_admits). */
+ * from the second bank on, a bank that would page in fresh memory meets the
+ * floor (avail == 0 fails closed; the box must hold marginal +
+ * PULSAR_SERVER_MEM_FLOOR_BYTES, same boundary as server_mem_floor_admits),
+ * and a recycled bank whose pages are already resident is never refused --
+ * reinstalling it pages in nothing (the 2026-09-29 pair's serialized c2). */
 static void test_l179_bank_floor_exempts_first_bank(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
     const uint64_t marginal = 2560ull * MiB;                 /* 2.5 GiB bank */
     const uint64_t floor = marginal + PULSAR_SERVER_MEM_FLOOR_BYTES;
     /* first bank: exempt everywhere */
-    TEST_ASSERT(!server_bank_floor_refuses(0, 0, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, 1ull * GiB, marginal));
-    /* second bank onward: gauge and floor both bind */
-    TEST_ASSERT(server_bank_floor_refuses(1, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(1, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(1, floor, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, 100ull * GiB, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, 0, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, 1ull * GiB, marginal));
+    /* second bank onward, fresh pages: gauge and floor both bind */
+    TEST_ASSERT(server_bank_floor_refuses(1, false, 0, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, floor, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, 0, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, floor, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, 100ull * GiB, marginal));
+    /* a recycled bank (resident pages): admitted however tight the box reads */
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, 4ull * GiB + 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, 0, marginal));
+}
+
+/* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
+ * lowest index on a tie, provisioned banks never; -1 on a full pool. */
+static void test_bank_pick_prefers_resident_hole(void) {
+    bool prov[6] = {true, false, false, true, false, false};
+    uint64_t res[6] = {999, 0, 0, 999, 0, 0};
+    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 1);    /* all fresh: lowest */
+    res[4] = 5;
+    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 4);    /* the recycled hole */
+    res[2] = 7;
+    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* the most resident */
+    res[5] = 7;
+    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* tie: lowest index */
+    res[0] = 1ull << 40;                                      /* provisioned: ignored */
+    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);
+    bool full[3] = {true, true, true};
+    uint64_t r3[3] = {0, 0, 0};
+    TEST_ASSERT(server_pick_free_bank(full, r3, 3) == -1);
+}
+
+/* 2026-09-29 -- the refusals an idle-bank eviction relieves: full pool and
+ * full ledger always; the MemAvailable floor in pool mode only (the evicted
+ * bank's resident pages are reused); a create failure never. */
+static void test_refusal_evictable(void) {
+    TEST_ASSERT(server_refusal_evictable(PROVISION_REFUSED_POOL_FULL, false));
+    TEST_ASSERT(server_refusal_evictable(PROVISION_REFUSED_POOL_FULL, true));
+    TEST_ASSERT(server_refusal_evictable(PROVISION_REFUSED_ADMISSION, false));
+    TEST_ASSERT(server_refusal_evictable(PROVISION_REFUSED_ADMISSION, true));
+    TEST_ASSERT(!server_refusal_evictable(PROVISION_REFUSED_MEM_FLOOR, false));
+    TEST_ASSERT(server_refusal_evictable(PROVISION_REFUSED_MEM_FLOOR, true));
+    TEST_ASSERT(!server_refusal_evictable(PROVISION_REFUSED_CREATE_FAIL, true));
+    TEST_ASSERT(!server_refusal_evictable(PROVISION_OK, true));
 }
 
 /* L179 branch 4 -- park_live_bank before a batched quantum. Invariant: the
@@ -8065,6 +8104,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_tool_admission_is_bound_decode_only();
     test_l179_deep_guard_blocks_two_deep_decoders();
     test_l179_bank_floor_exempts_first_bank();
+    test_bank_pick_prefers_resident_hole();
+    test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();

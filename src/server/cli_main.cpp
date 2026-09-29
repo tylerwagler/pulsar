@@ -766,19 +766,33 @@ int main(int argc, char **argv) {
      * (measured drift ~1 GiB by 2026-07-17, two days after the constants
      * were sized), while the measured number cannot.  The static formula is
      * kept as an upper bound — it still protects against a page-cache- or
-     * UVM-inflated MemAvailable reading — and slot 0's committed actual is
-     * added back because its bytes are already resident (and therefore
-     * already excluded from MemAvailable).  A parse failure keeps the
+     * UVM-inflated MemAvailable reading — and slot 0's RESIDENT bytes are
+     * added back because they are already excluded from MemAvailable.  A parse failure keeps the
      * static budget: the live floor check in provision_slot fails closed on
      * its own read. */
     uint64_t kv_budget_final = kv_budget;
     {
+        /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
+         * its priced cost less the pool's demand-paged comp/index VA that no
+         * warmup row touched.  A pooled session prices every bank's comp/index
+         * at full --ctx (the managed VA the create reserves), but a page exists
+         * only once a row lands on it; adding the whole price back counted
+         * ~38 GiB of VA as memory (2026-09-29, the pair at --ctx 1M: budget
+         * 61.3 GiB, box full at ~12 GiB of KV).  A single session allocates its
+         * comp/index eagerly, so all of it is resident. */
+        const int banks_now = pulsar_session_bank_count(session);
+        const uint64_t demand_va = banks_now > 1
+            ? (uint64_t)banks_now * pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size)
+            : 0;
+        const uint64_t touched_now = pulsar_session_touched_kv_bytes(session);
+        const uint64_t untouched_va = demand_va > touched_now ? demand_va - touched_now : 0;
+        const uint64_t resident_now = session_actual > untouched_va ? session_actual - untouched_va : 0;
         const uint64_t avail_now = server_mem_available_bytes();
         if (avail_now > 0) {
             const uint64_t headroom =
                 avail_now > PULSAR_SERVER_MEM_FLOOR_BYTES
                     ? avail_now - PULSAR_SERVER_MEM_FLOOR_BYTES : 0;
-            uint64_t measured = session_actual + headroom;
+            uint64_t measured = resident_now + headroom;
             /* The measured budget is one-shot and PERMANENT, while the
              * MemAvailable it derives from can read transiently low at
              * startup (a previous model process still releasing memory;
@@ -792,11 +806,11 @@ int main(int argc, char **argv) {
              * GENUINELY tight, the LIVE per-attempt floor check
              * (server_mem_floor_admits — truthful post-warmup) is the guard,
              * and it recovers naturally when memory frees. */
-            const uint64_t budget_min = session_actual + session_est;
+            const uint64_t budget_min = resident_now + session_est;
             if (measured < budget_min) {
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: session admission: measured budget "
-                           "%.2f GiB clamped up to %.2f GiB (slot 0 actual + "
+                           "%.2f GiB clamped up to %.2f GiB (slot 0 resident + "
                            "one session est): MemAvailable %.2f GiB reads low "
                            "at startup; the live MemAvailable floor check "
                            "remains the per-attempt guard",
@@ -809,11 +823,14 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: session admission: measured budget %.2f GiB "
                        "(MemAvailable %.2f GiB post-warmup - floor %.2f GiB "
-                       "+ slot 0 committed %.2f GiB; static bound %.2f GiB)",
+                       "+ slot 0 resident %.2f GiB [priced %.2f, untouched VA %.2f]; "
+                       "static bound %.2f GiB)",
                        (double)kv_budget_final / (1024.0 * 1024.0 * 1024.0),
                        (double)avail_now / (1024.0 * 1024.0 * 1024.0),
                        (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
+                       (double)resident_now / (1024.0 * 1024.0 * 1024.0),
                        (double)session_actual / (1024.0 * 1024.0 * 1024.0),
+                       (double)untouched_va / (1024.0 * 1024.0 * 1024.0),
                        (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
         }
     }

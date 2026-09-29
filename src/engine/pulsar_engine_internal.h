@@ -1487,6 +1487,14 @@ typedef struct {
      * All four are lazily allocated (prefill_cap entries) on the first
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];        ///< compressed rows per (bank, kv source): the authoritative frontier for the KV pool AND the index-K pool (one emit writes both)
+    /** High-water of ms_n_comp per (bank, kv source) since the bank's comp/index
+     * physical was last allocated: the rows whose demand-paged pages are
+     * RESIDENT.  A rewind, an invalidate, an eviction to an empty conversation
+     * or a speculative rollback lowers the frontier but frees no page, so the
+     * frontier undercounts memory; this does not.  Raised only by
+     * gpu_graph_set_n_comp, cleared only by gpu_graph_bank_free_physical (the
+     * one path that returns the pages). */
+    uint32_t ms_comp_hw[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
     /** The step's cross-bank compressed-row superset per layer, max over the
      * step's rows of (pos + 1) / ratio: computed ONCE in step_begin (where it
      * is checked against layer_comp_cap) and read by the layer encode as the
@@ -1648,11 +1656,15 @@ static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
  * still correct there, and now visibly a CHOICE rather than a default.  Batched
  * paths pass the row's seq_id.  A site that cannot name a bank is a site that
  * did not know whose frontier it was reading. */
-static inline uint32_t &gpu_graph_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
-    return g->ms_n_comp[bank][il];
-}
 static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
     return g->ms_n_comp[bank][il];
+}
+/** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
+ * bank's resident high-water (ms_comp_hw) with it, so no write can move the
+ * frontier past rows the accounting has not counted. */
+static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
+    g->ms_n_comp[bank][il] = rows;
+    if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }
 
 /** =========================================================================
@@ -1797,6 +1809,7 @@ struct pulsar_engine {
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     uint64_t tp_build_digest;   ///< L250: FNV-1a of the build id, stamped into disk-KV copies
+    uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
     void *tp_bulk_base;         ///< the bulk lane's buffer (host-pinned, v14), or NULL
@@ -3225,9 +3238,11 @@ uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
  * compressed_kv_rows.  ctx_size itself when no layer compresses. */
 uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size);
 /** Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
- * from its compressor frontier.  Every bank -- live or idle -- reads
- * ms_n_comp[bank] now; stage 1b removed the separate live-scalar case.  The increment-2b guard uses this for the
- * per-bank Δ projection and the smallest-frontier victim tie-break.
+ * from its resident high-water (ms_comp_hw), not its frontier: pages above a
+ * rewound or evicted frontier stay resident until the bank's physical is freed.
+ * The increment-2b guard uses this for the per-bank Δ projection and the
+ * victim tie-break; the server's provisioning reads it to prefer a bank whose
+ * pages are already resident.
  */
 uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
 /** Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
