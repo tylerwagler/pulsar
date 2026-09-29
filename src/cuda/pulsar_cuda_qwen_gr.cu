@@ -50,7 +50,11 @@ constexpr int kNormThreads = 256;
 constexpr int kNormPer = kH / kNormThreads;   ///< 10 columns per thread
 constexpr int kDownSplit = 5;                 ///< W_down split-K: 320 blocks of 32 -> 64 per split
 constexpr int kDownTB = 8;                    ///< tokens per down CTA
-constexpr int kUpTB = 16;                     ///< tokens per up CTA
+constexpr int kUpTB = 16;                     ///< tokens per up CTA at prefill widths (W_up reuse)
+constexpr int kUpTBDecode = 4;                ///< tokens per up CTA at decode widths: small enough that two
+                                              ///< CTAs (staged W_up tile + a, prod) share an SM, so the 80
+                                              ///< CTAs are one wave on 48 SMs.  The row arithmetic does not
+                                              ///< depend on the tile, so the two widths are bit-identical.
 static_assert(kH % kNormThreads == 0, "the norm walks a stream in whole passes of 256");
 static_assert((kHC / 32) % kDownSplit == 0, "W_down's 32-blocks split evenly");
 static_assert(kR % 32 == 0 && kR / 32 <= 12, "the low rank is whole 32-blocks");
@@ -394,8 +398,8 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
         }
 }
 
-/* 3. mid + up + gate + mean: one warp per stream, lane = channel, kUpTB
- * tokens per CTA.
+/* 3. mid + up + gate + mean: one warp per stream, lane = channel, TB
+ * tokens per CTA (kUpTB at prefill widths, kUpTBDecode at decode widths).
  *   mid  a = silu(d / 4), d = the down's splits summed in split order, for the
  *        CTA's tokens, in shared memory -- in the format W_up reads (E4M3 per
  *        32 by the one producer encoder, or bf16).  Every CTA derives the same
@@ -407,7 +411,22 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
  *        its blocks in order 0..9, so the row arithmetic does not depend on T);
  *        the gated products go to shared memory and one warp per token takes
  *        the stream mean and emits the row. */
-template <bool W8>
+/* The W8 up's weight tile at decode widths, staged whole: the CTA's 4 x 32 rows of 320 E4M3 bytes, copied by
+ * cp.async in coalesced 16-byte chunks at kernel entry so the load overlaps the mid.  The row
+ * stride is padded to 336 B (84 words): a quarter-warp's 8 lanes, reading rows l .. l + 7 at the
+ * same column, then hit 8 distinct 4-bank groups.  The arithmetic reads the same bytes in the same
+ * order as a direct global load, so the output is bit-identical to it. */
+constexpr int kUpRowBytes = kR;                               ///< 320 E4M3 codes
+constexpr int kUpRowStride = kUpRowBytes + 16;                ///< 336 B
+constexpr int kUpTileBytes = kS * 32 * kUpRowStride;          ///< 43,008 B dynamic shared memory
+static_assert(kUpRowBytes % 16 == 0 && (kUpRowStride / 4) % 32 == 20, "the padded stride is conflict-free");
+
+__device__ __forceinline__ void gr_cp_async16(void *smem, const void *gmem) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+}
+
+template <bool W8, int TB>
 __global__ void __launch_bounds__(32 * kS)
 qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                   const float *__restrict__ part, const float *__restrict__ injp, float *__restrict__ inj,
@@ -415,15 +434,30 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                   const float *__restrict__ rstd, int T,
                   __nv_bfloat16 *__restrict__ x_out) {
     constexpr int NB = kR / 32;
-    __shared__ float prod[kUpTB][kS][32];
+    __shared__ float prod[TB][kS][32];
     /* L251 / ac69748f: `a` is bf16 whatever W_up's WEIGHT format is -- this was the last op-internal
      * E4M3 activation in the read.  W8 now means E4M3 weights against a bf16 activation, the same
      * W8A16 shape the down already uses, so e4m3_bf16_dot32 serves here too. */
-    __shared__ __align__(16) uint8_t s_a[kUpTB][2 * kR];
+    __shared__ __align__(16) uint8_t s_a[TB][2 * kR];
     const int s = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int c = blockIdx.x * 32 + lane;
     const int row = s * kH + c;
-    const int t0 = blockIdx.y * kUpTB, nt = min(kUpTB, T - t0);
+    const int t0 = blockIdx.y * TB, nt = min(TB, T - t0);
+    /* the decode instance stages W_up (kUpTileBytes of dynamic shared memory); the prefill instance
+     * reads it directly -- at 16 tokens per CTA its weight row is reused 16 times from registers, and
+     * the tile would hold it to one CTA per SM */
+    constexpr bool STAGE = W8 && TB == kUpTBDecode;
+    extern __shared__ __align__(16) uint8_t s_w[];
+    if constexpr (STAGE) {
+        /* stream ss's 32 rows are one contiguous 10,240 B run of W_up */
+        constexpr int kChunks = kUpRowBytes / 16;                 /* 20 per row */
+        for (int i = threadIdx.x; i < kS * 32 * kChunks; i += 32 * kS) {
+            const int rr = i / kChunks, ch = i % kChunks, ss = rr / 32, cc = rr % 32;
+            const uint8_t *src = (const uint8_t *)wv + ((size_t)ss * kH + blockIdx.x * 32 + cc) * kR + ch * 16;
+            gr_cp_async16(s_w + rr * kUpRowStride + ch * 16, src);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
     /* mid: warp s takes the (token, 32-group) pairs s, s + 4, ...; lane = element */
     for (int g = s; g < nt * NB; g += kS) {
         const int tt = g / NB, b = g % NB, r = b * 32 + lane;
@@ -441,18 +475,20 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         for (int ss = 0; ss < kS; ++ss) zi += injp[((size_t)t * kS + ss) * kS + j];
         inj[t * kS + j] = 2.0f / (1.0f + expf(-zi * (1.0f / kS)));
     }
+    if constexpr (STAGE) asm volatile("cp.async.wait_all;\n" ::: "memory");
     __syncthreads();
-    float z[kUpTB];
+    float z[TB];
 #pragma unroll
-    for (int tt = 0; tt < kUpTB; ++tt) z[tt] = 0.0f;
+    for (int tt = 0; tt < TB; ++tt) z[tt] = 0.0f;
     if constexpr (W8) {
         const int w_kbp = pulsar_mx_kbp(kR);
-        const uint4 *wp = reinterpret_cast<const uint4 *>((const uint8_t *)wv + (size_t)row * kR);
+        const uint4 *wp = STAGE ? reinterpret_cast<const uint4 *>(s_w + (s * 32 + lane) * kUpRowStride)
+                                : reinterpret_cast<const uint4 *>((const uint8_t *)wv + (size_t)row * kR);
         for (int b = 0; b < NB; ++b) {
             const uint4 w0 = wp[2 * b], w1 = wp[2 * b + 1];
             const unsigned sw = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
 #pragma unroll
-            for (int tt = 0; tt < kUpTB; ++tt) {
+            for (int tt = 0; tt < TB; ++tt) {
                 if (tt < nt) {
                     /* 32 bf16 activations are FOUR uint4 where 32 E4M3 were two, and the weight's
                      * E8M0 is the only scale left to apply (bf16 carries its own exponent). */
@@ -467,13 +503,13 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         for (int ci = 0; ci < kR / 8; ++ci) {
             const uint4 w = wp[ci];
 #pragma unroll
-            for (int tt = 0; tt < kUpTB; ++tt)
+            for (int tt = 0; tt < TB; ++tt)
                 if (tt < nt) z[tt] = bf16_dot8(w, reinterpret_cast<const uint4 *>(s_a[tt])[ci], z[tt]);
         }
     }
     const float w1n = 1.0f + bf2f(norm_w[row]);
 #pragma unroll
-    for (int tt = 0; tt < kUpTB; ++tt) {
+    for (int tt = 0; tt < TB; ++tt) {
         if (tt < nt) {
             const int t = t0 + tt;
             const float g = 1.0f / (1.0f + expf(-z[tt]));
@@ -552,10 +588,26 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
         qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
             w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
     }
-    qwen_gr_up_kernel<W8><<<dim3(kH / 32, (T + kUpTB - 1) / kUpTB), 32 * kS, 0, stream>>>(
-        w->up.w, w->up.sf, m.part, w->inject ? m.injp : nullptr, inj, (const __nv_bfloat16 *)streams,
-        (const __nv_bfloat16 *)w->norm_w,
-        m.rstd, T, (__nv_bfloat16 *)x_bf16);
+    if (W8) {
+        static bool attr = false;                 /* idempotent; set once, not per launch */
+        if (!attr) {
+            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kUpTileBytes);
+            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            attr = true;
+        }
+    }
+    const int tb = T > kDecodeRowsMax ? kUpTB : kUpTBDecode;
+    const dim3 grid(kH / 32, (T + tb - 1) / tb);
+    const size_t smem = W8 && tb == kUpTBDecode ? kUpTileBytes : 0;
+    const float *injp = w->inject ? m.injp : nullptr;
+    if (tb == kUpTB)
+        qwen_gr_up_kernel<W8, kUpTB><<<grid, 32 * kS, smem, stream>>>(
+            w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
+            m.rstd, T, (__nv_bfloat16 *)x_bf16);
+    else
+        qwen_gr_up_kernel<W8, kUpTBDecode><<<grid, 32 * kS, smem, stream>>>(
+            w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
+            m.rstd, T, (__nv_bfloat16 *)x_bf16);
 }
 
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
