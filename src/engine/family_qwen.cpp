@@ -952,6 +952,7 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, cons
     st.bank = bank;
     st.streams = s->qwen->mtp_streams;
     st.mixer = &e->qwen_weights->mtp.mixer;
+    st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
     bool ok = pulsar_gpu_tensor_write(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
@@ -973,8 +974,16 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, cons
     }
     if (head_n)
         ok = pulsar_gpu_tensor_read(s->qwen->logits, 0, logits_out,
-                                    (uint64_t)head_n * g_qwen_shape.n_vocab * sizeof(float)) != 0;
+                                    (uint64_t)head_n * e->qwen_weights->n_draft * sizeof(float)) != 0;
     return ok;
+}
+
+/* The drafter's greedy token from one MTP head row (n_draft logits). */
+static int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row) {
+    const uint32_t n = e->qwen_weights->n_draft;
+    uint32_t a = 0;
+    for (uint32_t i = 1; i < n; i++) if (row[i] > row[a]) a = i;
+    return e->qwen_weights->draft_ids[a];
 }
 
 /* After a trunk step over rows (tokens, pos, bank): give every row whose next token is now known its
@@ -1127,13 +1136,10 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
         const bool had = s->qwen->mtp_pend_pos[live] != UINT32_MAX && s->qwen->mtp_pend_pos[live] + 1u == (uint32_t)pos;
         const bool ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_DECODE, &tok, &pos, &bank, 1, probe ? 1u : 0u, ml);
         if (ok && probe && had) {
-            uint32_t am = 0, at = 0;
-            for (uint32_t v = 1; v < g_qwen_shape.n_vocab; v++) {
-                if (ml[v] > ml[am]) am = v;
-                if (s->logits[v] > s->logits[at]) at = v;
-            }
+            uint32_t at = 0;
+            for (uint32_t v = 1; v < g_qwen_shape.n_vocab; v++) if (s->logits[v] > s->logits[at]) at = v;
             s->qwen->mtp_probe_n++;
-            s->qwen->mtp_probe_hit += am == at;
+            s->qwen->mtp_probe_hit += (uint32_t)qwen_mtp_argmax(s->engine, ml) == at;
         }
         free(ml);
         if (!ok) {
@@ -1302,7 +1308,7 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
                  qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, k > 0 ? 1u : 0u, L);
             q->mtp_pend_pos[b] = UINT32_MAX;              /* consumed; re-parked after the verify */
             if (ok && k > 0) {
-                d[1] = (int32_t)qwen_argmax(L, V);
+                d[1] = qwen_mtp_argmax(e, L);
                 /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows */
                 ok = pulsar_gpu_tensor_copy_async(q->spec.qsa_stage, (uint64_t)q->spec.n_qsa * itb,
                                                   q->layer[il_mtp].idx_tail, (uint64_t)b * itb, itb) != 0;
@@ -1311,7 +1317,7 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
                 tp = (int32_t)p + j - 2;
                 ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_streams, 0, hc) != 0 &&
                      qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &d[j - 1], &tp, &bb, 1, 0, 1, L);
-                if (ok) d[j] = (int32_t)qwen_argmax(L, V);
+                if (ok) d[j] = qwen_mtp_argmax(e, L);
             }
         }
         /* verify [x, d_1 .. d_k] at p .. p + k, every row headed */

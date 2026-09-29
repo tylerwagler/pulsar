@@ -133,8 +133,9 @@ int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t
 /** L251: bytes of an [out][in] mxfp8_lt matrix (E4M3 then the swizzled E8M0 plane); 0 if in % 32. */
 uint64_t pulsar_qwen_mxfp8_bytes(int out, int in);
 /** L251: a bf16 [out][in] matrix into mxfp8_lt at `dst` (pulsar_qwen_mxfp8_bytes), with the
- *  producers' own encoder.  0 on success. */
-int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, int out, int in, void *dst, cudaStream_t stream);
+ *  producers' own encoder.  `rows` (device, [out], or NULL for the identity) gathers: output row r is
+ *  w's row rows[r] (the MTP draft head, L251).  0 on success. */
+int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, const int32_t *rows, int out, int in, void *dst, cudaStream_t stream);
 
 /** A weight's device pointer: the engine's model-range cache for the span
  *  [offset, offset + bytes) of `model_map` (cuda_model_range_ptr). */

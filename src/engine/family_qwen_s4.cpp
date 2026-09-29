@@ -339,6 +339,17 @@ void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
         pulsar_gpu_tensor_free(w->head_mx);
         w->head_mx = NULL;
     }
+    if (w) {
+        pulsar_gpu_tensor_free(w->draft_head_mx);
+        pulsar_gpu_tensor_free(w->draft_ids_dev);
+        w->draft_head_mx = NULL;
+        w->draft_ids_dev = NULL;
+    }
+    if (w) {
+        free(w->draft_ids);
+        w->draft_ids = NULL;
+        w->n_draft = 0;
+    }
     pulsar_qwen_ple_io *io = w ? w->ple_io : NULL;
     if (!io) return;
     if (io->pending) (void)pulsar_engram_gather_wait(io->pending);
@@ -553,6 +564,48 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
                                   base + m.ws, m.ws_bytes, (uint32_t *)(base + m.nf), 0x51000000u | il, 0) == 0;
 }
 
+/* L251 MTP: the draft head (pulsar_qwen_weights::draft_head_mx), gathered once from the bf16 head.  With
+ * every id kept it IS the full head: no copy, only the identity id list. */
+static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm) {
+    const pulsar_qwen_shape *s = st->shape;
+    const int H = (int)s->n_embd;
+    const char *ev = getenv("PULSAR_QWEN_MTP_DRAFT_VOCAB");
+    uint32_t N = ev && ev[0] ? (uint32_t)strtoul(ev, NULL, 10) : 65536u;
+    if (N == 0 || N > s->eos_id) N = s->eos_id;
+    const uint32_t nd = N + (s->n_vocab - s->eos_id);
+    int32_t *ids = (int32_t *)xmalloc((size_t)nd * sizeof(int32_t));
+    for (uint32_t i = 0; i < N; i++) ids[i] = (int32_t)i;
+    for (uint32_t i = s->eos_id; i < s->n_vocab; i++) ids[N + (i - s->eos_id)] = (int32_t)i;
+    if (nd == s->n_vocab) {
+        wm->draft_ids = ids;
+        wm->n_draft = nd;
+        fprintf(stderr, "pulsar: %s: MTP draft head = the full lm_head (%u rows)\n", PULSAR_QWEN_ARCH, nd);
+        return true;
+    }
+    const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
+    const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)nd, H);
+    /* the device id list lives as long as the head (the gather kernel may still be reading it) */
+    wm->draft_ids_dev = pulsar_gpu_tensor_alloc((uint64_t)nd * sizeof(int32_t));
+    wm->draft_head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
+    const bool ok = wm->draft_ids_dev && wm->draft_head_mx &&
+                    pulsar_gpu_tensor_write(wm->draft_ids_dev, 0, ids, (uint64_t)nd * sizeof(int32_t)) &&
+                    pulsar_qwen_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
+                                              dptr(wm->draft_head_mx), 0) == 0;
+    if (!ok) {
+        free(ids);
+        pulsar_gpu_tensor_free(wm->draft_head_mx);
+        pulsar_gpu_tensor_free(wm->draft_ids_dev);
+        wm->draft_head_mx = NULL;
+        wm->draft_ids_dev = NULL;
+        return fail("the MTP draft head could not be built");
+    }
+    wm->draft_ids = ids;
+    wm->n_draft = nd;
+    fprintf(stderr, "pulsar: %s: MTP draft head: ids [0, %u) + [%u, %u) = %u rows (%.0f MB MXFP8)\n", PULSAR_QWEN_ARCH,
+            N, s->eos_id, s->n_vocab, nd, (double)bytes / 1e6);
+    return true;
+}
+
 bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) {
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd;
@@ -579,14 +632,17 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
             const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)s->n_vocab, H);
             wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
-            ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, (int)s->n_vocab, H, dptr(wm->head_mx), 0) == 0;
+            ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, NULL, (int)s->n_vocab, H, dptr(wm->head_mx), 0) == 0;
             if (ok) fprintf(stderr, "pulsar: %s: lm_head as MXFP8 (%.2f GB, from bf16 %.2f GB)\n", PULSAR_QWEN_ARCH,
                             (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
         }
+        if (ok && st->draft_head && !wm->draft_ids) ok = build_draft_head(st, wm);
         if (ok) {
-            const uint8_t *hq = (const uint8_t *)dptr(wm->head_mx);
-            const pulsar_qwen_lowrank l = {hq, hq + (uint64_t)s->n_vocab * H, (int)s->n_vocab, H};
+            const bool dh = st->draft_head;
+            const uint32_t rows = dh ? wm->n_draft : s->n_vocab;
+            const uint8_t *hq = (const uint8_t *)dptr(dh && wm->draft_head_mx ? wm->draft_head_mx : wm->head_mx);
+            const pulsar_qwen_lowrank l = {hq, hq + (uint64_t)rows * H, (int)rows, H};
             ok = pulsar_qwen_mxfp8_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(st->st->logits),
                                                  NULL, 0, 0) == 0;
         }
