@@ -17,6 +17,8 @@
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
+/* L251: the Qwen family's chat renderer, effort authority and output parser. */
+#include "qwen_chat.h"
 
 #include <new>
 #include <string>
@@ -620,6 +622,16 @@ typedef struct {
      * unless a parser says otherwise, so hand-built requests keep the default
      * profile's bytes. */
     bool chat_v41;
+    /** L251: a /v1/chat/completions request for the Qwen family.  Rendered by
+     * qwen_chat_render (src/lib/qwen_chat), and its generated text is read by
+     * ONE qwen_output_parser per generation (gen_state::qwen) instead of the
+     * DeepSeek think/DSML machinery: every DeepSeek continuation, forced-prefill,
+     * tool-memory and checkpoint-suffix builder is skipped for it, because each
+     * of them writes DeepSeek markup.  False for every other request. */
+    bool chat_qwen;
+    /** L251: the request's tools array as the client sent it (JSON text), for
+     * the Qwen output parser's argument typing; owned, NULL = no tools. */
+    char *qwen_tools_json;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -2346,6 +2358,21 @@ typedef enum {
     GEN_DONE,
 } gen_phase;
 
+/** L251: one Qwen generation's output side.  The ONE qwen_output_parser of the
+ * generation is fed g->text's bytes as the stop-string scan releases them, and
+ * its events become the response: reasoning and content deltas, and each
+ * completed tool call, which is given its id here and kept in `calls` for the
+ * final message.  A call reaches the client only when complete (TOOL_END): a
+ * call the parser later rejects (ERROR) was never announced, so a stream never
+ * carries a call the final message lacks. */
+struct qwen_gen {
+    qwen_output_parser parser;
+    std::vector<qwen_out_event> ev;  ///< scratch, reused per feed
+    size_t fed = 0;                  ///< bytes of g->text fed to the parser
+    tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
+    ~qwen_gen();                     ///< frees `calls` (server_jobs.cpp)
+};
+
 /** Everything one in-flight generation needs, for the whole life of the
  * request.
  *
@@ -2478,6 +2505,10 @@ struct gen_state {
      * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
      * once by the fused quantum on giveup; the classic path handles it correctly. */
     bool no_fuse;
+
+    /** L251: the Qwen output state for a request with chat_qwen set, owned
+     * (heap-held: gen_state is a memset C struct); NULL for every other request. */
+    qwen_gen *qwen;
 
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker
@@ -2830,6 +2861,15 @@ bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens);
+/* L251: the Qwen family's OpenAI chat deltas (see qwen_gen).  A reasoning or
+ * content delta carries the logprob entries released up to `release_upto`; a
+ * tool call goes out whole (start delta with id and name, then its arguments). */
+bool openai_sse_qwen_text(int fd, const request *r, const char *id, bool reasoning,
+                          const std::string &text, logprob_ledger *lp, size_t release_upto);
+bool openai_sse_qwen_tool_call(int fd, const request *r, const char *id, int index,
+                               const tool_call *tc);
+bool openai_sse_qwen_finish(int fd, const request *r, const char *id, logprob_ledger *lp,
+                            const char *finish, int prompt_tokens, int completion_tokens);
 bool request_uses_openai_live_stream(const request *r);
 bool request_uses_responses_live_stream(const request *r);
 bool request_uses_structured_stream(const request *r);

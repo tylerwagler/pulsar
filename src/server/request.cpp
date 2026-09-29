@@ -329,6 +329,7 @@ void request_free(request *r) {
     r->anthropic_live_suffix_spans = NULL;
     r->anthropic_live_suffix_n_spans = 0;
     tool_schema_orders_free(&r->tool_orders);
+    free(r->qwen_tools_json);
     memset(r, 0, sizeof(*r));
 }
 
@@ -479,6 +480,9 @@ bool model_alias_enables_thinking(const char *model) {
 
 
 const char *server_model_id_from_engine(pulsar_engine *engine) {
+    /* L251: the family is fixed at load (like the shape id), so this stays a
+     * plain read of immutable engine state on the client threads. */
+    if (pulsar_engine_family(engine) == PULSAR_FAMILY_ID_QWEN4_EXP) return "qwen3.8-flash-next";
     return pulsar_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }

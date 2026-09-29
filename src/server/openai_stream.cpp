@@ -1123,6 +1123,32 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
 
 
 
+/* Append the closing chat chunk (empty delta, the remaining logprob entries,
+ * finish_reason) to `b`, send `b`, then the usage chunk and [DONE]; frees `b`.
+ * Shared by the DeepSeek projection and the Qwen one (L251). */
+static bool openai_sse_send_final(int fd, const request *r, const char *id, long now, buf *b,
+                                  logprob_ledger *lp, const char *finish,
+                                  int prompt_tokens, int completion_tokens) {
+    buf_printf(b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(b, r->model);
+    buf_puts(b, ",\"choices\":[{\"index\":0,\"delta\":{}");
+    /* Entries whose bytes never reached a content/reasoning delta (tool-call
+     * bytes, suppressed protocol markers, a held tail) are still this
+     * completion's tokens: flush the remainder here so the streamed logprobs
+     * concatenate to the non-streaming array. */
+    append_openai_logprobs_delta(b, lp, SIZE_MAX);
+    buf_puts(b, ",\"finish_reason\":");
+    json_escape(b, finish);
+    buf_puts(b, "}]}\n\n");
+
+    bool ok = send_all(fd, b->ptr, b->len) &&
+              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    buf_free(b);
+    return ok;
+}
+
+
+
 bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
@@ -1139,22 +1165,39 @@ bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-    json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{}");
-    /* Entries whose bytes never reached a content/reasoning delta (tool-call
-     * bytes, suppressed protocol markers, a held tail) are still this
-     * completion's tokens: flush the remainder here so the streamed logprobs
-     * concatenate to the non-streaming array. */
-    append_openai_logprobs_delta(&b, st->lp, SIZE_MAX);
-    buf_puts(&b, ",\"finish_reason\":");
-    json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    return openai_sse_send_final(fd, r, id, now, &b, st->lp, finish,
+                                 prompt_tokens, completion_tokens);
+}
 
-    bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
-    return ok;
+
+
+/* ---- L251: the Qwen family's chat deltas (qwen_gen_feed drives them) ---- */
+
+bool openai_sse_qwen_text(int fd, const request *r, const char *id, bool reasoning,
+                          const std::string &text, logprob_ledger *lp, size_t release_upto) {
+    return sse_chat_delta_n(fd, r, id, reasoning ? "reasoning_content" : "content",
+                            text.data(), text.size(), lp, release_upto);
+}
+
+
+
+/* A complete call: the start delta (index, id, name, empty arguments) and one
+ * arguments delta carrying the whole JSON object -- the OpenAI streaming shape,
+ * so a client that concatenates argument fragments gets the object. */
+bool openai_sse_qwen_tool_call(int fd, const request *r, const char *id, int index,
+                               const tool_call *tc) {
+    const char *args = tc->arguments ? tc->arguments : "";
+    return sse_chat_tool_call_start_delta(fd, r, id, index, tc->id, tc->name) &&
+           sse_chat_tool_call_args_delta_n(fd, r, id, index, args, strlen(args));
+}
+
+
+
+bool openai_sse_qwen_finish(int fd, const request *r, const char *id, logprob_ledger *lp,
+                            const char *finish, int prompt_tokens, int completion_tokens) {
+    buf b = {0};
+    return openai_sse_send_final(fd, r, id, (long)time(NULL), &b, lp, finish,
+                                 prompt_tokens, completion_tokens);
 }
 
 
