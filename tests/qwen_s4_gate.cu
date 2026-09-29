@@ -487,12 +487,24 @@ static void section_ple(void) {
 }
 
 /* ======================================================================== */
-static void section_moe_at(const int T) {
+/* split = the MTP layer's routed experts: gate and up as separate slices (each its own suh), all three
+ * at K = 3 (turboderp's MTP rate); otherwise the trunk's fused gate_up K = 4 and down K = 5 */
+static void section_moe_at(const int T, const bool split = false) {
     const int P = 12;
-    std::vector<linear> pgu, pd;
-    for (int i = 0; i < P; i++) { pgu.push_back(make_linear(H, 2 * MID, 8)); pd.push_back(make_linear(MID, H, 10)); }
+    std::vector<linear> pgu, pd, pg, pu;
+    for (int i = 0; i < P; i++) {
+        if (split) {
+            pg.push_back(make_linear(H, MID, 6));
+            pu.push_back(make_linear(H, MID, 6));
+            pd.push_back(make_linear(MID, H, 6));
+        } else {
+            pgu.push_back(make_linear(H, 2 * MID, 8));
+            pd.push_back(make_linear(MID, H, 10));
+        }
+    }
     std::vector<expert> ex(E);
-    for (int e = 0; e < E; e++) ex[e] = {&pgu[e % P], &pd[e % P]};
+    for (int e = 0; e < E; e++)
+        ex[e] = split ? expert{nullptr, &pd[e % P], &pg[e % P], &pu[e % P]} : expert{&pgu[e % P], &pd[e % P]};
     const linear sg = make_linear(H, MID, 10), su = make_linear(H, MID, 10), sd = make_linear(MID, H, 8);
     auto table = [&](std::vector<linear> &pool) {
         std::vector<const void *> t(2 * E);
@@ -503,12 +515,17 @@ static void section_moe_at(const int T) {
         for (int e = 0; e < E; e++) { t[2 * e] = base[e % P]; t[2 * e + 1] = (const uint8_t *)base[e % P] + trellis; }
         return (const void *const *)up(t);
     };
-    pulsar_qwen_moe_dev w;
+    pulsar_qwen_moe_dev w{};
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
-    w.gate_up_table = table(pgu); w.down_table = table(pd);
-    w.k2_gate_up = 8; w.k2_down = 10;
+    if (split) {
+        w.gate_table = table(pg); w.up_table = table(pu); w.down_table = table(pd);
+        w.k2_gate_up = 6; w.k2_down = 6;
+    } else {
+        w.gate_up_table = table(pgu); w.down_table = table(pd);
+        w.k2_gate_up = 8; w.k2_down = 10;
+    }
     w.shared_gate = dev_linear(sg); w.shared_up = dev_linear(su); w.shared_down = dev_linear(sd);
     const auto x = rnd_act(T, H, 0.7);
     /* L251 / ac69748f: the MoE reads the bf16 rows directly -- there is no A8 slot, so the
@@ -560,8 +577,11 @@ static void section_moe_at(const int T) {
      * produced on this very line before the references were fixed), while the f32-order count
      * allows the two tie-affected rows.  The count is a proxy; the bound is the check. */
     if (T <= 16) {
-        CHECK(rows_f32 >= T - 2 && frob_worst < 1e-4, "T = %d (decode GEMV) out vs double: %d of %d rows at f32 order "
-              "(< 1e-5), worst row rel Frobenius %.2e, max |err| / max|ref| %.2e", T, rows_f32, T, frob_worst, worst);
+        /* split: K = 3 slices put more fold-mid values near a bf16 tie (3 of 5 rows off f32 order on the
+         * first draw, worst 3.2e-5) -- the count is the proxy and is graded for the fused arm only */
+        CHECK((split || rows_f32 >= T - 2) && frob_worst < 1e-4, "T = %d%s (decode GEMV) out vs double: %d of %d rows at f32 order "
+              "(< 1e-5), worst row rel Frobenius %.2e, max |err| / max|ref| %.2e", T, split ? " split experts" : "",
+              rows_f32, T, frob_worst, worst);
     } else {
         /* the prefill GEMMs (routed: qwen_exl3_moe_prefill.cu, shared: qwen_exl3_dense_prefill.cu).
          * The shared expert's cuBLAS GEMM is ~4e-6 per element (tests/exl3_dense_gate), not the GEMV's
@@ -572,15 +592,17 @@ static void section_moe_at(const int T) {
          * 25x below the 2.5e-2 a real format error read on this line -- and quality is judged END TO
          * END: teacher-forced NLL over 1,792 positions (14 prefixes, code + raw prose) is 2.62 with these
          * kernels vs 2.63 for the all-GEMV build.  The f32-order count is reported, not graded. */
-        CHECK(frob_worst < 1e-3, "T = %d (prefill GEMMs) out vs double: worst row rel Frobenius %.2e, max |err| / "
-              "max|ref| %.2e (%d of %d rows at f32 order)", T, frob_worst, worst, rows_f32, T);
+        CHECK(frob_worst < 1e-3, "T = %d%s (prefill GEMMs%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
+              "max|ref| %.2e (%d of %d rows at f32 order)", T, split ? " split experts" : "",
+              split ? "; the pair as two rotated slices" : "", frob_worst, worst, rows_f32, T);
     }
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
     if (T <= 16) {
         /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
         rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, 1, out, ws, wsb, nf, 0x7351u, 0);
         const auto O1 = down(out, H);
-        CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d batch's row", T);
+        CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d%s "
+              "batch's row", T, split ? " split-expert" : "");
     }
 }
 
@@ -588,6 +610,8 @@ static void section_moe(void) {
     printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
     section_moe_at(5);    /* 50 assignments: the decode GEMV */
     section_moe_at(37);   /* 370 assignments: the prefill GEMM (>= QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN) */
+    section_moe_at(5, true);    /* the MTP layer's split experts (pair GEMV + pair fold), decode width */
+    section_moe_at(37, true);   /* ... and a prompt width: the prefill GEMM per slice, k2 = 6 */
 }
 
 int main(void) {

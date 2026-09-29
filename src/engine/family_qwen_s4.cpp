@@ -242,6 +242,23 @@ static bool admit_gr(const pulsar_qwen_gr_weights &g) {
     return ok;
 }
 
+/* a layer's MoE: the router, the routed experts (fused gate_up, or the MTP layer's gate + up pair), the
+ * shared expert */
+static bool admit_moe(const pulsar_qwen_layer_weights &L) {
+    bool ok = admit_bf16(L.moe_router) & admit_bf16(L.sh_gate_scalar);
+    if (L.moe_gate_up)
+        ok &= admit_exl3(L.moe_gate_up, EXL3_ARM_GATE_UP_FUSED, "exl3m_k4 / exl3m_k5 (the fused gate_up arm)");
+    else
+        ok &= admit_exl3(L.moe_gate, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
+              admit_exl3(L.moe_up, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
+              admit(L.moe_up, L.moe_up->type == L.moe_gate->type, "the gate slice's rate (the pair shares one)");
+    ok &= admit_exl3(L.moe_down, EXL3_ARM_DOWN, "an exl3m rate the routed down arm reads");
+    ok &= admit_exl3(L.sh_gate, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
+          admit_exl3(L.sh_up, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
+          admit_exl3(L.sh_down, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads");
+    return ok;
+}
+
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     pulsar_qwen_weights *w = e->qwen_weights;
     const pulsar_qwen_shape *s = &g_qwen_shape;
@@ -249,18 +266,22 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     for (uint32_t il = 0; il < e->plan.n_layer; il++) {
         const pulsar_qwen_layer_weights &L = w->layer[il];
         ok &= admit_gr(L.gr_attn) & admit_gr(L.gr_mlp);
-        ok &= admit_bf16(L.moe_router) & admit_bf16(L.sh_gate_scalar);
-        ok &= admit_exl3(L.moe_gate_up, EXL3_ARM_GATE_UP_FUSED, "exl3m_k4 / exl3m_k5 (the fused gate_up arm)");
-        ok &= admit_exl3(L.moe_down, EXL3_ARM_DOWN, "an exl3m rate the routed down arm reads");
-        ok &= admit_exl3(L.sh_gate, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
-              admit_exl3(L.sh_up, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
-              admit_exl3(L.sh_down, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads");
+        ok &= admit_moe(L);
         if (L.ple_key) {
             ok &= admit_exl3(L.ple_key, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
                   admit_exl3(L.ple_value, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads");
             ok &= admit_bf16(L.ple_norm_key) & admit_bf16(L.ple_norm_query) & admit_bf16(L.ple_norm_conv) &
                   admit_bf16(L.ple_conv);
         }
+    }
+    if (w->mtp.present) {
+        /* L251 MTP: the layer's GR sites and MoE as the trunk's (split experts); the head side's
+         * norms bf16 and its two fc Linears mxfp8_lt (the sidecar recipe); the mixer's pair as the
+         * trunk mixer's rule allows */
+        const pulsar_qwen_layer_weights &L = w->layer[e->plan.n_layer];
+        ok &= admit_gr(L.gr_attn) & admit_gr(L.gr_mlp) & admit_moe(L) & admit_gr(w->mtp.mixer);
+        ok &= admit_bf16(w->mtp.norm_embd) & admit_bf16(w->mtp.norm_hidden) &
+              admit_mx8(w->mtp.fc_embd) & admit_mx8(w->mtp.fc_hidden);
     }
     if (!ok) return false;
 
@@ -487,22 +508,35 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd, MID = (int)s->n_ff_exp, SMID = (int)s->n_ff_shexp;
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
-    pulsar_qwen_moe_dev w;
+    pulsar_qwen_moe_dev w{};
     w.router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
     w.shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
-    /* the two expert stacks: [trellis | suh | svh] per expert (exl3_expert_layout) */
+    /* the expert stacks: [trellis | suh | svh] per expert (exl3_expert_layout).  The trunk's gate_up is
+     * ONE fused stack (2 MID outputs); the MTP layer's gate and up are two stacks of MID (split). */
+    const bool split = L.moe_gate_up == NULL;
+    const pulsar_tensor *first = split ? L.moe_gate : L.moe_gate_up;
+    const uint64_t first_out = split ? (uint64_t)MID : 2ull * MID;
     uint64_t tgu = 0, sc_gu = 0, stride_gu = 0, td = 0, sc_d = 0, stride_d = 0;
-    w.k2_gate_up = exl3_type_k2(L.moe_gate_up->type);
+    w.k2_gate_up = exl3_type_k2(first->type);
     w.k2_down = exl3_type_k2(L.moe_down->type);
-    if (!exl3_expert_layout((uint64_t)H, 2ull * MID, w.k2_gate_up, &tgu, &sc_gu, &stride_gu) ||
+    if (!exl3_expert_layout((uint64_t)H, first_out, w.k2_gate_up, &tgu, &sc_gu, &stride_gu) ||
         !exl3_expert_layout((uint64_t)MID, (uint64_t)H, w.k2_down, &td, &sc_d, &stride_d) ||
-        L.moe_gate_up->bytes != stride_gu * s->n_expert || L.moe_down->bytes != stride_d * s->n_expert)
+        first->bytes != stride_gu * s->n_expert || L.moe_down->bytes != stride_d * s->n_expert ||
+        (split && L.moe_up->bytes != stride_gu * s->n_expert))
         return fail("an expert stack's bytes are not n_expert EXL3 slices");
-    const void *gu = wptr(st, L.moe_gate_up, "qwen experts gate_up"), *dn = wptr(st, L.moe_down, "qwen experts down");
-    if (!gu || !dn || !w.router_w || !w.shared_gate_w) return false;
-    w.gate_up_table = pulsar_qwen_expert_table(gu, s->n_expert, stride_gu, tgu);
+    const void *gu = wptr(st, first, split ? "qwen experts gate" : "qwen experts gate_up");
+    const void *up = split ? wptr(st, L.moe_up, "qwen experts up") : NULL;
+    const void *dn = wptr(st, L.moe_down, "qwen experts down");
+    if (!gu || (split && !up) || !dn || !w.router_w || !w.shared_gate_w) return false;
+    if (split) {
+        w.gate_table = pulsar_qwen_expert_table(gu, s->n_expert, stride_gu, tgu);
+        w.up_table = pulsar_qwen_expert_table(up, s->n_expert, stride_gu, tgu);
+    } else {
+        w.gate_up_table = pulsar_qwen_expert_table(gu, s->n_expert, stride_gu, tgu);
+    }
     w.down_table = pulsar_qwen_expert_table(dn, s->n_expert, stride_d, td);
-    if (!w.gate_up_table || !w.down_table) return fail("no EXL3 expert table");
+    if ((split ? !w.gate_table || !w.up_table : !w.gate_up_table) || !w.down_table)
+        return fail("no EXL3 expert table");
     if (!linear_dev(st, L.sh_gate, H, SMID, "qwen shared gate_proj", &w.shared_gate) ||
         !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &w.shared_up) ||
         !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &w.shared_down))

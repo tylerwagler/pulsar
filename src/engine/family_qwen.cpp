@@ -343,14 +343,6 @@ static pulsar_tensor *qbind(const pulsar_model *m, bool *ok, const char *name,
     return t;
 }
 
-static pulsar_tensor *qbindf(const pulsar_model *m, bool *ok, uint32_t il, const char *suffix,
-                             uint32_t nd, uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0) {
-    char name[256];
-    snprintf(name, sizeof(name), QWEN_TEXT "layers.%u.%s", il, suffix);
-    /* The directory keeps its own copy of every name; this buffer is only the key. */
-    return qbind(m, ok, name, nd, d0, d1, d2);
-}
-
 static void qwen_bind_gr(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s,
                          const char *prefix, pulsar_qwen_gr_weights *gr, bool with_inject) {
     const uint64_t hc = pulsar_qwen_hc_dim(s);
@@ -383,62 +375,105 @@ static bool qwen_read_ple_tables(const pulsar_model *m, const pulsar_qwen_shape 
     return ok;
 }
 
-static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
-                              const pulsar_layer_plan *plan, pulsar_qwen_weights *w) {
-    bool ok = true;
-    const uint64_t E = s->n_embd, V = s->n_vocab, hc = pulsar_qwen_hc_dim(s);
-    w->token_embd = qbind(m, &ok, QWEN_TEXT "embed_tokens.weight", 2, E, V);
-    w->output = qbind(m, &ok, "lm_head.weight", 2, E, V);
-    qwen_bind_gr(m, &ok, s, QWEN_TEXT "hyper_connection_mixer.", &w->mixer, false);
+/* One layer's tensors under `lp` (the layer's name prefix, ending in '.'): the trunk's
+ * "model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.".  `split` binds the
+ * routed experts as separate gate / up stacks (the MTP layer) instead of the fused gate_up. */
+static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s, pulsar_layer_kind kind,
+                            const char *lp, bool ple, bool split, pulsar_qwen_layer_weights *L) {
+    const uint64_t E = s->n_embd, hc = pulsar_qwen_hc_dim(s);
     const uint64_t conv = pulsar_qwen_gdn_conv_dim(s), vt = pulsar_qwen_gdn_v_total(s);
     const uint64_t q_out = 2ull * s->n_head * s->head_dim, kv_out = (uint64_t)s->n_head_kv * s->head_dim;
     const uint64_t o_in = (uint64_t)s->n_head * s->head_dim;
     const uint64_t idx_out = (uint64_t)(s->idx_n_head + s->idx_n_head_kv) * s->idx_head_dim;
+    char name[256];
+    auto nm = [&](const char *suffix) -> const char * {
+        snprintf(name, sizeof(name), "%s%s", lp, suffix);   /* the directory keeps its own copy */
+        return name;
+    };
+    qwen_bind_gr(m, ok, s, nm("attn_hyper_connection."), &L->gr_attn, true);
+    qwen_bind_gr(m, ok, s, nm("mlp_hyper_connection."), &L->gr_mlp, true);
+    if (kind == PULSAR_LAYER_QWEN_GDN) {
+        L->gdn_in_qkv  = qbind(m, ok, nm("linear_attn.in_proj_qkv.weight"), 2, E, conv);
+        L->gdn_in_z    = qbind(m, ok, nm("linear_attn.in_proj_z.weight"), 2, E, vt);
+        L->gdn_in_a    = qbind(m, ok, nm("linear_attn.in_proj_a.weight"), 2, E, s->gdn_n_v_head);
+        L->gdn_in_b    = qbind(m, ok, nm("linear_attn.in_proj_b.weight"), 2, E, s->gdn_n_v_head);
+        L->gdn_conv    = qbind(m, ok, nm("linear_attn.conv1d.weight"), 3, s->gdn_conv_kernel, 1, conv);
+        L->gdn_a_log   = qbind(m, ok, nm("linear_attn.A_log"), 1, s->gdn_n_v_head);
+        L->gdn_dt_bias = qbind(m, ok, nm("linear_attn.dt_bias"), 1, s->gdn_n_v_head);
+        L->gdn_norm    = qbind(m, ok, nm("linear_attn.norm.weight"), 1, s->gdn_v_dim);
+        L->gdn_out     = qbind(m, ok, nm("linear_attn.out_proj.weight"), 2, vt, E);
+    } else {
+        L->attn_q      = qbind(m, ok, nm("self_attn.q_proj.weight"), 2, E, q_out);
+        L->attn_k      = qbind(m, ok, nm("self_attn.k_proj.weight"), 2, E, kv_out);
+        L->attn_v      = qbind(m, ok, nm("self_attn.v_proj.weight"), 2, E, kv_out);
+        L->attn_q_norm = qbind(m, ok, nm("self_attn.q_norm.weight"), 1, s->head_dim);
+        L->attn_k_norm = qbind(m, ok, nm("self_attn.k_norm.weight"), 1, s->head_dim);
+        L->attn_o      = qbind(m, ok, nm("self_attn.o_proj.weight"), 2, o_in, E);
+        L->idx_qk      = qbind(m, ok, nm("self_attn.indexer.index_qk_proj.weight"), 2, E, idx_out);
+        L->idx_q_norm  = qbind(m, ok, nm("self_attn.indexer.q_layernorm.weight"), 1, s->idx_head_dim);
+        L->idx_k_norm  = qbind(m, ok, nm("self_attn.indexer.k_layernorm.weight"), 1, s->idx_head_dim);
+    }
+    L->moe_router     = qbind(m, ok, nm("mlp.gate.weight"), 2, E, s->n_expert);
+    if (split) {
+        L->moe_gate   = qbind(m, ok, nm("mlp.experts.gate_proj"), 3, E, s->n_ff_exp, s->n_expert);
+        L->moe_up     = qbind(m, ok, nm("mlp.experts.up_proj"), 3, E, s->n_ff_exp, s->n_expert);
+        L->moe_down   = qbind(m, ok, nm("mlp.experts.down_proj"), 3, s->n_ff_exp, E, s->n_expert);
+    } else {
+        L->moe_gate_up = qbind(m, ok, nm("mlp.experts.gate_up_proj"), 3, E, 2ull * s->n_ff_exp, s->n_expert);
+        L->moe_down    = qbind(m, ok, nm("mlp.experts.down_proj"), 3, s->n_ff_exp, E, s->n_expert);
+    }
+    L->sh_gate        = qbind(m, ok, nm("mlp.shared_expert.gate_proj.weight"), 2, E, s->n_ff_shexp);
+    L->sh_up          = qbind(m, ok, nm("mlp.shared_expert.up_proj.weight"), 2, E, s->n_ff_shexp);
+    L->sh_down        = qbind(m, ok, nm("mlp.shared_expert.down_proj.weight"), 2, s->n_ff_shexp, E);
+    L->sh_gate_scalar = qbind(m, ok, nm("mlp.shared_expert_gate.weight"), 2, E, 1);
+    if (ple) {
+        L->ple_key        = qbind(m, ok, nm("ple.key_proj.weight"), 2, s->ple_embed_dim, hc);
+        L->ple_value      = qbind(m, ok, nm("ple.value_proj.weight"), 2, s->ple_embed_dim, E);
+        L->ple_norm_key   = qbind(m, ok, nm("ple.norm_key.weight"), 1, hc);
+        L->ple_norm_query = qbind(m, ok, nm("ple.norm_query.weight"), 1, hc);
+        L->ple_norm_conv  = qbind(m, ok, nm("ple.norm_conv.weight"), 1, hc);
+        L->ple_conv       = qbind(m, ok, nm("ple.conv1d.weight"), 3, s->ple_conv_kernel, 1, hc);
+    }
+}
+
+/* L251 MTP: the sidecar shard's layer and head-side tensors, bound when the artifact carries
+ * mtp.fc_hidden.weight -- then ALL of them or the load refuses (a partial MTP is a broken artifact,
+ * not a reason to run without one).  The layer goes to slot n_layer (family_qwen.h). */
+static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
+                          pulsar_qwen_weights *w) {
+    w->mtp.present = model_find_tensor(m, "mtp.fc_hidden.weight") != NULL;
+    if (!w->mtp.present) return true;
+    if (plan->n_layer + 1u > PULSAR_FAMILY_MAX_LAYER) {
+        fprintf(stderr, "pulsar: %s: no layer slot for the MTP layer past %u -- refusing\n", PULSAR_QWEN_ARCH,
+                plan->n_layer);
+        return false;
+    }
+    bool ok = true;
+    const uint64_t E = s->n_embd, hc = pulsar_qwen_hc_dim(s);
+    w->mtp.norm_embd   = qbind(m, &ok, "mtp.pre_fc_norm_embedding.weight", 1, E);
+    w->mtp.norm_hidden = qbind(m, &ok, "mtp.pre_fc_norm_hidden.weight", 1, hc);
+    w->mtp.fc_embd     = qbind(m, &ok, "mtp.fc_embedding.weight", 2, E, E);
+    w->mtp.fc_hidden   = qbind(m, &ok, "mtp.fc_hidden.weight", 2, E, E);
+    qwen_bind_gr(m, &ok, s, "mtp.hyper_connection_mixer.", &w->mtp.mixer, false);
+    qwen_bind_layer(m, &ok, s, PULSAR_LAYER_QWEN_QSA, "mtp.layers.0.", false, true, &w->layer[plan->n_layer]);
+    if (!ok) fprintf(stderr, "pulsar: %s: the artifact carries mtp.* but not all of it -- refusing\n", PULSAR_QWEN_ARCH);
+    return ok;
+}
+
+static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
+                              const pulsar_layer_plan *plan, pulsar_qwen_weights *w) {
+    bool ok = true;
+    const uint64_t E = s->n_embd, V = s->n_vocab;
+    w->token_embd = qbind(m, &ok, QWEN_TEXT "embed_tokens.weight", 2, E, V);
+    w->output = qbind(m, &ok, "lm_head.weight", 2, E, V);
+    qwen_bind_gr(m, &ok, s, QWEN_TEXT "hyper_connection_mixer.", &w->mixer, false);
     for (uint32_t il = 0; il < plan->n_layer; il++) {
-        pulsar_qwen_layer_weights *L = &w->layer[il];
-        char prefix[128];
-        snprintf(prefix, sizeof(prefix), QWEN_TEXT "layers.%u.attn_hyper_connection.", il);
-        qwen_bind_gr(m, &ok, s, prefix, &L->gr_attn, true);
-        snprintf(prefix, sizeof(prefix), QWEN_TEXT "layers.%u.mlp_hyper_connection.", il);
-        qwen_bind_gr(m, &ok, s, prefix, &L->gr_mlp, true);
-        if (plan->kind[il] == PULSAR_LAYER_QWEN_GDN) {
-            L->gdn_in_qkv  = qbindf(m, &ok, il, "linear_attn.in_proj_qkv.weight", 2, E, conv);
-            L->gdn_in_z    = qbindf(m, &ok, il, "linear_attn.in_proj_z.weight", 2, E, vt);
-            L->gdn_in_a    = qbindf(m, &ok, il, "linear_attn.in_proj_a.weight", 2, E, s->gdn_n_v_head);
-            L->gdn_in_b    = qbindf(m, &ok, il, "linear_attn.in_proj_b.weight", 2, E, s->gdn_n_v_head);
-            L->gdn_conv    = qbindf(m, &ok, il, "linear_attn.conv1d.weight", 3, s->gdn_conv_kernel, 1, conv);
-            L->gdn_a_log   = qbindf(m, &ok, il, "linear_attn.A_log", 1, s->gdn_n_v_head);
-            L->gdn_dt_bias = qbindf(m, &ok, il, "linear_attn.dt_bias", 1, s->gdn_n_v_head);
-            L->gdn_norm    = qbindf(m, &ok, il, "linear_attn.norm.weight", 1, s->gdn_v_dim);
-            L->gdn_out     = qbindf(m, &ok, il, "linear_attn.out_proj.weight", 2, vt, E);
-        } else {
-            L->attn_q      = qbindf(m, &ok, il, "self_attn.q_proj.weight", 2, E, q_out);
-            L->attn_k      = qbindf(m, &ok, il, "self_attn.k_proj.weight", 2, E, kv_out);
-            L->attn_v      = qbindf(m, &ok, il, "self_attn.v_proj.weight", 2, E, kv_out);
-            L->attn_q_norm = qbindf(m, &ok, il, "self_attn.q_norm.weight", 1, s->head_dim);
-            L->attn_k_norm = qbindf(m, &ok, il, "self_attn.k_norm.weight", 1, s->head_dim);
-            L->attn_o      = qbindf(m, &ok, il, "self_attn.o_proj.weight", 2, o_in, E);
-            L->idx_qk      = qbindf(m, &ok, il, "self_attn.indexer.index_qk_proj.weight", 2, E, idx_out);
-            L->idx_q_norm  = qbindf(m, &ok, il, "self_attn.indexer.q_layernorm.weight", 1, s->idx_head_dim);
-            L->idx_k_norm  = qbindf(m, &ok, il, "self_attn.indexer.k_layernorm.weight", 1, s->idx_head_dim);
-        }
-        L->moe_router     = qbindf(m, &ok, il, "mlp.gate.weight", 2, E, s->n_expert);
-        L->moe_gate_up    = qbindf(m, &ok, il, "mlp.experts.gate_up_proj", 3, E, 2ull * s->n_ff_exp, s->n_expert);
-        L->moe_down       = qbindf(m, &ok, il, "mlp.experts.down_proj", 3, s->n_ff_exp, E, s->n_expert);
-        L->sh_gate        = qbindf(m, &ok, il, "mlp.shared_expert.gate_proj.weight", 2, E, s->n_ff_shexp);
-        L->sh_up          = qbindf(m, &ok, il, "mlp.shared_expert.up_proj.weight", 2, E, s->n_ff_shexp);
-        L->sh_down        = qbindf(m, &ok, il, "mlp.shared_expert.down_proj.weight", 2, s->n_ff_shexp, E);
-        L->sh_gate_scalar = qbindf(m, &ok, il, "mlp.shared_expert_gate.weight", 2, E, 1);
-        if (il == s->ple_layer) {
-            L->ple_key        = qbindf(m, &ok, il, "ple.key_proj.weight", 2, s->ple_embed_dim, hc);
-            L->ple_value      = qbindf(m, &ok, il, "ple.value_proj.weight", 2, s->ple_embed_dim, E);
-            L->ple_norm_key   = qbindf(m, &ok, il, "ple.norm_key.weight", 1, hc);
-            L->ple_norm_query = qbindf(m, &ok, il, "ple.norm_query.weight", 1, hc);
-            L->ple_norm_conv  = qbindf(m, &ok, il, "ple.norm_conv.weight", 1, hc);
-            L->ple_conv       = qbindf(m, &ok, il, "ple.conv1d.weight", 3, s->ple_conv_kernel, 1, hc);
-        }
+        char lp[128];
+        snprintf(lp, sizeof(lp), QWEN_TEXT "layers.%u.", il);
+        qwen_bind_layer(m, &ok, s, plan->kind[il], lp, il == s->ple_layer, false, &w->layer[il]);
     }
     ok &= qwen_read_ple_tables(m, s, w);
+    ok &= qwen_bind_mtp(m, s, plan, w);
     return ok;
 }
 

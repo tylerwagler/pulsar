@@ -134,6 +134,22 @@ int ds4_exl3_moe_fused_bf16(
     cudaStream_t    stream,
     const void    * act_bf16);
 
+/* L251 MTP: the split gate / up arm (two slices, each with its own suh) over the same bf16 activation. */
+int ds4_exl3_moe_pair_bf16(
+    const void    * gate_table,
+    const void    * up_table,
+    int             k2,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_bf16);
+
 int ds4_exl3_moe_single_bf16(
     const void    * table,
     int             k2,

@@ -77,6 +77,14 @@ int ds4_exl3_moe_gemv_fused_bf16_launch(
         float *out, int M, int K, int64_t n_assign,
         int n_experts, cudaStream_t stream);
 
+/* The split gate / up arm over the same bf16 activation (the MTP layer's routed experts: two slices,
+ * each rotating the input by its own suh). */
+int ds4_exl3_moe_gemv_pair_bf16_launch(
+        const void *gate_table, const void *up_table, int k2, const void *act,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out_gate, float *out_up, int M, int K, int64_t n_assign,
+        int n_experts, cudaStream_t stream);
+
 /* The down arm over the same bf16 activation (its input is the fold's output). */
 int ds4_exl3_moe_gemv_single_bf16_launch(
         const void *table, int k2, const void *act,

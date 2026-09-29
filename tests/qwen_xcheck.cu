@@ -150,7 +150,7 @@ static int do_moe(int N, int k2gu, int k2d, int k2sg, int k2su, int k2sd) {
         tg[2 * e] = deg + (size_t)s * sgu;  tg[2 * e + 1] = deg + (size_t)s * sgu + tgu;
         tdn[2 * e] = ded + (size_t)s * sd;  tdn[2 * e + 1] = ded + (size_t)s * sd + td;
     }
-    pulsar_qwen_moe_dev w;
+    pulsar_qwen_moe_dev w{};
     w.router_w = up(wr);
     w.shared_gate_w = up(wsg);
     w.gate_up_table = (const void *const *)up(tg);

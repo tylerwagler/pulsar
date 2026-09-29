@@ -158,7 +158,11 @@ typedef struct {
     const void *const *gate_up_table;/**< exl3_expert_table pairs [512][2]: the FUSED gate_up 2560 -> 1280
                                           (output rows 0..639 gate, 640..1279 up -- the container's layout) */
     const void *const *down_table;   /**< down_proj 640 -> 2560 */
-    int k2_gate_up, k2_down;         /**< routed rates (half-bit units) */
+    /** L251 MTP: the SPLIT form -- gate 2560 -> 640 and up 2560 -> 640 as two slices, each with its own
+     *  suh (the MTP layer's experts, turboderp's EXL3).  Exactly one of gate_up_table and
+     *  (gate_table, up_table) is set; the artifact decides, the launcher refuses anything else. */
+    const void *const *gate_table, *const *up_table;
+    int k2_gate_up, k2_down;         /**< routed rates (half-bit units); k2_gate_up is the pair's rate in the split form */
     pulsar_qwen_linear shared_gate, shared_up, shared_down;
 } pulsar_qwen_moe_dev;
 

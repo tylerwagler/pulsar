@@ -281,8 +281,8 @@ int qwen_exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, c
                 tag, M, K, (long long)n_assign, n_experts, kBN, kMaxE);
         return -1;
     }
-    if (k2 != 8 && k2 != 10) {
-        fprintf(stderr, "%s: rate k2=%d has no prefill instance (8, 10) -- refusing\n", tag, k2);
+    if (k2 != 6 && k2 != 8 && k2 != 10) {
+        fprintf(stderr, "%s: rate k2=%d has no prefill instance (6, 8, 10) -- refusing\n", tag, k2);
         return -1;
     }
     const int64_t cap = n_assign / kBM + n_experts + 1;
@@ -326,7 +326,10 @@ int qwen_exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, c
         qwen_moe_prep_kernel<false><<<pgrid, 256, 0, stream>>>(table, x, ids_src, expert_bounds, n_experts, (int)n_assign, K,
                                                                phi, plo, pinv);
     const dim3 grid((unsigned)(M / kBN), (unsigned)cap, 1);
-    const bool ok = k2 == 8 ? launch_gemm<8>(grid, stream, table, phi, plo, pinv, ids_dst, expert_bounds, g_plan_work,
+    /* k2 = 6: the MTP layer's experts (turboderp's K = 3); 8 / 10: the trunk's */
+    const bool ok = k2 == 6 ? launch_gemm<6>(grid, stream, table, phi, plo, pinv, ids_dst, expert_bounds, g_plan_work,
+                                             g_plan_n, out, M, K)
+                  : k2 == 8 ? launch_gemm<8>(grid, stream, table, phi, plo, pinv, ids_dst, expert_bounds, g_plan_work,
                                              g_plan_n, out, M, K)
                             : launch_gemm<10>(grid, stream, table, phi, plo, pinv, ids_dst, expert_bounds, g_plan_work,
                                               g_plan_n, out, M, K);

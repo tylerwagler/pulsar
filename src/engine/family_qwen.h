@@ -184,6 +184,9 @@ typedef struct {
     pulsar_tensor *moe_router;     ///< mlp.gate.weight [n_embd -> n_expert]
     pulsar_tensor *moe_gate_up;    ///< mlp.experts.gate_up_proj [n_expert][n_embd -> 2 * n_ff_exp]
     pulsar_tensor *moe_down;       ///< mlp.experts.down_proj    [n_expert][n_ff_exp -> n_embd]
+    /** L251 MTP: the SPLIT expert form -- mlp.experts.gate_proj / up_proj [n_expert][n_embd -> n_ff_exp],
+     *  each slice with its own suh (the MTP layer, turboderp's EXL3).  Set exactly when moe_gate_up is NULL. */
+    pulsar_tensor *moe_gate, *moe_up;
     pulsar_tensor *sh_gate;        ///< mlp.shared_expert.gate_proj [n_embd -> n_ff_shexp]
     pulsar_tensor *sh_up;          ///< mlp.shared_expert.up_proj   [n_embd -> n_ff_shexp]
     pulsar_tensor *sh_down;        ///< mlp.shared_expert.down_proj [n_ff_shexp -> n_embd]
@@ -200,11 +203,25 @@ typedef struct {
 #define PULSAR_QWEN_MAX_NGRAM        4u   ///< n-gram orders the PLE tables may carry (Flash-Next: 3)
 #define PULSAR_QWEN_MAX_NGRAM_HEADS 32u   ///< n-gram tables (Flash-Next: 2 orders x 8 heads = 16)
 
+/** L251 MTP: the one multi-token-prediction layer's head-side tensors (the sidecar shard; the spec is
+ *  l251/docs/MTP-SPEC-2026-09-29.md).  The layer itself is bound as a QSA layer in
+ *  pulsar_qwen_weights::layer[n_layer] (split experts, no PLE), so the trunk's ops run it unchanged. */
+typedef struct {
+    bool present;                  ///< the artifact carries mtp.* (all of it, or the load refuses)
+    pulsar_tensor *norm_embd;      ///< mtp.pre_fc_norm_embedding.weight [n_embd] ((1 + w) RMSNorm)
+    pulsar_tensor *norm_hidden;    ///< mtp.pre_fc_norm_hidden.weight [n_hc * n_embd] (ONE RMS over all of it)
+    pulsar_tensor *fc_embd;        ///< mtp.fc_embedding.weight [n_embd -> n_embd]
+    pulsar_tensor *fc_hidden;      ///< mtp.fc_hidden.weight [n_embd -> n_embd], applied per stream
+    pulsar_qwen_gr_weights mixer;  ///< mtp.hyper_connection_mixer (no inject), then the trunk's lm_head
+} pulsar_qwen_mtp_weights;
+
 typedef struct {
     pulsar_tensor *token_embd;     ///< model.language_model.embed_tokens.weight [n_embd x n_vocab]
     pulsar_tensor *output;         ///< lm_head.weight [n_embd -> n_vocab]
     pulsar_qwen_gr_weights mixer;         ///< model.language_model.hyper_connection_mixer
+    /** [0, n_layer) the trunk; [n_layer] the MTP layer when mtp.present (a QSA layer, split experts) */
     pulsar_qwen_layer_weights layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_qwen_mtp_weights mtp;
     /* The PLE hash's config (section 2): read at load, used by the host-side
      * n-gram id hashing (S4). */
     uint64_t ple_multipliers[PULSAR_QWEN_MAX_NGRAM];       ///< [ngram_size]

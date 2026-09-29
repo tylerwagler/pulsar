@@ -305,9 +305,14 @@ extern "C" size_t pulsar_qwen_moe_workspace_bytes(int T) {
 extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
                                       int T, float *out, void *ws, size_t ws_bytes,
                                       uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
-    if (!w || !x_bf16 || !out || !nf_flag || T <= 0 ||
-        !w->gate_up_table || !w->down_table) {
+    if (!w || !x_bf16 || !out || !nf_flag || T <= 0 || !w->down_table) {
         fprintf(stderr, "pulsar: qwen MoE: a null input or a slot that is not %d wide -- refusing\n", kH);
+        return -1;
+    }
+    const bool split = w->gate_table != nullptr;
+    if (split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr)) {
+        fprintf(stderr, "pulsar: qwen MoE: the routed experts must be ONE of a fused gate_up table or a gate + up "
+                        "pair -- refusing\n");
         return -1;
     }
     const int smid = w->shared_gate.out;
@@ -347,6 +352,12 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
                 kTopK, kE, w->k2_gate_up / 2.0, w->k2_down / 2.0, w->shared_gate.k2 / 2.0,
                 w->shared_up.k2 / 2.0, w->shared_down.k2 / 2.0);
     }
+    static int announced_split = 0;
+    if (split && !announced_split) {
+        announced_split = 1;
+        fprintf(stderr, "pulsar: L251 qwen MoE (split experts, the MTP layer) = gate + up pair GEMV K=%g, pair fold, "
+                        "down K=%g\n", w->k2_gate_up / 2.0, w->k2_down / 2.0);
+    }
     const int mid = PULSAR_QWEN_EXPERT_MID;
     const int64_t pairs = (int64_t)T * kTopK;
     int rc = pulsar_qwen_router_launch(x_bf16, w->router_w, w->shared_gate_w, T, kH, kE, kTopK,
@@ -356,11 +367,21 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
     /* Routed: the four launches, all on the block input's bf16 row and the fold's bf16 output.
      * L251 / ac69748f: there is no E4M3 activation slot in this family, so nothing here stages or
      * encodes one -- the fused arm reads x_bf16 by ids_src1, and the fold hands the down arm bf16. */
-    rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK,
-                                 stream, x_bf16);
-    if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
-    rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
-                                        kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+    if (split) {
+        /* gate z in the first half of gu_z, up z in the second: [pairs][mid] each */
+        float *gz = m.gu_z, *uz = m.gu_z + (size_t)pairs * mid;
+        rc = ds4_exl3_moe_pair_bf16(w->gate_table, w->up_table, w->k2_gate_up, m.sel, gz, uz, mid, kH, T, kE, kTopK,
+                                    stream, x_bf16);
+        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate/up pair declined (rc=%d) -- no fallback\n", rc); return -1; }
+        rc = ds4_exl3_moe_fold_launch(gz, uz, m.sel, m.wts, w->gate_table, w->up_table, w->down_table,
+                                      kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+    } else {
+        rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK,
+                                     stream, x_bf16);
+        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
+        rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
+                                            kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+    }
     if (rc) return -1;
     /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down GEMV's input --
      * so the xcheck can compare the DEVICE's own values against its emulation's per element.  Under

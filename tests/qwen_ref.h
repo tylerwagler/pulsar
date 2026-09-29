@@ -254,8 +254,9 @@ inline void ple_token(const uint16_t *emb, const linear &key, const linear &valu
 
 /* ---- MoE ------------------------------------------------------------------ */
 
-/** one routed expert: the FUSED gate_up [2560 -> 1280] (gate rows then up rows) and the down */
-struct expert { const linear *gate_up, *down; };
+/** one routed expert: the FUSED gate_up [2560 -> 1280] (gate rows then up rows) and the down -- or,
+ *  when gate_up is null, the SPLIT gate and up [2560 -> 640] each (the MTP layer) */
+struct expert { const linear *gate_up, *down, *gate = nullptr, *up = nullptr; };
 
 /** the block for one token given the routing (sel, w, sgate -- the device's);
  *  x = the decoded E4M3 block input */
@@ -266,7 +267,12 @@ inline void moe_token(const double *x, const int32_t *sel, const double *w, doub
     std::vector<double> ygu(2 * MID), t(MID), td(MID), y(H);
     for (int k = 0; k < TOPK; k++) {
         const expert &ex = experts[sel[k]];
-        ex.gate_up->run(x, ygu.data());
+        if (ex.gate_up) {
+            ex.gate_up->run(x, ygu.data());
+        } else {
+            ex.gate->run(x, ygu.data());
+            ex.up->run(x, ygu.data() + MID);
+        }
         const double *yg = ygu.data(), *yu = ygu.data() + MID;
         /* the fold: v = silu(g) u w (the router weight folded in before the encode,
          * as the device does), then the down input's rotation t = H(v suh_d), E4M3;

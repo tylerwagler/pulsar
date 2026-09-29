@@ -571,7 +571,10 @@ int ds4_mmq_moe_pair_impl(
         const void    * act_sf     = NULL,
         int             act_kbp    = 0,
         /* L245: see ds4_mmq_moe_impl; the EXL3 tables ride in W_a / W_b. */
-        int             exl3_k2    = 0) {
+        int             exl3_k2    = 0,
+        /* L251 MTP: the activation is the Qwen family's row-major bf16 (act_q), as in ds4_mmq_moe_impl:
+         * nothing is staged or encoded and the gemv reads the token's row through ids_src1. */
+        bool            act_bf16   = false) {
 
     if (!W_a || !W_b || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -701,7 +704,15 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/input_quant",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
-        /* E4M3 or nothing -- same requirement as the single-tensor impl. */
+        /* E4M3 or nothing -- same requirement as the single-tensor impl -- except on the bf16 path,
+         * where the caller's buffer IS what the gemv reads. */
+        if (act_bf16) {
+            if (!act_q || exl3_k2 == 0) {
+                fprintf(stderr, "%s: the bf16 activation needs the EXL3 arm and a buffer (k2=%d) -- refusing\n",
+                        tag, exl3_k2);
+                return -1;
+            }
+        } else {
         if (!d2r_iq2) {
             fprintf(stderr,
                     "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
@@ -729,6 +740,7 @@ int ds4_mmq_moe_pair_impl(
             fprintf(stderr, "%s: ds4_gather_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
             return -3;
         }
+        }
     }
 
 
@@ -746,8 +758,19 @@ int ds4_mmq_moe_pair_impl(
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
                 const int d2r_rc = exl3_k2
-                    ? ds4_exl3_moe_gemv_pair_launch(W_a, W_b, exl3_k2, src1_e4m3, ids_dst, expert_bounds,
-                                                    out_a, out_b, M, K, ne_get_rows, n_experts, stream)
+                    ? (act_bf16
+                       ? (ne_get_rows >= QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN
+                          /* a prompt chunk: the grouped tensor-core GEMM, once per slice, each rotating the
+                           * input by its own suh -- the trunk's width rule (L251 MTP) */
+                          ? (qwen_exl3_moe_prefill_launch(W_a, exl3_k2, true, act_q, ids_dst, ids_src1, expert_bounds,
+                                                          out_a, M, K, ne_get_rows, n_experts, stream) ||
+                             qwen_exl3_moe_prefill_launch(W_b, exl3_k2, true, act_q, ids_dst, ids_src1, expert_bounds,
+                                                          out_b, M, K, ne_get_rows, n_experts, stream))
+                          : ds4_exl3_moe_gemv_pair_bf16_launch(W_a, W_b, exl3_k2, act_q, ids_dst, ids_src1,
+                                                               expert_bounds, out_a, out_b, M, K, ne_get_rows,
+                                                               n_experts, stream))
+                       : ds4_exl3_moe_gemv_pair_launch(W_a, W_b, exl3_k2, src1_e4m3, ids_dst, expert_bounds,
+                                                       out_a, out_b, M, K, ne_get_rows, n_experts, stream))
                     : ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks,
                         src1_e4m3, ids_dst,
@@ -902,6 +925,25 @@ extern "C" int ds4_exl3_moe_single(
     return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
                             M, K, n_tokens, n_experts, n_expert_used, stream,
                             NULL, 0, act_q, act_sf, act_kbp, k2);
+}
+
+/* L251 MTP: the split gate / up arm over the Qwen family's row-major bf16 activation (the MTP layer's
+ * routed experts): the pair GEMV at decode widths, the grouped prefill GEMM per slice at prompt widths
+ * (the trunk's rule, ds4_mmq_moe_impl). */
+extern "C" int ds4_exl3_moe_pair_bf16(
+        const void * gate_table, const void * up_table, int k2,
+        const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream, const void * act_bf16) {
+    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 ||
+        n_experts <= 0) {
+        fprintf(stderr, "ds4_exl3_moe_pair_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
+        return -1;
+    }
+    return ds4_mmq_moe_pair_impl(
+        "ds4_exl3_moe_pair_bf16", gate_table, up_table, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        NULL, NULL, 0, act_bf16, NULL, 0, k2, true);
 }
 
 /* L251 / ac69748f: the same two arms over the Qwen family's row-major bf16 activation.  Separate
