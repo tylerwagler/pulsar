@@ -19,8 +19,9 @@
 #include <vector>
 
 static int n_fail = 0;
-#define CHECK(c, ...) do { printf("  %s  ", (c) ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!(c)) n_fail++; } while (0)
+#define CHECK(c, ...) do { const bool ok_ = (c); printf("  %s  ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) n_fail++; } while (0)
 
+#define TRACE(s, what) printf("    [%s] pos %d | bank_pos 0:%d 1:%d\n", what, pulsar_session_pos(s), pulsar_session_bank_pos(s, 0), pulsar_session_bank_pos(s, 1))
 static std::vector<float> logits_of(pulsar_session *s, int W) {
     std::vector<float> v((size_t)W);
     if (pulsar_session_copy_logits(s, v.data(), W) != W) v.clear();
@@ -91,12 +92,18 @@ int main(int argc, char **argv) {
     /* B1 */
     CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0 (fresh)");
     CHECK(pulsar_session_sync(s, &A, err, sizeof(err)) == 0, "bank 0 prefills A: %s", err);
+    TRACE(s, "after sync A");
     pulsar_session_bank_state_save(s, 0);
+    TRACE(s, "after save 0");
     CHECK(pulsar_session_bank_state_restore(s, 1), "restore bank 1 (fresh)");
+    TRACE(s, "after restore 1");
     CHECK(pulsar_session_sync(s, &B, err, sizeof(err)) == 0, "bank 1 prefills B: %s", err);
+    TRACE(s, "after sync B");
     pulsar_session_bank_state_save(s, 1);
     CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0");
+    TRACE(s, "after restore 0");
     CHECK(pulsar_session_eval(s, ta, err, sizeof(err)) == 0, "bank 0 decodes: %s", err);
+    TRACE(s, "after eval ta");
     double d = 0;
     CHECK(same(logits_of(s, W), refA1, &d), "B1 bank 0 after bank 1's prefill == one-bank A + token (max |diff| %.3g)", d);
     pulsar_session_bank_state_save(s, 0);
