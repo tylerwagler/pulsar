@@ -347,7 +347,7 @@ typedef enum {
 } pulsar_qwen_op_id;
 
 /** L251 MTP: the draft depth the verify capture holds (a verify step is at most this + 1 rows). */
-#define PULSAR_QWEN_SPEC_DRAFT_MAX 4u
+#define PULSAR_QWEN_SPEC_DRAFT_MAX 6u
 
 /** L251 MTP: what a verify step keeps so a rejected draft rolls back (qwen_spec_*): the recurrent
  *  state after each row but the last (GDN recurrent + conv, PLE conv), each QSA layer's index stage

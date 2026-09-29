@@ -980,11 +980,18 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, cons
     return ok;
 }
 
-/* The drafter's greedy token from one MTP head row (n_draft logits). */
-static int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row) {
+/* The drafter's greedy token from one MTP head row (n_draft logits); *prob (optional) is its softmax
+ * probability over the draft head -- the confidence the draft schedule reads. */
+static int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row, float *prob = NULL) {
     const uint32_t n = e->qwen_weights->n_draft;
     uint32_t a = 0;
     for (uint32_t i = 1; i < n; i++) if (row[i] > row[a]) a = i;
+    if (prob) {
+        double z = 0.0;
+        const float m = row[a];
+        for (uint32_t i = 0; i < n; i++) z += exp((double)(row[i] - m));
+        *prob = (float)(1.0 / z);
+    }
     return e->qwen_weights->draft_ids[a];
 }
 
@@ -1275,8 +1282,21 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         if (err) snprintf(err, errlen, "%s: speculative generate needs a synced session", PULSAR_QWEN_ARCH);
         return -1;
     }
-    int K = e->dspark_draft_tokens > 0 ? e->dspark_draft_tokens : 3;
-    if (K > (int)PULSAR_QWEN_SPEC_DRAFT_MAX) K = (int)PULSAR_QWEN_SPEC_DRAFT_MAX;
+    /* The draft schedule: the chain continues while the last draft's MTP probability is >= tau, up to K
+     * (TensorFold's rule).  Swept on sparky over three code prompts (2026-09-29): K = 4, tau = 0.7 gives
+     * 58.7 / 58.9 / 59.2 tok/s vs 53.4 for a fixed K = 3; TensorFold's own 6 / 0.6 is 53.6 here -- a verify
+     * row costs more on this engine (4 rows read up to 40 distinct experts).  tau = 0 is a
+     * fixed depth of K.  PULSAR_QWEN_MTP_TAU / PULSAR_QWEN_MTP_K override them (the engine's DSpark depth
+     * option resolves an unset value to 3, so it cannot carry this family's default). */
+    static const int K = [] {
+        const char *k = getenv("PULSAR_QWEN_MTP_K");
+        const int v = k && k[0] ? atoi(k) : 4;
+        return v < 1 ? 1 : v > (int)PULSAR_QWEN_SPEC_DRAFT_MAX ? (int)PULSAR_QWEN_SPEC_DRAFT_MAX : v;
+    }();
+    static const float tau = [] {
+        const char *t = getenv("PULSAR_QWEN_MTP_TAU");
+        return t && t[0] ? (float)atof(t) : 0.7f;
+    }();
     const uint32_t V = sh->n_vocab, il_mtp = e->plan.n_layer;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
@@ -1309,17 +1329,19 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
             ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_pend, (uint64_t)b * hc, hc) != 0 &&
                  qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, k > 0 ? 1u : 0u, L);
             q->mtp_pend_pos[b] = UINT32_MAX;              /* consumed; re-parked after the verify */
+            float conf = 1.0f;
             if (ok && k > 0) {
-                d[1] = qwen_mtp_argmax(e, L);
+                d[1] = qwen_mtp_argmax(e, L, &conf);
                 /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows */
                 ok = pulsar_gpu_tensor_copy_async(q->spec.qsa_stage, (uint64_t)q->spec.n_qsa * itb,
                                                   q->layer[il_mtp].idx_tail, (uint64_t)b * itb, itb) != 0;
             }
             for (int j = 2; ok && j <= k; j++) {
+                if (conf < tau) { k = j - 1; break; }      /* the schedule: stop on an unsure draft */
                 tp = (int32_t)p + j - 2;
                 ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_streams, 0, hc) != 0 &&
                      qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &d[j - 1], &tp, &bb, 1, 0, 1, L);
-                if (ok) d[j] = qwen_mtp_argmax(e, L);
+                if (ok) d[j] = qwen_mtp_argmax(e, L, &conf);
             }
         }
         /* verify [x, d_1 .. d_k] at p .. p + k, every row headed */
