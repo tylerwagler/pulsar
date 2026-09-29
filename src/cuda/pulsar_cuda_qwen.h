@@ -103,6 +103,26 @@ typedef struct {
     int in, out;
 } pulsar_qwen_linear;
 
+/** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
+typedef struct {
+    const uint16_t *embd;            /**< the trunk's embed_tokens, bf16 [n_vocab][2560] */
+    int n_vocab;
+    const uint16_t *norm_embd;       /**< mtp.pre_fc_norm_embedding bf16 [2560] */
+    const uint16_t *norm_hidden;     /**< mtp.pre_fc_norm_hidden bf16 [10240] */
+    pulsar_qwen_lowrank fc_embd;     /**< mtp.fc_embedding mxfp8_lt [2560][2560] */
+    pulsar_qwen_lowrank fc_hidden;   /**< mtp.fc_hidden mxfp8_lt [2560][2560], applied per stream */
+} pulsar_qwen_mtp_dev;
+
+/** The MTP input combine (l251/docs/MTP-SPEC-2026-09-29.md (b)): for each row, h_streams [T][4][2560]
+ *  bf16 (the trunk's pre-mixer stack at position p) and tokens [T] int32 on the device (x_{p+1}) ->
+ *  out_streams [T][4][2560] bf16, the MTP layer's starting streams:
+ *    s_i = bf16( bf16(fc_hidden(hn_i)) + bf16(fc_embedding(ein)) ),
+ *    hn = (1+w) RMSNorm over all 10240 of h, ein = (1+w) RMSNorm of embed(token).
+ *  The workspace is a fixed size (rows go through in slabs). */
+size_t pulsar_qwen_mtp_combine_workspace_bytes(void);
+int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t *h_streams, const int32_t *tokens,
+                                   int T, uint16_t *out_streams, void *ws, size_t ws_bytes, cudaStream_t stream);
+
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
  *  of width `l->in` -- there is no E4M3 activation slot in this family (L251 /

@@ -381,7 +381,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
     if (!tok || !table || !pulsar_gpu_tensor_write(tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t))) return false;
     if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (int)s->n_vocab,
-                                 (uint16_t *)dptr(st->st->streams), 0))
+                                 (uint16_t *)dptr(st->streams), 0))
         return false;
 
     /* the PLE rows of these tokens: hash on the host, issue the gather now */
@@ -472,7 +472,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_qwen_rows rows = {(const int32_t *)(base + p.row_seq), (const int32_t *)(base + p.row_j),
                                    (const int32_t *)(base + p.seq_first), (const int32_t *)(base + p.seq_rows),
                                    (const int32_t *)(base + p.seq_bank), (int)n_seq};
-    return pulsar_qwen_ple_launch(&w, (const uint16_t *)(base + p.emb), (uint16_t *)dptr(st->st->streams), (int)n,
+    return pulsar_qwen_ple_launch(&w, (const uint16_t *)(base + p.emb), (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(st->st->layer[il].ple_conv), base + p.ws, p.ws_bytes, 0) == 0;
 }
 
@@ -489,7 +489,7 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
      * read emits the bf16 row and nothing else -- no slot, no arming, no notes.  `nullptr` is the read's
      * documented "no slot" form, so the mxfp8 W_down weights are still read by the same arm. */
     pulsar_gpu_tensor *x = st->st->x;
-    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->st->streams), (int)n, (uint16_t *)dptr(x),
+    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->streams), (int)n, (uint16_t *)dptr(x),
                                    (float *)(base + g.inj[side]), base + g.ws, g.ws_bytes, 0))
         return false;
     return true;
@@ -499,7 +499,7 @@ bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_g
     const gr_scratch g = gr_layout(st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GR_READ];
     if (!sc) return fail("no GR scratch");
-    return pulsar_qwen_gr_write_launch((uint16_t *)dptr(st->st->streams), (const float *)dptr(st->st->y),
+    return pulsar_qwen_gr_write_launch((uint16_t *)dptr(st->streams), (const float *)dptr(st->st->y),
                                        (const float *)((uint8_t *)dptr(sc) + g.inj[side]), (int)st->n_rows, 0) == 0;
 }
 
@@ -557,7 +557,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     const int H = (int)s->n_embd;
     if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
     pulsar_qwen_gr_dev w;
-    if (!gr_dev(st, st->w->mixer, &w)) return false;
+    if (!gr_dev(st, *st->mixer, &w)) return false;
     const head_scratch h = head_layout();
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_HEAD];
     if (!sc) return fail("no head scratch");
@@ -567,7 +567,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     pulsar_gpu_tensor *xkey = scratch_view(st, PULSAR_QWEN_OP_HEAD, h.xkey, (uint64_t)n * H * sizeof(float));
     void *xb = NULL;
     bool ok = xkey && pulsar_gpu_bf16_act_slot(xkey, n, (uint64_t)H, &xb);
-    const uint16_t *streams = (const uint16_t *)dptr(st->st->streams) + (size_t)row0 * pulsar_qwen_hc_dim(s);
+    const uint16_t *streams = (const uint16_t *)dptr(st->streams) + (size_t)row0 * pulsar_qwen_hc_dim(s);
     ok = ok && pulsar_qwen_gr_read_launch(&w, streams, (int)n, (uint16_t *)xb, NULL, base + h.ws, h.ws_bytes, 0) == 0;
     if (ok) {
         /* L251: the lm_head in MXFP8, made once on the device from the container's bf16 head (the
@@ -595,6 +595,41 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
         pulsar_gpu_tensor_free(xkey);
     }
     return ok || fail("the head (mixer + lm_head) failed");
+}
+
+/* L251 MTP: the input combine -- the MTP layer's starting streams from the trunk stacks `h` (device,
+ * one per row) and the rows' NEXT tokens (st->tokens).  It plays embed's part for the MTP step: the
+ * token check, the MoE non-finite flag cleared, the ids on the device. */
+uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void) { return pulsar_qwen_mtp_combine_workspace_bytes(); }
+
+bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
+    const pulsar_qwen_shape *s = st->shape;
+    const pulsar_qwen_mtp_weights &M = st->w->mtp;
+    const uint32_t n = st->n_rows;
+    if (!M.present || !st->st->mtp) return fail("the MTP combine without the MTP layer");
+    for (uint32_t r = 0; r < n; r++)
+        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
+    const uint32_t zero = 0;
+    if (!moe_sc || !pulsar_gpu_tensor_write(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+        return fail("could not clear the MoE non-finite flag");
+    if (!pulsar_gpu_tensor_write(st->st->mtp_tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t)))
+        return fail("could not stage the MTP rows' tokens");
+    const int H = (int)s->n_embd;
+    pulsar_qwen_mtp_dev d{};
+    d.embd = (const uint16_t *)wptr(st, st->w->token_embd, "qwen embed_tokens");
+    d.n_vocab = (int)s->n_vocab;
+    d.norm_embd = (const uint16_t *)wptr(st, M.norm_embd, "qwen MTP pre_fc_norm_embedding");
+    d.norm_hidden = (const uint16_t *)wptr(st, M.norm_hidden, "qwen MTP pre_fc_norm_hidden");
+    const uint8_t *fe = (const uint8_t *)wptr(st, M.fc_embd, "qwen MTP fc_embedding");
+    const uint8_t *fh = (const uint8_t *)wptr(st, M.fc_hidden, "qwen MTP fc_hidden");
+    if (!d.embd || !d.norm_embd || !d.norm_hidden || !fe || !fh) return false;
+    d.fc_embd = {fe, fe + (uint64_t)H * H, H, H};      /* mxfp8_lt: E4M3 [out][in] then the E8M0 plane */
+    d.fc_hidden = {fh, fh + (uint64_t)H * H, H, H};
+    return pulsar_qwen_mtp_combine_launch(&d, (const uint16_t *)h, (const int32_t *)dptr(st->st->mtp_tok), (int)n,
+                                          (uint16_t *)dptr(st->streams), dptr(st->st->mtp_ws),
+                                          pulsar_gpu_tensor_bytes(st->st->mtp_ws), 0) == 0 ||
+           fail("the MTP combine failed");
 }
 
 /* ======================================================================== */

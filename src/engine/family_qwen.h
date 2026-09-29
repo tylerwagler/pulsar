@@ -352,6 +352,17 @@ typedef struct pulsar_qwen_state {
     pulsar_gpu_tensor *row_pos;     ///< [max_rows] i32 positions
     pulsar_gpu_tensor *row_bank;    ///< [max_rows] i32 bank of each row
     pulsar_gpu_tensor *scratch[PULSAR_QWEN_OP_COUNT];  ///< each op's own arena, sized by its scratch_bytes (NULL = none)
+    /* L251 MTP (mtp.present): the MTP layer's KV / index state is layer[n_layer]; these are its
+     * activation slots.  Each bank's LAST trunk row waits in mtp_pend until its next token exists (the MTP
+     * row at position p pairs the trunk stack at p with x_{p+1}). */
+    bool mtp;
+    pulsar_gpu_tensor *mtp_streams; ///< [max_rows][n_hc][n_embd] bf16, the MTP layer's streams
+    pulsar_gpu_tensor *mtp_h;       ///< [max_rows + 1][n_hc][n_embd] bf16, the trunk stacks the MTP rows read
+    pulsar_gpu_tensor *mtp_tok;     ///< [max_rows] i32, x_{p+1} per MTP row
+    pulsar_gpu_tensor *mtp_ws;      ///< pulsar_qwen_mtp_combine_workspace_bytes
+    pulsar_gpu_tensor *mtp_pend;    ///< [n_banks][n_hc][n_embd] bf16, the trunk stack awaiting its next token
+    uint32_t *mtp_pend_pos;         ///< [n_banks] the pending row's position; UINT32_MAX = none
+    uint64_t mtp_probe_n, mtp_probe_hit;   ///< PULSAR_QWEN_MTP_PROBE counters (qwen_session_eval)
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
     uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds
@@ -397,6 +408,11 @@ typedef struct {
     const int32_t *tokens;                 ///< [n_rows] host token ids
     const int32_t *pos;                    ///< [n_rows] host positions
     const int32_t *bank;                   ///< [n_rows] host bank ids (PREFILL: all equal)
+    /** The residual streams the step runs on: st->streams for the trunk, st->mtp_streams for the MTP
+     *  layer (L251 MTP).  Every op reads and writes THIS, never st->streams directly. */
+    pulsar_gpu_tensor *streams;
+    /** The mixer the head reads through: the trunk's, or mtp.mixer for the MTP head. */
+    const pulsar_qwen_gr_weights *mixer;
 } pulsar_qwen_step;
 
 /** A per-layer op: reads/writes the step's slots for layer il.  Returns false
@@ -445,6 +461,11 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
 bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
 bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
 bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
+/** L251 MTP: the input combine into st->streams (the MTP streams) from the trunk stack rows `h`
+ *  (device, [n_rows][n_hc][n_embd] bf16) and st->tokens (x_{p+1} per row). */
+bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h);
+/** The combine's workspace bytes (a fixed size; the session allocates it once). */
+uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void);
 
 /* S2's op, landed on the integration branch in family_qwen_s4.cpp (see the note
  * there); moves to family_qwen_s2.cpp when S2 rebases. */
@@ -468,11 +489,11 @@ const char *pulsar_qwen_op_owner(pulsar_qwen_op_id op);
 pulsar_qwen_op_id pulsar_qwen_first_missing_op(const pulsar_qwen_ops *ops, const pulsar_layer_plan *plan,
                                                const pulsar_qwen_shape *shape, uint32_t *at_layer);
 
-/** Bytes a session's state takes at (n_banks, ctx, max_rows): the allocation
- * code run dry, so the price and the allocation are one function.
+/** Bytes a session's state takes at (n_banks, ctx, max_rows, with the MTP layer or not): the
+ * allocation code run dry, so the price and the allocation are one function.
  * *managed_bytes (optional) is the demand-paged subset (the KV slabs). */
 uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
-                                 uint32_t n_banks, uint32_t ctx, uint32_t max_rows,
+                                 uint32_t n_banks, uint32_t ctx, uint32_t max_rows, bool mtp,
                                  uint64_t *managed_bytes);
 
 #endif /* PULSAR_FAMILY_QWEN_H */

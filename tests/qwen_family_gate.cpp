@@ -121,7 +121,7 @@ static void host_part(const char *dir) {
     const uint64_t per_tok = 12ull * pulsar_qwen_kv_row_bytes(s);
     for (size_t i = 0; i < sizeof(cfgs) / sizeof(cfgs[0]); i++) {
         uint64_t managed = 0;
-        const uint64_t bytes = pulsar_qwen_state_price(s, p, cfgs[i].banks, cfgs[i].ctx, 4096, &managed);
+        const uint64_t bytes = pulsar_qwen_state_price(s, p, cfgs[i].banks, cfgs[i].ctx, 4096, false, &managed);
         const uint64_t want_managed = (uint64_t)cfgs[i].banks *
             (cfgs[i].ctx * per_tok + 12ull * ((cfgs[i].ctx + s->idx_block - 1) / s->idx_block) *
                                      pulsar_qwen_index_row_bytes(s));
