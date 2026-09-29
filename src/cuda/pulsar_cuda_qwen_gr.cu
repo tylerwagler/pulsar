@@ -50,7 +50,7 @@ constexpr int kNormThreads = 256;
 constexpr int kNormPer = kH / kNormThreads;   ///< 10 columns per thread
 constexpr int kDownSplit = 5;                 ///< W_down split-K: 320 blocks of 32 -> 64 per split
 constexpr int kDownTB = 8;                    ///< tokens per down CTA
-constexpr int kUpTB = 16;                     ///< tokens per up CTA at prefill widths (W_up reuse)
+constexpr int kUpTB = 16;                     ///< tokens per up CTA, BF16 mixer at prefill widths
 constexpr int kUpTBDecode = 4;                ///< tokens per up CTA at decode widths: small enough that two
                                               ///< CTAs (staged W_up tile + a, prod) share an SM, so the 80
                                               ///< CTAs are one wave on 48 SMs.  The row arithmetic does not
@@ -399,7 +399,7 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
 }
 
 /* 3. mid + up + gate + mean: one warp per stream, lane = channel, TB
- * tokens per CTA (kUpTB at prefill widths, kUpTBDecode at decode widths).
+ * tokens per CTA (kUpTBDecode; kUpTB for the BF16 mixer at prefill widths -- the W8 prefill is 3').
  *   mid  a = silu(d / 4), d = the down's splits summed in split order, for the
  *        CTA's tokens, in shared memory -- in the format W_up reads (E4M3 per
  *        32 by the one producer encoder, or bf16).  Every CTA derives the same
@@ -411,7 +411,7 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
  *        its blocks in order 0..9, so the row arithmetic does not depend on T);
  *        the gated products go to shared memory and one warp per token takes
  *        the stream mean and emits the row. */
-/* The W8 up's weight tile at decode widths, staged whole: the CTA's 4 x 32 rows of 320 E4M3 bytes, copied by
+/* The W8 up's weight tile (decode widths), staged whole: the CTA's 4 x 32 rows of 320 E4M3 bytes, copied by
  * cp.async in coalesced 16-byte chunks at kernel entry so the load overlaps the mid.  The row
  * stride is padded to 336 B (84 words): a quarter-warp's 8 lanes, reading rows l .. l + 7 at the
  * same column, then hit 8 distinct 4-bank groups.  The arithmetic reads the same bytes in the same
@@ -443,10 +443,9 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
     const int c = blockIdx.x * 32 + lane;
     const int row = s * kH + c;
     const int t0 = blockIdx.y * TB, nt = min(TB, T - t0);
-    /* the decode instance stages W_up (kUpTileBytes of dynamic shared memory); the prefill instance
-     * reads it directly -- at 16 tokens per CTA its weight row is reused 16 times from registers, and
-     * the tile would hold it to one CTA per SM */
-    constexpr bool STAGE = W8 && TB == kUpTBDecode;
+    /* W8 runs this kernel at decode widths only (its prefill is 3'), and stages W_up there */
+    static_assert(!W8 || TB == kUpTBDecode, "the W8 up at prefill widths is the GEMM (3')");
+    constexpr bool STAGE = W8;
     extern __shared__ __align__(16) uint8_t s_w[];
     if constexpr (STAGE) {
         /* stream ss's 32 rows are one contiguous 10,240 B run of W_up */
@@ -482,8 +481,7 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
     for (int tt = 0; tt < TB; ++tt) z[tt] = 0.0f;
     if constexpr (W8) {
         const int w_kbp = pulsar_mx_kbp(kR);
-        const uint4 *wp = STAGE ? reinterpret_cast<const uint4 *>(s_w + (s * 32 + lane) * kUpRowStride)
-                                : reinterpret_cast<const uint4 *>((const uint8_t *)wv + (size_t)row * kR);
+        const uint4 *wp = reinterpret_cast<const uint4 *>(s_w + (s * 32 + lane) * kUpRowStride);
         for (int b = 0; b < NB; ++b) {
             const uint4 w0 = wp[2 * b], w1 = wp[2 * b + 1];
             const unsigned sw = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
@@ -535,9 +533,59 @@ __global__ void qwen_gr_write_kernel(__nv_bfloat16 *__restrict__ streams, const 
     streams[i] = __float2bfloat16(bf2f(streams[i]) + out[t * kH + c] * inj[t * kS + s]);
 }
 
+/* 3'. PREFILL (W8, T > kDecodeRowsMax): the up as a tensor-core GEMM.  The up kernel above reads its
+ * W_up row once per 16-token CTA on the CUDA cores (0.49 s of a 4096-row prefill); here
+ *   mid   a = silu(d / 4) for every (token, rank) into a bf16 [T][kR] buffer, and inj -- the same
+ *         three operations as the up kernel's mid, so `a` is bit-identical to its shared copy;
+ *   GEMM  z [T][kHC] = W_up a, the W8A16 prefill kernel (2') with one split;
+ *   gate  x = (g_0 xn_0 + g_1 xn_1 + g_2 xn_2 + g_3 xn_3) / 4, g_s = sigmoid(z_s), one thread per
+ *         (token, channel), the up kernel's emit.
+ * Only z's summation order differs from the decode kernel, so a prefilled row agrees with a decoded one
+ * to rounding (the same contract as 2'). */
+__global__ void __launch_bounds__(256)
+qwen_gr_mid_kernel(const float *__restrict__ part, const float *__restrict__ injp, float *__restrict__ inj,
+                   int T, __nv_bfloat16 *__restrict__ a) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (int64_t)T * kR) {
+        const int t = (int)(i / kR), r = (int)(i % kR);
+        float d = 0.0f;
+#pragma unroll
+        for (int sp = 0; sp < kDownSplit; ++sp) d += part[((size_t)t * kDownSplit + sp) * kR + r];
+        const float zz = d * (1.0f / kS);
+        a[i] = __float2bfloat16(zz / (1.0f + expf(-zz)));
+    }
+    if (injp && i < (int64_t)T * kS) {
+        const int t = (int)(i / kS), j = (int)(i % kS);
+        float zi = 0.0f;
+#pragma unroll
+        for (int ss = 0; ss < kS; ++ss) zi += injp[((size_t)t * kS + ss) * kS + j];
+        inj[t * kS + j] = 2.0f / (1.0f + expf(-zi * (1.0f / kS)));
+    }
+}
+
+__global__ void __launch_bounds__(256)
+qwen_gr_gate_kernel(const float *__restrict__ z, const __nv_bfloat16 *__restrict__ streams,
+                    const __nv_bfloat16 *__restrict__ norm_w, const float *__restrict__ rstd, int T,
+                    __nv_bfloat16 *__restrict__ x_out) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)T * kH) return;
+    const int t = (int)(i / kH), c = (int)(i % kH);
+    float p[kS];
+#pragma unroll
+    for (int s = 0; s < kS; ++s) {
+        const int row = s * kH + c;
+        const float g = 1.0f / (1.0f + expf(-z[(size_t)t * kHC + row]));
+        const float xn = bf2f(streams[(size_t)t * kHC + row]) * rstd[t * kS + s] * (1.0f + bf2f(norm_w[row]));
+        p[s] = g * xn;
+    }
+    x_out[i] = __float2bfloat16((((p[0] + p[1]) + p[2]) + p[3]) * (1.0f / kS));
+}
+
 struct gr_ws {
     uint8_t *xn;                      /* the norm's bf16 activation row (L251 / ac69748f) */
     float *rstd, *injp, *part;
+    __nv_bfloat16 *a;                 /* prefill only: silu(d / 4), [T][kR] */
+    float *z;                         /* prefill only: W_up a, [T][kHC] */
 };
 
 static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
@@ -554,6 +602,10 @@ static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
     m.rstd  = (float *)take((size_t)T * kS * 4);
     m.injp  = (float *)take((size_t)T * kS * kS * 4);
     m.part  = (float *)take((size_t)T * kDownSplit * kR * 4);
+    if (T > kDecodeRowsMax) {
+        m.a = (__nv_bfloat16 *)take((size_t)T * kR * 2);
+        m.z = (float *)take((size_t)T * kHC * 4);
+    }
     if (o) *o = m;
     return failed ? 0 : used;
 }
@@ -588,6 +640,17 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
         qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
             w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
     }
+    if (W8 && T > kDecodeRowsMax) {
+        const int64_t nm = (int64_t)T * kR;
+        qwen_gr_mid_kernel<<<(unsigned)((nm + 255) / 256), 256, 0, stream>>>(m.part, w->inject ? m.injp : nullptr, inj,
+                                                                           T, m.a);
+        qwen_w8a16_prefill_kernel<<<dim3((kHC + kMmaOut - 1) / kMmaOut, 1, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
+            (const uint8_t *)w->up.w, w->up.sf, m.a, kHC, kR, T, 1, m.z);
+        const int64_t ng = (int64_t)T * kH;
+        qwen_gr_gate_kernel<<<(unsigned)((ng + 255) / 256), 256, 0, stream>>>(
+            m.z, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, m.rstd, T, (__nv_bfloat16 *)x_bf16);
+        return;
+    }
     if (W8) {
         static bool attr = false;                 /* idempotent; set once, not per launch */
         if (!attr) {
@@ -596,18 +659,22 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
             attr = true;
         }
     }
-    const int tb = T > kDecodeRowsMax ? kUpTB : kUpTBDecode;
+    /* W8 is at decode widths here; the BF16 mixer takes the 16-token tile at prefill widths */
+    const int tb = !W8 && T > kDecodeRowsMax ? kUpTB : kUpTBDecode;
     const dim3 grid(kH / 32, (T + tb - 1) / tb);
-    const size_t smem = W8 && tb == kUpTBDecode ? kUpTileBytes : 0;
+    const size_t smem = W8 ? kUpTileBytes : 0;
     const float *injp = w->inject ? m.injp : nullptr;
-    if (tb == kUpTB)
-        qwen_gr_up_kernel<W8, kUpTB><<<grid, 32 * kS, smem, stream>>>(
-            w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
-            m.rstd, T, (__nv_bfloat16 *)x_bf16);
-    else
-        qwen_gr_up_kernel<W8, kUpTBDecode><<<grid, 32 * kS, smem, stream>>>(
-            w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
-            m.rstd, T, (__nv_bfloat16 *)x_bf16);
+    if constexpr (!W8) {
+        if (tb == kUpTB) {
+            qwen_gr_up_kernel<W8, kUpTB><<<grid, 32 * kS, smem, stream>>>(
+                w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
+                m.rstd, T, (__nv_bfloat16 *)x_bf16);
+            return;
+        }
+    }
+    qwen_gr_up_kernel<W8, kUpTBDecode><<<grid, 32 * kS, smem, stream>>>(
+        w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
+        m.rstd, T, (__nv_bfloat16 *)x_bf16);
 }
 
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
