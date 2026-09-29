@@ -84,8 +84,11 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
      * source map explicitly.  With it the token's row is addressed directly, and the E4M3 gather/encode
      * that builds the A8 blocks is not needed at all on this path. */
     const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
-    __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
-    __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
+    /* the whole-vector staging, sized by the launch to (PAIR ? 2 : 1) x K floats (L251: a static kMaxK
+     * buffer held the kernel to 4 CTAs per SM at Qwen's K = 2560 / 640) */
+    extern __shared__ __align__(16) float s_dyn[];
+    float *s_x[2] = {s_dyn, s_dyn + (PAIR ? K : 0)};
+    __shared__ float s_red[kWarps][kRows][2];
     __shared__ int   s_expert;
 
     const int col  = blockIdx.y;                 /* assignment (expert-sorted) */
@@ -118,7 +121,34 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
      * projection.  block i holds k in [128 i, 128 i + 128) as 4 groups of 32
      * E4M3 under one ue8m0 byte each. */
     const int n_k128 = K >> 7;
-    for (int i = tid; i < n_k128 * 4; i += kRows * kWarps) {
+    if constexpr (!A8) {
+        /* bf16 (the Qwen family): every thread stages runs of 8 with 16-byte loads of x and of the suh
+         * rows -- the per-group form below had a third of the threads doing 32 serial 2-byte loads each,
+         * with stores 32 floats apart (one bank per warp).  Each element is the same v * suh product. */
+        const __nv_bfloat16 *xr = xb + (size_t)ids_src[col] * (size_t)K;
+        for (int i = tid; i < (K >> 3); i += kRows * kWarps) {
+            const int k0 = i * 8;
+            const uint4 xw = *reinterpret_cast<const uint4 *>(xr + k0);
+            const __nv_bfloat16 *xv = reinterpret_cast<const __nv_bfloat16 *>(&xw);
+            if constexpr (ROT) {
+                const uint4 gw = *reinterpret_cast<const uint4 *>(sg + k0);
+                const __half *gv = reinterpret_cast<const __half *>(&gw);
+                uint4 uw = gw;
+                if constexpr (PAIR) uw = *reinterpret_cast<const uint4 *>(su + k0);
+                const __half *uv = reinterpret_cast<const __half *>(&uw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = __bfloat162float(xv[j]);
+                    s_x[0][k0 + j] = v * __half2float(gv[j]);
+                    if constexpr (PAIR) s_x[1][k0 + j] = v * __half2float(uv[j]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) s_x[0][k0 + j] = __bfloat162float(xv[j]);
+            }
+        }
+    }
+    for (int i = tid; A8 && i < n_k128 * 4; i += kRows * kWarps) {
         const int blk = i >> 2, grp = i & 3;
         const int k0 = blk * 128 + grp * 32;
         /* A8: the vendored MMQ block, whose per-32 ue8m0 byte folds in here (the DeepSeek lane).  bf16:
@@ -556,7 +586,17 @@ static void exl3_gemv_dispatch_r(int R, const dim3 &grid, const dim3 &block, cud
                                  const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                  float *og, float *ou, int M, int K, int n_assign, int E) {
     switch (R) {
-    case 1:  exl3_moe_gemv_kernel_r1<MODE, K2, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 1: {
+        const size_t smem = (size_t)(MODE == kPair ? 2 : 1) * (size_t)K * sizeof(float);
+        static bool attr = false;                    /* per instance; idempotent */
+        if (!attr) {
+            cudaFuncSetAttribute(exl3_moe_gemv_kernel_r1<MODE, K2, A8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)((MODE == kPair ? 2 : 1) * kMaxK * sizeof(float)));
+            attr = true;
+        }
+        exl3_moe_gemv_kernel_r1<MODE, K2, A8><<<grid, block, smem, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E);
+        break;
+    }
     case 4:  exl3_gemv_kernel_launch<MODE, K2, 4, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
     default: exl3_gemv_kernel_launch<MODE, K2, kMaxR, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
     }
