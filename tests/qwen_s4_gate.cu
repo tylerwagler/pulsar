@@ -543,8 +543,9 @@ int main(void) {
 
 static void section_mxfp8_linear(void) {
     printf("G. MXFP8 dense Linear (mxfp8_lt: in_proj_a 2560->48, index_qk_proj 2560->640)\n");
-    const int T = 5;
     const struct { int in, out; } SH[2] = {{H, 48}, {H, 640}};
+    /* T = 5 is the decode GEMV; T = 97 the prefill tensor-core GEMM (two 64-token tiles, one partial) */
+    for (const int T : {5, 97})
     for (const auto &sh : SH) {
         std::vector<double> wd((size_t)sh.out * sh.in);
         for (auto &v : wd) v = rndn() * 0.05;
@@ -559,17 +560,34 @@ static void section_mxfp8_linear(void) {
         if (rc == 0) {
             const auto Y = down(y, (size_t)T * sh.out);
             const auto AX = down(dx, (size_t)T * sh.in);
-            double worst = 0;
+            double worst = 0, w_ref = 0, w_got = 0, w_l1 = 0, worst_l1n = 0;
+            int w_t = -1, w_o = -1;
             for (int t = 0; t < T; t++)
                 for (int o = 0; o < sh.out; o++) {
-                    double ref = 0;
-                    for (int k = 0; k < sh.in; k++)
-                        ref += w.at(o, k) * bf(AX[(size_t)t * sh.in + k]);
+                    double ref = 0, l1 = 0;
+                    for (int k = 0; k < sh.in; k++) {
+                        const double p = w.at(o, k) * bf(AX[(size_t)t * sh.in + k]);
+                        ref += p;
+                        l1 += fabs(p);
+                    }
                     const double got = Y[(size_t)t * sh.out + o];
                     const double d = ref != 0 ? fabs(got - ref) / fabs(ref) : fabs(got);
-                    if (d > worst) worst = d;
+                    if (l1 > 0 && fabs(got - ref) / l1 > worst_l1n) worst_l1n = fabs(got - ref) / l1;
+                    if (d > worst) { worst = d; w_ref = ref; w_got = got; w_l1 = l1; w_t = t; w_o = o; }
                 }
-            CHECK(worst < 1e-4, "%d -> %d vs the same quantized operands in double: max rel %.2e", sh.in, sh.out, worst);
+            /* The decode GEMV is graded per element, as it always was.  The prefill GEMM sums on the
+             * tensor cores in 16-k fragments, so on a row whose terms nearly cancel (measured: a
+             * -2.0e-05 result from 66.8 of |terms|) its RELATIVE error is large while its error
+             * against the term mass is f32-class (8.5e-08, the GEMV's being 1.5e-08) -- so it is
+             * graded by |err| / sum|terms|, the bound a dot product actually carries. */
+            if (T <= 16) {
+                CHECK(worst < 1e-4, "%d -> %d at T = %d (decode GEMV) vs the same quantized operands in double: "
+                      "max rel %.2e", sh.in, sh.out, T, worst);
+            } else {
+                CHECK(worst_l1n < 1e-6, "%d -> %d at T = %d (prefill GEMM) vs the same quantized operands in double: "
+                      "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
+                      sh.in, sh.out, T, worst_l1n, worst, w_ref, w_l1, w_t, w_o, w_got);
+            }
         }
         /* a missing activation is refused, not mis-read.  The old negative control was a slot
          * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so

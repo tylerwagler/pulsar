@@ -276,6 +276,124 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
     }
 }
 
+/* 2'. PREFILL: the W8A16 product as a tensor-core GEMM, for prompt chunks (T > kDecodeRowsMax).
+ * part[t][split][row] = sum over the split's k of x[t][k] * W[row][k], W = E4M3 * 2^(e8m0 - 127).
+ * That weight is EXACT in bf16 (3 mantissa bits, a power-of-two scale), so it is dequantized into
+ * shared memory as bf16 and the product runs as mma.m16n8k16 bf16 x bf16 -> f32, a fresh fragment per
+ * 16-k step added into the f32 accumulator.
+ *
+ * Decode widths keep the GEMV (2): a decode kernel run over a prompt re-reads the activation once per
+ * 8 weight rows (40x per call for W_down), which was 22% of a 4096-row prefill.  The two kernels sum in
+ * different orders, so a prefilled row and a decoded row agree to rounding, not to the bit (Tyler
+ * 2026-09-29: "Don't use a decode kernel for prefill"); within this kernel a row's arithmetic depends
+ * on nothing but its own x and W, so the chunk width changes no bit.  CTA = 4 warps = 64 tokens x 32
+ * outputs (warp w: tokens 16w..16w+15, four n8 tiles); kMmaStage MX blocks staged per barrier. */
+constexpr int kDecodeRowsMax = 16;               ///< widths at or below take the decode GEMV
+constexpr int kMmaTok = 64, kMmaOut = 32, kMmaStage = 4;
+constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
+constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
+
+__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void gr_ldsm_x4(uint32_t (&r)[4], const void *p) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+__device__ __forceinline__ void gr_ldsm_x2(uint32_t &r0, uint32_t &r1, const void *p) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(s));
+}
+
+__device__ __forceinline__ void gr_cp_async16(void *smem, const void *gmem, int src_bytes) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
+}
+
+__global__ void __launch_bounds__(128)
+qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsf,
+                      const __nv_bfloat16 *__restrict__ x, int out, int in, int T, int n_split,
+                      float *__restrict__ part) {
+    __shared__ __align__(16) __nv_bfloat16 sx[kMmaTok][kMmaPad];
+    __shared__ __align__(16) __nv_bfloat16 sw[kMmaOut][kMmaPad];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int r0 = blockIdx.x * kMmaOut, split = blockIdx.y, t0 = blockIdx.z * kMmaTok;
+    const int nblk = in / 32, per = nblk / n_split, b_lo = split * per, b_hi = b_lo + per;
+    const int w_kbp = pulsar_mx_kbp(in);
+    float acc[4][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
+
+    for (int b0 = b_lo; b0 < b_hi; b0 += kMmaStage) {
+        const int nbs = min(kMmaStage, b_hi - b0);
+        /* x: kMmaTok rows x nbs blocks of 32 bf16 = 4 16-byte chunks a block; rows past T read zero */
+        for (int c = tid; c < kMmaTok * kMmaStage * 4; c += 128) {
+            const int tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
+            if (ch < nbs * 4) {
+                const bool ok = t < T;
+                gr_cp_async16(&sx[tr][ch * 8], x + (size_t)(ok ? t : 0) * in + (size_t)b0 * 32 + ch * 8, ok ? 16 : 0);
+            }
+        }
+        /* W: kMmaOut rows x nbs blocks, 8 codes a thread-task, dequantized exactly into bf16 */
+        for (int c = tid; c < kMmaOut * kMmaStage * 4; c += 128) {
+            const int wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), row = r0 + wr;
+            if (ch >= nbs * 4) continue;
+            uint32_t o[4] = {0u, 0u, 0u, 0u};
+            if (row < out) {
+                const int b = b0 + (ch >> 2);
+                const uint2 codes = *reinterpret_cast<const uint2 *>(wq + (size_t)row * in + (size_t)b0 * 32 + ch * 8);
+                const float s = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
+                const uint8_t *cb = reinterpret_cast<const uint8_t *>(&codes);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    __nv_fp8_e4m3 q0, q1;
+                    q0.__x = cb[2 * e];
+                    q1.__x = cb[2 * e + 1];
+                    const __nv_bfloat162 v = __floats2bfloat162_rn(float(q0) * s, float(q1) * s);
+                    o[e] = *reinterpret_cast<const uint32_t *>(&v);
+                }
+            }
+            *reinterpret_cast<uint4 *>(&sw[wr][ch * 8]) = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        for (int kk = 0; kk < nbs * 32; kk += 16) {
+            uint32_t a[4];
+            gr_ldsm_x4(a, &sx[warp * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t bb0, bb1;
+                gr_ldsm_x2(bb0, bb1, &sw[j * 8 + (lane & 7)][kk + ((lane >> 3) & 1) * 8]);
+                /* a FRESH fragment per 16-k step, added into acc in f32: the tensor core's own
+                 * accumulate is not IEEE f32 (measured: 2.9e-04 against double over K = 2560 when
+                 * acc rode in the C operand, vs ~1e-6 this way) -- the dense EXL3 arm's pattern */
+                float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma_bf16_16816(d, a, bb0, bb1);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
+            }
+        }
+        __syncthreads();
+    }
+    /* lane (g, c): acc[j][0..1] = token 16w+g, rows 8j+2c, +1; acc[j][2..3] = token 16w+g+8 */
+    const int g = lane >> 2, c2 = (lane & 3) * 2;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int t = t0 + warp * 16 + g + 8 * (e >> 1), row = r0 + j * 8 + c2 + (e & 1);
+            if (t < T && row < out) part[((size_t)t * n_split + split) * out + row] = acc[j][e];
+        }
+}
+
 /* 3. mid + up + gate + mean: one warp per stream, lane = channel, kUpTB
  * tokens per CTA.
  *   mid  a = silu(d / 4), d = the down's splits summed in split order, for the
@@ -425,9 +543,15 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
     qwen_gr_norm_kernel<<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
         (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
-    /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm. */
-    qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
-        w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
+    /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
+     * tensor cores (2'). */
+    if (W8 && T > kDecodeRowsMax) {
+        qwen_w8a16_prefill_kernel<<<dim3((kR + kMmaOut - 1) / kMmaOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
+            (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)m.xn, kR, kHC, T, kDownSplit, m.part);
+    } else {
+        qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
+            w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
+    }
     qwen_gr_up_kernel<W8><<<dim3(kH / 32, (T + kUpTB - 1) / kUpTB), 32 * kS, 0, stream>>>(
         w->up.w, w->up.sf, m.part, w->inject ? m.injp : nullptr, inj, (const __nv_bfloat16 *)streams,
         (const __nv_bfloat16 *)w->norm_w,
@@ -504,14 +628,16 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
                 l ? l->in : -1, l ? l->out : -1, l ? l->in : -1);
         return -1;
     }
-    /* FAIL CLOSED (L251).  This is a W8A16 shape -- mxfp8_lt (E4M3 + E8M0) weights against a bf16
-     * activation -- and the arm does NOT exist yet: qwen_gr_down_kernel<W8=false> reads its WEIGHT as
-     * bf16 (:196), so handing it mxfp8 weights would read E4M3 bytes as bf16 and produce plausible
-     * garbage, which is precisely what VENDOR.md warns about ("compiling is not evidence of
-     * correctness").  Refuse by name until the W8A16 branch is built; the engine's rule is one path or
-     * an error, never a second format chosen silently. */
-    const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
-    qwen_gr_down_kernel<true, false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
+    /* One split, so part[t][0][row] is y[t][row].  Decode widths take the W8A16 GEMV (2); prompt
+     * chunks take the tensor-core GEMM (2'). */
+    if (rows > kDecodeRowsMax) {
+        const dim3 grid((l->out + kMmaOut - 1) / kMmaOut, 1, (rows + kMmaTok - 1) / kMmaTok);
+        qwen_w8a16_prefill_kernel<<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
+                                                            l->out, l->in, rows, 1, y);
+    } else {
+        const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
+        qwen_gr_down_kernel<true, false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
+    }
     const cudaError_t qe = cudaGetLastError();
     if (qe != cudaSuccess) {
         fprintf(stderr, "pulsar: qwen mxfp8 linear launch: %s\n", cudaGetErrorString(qe));

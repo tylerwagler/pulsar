@@ -23,6 +23,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -90,18 +97,25 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     int T = n_tok, generated = 0;
+    double t_prefill = 0.0, t_decode = 0.0;
     for (int i = 0; i < n_predict; i++) {
-        /* Extend the prefix by one each step: sync() reuses the existing graph state, so this
-         * is the session lane's decode, not a fresh prefill of the whole prompt. */
-        pulsar_tokens t = { ids, T, T };
+        /* Step 0 prefills the prompt with sync(), which leaves the prompt's next-token row in the
+         * logits.  Every later step DECODES the previous argmax with eval(s, token) -- the
+         * session's one-token decode path, the one a server stream runs.  (The old eval(sess, 1)
+         * decoded id 1 in front of every prediction: the "degenerate repetition" this tool
+         * reported before the fix.)  Each step is timed through copy_logits, i.e. end to end. */
         char err[256] = "";
-        if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
-            fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
+        const double t0 = now_s();
+        if (i == 0) {
+            pulsar_tokens t = { ids, T, T };
+            if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
+                fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
+                break;
+            }
+        } else if (pulsar_session_eval(sess, ids[T - 1], err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nqwen-generate: eval at %d tokens: %s\n", T, err);
             break;
         }
-        /* sync() leaves the prefix's next-token row in the logits.  No eval(): eval(s, token)
-         * decodes `token` at position T, and the old eval(sess, 1) put id 1 in front of every
-         * prediction -- the "degenerate repetition" this tool reported before the fix. */
         /* copy_logits returns the count WRITTEN (0 on error), the opposite of set_logits. */
         if (pulsar_session_copy_logits(sess, row, W) != W) {
             fprintf(stderr, "\nqwen-generate: copy_logits at %d tokens\n", T);
@@ -109,6 +123,7 @@ int main(int argc, char **argv) {
         }
         int am = 0;
         for (int j = 1; j < W; j++) if (row[j] > row[am]) am = j;
+        if (i == 0) t_prefill = now_s() - t0; else t_decode += now_s() - t0;
         /* L251: the top-5 and the MARGIN per step.  A greedy run that locks onto a repeat token is
          * a precision question -- the reference's token is either a hair behind (knife-edge, so a
          * few-percent fidelity deficit explains it) or nowhere near (a real error).  Without this
@@ -141,6 +156,13 @@ int main(int argc, char **argv) {
         if (stop) { printf(" <stop:%d>", am); fflush(stdout); break; }
     }
     printf("\n");
+    /* SPEED: prefill is the prompt's one sync(); decode is every eval() after it.  Both include
+     * the host argmax and the top-5 scan (negligible beside a step), not the printing. */
+    if (generated > 0)
+        printf("qwen-generate: SPEED prefill %d tokens in %.3f s = %.1f tok/s | decode %d tokens in %.3f s = %.2f tok/s (%.1f ms/token)\n",
+               n_tok, t_prefill, n_tok / t_prefill, generated - 1, t_decode,
+               generated > 1 ? (generated - 1) / t_decode : 0.0,
+               generated > 1 ? 1e3 * t_decode / (generated - 1) : 0.0);
 
     if (argc > 4) {
         FILE *f = fopen(argv[4], "wb");
