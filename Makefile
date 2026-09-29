@@ -711,6 +711,24 @@ qwen-ngram-test: tests/qwen_ngram_test
 	./tests/qwen_ngram_test tests/test-vectors/qwen-ngram-small.vec --no-rows
 	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS) $(if $(QWEN_NGRAM_ROWFILE),--rowfile $(QWEN_NGRAM_ROWFILE),)
 
+# L251 S5: the Qwen3.8-Flash-Next tokenizer, chat renderer, client-span map and
+# output parser, graded against HF (goldens from tests/qwen/gen_qwen_goldens.py
+# -- transformers' apply_chat_template + tokenizers).  Model-free; the inputs are
+# the checkpoint's tokenizer.json + generation_config.json, the L216 corpus case
+# files and the 466-row calibration corpus HF rendered from them.
+QWEN_TOK_DIR ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
+QWEN_RENDER_CASES ?= /mnt/models/reap-corpus/cases
+QWEN_CALIB ?= /mnt/models/qwen38-calib/calib-qwen38-v1.jsonl
+QWEN_CHAT_SRCS = src/lib/qwen_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp
+tests/qwen_chat_gate: tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS) src/lib/qwen_tokenizer.h \
+                      src/lib/qwen_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/pulsar_utf8.h \
+                      src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
+.PHONY: qwen-chat-gate
+qwen-chat-gate: tests/qwen_chat_gate
+	./tests/qwen_chat_gate --tok $(QWEN_TOK_DIR) --vectors tests/test-vectors/qwen38 \
+	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
+
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
 # mode rows are checkable with no model and no device.  The arrays in the test are

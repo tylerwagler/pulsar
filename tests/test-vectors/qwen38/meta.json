@@ -1,0 +1,20 @@
+{
+ "transformers": "5.18.0.dev0",
+ "tokenizers": "0.23.2",
+ "python": "3.14.4",
+ "sha256": {
+  "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+  "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+  "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+ },
+ "calib": {
+  "path": "/srv/models/calib-qwen38-v1.jsonl",
+  "sha256": "870e3226e28ce2ee27e1fea2ff936b856a810467b800ddf50d9bda851ee9e8eb"
+ },
+ "stop_ids": [
+  248046,
+  248044
+ ],
+ "n_tokens": 248077
+}
