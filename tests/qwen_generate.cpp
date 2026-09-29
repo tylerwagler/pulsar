@@ -2,7 +2,7 @@
  *
  * The reference gate proves FORWARDS: one row per recorded depth, graded against anchors.  This
  * proves the lane PRODUCES TOKENS, walking the same session lane the gate walks -- sync() to
- * extend the prefix by one, eval() for the last position, copy_logits(), argmax.
+ * extend the prefix by one (which leaves that prefix's next-token logits), copy_logits(), argmax.
  *
  * It exists because the family has no tokenizer or renderer yet (S5), so the CLI's text path
  * refuses by design ("only --inspect runs").  Feeding ids and printing ids keeps S5 out of the
@@ -15,9 +15,8 @@
  * decode the whole thing in one pass.  Not part of the battery: it needs a real container and
  * a tokens.bin on disk.
  *
- * NOTE ON WHAT THIS MEASURES: the engine's prefill quantizes activations to MXFP8 (A8) and the
- * container's weights are EXL3, so a greedy stream here is NOT expected to equal the BF16
- * source's.  That divergence is the lane's precision, not a defect -- see rows/L251.md.
+ * NOTE ON WHAT THIS MEASURES: the container's weights are EXL3 (and the QSA KV cache is MXFP8),
+ * so a greedy stream here is NOT expected to equal the BF16 source's token for token.
  */
 #include "pulsar.h"
 
@@ -100,11 +99,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
             break;
         }
-        err[0] = '\0';
-        if (pulsar_session_eval(sess, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "\nqwen-generate: eval at %d tokens: %s\n", T, err);
-            break;
-        }
+        /* sync() leaves the prefix's next-token row in the logits.  No eval(): eval(s, token)
+         * decodes `token` at position T, and the old eval(sess, 1) put id 1 in front of every
+         * prediction -- the "degenerate repetition" this tool reported before the fix. */
         /* copy_logits returns the count WRITTEN (0 on error), the opposite of set_logits. */
         if (pulsar_session_copy_logits(sess, row, W) != W) {
             fprintf(stderr, "\nqwen-generate: copy_logits at %d tokens\n", T);

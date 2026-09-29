@@ -204,10 +204,11 @@ int main(int argc, char **argv) {
             if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
                 check(false, "%s d=%d sync: %s", prompts[i], d, err); break;
             }
-            err[0] = '\0';
-            if (pulsar_session_eval(sess, 1, err, sizeof(err)) != 0) {
-                check(false, "%s d=%d eval: %s", prompts[i], d, err); break;
-            }
+            /* sync() leaves the prefix's NEXT-token row in the session's logits; that row is
+             * what the anchor recorded.  There is no eval() here: eval(s, token) DECODES
+             * `token` at position d, so the old eval(sess, 1) graded prefix + [id 1] against
+             * the reference's prefix -- every "wrong" depth and every SHIFTED CONTEXT line
+             * this gate printed before the fix. */
             /* copy_logits returns the number of logits WRITTEN and 0 on error -- the
              * opposite convention to set_logits (0 on success).  Checking `!= 0` here
              * flagged a perfectly good 248320-logit copy as a failure. */
