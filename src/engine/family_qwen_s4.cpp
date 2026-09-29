@@ -314,6 +314,10 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
 }
 
 void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
+    if (w && w->head_mx) {
+        pulsar_gpu_tensor_free(w->head_mx);
+        w->head_mx = NULL;
+    }
     pulsar_qwen_ple_io *io = w ? w->ple_io : NULL;
     if (!io) return;
     if (io->pending) (void)pulsar_engram_gather_wait(io->pending);
@@ -532,12 +536,25 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     const uint16_t *streams = (const uint16_t *)dptr(st->st->streams) + (size_t)row0 * pulsar_qwen_hc_dim(s);
     ok = ok && pulsar_qwen_gr_read_launch(&w, streams, (int)n, (uint16_t *)xb, NULL, base + h.ws, h.ws_bytes, 0) == 0;
     if (ok) {
-        pulsar_gpu_bf16_act_note(xkey, n, (uint64_t)H);
-        const pulsar_decode_rows_scope rows(n);   /* the head's rows are decode rows: the M-independent arms */
-        const pulsar_tensor *out = st->w->output;
-        ok = rows.ok() && pulsar_gpu_matmul_bf16_tensor(st->st->logits, tensor_map_base(st->model, out),
-                                                        tensor_map_size(st->model, out), out->abs_offset,
-                                                        (uint64_t)H, s->n_vocab, xkey, n) != 0;
+        /* L251: the lm_head in MXFP8, made once on the device from the container's bf16 head (the
+         * producers' own encoder) -- half the bytes of the bf16 GEMV that was 5.1 ms of a 33 ms
+         * token -- through the W8A16 arms (the GEMV at decode widths). */
+        pulsar_qwen_weights *wm = const_cast<pulsar_qwen_weights *>(st->w);
+        if (!wm->head_mx) {
+            const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
+            const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)s->n_vocab, H);
+            wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
+            ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, (int)s->n_vocab, H, dptr(wm->head_mx), 0) == 0;
+            if (ok) fprintf(stderr, "pulsar: %s: lm_head as MXFP8 (%.2f GB, from bf16 %.2f GB)\n", PULSAR_QWEN_ARCH,
+                            (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
+            else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
+        }
+        if (ok) {
+            const uint8_t *hq = (const uint8_t *)dptr(wm->head_mx);
+            const pulsar_qwen_lowrank l = {hq, hq + (uint64_t)s->n_vocab * H, (int)s->n_vocab, H};
+            ok = pulsar_qwen_mxfp8_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(st->st->logits),
+                                                 NULL, 0, 0) == 0;
+        }
     }
     if (xkey) {
         pulsar_gpu_act_slot_drop(xkey);

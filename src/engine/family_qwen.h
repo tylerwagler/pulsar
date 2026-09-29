@@ -213,6 +213,9 @@ typedef struct {
     /** S4: the PLE row file (the container's pulsar.ple_rows.*), its pread pool
      * and the host gather in flight; opened by pulsar_qwen_s4_load. */
     struct pulsar_qwen_ple_io *ple_io;
+    /** L251: the lm_head as MXFP8 (mxfp8_lt), made on the device from `output` at the first head
+     *  step (the bf16 head is 1.27 GB read per decode row; this is half); freed at unload. */
+    struct pulsar_gpu_tensor *head_mx;
 } pulsar_qwen_weights;
 
 /* ---- 4. Session state -------------------------------------------------------

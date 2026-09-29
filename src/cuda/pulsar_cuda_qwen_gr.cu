@@ -645,3 +645,42 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
     }
     return 0;
 }
+
+/* L251: the lm_head as MXFP8, made once at load from the container's bf16 head.  The bf16 head
+ * is 1.27 GB read per decode row (5.1 ms of a 33 ms token, nsys); MXFP8 is half the bytes and
+ * the W8A16 arms above read it.  One warp per (row, 32-block), the producers' own encoder
+ * (pulsar_mx_emit_block: the shared exponent, E4M3, the swizzled E8M0 plane), so the result is
+ * the same mxfp8_lt layout the container's own MXFP8 tensors carry. */
+namespace {
+__global__ void __launch_bounds__(256)
+qwen_bf16_to_mxfp8_kernel(const __nv_bfloat16 *__restrict__ w, int out, int in, int kbp,
+                          __nv_fp8_e4m3 *__restrict__ data, unsigned char *__restrict__ scale) {
+    const int64_t task = (int64_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int nblk = in / 32;
+    if (task >= (int64_t)out * nblk) return;
+    const int row = (int)(task / nblk), blk = (int)(task % nblk), lane = threadIdx.x & 31;
+    const uint32_t col = (uint32_t)(blk * 32 + lane);
+    const float v = __bfloat162float(w[(size_t)row * in + col]);
+    pulsar_mx_emit_block(v, col, (uint32_t)row, (uint32_t)in, kbp, data, scale);
+}
+} // namespace
+
+extern "C" uint64_t pulsar_qwen_mxfp8_bytes(int out, int in) {
+    if (out <= 0 || in <= 0 || in % 32) return 0;
+    return (uint64_t)out * in + (uint64_t)pulsar_mx_sf_slab_bytes(out, pulsar_mx_kbp(in));
+}
+
+extern "C" int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, int out, int in, void *dst, cudaStream_t stream) {
+    const uint64_t bytes = pulsar_qwen_mxfp8_bytes(out, in);
+    if (!w || !dst || !bytes) {
+        fprintf(stderr, "pulsar: qwen bf16 -> MXFP8: %d x %d refused (in %% 32, non-null)\n", out, in);
+        return -1;
+    }
+    uint8_t *data = (uint8_t *)dst, *scale = data + (uint64_t)out * in;
+    /* the scale slab must start zeroed: sfoff leaves holes when rows or blocks are not multiples */
+    if (cudaMemsetAsync(scale, 0, bytes - (uint64_t)out * in, stream) != cudaSuccess) return -1;
+    const int64_t tasks = (int64_t)out * (in / 32);
+    qwen_bf16_to_mxfp8_kernel<<<(unsigned)((tasks + 7) / 8), 256, 0, stream>>>(
+        (const __nv_bfloat16 *)w, out, in, pulsar_mx_kbp(in), (__nv_fp8_e4m3 *)data, scale);
+    return launch_ok("bf16 -> mxfp8") ? 0 : -1;
+}
