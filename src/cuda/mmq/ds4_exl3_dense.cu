@@ -304,6 +304,9 @@ exl3_dense_epilogue_kernel(const float *__restrict__ part, const __half *__restr
 
 } // namespace
 
+int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+                                   uint64_t trellis_bytes, cudaStream_t stream);
+
 bool ds4_exl3_dense_rate_supported(int k2) { return exl3_arm_has_rate(EXL3_ARM_DENSE, k2); }
 
 int ds4_exl3_dense_splits(int K, int N) {
@@ -338,6 +341,10 @@ int ds4_exl3_dense_launch(const void *w, int k2, const void *xb, float *y,
         fprintf(stderr, "%s: w / y / workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
         return -1;
     }
+    /* L251: a prompt chunk takes the tensor-core GEMM (qwen_exl3_moe_prefill.cu's dense mode): this
+     * arm's GEMV re-decodes the trellis per 16 rows and re-reads the activation planes per 32 outputs,
+     * a decode kernel doing a GEMM's work.  Decode widths keep the GEMV bit for bit. */
+    if (M > kRows) return qwen_exl3_dense_prefill_launch(w, k2, xb, y, M, K, N, trellis_bytes, stream);
     const size_t need = ds4_exl3_dense_workspace_bytes(M, K, N);
     if (workspace_bytes < need) {
         fprintf(stderr, "%s: workspace %zu bytes < %zu for M=%d K=%d N=%d -- refusing\n", tag, workspace_bytes, need, M, K, N);

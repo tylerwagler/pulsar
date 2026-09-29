@@ -166,6 +166,8 @@ int main(void) {
         {2560, 6144,  "Qwen DeltaNet in_proj_z"},
         {6144, 2560,  "Qwen DeltaNet out_proj"},
         {2560, 1280,  "Qwen 2560->1280"},
+        {2560, 640,   "Qwen shared gate/up"},
+        {640,  2560,  "Qwen shared down"},
         {4096, 1024,  "DeepSeek attn_q_a"},
     };
     const int rates[] = {4, 6, 8, 10};
@@ -175,7 +177,8 @@ int main(void) {
 
     for (const shape &sh : shapes) {
         const int K = sh.K, N = sh.N;
-        const int max_rows = (K == 2560 && N == 6144) ? 40 : (K == 2560 && N == 1280) ? 300 : 16;
+        const int max_rows = (K == 2560 && N == 6144) ? 40 : (K == 2560 && N == 1280) ? 300
+                           : (N == 640 || K == 640) ? 97 : 16;
         const slot s = make_slot(max_rows, K);
         for (int k2 : rates) {
             const weight w = make_weight(K, N, k2);
@@ -206,19 +209,24 @@ int main(void) {
                    sh.what, K, N, k2 / 2, ds4_exl3_dense_splits(K, N), mx, med,
                    diff_m ? "DIFFER" : "bit-identical to M=16's rows");
 
-            if (max_rows > 16 && k2 == 8) {
+            if (max_rows > 16) {   /* every rate: the prefill GEMM instantiates each */
                 /* 3. prefill rows: row blocks of 16 (the last partial), and slabs of 128 */
                 rc = run(d, k2, max_rows, K, N, y);
                 CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
                 if (!rc) {
+                    /* M > 16 is the PREFILL GEMM (qwen_exl3_moe_prefill.cu, L251): it sums in its own
+                     * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
+                     * row is graded against the double reference instead, rows 0..15 included */
                     const bool same16 = memcmp(y.data(), y16.data(), y16.size() * sizeof(float)) == 0;
+                    std::vector<float> head(y.begin(), y.begin() + (size_t)16 * N);
+                    double mx0 = 0, med0 = 0;
+                    grade(head, yref, 16, N, 0, &mx0, &med0);
                     std::vector<float> tail(y.begin() + (size_t)16 * N, y.end());
                     grade(tail, yref, max_rows - 16, N, 16, &mx, &med);
-                    CHECK(same16, "prefill M=%d: rows 0..15 differ from the M=16 run", max_rows);
+                    CHECK(mx0 < tol, "prefill M=%d: rows 0..15 max rel %.3e", max_rows, mx0);
                     CHECK(mx < tol, "prefill M=%d: rows 16..%d max rel %.3e", max_rows, max_rows - 1, mx);
-                    printf("  prefill M=%d (%s): rows 0..15 %s; rows 16..%d max rel %.2e median %.2e\n", max_rows,
-                           max_rows > 128 ? "slabs 128+128+44" : "row blocks 16+16+8",
-                           same16 ? "bit-identical to M=16" : "DIFFER", max_rows - 1, mx, med);
+                    printf("  prefill GEMM M=%d: rows 0..15 max rel %.2e (%s the GEMV's bits); rows 16..%d max rel %.2e "
+                           "median %.2e\n", max_rows, mx0, same16 ? "equal to" : "rounding-close to", max_rows - 1, mx, med);
                 }
             }
             if (sh.N == 10240 && k2 == 8) {
