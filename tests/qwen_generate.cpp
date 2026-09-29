@@ -112,6 +112,27 @@ int main(int argc, char **argv) {
         }
         int am = 0;
         for (int j = 1; j < W; j++) if (row[j] > row[am]) am = j;
+        /* L251: the top-5 and the MARGIN per step.  A greedy run that locks onto a repeat token is
+         * a precision question -- the reference's token is either a hair behind (knife-edge, so a
+         * few-percent fidelity deficit explains it) or nowhere near (a real error).  Without this
+         * the loop's cause cannot be told apart. */
+        {
+            int best[5];
+            for (int k = 0; k < 5; k++) best[k] = -1;
+            for (int j = 0; j < W; j++) {
+                for (int k = 0; k < 5; k++) {
+                    if (best[k] < 0 || row[j] > row[best[k]]) {
+                        for (int m = 4; m > k; m--) best[m] = best[m - 1];
+                        best[k] = j;
+                        break;
+                    }
+                }
+            }
+            printf("\n  step %2d |", i);
+            for (int k = 0; k < 5; k++) printf(" %d@%.4f", best[k], (double)row[best[k]]);
+            printf(" | margin %.4f", (double)(row[best[0]] - row[best[1]]));
+            fflush(stdout);
+        }
         ids[T++] = am;
         generated++;
         printf(" %d", am);
