@@ -186,12 +186,12 @@ static void gpu_part(const char *dir) {
     float *logits = (float *)xmalloc(248320u * sizeof(float));
     err[0] = '\0';
     check(pulsar_session_decode_multiseq(sess, &row, 1, logits, 248320, err, sizeof(err)) != 0,
-          "batched decode refused: %s", err);
+          "a batched row at the wrong position refused: %s", err);
     err[0] = '\0';
     check(pulsar_session_decode_mixed(sess, &row, 1, logits, 248320, NULL, 0, err, sizeof(err)) != 0,
-          "mixed step refused: %s", err);
+          "a mixed row at the wrong position refused: %s", err);
     free(logits);
-    check(pulsar_session_bank_fork(sess, 0, 1, toks, 8, 0) != 0, "bank fork refused (no BANKS cap)");
+    check(pulsar_session_bank_fork(sess, 0, 1, toks, 8, 0) != 0, "bank fork refused (a recurrent pool has no forks)");
     check(pulsar_session_payload_bytes(sess) == 0, "payload refused (no PAYLOAD cap)");
     check(pulsar_session_spec_next_base(sess, 0.0f, 0, 1.0f, 0.0f, NULL) < 0, "speculation refused (no SPEC cap)");
     pulsar_session_invalidate(sess);

@@ -335,7 +335,22 @@ typedef struct pulsar_qwen_state {
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
     uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds
+    /* The bank pool (L251, family_qwen_banks.cpp): the session's host view (checkpoint,
+     * logits) describes `live_bank`; every other bank's view waits in its carry. */
+    uint32_t live_bank;     ///< the bank sync / eval run on
+    bool logits_fresh;      ///< the session's logits are live_bank's NEXT-token row
+    struct pulsar_qwen_bank_carry *carry;   ///< [n_banks]
 } pulsar_qwen_state;
+
+/** A bank's saved host view: what bank_state_save took from the session. */
+typedef struct pulsar_qwen_bank_carry {
+    pulsar_tokens checkpoint;
+    float *logits;          ///< [n_vocab]
+    bool valid, checkpoint_valid, logits_fresh;
+} pulsar_qwen_bank_carry;
+
+/** The Qwen family's bank-pool operations (family.h pulsar_family_bank_ops). */
+extern const pulsar_family_bank_ops k_qwen_bank_ops;
 
 /* ---- 5. The step and the op table ------------------------------------------ */
 

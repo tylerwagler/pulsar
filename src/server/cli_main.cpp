@@ -898,7 +898,10 @@ int main(int argc, char **argv) {
          * PULSAR_MIXED_BATCH=0 still forces the lane fully off;
          * PULSAR_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
         const char *mb = getenv("PULSAR_MIXED_BATCH");
-        s.mixed_batch_enabled = s.pool_banks > 0 &&
+        /* L251: the fused lane and warm forks are DeepSeek graph-pool features; a family bank pool
+         * (Qwen) refuses fused prefill runs and forks, so the lanes are off there, not flag-dependent */
+        const bool graph_pool = pulsar_engine_family(engine) == PULSAR_FAMILY_ID_DEEPSEEK4;
+        s.mixed_batch_enabled = s.pool_banks > 0 && graph_pool &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
         s.mixed_deep_guard_rows = 16384;
@@ -914,7 +917,7 @@ int main(int argc, char **argv) {
      * exactly. One startup read — never on a hot path. */
     {
         const char *wf = getenv("PULSAR_WARM_FORK");
-        s.warm_fork_enabled = s.pool_banks > 0 &&
+        s.warm_fork_enabled = s.pool_banks > 0 && pulsar_engine_family(engine) == PULSAR_FAMILY_ID_DEEPSEEK4 &&
                               !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
         /* inc D: partial-cut floor. Default 256 tokens (2 ratio-4 groups of
          * reuse); floor to 128 so a cut always aligns to >= one group of R. */

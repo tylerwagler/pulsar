@@ -720,7 +720,14 @@ void pulsar_qsa_inv_freq(float inv_freq[PULSAR_QSA_ROT_DIM / 2]) {
 }
 
 uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
-    return qsa_ws_layout(nullptr, n_rows, max_ctx).bytes;
+    /* Sized for EVERY call of at most n_rows rows, not only an n_rows one: a call of fewer than
+     * QSA_FOLD_ROWS rows takes the split schedule and needs its partials, which an n_rows >=
+     * QSA_FOLD_ROWS layout does not carve.  (A 96-row session refused its 24-row prompt: 2.76 MB
+     * sized, 20.3 MB needed.  Larger contexts hid it -- their score budget covered the partials.) */
+    const uint64_t at_max = qsa_ws_layout(nullptr, n_rows, max_ctx).bytes;
+    if (n_rows < QSA_FOLD_ROWS) return at_max;
+    const uint64_t split = qsa_ws_layout(nullptr, QSA_FOLD_ROWS - 1u, max_ctx).bytes;
+    return at_max > split ? at_max : split;
 }
 
 int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,

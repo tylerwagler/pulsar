@@ -114,8 +114,19 @@ int main(int argc, char **argv) {
         if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) { fprintf(stderr, "qwen-generate: sync: %s\n", err); return 1; }
         double nll = 0.0, mass_end = 0.0, mass_pad = 0.0;
         int top1 = 0, scored = 0;
+        /* QWEN_NLL_MODE=sync scores every position through the PREFILL path instead (sync() of the
+         * prefix extended by one -- a one-row prefill step), so eval-vs-sync separates the decode
+         * step from the state the prompt left. */
+        const char *mode = getenv("QWEN_NLL_MODE");
+        const bool via_sync = mode && !strcmp(mode, "sync");
         for (int i = 0; i < N; i++) {
-            if (i > 0 && pulsar_session_eval(sess, ids[P + i - 1], err, sizeof(err)) != 0) {
+            if (i > 0 && via_sync) {
+                pulsar_tokens ext = { ids, P + i, P + i };
+                if (pulsar_session_sync(sess, &ext, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "qwen-generate: sync at %d: %s\n", P + i, err);
+                    break;
+                }
+            } else if (i > 0 && pulsar_session_eval(sess, ids[P + i - 1], err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: eval at %d: %s\n", P + i, err);
                 break;
             }

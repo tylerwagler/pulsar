@@ -140,6 +140,13 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
 bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: the Qwen chat renderer (src/lib/qwen_chat) is not wired into this endpoint yet, and the
+         * DeepSeek template must never render a Qwen conversation -- refuse by name */
+        if (err && errlen) snprintf(err, errlen, "this endpoint does not serve the Qwen family yet; "
+                                                 "/v1/completions takes raw text");
+        return false;
+    }
     /* The chat template family follows the LOADED model (L218 s123): the
      * renderer, the forced-prefill and the KV-key suffix builders all read it
      * from the request, so a 0731 artifact cannot be primed with V4.1's
@@ -400,6 +407,13 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: the Qwen chat renderer (src/lib/qwen_chat) is not wired into this endpoint yet, and the
+         * DeepSeek template must never render a Qwen conversation -- refuse by name */
+        if (err && errlen) snprintf(err, errlen, "this endpoint does not serve the Qwen family yet; "
+                                                 "/v1/completions takes raw text");
+        return false;
+    }
     r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_ANTHROPIC;
     if (err && errlen) err[0] = '\0';
@@ -1506,6 +1520,13 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: the Qwen chat renderer (src/lib/qwen_chat) is not wired into this endpoint yet, and the
+         * DeepSeek template must never render a Qwen conversation -- refuse by name */
+        if (err && errlen) snprintf(err, errlen, "this endpoint does not serve the Qwen family yet; "
+                                                 "/v1/completions takes raw text");
+        return false;
+    }
     r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_RESPONSES;
     const char *p = body;
@@ -1957,6 +1978,26 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         snprintf(err, errlen, "missing prompt");
         request_free(r);
         return false;
+    }
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: a Qwen completion is a RAW continuation (vLLM's /v1/completions): no template and
+         * no thinking block; the whole prompt is client text, so no added token matches in it */
+        r->think_mode = think_mode_from_enabled(false, reasoning_effort);
+        free(r->prompt_spans);
+        r->prompt_n_spans = 0;
+        r->prompt_spans = NULL;
+        r->prompt_text = prompt;
+        prompt = NULL;
+        const size_t plen = strlen(r->prompt_text);
+        if (plen) {
+            r->prompt_spans = (pulsar_text_span *)malloc(sizeof(pulsar_text_span));
+            if (!r->prompt_spans) { if (err && errlen) snprintf(err, errlen, "out of memory"); return false; }
+            r->prompt_spans[0].lo = 0;
+            r->prompt_spans[0].hi = (uint32_t)plen;
+            r->prompt_n_spans = 1;
+        }
+        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        return true;
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;

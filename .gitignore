@@ -36,6 +36,7 @@ __pycache__/
 /tests/qwen_ref_gate
 /tests/qwen_generate
 /tests/qwen_chat_smoke
+/tests/qwen_banks_gate
 /tests/qwen_s4_gate
 /tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe

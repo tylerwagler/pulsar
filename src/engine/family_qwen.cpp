@@ -686,6 +686,7 @@ static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_s
         }
     }
     s->logits = (float *)xmalloc((size_t)g_qwen_shape.n_vocab * sizeof(s->logits[0]));
+    s->qwen->carry = (pulsar_qwen_bank_carry *)xcalloc(n_banks, sizeof(pulsar_qwen_bank_carry));
     s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
     fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps, %.2f GiB of state "
                     "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
@@ -702,6 +703,14 @@ static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_s
 }
 
 static void qwen_session_destroy(pulsar_session *s) {
+    if (s->qwen && s->qwen->carry) {
+        for (uint32_t b = 0; b < s->qwen->n_banks; b++) {
+            token_vec_free(&s->qwen->carry[b].checkpoint);
+            free(s->qwen->carry[b].logits);
+        }
+        free(s->qwen->carry);
+        s->qwen->carry = NULL;
+    }
     qwen_state_free(s->qwen);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
@@ -811,12 +820,14 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
     return ok;
 }
 
-/* Prefill `n` tokens of bank 0 from position `start`, in prefill_cap chunks;
- * the last chunk heads its last row into s->logits. */
+/* Prefill `n` tokens of the live bank from position `start`, in prefill_cap
+ * chunks; the last chunk heads its last row into s->logits. */
 static bool qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
     const uint32_t n = (uint32_t)prompt->len - start;
+    const uint32_t live = s->qwen->live_bank;
     int32_t *pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
-    int32_t *bank = (int32_t *)xcalloc(s->prefill_cap, sizeof(int32_t));
+    int32_t *bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
+    for (uint32_t r = 0; r < s->prefill_cap; r++) bank[r] = (int32_t)live;
     bool ok = true;
     for (uint32_t off = 0; ok && off < n; off += s->prefill_cap) {
         const uint32_t rows = n - off < s->prefill_cap ? n - off : s->prefill_cap;
@@ -824,14 +835,15 @@ static bool qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_
         const bool last = off + rows == n;
         ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + start + off, pos, bank, rows,
                           rows - 1u, last ? 1u : 0u, s->logits);
-        if (ok) s->qwen->bank_pos[0] = start + off + rows;
+        if (ok) s->qwen->bank_pos[live] = start + off + rows;
     }
+    s->qwen->logits_fresh = ok;
     free(pos);
     free(bank);
     return ok;
 }
 
-/* Make bank 0 hold exactly `prompt`.  A recurrent state cannot be cut back,
+/* Make the live bank hold exactly `prompt`.  A recurrent state cannot be cut back,
  * so the one path is: continue when the prompt extends what the bank holds,
  * otherwise clear the bank and prefill from 0.  (Resuming from saved state
  * snapshots is the prefix-reuse follow-up; until it exists a divergent prompt
@@ -852,16 +864,20 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
         while (common < s->checkpoint.len && common < prompt->len &&
                s->checkpoint.v[common] == prompt->v[common]) common++;
     }
-    /* bank_pos[0] is the state's authority; the checkpoint must agree with it
-     * to be continued (a batched step on bank 0 moves the state, not the
+    /* bank_pos[live] is the state's authority; the checkpoint must agree with it
+     * to be continued (a batched step on the live bank moves the state, not the
      * checkpoint, and clears checkpoint_valid). */
-    if (s->checkpoint_valid && s->qwen->bank_pos[0] != (uint32_t)s->checkpoint.len) s->checkpoint_valid = false;
+    const uint32_t live = s->qwen->live_bank;
+    if (s->checkpoint_valid && s->qwen->bank_pos[live] != (uint32_t)s->checkpoint.len) s->checkpoint_valid = false;
     const bool extends = s->checkpoint_valid && common == s->checkpoint.len && common < prompt->len;
-    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len) return 0;
+    /* the same prompt is a no-op only while the logits are its next-token row: after the batched
+     * lane (note_committed) they are stale, and a recurrent state cannot rewind one token to redo
+     * the last row -- so that case prefills cold */
+    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && s->qwen->logits_fresh) return 0;
     uint32_t start = 0;
     if (extends) {
         start = (uint32_t)common;
-    } else if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, 0)) {
+    } else if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, live)) {
         if (err) snprintf(err, errlen, "%s: could not clear the session's state", PULSAR_QWEN_ARCH);
         return 1;
     }
@@ -881,13 +897,20 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
         if (err) snprintf(err, errlen, "%s: eval needs a synced session with room left", PULSAR_QWEN_ARCH);
         return 1;
     }
-    const int32_t tok = token, pos = s->checkpoint.len, bank = 0;
+    const uint32_t live = s->qwen->live_bank;
+    if (s->qwen->bank_pos[live] != (uint32_t)s->checkpoint.len) {
+        if (err) snprintf(err, errlen, "%s: eval: bank %u holds %u tokens, the checkpoint %d", PULSAR_QWEN_ARCH, live,
+                          s->qwen->bank_pos[live], s->checkpoint.len);
+        return 1;
+    }
+    const int32_t tok = token, pos = s->checkpoint.len, bank = (int32_t)live;
     if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, &tok, &pos, &bank, 1, 0, 1, s->logits)) {
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
-    s->qwen->bank_pos[0] = (uint32_t)s->checkpoint.len;
+    s->qwen->bank_pos[live] = (uint32_t)s->checkpoint.len;
+    s->qwen->logits_fresh = true;
     return 0;
 }
 
@@ -920,31 +943,52 @@ static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq
         bank[i] = (int32_t)reqs[i].bank;
     }
     if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, n, 0, n, logits)) {
+        /* the failed step reset the banks it touched (qwen_forward): fatal for these rows */
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return 1;
+        return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
         s->qwen->bank_pos[reqs[i].bank]++;
-        if (reqs[i].bank == 0) s->checkpoint_valid = false;   /* bank 0 moved past the checkpoint */
+        if (reqs[i].bank == s->qwen->live_bank) {   /* the live bank moved past the host view */
+            s->checkpoint_valid = false;
+            s->qwen->logits_fresh = false;
+        }
     }
     return 0;
 }
 
-static int qwen_session_decode_mixed(pulsar_session *, const pulsar_multiseq_req *, uint32_t,
-                                     float *, int, uint32_t *, uint32_t, char *err, size_t errlen) {
-    if (err) snprintf(err, errlen, "%s: the mixed decode+prefill step is not implemented for this family",
-                      PULSAR_QWEN_ARCH);
-    return 1;
+/* The server's batched lane: its plain decode is this entry with one row per bank and no prefill
+ * runs (max_head_runs 0), which is exactly the batched decode.  A step that fuses a PREFILL run (a
+ * bank with more than one row) is refused before anything moves (rc 1: the lane then retries
+ * decode-only; prefill keeps the sync path). */
+static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                                     float *logits, int logits_cap, uint32_t *out_n_rows,
+                                     uint32_t max_head_runs, char *err, size_t errlen) {
+    if (out_n_rows) *out_n_rows = 0;
+    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) {
+        if (err) snprintf(err, errlen, "%s: a verify step (heads on every row) is not implemented", PULSAR_QWEN_ARCH);
+        return 1;
+    }
+    for (uint32_t i = 0; reqs && i < n_rows; i++)
+        for (uint32_t j = 0; j < i; j++)
+            if (reqs[j].bank == reqs[i].bank) {
+                if (err) snprintf(err, errlen, "%s: a fused prefill run (bank %u, %u+ rows) is not implemented; "
+                                  "prefill goes through sync", PULSAR_QWEN_ARCH, reqs[i].bank, 2u);
+                return 1;
+            }
+    const int rc = qwen_session_decode_multiseq(s, reqs, n_rows, logits, logits_cap, err, errlen);
+    if (rc == 0 && out_n_rows) *out_n_rows = n_rows;
+    return rc;
 }
 
-/* Every bank starts over: its position AND its recurrent state (a bank at
- * position 0 with an advanced state would decode on stale state). */
+/* The HOST view forgets the live bank's history; its device state is left alone.  The next sync
+ * of that bank finds the checkpoint invalid and resets the bank before it prefills, so a stale
+ * state is never decoded -- and the server's invalidate (a bank provision, an eviction, a stop
+ * string mid-batch) cannot wipe OTHER banks' conversations, which resetting every bank did. */
 static void qwen_session_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    for (uint32_t b = 0; b < s->qwen->n_banks; b++)
-        if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, b))
-            fprintf(stderr, "pulsar: %s: invalidate could not clear bank %u's state\n", PULSAR_QWEN_ARCH, b);
+    s->qwen->logits_fresh = false;
 }
 
 static const pulsar_family_session_ops k_qwen_session_ops = {
@@ -963,7 +1007,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
     /* .drafter      = */ PULSAR_DRAFTER_MTP,
-    /* .caps         = */ 0u,
+    /* .caps         = */ PULSAR_FAMILY_CAP_BANKS,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
@@ -971,4 +1015,5 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .chat_format  = */ qwen_chat_format,
     /* .model_id     = */ qwen_model_id,
     /* .session      = */ &k_qwen_session_ops,
+    /* .banks        = */ &k_qwen_bank_ops,
 };

@@ -113,6 +113,24 @@ typedef struct {
     void (*invalidate)(pulsar_session *s);
 } pulsar_family_session_ops;
 
+/** A family's own bank pool (L251): the server's per-bank bookkeeping for a
+ * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
+ * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
+ * entries call these, and the operations a family cannot do -- forks, per-bank
+ * KV spill, physical residency -- refuse with each entry's own failure value
+ * (the server has a path for every one of them). */
+typedef struct {
+    int (*count)(pulsar_session *s);
+    /** The live host view (checkpoint, logits) into bank's carry; host only. */
+    void (*save)(pulsar_session *s, uint32_t bank);
+    /** Make `bank` live: its carry back into the host view.  false = refused. */
+    bool (*restore)(pulsar_session *s, uint32_t bank);
+    /** The bank's committed history: the live checkpoint, or its carry.  NULL = none. */
+    const pulsar_tokens *(*tokens)(pulsar_session *s, uint32_t bank);
+    /** Tokens the batched lane fed that the host view has not recorded yet. */
+    void (*note_committed)(pulsar_session *s, const int *toks, int n);
+} pulsar_family_bank_ops;
+
 /** One model family.  Instances are static and const; pulsar_engine::family
  * points at one for the engine's lifetime. */
 struct pulsar_family {
@@ -134,6 +152,8 @@ struct pulsar_family {
     pulsar_chat_format (*chat_format)(const pulsar_engine *e);
     int (*model_id)(const pulsar_engine *e);
     const pulsar_family_session_ops *session;
+    /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
+    const pulsar_family_bank_ops *banks;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;
