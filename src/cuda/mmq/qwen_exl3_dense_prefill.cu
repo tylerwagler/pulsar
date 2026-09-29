@@ -9,9 +9,10 @@
 //   1. DECODE  the trellis ONCE into an fp16 K x N matrix W_q (row-major), with the GEMV's own tile
 //              decode (mul1_pair: the same fp16 values, bit for bit).
 //   2. PREP    per row: x * suh, H128 per 128-block, then ONE power-of-two prescale for the whole row
-//              (so a GEMM can sum across blocks) and the split v = hi + lo into two fp16 planes
-//              (~22 significant bits -- the GEMV's operand, with the scale per row instead of block).
-//   3. GEMM    two cuBLAS tensor-core GEMMs, Z = X_hi W_q + X_lo W_q, f32 accumulate and output.
+//              (so a GEMM can sum across blocks), rounded to one fp16 plane: 11 significant bits,
+//              8x finer than the bf16 row it came from (exllamav3's and TensorFold's operand; a second
+//              "lo" plane doubled the GEMM for precision the input does not carry).
+//   3. GEMM    one cuBLAS tensor-core GEMM, Z = X W_q, f32 accumulate and output.
 //   4. EPILOGUE per row: times 2^-P, the output H128 per 128-block, times svh.
 //
 // A prefilled row and a decoded row agree to rounding, not to the bit (Tyler 2026-09-29, "Don't use
@@ -62,10 +63,10 @@ dense_decode_kernel(const uint32_t *__restrict__ trellis, __half *__restrict__ w
 }
 
 /* 2. one CTA (8 warps) per row: the rotated row into shared memory block by block, the row amax,
- * then the hi / lo planes and the row's inverse prescale. */
+ * then the fp16 plane and the row's inverse prescale. */
 __global__ void __launch_bounds__(256)
 dense_prep_kernel(const __nv_bfloat16 *__restrict__ x, const __half *__restrict__ suh,
-                  __half *__restrict__ xhi, __half *__restrict__ xlo, float *__restrict__ inv, int K) {
+                  __half *__restrict__ xhi, float *__restrict__ inv, int K) {
     extern __shared__ float s_row[];              /* [K] */
     __shared__ float s_amax[8];
     const int m = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -94,10 +95,7 @@ dense_prep_kernel(const __nv_bfloat16 *__restrict__ x, const __half *__restrict_
     const float up = pow2f(p);
     for (int k = threadIdx.x * 2; k < K; k += 512) {
         const float a0 = s_row[k] * up, a1 = s_row[k + 1] * up;
-        const __half2 h2 = __floats2half2_rn(a0, a1);
-        const __half2 l2 = __floats2half2_rn(a0 - __low2float(h2), a1 - __high2float(h2));
-        *reinterpret_cast<__half2 *>(xhi + (size_t)m * K + k) = h2;
-        *reinterpret_cast<__half2 *>(xlo + (size_t)m * K + k) = l2;
+        *reinterpret_cast<__half2 *>(xhi + (size_t)m * K + k) = __floats2half2_rn(a0, a1);
     }
     if (threadIdx.x == 0) inv[m] = pow2f(-p);
 }
@@ -135,7 +133,7 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         return -1;
     }
     const size_t wq_b = up256((size_t)K * N * sizeof(__half)), pl_b = up256((size_t)M * K * sizeof(__half));
-    const size_t need = wq_b + 2 * pl_b + up256((size_t)M * sizeof(float));
+    const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float));
     if (need > g_scratch_bytes) {
         if (g_scratch) cudaFree(g_scratch);
         g_scratch = nullptr;
@@ -152,8 +150,8 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         return -1;
     }
     __half *wq = reinterpret_cast<__half *>(g_scratch);
-    __half *xhi = reinterpret_cast<__half *>(g_scratch + wq_b), *xlo = reinterpret_cast<__half *>(g_scratch + wq_b + pl_b);
-    float *inv = reinterpret_cast<float *>(g_scratch + wq_b + 2 * pl_b);
+    __half *xhi = reinterpret_cast<__half *>(g_scratch + wq_b);
+    float *inv = reinterpret_cast<float *>(g_scratch + wq_b + pl_b);
     const uint32_t *tr = static_cast<const uint32_t *>(w);
     const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w) + trellis_bytes);
     const __half *svh = suh + K;
@@ -170,15 +168,12 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         return -1;
     }
     dense_prep_kernel<<<M, 256, (size_t)K * sizeof(float), stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh,
-                                                                       xhi, xlo, inv, K);
+                                                                       xhi, inv, K);
     /* column-major view: Y^T (N x M, ld N) = W_q^T (N x K, ld N) . X^T (K x M, ld K) */
     const float one = 1.0f, zero = 0.0f;
     cublasSetStream(g_blas, stream);
     cublasStatus_t st = cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &one, wq, CUDA_R_16F, N, xhi,
                                      CUDA_R_16F, K, &zero, y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &one, wq, CUDA_R_16F, N, xlo, CUDA_R_16F, K,
-                          &one, y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "%s: cuBLAS GEMM failed (%d) -- refusing\n", tag, (int)st);
         return -3;

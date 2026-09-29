@@ -413,8 +413,8 @@ static void section_ple(void) {
         }
         cudaFree(ws); cudaFree(de); cudaFree(ds);
     };
-    double worst = 0;
-    size_t over = 0, n = 0;
+    double worst[2] = {0, 0};
+    size_t over[2] = {0, 0}, n[2] = {0, 0};
     std::vector<uint16_t> emb, st, dev, st_in;
     for (int b = 0; b < 2; b++) {
         run_batch(b ? rowsB : rowsA, true, emb, st, &dev, &st_in);
@@ -423,13 +423,21 @@ static void section_ple(void) {
              * cancel, and then the f32 sum's own error is many ulps of the small result */
             const double sc = fmax(fabs(bf(st[i])), fabs(bf(st_in[i])));
             const double u = bf_ulps(bf(dev[i]), bf(st[i])) * (bf(st[i]) != 0 ? fabs(bf(st[i])) / sc : 1.0);
-            worst = fmax(worst, u);
-            over += u > 1.0;
-            n++;
+            worst[b] = fmax(worst[b], u);
+            over[b] += u > 1.0;
+            n[b]++;
         }
     }
-    CHECK(over <= n / 5000 && worst <= 4.0, "streams vs double over both batches: %zu of %zu beyond 1 bf16 ulp (worst %.2f)",
-          over, n, worst);
+    /* Batch A (20 rows) takes the PREFILL GEMM for key / value, whose operand is one fp16 plane (2^-12 per
+     * element); batch B (10 rows, decode width) continues the conv history A wrote, so it inherits that too.
+     * The signed-sqrt gate amplifies an operand perturbation without bound where the key-query dot is near 0
+     * (the worst element, 15.5 ulp, sits there), so the worst is graded only against a format error
+     * (thousands of ulps, or the count blowing up) and the count is the check. */
+    const size_t over_all = over[0] + over[1], n_all = n[0] + n[1];
+    const double worst_all = fmax(worst[0], worst[1]);
+    CHECK(over_all <= n_all / 5000 && worst_all <= 64.0,
+          "streams vs double over both batches: %zu of %zu beyond 1 bf16 ulp (worst %.2f; prefill batch %zu / %.2f, "
+          "decode batch %zu / %.2f)", over_all, n_all, worst_all, over[0], worst[0], over[1], worst[1]);
 
     /* decode == prefill: a third batch (batch B's shape) from the carried state, as one
      * batch and as single-token steps from the same snapshot */
@@ -588,11 +596,14 @@ static void section_moe_at(const int T, const bool split = false) {
          * 3e-7, so more of h's (and the fold mid's) bf16 roundings land across a tie.  ONE flipped
          * element moves its row by up to ~2^-9 of that element's share of the output, so the worst row
          * is a property of the draw, not of the kernels: 1.07e-4 on the first draw, 4.51e-4 when an
-         * added section B check shifted the RNG (2026-09-29).  The bound is 1e-3 -- the tie envelope,
-         * 25x below the 2.5e-2 a real format error read on this line -- and quality is judged END TO
-         * END: teacher-forced NLL over 1,792 positions (14 prefixes, code + raw prose) is 2.62 with these
-         * kernels vs 2.63 for the all-GEMV build.  The f32-order count is reported, not graded. */
-        CHECK(frob_worst < 1e-3, "T = %d%s (prefill GEMMs%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
+         * added section B check shifted the RNG (2026-09-29).  The prefill GEMMs' operand is ONE fp16
+         * plane (2^-12 per element; each GEMM's exact envelope is graded in tests/exl3_dense_gate), which
+         * adds ~5e-4 through the block's GEMMs in series: the bound is 2e-3 -- the tie envelope plus that,
+         * 12x below the 2.5e-2 a real format error read on this line.  End to end the one-plane build was
+         * graded by the per-layer local error against the container reference (code d = 2048, layers
+         * 2..47): mean 7.88e-3 vs 7.90e-3 two-plane and 7.93e-3 all-GEMV -- no measurable change.  The
+         * f32-order count is reported, not graded. */
+        CHECK(frob_worst < 2e-3, "T = %d%s (prefill GEMMs%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
               "max|ref| %.2e (%d of %d rows at f32 order)", T, split ? " split experts" : "",
               split ? "; the pair as two rotated slices" : "", frob_worst, worst, rows_f32, T);
     }

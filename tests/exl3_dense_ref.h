@@ -83,3 +83,35 @@ static inline void exl3t_reference(const uint8_t *slice, const std::vector<doubl
         for (int n = 0; n < N; n++) y[(size_t)r * N + n] = z[n] * exl3_f16_to_f32(svh[n]);
     }
 }
+
+/* The prefill arm's error bound per output (L251): the GEMM reads the rotated activation x^ rounded to
+ * ONE fp16 plane after a power-of-two row prescale, so each operand element moves by at most 2^-12 of
+ * itself (plus a subnormal floor far below the f32 order).  Through z = W^T x^ that is at most
+ * 2^-12 sum_k |W_kj x^_k| per z_j, and through y = svh * H128(z) (the normalised Hadamard) at most
+ * |svh_n| / sqrt(128) times the block's sum of those.  bound[r * N + n] is that envelope, exactly. */
+static inline void exl3t_fp16_operand_bound(const uint8_t *slice, const std::vector<double> &what, int K, int N, int k2,
+                                            const double *x, int rows, std::vector<double> &bound) {
+    uint64_t trellis = 0, stride = 0;
+    exl3t_layout(K, N, k2, &trellis, &stride);
+    const uint16_t *suh = (const uint16_t *)(slice + trellis), *svh = suh + K;
+    bound.assign((size_t)rows * N, 0.0);
+    std::vector<double> xr(K), za(N);
+    for (int r = 0; r < rows; r++) {
+        double amax = 0;
+        for (int k = 0; k < K; k++) xr[k] = x[(size_t)r * K + k] * exl3_f16_to_f32(suh[k]);
+        for (int i = 0; i + 128 <= K; i += 128) exl3_had128(xr.data() + i);
+        for (int k = 0; k < K; k++) amax = fmax(amax, fabs(xr[k]));
+        std::fill(za.begin(), za.end(), 0.0);
+        for (int k = 0; k < K; k++) {
+            const double ek = ldexp(fabs(xr[k]), -12) + ldexp(amax, -40);
+            const double *wr = what.data() + (size_t)k * N;
+            for (int n = 0; n < N; n++) za[n] += fabs(wr[n]) * ek;
+        }
+        for (int b = 0; b + 128 <= N; b += 128) {
+            double sum = 0;
+            for (int j = b; j < b + 128; j++) sum += za[j];
+            for (int n = b; n < b + 128; n++)
+                bound[(size_t)r * N + n] = fabs(exl3_f16_to_f32(svh[n])) * sum / 11.313708498984761;
+        }
+    }
+}

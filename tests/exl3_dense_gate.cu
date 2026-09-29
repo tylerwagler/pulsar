@@ -20,9 +20,8 @@
  *      accumulation order; the median proves the fixture is not degenerate);
  *   2. M = 1, 2, 4, 8 are BIT-IDENTICAL to the same rows of the M = 16 run (a
  *      row's bytes do not depend on the batch width -- the decode-row contract);
- *   3. prefill: M = 40 (three row blocks, the last partial) at one shape and
- *      M = 300 (three 128-row slabs, the last partial) at another -- rows
- *      0..15 bit-identical to M = 16, every other row against the reference;
+ *   3. prefill: M = 40 / 97 / 300 at several shapes -- the prefill GEMM (one fp16 operand plane):
+ *      every output within the fp16-operand envelope (exl3t_fp16_operand_bound) plus f32 order;
  *   4. mutations: one flipped trellis bit must move outputs, and a sign-flipped
  *      suh block must push the error far past the tolerance;
  *   5. refusals: K % 128, an uninstantiated rate, a short workspace, M = 0.
@@ -217,16 +216,30 @@ int main(void) {
                     /* M > 16 is the PREFILL GEMM (qwen_exl3_moe_prefill.cu, L251): it sums in its own
                      * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
                      * row is graded against the double reference instead, rows 0..15 included */
+                    /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded
+                     * against that rounding's exact envelope (exl3t_fp16_operand_bound) plus the f32-order
+                     * tolerance of its row -- not the GEMV's f32-class limit */
                     const bool same16 = memcmp(y.data(), y16.data(), y16.size() * sizeof(float)) == 0;
-                    std::vector<float> head(y.begin(), y.begin() + (size_t)16 * N);
-                    double mx0 = 0, med0 = 0;
-                    grade(head, yref, 16, N, 0, &mx0, &med0);
-                    std::vector<float> tail(y.begin() + (size_t)16 * N, y.end());
-                    grade(tail, yref, max_rows - 16, N, 16, &mx, &med);
-                    CHECK(mx0 < tol, "prefill M=%d: rows 0..15 max rel %.3e", max_rows, mx0);
-                    CHECK(mx < tol, "prefill M=%d: rows 16..%d max rel %.3e", max_rows, max_rows - 1, mx);
-                    printf("  prefill GEMM M=%d: rows 0..15 max rel %.2e (%s the GEMV's bits); rows 16..%d max rel %.2e "
-                           "median %.2e\n", max_rows, mx0, same16 ? "equal to" : "rounding-close to", max_rows - 1, mx, med);
+                    std::vector<double> bnd;
+                    exl3t_fp16_operand_bound(w.bytes.data(), what, K, N, k2, s.x.data(), max_rows, bnd);
+                    size_t over = 0;
+                    double worst = 0;
+                    for (int r = 0; r < max_rows; r++) {
+                        double sc = 0;
+                        for (int n = 0; n < N; n++) sc = fmax(sc, fabs(yref[(size_t)r * N + n]));
+                        for (int n = 0; n < N; n++) {
+                            const size_t i = (size_t)r * N + n;
+                            const double err = fabs((double)y[i] - yref[i]), lim = bnd[i] + tol * sc;
+                            over += err > lim;
+                            worst = fmax(worst, err / lim);
+                        }
+                    }
+                    grade(y, yref, max_rows, N, 0, &mx, &med);
+                    CHECK(over == 0, "prefill M=%d: %zu outputs past the fp16-operand envelope (worst err/limit %.3f)",
+                          max_rows, over, worst);
+                    printf("  prefill GEMM M=%d: every output within its fp16-operand envelope (worst err/limit %.3f); "
+                           "max rel %.2e median %.2e (rows 0..15 %s the GEMV's bits)\n", max_rows, worst, mx, med,
+                           same16 ? "equal to" : "rounding-close to");
                 }
             }
             if (sh.N == 10240 && k2 == 8) {
