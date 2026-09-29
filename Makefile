@@ -2260,6 +2260,10 @@ tests/qwen_generate.o: tests/qwen_generate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 .PHONY: qwen-generate
 qwen-generate: tests/qwen_generate
 	@./tests/qwen_generate $(QWEN_GEN_MODEL) $(QWEN_GEN_TOKENS) $(QWEN_GEN_N) /tmp/qwen-gen-ids.bin
