@@ -33,6 +33,10 @@ __pycache__/
 /tests/tp_mesh_test
 /tests/tp_mirror_test
 /tests/mseq_short_ctx_probe
+/tests/qwen_ref_gate
+/tests/qwen_generate
+/tests/qwen_s4_gate
+/tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe
 /tests/nt_crossover_sweep
 /tests/tp_identity_test
