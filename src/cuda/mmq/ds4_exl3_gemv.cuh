@@ -84,6 +84,16 @@ int ds4_exl3_moe_gemv_single_bf16_launch(
         float *out, int M, int K, int64_t n_assign,
         int n_experts, cudaStream_t stream);
 
+/* L251: the Qwen routed arm for PROMPT CHUNKS (qwen_exl3_moe_prefill.cu) -- a grouped tensor-core GEMM
+ * over the same expert-sorted schedule, writing the same unrotated z as the two bf16 GEMVs above.
+ * rotate_input: the fused gate_up (x * suh, H128); false: the down (input rotated by the fold).
+ * Rates k2 = 8, 10; M % 64, K % 128.  Agrees with the GEMV to rounding, not to the bit. */
+constexpr int64_t QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN = 161;   /* more than 16 tokens x 10 slots */
+int qwen_exl3_moe_prefill_launch(
+        const void *table, int k2, bool rotate_input, const void *x_bf16,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out, int M, int K, int64_t n_assign, int n_experts, cudaStream_t stream);
+
 int ds4_exl3_moe_gemv_fused_launch(
     const void    * table,
     int             k2,

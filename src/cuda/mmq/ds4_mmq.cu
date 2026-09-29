@@ -500,7 +500,11 @@ int ds4_mmq_moe_impl(
     {
         const int rc = exl3_k2
             ? (act_bf16
-               ? (exl3_fused ? ds4_exl3_moe_gemv_fused_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
+               ? (ne_get_rows >= QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN
+                  /* a prompt chunk: the grouped tensor-core GEMM, not the decode GEMV (L251) */
+                  ? qwen_exl3_moe_prefill_launch(W, exl3_k2, exl3_fused, act_q, ids_dst, ids_src1, expert_bounds,
+                                                 out_f32, M, K, ne_get_rows, n_experts, stream)
+                  : exl3_fused ? ds4_exl3_moe_gemv_fused_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
                                                                    expert_bounds, out_f32, M, K, ne_get_rows,
                                                                    n_experts, stream)
                              : ds4_exl3_moe_gemv_single_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,

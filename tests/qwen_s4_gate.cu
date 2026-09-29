@@ -438,9 +438,8 @@ static void section_ple(void) {
 }
 
 /* ======================================================================== */
-static void section_moe(void) {
-    printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
-    const int P = 12, T = 5;
+static void section_moe_at(const int T) {
+    const int P = 12;
     std::vector<linear> pgu, pd;
     for (int i = 0; i < P; i++) { pgu.push_back(make_linear(H, 2 * MID, 8)); pd.push_back(make_linear(MID, H, 10)); }
     std::vector<expert> ex(E);
@@ -511,13 +510,28 @@ static void section_moe(void) {
      * still 4x clear of the measured value and 1000x below the 2.5e-02 a real format error
      * produced on this very line before the references were fixed), while the f32-order count
      * allows the two tie-affected rows.  The count is a proxy; the bound is the check. */
-    CHECK(rows_f32 >= T - 2 && frob_worst < 1e-4, "out vs double: %d of %d rows at f32 order (< 1e-5), worst row rel "
-          "Frobenius %.2e, max |err| / max|ref| %.2e", rows_f32, T, frob_worst, worst);
+    if (T <= 16) {
+        CHECK(rows_f32 >= T - 2 && frob_worst < 1e-4, "T = %d (decode GEMV) out vs double: %d of %d rows at f32 order "
+              "(< 1e-5), worst row rel Frobenius %.2e, max |err| / max|ref| %.2e", T, rows_f32, T, frob_worst, worst);
+    } else {
+        /* the prefill GEMM (qwen_exl3_moe_prefill.cu): the same BOUND; the f32-order count is the
+         * decode bar's tie-sensitive proxy, calibrated on 5 rows, so here it is reported, not graded */
+        CHECK(frob_worst < 1e-4, "T = %d (prefill GEMM) out vs double: worst row rel Frobenius %.2e, max |err| / "
+              "max|ref| %.2e (%d of %d rows at f32 order)", T, frob_worst, worst, rows_f32, T);
+    }
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
-    /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
-    rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, 1, out, ws, wsb, nf, 0x7351u, 0);
-    const auto O1 = down(out, H);
-    CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d batch's row", T);
+    if (T <= 16) {
+        /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
+        rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, 1, out, ws, wsb, nf, 0x7351u, 0);
+        const auto O1 = down(out, H);
+        CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d batch's row", T);
+    }
+}
+
+static void section_moe(void) {
+    printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
+    section_moe_at(5);    /* 50 assignments: the decode GEMV */
+    section_moe_at(37);   /* 370 assignments: the prefill GEMM (>= QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN) */
 }
 
 int main(void) {
@@ -575,19 +589,16 @@ static void section_mxfp8_linear(void) {
                     if (l1 > 0 && fabs(got - ref) / l1 > worst_l1n) worst_l1n = fabs(got - ref) / l1;
                     if (d > worst) { worst = d; w_ref = ref; w_got = got; w_l1 = l1; w_t = t; w_o = o; }
                 }
-            /* The decode GEMV is graded per element, as it always was.  The prefill GEMM sums on the
-             * tensor cores in 16-k fragments, so on a row whose terms nearly cancel (measured: a
-             * -2.0e-05 result from 66.8 of |terms|) its RELATIVE error is large while its error
-             * against the term mass is f32-class (8.5e-08, the GEMV's being 1.5e-08) -- so it is
-             * graded by |err| / sum|terms|, the bound a dot product actually carries. */
-            if (T <= 16) {
-                CHECK(worst < 1e-4, "%d -> %d at T = %d (decode GEMV) vs the same quantized operands in double: "
-                      "max rel %.2e", sh.in, sh.out, T, worst);
-            } else {
-                CHECK(worst_l1n < 1e-6, "%d -> %d at T = %d (prefill GEMM) vs the same quantized operands in double: "
-                      "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
-                      sh.in, sh.out, T, worst_l1n, worst, w_ref, w_l1, w_t, w_o, w_got);
-            }
+            /* Graded by |err| / sum|terms|, the bound a dot product carries.  The per-element relative
+             * error this check used to bound (< 1e-4) is undefined on a row whose terms cancel, and it
+             * passed on the RNG stream's luck: when section D began drawing a T = 37 batch, this same
+             * decode GEMV -- unchanged -- read 1.09e-03 on a new near-zero element.  The GEMV keeps a
+             * 10x tighter bar than the prefill GEMM (measured 0.9-1.5e-08 vs 5.7-8.5e-08), since it
+             * sums in f32 FMAs where the GEMM sums 16-k tensor-core fragments. */
+            const bool gemv = T <= 16;
+            CHECK(worst_l1n < (gemv ? 1e-7 : 1e-6), "%d -> %d at T = %d (%s) vs the same quantized operands in double: "
+                  "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
+                  sh.in, sh.out, T, gemv ? "decode GEMV" : "prefill GEMM", worst_l1n, worst, w_ref, w_l1, w_t, w_o, w_got);
         }
         /* a missing activation is refused, not mis-read.  The old negative control was a slot
          * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so

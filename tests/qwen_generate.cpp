@@ -20,6 +20,7 @@
  */
 #include "pulsar.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,59 @@ int main(int argc, char **argv) {
            argv[1], n_tok, W, n_predict);
     printf("tokens:");
     fflush(stdout);
+
+    /* NLL MODE (QWEN_NLL_PREFIX=P): prefill tokens[0:P] with sync(), then TEACHER-FORCE the rest of
+     * tokens.bin through eval() -- at each step the logprob of the true next token and whether the
+     * argmax is it.  The decode steps are the same code in every build, so two builds that differ
+     * only in their PREFILL kernels differ here only through the state the prefill left: the
+     * measurement for "did the prefill path cost quality", over hundreds of positions instead of a
+     * handful of argmaxes.  n_predict caps the teacher-forced steps. */
+    const char *nll_env = getenv("QWEN_NLL_PREFIX");
+    if (nll_env && nll_env[0]) {
+        const int P = atoi(nll_env);
+        const int N = n_tok - P < n_predict ? n_tok - P : n_predict;
+        if (P <= 0 || N <= 0) { fprintf(stderr, "qwen-generate: QWEN_NLL_PREFIX=%d leaves no tokens to score\n", P); return 2; }
+        char err[256] = "";
+        const double t0 = now_s();
+        pulsar_tokens t = { ids, P, P };
+        if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) { fprintf(stderr, "qwen-generate: sync: %s\n", err); return 1; }
+        double nll = 0.0, mass_end = 0.0, mass_pad = 0.0;
+        int top1 = 0, scored = 0;
+        for (int i = 0; i < N; i++) {
+            if (i > 0 && pulsar_session_eval(sess, ids[P + i - 1], err, sizeof(err)) != 0) {
+                fprintf(stderr, "qwen-generate: eval at %d: %s\n", P + i, err);
+                break;
+            }
+            if (pulsar_session_copy_logits(sess, row, W) != W) { fprintf(stderr, "qwen-generate: copy_logits\n"); break; }
+            double mx = row[0];
+            int am = 0;
+            for (int j = 1; j < W; j++) if (row[j] > mx) { mx = row[j]; am = j; }
+            double se = 0.0;
+            for (int j = 0; j < W; j++) se += exp((double)row[j] - mx);
+            const int truth = ids[P + i];
+            nll += -((double)row[truth] - mx - log(se));
+            top1 += am == truth;
+            scored++;
+            /* where the mass goes: <|im_end|>, the text-less padded ids past the tokenizer's 248077,
+             * and -- when the argmax misses -- what it picked */
+            double p_end = exp((double)row[248046] - mx) / se, p_pad = 0.0;
+            for (int j = 248077; j < W; j++) p_pad += exp((double)row[j] - mx) / se;
+            mass_end += p_end;
+            mass_pad += p_pad;
+            if (am != truth && i < 24)
+                printf("  pos %d: truth %d (p %.4f)  argmax %d (p %.4f)  p<|im_end|> %.4f  p_pad %.2e\n", P + i, truth,
+                       exp((double)row[truth] - mx) / se, am, 1.0 / se, p_end, p_pad);
+        }
+        printf("qwen-generate: mean p(<|im_end|>) %.4f, mean p(padded ids >= 248077) %.3e\n", mass_end / scored,
+               mass_pad / scored);
+        printf("qwen-generate: NLL prefix %d, %d teacher-forced positions: mean NLL %.5f nats (ppl %.4f), top-1 %.4f "
+               "(%d/%d), %.1f s\n", P, scored, nll / scored, exp(nll / scored), (double)top1 / scored, top1, scored,
+               now_s() - t0);
+        pulsar_session_free(sess);
+        free(ids);
+        free(row);
+        return 0;
+    }
 
     int T = n_tok, generated = 0;
     double t_prefill = 0.0, t_decode = 0.0;
