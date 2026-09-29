@@ -82,10 +82,10 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                  * a rejected step (bad args / dirty multiseq state), not eos. */
                 if (n <= 0) { ok = false; break; }
                 emitted += n;
-                if (toks[n - 1] == pulsar_token_eos(engine)) break;
+                if (pulsar_token_is_stop(engine, toks[n - 1])) break;
             } else {
                 const int tok = pulsar_session_argmax(session);
-                if (tok == pulsar_token_eos(engine)) break;
+                if (pulsar_token_is_stop(engine, tok)) break;
                 if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) {
                     ok = false;
                     break;

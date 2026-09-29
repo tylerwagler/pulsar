@@ -334,7 +334,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(session, cfg->gen.temperature, 0,
                                            cfg->gen.top_p, cfg->gen.min_p, &rng);
@@ -343,7 +343,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (token == pulsar_token_eos(engine)) break;
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -356,7 +356,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -596,7 +596,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
         }
         fputs("]}", fp);
 
-        if (token == pulsar_token_eos(engine)) break;
+        if (pulsar_token_is_stop(engine, token)) break;
         if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -1259,7 +1259,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(chat->session,
                                            cfg->gen.temperature,
@@ -1271,7 +1271,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
                 return 1;
             }
-            if (token == pulsar_token_eos(engine)) break;
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -1283,7 +1283,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }

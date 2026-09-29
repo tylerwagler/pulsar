@@ -522,6 +522,9 @@ void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
 int pulsar_token_eos(pulsar_engine *e);
+/** L251: whether `token` ends generation -- the family's whole stop set (Qwen: <|im_end|> and
+ * <|endoftext|>, generation_config.json); DeepSeek: its one eos id. */
+bool pulsar_token_is_stop(pulsar_engine *e, int token);
 int pulsar_token_user(pulsar_engine *e);
 int pulsar_token_assistant(pulsar_engine *e);
 

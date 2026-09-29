@@ -2246,7 +2246,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (first == eos_token) {
+            if (pulsar_token_is_stop(s->engine, first)) {
                 /* generate_speculative's short-circuit: emit EOS, never eval it. */
                 slot_writer_install(&g->writer);
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();

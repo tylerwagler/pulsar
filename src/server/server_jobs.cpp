@@ -1364,7 +1364,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    if (token == pulsar_token_eos(s->engine)) {
+    if (pulsar_token_is_stop(s->engine, token)) {
         g->finish = "stop";
         return true;
     }

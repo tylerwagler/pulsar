@@ -156,7 +156,10 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h 
 # scans shard headers and __metadata__ as JSON), so every target that links
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(TP_OBJS)
+# The Qwen tokenizer (L251 S5) rides here too: the Qwen family loads it at open and the engine's
+# tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
+QWEN_TOK_OBJS = src/lib/qwen_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(QWEN_TOK_OBJS) $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)

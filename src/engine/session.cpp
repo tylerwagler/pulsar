@@ -2,6 +2,7 @@
 #include "exl3_trellis.h"
 #include "tp/pulsar_tp.h"
 #include "tp/pulsar_tp_gpu.h"
+#include "lib/qwen_tokenizer.h"
 
 
 int pulsar_engine::routed_quant_bits() {
@@ -1092,6 +1093,8 @@ void pulsar_engine::destroy() {
     }
     weights_free(&e->weights);
     if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
+    if (e->qwen_tok) qwen_tokenizer_free(e->qwen_tok);
+    e->qwen_tok = NULL;
     free(e->qwen_weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)

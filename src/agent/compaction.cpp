@@ -193,7 +193,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             return false;
         }
         int token = pulsar_session_argmax(w->session);
-        if (token == pulsar_token_eos(w->engine)) break;
+        if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';

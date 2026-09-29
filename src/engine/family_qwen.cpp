@@ -8,6 +8,7 @@
  * Until S2-S4 fill g_qwen_ops, a step refuses by naming the first op it would
  * call and the stream that owns it; nothing computes a number (rules 1, 9). */
 #include "pulsar_engine_internal.h"
+#include "lib/qwen_tokenizer.h"
 
 const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
     /* .name              = */ "Qwen3.8-Flash-Next",
@@ -441,6 +442,49 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
     return ok;
 }
 
+/* The checkpoint's tokenizer.json / generation_config.json, read verbatim from the container
+ * directory (L251 S5).  The tokenizer's loader is graded against HF on exactly these files
+ * (make qwen-chat-gate), so the family takes them as shipped rather than a re-encoding. */
+static bool qwen_read_text(const std::string &path, std::string *out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[1 << 16];
+    size_t n;
+    out->clear();
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
+    const bool ok = !ferror(f);
+    fclose(f);
+    return ok;
+}
+
+static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
+    std::string dir = model_path ? model_path : "";
+    struct stat st;
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        const size_t slash = dir.find_last_of('/');
+        dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+    }
+    std::string tj, gc;
+    const std::string tp = dir + "/tokenizer.json", gp = dir + "/generation_config.json";
+    if (!qwen_read_text(tp, &tj) || !qwen_read_text(gp, &gc)) {
+        fprintf(stderr, "pulsar: %s: the container carries no %s / %s -- copy the checkpoint's own two files "
+                        "beside the shards; refusing\n", PULSAR_QWEN_ARCH, tp.c_str(), gp.c_str());
+        return false;
+    }
+    char err[256] = "";
+    e->qwen_tok = qwen_tokenizer_load(tj.data(), tj.size(), gc.data(), gc.size(), err, sizeof(err));
+    if (!e->qwen_tok) {
+        fprintf(stderr, "pulsar: %s: tokenizer refused: %s\n", PULSAR_QWEN_ARCH, err);
+        return false;
+    }
+    const std::vector<int> &stop = qwen_tokenizer_stop_ids(e->qwen_tok);
+    fprintf(stderr, "pulsar: %s: tokenizer %d ids from %s; stop ids", PULSAR_QWEN_ARCH,
+            qwen_tokenizer_n_tokens(e->qwen_tok), tp.c_str());
+    for (int id : stop) fprintf(stderr, " %d", id);
+    fprintf(stderr, "\n");
+    return true;
+}
+
 static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* The options that name a DeepSeek-only feature refuse here, by name,
      * rather than being ignored. */
@@ -470,8 +514,8 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
         return false;
     }
     if (!pulsar_qwen_s4_load(e, opt)) return false;
-    fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u; the tokenizer "
-                    "and renderer are not implemented (S5)\n",
+    if (!qwen_load_tokenizer(e, opt->model_path)) return false;
+    fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA), g_qwen_shape.ple_layer);

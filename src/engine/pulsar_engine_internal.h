@@ -1826,6 +1826,10 @@ struct pulsar_engine {
     pulsar_layer_plan plan;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
+    /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
+     * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
+     * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
+    struct qwen_tokenizer *qwen_tok;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids
