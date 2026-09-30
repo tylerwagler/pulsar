@@ -2906,6 +2906,13 @@ bool model_get_u64_compat(const pulsar_model *m, const char *key, uint64_t *out)
 bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out);
 bool model_get_bool(const pulsar_model *m, const char *key, bool *out);
 bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *out);
+/** Give the checkpoint's host pages back after load: MADV_DONTNEED on every
+ * shard mapping (the mapping stays valid -- a later host read refaults the page
+ * from disk) and POSIX_FADV_DONTNEED on its file (drops the page cache).  Only
+ * when the device reads no weight through the host mapping
+ * (pulsar_gpu_model_reads_host_pages) and the graph backend owns the weights;
+ * the caller decides.  @return the resident bytes released. */
+uint64_t pulsar_model_release_host_pages(pulsar_model *m);
 void model_close(pulsar_model *m);
 /** Open and map the GGUF once.  The GPU path needs a shared mapping for
  * no-copy GPU buffers; tokenizer/inspection opens use a private read-only
