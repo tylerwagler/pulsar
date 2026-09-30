@@ -17,6 +17,7 @@
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,27 @@ static char *read_file(const char *path) {
     fclose(fp);
     buf[n] = '\0';
     return buf;
+}
+
+/* host wall time of every bank save / restore the lane makes (the L260 cost), printed at the end */
+static double g_save_us, g_restore_us;
+static uint64_t g_saves, g_restores;
+static double now_us() {
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count() / 1e3;
+}
+static void timed_save(pulsar_session *s, uint32_t b) {
+    const double t0 = now_us();
+    pulsar_session_bank_state_save(s, b);
+    g_save_us += now_us() - t0;
+    g_saves++;
+}
+static bool timed_restore(pulsar_session *s, uint32_t b) {
+    const double t0 = now_us();
+    const bool ok = pulsar_session_bank_state_restore(s, b);
+    g_restore_us += now_us() - t0;
+    g_restores++;
+    return ok;
 }
 
 static uint64_t fnv(uint64_t h, int v) {
@@ -107,7 +129,7 @@ int GATE_ENTRY(int argc, char **argv) {
         int first[NB];
         uint32_t row0[NB], rows = 0;
         for (int b = 0; b < NB; b++) {
-            if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
+            if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
             first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]);
             if (first[b] < 0 || pulsar_session_spec_round_begin(s, r[b], first[b], 64, 17, temp, top_k, top_p, min_p,
                                                                 err, sizeof(err)) != 0) {
@@ -116,7 +138,7 @@ int GATE_ENTRY(int argc, char **argv) {
             }
             row0[b] = rows;
             rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, first[b], reqs + rows);
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            timed_save(s, (uint32_t)b);
         }
         pulsar_session_spec_arm_capture(s, rows);
         uint32_t got = 0;
@@ -126,7 +148,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (rc != 0 || got != rows) { fprintf(stderr, "tick %d forward: %s\n", t, err); return 1; }
         printf("tick %d:", t);
         for (int b = 0; b < NB; b++) {
-            if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
+            if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
             int acc[17];
             const int na = pulsar_session_spec_round_end(s, r[b], first[b], eos, temp, top_k, top_p, min_p, &rngs[b],
                                                          logits, row0[b], acc, 17, err, sizeof(err));
@@ -134,7 +156,7 @@ int GATE_ENTRY(int argc, char **argv) {
             printf(" [b%d", b);
             for (int k = 0; k < na; k++) { printf(" %d", acc[k]); hash[b] = fnv(hash[b], acc[k]); }
             printf("]");
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            timed_save(s, (uint32_t)b);
         }
         printf("\n");
         uint32_t banks[NB] = {0, 1, 2};
@@ -142,17 +164,21 @@ int GATE_ENTRY(int argc, char **argv) {
         if (pulsar_session_spec_redraft_batch(s, r, banks, rps, NB, err, sizeof(err)) != 0)
             fprintf(stderr, "tick %d redraft: %s (banks take a plain step)\n", t, err);
         for (int b = 0; b < NB; b++) {
-            if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
+            if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
             pulsar_session_spec_redraft_commit(s, r[b]);
             drafted += s->spec.dspark_n_pending;
             full_rows += full_row_pendings(s);
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            timed_save(s, (uint32_t)b);
         }
     }
     printf("hash b0 %016llx b1 %016llx b2 %016llx\n", (unsigned long long)hash[0], (unsigned long long)hash[1],
            (unsigned long long)hash[2]);
     printf("pending drafts %llu, of them full-row (non-compact q) %llu%s\n", (unsigned long long)drafted,
            (unsigned long long)full_rows, full_rows ? "" : "  -- the full-row path was NOT exercised");
+    printf("host: %llu saves %.1f us mean, %llu restores %.1f us mean (the timing lines differ run to run; the "
+           "token lines above are the identity)\n", (unsigned long long)g_saves,
+           g_saves ? g_save_us / (double)g_saves : 0.0, (unsigned long long)g_restores,
+           g_restores ? g_restore_us / (double)g_restores : 0.0);
     for (int b = 0; b < NB; b++) pulsar_spec_round_free(r[b]);
     free(logits);
     pulsar_session_free(s);
