@@ -168,6 +168,21 @@ typedef struct {
     pulsar_tensor *inject;         ///< block_inject_weight   [n_hc*n_embd -> n_hc]; NULL on the mixer
 } pulsar_qwen_gr_weights;
 
+/** L255: one Tessera projection stack's kernel-ready planes (src/cuda/mmq/pulsar_tessera.h), in this order,
+ *  each the tensor mlp.experts.tessera.<proj>.<plane> (plane names in family_qwen.cpp). */
+enum {
+    PULSAR_QWEN_TESS_WORDS = 0,   ///< I32  [n_expert][words_stride]
+    PULSAR_QWEN_TESS_TABLE,       ///< BF16 [n_expert][16384] composed table
+    PULSAR_QWEN_TESS_INIT,        ///< I32  [n_expert][in]
+    PULSAR_QWEN_TESS_HAS_INIT,    ///< I32  [n_expert]
+    PULSAR_QWEN_TESS_WSCALE,      ///< F32  [n_expert][out]
+    PULSAR_QWEN_TESS_RUNS,        ///< I32  [n_expert][8]
+    PULSAR_QWEN_TESS_BDESC,       ///< I32  [n_expert][in / 32][12]
+    PULSAR_QWEN_TESS_GEOM,        ///< I32  [2]: tile_words, slot_words (read on the host)
+    PULSAR_QWEN_TESS_PLANES
+};
+enum { PULSAR_QWEN_TESS_GATE = 0, PULSAR_QWEN_TESS_UP, PULSAR_QWEN_TESS_DOWN, PULSAR_QWEN_TESS_PROJS };
+
 typedef struct {
     pulsar_qwen_gr_weights gr_attn;
     pulsar_qwen_gr_weights gr_mlp;
@@ -198,6 +213,10 @@ typedef struct {
     /** L251 MTP: the SPLIT expert form -- mlp.experts.gate_proj / up_proj [n_expert][n_embd -> n_ff_exp],
      *  each slice with its own suh (the MTP layer, turboderp's EXL3).  Set exactly when moe_gate_up is NULL. */
     pulsar_tensor *moe_gate, *moe_up;
+    /** L255: the routed experts in Tessera's value family -- set (every plane of all three projections)
+     *  exactly when the artifact carries the layer's experts that way, and then every EXL3 expert tensor above
+     *  is NULL: a layer declares its experts once, and the load refuses a partial set or both forms. */
+    pulsar_tensor *moe_tess[PULSAR_QWEN_TESS_PROJS][PULSAR_QWEN_TESS_PLANES];
     pulsar_tensor *sh_gate;        ///< mlp.shared_expert.gate_proj [n_embd -> n_ff_shexp]
     pulsar_tensor *sh_up;          ///< mlp.shared_expert.up_proj   [n_embd -> n_ff_shexp]
     pulsar_tensor *sh_down;        ///< mlp.shared_expert.down_proj [n_ff_shexp -> n_embd]

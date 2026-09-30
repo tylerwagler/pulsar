@@ -187,10 +187,15 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
  *  up) or a gate + up PAIR (two stacks, each with its own suh), and a down stack.  The tables hold experts
  *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
  *  rank's experts are dropped here and summed there. */
+struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
     const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */
     const void *const *down_table;
+    /** L255: the routed experts in Tessera's value family (src/cuda/mmq/pulsar_tessera.h) -- gate, up and down
+     *  stacks of n_expert, kernel-ready.  Set INSTEAD of every EXL3 table above; the launcher refuses a descriptor
+     *  with both or neither, and (no expert range in that arm yet) one whose tables are not every expert. */
+    const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
     int ex_lo, n_local;                  /**< the experts the tables hold */
     /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is

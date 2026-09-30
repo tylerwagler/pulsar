@@ -17,6 +17,7 @@
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 #include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/mmq/pulsar_tessera.h"
 
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
                                   pulsar_act_format act) {
@@ -88,6 +89,20 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
 }
 
 bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
+    if (c->tessera_gate) {
+        /* L255: Tessera planes carry no format the registry names -- the family admitted them plane by plane
+         * (admit_tessera) and built the three descriptors; the arm takes every expert (no range: the family refuses
+         * the call under tensor parallelism), so the plan is not consulted */
+        pulsar_rows_moe w{};
+        w.tessera_gate = c->tessera_gate;
+        w.tessera_up = c->tessera_up;
+        w.tessera_down = c->tessera_down;
+        w.ex_lo = 0;
+        w.n_local = c->tessera_gate->E;
+        w.prompt = c->prompt;
+        return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
+                                             c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
+    }
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
     const pulsar_moe_arm arm = pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
     if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR) {

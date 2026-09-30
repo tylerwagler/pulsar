@@ -3138,9 +3138,13 @@ typedef struct {
 bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c);
 /** The routed part over raw bf16 rows (pulsar_rows_moe_routed_launch): `selected` is localised in place under
  *  expert parallelism (the rank's plan's range of whole experts). */
+struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 typedef struct {
     const pulsar_model *m;
     const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
+    /** L255: the layer's routed experts as Tessera planes instead -- the three kernel-ready stacks the family
+     *  built from them (family_qwen.h PULSAR_QWEN_TESS_*), or NULL; then gate / up / down are unread. */
+    const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int32_t *selected;
     const float *weights;
     const uint16_t *x_bf16;
