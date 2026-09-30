@@ -1392,6 +1392,11 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  */
 int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
                          int n_images, char *err, size_t errlen) {
+    return sync_impl(prompt, images, n_images, false, err, errlen);
+}
+
+int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                              int n_images, bool logits_owed, char *err, size_t errlen) {
     auto *s = this;
     s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -1557,8 +1562,21 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
-            if (ahead) s->rewind(s->checkpoint.len);
+            if (ahead) {
+                s->rewind(s->checkpoint.len);
+                logits_owed = true;
+            }
         }
+        /* A rewind -- ours just above, or the seam rescue's that re-entered here
+         * -- leaves s->logits describing the frontier the bank was cut FROM.  With
+         * rows still to evaluate the prefill below refreshes them; with none
+         * (the prompt is exactly the cut: a retried or regenerated request on a
+         * bank that went on to answer it) they would be a finished answer's
+         * distribution, and the request sampled EOS and returned nothing
+         * (2026-09-30, the pair: the same 16-token prompt twice, the second
+         * 0 tokens).  Owe one row: step back one token, and the resume below
+         * re-prefills from its grid point, byte for byte the cold prefill. */
+        if (logits_owed && prompt->len == s->checkpoint.len) s->rewind(prompt->len - 1);
         /* L183/L194/L195/L218: a resume is a COLD PREFILL FROM A GRID POINT.  A
          * prefill chunk's bytes depend on the chunk's row count and on a row's
          * offset within the call (L183), so a suffix evaluated from an off-grid
@@ -1738,8 +1756,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             memcpy(stitched.v + live_n, prompt->v + prompt_n,
                    (size_t)(prompt->len - prompt_n) * sizeof(int));
             stitched.len = stitched.cap;
-            const int rc = s->sync(&stitched, n_images > 0 ? images : NULL,
-                                   n_images > 0 ? n_images : 0, err, errlen);
+            const int rc = s->sync_impl(&stitched, n_images > 0 ? images : NULL,
+                                        n_images > 0 ? n_images : 0, true, err, errlen);
             free(stitched.v);
             return rc;
         }
