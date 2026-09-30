@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 17u           /* v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 18u           /* v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -368,6 +368,12 @@ int pulsar_tp_bulk_arrival_ready(const pulsar_tp_bulk_arrivals *a, uint64_t want
 /** Did arrival `want` carry exchange id `exch`, with the peer at most one exchange
  * ahead?  0 = the ranks' exchange order really diverged. */
 int pulsar_tp_bulk_arrival_matches(const pulsar_tp_bulk_arrivals *a, uint64_t want, uint64_t exch);
+/** The bulk lane's two-rail split (v18): of a `bytes` exchange, the primary rail
+ * carries [0, return) and the second rail [return, bytes).  The second rail's
+ * share is half the payload rounded down to 4 KiB, so both shares stay page
+ * aligned and an exchange under 8 KiB rides the primary whole (the second
+ * rail then sends only its zero-length WITH_IMM).  Both ranks split alike. */
+uint64_t pulsar_tp_bulk_rail_split(uint64_t bytes);
 /* The row-lane descriptor's bulk flag (word 2; low bit = buffer). */
 #define PULSAR_TP_DESC_BULK_FLAG (UINT64_C(1) << 63)
 

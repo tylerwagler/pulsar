@@ -109,6 +109,15 @@ typedef struct {
     uint32_t bulk_rkey;
     uint32_t bulk_qpn;
     uint32_t bulk_psn;
+    /* v18: the bulk lane's second rail (PULSAR_TP_RDMA_DEV2) -- the same bulk
+     * buffer registered on a second HCA function, and that function's bulk QP
+     * and address; all zero when this rank opened no second rail. */
+    uint32_t bulk2_rkey;
+    uint32_t bulk2_qpn;
+    uint32_t bulk2_psn;
+    uint32_t bulk2_mtu;
+    uint16_t bulk2_lid;
+    uint8_t bulk2_gid[16];
 } pulsar_tp_rdma_info;
 
 /* ---- verbs ABI thunk (see head-of-section note) ---- */
@@ -524,6 +533,10 @@ typedef struct {
      * never mixes with the gate QP's 16 KB receives. */
     tp_ibv_qp bulk_qp;
     pulsar_tp_bulk_arrivals bulk_arr;   /* the peer's imm arrivals, credited by index (L258) */
+    /* The bulk lane's second rail (v18): a UC QP on tp->rail2 that carries the
+     * back half of every bulk exchange, with its own imm arrivals. */
+    tp_ibv_qp bulk_qp2;
+    pulsar_tp_bulk_arrivals bulk_arr2;
 } pulsar_tp_rdma_link;
 
 /* One peer in the TP mesh.  A full-mesh rank connects to every other rank
@@ -597,6 +610,12 @@ struct pulsar_tp {
     uint64_t bulk_seq = 0;          /* engine thread: bulk exchanges numbered (buffer parity) */
     uint64_t peer_bulk_base = 0;    /* the peer's bulk buffer and rkey (v14 info) */
     uint32_t peer_bulk_rkey = 0;
+    /* The bulk lane's second rail (PULSAR_TP_RDMA_DEV2, v18): a second HCA
+     * function on the same port -- one function's PCIe x4 caps a direction near
+     * 109 Gb/s, the port is 200.  Only ctx/pd/bulk_cq/bulk_mr and the address
+     * are used; ctx == NULL means one rail. */
+    pulsar_tp_rdma rail2;
+    uint32_t peer_bulk2_rkey = 0;
 };
 
 /* ------------------------------------------------------------------------
@@ -880,8 +899,12 @@ static pulsar_tp_rdma_link *tp_pair_link(pulsar_tp *tp) {
     return (tp->n_peers > 0) ? &tp->peers[0].rdma : NULL;
 }
 
-static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
-    pulsar_tp_rdma *r = &tp->rdma;
+/* Open ONE verbs device into `r` (whose api is already loaded): pick the
+ * device (`want_name`, else the first ACTIVE port by name), resolve its ops
+ * table and choose its GID (`gid_env`, else the RoCEv2 preference below).  The
+ * primary device and the bulk lane's second rail both come through here. */
+static int tp_rdma_open_device(pulsar_tp_rdma *r, const char *want_name, const char *gid_env,
+                               char *err, size_t errlen) {
     int num = 0;
     tp_ibv_device *devs = r->api.get_device_list(&num);
     if (!devs || num == 0) {
@@ -903,14 +926,10 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
                 devs[j - 1] = devs[j];
                 devs[j] = t;
             }
-    if (num > 1 && !getenv("PULSAR_TP_RDMA_DEV"))
+    if (num > 1 && !want_name)
         fprintf(stderr,
                 "pulsar-tp: %d verbs devices; auto-picked by name — pin the "
                 "SAME cable on both ranks with PULSAR_TP_RDMA_DEV=<hca>\n", num);
-    /* One verbs device per link.  The pair is wired by two QSFP cables, so
-     * PULSAR_TP_RDMA_DEV pins the device per rank (later two-link bench);
-     * the default auto-picks the first ACTIVE port. */
-    const char *want_name = getenv("PULSAR_TP_RDMA_DEV");
     char states[256] = "";
     int chose;
     for (int i = 0; i < num && !r->ctx; i++) {
@@ -975,7 +994,6 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
      * a non-zero index, so: honor PULSAR_TP_RDMA_GID_INDEX, else prefer the
      * RoCEv2 IPv4-mapped GID (per gid_type), else a RoCEv2 routable GID, else
      * the first non-link-local (routable) GID on the legacy path. */
-    const char *gid_env = getenv("PULSAR_TP_RDMA_GID_INDEX");
     r->gid_index = -1;
     if (gid_env) {
         const int gi = atoi(gid_env);
@@ -1044,6 +1062,17 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
             "pulsar-tp: gid index %d (%02x:%02x:%02x:%02x:...)\n",
             r->gid_index, r->gid.raw[0], r->gid.raw[1], r->gid.raw[2],
             r->gid.raw[3]);
+    return 1;
+}
+
+static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
+    pulsar_tp_rdma *r = &tp->rdma;
+    /* One verbs device per link.  The pair is wired by two QSFP cables, so
+     * PULSAR_TP_RDMA_DEV pins the device per rank; the default auto-picks the
+     * first ACTIVE port. */
+    if (!tp_rdma_open_device(r, getenv("PULSAR_TP_RDMA_DEV"), getenv("PULSAR_TP_RDMA_GID_INDEX"),
+                             err, errlen))
+        return 0;
     r->pd = r->api.alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
@@ -1163,9 +1192,11 @@ static int tp_rdma_register_slab(pulsar_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
-/* INIT -> RTR -> RTS for one UC QP toward `peer` (GRH addressing through its
- * GID, the lower of the two ports' MTUs).  The gate QP and the bulk QP share it. */
-static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_info *peer,
+/* INIT -> RTR -> RTS for one UC QP on `rail` toward the peer's address (GRH
+ * addressing through its GID, the lower of the two ports' MTUs).  The gate QP
+ * and both bulk rails share it. */
+static int tp_rdma_qp_connect(const pulsar_tp_rdma *rail, tp_ibv_qp qp, uint32_t peer_mtu,
+                              uint16_t peer_lid, const uint8_t *peer_gid,
                               uint32_t dest_qpn, uint32_t dest_psn, uint32_t my_psn, int rank,
                               char *err, size_t errlen) {
     /* INIT -> RTR -> RTS with GRH addressing through the exchanged GID. */
@@ -1176,7 +1207,7 @@ static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_
     a.port_num = 1;
     a.qp_access_flags = TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_READ |
                         TP_IBV_ACCESS_REMOTE_WRITE;
-    if (tp->rdma.api.modify_qp(qp, &a,
+    if (rail->api.modify_qp(qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_PKEY_INDEX | TP_IBV_QP_PORT |
             TP_IBV_QP_ACCESS_FLAGS) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify INIT rank %d: %s", rank, strerror(errno));
@@ -1190,18 +1221,18 @@ static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_
      * silently drops (bisected with a probe: >1024 fails with per-port
      * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
      * two ports' MTUs, on both ranks. */
-    a.path_mtu = tp->rdma.port.active_mtu;
-    if (peer->mtu != 0 && (int)peer->mtu < (int)a.path_mtu)
-        a.path_mtu = (decltype(a.path_mtu))(int)peer->mtu;
+    a.path_mtu = rail->port.active_mtu;
+    if (peer_mtu != 0 && (int)peer_mtu < (int)a.path_mtu)
+        a.path_mtu = (decltype(a.path_mtu))(int)peer_mtu;
     a.dest_qp_num = dest_qpn;
     a.rq_psn = dest_psn;
-    a.ah_attr.dlid = (uint16_t)peer->lid;
+    a.ah_attr.dlid = peer_lid;
     a.ah_attr.port_num = 1;
     a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, peer->gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)tp->rdma.gid_index;
+    memcpy(a.ah_attr.grh.dgid.raw, peer_gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)rail->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (tp->rdma.api.modify_qp(qp, &a,
+    if (rail->api.modify_qp(qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
             TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR rank %d: %s", rank, strerror(errno));
@@ -1210,7 +1241,7 @@ static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTS;
     a.sq_psn = my_psn;
-    if (tp->rdma.api.modify_qp(qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
+    if (rail->api.modify_qp(qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS rank %d: %s", rank, strerror(errno));
         return 0;
     }
@@ -1234,15 +1265,15 @@ int pulsar_tp_bulk_arrival_matches(const pulsar_tp_bulk_arrivals *a, uint64_t wa
     return a->arrived >= want && a->arrived <= want + 1u && a->imm[want & 1u] == (uint32_t)exch;
 }
 
-static int tp_bulk_post_imm_recv(pulsar_tp *tp, pulsar_tp_rdma_link *r) {
+static int tp_bulk_post_imm_recv(const pulsar_tp_rdma *rail, tp_ibv_qp qp) {
     struct tp_ibv_recv_wr wr;
     struct tp_ibv_recv_wr *bad = NULL;
     (void)memset(&wr, 0, sizeof(wr));
     wr.wr_id = PULSAR_TP_BULK_WR_TAG;
     wr.sg_list = NULL;
     wr.num_sge = 0;
-    if (tp->rdma.api.post_recv(r->bulk_qp, &wr, &bad) != 0) {
-        fprintf(stderr, "pulsar-tp: bulk imm post_recv: %s\n", strerror(errno));
+    if (rail->api.post_recv(qp, &wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk imm post_recv (%s): %s\n", rail->dev_name, strerror(errno));
         return 0;
     }
     return 1;
@@ -1283,6 +1314,22 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
         mine.bulk_rkey = TP_RKEY(tp->rdma.bulk_mr);
         mine.bulk_qpn = TP_QPN(r->bulk_qp);
         mine.bulk_psn = (mine.psn ^ 0x5a5a5au) & 0xffffff;
+        if (tp->rail2.ctx) {
+            qia.send_cq = (decltype(qia.send_cq))tp->rail2.bulk_cq;
+            qia.recv_cq = (decltype(qia.recv_cq))tp->rail2.bulk_cq;
+            r->bulk_qp2 = tp->rail2.api.create_qp(tp->rail2.pd, &qia);
+            if (!r->bulk_qp2) {
+                tp_set_err(err, errlen, "tp rdma: create_qp(UC, bulk rail 2 on %s): %s",
+                           tp->rail2.dev_name, strerror(errno));
+                return 0;
+            }
+            mine.bulk2_rkey = TP_RKEY(tp->rail2.bulk_mr);
+            mine.bulk2_qpn = TP_QPN(r->bulk_qp2);
+            mine.bulk2_psn = (mine.psn ^ 0xa5a5a5u) & 0xffffff;
+            mine.bulk2_mtu = (uint32_t)tp->rail2.port.active_mtu;
+            mine.bulk2_lid = tp->rail2.port.lid;
+            memcpy(mine.bulk2_gid, tp->rail2.gid.raw, 16);
+        }
     }
     mine.mtu = (uint32_t)tp->rdma.port.active_mtu;
     mine.lid = tp->rdma.port.lid;
@@ -1301,24 +1348,47 @@ static int tp_rdma_link_bringup(pulsar_tp *tp, pulsar_tp_peer *pp,
         return 0;
     }
 
-    if (!tp_rdma_qp_connect(tp, r->qp, &r->peer, r->peer.qpn, r->peer.psn, mine.psn, pp->rank,
-                            err, errlen))
+    if (!tp_rdma_qp_connect(&tp->rdma, r->qp, r->peer.mtu, r->peer.lid, r->peer.gid, r->peer.qpn,
+                            r->peer.psn, mine.psn, pp->rank, err, errlen))
         return 0;
+    /* Both ranks split every bulk exchange the same way, so a second rail on
+     * one rank only is a configuration error, refused by name. */
+    if ((mine.bulk2_qpn != 0) != (r->peer.bulk2_qpn != 0)) {
+        tp_set_err(err, errlen, "tp rdma: rank %d %s a second bulk rail and rank %d %s -- set "
+                   "PULSAR_TP_RDMA_DEV2 on both ranks or on neither", tp->rank,
+                   mine.bulk2_qpn ? "opened" : "did not open", pp->rank,
+                   r->peer.bulk2_qpn ? "did" : "did not");
+        return 0;
+    }
     /* The bulk lane: both ranks attached a bulk buffer (the info says so), so
      * connect the second QP and post its imm window BEFORE the ready barrier --
      * a WRITE_WITH_IMM that arrives before the peer posted its receive is
      * dropped by UC. */
     if (r->bulk_qp && r->peer.bulk_qpn != 0) {
-        if (!tp_rdma_qp_connect(tp, r->bulk_qp, &r->peer, r->peer.bulk_qpn, r->peer.bulk_psn,
-                                mine.bulk_psn, pp->rank, err, errlen))
+        if (!tp_rdma_qp_connect(&tp->rdma, r->bulk_qp, r->peer.mtu, r->peer.lid, r->peer.gid,
+                                r->peer.bulk_qpn, r->peer.bulk_psn, mine.bulk_psn, pp->rank,
+                                err, errlen))
             return 0;
         tp->peer_bulk_base = r->peer.bulk_base;
         tp->peer_bulk_rkey = r->peer.bulk_rkey;
         for (uint32_t k = 0; k < PULSAR_TP_BULK_IMM_WINDOW; k++)
-            if (!tp_bulk_post_imm_recv(tp, r)) {
+            if (!tp_bulk_post_imm_recv(&tp->rdma, r->bulk_qp)) {
                 tp_set_err(err, errlen, "tp rdma: bulk imm window post to rank %d failed", pp->rank);
                 return 0;
             }
+        if (r->bulk_qp2) {
+            if (!tp_rdma_qp_connect(&tp->rail2, r->bulk_qp2, r->peer.bulk2_mtu, r->peer.bulk2_lid,
+                                    r->peer.bulk2_gid, r->peer.bulk2_qpn, r->peer.bulk2_psn,
+                                    mine.bulk2_psn, pp->rank, err, errlen))
+                return 0;
+            tp->peer_bulk2_rkey = r->peer.bulk2_rkey;
+            for (uint32_t k = 0; k < PULSAR_TP_BULK_IMM_WINDOW; k++)
+                if (!tp_bulk_post_imm_recv(&tp->rail2, r->bulk_qp2)) {
+                    tp_set_err(err, errlen, "tp rdma: bulk rail 2 imm window post to rank %d failed",
+                               pp->rank);
+                    return 0;
+                }
+        }
     }
     /* Leave the receive queue empty for an initial bulk prefill; the first
      * decode gate arms the normal lookahead window. */
@@ -1624,72 +1694,109 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     return ok;
 }
 
-/* One BULK exchange, proxy thread (v14).  This rank's payload sits in its bulk
- * out-region (the GPU staged it); it is RDMA-written straight into the peer's
- * in[buf], PULSAR_TP_BULK_PIECE at a time, the last write carrying the exchange
- * id as immediate data.  Completion = the peer's matching WITH_IMM arrived (its
- * data is in our in[buf]: UC delivers a QP's writes in order, so the imm lands
- * after them) AND our own writes retired (the out-region may be restaged).
- * One zero-length receive is re-posted per exchange, keeping the window full.
- * No handshake: both ranks number bulk exchanges identically, and the window
- * was armed before the bring-up's ready barrier. */
-static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uint32_t buf) {
-    pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    const uint32_t n = (uint32_t)((bytes + PULSAR_TP_BULK_PIECE - 1u) / PULSAR_TP_BULK_PIECE);
-    if (!r || !r->bulk_qp || n == 0 || n > 64u) {
-        fprintf(stderr, "pulsar-tp: bulk exchange %llu refused (%llu bytes, %u pieces)\n",
-                (unsigned long long)e, (unsigned long long)bytes, n);
+uint64_t pulsar_tp_bulk_rail_split(uint64_t bytes) {
+    return bytes - (bytes / 2u) / 4096u * 4096u;
+}
+
+/* Post one rail's share of a bulk exchange: [off, off+len) of this rank's
+ * out-region RDMA-written into the peer's in-buffer at the same offset,
+ * PULSAR_TP_BULK_PIECE at a time, the last write carrying the exchange id as
+ * immediate data (a zero-length share is that one write alone). */
+static int tp_bulk_post_rail(const pulsar_tp_rdma *rail, tp_ibv_qp qp, uint32_t rkey,
+                             const uint8_t *out, uint64_t remote, uint64_t off, uint64_t len,
+                             uint64_t e) {
+    const uint32_t n = len ? (uint32_t)((len + PULSAR_TP_BULK_PIECE - 1u) / PULSAR_TP_BULK_PIECE) : 1u;
+    if (n > 64u) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu refused on %s (%llu bytes, %u pieces)\n",
+                (unsigned long long)e, rail->dev_name, (unsigned long long)len, n);
         return 0;
     }
-    const uint64_t remote = tp->peer_bulk_base + (1u + buf) * tp->bulk_cap;
     struct tp_ibv_sge sge[64];
     struct tp_ibv_send_wr wr[64];
     (void)memset(wr, 0, sizeof(wr));
     for (uint32_t i = 0; i < n; i++) {
-        const uint64_t off = (uint64_t)i * PULSAR_TP_BULK_PIECE;
-        const uint64_t len = bytes - off < PULSAR_TP_BULK_PIECE ? bytes - off : PULSAR_TP_BULK_PIECE;
+        const uint64_t o = off + (uint64_t)i * PULSAR_TP_BULK_PIECE;
+        const uint64_t l = len == 0 ? 0 : off + len - o < PULSAR_TP_BULK_PIECE ? off + len - o
+                                                                           : PULSAR_TP_BULK_PIECE;
         const bool last = i + 1u == n;
-        sge[i].addr = (uintptr_t)(tp->bulk + off);
-        sge[i].length = (uint32_t)len;
-        sge[i].lkey = TP_LKEY(tp->rdma.bulk_mr);
+        sge[i].addr = (uintptr_t)(out + o);
+        sge[i].length = (uint32_t)l;
+        sge[i].lkey = TP_LKEY(rail->bulk_mr);
         wr[i].wr_id = PULSAR_TP_BULK_WR_TAG | e;
-        wr[i].sg_list = &sge[i];
-        wr[i].num_sge = 1;
+        wr[i].sg_list = l ? &sge[i] : NULL;
+        wr[i].num_sge = l ? 1 : 0;
         wr[i].opcode = last ? TP_IBV_WR_RDMA_WRITE_WITH_IMM : TP_IBV_WR_RDMA_WRITE;
         wr[i].send_flags = last ? TP_IBV_SEND_SIGNALED : 0;
-        wr[i].wr.rdma.remote_addr = remote + off;
-        wr[i].wr.rdma.rkey = tp->peer_bulk_rkey;
+        wr[i].wr.rdma.remote_addr = remote + o;
+        wr[i].wr.rdma.rkey = rkey;
         if (last) wr[i].imm_data = (uint32_t)e;
         wr[i].next = last ? NULL : &wr[i + 1u];
     }
     struct tp_ibv_send_wr *bad = NULL;
-    if (tp->rdma.api.post_send(r->bulk_qp, wr, &bad) != 0) {
-        fprintf(stderr, "pulsar-tp: bulk rdma write post (exchange %llu): %s\n",
-                (unsigned long long)e, strerror(errno));
+    if (rail->api.post_send(qp, wr, &bad) != 0) {
+        fprintf(stderr, "pulsar-tp: bulk rdma write post on %s (exchange %llu): %s\n",
+                rail->dev_name, (unsigned long long)e, strerror(errno));
         return 0;
     }
+    return 1;
+}
+
+/* Reap one rail's bulk completions: a send CQE retires our writes, a recv CQE
+ * credits the peer's imm.  0 = a completion error. */
+static int tp_bulk_reap_rail(const pulsar_tp_rdma *rail, pulsar_tp_bulk_arrivals *arr, bool *sent,
+                             uint64_t e) {
+    struct tp_ibv_wc wc[8];
+    const int got = rail->api.poll_cq(rail->bulk_cq, 8, wc);
+    if (got < 0) return 0;
+    for (int i = 0; i < got; i++) {
+        if (wc[i].status != TP_IBV_WC_SUCCESS) {
+            fprintf(stderr, "pulsar-tp: bulk rdma completion error on %s: %s (exchange %llu)\n",
+                    rail->dev_name, tp_wc_status_str(wc[i].status), (unsigned long long)e);
+            return 0;
+        }
+        if (wc[i].opcode & TP_IBV_WC_RECV) pulsar_tp_bulk_arrival_credit(arr, wc[i].imm_data);
+        else *sent = true;
+    }
+    return 1;
+}
+
+/* One BULK exchange, proxy thread (v14; two rails v18).  This rank's payload
+ * sits in its bulk out-region (the GPU staged it); it is RDMA-written straight
+ * into the peer's in[buf].  With a second rail, the front of the payload rides
+ * the primary HCA and the back rides rail 2 (pulsar_tp_bulk_rail_split), each
+ * ending in its own WITH_IMM.  Completion = on every rail, the peer's matching
+ * WITH_IMM arrived (UC delivers a QP's writes in order, so its share of our
+ * in[buf] is whole) AND our own writes retired (the out-region may be
+ * restaged).  One zero-length receive is re-posted per rail per exchange,
+ * keeping the windows full.  No handshake: both ranks number and split bulk
+ * exchanges identically, and the windows were armed before the bring-up's
+ * ready barrier. */
+static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uint32_t buf) {
+    pulsar_tp_rdma_link *r = tp_pair_link(tp);
+    if (!r || !r->bulk_qp || bytes == 0) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu refused (%llu bytes)\n",
+                (unsigned long long)e, (unsigned long long)bytes);
+        return 0;
+    }
+    const bool two = r->bulk_qp2 != NULL;
+    const uint64_t front = two ? pulsar_tp_bulk_rail_split(bytes) : bytes;
+    const uint64_t remote = tp->peer_bulk_base + (1u + buf) * tp->bulk_cap;
+    if (!tp_bulk_post_rail(&tp->rdma, r->bulk_qp, tp->peer_bulk_rkey, tp->bulk, remote, 0, front, e))
+        return 0;
+    if (two && !tp_bulk_post_rail(&tp->rail2, r->bulk_qp2, tp->peer_bulk2_rkey, tp->bulk, remote,
+                                  front, bytes - front, e))
+        return 0;
     const double t_posted = tp_now_sec();
-    /* The peer's k-th bulk exchange is our k-th imm arrival. */
+    /* The peer's k-th bulk exchange is our k-th imm arrival, on every rail. */
     const uint64_t want = pulsar_tp_bulk_arrival_next(&r->bulk_arr);
-    bool sent = false;
+    const uint64_t want2 = two ? pulsar_tp_bulk_arrival_next(&r->bulk_arr2) : 0;
+    bool sent = false, sent2 = !two;
     const double deadline = t_posted + (double)tp->timeout_sec;
     double next_abort_check = t_posted + 1e-3;
-    while (!sent || !pulsar_tp_bulk_arrival_ready(&r->bulk_arr, want)) {
-        struct tp_ibv_wc wc[8];
-        const int got = tp->rdma.api.poll_cq(tp->rdma.bulk_cq, 8, wc);
-        if (got < 0) return 0;
-        for (int i = 0; i < got; i++) {
-            if (wc[i].status != TP_IBV_WC_SUCCESS) {
-                fprintf(stderr, "pulsar-tp: bulk rdma completion error: %s (exchange %llu)\n",
-                        tp_wc_status_str(wc[i].status), (unsigned long long)e);
-                return 0;
-            }
-            if (wc[i].opcode & TP_IBV_WC_RECV) {
-                pulsar_tp_bulk_arrival_credit(&r->bulk_arr, wc[i].imm_data);
-            } else {
-                sent = true;
-            }
-        }
+    while (!sent || !sent2 || !pulsar_tp_bulk_arrival_ready(&r->bulk_arr, want) ||
+           (two && !pulsar_tp_bulk_arrival_ready(&r->bulk_arr2, want2))) {
+        if (!tp_bulk_reap_rail(&tp->rdma, &r->bulk_arr, &sent, e)) return 0;
+        if (two && !tp_bulk_reap_rail(&tp->rail2, &r->bulk_arr2, &sent2, e)) return 0;
         const double now = tp_now_sec();
         if (now > next_abort_check) {
             next_abort_check = now + 1e-3;
@@ -1699,24 +1806,32 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
                 return 0;
             }
             if (now > deadline) {
-                fprintf(stderr, "pulsar-tp: bulk exchange %llu timed out (imm %llu/%llu, sent %d)\n",
+                fprintf(stderr, "pulsar-tp: bulk exchange %llu timed out (imm %llu/%llu sent %d; "
+                                "rail 2 imm %llu/%llu sent %d)\n",
                         (unsigned long long)e, (unsigned long long)r->bulk_arr.arrived,
-                        (unsigned long long)want, (int)sent);
+                        (unsigned long long)want, (int)sent,
+                        (unsigned long long)r->bulk_arr2.arrived, (unsigned long long)want2,
+                        (int)sent2);
                 return 0;
             }
         }
     }
     /* The ranks number exchanges identically: the arrival that answers THIS
-     * exchange must carry its id.  A later arrival already reaped (the peer is
-     * one exchange ahead) is its own exchange's answer, kept for it. */
-    if (!pulsar_tp_bulk_arrival_matches(&r->bulk_arr, want, e)) {
-        fprintf(stderr, "pulsar-tp: bulk exchange %llu was answered by the peer's exchange %u "
-                        "(arrival %llu of %llu reaped) -- the ranks' exchange order diverged\n",
-                (unsigned long long)e, r->bulk_arr.imm[want & 1u], (unsigned long long)want,
-                (unsigned long long)r->bulk_arr.arrived);
-        return 0;
+     * exchange must carry its id, on each rail.  A later arrival already reaped
+     * (the peer is one exchange ahead) is its own exchange's answer, kept for it. */
+    for (int k = 0; k < (two ? 2 : 1); k++) {
+        const pulsar_tp_bulk_arrivals *arr = k ? &r->bulk_arr2 : &r->bulk_arr;
+        const uint64_t w = k ? want2 : want;
+        if (!pulsar_tp_bulk_arrival_matches(arr, w, e)) {
+            fprintf(stderr, "pulsar-tp: bulk exchange %llu was answered on %s by the peer's exchange %u "
+                            "(arrival %llu of %llu reaped) -- the ranks' exchange order diverged\n",
+                    (unsigned long long)e, k ? tp->rail2.dev_name : tp->rdma.dev_name,
+                    arr->imm[w & 1u], (unsigned long long)w, (unsigned long long)arr->arrived);
+            return 0;
+        }
     }
-    if (!tp_bulk_post_imm_recv(tp, r)) return 0;
+    if (!tp_bulk_post_imm_recv(&tp->rdma, r->bulk_qp)) return 0;
+    if (two && !tp_bulk_post_imm_recv(&tp->rail2, r->bulk_qp2)) return 0;
     return 1;
 }
 
@@ -2061,13 +2176,19 @@ static void tp_rdma_close(pulsar_tp *tp) {
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
     if (r && r->qp) tp->rdma.api.destroy_qp(r->qp);
     if (r && r->bulk_qp) tp->rdma.api.destroy_qp(r->bulk_qp);
+    if (r && r->bulk_qp2) tp->rail2.api.destroy_qp(r->bulk_qp2);
+    if (tp->rail2.bulk_mr) tp->rail2.api.dereg_mr(tp->rail2.bulk_mr);
+    if (tp->rail2.bulk_cq) tp->rail2.api.destroy_cq(tp->rail2.bulk_cq);
+    if (tp->rail2.pd) tp->rail2.api.dealloc_pd(tp->rail2.pd);
+    if (tp->rail2.ctx) tp->rail2.api.close_device(tp->rail2.ctx);
     if (tp->rdma.mr) tp->rdma.api.dereg_mr(tp->rdma.mr);
     if (tp->rdma.bulk_mr) tp->rdma.api.dereg_mr(tp->rdma.bulk_mr);
     if (tp->rdma.cq) tp->rdma.api.destroy_cq(tp->rdma.cq);
     if (tp->rdma.bulk_cq) tp->rdma.api.destroy_cq(tp->rdma.bulk_cq);
     if (tp->rdma.pd) tp->rdma.api.dealloc_pd(tp->rdma.pd);
     if (tp->rdma.ctx) tp->rdma.api.close_device(tp->rdma.ctx);
-    if (r) { r->qp = NULL; r->bulk_qp = NULL; }
+    if (r) { r->qp = NULL; r->bulk_qp = NULL; r->bulk_qp2 = NULL; }
+    tp->rail2.bulk_mr = NULL; tp->rail2.bulk_cq = NULL; tp->rail2.pd = NULL; tp->rail2.ctx = NULL;
     tp->rdma.mr = NULL; tp->rdma.cq = NULL; tp->rdma.pd = NULL; tp->rdma.ctx = NULL;
     tp->rdma.bulk_mr = NULL; tp->rdma.bulk_cq = NULL;
 }
@@ -2691,6 +2812,32 @@ fail:
     return 0;
 }
 
+/* The bulk lane's second rail: open `name` (a second HCA function on the same
+ * port -- PULSAR_TP_RDMA_DEV2), give it its own PD and bulk CQ, and register
+ * the bulk buffer there.  Pair only; asked for and not usable = refused. */
+static int tp_rdma_rail2_open(pulsar_tp *tp, const char *name, char *err, size_t errlen) {
+    if (tp->n_ranks != 2 || strcmp(name, tp->rdma.dev_name) == 0) {
+        tp_set_err(err, errlen, "tp rdma: PULSAR_TP_RDMA_DEV2=%s refused (%s)", name,
+                   tp->n_ranks != 2 ? "the second bulk rail is pair-only"
+                                    : "it names the primary device");
+        return 0;
+    }
+    pulsar_tp_rdma *r2 = &tp->rail2;
+    r2->api = tp->rdma.api;
+    if (!tp_rdma_open_device(r2, name, NULL, err, errlen)) return 0;
+    r2->pd = r2->api.alloc_pd(r2->ctx);
+    r2->bulk_cq = r2->pd ? r2->api.create_cq(r2->ctx, 256, NULL, NULL, 0) : NULL;
+    r2->bulk_mr = r2->bulk_cq ? r2->api.reg_mr(r2->pd, tp->bulk, (size_t)tp->bulk_bytes,
+                                               TP_IBV_ACCESS_LOCAL_WRITE | TP_IBV_ACCESS_REMOTE_WRITE)
+                              : NULL;
+    if (!r2->bulk_mr) {
+        tp_set_err(err, errlen, "tp rdma: bulk rail 2 on %s: %s failed: %s", name,
+                   !r2->pd ? "alloc_pd" : !r2->bulk_cq ? "create_cq" : "reg_mr", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
 int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = static_cast<uint8_t *>(base);
     memset(tp->slab + tp->layout.in_flags_off, 0, (uint64_t)tp->n_slots * 8);
@@ -2708,6 +2855,8 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen) {
                            (unsigned long long)tp->bulk_bytes, strerror(errno));
                 return 0;
             }
+            const char *dev2 = getenv("PULSAR_TP_RDMA_DEV2");
+            if (dev2 && !tp_rdma_rail2_open(tp, dev2, err, errlen)) return 0;
         }
         for (int i = 0; i < tp->n_peers; i++)
             if (!tp_rdma_link_bringup(tp, &tp->peers[i], err, errlen)) return 0;
@@ -2808,9 +2957,18 @@ int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t
         return 0;
     }
     static int said = 0;
-    if (!said) { said = 1; fprintf(stderr, "pulsar-tp: bulk lane armed (async: GPU stage/publish/combine + "
-                                   "RDMA writes on a second QP, %llu MiB per exchange)\n",
-                                   (unsigned long long)(tp->bulk_cap >> 20)); }
+    if (!said) {
+        said = 1;
+        const pulsar_tp_rdma_link *r = tp_pair_link(tp);
+        if (r->bulk_qp2)
+            fprintf(stderr, "pulsar-tp: bulk lane armed (async: GPU stage/publish/combine + RDMA writes "
+                            "split over two rails, %s + %s, %llu MiB per exchange)\n",
+                    tp->rdma.dev_name, tp->rail2.dev_name, (unsigned long long)(tp->bulk_cap >> 20));
+        else
+            fprintf(stderr, "pulsar-tp: bulk lane armed (async: GPU stage/publish/combine + RDMA writes "
+                            "on a second QP on %s, one rail, %llu MiB per exchange)\n",
+                    tp->rdma.dev_name, (unsigned long long)(tp->bulk_cap >> 20));
+    }
     *exch = ++tp->row_exch;
     *buf = (uint32_t)(tp->bulk_seq++ & 1u);
     return 1;
