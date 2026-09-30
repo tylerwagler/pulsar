@@ -523,8 +523,7 @@ typedef struct {
      * zero-length receives the peer's RDMA_WRITE_WITH_IMM consumes -- so it
      * never mixes with the gate QP's 16 KB receives. */
     tp_ibv_qp bulk_qp;
-    uint64_t bulk_imm_count;    /* imm arrivals reaped (the peer's bulk exchanges, in order) */
-    uint32_t bulk_last_imm;     /* the exchange id the latest arrival carried */
+    pulsar_tp_bulk_arrivals bulk_arr;   /* the peer's imm arrivals, credited by index (L258) */
 } pulsar_tp_rdma_link;
 
 /* One peer in the TP mesh.  A full-mesh rank connects to every other rank
@@ -1220,6 +1219,21 @@ static int tp_rdma_qp_connect(pulsar_tp *tp, tp_ibv_qp qp, const pulsar_tp_rdma_
 
 /* The bulk lane's zero-length receive: consumed by the peer's final
  * RDMA_WRITE_WITH_IMM of an exchange (the data itself lands by RDMA write). */
+uint64_t pulsar_tp_bulk_arrival_next(pulsar_tp_bulk_arrivals *a) {
+    return ++a->mine;
+}
+void pulsar_tp_bulk_arrival_credit(pulsar_tp_bulk_arrivals *a, uint32_t imm) {
+    a->imm[++a->arrived & 1u] = imm;
+}
+int pulsar_tp_bulk_arrival_ready(const pulsar_tp_bulk_arrivals *a, uint64_t want) {
+    return a->arrived >= want;
+}
+int pulsar_tp_bulk_arrival_matches(const pulsar_tp_bulk_arrivals *a, uint64_t want, uint64_t exch) {
+    /* two arrivals past `want` would mean the peer ran two exchanges ahead,
+     * which it cannot without this rank's answer to the first: divergence */
+    return a->arrived >= want && a->arrived <= want + 1u && a->imm[want & 1u] == (uint32_t)exch;
+}
+
 static int tp_bulk_post_imm_recv(pulsar_tp *tp, pulsar_tp_rdma_link *r) {
     struct tp_ibv_recv_wr wr;
     struct tp_ibv_recv_wr *bad = NULL;
@@ -1656,11 +1670,11 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
     }
     const double t_posted = tp_now_sec();
     /* The peer's k-th bulk exchange is our k-th imm arrival. */
-    const uint64_t want = r->bulk_imm_count + 1u;
+    const uint64_t want = pulsar_tp_bulk_arrival_next(&r->bulk_arr);
     bool sent = false;
     const double deadline = t_posted + (double)tp->timeout_sec;
     double next_abort_check = t_posted + 1e-3;
-    while (!sent || r->bulk_imm_count < want) {
+    while (!sent || !pulsar_tp_bulk_arrival_ready(&r->bulk_arr, want)) {
         struct tp_ibv_wc wc[8];
         const int got = tp->rdma.api.poll_cq(tp->rdma.bulk_cq, 8, wc);
         if (got < 0) return 0;
@@ -1671,8 +1685,7 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
                 return 0;
             }
             if (wc[i].opcode & TP_IBV_WC_RECV) {
-                r->bulk_imm_count++;
-                r->bulk_last_imm = wc[i].imm_data;
+                pulsar_tp_bulk_arrival_credit(&r->bulk_arr, wc[i].imm_data);
             } else {
                 sent = true;
             }
@@ -1687,17 +1700,20 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
             }
             if (now > deadline) {
                 fprintf(stderr, "pulsar-tp: bulk exchange %llu timed out (imm %llu/%llu, sent %d)\n",
-                        (unsigned long long)e, (unsigned long long)r->bulk_imm_count,
+                        (unsigned long long)e, (unsigned long long)r->bulk_arr.arrived,
                         (unsigned long long)want, (int)sent);
                 return 0;
             }
         }
     }
-    /* The ranks number exchanges identically: the peer's arrival must carry
-     * this exchange's id, or the lanes are out of step. */
-    if (r->bulk_last_imm != (uint32_t)e) {
-        fprintf(stderr, "pulsar-tp: bulk exchange %llu received the peer's exchange %u -- the ranks' "
-                        "exchange order diverged\n", (unsigned long long)e, r->bulk_last_imm);
+    /* The ranks number exchanges identically: the arrival that answers THIS
+     * exchange must carry its id.  A later arrival already reaped (the peer is
+     * one exchange ahead) is its own exchange's answer, kept for it. */
+    if (!pulsar_tp_bulk_arrival_matches(&r->bulk_arr, want, e)) {
+        fprintf(stderr, "pulsar-tp: bulk exchange %llu was answered by the peer's exchange %u "
+                        "(arrival %llu of %llu reaped) -- the ranks' exchange order diverged\n",
+                (unsigned long long)e, r->bulk_arr.imm[want & 1u], (unsigned long long)want,
+                (unsigned long long)r->bulk_arr.arrived);
         return 0;
     }
     if (!tp_bulk_post_imm_recv(tp, r)) return 0;
