@@ -2993,6 +2993,20 @@ void *worker_main(void *arg) {
             continue;
         }
 
+        /* L260: a prompt that finished prefill takes its first-token init
+         * (host bookkeeping, no GPU work) HERE, so it rides this iteration's
+         * decode round.  Stepped after the quantum as an "other" slot, it
+         * waited out a full quantum it was not in (c2 on one Spark: ~600 ms
+         * of the second prompt's TTFT). */
+        for (int i = 0; i < s->n_slots; i++) {
+            session_slot *c = &s->slots[i];
+            if (!c->active_job || !c->gen || c->gen->phase != GEN_DECODE_INIT) continue;
+            s->generate_job_step(c);
+            if (c->gen) slot_writer_flush(&c->gen->writer);
+            c->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+            if (!c->gen || c->gen->phase == GEN_DONE) s->worker_finish_slot(c);
+        }
+
         /* Gather steady-state batchable decode slots. n_batched > 0 means a
          * plain batch is already in flight — those slots stay on the plain
          * lane until they finish (no mid-conversation lane switch, which
