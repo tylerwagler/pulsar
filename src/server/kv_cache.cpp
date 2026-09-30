@@ -704,6 +704,17 @@ void server::kv_cache_maybe_store_continued(session_slot *sl) {
 
 
 
+bool server::kv_cache_continued_store_due(session_slot *sl) {
+    auto *s = this;
+    s->kv_cache_tracker_bind(sl);
+    const int target = kv_cache_continued_store_target(&s->kv,
+                                                       pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank));
+    s->kv_cache_tracker_flush(sl);
+    return target != 0;
+}
+
+
+
 #ifdef PULSAR_SERVER_TEST
 
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,

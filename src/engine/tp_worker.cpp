@@ -709,6 +709,68 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (r) pulsar_session_spec_redraft_commit_local(slot->s, r);
         return 1;
     }
+    /* L260: the batch phases.  Each record is one bank's step; the verdict is
+     * the phase's outcome fingerprint over every step (0 = refused here). */
+    case PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH:
+    case PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH:
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH: {
+        const char *op = c->type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? "spec_assemble_batch"
+                       : c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH ? "spec_round_end_batch"
+                                                                         : "spec_redraft_commit_batch";
+        int status = 0;
+        if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
+            const int n = (int)c->spec.count;
+            pulsar_spec_step steps[PULSAR_TP_SPEC_STEPS_MAX];
+            uint64_t rngs[PULSAR_TP_SPEC_STEPS_MAX];
+            int cap_total = 0;
+            for (int i = 0; i < n; i++) cap_total += c->spec_steps[i].i2 > 0 ? c->spec_steps[i].i2 : 0;
+            int *acc = worker_accepted(slot, cap_total);
+            int ok = 1;
+            for (int i = 0, off = 0; i < n; i++) {
+                const pulsar_tp_spec_command *r = &c->spec_steps[i];
+                pulsar_spec_step *st = &steps[i];
+                memset(st, 0, sizeof(*st));
+                st->bank = (uint32_t)r->bank;
+                st->round = worker_round(slot, r->bank);
+                st->temperature = r->temperature; st->top_k = r->top_k;
+                st->top_p = r->top_p; st->min_p = r->min_p;
+                rngs[i] = r->rng;
+                st->rng = &rngs[i];
+                st->max_tokens = r->i0;
+                st->first_token = r->i0;
+                st->k_alloc = r->i1;
+                st->accepted_cap = r->i2;
+                st->accepted = acc + off;
+                st->row0 = (uint32_t)r->i3;
+                off += r->i2 > 0 ? r->i2 : 0;
+                if (!st->round) ok = 0;
+                if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH &&
+                    (!slot->logits || r->i3 < 0 ||
+                     (uint64_t)r->i3 + pulsar_spec_round_n_rows(st->round) > (uint64_t)slot->logits_rows))
+                    ok = 0;
+            }
+            if (!ok) {
+                snprintf(ferr, sizeof(ferr), "tp: %s names a bank with no round or rows past this rank's forward block", op);
+                fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
+            } else if (c->type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH) {
+                uint32_t rows = 0;
+                pulsar_session_spec_assemble_batch_local(slot->s, steps, n, c->spec.i0, (uint32_t)c->spec.i1,
+                                                         NULL, &rows);
+                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, rows);
+            } else if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH) {
+                pulsar_session_spec_round_end_batch_local(slot->s, steps, n, c->spec.i0, slot->logits);
+                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
+            } else {
+                pulsar_session_spec_redraft_commit_batch_local(slot->s, steps, n);
+                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
+            }
+            for (int i = 0; i < n; i++)
+                if (steps[i].status == PULSAR_SPEC_STEP_FAILED || steps[i].status == PULSAR_SPEC_STEP_RESTORE_FAILED)
+                    fprintf(stderr, "pulsar: tp worker: %s bank %u: status %d %s\n", op, steps[i].bank,
+                            steps[i].status, steps[i].err);
+        } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
     case PULSAR_TP_FRAME_GENERATE_SPECULATIVE: {
         /* The CLI's whole loop as ONE frame: with the leader's rng and the
          * same state the member's accept walk is deterministic, so the

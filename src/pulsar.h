@@ -856,6 +856,61 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
                                       const uint32_t *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen);
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r);
+/** L260: the batched lane's per-bank bookkeeping, ONE call per phase.  Each
+ * step names a bank; the call runs, bank after bank in order, exactly the
+ * sequence the lane ran per bank -- bank_state_restore, the phase, then
+ * bank_state_save -- so the banks' state and tokens are those of the per-bank
+ * calls.  On a pair it is ONE mirrored frame with ONE verdict (a fingerprint
+ * of every step's outcome) where the per-bank calls paid 2-3 verdict round
+ * trips per bank.  The caller saves its live bank first: step 0's restore
+ * overwrites whatever is installed.  Every step whose restore succeeded is
+ * saved, whatever its status; afterwards the last such step's bank is
+ * installed, clean. */
+typedef enum {
+    PULSAR_SPEC_STEP_OK = 0,
+    PULSAR_SPEC_STEP_RESTORE_FAILED = 1, /* the bank is not installed; nothing ran */
+    PULSAR_SPEC_STEP_LENGTH = 2,         /* assemble: the bank's frontier is at ctx */
+    PULSAR_SPEC_STEP_SKIPPED = 3,        /* assemble: over the row budget; sat out untouched */
+    PULSAR_SPEC_STEP_EOS = 4,            /* assemble: the base token is EOS -- emit it, never eval it */
+    PULSAR_SPEC_STEP_FAILED = 5,         /* the phase refused; err says why */
+} pulsar_spec_step_status;
+typedef struct {
+    /* in */
+    uint32_t bank;
+    pulsar_spec_round *round;
+    float temperature, top_p, min_p;
+    int top_k;
+    uint64_t *rng;           /* assemble (base draw), round_end (walk) */
+    int max_tokens;          /* assemble: tokens left in the request */
+    int k_alloc;             /* assemble: drafts allocated under overflow; -1 = no allocation */
+    int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
+    int *accepted;           /* round_end: this bank's accepted tokens */
+    /* assemble out, round_end in */
+    int first_token;
+    uint32_t row0;           /* the bank's first row in the shared forward */
+    uint32_t n_rows;         /* base + drafts it contributed */
+    /* out */
+    int status;              /* pulsar_spec_step_status */
+    int n_accepted;          /* round_end */
+    int pos_before;          /* round_end: the round's base position (L155) */
+    int pos_after;           /* round_end: the bank's frontier after the round */
+    char err[160];
+} pulsar_spec_step;
+/** Per step: restore; LENGTH at ctx; SKIPPED when 1 + K (the allocation, or
+ * the pendings) would pass `row_budget` -- checked BEFORE the base draw, so a
+ * residual carry survives; the base draw (EOS short-circuits); round_begin;
+ * the round's rows into reqs[row0..row0+n_rows) (reqs holds row_budget
+ * entries).  *n_rows_out = rows written.  0, or -1 when the pair refused or
+ * diverged (every step then counts as failed). */
+int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                       int eos_token, uint32_t row_budget,
+                                       pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
+/** Per step: restore, round_end against the shared forward's block `rows`
+ * (the step's row0 / first_token from assemble), save.  0 or -1 as above. */
+int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                        int eos_token, const float *rows);
+/** Per step: restore, pulsar_session_spec_redraft_commit, save.  0 or -1. */
+int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** Gate-facing: read a batched redraft's result out of the round before it is
  * committed (ids[0] = the base, ids[1..n_draft] = the drafts; conf per draft
  * position; keep = the confidence-trimmed pending count). 1 if a result is

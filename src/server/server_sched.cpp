@@ -2154,7 +2154,8 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
  * Stage-B saves armed; then per bank round_end walks its slice, rolls state,
  * redrafts, and we emit the accepted tokens through the same slot machinery
  * the plain lane uses. Tokens per weight-stream compound: batching x
- * acceptance ([[L076]]).
+ * acceptance ([[L076]]).  Each per-bank phase is ONE engine call over every
+ * bank (L260: pulsar_session_spec_*_batch, one mirrored frame on a pair).
  *
  * Emission mirrors gen_decode's L073 discipline: a mid-emit stop (tool-call
  * end, stop string) rewinds the ghost tail so the bank's history never
@@ -2187,7 +2188,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     int row_nb[PULSAR_SESSION_POOL_CAP];   /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
     pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
-    int accepted[PULSAR_SPEC_LOGITS_ROWS + 1];
+    /* L260: one step per bank per phase; each bank keeps its own accepted[]
+     * because the batched round_end finishes every bank before any emits. */
+    pulsar_spec_step steps[PULSAR_SESSION_POOL_CAP];
+    int step_slot[PULSAR_SESSION_POOL_CAP];
+    int accepted[PULSAR_SESSION_POOL_CAP][PULSAR_SPEC_LOGITS_ROWS + 1];
     /* ALL_ROWS caps the shared forward at 16 rows (the spec-logits ceiling).
      * L123: the landing buffer lives on the server (allocated once) — the
      * per-quantum malloc re-faulted 16.5 MB of demand-zero pages every
@@ -2267,10 +2272,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             if (k_overflow) s->w_spec_overflow_rounds++;
             s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
         }
-        /* ---- assemble: per bank, base draw + round begin + rows ---------- */
-        uint32_t rows = 0;
-        int m = 0;
-        for (int i = 0; i < n && m < PULSAR_SESSION_POOL_CAP; i++) {
+        /* ---- assemble: ONE call restores each bank, draws its base, begins
+         * its round and lays its rows, saving it after (L260: one mirrored
+         * frame for every bank, where each bank paid three verdicts). */
+        int ns = 0;
+        for (int i = 0; i < n && ns < PULSAR_SESSION_POOL_CAP; i++) {
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g || g->phase != GEN_DECODE) continue;
@@ -2279,7 +2285,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (!s->bank_switch(sl->bank)) {
+            /* Tier-2 2b: a guard-spilled bank reloads its KV from disk before
+             * the batch installs it (bank_switch's first half). */
+            if (s->slots[sl->bank].spilled && !s->bank_restore_spilled(sl->bank)) {
                 snprintf(g->err, sizeof g->err,
                          "bank %u state restore failed (evicted KV unrecoverable)",
                          (unsigned)sl->bank);
@@ -2287,79 +2295,75 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (pulsar_session_pos(pool) >= pulsar_session_ctx(pool)) {
-                g->finish = "length";
-                g->phase = GEN_FINISH;
-                continue;
-            }
-            const uint32_t k_cap_rows = k_overflow
-                ? 1u + (uint32_t)k_alloc[i]
-                : pulsar_session_spec_next_rows_max(pool);
-            if (rows + k_cap_rows > PULSAR_SPEC_ROW_BUDGET) {
-                /* Over the shared-forward row budget even at the allocated
-                 * K (can only happen when an earlier bank EOS'd/errored and
-                 * the sweep shape shifted): sit this sweep out BEFORE the
-                 * base draw or round_begin touch anything -- the carry
-                 * (possibly a rejection residual, whose exact emission the
-                 * acceptance proof needs) and the pendings stay intact. */
-                pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
-                continue;
-            }
-            float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            const int first = pulsar_session_spec_next_base(pool, temp, top_k,
-                                                         top_p, min_p, &g->rng);
-            if (first < 0) {
-                snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
-                g->finish = "error";
-                g->phase = GEN_FINISH;
-                continue;
-            }
-            if (first == eos_token) {
-                /* generate_speculative's short-circuit: emit EOS, never eval it. */
-                slot_writer_install(&g->writer);
-                if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-                (void)s->gen_emit_token(sl, first);
-                pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
-                g->phase = GEN_FINISH;
-                emitted_total++;
-                continue;
-            }
             if (!rounds[i]) rounds[i] = pulsar_spec_round_new();
-            char err[160];
+            pulsar_spec_step *st = &steps[ns];
+            memset(st, 0, sizeof(*st));
+            st->bank = (uint32_t)sl->bank;
+            st->round = rounds[i];
+            gen_resolve_sampling_decode(g, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
+            st->rng = &g->rng;
+            st->max_tokens = g->max_tokens - g->completion;
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
              * upper bound, never a promise. */
-            if (pulsar_session_spec_round_begin(pool, rounds[i], first,
-                                             g->max_tokens - g->completion,
-                                             k_overflow ? k_alloc[i] + 1
-                                                        : (int)(sizeof(accepted) / sizeof(accepted[0])),
-                                             temp, top_k, top_p, min_p,
-                                             err, sizeof err) != 0) {
-                snprintf(g->err, sizeof g->err, "spec round begin failed: %s", err);
+            st->k_alloc = k_overflow ? k_alloc[i] : -1;
+            st->accepted_cap = k_overflow ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            step_slot[ns++] = i;
+        }
+        /* The batch's first restore overwrites whatever is installed: park the
+         * live bank first, exactly as bank_switch's switch-away save does. */
+        if (s->live_bank >= 0) {
+            s->slots[s->live_bank].committed_pos = pulsar_session_pos(pool);
+            pulsar_session_bank_state_save(pool, (uint32_t)s->live_bank);
+            s->live_bank = -1;
+        }
+        uint32_t rows = 0;
+        if (ns > 0)
+            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, eos_token, PULSAR_SPEC_ROW_BUDGET,
+                                                     reqs, &rows);
+        int m = 0;
+        for (int j = 0; j < ns; j++) {
+            const pulsar_spec_step *st = &steps[j];
+            const int i = step_slot[j];
+            session_slot *sl = dec[i];
+            gen_state *g = sl->gen;
+            switch (st->status) {
+            case PULSAR_SPEC_STEP_OK:
+                row0s[m] = st->row0;
+                row_nb[m] = (int)st->n_rows;
+                first_tok[m] = st->first_token;
+                live_idx[m] = i;
+                m++;
+                break;
+            case PULSAR_SPEC_STEP_SKIPPED:
+                break;
+            case PULSAR_SPEC_STEP_EOS:
+                /* generate_speculative's short-circuit: emit EOS, never eval it. */
+                slot_writer_install(&g->writer);
+                if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+                (void)s->gen_emit_token(sl, st->first_token);
+                g->phase = GEN_FINISH;
+                emitted_total++;
+                break;
+            case PULSAR_SPEC_STEP_LENGTH:
+                g->finish = "length";
+                g->phase = GEN_FINISH;
+                break;
+            case PULSAR_SPEC_STEP_RESTORE_FAILED:
+                snprintf(g->err, sizeof g->err,
+                         "bank %u state restore failed (evicted KV unrecoverable)",
+                         (unsigned)sl->bank);
                 g->finish = "error";
                 g->phase = GEN_FINISH;
-                continue;
+                break;
+            default:
+                if (st->first_token < 0) snprintf(g->err, sizeof g->err, "%s", st->err);
+                else snprintf(g->err, sizeof g->err, "spec round begin failed: %s", st->err);
+                g->finish = "error";
+                g->phase = GEN_FINISH;
+                break;
             }
-            if (rows + pulsar_spec_round_n_rows(rounds[i]) > PULSAR_SPEC_ROW_BUDGET) {
-                /* Unreachable: the pre-begin budget check bounds n_batch from
-                 * above (begin only trims). Defensive backstop, checked
-                 * BEFORE fill_reqs writes, so a future change to begin's row
-                 * math cannot overflow reqs[]. */
-                pulsar_session_spec_round_abort(pool, rounds[i]);
-                pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
-                continue;
-            }
-            const uint32_t nb = pulsar_spec_round_fill_reqs(rounds[i], sl->bank,
-                                                         first, reqs + rows);
-            row0s[m] = rows;
-            row_nb[m] = (int)nb;
-            first_tok[m] = first;
-            live_idx[m] = i;
-            rows += nb;
-            m++;
-            pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         }
         if (m == 0) break;
 
@@ -2388,67 +2392,98 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             break;
         }
 
-        /* ---- per bank: finish the round, emit, persist ------------------- */
+        /* ---- finish every bank's round in ONE call (restore, round_end,
+         * save per bank), then emit and persist per bank ------------------ */
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
             gen_state *g = sl->gen;
-            if (!s->bank_switch(sl->bank)) {
+            pulsar_spec_step *st = &steps[q];
+            memset(st, 0, sizeof(*st));
+            st->bank = (uint32_t)sl->bank;
+            st->round = rounds[live_idx[q]];
+            gen_resolve_sampling_decode(g, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
+            st->rng = &g->rng;
+            st->first_token = first_tok[q];
+            st->row0 = row0s[q];
+            st->accepted = accepted[q];
+            st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+        }
+        (void)pulsar_session_spec_round_end_batch(pool, steps, m, eos_token, logits);
+        for (int q = 0; q < m; q++) {
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            const pulsar_spec_step *st = &steps[q];
+            if (st->status == PULSAR_SPEC_STEP_RESTORE_FAILED) {
                 g->finish = "error";
                 snprintf(g->err, sizeof g->err,
                          "bank %u restore failed after spec forward", (unsigned)sl->bank);
                 g->phase = GEN_FINISH;
                 continue;
             }
-            float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            /* The round's base position -- NOT pulsar_session_pos() here: during
-             * the round the checkpoint already spans the verify batch. */
-            const int pos_before = pulsar_spec_round_saved_len(rounds[live_idx[q]]);
-            const int na = pulsar_session_spec_round_end(pool, rounds[live_idx[q]],
-                                                      first_tok[q], eos_token,
-                                                      temp, top_k, top_p, min_p,
-                                                      &g->rng, logits, row0s[q],
-                                                      accepted,
-                                                      (int)(sizeof(accepted) / sizeof(accepted[0])),
-                                                      err, sizeof err);
-            if (na < 0) {
+            if (st->status != PULSAR_SPEC_STEP_OK) {
                 g->finish = "error";
-                snprintf(g->err, sizeof g->err, "spec round end failed: %s", err);
+                snprintf(g->err, sizeof g->err, "spec round end failed: %s", st->err);
                 g->phase = GEN_FINISH;
                 continue;
             }
+            const int na = st->n_accepted;
             /* L155 tripwire: the round must hand back exactly the positions it
              * committed (the engine clamps commit at EOS and trims to the
              * accepted count).  The ghost rewind below counts na - emitted and
              * cannot see a frontier that ran ahead of na, so this is the only
              * place that would notice; it says so if the invariant ever breaks. */
-            if (pulsar_session_pos(pool) != pos_before + na)
+            if (st->pos_after != st->pos_before + na)
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: spec batched round bank %u: frontier %d != "
                            "%d + %d accepted -- the bank carries tokens the client "
                            "will not see (L155)",
-                           (unsigned)sl->bank, pulsar_session_pos(pool), pos_before, na);
+                           (unsigned)sl->bank, st->pos_after, st->pos_before, na);
             slot_writer_install(&g->writer);
             int done = 0;
             bool stopped = false;
             for (int t = 0; t < na; t++) {
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
                 done = t + 1;
-                if (s->gen_emit_token(sl, accepted[t])) { stopped = true; break; }
-            }
-            if (done < na) {
-                /* L073, batched-lane edition: committed-but-never-emitted
-                 * tokens rewind, whatever ended the emission. */
-                const int ghost = na - done;
-                const int target = pulsar_session_pos(pool) - ghost;
-                pulsar_session_rewind(pool, target);
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: spec batched round bank %u: rewound %d "
-                           "ghost tokens to pos %d",
-                           (unsigned)sl->bank, ghost, target);
+                if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
             }
             if (stopped) g->phase = GEN_FINISH;
-            sl->committed_pos = pulsar_session_pos(pool);
+            /* L118: continued disk-KV store -- the classic loop's cadence, on
+             * the bank's token-true frontier.  Same tool-span suppression as
+             * the classic loop; the bank is installed only when one is due. */
+            bool store = false;
+            if (!stopped && g->phase == GEN_DECODE) {
+                const request *rq = &g->j->req;
+                const dsml_decode_state ds =
+                    rq->kind == REQ_CHAT && rq->has_tools ?
+                        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+                store = !(rq->kind == REQ_CHAT && rq->has_tools &&
+                          (g->saw_tool_start || dsml_decode_state_is_tool(ds))) &&
+                        s->kv_cache_continued_store_due(sl);
+            }
+            if (done < na || store) {
+                if (!s->bank_switch(sl->bank)) {
+                    snprintf(g->err, sizeof g->err,
+                             "bank %u restore failed after spec round end", (unsigned)sl->bank);
+                    g->finish = "error";
+                    g->phase = GEN_FINISH;
+                    continue;
+                }
+                if (done < na) {
+                    /* L073, batched-lane edition: committed-but-never-emitted
+                     * tokens rewind, whatever ended the emission. */
+                    const int ghost = na - done;
+                    const int target = pulsar_session_pos(pool) - ghost;
+                    pulsar_session_rewind(pool, target);
+                    server_log(PULSAR_LOG_KVCACHE,
+                               "pulsar-server: spec batched round bank %u: rewound %d "
+                               "ghost tokens to pos %d",
+                               (unsigned)sl->bank, ghost, target);
+                }
+                if (store) s->kv_cache_maybe_store_continued(sl);
+                pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
+                s->live_bank = -1;   /* saved: the next install need not save it again */
+            }
+            sl->committed_pos = pulsar_session_bank_pos(pool, (uint32_t)sl->bank);
             sl->tokens_emitted += (uint64_t)done;
             /* L119: request-scoped DSpark accounting — the round's truth,
              * accumulated here where it is unambiguous (row_nb = base+K rows
@@ -2457,27 +2492,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             if (row_nb[q] > 1) g->req_spec_draft += (uint64_t)(row_nb[q] - 1);
             if (na > 1) g->req_spec_accepted += (uint64_t)(na - 1);
             g->req_spec_gen += (uint64_t)done;
-            /* L118: continued disk-KV store — the classic loop's cadence,
-             * ported to the one point where it is valid in this lane: the
-             * bank is live (round-end bank_switch) and round_end + the ghost
-             * rewind left s->checkpoint token-true for it. Same tool-span
-             * suppression as the classic loop. */
-            if (!stopped && g->phase == GEN_DECODE) {
-                const request *rq = &g->j->req;
-                const dsml_decode_state ds =
-                    rq->kind == REQ_CHAT && rq->has_tools ?
-                        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
-                if (!(rq->kind == REQ_CHAT && rq->has_tools &&
-                      (g->saw_tool_start || dsml_decode_state_is_tool(ds))))
-                    s->kv_cache_maybe_store_continued(sl);
-            }
-            pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
             emitted_total += done;
         }
         /* L150: round_end deferred every bank's redraft; run ONE drafter pass
          * over all of them (the engine reads their saved ring counters and the
          * bank-major rings, and never switches banks), then stamp each bank's
-         * draft into its shadow under this scheduler's own bank switch. A
+         * draft into its shadow in one batched commit. A
          * device failure here is not fatal: the banks keep no pendings and take
          * a plain n=1 step next round. */
         {
@@ -2502,21 +2522,26 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: batched redraft failed: %s (banks take a plain step)",
                            rerr);
+            /* One call stamps every bank's draft into its shadow (restore,
+             * commit, save per bank). */
             for (int q = 0; q < nl; q++) {
-                if (!s->bank_switch(live_banks[q])) {
-                    /* bank_switch's contract: a failed state restore fails the
-                     * request.  Skipping the commit left the bank's ring holding
-                     * an uncommitted draft and the slot decoding on (L190 D1). */
+                memset(&steps[q], 0, sizeof(steps[q]));
+                steps[q].bank = live_banks[q];
+                steps[q].round = live_rounds[q];
+            }
+            if (nl > 0) (void)pulsar_session_spec_redraft_commit_batch(pool, steps, nl);
+            for (int q = 0; q < nl; q++) {
+                if (steps[q].status != PULSAR_SPEC_STEP_OK) {
+                    /* A failed state restore fails the request: skipping the
+                     * commit left the bank's ring holding an uncommitted draft
+                     * and the slot decoding on (L190 D1). */
                     gen_state *g = live_slots[q]->gen;
                     snprintf(g->err, sizeof g->err,
                              "bank %u state restore failed before redraft commit",
                              (unsigned)live_banks[q]);
                     g->finish = "error";
                     g->phase = GEN_FINISH;
-                    continue;
                 }
-                pulsar_session_spec_redraft_commit(pool, live_rounds[q]);
-                pulsar_session_bank_state_save(pool, live_banks[q]);
             }
         }
         /* /metrics granularity: publish per ROUND, not per quantum.  A

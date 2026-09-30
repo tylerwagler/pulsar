@@ -2289,6 +2289,26 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
                                             const uint32_t *banks, uint64_t **rngs, int n,
                                             char *err, size_t errlen);
 void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_round *r);
+/** L260: the batch phases' local implementations (the steps' contract is on
+ * pulsar_session_spec_assemble_batch in pulsar.h); reqs may be NULL (the
+ * worker's rows ride the mixed-batch frame). */
+void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                              int eos_token, uint32_t row_budget,
+                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                               int eos_token, const float *rows);
+void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
+/** L260: a batch phase's verdict -- a positive fingerprint of what the phase
+ * decided for every step (statuses, base tokens and rows; frontiers and
+ * accepted tokens), identical on ranks that agree.  n_rows: assemble's total
+ * rows, 0 for the other phases. */
+typedef enum {
+    PULSAR_SPEC_PHASE_ASSEMBLE = 1,
+    PULSAR_SPEC_PHASE_ROUND_END = 2,
+    PULSAR_SPEC_PHASE_REDRAFT_COMMIT = 3,
+} pulsar_spec_phase;
+int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
+                              uint32_t n_rows);
 
 /** Slice 4e (L238): the failure report a void mirrored operation can make --
  * marks the pair failed and prints the reason once.  Defined in engine_api.cpp,

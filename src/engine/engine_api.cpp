@@ -1253,6 +1253,109 @@ void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r)
                         pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT, &c, NULL, NULL), NULL, 0)) return;
     pulsar_session_spec_redraft_commit_local(s, r);
 }
+/* ---- L260: the batched lane's per-bank bookkeeping as ONE frame per phase.
+ * The frame carries every step's inputs (its rng as it stands BEFORE the
+ * phase); both ranks run the same local batch on the same state and the
+ * verdict is the phase's outcome fingerprint, so any bank's split -- a
+ * status, a base token, a row, an accepted token, a frontier -- is one
+ * divergence, refused. */
+static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame_type,
+                                const char *operation, const pulsar_spec_step *steps, int n,
+                                int eos_token, uint32_t row_budget) {
+    if (n < 0 || (uint32_t)n > PULSAR_TP_SPEC_STEPS_MAX) {
+        fprintf(stderr, "pulsar: tp: %s carries %d steps (at most %u)\n", operation, n,
+                (unsigned)PULSAR_TP_SPEC_STEPS_MAX);
+        return 0;
+    }
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.count = (uint32_t)n;
+    c.i0 = eos_token;
+    c.i1 = (int32_t)row_budget;
+    pulsar_tp_spec_command recs[PULSAR_TP_SPEC_STEPS_MAX];
+    for (int i = 0; i < n; i++) {
+        const pulsar_spec_step *st = &steps[i];
+        pulsar_tp_spec_command *r = &recs[i];
+        *r = tp_spec_cmd(s, (int)st->bank);
+        r->temperature = st->temperature; r->top_k = st->top_k;
+        r->top_p = st->top_p; r->min_p = st->min_p;
+        r->rng = st->rng ? *st->rng : 0;
+        r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens : st->first_token;
+        r->i1 = st->k_alloc;
+        r->i2 = st->accepted_cap;
+        r->i3 = (int32_t)st->row0;
+    }
+    return tp_mirror_sent(tp, operation, pulsar_tp_send_spec_steps(tp, frame_type, &c, recs), NULL, 0);
+}
+static int tp_spec_steps_fail(pulsar_spec_step *steps, int n, const char *operation) {
+    for (int i = 0; i < n; i++) {
+        steps[i].status = PULSAR_SPEC_STEP_FAILED;
+        snprintf(steps[i].err, sizeof steps[i].err, "tp: the pair refused %s", operation);
+    }
+    return -1;
+}
+int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n, int eos_token,
+                                       uint32_t row_budget, pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
+    PULSAR_NVTX_FN();
+    const char *operation = "spec_assemble_batch";
+    *n_rows_out = 0;
+    if (!s || n < 0 || (n > 0 && (!steps || !reqs))) return -1;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
+    if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return tp_spec_steps_fail(steps, n, operation); }
+    if (route == 1) {
+        pulsar_session_spec_assemble_batch_local(s, steps, n, eos_token, row_budget, reqs, n_rows_out);
+        return 0;
+    }
+    if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH, operation, steps, n,
+                              eos_token, row_budget)) return tp_spec_steps_fail(steps, n, operation);
+    pulsar_session_spec_assemble_batch_local(s, steps, n, eos_token, row_budget, reqs, n_rows_out);
+    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, *n_rows_out);
+    if (tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0) {
+        *n_rows_out = 0;
+        return tp_spec_steps_fail(steps, n, operation);
+    }
+    return 0;
+}
+int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n, int eos_token,
+                                        const float *rows) {
+    PULSAR_NVTX_FN();
+    const char *operation = "spec_round_end_batch";
+    if (!s || n < 0 || (n > 0 && (!steps || !rows))) return -1;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
+    if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return tp_spec_steps_fail(steps, n, operation); }
+    if (route == 1) {
+        pulsar_session_spec_round_end_batch_local(s, steps, n, eos_token, rows);
+        return 0;
+    }
+    /* The logits block is NOT shipped: every rank holds the same block from
+     * its own mirrored forward, so only each step's row0 crosses. */
+    if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH, operation, steps, n,
+                              eos_token, 0u)) return tp_spec_steps_fail(steps, n, operation);
+    pulsar_session_spec_round_end_batch_local(s, steps, n, eos_token, rows);
+    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
+    return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
+}
+int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    PULSAR_NVTX_FN();
+    const char *operation = "spec_redraft_commit_batch";
+    if (!s || n < 0 || (n > 0 && !steps)) return -1;
+    char err[256];
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
+    if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return tp_spec_steps_fail(steps, n, operation); }
+    if (route == 1) {
+        pulsar_session_spec_redraft_commit_batch_local(s, steps, n);
+        return 0;
+    }
+    if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH, operation, steps, n,
+                              0, 0u)) return tp_spec_steps_fail(steps, n, operation);
+    pulsar_session_spec_redraft_commit_batch_local(s, steps, n);
+    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
+    return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
+}
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) {
     PULSAR_NVTX_FN();

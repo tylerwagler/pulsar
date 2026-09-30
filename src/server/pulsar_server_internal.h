@@ -1664,6 +1664,9 @@ struct server {
     /** Write a "continued" cache entry if the slot has advanced far enough past
      * the last one. Cheap no-op when it has not. */
     void kv_cache_maybe_store_continued(session_slot *sl);
+    /* L260: whether kv_cache_maybe_store_continued would store for this slot's
+     * bank, read from the bank's saved frontier (no bank switch). */
+    bool kv_cache_continued_store_due(session_slot *sl);
     /** kv_cache_try_load() keyed on raw prompt TEXT rather than a request.
      * The cache is keyed by rendered bytes, so this is the primitive and the
      * request form is the wrapper. @return prefix tokens loaded, 0 for a miss. */
