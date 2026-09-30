@@ -614,6 +614,19 @@ static bool gen_prefill_cancel_cb(void *ud) {
     return (uint32_t)(g->prefill_total - g->prefill_last_current) >= g->prefill_min_suffix;
 }
 
+/* Bind THIS slot's prefill callbacks to the shared pool session.  Every slot
+ * shares s->sess and the callbacks are per-session, so any other slot's
+ * begin (which binds its own) or stream begin (which clears them) replaces
+ * them: armed once per job, a long prefill lost its progress callback to the
+ * next request, never counted a chunk, and the cancel callback never yielded
+ * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
+ * before every sync this slot issues. */
+static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g, bool cancellable) {
+    pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
+    pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
+    pulsar_session_set_cancel(sess, cancellable ? gen_prefill_cancel_cb : NULL, g);
+}
+
 
 
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
@@ -1029,7 +1042,7 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
-    /* Arm the cancel callback on THIS slot's gen_state right before the sync.
+    /* Arm the callbacks on THIS slot's gen_state right before the sync.
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
      * jobs (each of which would set the callback) before prefilling any of them,
      * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
@@ -1044,7 +1057,7 @@ void server::gen_step_prefill(session_slot *sl) {
      * callback is armed and the mm call runs to completion; a client that has
      * gone away is noticed at the next quantum boundary. */
     const int n_images = g->j->req.n_images;
-    pulsar_session_set_cancel(s->sess, n_images > 0 ? NULL : gen_prefill_cancel_cb, g);
+    gen_arm_prefill_callbacks(s->sess, g, n_images == 0);
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
