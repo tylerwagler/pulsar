@@ -382,10 +382,12 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     pulsar_qwen_weights *w = e->qwen_weights;
     const pulsar_qwen_shape *s = &g_qwen_shape;
     bool ok = admit_bf16(w->token_embd) & admit_bf16(w->output) & admit_gr(w->mixer);
+    uint32_t tessera_layers = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) {
         const pulsar_qwen_layer_weights &L = w->layer[il];
         ok &= admit_gr(L.gr_attn) & admit_gr(L.gr_mlp);
         ok &= admit_moe(L);
+        tessera_layers += L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS] != NULL;
         if (L.ple_key) {
             /* EXL3 (our quant) or mxfp8_lt (turboderp's packs leave them F16; the builder encodes the
              * HF bf16): linear_dev launches either */
@@ -448,9 +450,10 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     w->ple_io = io;
     fprintf(stderr, "pulsar: L251 qwen PLE rows: %s (%llu rows x %u B, %u per token, %u pread threads); S4 tensors "
-                    "admitted (experts %s gate_up + down EXL3, dense EXL3 / MXFP8, GR low-rank MXFP8, head bf16)\n",
+                    "admitted (routed experts: %u layers fused gate_up + down EXL3, %u layers Tessera value family "
+                    "[L255]; dense EXL3, GR low-rank MXFP8, head bf16)\n",
             path, (unsigned long long)n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, PULSAR_QWEN_NGRAM_COLS,
-            PULSAR_ENGRAM_IO_THREADS, w->layer[0].moe_gate_up ? "fused" : "split");
+            PULSAR_ENGRAM_IO_THREADS, e->plan.n_layer - tessera_layers, tessera_layers);
     return true;
 }
 
