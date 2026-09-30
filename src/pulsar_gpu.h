@@ -781,6 +781,12 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
  * f32-store skips read it too: the split's offset views key no slot, so the
  * skips apply only while no decode prefix is in flight.
  * Returns 0 and refuses when n exceeds PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
+/** Does any kernel read the model through its HOST mapping (a host-registered
+ * whole model or range)?  When it does not, every weight byte the device reads
+ * lives in device memory, and the engine may release the checkpoint's host
+ * pages after load (pulsar_model_release_host_pages). */
+int pulsar_gpu_model_reads_host_pages(void);
+
 int pulsar_gpu_matmul_set_batch_decode_rows(int n);
 int pulsar_gpu_matmul_batch_decode_rows(void);
 

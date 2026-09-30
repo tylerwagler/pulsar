@@ -496,6 +496,13 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 
 
 
+int pulsar_gpu_model_reads_host_pages(void) {
+    if (g_model_registered) return 1;
+    for (const cuda_model_range &r : g_model_ranges)
+        if (r.host_registered) return 1;
+    return 0;
+}
+
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (g_model_registered) return 1;

@@ -955,6 +955,28 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
     }
 
+    /* Every weight the device reads now lives in device memory (the staged spans,
+     * and under TP this rank's expert halves), so the checkpoint's host pages are
+     * dead weight: ~11 GiB per rank on the pair stayed resident after the TP half
+     * build read the expert stacks through the mapping, and with swappiness 60 the
+     * kernel swapped server memory out to keep them (2026-09-30).  Release them;
+     * a later host read of the mapping (metadata, a debug range check) refaults
+     * from disk.  Kept when the device reads through the host mapping, or when a
+     * non-graph backend computes from it. */
+    if (pulsar_backend_uses_graph(e->backend) && e->gpu_ready) {
+        if (pulsar_gpu_model_reads_host_pages()) {
+            fprintf(stderr, "pulsar: checkpoint host pages KEPT: the device reads weights through the "
+                            "host mapping\n");
+        } else {
+            uint64_t released = pulsar_model_release_host_pages(&e->model);
+            if (e->dspark_ready && e->dspark_external)
+                released += pulsar_model_release_host_pages(&e->dspark_model);
+            if (e->overlay_ready) released += pulsar_model_release_host_pages(&e->overlay_model);
+            fprintf(stderr, "pulsar: released %.2f GiB of checkpoint pages from host memory after load "
+                            "(weights are device-resident)\n", (double)released / 1073741824.0);
+        }
+    }
+
     *out = e;
     return 0;
 }
