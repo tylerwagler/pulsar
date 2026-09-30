@@ -2449,6 +2449,12 @@ struct pulsar_session {
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
              char *err, size_t errlen);
+    /** sync's body.  `logits_owed`: the caller has just CUT this bank (a rewind
+     * leaves s->logits describing the old frontier), so if the prompt turns out
+     * to need no new rows the last one is re-evaluated anyway -- else the
+     * request samples from a finished conversation's distribution. */
+    int sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
+                  bool logits_owed, char *err, size_t errlen);
     /** Rewrite the session to `prompt` given an already-computed `common`
      * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
