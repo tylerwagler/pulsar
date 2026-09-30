@@ -8,6 +8,7 @@
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
  * for the pulsar-server link. */
 #include "pulsar_server_internal.h"
+#include "lib/pulsar_writeback.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -5213,6 +5214,57 @@ static void test_kv_cache_eviction_score_demotes_superseded_continued(void) {
 
 
 
+/* L261: every stored reason names itself, so a hit can report which trigger
+ * earned it ("stored=<reason>" on the hit line). */
+static void test_kv_cache_reason_names_round_trip(void) {
+    static const char *const names[] = {"cold", "continued", "evict", "shutdown",
+                                        "agent-system", "agent-session", "sys-prefix"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(pulsar_kvstore_reason_code(names[i])), names[i]));
+    TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(PULSAR_KVSTORE_REASON_UNKNOWN), "unknown"));
+    TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(200), "unknown"));
+}
+
+/* L261: streaming writeback drops written pages from the cache but never the
+ * bytes -- a file written through step/finish/drop reads back identical, across
+ * more than one PULSAR_WRITEBACK_STEP. */
+static void test_writeback_preserves_bytes(void) {
+    char path[] = "/tmp/pulsar-writeback-test.XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    FILE *fp = fdopen(fd, "w+b");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) { close(fd); unlink(path); return; }
+    const size_t chunk = 1u << 20;
+    const size_t chunks = (size_t)(PULSAR_WRITEBACK_STEP / chunk) + 3u;   /* crosses a step */
+    unsigned char *buf = (unsigned char *)malloc(chunk);
+    TEST_ASSERT(buf != NULL);
+    pulsar_writeback wb;
+    pulsar_writeback_init(&wb, fp);
+    bool ok = buf != NULL;
+    for (size_t c = 0; ok && c < chunks; c++) {
+        for (size_t i = 0; i < chunk; i++) buf[i] = (unsigned char)((c * 131u + i * 7u) & 0xffu);
+        ok = fwrite(buf, 1, chunk, fp) == chunk;
+        pulsar_writeback_step(&wb);
+    }
+    TEST_ASSERT(ok);
+    TEST_ASSERT(wb.synced > 0);                     /* at least one step was written back */
+    pulsar_writeback_finish(&wb);
+    TEST_ASSERT(fsync(fileno(fp)) == 0);
+    pulsar_writeback_drop_file(fp);
+    TEST_ASSERT(fseeko(fp, 0, SEEK_SET) == 0);
+    for (size_t c = 0; ok && c < chunks; c++) {
+        ok = fread(buf, 1, chunk, fp) == chunk;
+        for (size_t i = 0; ok && i < chunk; i++)
+            ok = buf[i] == (unsigned char)((c * 131u + i * 7u) & 0xffu);
+    }
+    TEST_ASSERT(ok);
+    free(buf);
+    fclose(fp);
+    unlink(path);
+}
+
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -8047,6 +8099,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
+    test_kv_cache_reason_names_round_trip();
+    test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();

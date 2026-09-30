@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "lib/pulsar_writeback.h"
 
 void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -96,6 +97,7 @@ static uint64_t payload_digest_final(const payload_digest *d) {
 typedef struct {
     FILE *fp;
     payload_digest digest;
+    pulsar_writeback wb;   ///< write side only: written pages go to disk and leave the cache as they stream (L261)
 } payload_io;
 
 static int payload_write_bytes(payload_io *io, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
@@ -110,6 +112,7 @@ static int payload_write_bytes(payload_io *io, const void *ptr, uint64_t bytes, 
         p += n;
         bytes -= n;
     }
+    pulsar_writeback_step(&io->wb);
     return 0;
 }
 
@@ -158,6 +161,8 @@ static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, ch
 static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
+    pulsar_writeback wb;
+    pulsar_writeback_init(&wb, dst);
     while (bytes != 0) {
         const size_t n = bytes > PULSAR_SESSION_IO_CHUNK ? PULSAR_SESSION_IO_CHUNK : (size_t)bytes;
         if (fread(buf, 1, n, src) != n) {
@@ -171,8 +176,10 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
             break;
         }
         bytes -= n;
+        pulsar_writeback_step(&wb);
     }
     free(buf);
+    if (rc == 0) pulsar_writeback_finish(&wb);
     return rc;
 }
 
@@ -606,6 +613,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     payload_io io;
     io.fp = fp;
     payload_digest_init(&io.digest);
+    pulsar_writeback_init(&io.wb, fp);
 
     /* Header fields:
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
@@ -717,6 +725,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
             payload_set_err(err, errlen, "failed to write session payload digest");
             return 1;
         }
+        pulsar_writeback_finish(&io.wb);
     }
     return rc;
 }
@@ -738,6 +747,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     payload_io io;
     io.fp = fp;
     payload_digest_init(&io.digest);
+    pulsar_writeback_init(&io.wb, NULL);   /* a read stream */
 
     uint64_t remaining = payload_bytes;
     uint32_t h[PULSAR_SESSION_PAYLOAD_U32_FIELDS];

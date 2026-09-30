@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "lib/pulsar_writeback.h"
 #include "tp/pulsar_tp.h"
 #include <errno.h>
 #include <sys/stat.h>
@@ -174,6 +175,7 @@ static bool worker_kv_blob_save(pulsar_engine *e, pulsar_session *s, const char 
         h.payload_bytes = (uint64_t)end - sizeof(h);
         ok = fseeko(fp, 0, SEEK_SET) == 0 && fwrite(&h, 1, sizeof(h), fp) == sizeof(h) &&
              fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+        if (ok) pulsar_writeback_drop_file(fp);   /* L261: this rank's copy leaves the page cache */
     }
     const int saved_errno = errno;
     if (fclose(fp) != 0) ok = false;
@@ -791,6 +793,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             } else {
                 const int rc = slot->s->bank_kv_save((uint32_t)c->value, fp, ferr, sizeof(ferr));
                 const bool synced = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+                if (synced) pulsar_writeback_drop_file(fp);   /* L261 */
                 const int fc = fclose(fp);
                 if (!synced || fc != 0 || rename(tmp, path) != 0) {
                     remove(tmp);
