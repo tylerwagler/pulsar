@@ -5,6 +5,7 @@
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
 #include "pulsar_server_internal.h"
+#include "pulsar_nvtx.h"
 #include "pulsar_lock.hpp"
 
 
@@ -889,6 +890,7 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
  * owner lookups (tool_mu + session pos) run after mu is released — the two
  * locks are never nested. */
 void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     memset(protect, 0, sizeof(protect[0]) * PULSAR_SESSION_POOL_CAP);
     job *queued[PULSAR_SERVER_MAX_CLIENTS];
@@ -935,6 +937,7 @@ static bool warm_match_usable(int best_common, int warm_partial_min, int frontie
 }
 
 void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (s->pool_banks <= 0) return;
     job *queued[PULSAR_SERVER_MAX_CLIENTS];
@@ -979,6 +982,7 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
  * is the provisioning-refusal reason check in worker_try_bind.) */
 bool server::worker_eviction_could_help(const job *j,
                                        const bool *protect) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (s->pool_banks > 0) {
         /* Pool mode: a provision costs one bank's ledger marginal, and the
@@ -1066,6 +1070,7 @@ static int evict_reset_slot_fields(session_slot *sl) {
 }
 
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
      * eviction (belt-and-suspenders — fork and evict are both worker-thread ops
@@ -1270,6 +1275,7 @@ bool server::fresh_make_room() {
  * stops helping — then the clobber fallback binds it exactly like the
  * increment-3 scheduler did. */
 bool server::worker_try_bind() {
+    PULSAR_NVTX_FN();
     auto *s = this;
     pthread_mutex_lock(&s->mu);
     job *j = s->head; /* peek: only the worker pops */
@@ -1514,6 +1520,7 @@ void server::note_provision_refusal(job *j, provision_refusal refusal) {
 
 /* Detach a finished job from its slot and wake its client thread. */
 void server::worker_finish_slot(session_slot *sl) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     job *j = sl->active_job;
     s->generate_job_end(sl);
@@ -1921,6 +1928,7 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
 }
 
 void server::worker_batched_decode_quantum(session_slot **dec, int n) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
@@ -2154,6 +2162,7 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
  * the pendings/carry, which is exactly right -- they were conditioned on the
  * ghosts). */
 void server::worker_spec_batched_quantum(session_slot **dec, int n) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
@@ -2561,6 +2570,7 @@ static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int 
 }
 
 session_slot *server::worker_find_fuse_prefill() {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
     /* Those prefills take the classic (unfused) path instead. */
@@ -2634,6 +2644,7 @@ static int mixed_prefill_giveup(int rc, int kthis, int m) {
 }
 
 void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf) {
+    PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
     pulsar_session *pool = s->sess;
