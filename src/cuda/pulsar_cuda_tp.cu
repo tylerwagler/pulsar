@@ -212,16 +212,41 @@ static __global__ void tp_publish_bulk_kernel(uint64_t *desc, uint64_t exch, uin
     tp_st_release_sys(&desc[0], exch);
 }
 
-/* The bulk lane's combine: dst[i] = dst[i] + peer[i] once the proxy reports
- * the exchange done -- the all-reduce's own + peer, one add per element,
- * bit-identical to the host big gate it replaces (acc[i] += peer[i]). */
-static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *peer, uint64_t n,
-                                                  const uint64_t *done, uint64_t exch,
+/* The bulk lane's stage (L260): this rank's partial written by SMs straight
+ * into the mapped out-region -- src + addend when there is an addend (the
+ * engine's add_kernel arithmetic), which is then zeroed, exactly what the row
+ * lane's stage kernel does.  On GB10 an SM store into the registered buffer
+ * runs at device-memory speed (0.31 ms per 32 MiB) where the copy engine took
+ * 0.56 ms, and the fold no longer costs an add pass + a fill pass of its own. */
+template <bool ADD>
+static __global__ void tp_bulk_stage_kernel(float *out, const float *src, float *addend, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        if (ADD) {
+            out[i] = src[i] + addend[i];
+            addend[i] = 0.0f;
+        } else {
+            out[i] = src[i];
+        }
+    }
+}
+
+/* The bulk lane's combine: dst[i] = own[i] + peer[i] once the proxy reports
+ * the exchange done, own being this rank's staged partial in the out-region --
+ * the all-reduce's own + peer, one add per element, bit-identical to the host
+ * big gate it replaces (acc[i] += peer[i]). */
+static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *own, const float *peer,
+                                                  uint64_t n, const uint64_t *done, uint64_t exch,
                                                   uint32_t *err, uint64_t timeout_ns) {
     if (!tp_wait_done(done, exch, err, timeout_ns)) return;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x)
-        dst[i] = dst[i] + __ldcv(peer + i);
+        dst[i] = own[i] + __ldcv(peer + i);
+}
+
+static unsigned tp_bulk_grid(uint64_t n) {
+    const uint64_t b = (n + 255u) / 256u;
+    return (unsigned)(b > 2048u ? 2048u : b);
 }
 
 static unsigned tp_grid(uint64_t n) {
@@ -292,12 +317,19 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
     return cuda_ok(cudaGetLastError(), "tp scatter cols launch");
 }
 
-int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, uint64_t src_off, void *dst_dev,
-                             uint64_t bytes) {
-    if (!src || !dst_dev || bytes == 0 || src_off > src->bytes || bytes > src->bytes - src_off) return 0;
-    return cuda_ok(cudaMemcpyAsync(dst_dev, (const uint8_t *)src->ptr + src_off, (size_t)bytes,
-                                   cudaMemcpyDefault, cudaStreamPerThread),
-                   "tp bulk stage");
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, uint64_t off,
+                             void *out_dev, uint64_t bytes) {
+    if (!src || !out_dev || bytes == 0 || bytes % sizeof(float) != 0 || off % sizeof(float) != 0 ||
+        off > src->bytes || bytes > src->bytes - off ||
+        (addend && (off > addend->bytes || bytes > addend->bytes - off))) return 0;
+    const uint64_t n = bytes / sizeof(float);
+    const float *s = (const float *)((const uint8_t *)src->ptr + off);
+    if (addend)
+        tp_bulk_stage_kernel<true><<<tp_bulk_grid(n), 256>>>(
+            (float *)out_dev, s, (float *)((uint8_t *)addend->ptr + off), n);
+    else
+        tp_bulk_stage_kernel<false><<<tp_bulk_grid(n), 256>>>((float *)out_dev, s, NULL, n);
+    return cuda_ok(cudaGetLastError(), "tp bulk stage launch");
 }
 
 int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2) {
@@ -306,18 +338,18 @@ int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, ui
     return cuda_ok(cudaGetLastError(), "tp publish bulk launch");
 }
 
-int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *peer_dev,
-                                   uint64_t bytes, const void *done_dev, uint64_t exch,
-                                   void *err_dev, uint64_t timeout_ns) {
-    if (!dst || !peer_dev || !done_dev || !err_dev || bytes == 0 || bytes % sizeof(float) != 0 ||
-        dst_off % sizeof(float) != 0 || dst_off > dst->bytes || bytes > dst->bytes - dst_off) return 0;
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
+                                   const void *peer_dev, uint64_t bytes, const void *done_dev,
+                                   uint64_t exch, void *err_dev, uint64_t timeout_ns) {
+    if (!dst || !own_dev || !peer_dev || !done_dev || !err_dev || bytes == 0 ||
+        bytes % sizeof(float) != 0 || dst_off % sizeof(float) != 0 || dst_off > dst->bytes ||
+        bytes > dst->bytes - dst_off) return 0;
     const uint64_t n = bytes / sizeof(float);
-    const uint64_t b = (n + 255u) / 256u;
-    const unsigned grid = (unsigned)(b > 2048u ? 2048u : b);
-    tp_bulk_combine_sum_kernel<<<grid, 256>>>((float *)((uint8_t *)dst->ptr + dst_off),
-                                              (const float *)peer_dev, n,
-                                              (const uint64_t *)done_dev, exch,
-                                              (uint32_t *)err_dev, timeout_ns);
+    tp_bulk_combine_sum_kernel<<<tp_bulk_grid(n), 256>>>((float *)((uint8_t *)dst->ptr + dst_off),
+                                                         (const float *)own_dev,
+                                                         (const float *)peer_dev, n,
+                                                         (const uint64_t *)done_dev, exch,
+                                                         (uint32_t *)err_dev, timeout_ns);
     return cuda_ok(cudaGetLastError(), "tp bulk combine sum launch");
 }
 

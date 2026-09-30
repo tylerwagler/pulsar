@@ -2494,14 +2494,16 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
                                         uint64_t first_msg, uint32_t n_slots, const void *done_dev,
                                         uint64_t exch, void *err_dev, uint64_t timeout_ns);
 /* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
- * `src` from src_off into the mapped bulk out-region (stream-ordered copy),
+ * `src` from `off` into the mapped bulk out-region with an SM kernel -- plus
+ * the addend at the same offset when there is one, which is then zeroed --
  * publish the descriptor {exch, bytes, word2 = bulk flag | buffer}, and combine
- * dst[off..] += the peer's rows in the mapped receive buffer once done >= exch. */
-int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, uint64_t src_off, void *dst_dev,
-                             uint64_t bytes);
+ * dst[off..] = own + the peer's rows (own = the staged out-region, peer = the
+ * mapped receive buffer) once done >= exch. */
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, uint64_t off,
+                             void *out_dev, uint64_t bytes);
 int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2);
-int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *peer_dev,
-                                   uint64_t bytes, const void *done_dev, uint64_t exch,
-                                   void *err_dev, uint64_t timeout_ns);
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
+                                   const void *peer_dev, uint64_t bytes, const void *done_dev,
+                                   uint64_t exch, void *err_dev, uint64_t timeout_ns);
 
 #endif
