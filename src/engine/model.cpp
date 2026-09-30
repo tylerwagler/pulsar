@@ -1,6 +1,10 @@
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 
 
 /* Pulsar's tensor LAYOUT vocabulary, in one table so that a name -> id and an
@@ -187,6 +191,41 @@ bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *o
 }
 
 
+
+/* Resident bytes of one read-only mapping (mincore), counted before a release
+ * so the engine can say what it gave back. */
+static uint64_t model_mapping_resident_bytes(const void *map, uint64_t size) {
+    if (!map || size == 0) return 0;
+    const long pg = sysconf(_SC_PAGESIZE);
+    const uint64_t pages = (size + (uint64_t)pg - 1) / (uint64_t)pg;
+    unsigned char *vec = (unsigned char *)malloc((size_t)pages);
+    if (!vec) return 0;
+    uint64_t resident = 0;
+    if (mincore((void *)map, (size_t)size, vec) == 0)
+        for (uint64_t i = 0; i < pages; i++) resident += vec[i] & 1u;
+    free(vec);
+    return resident * (uint64_t)pg;
+}
+
+static void model_release_mapping(const void *map, uint64_t size, int fd) {
+    if (map && size) (void)madvise((void *)map, (size_t)size, MADV_DONTNEED);
+    if (fd >= 0) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+}
+
+uint64_t pulsar_model_release_host_pages(pulsar_model *m) {
+    if (!m) return 0;
+    uint64_t released = 0;
+    if (m->n_shards > 0) {
+        for (uint64_t i = 0; i < m->n_shards; i++) {
+            released += model_mapping_resident_bytes(m->shard_map[i], m->shard_size[i]);
+            model_release_mapping(m->shard_map[i], m->shard_size[i], m->shard_fd[i]);
+        }
+    } else {
+        released += model_mapping_resident_bytes(m->map, m->size);
+        model_release_mapping(m->map, m->size, m->fd);
+    }
+    return released;
+}
 
 void model_close(pulsar_model *m) {
     if (!m) return;
