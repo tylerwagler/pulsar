@@ -1,20 +1,25 @@
 /* tessera_kernel_gate -- pulsar's Tessera launcher against Tessera's own build, byte for byte (L255).
  *
- *   tests/tessera_kernel_gate FIXTURE
+ *   tests/tessera_kernel_gate FIXTURE [--bench N]
  *
  * FIXTURE comes from tools/tessera/kernel_fixture.py: Tessera's own torch extension (built from Tessera's
  * source by Tessera's loader) run on Qwen3.8-Flash-Next layer-12 weights, with every kernel input and the
  * output bytes recorded.  This gate feeds the same inputs to pulsar_tessera_dense_launch /
  * pulsar_tessera_moe_launch (src/cuda/mmq/pulsar_tessera.cu: the vendored device code under pulsar's host
  * side) and passes only if every output byte matches and pulsar's split-K choice equals Tessera's.
+ * --bench N then times each passing case N times (CUDA events, median, after 5 warm-up launches): a HOT
+ * microbenchmark -- consecutive launches leave the weights wherever the previous one did -- whose MoE scope is
+ * the whole call (routing prep, both launches, token sum), the scope of Tessera's FusedRoutedWindowMoE.__call__.
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera */
 #include "pulsar_tessera.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -131,11 +136,30 @@ bool same_bytes(const char *label, const std::vector<uint16_t> &got, const Rec &
     return bad == 0;
 }
 
+/* median microseconds of n launches of fn on stream, after 5 warm-up launches */
+template <typename F> double median_us(F fn, int n, cudaStream_t stream) {
+    for (int i = 0; i < 5; ++i) fn();
+    std::vector<cudaEvent_t> ev(2 * (size_t)n);
+    for (auto &e : ev) cudaEventCreate(&e);
+    for (int i = 0; i < n; ++i) {
+        cudaEventRecord(ev[2 * i], stream);
+        fn();
+        cudaEventRecord(ev[2 * i + 1], stream);
+    }
+    cudaStreamSynchronize(stream);
+    std::vector<float> ms((size_t)n);
+    for (int i = 0; i < n; ++i) cudaEventElapsedTime(&ms[i], ev[2 * i], ev[2 * i + 1]);
+    for (auto &e : ev) cudaEventDestroy(e);
+    std::sort(ms.begin(), ms.end());
+    return 1000.0 * ms[(size_t)n / 2];
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s FIXTURE (tools/tessera/kernel_fixture.py)\n", argv[0]);
+    const int bench = argc == 4 && strcmp(argv[2], "--bench") == 0 ? atoi(argv[3]) : 0;
+    if (argc != 2 && bench <= 0) {
+        fprintf(stderr, "usage: %s FIXTURE [--bench N] (tools/tessera/kernel_fixture.py)\n", argv[0]);
         return 2;
     }
     Fixture fx;
@@ -185,7 +209,12 @@ int main(int argc, char **argv) {
             }
             std::vector<uint16_t> got((size_t)M * w.N);
             if (!cuda_ok(cudaMemcpy(got.data(), dy, got.size() * 2, cudaMemcpyDeviceToHost), "download")) return 2;
-            fails += same_bytes(label, got, *fx.get(c + "y")) ? 0 : 1;
+            const bool pass = same_bytes(label, got, *fx.get(c + "y"));
+            fails += pass ? 0 : 1;
+            if (pass && bench)
+                printf("  %-28s bench %.1f us (median of %d, hot)\n", label,
+                       median_us([&] { pulsar_tessera_dense_launch(&w, dx, M, dy, w.N, ws, wsb, stream); }, bench,
+                                 stream), bench);
         }
     }
 
@@ -223,7 +252,13 @@ int main(int argc, char **argv) {
         }
         std::vector<uint16_t> got((size_t)T * down.N);
         if (!cuda_ok(cudaMemcpy(got.data(), dy, got.size() * 2, cudaMemcpyDeviceToHost), "download")) return 2;
-        fails += same_bytes(label, got, *fx.get(c + "y")) ? 0 : 1;
+        const bool pass = same_bytes(label, got, *fx.get(c + "y"));
+        fails += pass ? 0 : 1;
+        if (pass && bench)
+            printf("  %-28s bench %.1f us (median of %d, hot, whole call)\n", label,
+                   median_us([&] {
+                       pulsar_tessera_moe_launch(&gate, &up, &down, dx, T, top_k, ids, wts, dy, ws, wsb, stream);
+                   }, bench, stream), bench);
     }
     cudaStreamDestroy(stream);
     printf("tessera_kernel_gate: %d of %d cases byte-identical to Tessera's build -- %s\n", cases - fails, cases,

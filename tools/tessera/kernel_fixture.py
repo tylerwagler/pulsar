@@ -60,6 +60,13 @@ def main():
     ap.add_argument("--act", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=255)
+    ap.add_argument("--moe-blobs", default=None, help="a separate expert-stack blob file (default: --blobs)")
+    ap.add_argument("--moe-only", action="store_true", help="skip the dense cases")
+    ap.add_argument("--real-routing", default=None, metavar="SNAPSHOT",
+                    help="route with the capture's own top-10 ids (topk.pt, expert ids must index the stack) and "
+                         "the router's softmax renormalised over them, the router read from this BF16 snapshot; "
+                         "default: seeded random top-10 over the stack")
+    ap.add_argument("--layer", type=int, default=12, help="the router's layer, with --real-routing")
     a = ap.parse_args()
 
     from tessera import routed_fused as rf
@@ -73,7 +80,8 @@ def main():
     unit = lambda b: prepare_window_compact(parse_compact_wire(b), device=dev, family="value")
 
     # ---- dense: one role per Linear, x = the layer's real inputs
-    for role, act_file, ms in (("qkv", "gdn_in.pt", (1, 8, 64, 4096)), ("oproj", "oproj_in.pt", (1, 8, 4096))):
+    dense_cases = () if a.moe_only else (("qkv", "gdn_in.pt", (1, 8, 64, 4096)), ("oproj", "oproj_in.pt", (1, 8, 4096)))
+    for role, act_file, ms in dense_cases:
         bundle = wg.prepare_window_gemm(unit(blobs[role][0]), block_m=64, block_n=64, block_k=64,
                                         arithmetic="folded")
         why = rf.fused_dense_window_supported(bundle)
@@ -105,6 +113,8 @@ def main():
                   flush=True)
 
     # ---- routed: the encoded experts as one stack, distinct top-10 routing per token
+    if a.moe_blobs:
+        blobs = torch.load(a.moe_blobs)
     bundles = {k: wgg.prepare_grouped_window_gemm([unit(b) for b in blobs[k]], block_m=32, block_n=64, block_k=64,
                                                   arithmetic="folded") for k in ("gate", "up", "down")}
     fused = rf.FusedRoutedWindowMoE.from_bundles(bundles["gate"], bundles["up"], bundles["down"])
@@ -123,12 +133,29 @@ def main():
                             fused.tile_words_down, fused.slot_words_down))
     xin = torch.load(f"{a.act}/moe_in.pt", mmap=True)
     g = torch.Generator().manual_seed(a.seed)
+    router = None
+    if a.real_routing:
+        import json
+        from safetensors import safe_open
+        name = f"model.language_model.layers.{a.layer}.mlp.gate.weight"
+        shard = json.load(open(f"{a.real_routing}/model.safetensors.index.json"))["weight_map"][name]
+        with safe_open(f"{a.real_routing}/{shard}", "pt") as h:
+            router = h.get_tensor(name).to(dev).float()
+        if router.shape[0] != E:
+            raise SystemExit(f"--real-routing: the router scores {router.shape[0]} experts, the stack holds {E}")
+        topk_all = torch.load(f"{a.act}/topk.pt", mmap=True)
     for t in (1, 8, 64, 512, 4096):
         x = xin[:t].to(dev).to(torch.bfloat16).contiguous()
-        logits = torch.randn(t, E, generator=g)
-        top = torch.topk(logits, 10, dim=-1)
-        ids = top.indices.to(torch.int32).to(dev).contiguous()
-        w = torch.softmax(top.values, dim=-1).to(torch.float32).to(dev).contiguous()
+        if router is not None:
+            ids64 = topk_all[:t].to(dev).long()
+            probs = torch.softmax(x.float() @ router.t(), dim=-1).gather(1, ids64)
+            ids = ids64.to(torch.int32).contiguous()
+            w = (probs / probs.sum(-1, keepdim=True)).to(torch.float32).contiguous()
+        else:
+            logits = torch.randn(t, E, generator=g)
+            top = torch.topk(logits, 10, dim=-1)
+            ids = top.indices.to(torch.int32).to(dev).contiguous()
+            w = torch.softmax(top.values, dim=-1).to(torch.float32).to(dev).contiguous()
         y = fused(x, ids, w)
         torch.cuda.synchronize()
         c = f"case.moe.T{t}."
