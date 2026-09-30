@@ -548,6 +548,12 @@ typedef struct {
 
 struct pulsar_tp {
     pulsar_tp_options opt;
+    /* TEMPORARY instrument (work/tp-exchange-trace): PULSAR_TP_TRACE=<dir>
+     * writes every exchange and control frame to <dir>/tp-trace-rank<r>.log. */
+    FILE *trace;
+    int trace_state;            /* 0 unopened, 1 open, -1 off */
+    const char *trace_tag;
+    int trace_layer;
     int rank;                   /* 0 leader, 1 worker */
     int n_ranks;                /* ranks in this TP group (2 for the pair) */
     int n_peers;                /* connected peers (n_ranks-1) */
@@ -2777,6 +2783,9 @@ void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
     out->in_off[1] = 2u * tp->bulk_cap;
 }
 
+static double tp_trace_now(void);
+static void tp_trace_exch(pulsar_tp *tp, const char *lane, uint64_t exch, uint64_t size);
+
 int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
     if (!pulsar_tp_bulk_lane(tp) || bytes == 0 || bytes > tp->bulk_cap || !exch || !buf) {
         fprintf(stderr, "pulsar-tp: bulk lane refused (%llu bytes, cap %llu; pair+rdma+bulk buffer "
@@ -2797,6 +2806,7 @@ int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t
                                    (unsigned long long)(tp->bulk_cap >> 20)); }
     *exch = ++tp->row_exch;
     *buf = (uint32_t)(tp->bulk_seq++ & 1u);
+    tp_trace_exch(tp, "bulk", *exch, bytes);
     return 1;
 }
 
@@ -2850,6 +2860,7 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
     *first_msg = tp->gate_seq + 1u;
     tp->gate_seq += rows;
     *exch = ++tp->row_exch;
+    tp_trace_exch(tp, "row", *exch, rows);
     tp->last_gate_exch = *exch;
     return 1;
 }
@@ -2884,6 +2895,10 @@ bool pulsar_tp_failed(const pulsar_tp *tp) {
 }
 void pulsar_tp_mark_failed(pulsar_tp *tp) {
     if (tp) tp->failed.store(true, std::memory_order_release);
+    if (tp && tp->trace_state == 1) {
+        fprintf(tp->trace, "%.6f FAILED exch_now %llu\n", tp_trace_now(), (unsigned long long)tp->row_exch);
+        fflush(tp->trace);
+    }
 }
 
 /* ------------------------------------------------------------------------
@@ -3373,9 +3388,55 @@ typedef struct {
  * peers[0].  Worker -> leader frames (ack, logits half, verify) do NOT come
  * through here: a worker has one peer, the leader, so its control_fd is already
  * that link. */
+
+/* ---- TEMPORARY exchange trace (work/tp-exchange-trace, not for landing) ---- */
+static FILE *tp_trace(pulsar_tp *tp) {
+    if (!tp) return NULL;
+    if (tp->trace_state == 0) {
+        const char *dir = getenv("PULSAR_TP_TRACE");
+        tp->trace_state = -1;
+        if (dir && dir[0]) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/tp-trace-rank%d.log", dir, tp->rank);
+            tp->trace = fopen(path, "w");
+            if (tp->trace) {
+                setvbuf(tp->trace, NULL, _IOFBF, 1 << 20);
+                tp->trace_state = 1;
+                fprintf(stderr, "pulsar-tp: TRACE -> %s\n", path);
+            }
+        }
+    }
+    return tp->trace_state == 1 ? tp->trace : NULL;
+}
+static double tp_trace_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+void pulsar_tp_trace_tag(pulsar_tp *tp, const char *tag, int layer) {
+    if (!tp) return;
+    tp->trace_tag = tag;
+    tp->trace_layer = layer;
+}
+static void tp_trace_exch(pulsar_tp *tp, const char *lane, uint64_t exch, uint64_t size) {
+    FILE *f = tp_trace(tp);
+    if (!f) return;
+    fprintf(f, "%.6f X %llu %s %llu %s L%d\n", tp_trace_now(), (unsigned long long)exch, lane,
+            (unsigned long long)size, tp->trace_tag ? tp->trace_tag : "?", tp->trace_layer);
+    tp->trace_tag = NULL;
+    tp->trace_layer = -1;
+}
+static void tp_trace_frame(pulsar_tp *tp, char dir, uint32_t type, uint32_t bytes) {
+    FILE *f = tp_trace(tp);
+    if (!f) return;
+    fprintf(f, "%.6f %c frame %u %u exch_now %llu\n", tp_trace_now(), dir, type, bytes,
+            (unsigned long long)tp->row_exch);
+}
+
 static int tp_send_frame_to_peers(pulsar_tp *tp, uint32_t type,
                                   const void *payload, uint32_t bytes) {
     if (!tp || tp->n_peers < 1) return 0;
+    tp_trace_frame(tp, 'S', type, bytes);
     for (int i = 0; i < tp->n_peers; i++) {
         if (tp->peers[i].control_fd < 0) return 0;
         if (!tp_send_frame(tp->peers[i].control_fd, type, payload, bytes)) return 0;
@@ -4194,6 +4255,7 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         tp_set_err(err, errlen, "tp: control channel closed");
         return 0;
     }
+    tp_trace_frame(tp, 'R', ftype, bytes);
     uint8_t *payload = NULL;
     if (bytes != 0) {
         payload = static_cast<uint8_t *>(malloc(bytes));

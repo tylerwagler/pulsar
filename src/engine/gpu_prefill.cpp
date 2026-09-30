@@ -1279,6 +1279,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     uint8_t *slab = (uint8_t *)g->tp_slab_dev;
     uint64_t first = 0, exch = 0;
     pulsar_gpu_tensor *payload = ok ? pulsar_gpu_tensor_view(g->tp_ain_own, 0, (uint64_t)msgs * L.vec_bytes) : NULL;
+    pulsar_tp_trace_tag(g->tp, "attn input", (int)il);
     if (ok) ok = payload && pulsar_tp_row_lane_begin(g->tp, msgs, &first, &exch) != 0;
     if (ok) ok = pulsar_gpu_tp_stage_publish(payload, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots,
                                              msgs, slab + L.desc_off, exch, g->tp_stage_ticket) != 0;
@@ -2612,6 +2613,7 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
         pulsar_tp_row_lane_layout(g->tp, &L);
         uint8_t *slab = (uint8_t *)g->tp_slab_dev;
         uint64_t first = 0, exch = 0;
+        pulsar_tp_trace_tag(g->tp, what, (int)il);
         bool ok = slab && g->tp_stage_ticket &&
                   pulsar_tp_row_lane_begin(g->tp, n_tokens, &first, &exch) != 0;
         if (ok) ok = pulsar_gpu_tp_stage_publish(t, addend, slab, L.out_off, L.vec_bytes,
@@ -2654,6 +2656,7 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
             const uint64_t off = r0 * row_bytes, len = rows * row_bytes;
             uint64_t exch = 0;
             uint32_t buf = 0;
+            pulsar_tp_trace_tag(g->tp, what, (int)il);
             ok = pulsar_tp_bulk_begin(g->tp, len, &exch, &buf) != 0 &&
                  pulsar_gpu_tp_bulk_stage(t, off, bulk + BL.out_off, len) != 0 &&
                  pulsar_gpu_tp_publish_bulk(slab + L.desc_off, exch, len,

@@ -321,6 +321,8 @@ typedef struct {
 bool pulsar_tp_row_lane(const pulsar_tp *tp);
 void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out);
 int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch);
+/** TEMPORARY instrument: name the next exchange (site, layer) in the PULSAR_TP_TRACE log. */
+void pulsar_tp_trace_tag(pulsar_tp *tp, const char *tag, int layer);
 /* At a host sync point (the stream is drained): 1 when every enqueued
  * exchange completed cleanly, 0 (refused by name) otherwise. */
 int pulsar_tp_row_lane_check(pulsar_tp *tp);

@@ -1116,6 +1116,7 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
             uint64_t first = 0, exch = 0;
             pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->tp_vocab_own, (uint64_t)m0 * L.vec_bytes,
                                                               (uint64_t)m * L.vec_bytes);
+            pulsar_tp_trace_tag(g->tp, "vocab gather", (int)m0);
             ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
                  pulsar_gpu_tp_stage_publish(chunk, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots, m,
                                              slab + L.desc_off, exch, g->tp_stage_ticket) != 0 &&
