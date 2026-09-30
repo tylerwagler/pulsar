@@ -668,6 +668,13 @@ exl3-dequant-gate: tests/exl3_dequant_gate
 # qwen-family-gate-device adds a real session on the GPU (the battery's entry).
 QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
+# The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
+.PHONY: spec-depth-gate
+tests/spec_depth_gate: tests/spec_depth_gate.cpp src/engine/spec_depth.h Makefile
+	$(CXX) $(CXXFLAGS) -o $@ tests/spec_depth_gate.cpp
+spec-depth-gate: tests/spec_depth_gate
+	./tests/spec_depth_gate
+
 .PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
 qwen-family-containers:
 	@test -f $(QWEN_HF_DIR)/model.safetensors.index.json || { \

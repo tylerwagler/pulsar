@@ -1297,6 +1297,10 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         const char *t = getenv("PULSAR_QWEN_MTP_TAU");
         return t && t[0] ? (float)atof(t) : 0.7f;
     }();
+    /* NOT the adaptive cap (spec_depth.h, DSpark's L107 rule): measured 2026-09-29 on three code prompts it
+     * LOST to the fixed cap of 4 (52-59 vs 59.5-60.4 tok/s at tau 0.6-0.8).  The confidence stop already
+     * adapts inside every round, and the rule's down-signal (< half converted) fires on chains that stopped
+     * early by design.  DSpark needs it because it drafts all K at once and cannot stop early. */
     const uint32_t V = sh->n_vocab, il_mtp = e->plan.n_layer;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
