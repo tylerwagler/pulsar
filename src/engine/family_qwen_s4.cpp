@@ -18,6 +18,7 @@
 #include "qwen_ngram.h"
 #include "cuda/pulsar_cuda_qwen.h"
 #include "cuda/pulsar_cuda_gdn.h"
+#include "cuda/mmq/pulsar_tessera.h"
 
 #include <sys/stat.h>
 
@@ -242,17 +243,32 @@ static bool admit_gr(const pulsar_qwen_gr_weights &g) {
     return ok;
 }
 
-/* a layer's MoE: the router, the routed experts (fused gate_up, or the MTP layer's gate + up pair), the
- * shared expert */
+/* L255: a Tessera stack's planes in the storage the launcher reads (family_qwen.h PULSAR_QWEN_TESS_*) */
+static bool admit_tessera(pulsar_tensor *const P[PULSAR_QWEN_TESS_PLANES]) {
+    static const uint32_t want[PULSAR_QWEN_TESS_PLANES] = {
+        PULSAR_TENSOR_I32, PULSAR_TENSOR_BF16, PULSAR_TENSOR_I32, PULSAR_TENSOR_I32,
+        PULSAR_TENSOR_F32, PULSAR_TENSOR_I32,  PULSAR_TENSOR_I32, PULSAR_TENSOR_I32};
+    bool ok = true;
+    for (int i = 0; i < PULSAR_QWEN_TESS_PLANES; ++i)
+        ok &= admit(P[i], P[i]->type == want[i], tensor_type_name(want[i]));
+    return ok;
+}
+
+/* a layer's MoE: the router, the routed experts (fused gate_up, the MTP layer's gate + up pair, or L255's
+ * Tessera planes), the shared expert */
 static bool admit_moe(const pulsar_qwen_layer_weights &L) {
     bool ok = admit_bf16(L.moe_router) & admit_bf16(L.sh_gate_scalar);
-    if (L.moe_gate_up)
-        ok &= admit_exl3(L.moe_gate_up, EXL3_ARM_GATE_UP_FUSED, "exl3m_k4 / exl3m_k5 (the fused gate_up arm)");
-    else
-        ok &= admit_exl3(L.moe_gate, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
-              admit_exl3(L.moe_up, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
-              admit(L.moe_up, L.moe_up->type == L.moe_gate->type, "the gate slice's rate (the pair shares one)");
-    ok &= admit_exl3(L.moe_down, EXL3_ARM_DOWN, "an exl3m rate the routed down arm reads");
+    if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
+        for (int p = 0; p < PULSAR_QWEN_TESS_PROJS; ++p) ok &= admit_tessera(L.moe_tess[p]);
+    } else {
+        if (L.moe_gate_up)
+            ok &= admit_exl3(L.moe_gate_up, EXL3_ARM_GATE_UP_FUSED, "exl3m_k4 / exl3m_k5 (the fused gate_up arm)");
+        else
+            ok &= admit_exl3(L.moe_gate, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
+                  admit_exl3(L.moe_up, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
+                  admit(L.moe_up, L.moe_up->type == L.moe_gate->type, "the gate slice's rate (the pair shares one)");
+        ok &= admit_exl3(L.moe_down, EXL3_ARM_DOWN, "an exl3m rate the routed down arm reads");
+    }
     ok &= admit_exl3(L.sh_gate, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
           admit_exl3(L.sh_up, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
           admit_exl3(L.sh_down, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads");
@@ -515,16 +531,13 @@ bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_g
                                        (const float *)((uint8_t *)dptr(sc) + g.inj[side]), (int)st->n_rows, 0) == 0;
 }
 
-bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
-    const uint32_t n = st->n_rows;
+/* The EXL3 expert stacks -> the launcher's tables.  The stacks are [trellis | suh | svh] per expert
+ * (exl3_expert_layout); the trunk's gate_up is ONE fused stack (2 MID outputs), the MTP layer's gate and up
+ * two stacks of MID (split). */
+static bool bind_exl3_experts(const pulsar_qwen_step *st, const pulsar_qwen_layer_weights &L, int H, int MID,
+                              pulsar_qwen_moe_dev *wp) {
     const pulsar_qwen_shape *s = st->shape;
-    const int H = (int)s->n_embd, MID = (int)s->n_ff_exp, SMID = (int)s->n_ff_shexp;
-    const pulsar_qwen_layer_weights &L = layer_w(st, il);
-    pulsar_qwen_moe_dev w{};
-    w.router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
-    w.shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
-    /* the expert stacks: [trellis | suh | svh] per expert (exl3_expert_layout).  The trunk's gate_up is
-     * ONE fused stack (2 MID outputs); the MTP layer's gate and up are two stacks of MID (split). */
+    pulsar_qwen_moe_dev &w = *wp;
     const bool split = L.moe_gate_up == NULL;
     const pulsar_tensor *first = split ? L.moe_gate : L.moe_gate_up;
     const uint64_t first_out = split ? (uint64_t)MID : 2ull * MID;
@@ -549,6 +562,53 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     w.down_table = pulsar_qwen_expert_table(dn, s->n_expert, stride_d, td);
     if ((split ? !w.gate_table || !w.up_table : !w.gate_up_table) || !w.down_table)
         return fail("no EXL3 expert table");
+    return true;
+}
+
+/* L255: one Tessera stack's launch descriptor from its bound planes -- device pointers, the stack geometry
+ * (in -> out, n_expert) and the two host integers of its geom plane. */
+static bool tessera_proj(const pulsar_qwen_step *st, pulsar_tensor *const P[PULSAR_QWEN_TESS_PLANES], int in,
+                         int out, pulsar_tessera_proj *o) {
+    const int32_t *geom = (const int32_t *)tensor_data(st->model, P[PULSAR_QWEN_TESS_GEOM]);
+    o->E = (int)st->shape->n_expert;
+    o->K = in;
+    o->N = out;
+    o->words = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_WORDS], "qwen tessera words");
+    o->words_stride = (long)P[PULSAR_QWEN_TESS_WORDS]->dim[0];
+    o->table = (const uint16_t *)wptr(st, P[PULSAR_QWEN_TESS_TABLE], "qwen tessera table");
+    o->init = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_INIT], "qwen tessera init");
+    o->has_init = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_HAS_INIT], "qwen tessera has_init");
+    o->wscale = (const float *)wptr(st, P[PULSAR_QWEN_TESS_WSCALE], "qwen tessera wscale");
+    o->runs = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_RUNS], "qwen tessera runs");
+    o->bdesc = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_BDESC], "qwen tessera bdesc");
+    o->tile_words = geom ? geom[0] : 0;
+    o->slot_words = geom ? geom[1] : 0;
+    if (!geom) return fail("no host view of a Tessera geom plane");
+    return o->words && o->table && o->init && o->has_init && o->wscale && o->runs && o->bdesc;
+}
+
+bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
+    const uint32_t n = st->n_rows;
+    const pulsar_qwen_shape *s = st->shape;
+    const int H = (int)s->n_embd, MID = (int)s->n_ff_exp, SMID = (int)s->n_ff_shexp;
+    const pulsar_qwen_layer_weights &L = layer_w(st, il);
+    pulsar_qwen_moe_dev w{};
+    w.router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
+    w.shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
+    pulsar_tessera_proj tp[PULSAR_QWEN_TESS_PROJS];
+    if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
+        /* L255: the layer's experts are Tessera planes; the launcher reads them through tp */
+        if (!tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_GATE], H, MID, &tp[PULSAR_QWEN_TESS_GATE]) ||
+            !tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_UP], H, MID, &tp[PULSAR_QWEN_TESS_UP]) ||
+            !tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_DOWN], MID, H, &tp[PULSAR_QWEN_TESS_DOWN]) ||
+            !w.router_w || !w.shared_gate_w)
+            return false;
+        w.tessera_gate = &tp[PULSAR_QWEN_TESS_GATE];
+        w.tessera_up = &tp[PULSAR_QWEN_TESS_UP];
+        w.tessera_down = &tp[PULSAR_QWEN_TESS_DOWN];
+    } else if (!bind_exl3_experts(st, L, H, MID, &w)) {
+        return false;
+    }
     if (!linear_dev(st, L.sh_gate, H, SMID, "qwen shared gate_proj", &w.shared_gate) ||
         !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &w.shared_up) ||
         !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &w.shared_down))

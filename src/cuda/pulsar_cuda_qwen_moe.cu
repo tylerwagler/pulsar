@@ -23,6 +23,7 @@
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"
 #include "mmq/ds4_exl3_gemv.cuh"
+#include "mmq/pulsar_tessera.h"
 #endif
 
 #include <cuda_bf16.h>
@@ -179,6 +180,18 @@ qwen_swiglu_emit_kernel(const float *__restrict__ g, const float *__restrict__ u
     }
 }
 
+/* L255: the Tessera arm's routed sum -- bf16 [T][kH], summed over the top-k in fixed order and rounded once by
+ * Tessera's token_sum -- is the block's routed term in f32, exactly; a non-finite value records nf_code (first
+ * writer wins), as the EXL3 sum does. */
+__global__ void qwen_tessera_routed_kernel(float *__restrict__ out, const uint16_t *__restrict__ routed, size_t n,
+                                           uint32_t *__restrict__ nf_flag, uint32_t nf_code) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = __uint_as_float((uint32_t)routed[i] << 16);
+    out[i] = v;
+    if (!isfinite(v)) atomicCAS(nf_flag, 0u, nf_code);
+}
+
 /* out = routed + sgate * shared, in that order. */
 __global__ void qwen_shared_add_kernel(float *__restrict__ out, const float *__restrict__ ys,
                                        const float *__restrict__ sgate, int T) {
@@ -305,14 +318,19 @@ extern "C" size_t pulsar_qwen_moe_workspace_bytes(int T) {
 extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
                                       int T, float *out, void *ws, size_t ws_bytes,
                                       uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
-    if (!w || !x_bf16 || !out || !nf_flag || T <= 0 || !w->down_table) {
+    if (!w || !x_bf16 || !out || !nf_flag || T <= 0) {
         fprintf(stderr, "pulsar: qwen MoE: a null input or a slot that is not %d wide -- refusing\n", kH);
         return -1;
     }
+    /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255) */
+    const bool tessera = w->tessera_gate != nullptr;
     const bool split = w->gate_table != nullptr;
-    if (split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr)) {
-        fprintf(stderr, "pulsar: qwen MoE: the routed experts must be ONE of a fused gate_up table or a gate + up "
-                        "pair -- refusing\n");
+    const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
+    if (tessera ? (!w->tessera_up || !w->tessera_down || exl3)
+                : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr) ||
+                   w->tessera_up || w->tessera_down)) {
+        fprintf(stderr, "pulsar: qwen MoE: the routed experts must be ONE of an EXL3 fused gate_up table, an EXL3 "
+                        "gate + up pair, or a Tessera gate / up / down triple -- refusing\n");
         return -1;
     }
     const int smid = w->shared_gate.out;
@@ -345,7 +363,7 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
         return -1;
     }
     static int announced = 0;
-    if (!announced) {
+    if (!announced && !tessera) {
         announced = 1;
         fprintf(stderr, "pulsar: L251 qwen MoE = bf16 router softmax top-%d of %d + EXL3 routed trellis GEMV "
                         "(fused gate_up K=%g, down K=%g) + EXL3 dense shared expert (K=%g/%g/%g), sigmoid-gated\n",
@@ -364,48 +382,80 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
                                        m.logits, m.sel, m.wts, m.sgate, stream);
     if (rc) return rc;
 
-    /* Routed: the four launches, all on the block input's bf16 row and the fold's bf16 output.
-     * L251 / ac69748f: there is no E4M3 activation slot in this family, so nothing here stages or
-     * encodes one -- the fused arm reads x_bf16 by ids_src1, and the fold hands the down arm bf16. */
-    if (split) {
-        /* gate z in the first half of gu_z, up z in the second: [pairs][mid] each */
-        float *gz = m.gu_z, *uz = m.gu_z + (size_t)pairs * mid;
-        rc = ds4_exl3_moe_pair_bf16(w->gate_table, w->up_table, w->k2_gate_up, m.sel, gz, uz, mid, kH, T, kE, kTopK,
-                                    stream, x_bf16);
-        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate/up pair declined (rc=%d) -- no fallback\n", rc); return -1; }
-        rc = ds4_exl3_moe_fold_launch(gz, uz, m.sel, m.wts, w->gate_table, w->up_table, w->down_table,
-                                      kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+    if (tessera) {
+        /* L255: Tessera's fused window kernel on the router's own selection -- routing prep, gate/up + SwiGLU,
+         * weighted down, fixed-order token sum -- then the block's f32 routed term.  Its workspace and its
+         * bf16 output live in the EXL3 arm's buffers (down_z, gu_z): exactly one routed arm runs. */
+        static int announced_tessera = 0;
+        if (!announced_tessera) {
+            announced_tessera = 1;
+            fprintf(stderr, "pulsar: L255 qwen MoE = bf16 router softmax top-%d of %d + Tessera routed fused window "
+                            "kernel (value family, gate/up tile_words %d, down %d) + EXL3 dense shared expert "
+                            "(K=%g/%g/%g), sigmoid-gated\n",
+                    kTopK, kE, w->tessera_gate->tile_words, w->tessera_down->tile_words, w->shared_gate.k2 / 2.0,
+                    w->shared_up.k2 / 2.0, w->shared_down.k2 / 2.0);
+        }
+        const size_t tws = pulsar_tessera_moe_workspace_bytes(w->tessera_gate, w->tessera_down, T, kTopK);
+        const size_t have_ws = (size_t)T * kTopK * kH * 4, have_out = (size_t)T * kTopK * 2 * PULSAR_QWEN_EXPERT_MID * 4;
+        if (w->tessera_gate->E != kE || w->tessera_gate->K != kH || w->tessera_gate->N != PULSAR_QWEN_EXPERT_MID ||
+            tws > have_ws || (size_t)T * kH * 2 > have_out) {
+            fprintf(stderr, "pulsar: qwen MoE: the Tessera stacks are E %d, %d -> %d (built for %d, %d -> %d), or "
+                            "their workspace %zu B exceeds the routed arm's %zu B -- refusing\n",
+                    w->tessera_gate->E, w->tessera_gate->K, w->tessera_gate->N, kE, kH, PULSAR_QWEN_EXPERT_MID, tws,
+                    have_ws);
+            return -1;
+        }
+        uint16_t *routed = (uint16_t *)m.gu_z;
+        rc = pulsar_tessera_moe_launch(w->tessera_gate, w->tessera_up, w->tessera_down, x_bf16, T, kTopK, m.sel,
+                                       m.wts, routed, m.down_z, have_ws, stream);
+        if (rc) { fprintf(stderr, "pulsar: qwen MoE: the Tessera routed launch refused (rc=%d) -- no fallback\n", rc); return -1; }
+        const size_t n = (size_t)T * kH;
+        qwen_tessera_routed_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, routed, n, nf_flag, nf_code);
+        if (!launch_ok("tessera routed term")) return -3;
     } else {
-        rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK,
-                                     stream, x_bf16);
-        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
-        rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
-                                            kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
-    }
-    if (rc) return -1;
-    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down GEMV's input --
-     * so the xcheck can compare the DEVICE's own values against its emulation's per element.  Under
-     * bf16 there are no codes and no per-32 scale to differ on, so the comparison is now on the value
-     * itself; the dump is 2 bytes per element where the A8 pair was 1 plus its slab.  Armed only by
-     * the env var; nothing runs and nothing allocates when it is unset. */
-    { const char *sp = getenv("PULSAR_MOE_SPILL_MID");
-      if (sp && sp[0] && T > 1) {   /* the batch call; the M=1 loop would overwrite it */
-          const size_t nb = (size_t)pairs * (size_t)mid * 2u;
-          uint8_t *hb = (uint8_t *)malloc(nb);
-          cudaStreamSynchronize(stream);
-          if (hb && cudaMemcpy(hb, m.mid_x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-              char fp[1024];
-              snprintf(fp, sizeof(fp), "%s.mid_x.bin", sp);
-              FILE *f = fopen(fp, "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); }
+        /* Routed: the four launches, all on the block input's bf16 row and the fold's bf16 output.
+         * L251 / ac69748f: there is no E4M3 activation slot in this family, so nothing here stages or
+         * encodes one -- the fused arm reads x_bf16 by ids_src1, and the fold hands the down arm bf16. */
+        if (split) {
+            /* gate z in the first half of gu_z, up z in the second: [pairs][mid] each */
+            float *gz = m.gu_z, *uz = m.gu_z + (size_t)pairs * mid;
+            rc = ds4_exl3_moe_pair_bf16(w->gate_table, w->up_table, w->k2_gate_up, m.sel, gz, uz, mid, kH, T, kE, kTopK,
+                                        stream, x_bf16);
+            if (rc) { fprintf(stderr, "pulsar: qwen MoE gate/up pair declined (rc=%d) -- no fallback\n", rc); return -1; }
+            rc = ds4_exl3_moe_fold_launch(gz, uz, m.sel, m.wts, w->gate_table, w->up_table, w->down_table,
+                                          kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+        } else {
+            rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, kE, kTopK,
+                                         stream, x_bf16);
+            if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
+            rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
+                                                kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
+        }
+        if (rc) return -1;
+        /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down GEMV's input --
+         * so the xcheck can compare the DEVICE's own values against its emulation's per element.  Under
+         * bf16 there are no codes and no per-32 scale to differ on, so the comparison is now on the value
+         * itself; the dump is 2 bytes per element where the A8 pair was 1 plus its slab.  Armed only by
+         * the env var; nothing runs and nothing allocates when it is unset. */
+        { const char *sp = getenv("PULSAR_MOE_SPILL_MID");
+          if (sp && sp[0] && T > 1) {   /* the batch call; the M=1 loop would overwrite it */
+              const size_t nb = (size_t)pairs * (size_t)mid * 2u;
+              uint8_t *hb = (uint8_t *)malloc(nb);
+              cudaStreamSynchronize(stream);
+              if (hb && cudaMemcpy(hb, m.mid_x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                  char fp[1024];
+                  snprintf(fp, sizeof(fp), "%s.mid_x.bin", sp);
+                  FILE *f = fopen(fp, "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); }
+              }
+              free(hb);
           }
-          free(hb);
-      }
+        }
+        rc = ds4_exl3_moe_single_bf16(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
+                                      stream, m.mid_x);
+        if (rc) { fprintf(stderr, "pulsar: qwen MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
+        rc = ds4_exl3_moe_sum_launch(out, m.down_z, m.sel, w->down_table, mid, kH, kTopK, T, nf_flag, nf_code, stream);
+        if (rc) return -1;
     }
-    rc = ds4_exl3_moe_single_bf16(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, kE, 1,
-                                  stream, m.mid_x);
-    if (rc) { fprintf(stderr, "pulsar: qwen MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
-    rc = ds4_exl3_moe_sum_launch(out, m.down_z, m.sel, w->down_table, mid, kH, kTopK, T, nf_flag, nf_code, stream);
-    if (rc) return -1;
 
     /* shared: gate + up on the same slot, the SwiGLU producer, down */
     rc = pulsar_qwen_linear_launch(&w->shared_gate, x_bf16, T, m.yg, m.lin, m.lin_bytes, stream);

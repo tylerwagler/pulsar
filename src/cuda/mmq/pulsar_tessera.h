@@ -18,7 +18,12 @@
  */
 #pragma once
 
+#ifdef __CUDACC__
 #include <cuda_runtime.h>
+#else
+/* the engine's CUDA-free TUs (family_qwen_s4.cpp) fill the descriptors: the stream typedef is all they need */
+typedef struct CUstream_st *cudaStream_t;
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,7 +33,7 @@ extern "C" {
 
 /** One projection stack of the value family, kernel-ready: E experts (1 for a dense Linear), each an
  *  N x K weight.  Every pointer is device memory. */
-typedef struct {
+typedef struct pulsar_tessera_proj {
     int E;                    /**< experts in the stack (1 for a dense Linear) */
     int K;                    /**< input columns: a multiple of 32, at least 128 */
     int N;                    /**< output rows: a multiple of 128 */

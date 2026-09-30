@@ -49,6 +49,8 @@ typedef struct CUstream_st *cudaStream_t;
 extern "C" {
 #endif
 
+struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+
 /* ---- the shapes these kernels are built for (config.json of the checkpoint).
  * The launchers take the dims they are handed and REFUSE any that differ: the
  * config is the authority, these constants are what the templates were
@@ -183,6 +185,10 @@ typedef struct {
      *  suh (the MTP layer's experts, turboderp's EXL3).  Exactly one of gate_up_table and
      *  (gate_table, up_table) is set; the artifact decides, the launcher refuses anything else. */
     const void *const *gate_table, *const *up_table;
+    /** L255: the routed experts in Tessera's value family (src/cuda/mmq/pulsar_tessera.h) -- gate, up and down
+     *  stacks of n_expert, kernel-ready.  Set instead of every EXL3 table above when the artifact carries the
+     *  layer's experts that way; the launcher refuses a block with both or neither. */
+    const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int k2_gate_up, k2_down;         /**< routed rates (half-bit units); k2_gate_up is the pair's rate in the split form */
     pulsar_qwen_linear shared_gate, shared_up, shared_down;
 } pulsar_qwen_moe_dev;

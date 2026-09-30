@@ -71,8 +71,9 @@ def main():
 
     from tessera import routed_fused as rf
     from tessera import window_gemm as wg
-    from tessera import window_gemm_grouped as wgg
     from tessera.compact_prep import parse_compact_wire, prepare_window_compact
+
+    import planes
 
     dev = torch.device("cuda")
     blobs = torch.load(a.blobs)
@@ -115,19 +116,10 @@ def main():
     # ---- routed: the encoded experts as one stack, distinct top-10 routing per token
     if a.moe_blobs:
         blobs = torch.load(a.moe_blobs)
-    bundles = {k: wgg.prepare_grouped_window_gemm([unit(b) for b in blobs[k]], block_m=32, block_n=64, block_k=64,
-                                                  arithmetic="folded") for k in ("gate", "up", "down")}
-    fused = rf.FusedRoutedWindowMoE.from_bundles(bundles["gate"], bundles["up"], bundles["down"])
-    for k in ("gate", "up", "down"):
-        b = getattr(fused, k)
-        p = f"moe.{k}."
-        fx.add(p + "words", getattr(fused, f"words_{k}"))
-        fx.add(p + "table", getattr(fused, f"table_{k}"))
-        fx.add(p + "init", b.init_all)
-        fx.add(p + "has_init", b.has_init)
-        fx.add(p + "wscale", b.scale_all)
-        fx.add(p + "runs", getattr(fused, f"runs_{k}"))
-        fx.add(p + "bdesc", getattr(fused, f"bdesc_{k}"))
+    fused = planes.fused_stack(blobs, dev)
+    for k, pl in planes.stack_planes(fused).items():
+        for name in planes.PLANES[:-1]:   # the geometry travels in moe.geom
+            fx.add(f"moe.{k}.{name}", pl[name])
     E = len(blobs["gate"])
     fx.scalars("moe.geom", (E, fused.gate.rows, fused.gate.cols, fused.tile_words_gate_up, fused.slot_words_gate_up,
                             fused.tile_words_down, fused.slot_words_down))
