@@ -1,6 +1,7 @@
 #include "pulsar_kvstore.h"
 
 #include "sha1.hpp"
+#include "pulsar_writeback.h"
 
 /* Shared disk KV checkpoint file support (C++ port).
  *
@@ -245,11 +246,12 @@ bool kv_cache_budget_required(uint64_t file_bytes,
     return true;
 }
 
-bool kv_cache_incoming_supersedes_continued(
+/* Is entry `e` a checkpoint of a strict PREFIX of the incoming text, loadable
+ * wherever the incoming one would be (same model, quant, and no wider ctx)? */
+bool kv_cache_entry_is_incoming_prefix(
         const pulsar_kvstore_entry *e,
         const pulsar_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != PULSAR_KVSTORE_REASON_CONTINUED) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -264,6 +266,13 @@ bool kv_cache_incoming_supersedes_continued(
     char prefix_sha[41];
     Sha1::bytes_hex(incoming->text, (size_t)e->text_bytes, prefix_sha);
     return !strcmp(prefix_sha, e->sha);
+}
+
+bool kv_cache_incoming_supersedes_continued(
+        const pulsar_kvstore_entry *e,
+        const pulsar_kvstore_eviction_context *incoming) {
+    return e && e->reason == PULSAR_KVSTORE_REASON_CONTINUED &&
+           kv_cache_entry_is_incoming_prefix(e, incoming);
 }
 
 /* Eviction score with the supersedes-continued decision SUPPLIED rather than
@@ -854,6 +863,40 @@ public:
             return true;
         }
 
+        /* L261: a continued snapshot a whole ~800 MB write away from one the store
+         * already holds buys at most one interval of prefill.  On the pair two
+         * banks sharing a history stored 307,109 and 307,201 tokens 7 s apart, and
+         * the second write evicted the first.  Skip the write when an entry is a
+         * prefix of this text within one continued interval, and report it
+         * stored: the caller advances its interval baseline instead of retrying
+         * every step. */
+        if (reason_code == PULSAR_KVSTORE_REASON_CONTINUED) {
+            const int step = continued_step();
+            pulsar_kvstore_eviction_context probe = {};
+            probe.text = text;
+            probe.text_len = text_len;
+            probe.model_id = (uint8_t)model_id;
+            probe.quant_bits = (uint8_t)quant_bits;
+            probe.ctx_size = (uint32_t)pulsar_session_ctx(session);
+            probe.reject_different_quant = kc_.reject_different_quant;
+            refresh();
+            for (int i = 0; step > 0 && i < kc_.len; i++) {
+                const pulsar_kvstore_entry *e = &kc_.entry[i];
+                if (e->tokens >= (uint32_t)store_tokens.len ||
+                    (uint32_t)store_tokens.len - e->tokens >= (uint32_t)step)
+                    continue;
+                if (!kv_cache_entry_is_incoming_prefix(e, &probe)) continue;
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                     "%s: kv cache skipped tokens=%d reason=continued because an entry already "
+                     "holds %u of them (within one %d-token interval): %s",
+                     log_name(), store_tokens.len, e->tokens, step, e->path ? e->path : "?");
+                free(text);
+                free(path);
+                pulsar_tokens_free(&store_tokens);
+                return true;
+            }
+        }
+
         pulsar_session_payload_file staged = {};
         /* Stage in the store's own dir (real disk), not /tmp (L110 F5). */
         /* L250: on a TP group every rank writes its own copy under this key;
@@ -946,6 +989,10 @@ public:
                   /* fsync before the atomic rename: without it a crash can leave
                    * a zero/partial .kv visible under the final name. */
                   fsync(fileno(fp)) == 0;
+        /* L261: a stored entry is read back rarely (18 hits in 4.5 days of agent
+         * traffic); its pages must not squat in the page cache and push the
+         * server into swap.  The payload copy above already streamed them out. */
+        if (ok) pulsar_writeback_drop_file(fp);
         int saved_errno = errno;
         if (fclose(fp) != 0) {
             if (!saved_errno) saved_errno = errno;
@@ -1179,11 +1226,12 @@ public:
              * load. */
             pulsar_kvstore_touch_file(path, hdr.hits + 1);
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                 "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                 "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s stored=%s hits=%u load=%.1f ms file=%s",
                  log_name(),
                  responses_protocol ? " " : "",
                  responses_protocol ? "RESPPROTO" : "",
-                 loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
+                 loaded, text_bytes, hdr.quant_bits, key_kind,
+                 pulsar_kvstore_reason_name(hdr.reason), hdr.hits + 1, load_ms, path);
             if (result) {
                 result->tokens = loaded;
                 result->text_bytes = text_bytes;
@@ -1237,6 +1285,19 @@ uint8_t pulsar_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "agent-session")) return PULSAR_KVSTORE_REASON_AGENT_SESSION;
     if (!strcmp(reason, "sys-prefix")) return PULSAR_KVSTORE_REASON_SYS_PREFIX;
     return PULSAR_KVSTORE_REASON_UNKNOWN;
+}
+
+const char *pulsar_kvstore_reason_name(uint8_t code) {
+    switch (code) {
+    case PULSAR_KVSTORE_REASON_COLD: return "cold";
+    case PULSAR_KVSTORE_REASON_CONTINUED: return "continued";
+    case PULSAR_KVSTORE_REASON_EVICT: return "evict";
+    case PULSAR_KVSTORE_REASON_SHUTDOWN: return "shutdown";
+    case PULSAR_KVSTORE_REASON_AGENT_SYSTEM: return "agent-system";
+    case PULSAR_KVSTORE_REASON_AGENT_SESSION: return "agent-session";
+    case PULSAR_KVSTORE_REASON_SYS_PREFIX: return "sys-prefix";
+    default: return "unknown";
+    }
 }
 
 const char *pulsar_kvstore_key_kind(uint8_t ext_flags) {

@@ -154,6 +154,8 @@ typedef struct {
 
 pulsar_kvstore_options pulsar_kvstore_default_options(void);
 uint8_t pulsar_kvstore_reason_code(const char *reason);
+/** The reason code's name ("continued", "cold", ...); "unknown" for an unnamed code. */
+const char *pulsar_kvstore_reason_name(uint8_t code);
 const char *pulsar_kvstore_key_kind(uint8_t ext_flags);
 
 bool pulsar_kvstore_open(pulsar_kvstore *kc, const char *dir, uint64_t budget_mb,
