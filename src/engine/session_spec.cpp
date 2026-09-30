@@ -965,6 +965,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * the residual rebuilds q from the qrows under THESE params, so the stored
      * accept denominator and the residual describe one proposal. */
     s->spec.dspark_pending_sampled = sample_drafts;
+    s->spec.dspark_qrows_n = sample_drafts ? n_draft : 0u;   /* L260: the rows the drafting loop wrote */
     s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->spec.dspark_pending_temp = temperature;
     s->spec.dspark_pending_top_k = top_k;
@@ -1319,6 +1320,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                      temperature, top_k, top_p, min_p,
                                      rng, &carry_tok);
     }
+    s->spec.dspark_qrows_n = 0u;   /* L260: the walk was the last reader of this round's q rows */
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
         (void)spec_frontier_restore(&frontier, s);
@@ -2331,6 +2333,7 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
     s->spec.dspark_n_pending = q->keep;
     for (uint32_t i = 0; i < q->keep; i++) s->spec.dspark_pending[i] = q->refined[i + 1];
     s->spec.dspark_pending_sampled = q->sample_drafts;
+    s->spec.dspark_qrows_n = q->sample_drafts ? q->n_draft : 0u;   /* L260: the rows this commit writes */
     s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->spec.dspark_pending_temp = q->temperature;
     s->spec.dspark_pending_top_k = q->top_k;

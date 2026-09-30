@@ -2018,6 +2018,12 @@ typedef struct pulsar_spec_carry_state {
     bool dspark_chain_conf;      ///< the confidence head ran for the in-flight chain
     uint32_t dspark_chain_n;     ///< drafted depth of the in-flight chain
     uint32_t dspark_n_pending;   ///< drafts proposed and awaiting verification
+    /** L260: draft positions whose proposal q may still be read from the session's dspark_pending_qrows (the
+     *  non-compact ones, pulsar_spec_q_compact).  Set where the rows are written (the drafting loop, redraft
+     *  commit); NOT reset by pulsar_spec_drop_pendings, because round_begin drops the pendings before the
+     *  in-flight round's walk reads their rows; cleared once that walk is done.  The bank carry copies these
+     *  rows and no others. */
+    uint32_t dspark_qrows_n;
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */

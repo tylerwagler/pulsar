@@ -539,14 +539,15 @@ int pulsar_session::bank_repoint(uint32_t bank) {
     return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
 }
 
-/* L260: the full q rows a bank's pending drafts carry -- rows j < n_pending of sampled drafts whose q did not
- * fit the compact form (pulsar_spec_q_compact), the only rows the verify walk reads -- copied from src to dst.
- * The rest of the n_draft x PULSAR_N_VOCAB capacity is never read, and copying it on every bank switch was
- * ~2.6 MB per save and per restore at depth 5 under sampling (the c10 host-bookkeeping cost). */
+/* L260: the full q rows a bank carries -- rows j < dspark_qrows_n (the positions whose rows may still be read,
+ * which outlives the pendings: round_begin drops them before the in-flight round's walk reads the rows) of
+ * sampled drafts whose q did not fit the compact form (pulsar_spec_q_compact) -- copied from src to dst.  The
+ * rest of the n_draft x PULSAR_N_VOCAB capacity is never read, and copying it on every bank switch was ~2.6 MB
+ * per save and per restore at depth 5 under sampling (the c10 host-bookkeeping cost). */
 static void copy_pending_qrows(float *dst, uint32_t dst_cap, const float *src, uint32_t src_cap,
                                const pulsar_spec_carry_state &sp) {
     if (!sp.dspark_pending_sampled) return;
-    const uint32_t n = sp.dspark_n_pending < 16u ? sp.dspark_n_pending : 16u;
+    const uint32_t n = sp.dspark_qrows_n < 16u ? sp.dspark_qrows_n : 16u;
     for (uint32_t j = 0; j < n; j++) {
         if (pulsar_spec_q_compact(sp.dspark_pending_qn[j])) continue;
         const uint64_t end = (uint64_t)(j + 1u) * PULSAR_N_VOCAB;
