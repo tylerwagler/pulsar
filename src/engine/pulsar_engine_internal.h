@@ -1996,6 +1996,10 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
 #define PULSAR_DSPARK_PREFILTER_ROW_I32 (3u + 2u * PULSAR_DSPARK_PREFILTER_CAP)
 /** L149: widest proposal distribution stored per pending draft position. */
 #define PULSAR_DSPARK_QDIST_CAP 256u
+/** L149/L260: a pending draft's proposal q is held in the compact form (qids/qprobs, qn entries) exactly when
+ *  this holds; otherwise the verify walk rebuilds q from the draft's full row in dspark_pending_qrows.  The one
+ *  test for both the walk and the bank carry's row copy. */
+static inline bool pulsar_spec_q_compact(uint32_t qn) { return qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP; }
 
 typedef struct pulsar_spec_carry_state {
     /** Fused DSpark loop (P2): drafts produced LAST step from the last-accepted

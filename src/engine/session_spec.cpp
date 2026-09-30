@@ -604,7 +604,7 @@ static int spec_accept_walk(pulsar_session *s,
             if (pend_sampled) {
                 pulsar_sample_dist qd;
                 const uint32_t qn = s->spec.dspark_pending_qn[commit];
-                if (qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP) {
+                if (pulsar_spec_q_compact(qn)) {
                     /* L149: q_X exactly as built at draft time (drafting loop) */
                     memset(&qd, 0, sizeof(qd));
                     qd.n = qn;
@@ -2343,7 +2343,7 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
         for (uint32_t i = 0; i < q->n_draft; i++) {
             s->spec.dspark_pending_q[i] = q->q_drawn[i];
             s->spec.dspark_pending_qn[i] = q->qn[i];
-            if (q->qn[i] > 0) {
+            if (pulsar_spec_q_compact(q->qn[i])) {
                 memcpy(s->spec.dspark_pending_qids[i], q->qids[i], (size_t)q->qn[i] * sizeof(int32_t));
                 memcpy(s->spec.dspark_pending_qprobs[i], q->qprobs[i], (size_t)q->qn[i] * sizeof(float));
             } else {
