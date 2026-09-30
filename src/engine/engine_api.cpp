@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
 
@@ -311,6 +312,7 @@ int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, i
  * ------------------------------------------------------------------------ */
 
 bool pulsar_session_is_mirrored(const pulsar_session *s) {
+    PULSAR_NVTX_FN();
     return s && s->engine && s->engine->tp && s->tp_session_id != 0;
 }
 
@@ -372,6 +374,7 @@ static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *
 
 static int tp_mirror_worker_drives_nothing(pulsar_tp *tp, const char *operation,
                                            char *err, size_t errlen) {
+    PULSAR_NVTX("tp: wait worker verdict");
     if (pulsar_tp_rank(tp) == 0) return 0;
     if (err) snprintf(err, errlen,
                       "tp: rank %d is a worker; it does not drive %s -- it runs pulsar_tp_worker_run",
@@ -438,6 +441,7 @@ static int tp_mirror_settle(pulsar_session *s, char *err, size_t errlen) {
 }
 
 int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     return s && tp_mirror_settle(s, err, errlen) ? 0 : 1;
 }
 
@@ -511,6 +515,7 @@ static int tp_mirror_sent(pulsar_tp *tp, const char *operation, int sent,
 }
 
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    PULSAR_NVTX_FN();
     /* A worker rank creates sessions only from the leader's frames (the loop
      * calls the member directly); a driver creating one here is refused before
      * the ordinal is consumed, so the two ranks' ordinals stay aligned. */
@@ -552,6 +557,7 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
 }
 
 void pulsar_session_free(pulsar_session *s) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     pulsar_tp *tp = tp_mirror_target(s);
     if (tp && pulsar_tp_rank(tp) == 0) {
@@ -581,10 +587,12 @@ static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsa
 }
 
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
 }
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->sync(prompt, images, n_images, err, errlen);
@@ -716,6 +724,7 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
     return ok;
 }
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return PULSAR_SESSION_REWRITE_ERROR;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->rewrite_from_common(prompt, common, err, errlen);
@@ -741,6 +750,7 @@ int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int 
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token, out) : 0; }
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s && tp_mirror_settle(s, NULL, 0) ? s->copy_logits(out, cap) : 0; }
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->set_logits(logits, n);
@@ -760,6 +770,7 @@ int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
     return tp_mirror_bank_verdict(s, tp, "set logits", s->set_logits(logits, n) != 0 ? 1 : 0, 1);
 }
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->eval(token, err, errlen);
@@ -810,6 +821,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     return 0;
 }
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->decode_multiseq(reqs, n, logits, logits_cap, err, errlen);
@@ -828,6 +840,7 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
                                        logits, n, err, errlen);
 }
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->decode_mixed(reqs, n_rows, logits, logits_cap, out_n_rows,
@@ -861,6 +874,7 @@ int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 
  * vote. */
 static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                   int own, int divergence_rc) {
+    PULSAR_NVTX("tp: wait worker verdict");
     char err[256];
     err[0] = '\0';
     int peers = 0;
@@ -885,6 +899,7 @@ static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *
 static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                          int own, int divergence_rc, const float *logits,
                                          uint32_t n_rows) {
+    PULSAR_NVTX("tp: wait worker verdict");
     if (own <= 0) return tp_mirror_bank_verdict(s, tp, operation, own, divergence_rc);
     char err[256];
     err[0] = '\0';
@@ -903,6 +918,7 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     return own;
 }
 int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->bank_repoint(bank);
@@ -917,6 +933,7 @@ int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
     return tp_mirror_bank_verdict(s, tp, "bank repoint", s->bank_repoint(bank), 1);
 }
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->bank_state_save(bank); return; }
@@ -930,6 +947,7 @@ void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
     s->bank_state_save(bank);
 }
 bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
+    PULSAR_NVTX_FN();
     if (!s) return false;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->bank_state_restore(bank);
@@ -969,6 +987,7 @@ static int tp_mirror_bank_fork(pulsar_session *s, int partial, uint32_t src, uin
     return tp_mirror_bank_verdict(s, tp, operation, own, PULSAR_FORK_EINVAL);
 }
 int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_fork(s, 0, src, dst, tokens, n_tokens, n_cached) : 1;
 }
 /* ---- The eviction guard's spill path (increment 6).  KV is replicated per
@@ -1020,9 +1039,11 @@ static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t ban
     return tp_mirror_bank_verdict(s, tp, operation, own, 1) == 0;
 }
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_physical(s, 1, bank) : false;
 }
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
 static int tp_mirror_bank_kv(pulsar_session *s, int load, uint32_t bank, FILE *fp, char *err, size_t errlen) {
@@ -1042,12 +1063,15 @@ static int tp_mirror_bank_kv(pulsar_session *s, int load, uint32_t bank, FILE *f
     return tp_mirror_bank_verdict(s, tp, operation, own, 1);
 }
 int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_kv(s, 0, bank, fp, err, errlen) : 1;
 }
 int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_kv(s, 1, bank, fp, err, errlen) : 1;
 }
 int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
+    PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_fork(s, 1, src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
@@ -1056,6 +1080,7 @@ const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->bank_prefix_match(bank, prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->note_committed_tokens(toks, n); return; }
@@ -1098,6 +1123,7 @@ static int tp_spec_route(pulsar_session *s, const char *operation, pulsar_tp **t
 }
 
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 0;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "generate_speculative", &tp, err, errlen);
@@ -1116,6 +1142,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
     return agreed < 0 ? -1 : own;
 }
 int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    PULSAR_NVTX_FN();
     if (!s) return -1;
     char err[256];
     pulsar_tp *tp = NULL;
@@ -1133,6 +1160,7 @@ int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_
     return agreed < 0 ? -1 : own;
 }
 int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, int first_token, int max_tokens, int accepted_cap, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_round_begin", &tp, err, errlen);
@@ -1147,6 +1175,7 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, int
     return tp_mirror_bank_verdict(s, tp, "spec_round_begin", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int first_token, int eos_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, const float *rows, uint32_t row0, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_round_end", &tp, err, errlen);
@@ -1166,6 +1195,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     return agreed < 0 ? -1 : own;
 }
 void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     char err[256];
     pulsar_tp *tp = NULL;
@@ -1178,6 +1208,7 @@ void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
     pulsar_session_spec_round_abort_local(s, r);
 }
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     char err[256];
     pulsar_tp *tp = NULL;
@@ -1191,6 +1222,7 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
     pulsar_session_spec_arm_capture_local(s, n_rows);
 }
 int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_redraft_batch", &tp, err, errlen);
@@ -1209,6 +1241,7 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
     return tp_mirror_bank_verdict(s, tp, "spec_redraft_batch", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {
+    PULSAR_NVTX_FN();
     if (!s) return;
     char err[256];
     pulsar_tp *tp = NULL;
@@ -1222,6 +1255,7 @@ void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r)
 }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) {
+    PULSAR_NVTX_FN();
     /* The pair-off shape is untouched: one call, no TP code on the live path. */
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->invalidate(); return; }
@@ -1235,6 +1269,7 @@ void pulsar_session_invalidate(pulsar_session *s) {
     s->invalidate();
 }
 void pulsar_session_rewind(pulsar_session *s, int pos) {
+    PULSAR_NVTX_FN();
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { s->rewind(pos); return; }
     char err[256];
@@ -1263,6 +1298,7 @@ int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_
     return pulsar_tp_send_kvstore_reconcile(e->tp, keys, (uint32_t)n_keys) ? 0 : 1;
 }
 void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key) {
+    PULSAR_NVTX_FN();
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp || pulsar_tp_rank(tp) != 0 || pulsar_tp_failed(tp) || !pulsar_tp_kv_key_ok(key)) return;
     /* Inside a mirrored prefill the workers read only chunk verdicts; the
@@ -1276,6 +1312,7 @@ void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key) {
 int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payload_file *out,
                                           const char *stage_dir, const char *key,
                                           char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->stage_payload(out, stage_dir, err, errlen);
@@ -1326,6 +1363,7 @@ int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payl
 }
 int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t payload_bytes,
                                          const char *key, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->load_payload(fp, payload_bytes, err, errlen);
