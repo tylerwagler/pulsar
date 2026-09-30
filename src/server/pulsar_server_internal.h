@@ -2094,7 +2094,7 @@ struct server {
      * THE decode lane: all `n` slots step together through the shared multiseq
      * path, each row landing at its own bank's frontier. Since L118 there is no
      * classic per-slot alternative -- a single decoding slot is simply n == 1. */
-    void worker_batched_decode_quantum(session_slot **dec, int n);
+    void worker_batched_decode_quantum(session_slot **dec, int n, int quantum_tokens);
     /** plan-34 inc 6: the SPEC batched quantum. Same skeleton as
      * worker_batched_decode_quantum, but each sweep runs one speculative ROUND
      * per bank instead of one token: per bank under its restored state we draw
@@ -2111,7 +2111,7 @@ struct server {
      * the pendings/carry, which is exactly right -- they were conditioned on the
      * ghosts).
      */
-    void worker_spec_batched_quantum(session_slot **dec, int n);
+    void worker_spec_batched_quantum(session_slot **dec, int n, int quantum_tokens);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
      * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
      * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
