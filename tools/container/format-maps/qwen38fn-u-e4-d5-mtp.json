@@ -1,0 +1,48 @@
+{
+  "recipe": "U-e4-d5-mtp",
+  "model_type": "qwen4_exp",
+  "base_recipe_sha256": "406ced5852ff9a8f701f09f7746a618fb59707fb69217becff43e41a05bde32e",
+  "about": "The MTP sidecar of the U-e4-d5 container (mtp_sidecar.py): the 31 mtp.* tensors of the BF16 checkpoint, which the base recipe omits. EXL3 tensors are turboderp/Qwen3.8-Flash-Next-exl3's own trellis | suh | svh copied verbatim (mtp_bits 3: the rates are that checkpoint's, per tensor, and each row below must equal the rate its trellis width encodes, else refused). Everything else follows the base recipe's row for the analogous main-layer tensor, produced from the BF16 source (turboderp stores those F16, which is lossy). Every mtp.* tensor must match exactly one row; a row that matches nothing is refused too.",
+  "expert_gate_up": "split",
+  "deviations_from_base": {
+    "mtp.layers.*.mlp.experts.*": "exl3m_k3, gate / up SPLIT per expert (turboderp's layout; the PAIR arm), where the main layers are exl3m_k4 fused gate_up",
+    "mtp.fc_embedding.weight / mtp.fc_hidden.weight": "no main-layer analog: mxfp8_lt from BF16, not turboderp's K4 (reconstructs at 0.067 / 0.200 rel. error -- too lossy for the drafter's input). index_qk_proj is mxfp8_lt from BF16 like the trunk's, not turboderp's K3"
+  },
+  "rows": [
+    ["mtp.fc_embedding.weight", "mxfp8_lt"],
+    ["mtp.fc_hidden.weight", "mxfp8_lt"],
+    ["mtp.pre_fc_norm_embedding.weight", "bf16"],
+    ["mtp.pre_fc_norm_hidden.weight", "bf16"],
+
+    ["mtp.hyper_connection_mixer.hc_norm.weight", "bf16"],
+    ["mtp.hyper_connection_mixer.input_mix_weight_down.weight", "bf16"],
+    ["mtp.hyper_connection_mixer.input_mix_weight_up.weight", "bf16"],
+
+    ["mtp.layers.*.attn_hyper_connection.block_inject_weight.weight", "bf16"],
+    ["mtp.layers.*.attn_hyper_connection.hc_norm.weight", "bf16"],
+    ["mtp.layers.*.attn_hyper_connection.input_mix_weight_down.weight", "mxfp8_lt"],
+    ["mtp.layers.*.attn_hyper_connection.input_mix_weight_up.weight", "mxfp8_lt"],
+    ["mtp.layers.*.mlp_hyper_connection.block_inject_weight.weight", "bf16"],
+    ["mtp.layers.*.mlp_hyper_connection.hc_norm.weight", "bf16"],
+    ["mtp.layers.*.mlp_hyper_connection.input_mix_weight_down.weight", "mxfp8_lt"],
+    ["mtp.layers.*.mlp_hyper_connection.input_mix_weight_up.weight", "mxfp8_lt"],
+
+    ["mtp.layers.*.self_attn.q_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.self_attn.k_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.self_attn.v_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.self_attn.o_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.self_attn.q_norm.weight", "bf16"],
+    ["mtp.layers.*.self_attn.k_norm.weight", "bf16"],
+    ["mtp.layers.*.self_attn.indexer.index_qk_proj.weight", "mxfp8_lt"],
+    ["mtp.layers.*.self_attn.indexer.q_layernorm.weight", "bf16"],
+    ["mtp.layers.*.self_attn.indexer.k_layernorm.weight", "bf16"],
+
+    ["mtp.layers.*.mlp.gate.weight", "bf16"],
+    ["mtp.layers.*.mlp.experts.gate_up_proj", "exl3m_k3"],
+    ["mtp.layers.*.mlp.experts.down_proj", "exl3m_k3"],
+    ["mtp.layers.*.mlp.shared_expert.gate_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.mlp.shared_expert.up_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.mlp.shared_expert.down_proj.weight", "exl3m_k5"],
+    ["mtp.layers.*.mlp.shared_expert_gate.weight", "bf16"]
+  ]
+}
