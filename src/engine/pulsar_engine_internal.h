@@ -1066,6 +1066,17 @@ typedef struct {
     uint64_t dspark_prompt_bank_bytes;   ///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
     pulsar_gpu_tensor *dspark_raw[3];       ///< per draft layer, bank-major drafter raw ring; NULL without a pool or drafter
     pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
+    /** L260: each PARKED bank's spec-frontier batched-copy tables (the graph's spec_snap_copies /
+     *  spec_restore_copies and their counts while that bank is installed).  The tables address the bank's state-lane
+     *  views, whose slabs are allocated once at pool build and never move, so a bank switch parks the outgoing
+     *  bank's tables here and installs the incoming bank's -- freeing them was a device-synchronizing cudaFree pair
+     *  on every switch, rebuilt with cudaMalloc at the next snapshot.  The installed bank's slot is NULL (its
+     *  tables live in the graph fields); NULL elsewhere = not built yet. */
+    void *spec_snap_copies[PULSAR_MSEQ_MAX];
+    void *spec_restore_copies[PULSAR_MSEQ_MAX];
+    uint32_t spec_frontier_copy_n[PULSAR_MSEQ_MAX];
+    uint64_t spec_frontier_copy_max_bytes[PULSAR_MSEQ_MAX];
+    int spec_frontier_copy_init[PULSAR_MSEQ_MAX];
 } pulsar_bank_slabs;
 
 /** Every device buffer one session needs, plus the host bookkeeping that says
