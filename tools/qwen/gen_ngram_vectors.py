@@ -25,8 +25,8 @@ from transformers import AutoTokenizer
 from transformers.models.qwen4_exp import modeling_qwen4_exp as M
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 
-SRC = "/srv/models/qwen38fn-bf16"
-TOK = "/srv/models/qwen38fn-tok"
+SRC = "/mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540"
+TOK = "/mnt/models/qwen38fn-tok"
 CALIB = "/srv/models/calib-qwen38-v1.jsonl"
 PFX = "model.language_model.layers.1.ple.ple_embedding."
 

@@ -2,7 +2,7 @@
 """L251 S4: the Qwen3.8-Flash-Next router, MoE block, Gated Residual and PLE launchers on REAL weights,
 against transformers' own `qwen4_exp` modules (and exllamav3's reconstruct for the EXL3 weights).
 
-  router   layer 12's router on the captured MoE inputs (/srv/models/qwen38fn-act-L12/moe_in.pt, 145,172
+  router   layer 12's router on the captured MoE inputs (/mnt/models/qwen38fn-act-L12/moe_in.pt, 145,172
            rows) vs the source's recorded top-10 (topk.pt): the SET per row must match; every mismatch is
            classified (a bf16 tie at the boundary, or a boundary logit that rounds to a different bf16).
   moe      layer 12's MoE block on a handful of captured rows: the experts they route to and the shared
@@ -14,7 +14,7 @@ against transformers' own `qwen4_exp` modules (and exllamav3's reconstruct for t
              recon  the source semantics in fp64 with the reconstructed weights, no A8 -- the quant error;
              hf     transformers' Qwen4ExpTextSparseMoeBlock on the BF16 source -- the whole difference.
   capture  embed + layer 0 + layer 1's PLE and attention GR through the HF modules for a few sequences
-           (the stream inputs of the next two checks), to /srv/models/qwen-s4/cap-l1.
+           (the stream inputs of the next two checks), to /mnt/models/qwen-s4/cap-l1.
   gr       layer 1's attention-site GR (and the top-level mixer on the same streams) with W_down / W_up
            MXFP8 (tools/container/producers.py, the builder's encoder) vs the HF module (bf16) and its
            fp64 twin on the MXFP8-decoded weights; the host double reference for 16 rows.
@@ -31,11 +31,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-SRC = "/srv/models/qwen38fn-bf16"
-TOK = "/srv/models/qwen38fn-tok"
+SRC = "/mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540"
+TOK = "/mnt/models/qwen38fn-tok"
 CALIB = "/srv/models/calib-qwen38-v1.jsonl"
-ACT = "/srv/models/qwen38fn-act-L12"
-CAP = "/srv/models/qwen-s4/cap-l1"
+ACT = "/mnt/models/qwen38fn-act-L12"
+CAP = "/mnt/models/qwen-s4/cap-l1"
 PFX = "model.language_model."
 DEV = torch.device(os.environ.get("QWEN_S4_DEV", "cuda:0"))   # cpu only for a dry run of the python side
 LOGF = None

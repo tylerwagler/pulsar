@@ -666,7 +666,7 @@ exl3-dequant-gate: tests/exl3_dequant_gate
 # headers and config (tests/qwen_family_container.py: sparse files, no weight
 # byte is read), plus four mutants the loader must refuse by name.
 # qwen-family-gate-device adds a real session on the GPU (the battery's entry).
-QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
+QWEN_HF_DIR   ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 # The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
 .PHONY: spec-depth-gate
@@ -674,6 +674,16 @@ tests/spec_depth_gate: tests/spec_depth_gate.cpp src/engine/spec_depth.h Makefil
 	$(CXX) $(CXXFLAGS) -o $@ tests/spec_depth_gate.cpp
 spec-depth-gate: tests/spec_depth_gate
 	./tests/spec_depth_gate
+
+# Tessera's fused window kernel (L255): pulsar's launcher vs Tessera's own build, byte for byte, on Qwen
+# layer-12 weights.  TESSERA_FIXTURE comes from tools/tessera/kernel_fixture.py (needs Tessera + torch).
+TESSERA_FIXTURE ?= /mnt/models/tessera-l255/tessera_kernel.fx
+.PHONY: tessera-kernel-gate
+tests/tessera_kernel_gate: tests/tessera_kernel_gate.cu src/cuda/mmq/pulsar_tessera.o src/cuda/mmq/pulsar_tessera.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda/mmq -o $@ tests/tessera_kernel_gate.cu \
+		src/cuda/mmq/pulsar_tessera.o $(CUDA_LDLIBS)
+tessera-kernel-gate: tests/tessera_kernel_gate
+	./tests/tessera_kernel_gate $(TESSERA_FIXTURE)
 
 .PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
 qwen-family-containers:
@@ -707,7 +717,7 @@ engram-table-check: tests/engram_table_test
 # 128 shard tensors through the Engram pool -- HOST ONLY.  Vectors from
 # tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
 # sparky; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
-QWEN_NGRAM_VECTORS ?= /srv/models/qwen-s4/ngram-corpus.vec
+QWEN_NGRAM_VECTORS ?= /mnt/models/qwen-s4/ngram-corpus.vec
 # the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
 # checkpoint's shard parts named in the vectors instead
 QWEN_NGRAM_ROWFILE ?=
@@ -2156,6 +2166,12 @@ MMQ_HDRS := $(wildcard src/cuda/mmq/*.cuh) $(wildcard src/cuda/mmq/*.h)
 src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda \
 		-diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda/mmq -c -o $@ $<
+
+# Tessera's fused window kernel (L255; vendored in tessera_routed_fused_window.cuh, VENDOR-TESSERA.md) is built
+# WITHOUT --use_fast_math, as upstream builds it (-O3 -lineinfo): its SwiGLU epilogue calls expf and divides,
+# and fast-math would approximate both.  tests/tessera_kernel_gate holds the bytes to Tessera's own build.
+src/cuda/mmq/pulsar_tessera.o: src/cuda/mmq/pulsar_tessera.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
+	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -std=c++17 -Isrc -Isrc/cuda/mmq -c -o $@ $<
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
