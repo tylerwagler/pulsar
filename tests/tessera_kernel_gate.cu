@@ -171,6 +171,10 @@ int main(int argc, char **argv) {
     printf("tessera_kernel_gate: %s (%zu records)\n", argv[1], fx.recs.size());
     for (const char *role : {"qkv", "oproj"}) {
         const std::string p = std::string("dense.") + role + ".";
+        if (!fx.recs.count(p + "geom")) {   // a --moe-only fixture: no dense roles to run
+            printf("  (no dense %s role in this fixture)\n", role);
+            continue;
+        }
         const int32_t *g = fx.ints(p + "geom");   // rows, cols, tile_words, slot_words
         pulsar_tessera_proj w{};
         if (!g || !fx.proj(p, 1, g[1], g[0], g[2], g[3], &w)) return 2;
