@@ -18,6 +18,7 @@
 #include "tp/pulsar_tp.h"
 #include "cuda/pulsar_cuda_qwen.h"
 #include "cuda/pulsar_cuda_gdn.h"
+#include "cuda/mmq/pulsar_tessera.h"
 
 #include <sys/stat.h>
 
@@ -345,17 +346,33 @@ static bool admit_gr(const pulsar_qwen_gr_weights &g) {
     return ok;
 }
 
-/* a layer's MoE: the router, the routed experts (fused gate_up, or the MTP layer's gate + up pair), the
- * shared expert */
+/* L255: a Tessera stack's planes in the storage the launcher reads (family_qwen.h PULSAR_QWEN_TESS_*) -- native
+ * I32 / BF16 / F32 tensors, so the format registry has no row for them: admitted plane by plane here */
+static bool admit_tessera(pulsar_tensor *const P[PULSAR_QWEN_TESS_PLANES]) {
+    static const uint32_t want[PULSAR_QWEN_TESS_PLANES] = {
+        PULSAR_TENSOR_I32, PULSAR_TENSOR_BF16, PULSAR_TENSOR_I32, PULSAR_TENSOR_I32,
+        PULSAR_TENSOR_F32, PULSAR_TENSOR_I32,  PULSAR_TENSOR_I32, PULSAR_TENSOR_I32};
+    bool ok = true;
+    for (int i = 0; i < PULSAR_QWEN_TESS_PLANES; ++i)
+        ok &= admit(P[i], P[i]->type == want[i], tensor_type_name(want[i]));
+    return ok;
+}
+
+/* a layer's MoE: the router, the routed experts (fused gate_up, the MTP layer's gate + up pair, or L255's
+ * Tessera planes), the shared expert */
 static bool admit_moe(const pulsar_qwen_layer_weights &L) {
     bool ok = admit_bf16(L.moe_router) & admit_bf16(L.sh_gate_scalar);
-    if (L.moe_gate_up)
-        ok &= admit_role(L.moe_gate_up, PULSAR_ROLE_EXPERT_GATE_UP_FUSED);
-    else
-        ok &= admit_role(L.moe_gate, PULSAR_ROLE_EXPERT_GATE_UP) & admit_role(L.moe_up, PULSAR_ROLE_EXPERT_GATE_UP);
-    ok &= admit_role(L.moe_down, PULSAR_ROLE_EXPERT_DOWN);
-    if (ok) ok = pulsar_format_moe_combo(L.moe_gate_up ? L.moe_gate_up : L.moe_gate, L.moe_gate_up ? NULL : L.moe_up,
-                                         L.moe_down, PULSAR_ACT_ROWS_BF16, PULSAR_QWEN_ARCH);
+    if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
+        for (int p = 0; p < PULSAR_QWEN_TESS_PROJS; ++p) ok &= admit_tessera(L.moe_tess[p]);
+    } else {
+        if (L.moe_gate_up)
+            ok &= admit_role(L.moe_gate_up, PULSAR_ROLE_EXPERT_GATE_UP_FUSED);
+        else
+            ok &= admit_role(L.moe_gate, PULSAR_ROLE_EXPERT_GATE_UP) & admit_role(L.moe_up, PULSAR_ROLE_EXPERT_GATE_UP);
+        ok &= admit_role(L.moe_down, PULSAR_ROLE_EXPERT_DOWN);
+        if (ok) ok = pulsar_format_moe_combo(L.moe_gate_up ? L.moe_gate_up : L.moe_gate, L.moe_gate_up ? NULL : L.moe_up,
+                                             L.moe_down, PULSAR_ACT_ROWS_BF16, PULSAR_QWEN_ARCH);
+    }
     ok &= admit_role(L.sh_gate, PULSAR_ROLE_SHARED_EXPERT) & admit_role(L.sh_up, PULSAR_ROLE_SHARED_EXPERT) &
           admit_role(L.sh_down, PULSAR_ROLE_SHARED_EXPERT);
     return ok;
@@ -635,6 +652,28 @@ bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_g
                                        (const float *)((uint8_t *)dptr(sc) + g.inj[side]), (int)st->n_rows, 0) == 0;
 }
 
+/* L255: one Tessera stack's launch descriptor from its bound planes -- device pointers, the stack geometry
+ * (in -> out, n_expert) and the two host integers of its geom plane. */
+static bool tessera_proj(const pulsar_qwen_step *st, pulsar_tensor *const P[PULSAR_QWEN_TESS_PLANES], int in,
+                         int out, pulsar_tessera_proj *o) {
+    const int32_t *geom = (const int32_t *)tensor_data(st->model, P[PULSAR_QWEN_TESS_GEOM]);
+    o->E = (int)st->shape->n_expert;
+    o->K = in;
+    o->N = out;
+    o->words = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_WORDS], "qwen tessera words");
+    o->words_stride = (long)P[PULSAR_QWEN_TESS_WORDS]->dim[0];
+    o->table = (const uint16_t *)wptr(st, P[PULSAR_QWEN_TESS_TABLE], "qwen tessera table");
+    o->init = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_INIT], "qwen tessera init");
+    o->has_init = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_HAS_INIT], "qwen tessera has_init");
+    o->wscale = (const float *)wptr(st, P[PULSAR_QWEN_TESS_WSCALE], "qwen tessera wscale");
+    o->runs = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_RUNS], "qwen tessera runs");
+    o->bdesc = (const int32_t *)wptr(st, P[PULSAR_QWEN_TESS_BDESC], "qwen tessera bdesc");
+    o->tile_words = geom ? geom[0] : 0;
+    o->slot_words = geom ? geom[1] : 0;
+    if (!geom) return fail("no host view of a Tessera geom plane");
+    return o->words && o->table && o->init && o->has_init && o->wscale && o->runs && o->bdesc;
+}
+
 bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     const uint32_t n = st->n_rows;
     const pulsar_qwen_shape *s = st->shape;
@@ -672,6 +711,23 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     rc.ws_bytes = parts.routed_bytes;
     rc.nf_flag = (uint32_t *)(base + m.nf);
     rc.nf_code = 0x51000000u | il;
+    pulsar_tessera_proj tp[PULSAR_QWEN_TESS_PROJS];
+    if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
+        /* L255: the layer's experts are Tessera planes; the front door reads them through tp, built once here and
+         * read by every segment below.  The arm holds every expert on one GPU -- no expert range yet, so not under
+         * tensor parallelism -- and the imatrix taps read the EXL3 stacks (rc.gate / rc.down), so a collection run
+         * is refused on a Tessera layer rather than tapping a NULL stack. */
+        const int MID = (int)s->n_ff_exp;
+        if (pulsar_qwen_tp(s) > 1) return fail("Tessera routed experts under tensor parallelism (the arm has no expert range)");
+        if (st->tap) return fail("imatrix collection over Tessera routed experts (the taps read EXL3 stacks)");
+        if (!tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_GATE], H, MID, &tp[PULSAR_QWEN_TESS_GATE]) ||
+            !tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_UP], H, MID, &tp[PULSAR_QWEN_TESS_UP]) ||
+            !tessera_proj(st, L.moe_tess[PULSAR_QWEN_TESS_DOWN], MID, H, &tp[PULSAR_QWEN_TESS_DOWN]))
+            return false;
+        rc.tessera_gate = &tp[PULSAR_QWEN_TESS_GATE];
+        rc.tessera_up = &tp[PULSAR_QWEN_TESS_UP];
+        rc.tessera_down = &tp[PULSAR_QWEN_TESS_DOWN];
+    }
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             rc.selected = parts.sel + (size_t)r0 * K;
             rc.weights = parts.wts + (size_t)r0 * K;
