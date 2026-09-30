@@ -81,17 +81,12 @@ typedef struct {
  *
  * The cut position matters more than it looks. A checkpoint that ends a few
  * tokens into volatile text is useless -- the next request diverges right
- * there and reuses nothing -- so cuts are pulled back off the frontier and
- * landed on an alignment boundary.
+ * there and reuses nothing -- so the sys-prefix cut is pulled back a margin
+ * below the chat anchor, and cuts land on an alignment boundary.
  */
 typedef struct {
     int min_tokens;                ///< below this many tokens a checkpoint is not worth writing
-    int cold_max_tokens;           ///< cap on a cold checkpoint's length
     int continued_interval_tokens; ///< write a continued checkpoint every this many new tokens
-    /** Back the cut off the frontier by this many tokens. The last few tokens
-     * before the frontier are the least stable part of a prompt; a checkpoint
-     * ending inside them rarely matches the next request. */
-    int boundary_trim_tokens;
     int boundary_align_tokens;     ///< round the cut down to a multiple of this
     /** Extra margin below the chat anchor for a sys-prefix checkpoint, to clear
      * harness-injected preamble jitter that would otherwise vary the cut. */
@@ -197,7 +192,6 @@ void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out);
 
-int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens);
 int pulsar_kvstore_chat_anchor_pos(const pulsar_kvstore *kc,
                                 const pulsar_tokens *prompt,
                                 int user_token_id,

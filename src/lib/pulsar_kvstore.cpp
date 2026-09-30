@@ -39,13 +39,11 @@
  * pulsar_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
-#define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
  * still improves the cheap token-prefix path, while text-prefix lookup handles
  * cases where canonical prompt tokenization spells the same bytes differently.
  * The 2048 alignment also matches the backend prefill chunk schedule, which
  * keeps compressor row finalization identical to a cold full prompt. */
-#define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 /* Agent harnesses inject ephemeral blocks (task-tool nags, mode-change notices)
@@ -439,15 +437,13 @@ public:
         kc_.opt = opt;
         evict(NULL, 0, NULL);
         logf(PULSAR_KVSTORE_LOG_KVCACHE,
-             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, continued=%d, align=%d, hit_half_life=%llus)",
              this->log_name(),
              kc_.dir,
              (unsigned long long)(kc_.budget_bytes / (1024ull * 1024ull)),
              reject_different_quant ? "reject" : "accept",
              kc_.opt.min_tokens,
-             kc_.opt.cold_max_tokens,
              kc_.opt.continued_interval_tokens,
-             kc_.opt.boundary_trim_tokens,
              kc_.opt.boundary_align_tokens,
              (unsigned long long)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
         return true;
@@ -560,17 +556,6 @@ public:
             kc_.len--;
         }
         free(supersedes);
-    }
-
-    int store_len(int tokens) const {
-        const int trim = kc_.opt.boundary_trim_tokens;
-        const int align = kc_.opt.boundary_align_tokens;
-        if (tokens > kc_.opt.min_tokens + trim) {
-            int stable = tokens - trim;
-            if (align > 0) stable -= stable % align;
-            if (stable >= kc_.opt.min_tokens) return stable;
-        }
-        return tokens;
     }
 
     int chat_anchor_pos(const pulsar_tokens *prompt,
@@ -1191,8 +1176,7 @@ public:
              * continued-store scheduler then believed the file still existed,
              * so a second replay of the same deep prefix cold-prefilled the
              * whole thing. Disk reclamation belongs to budget eviction, not
-             * load. cold_max_tokens keeps its real job: gating cold-store
-             * writes. */
+             * load. */
             pulsar_kvstore_touch_file(path, hdr.hits + 1);
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
@@ -1237,9 +1221,7 @@ using pulsar::KvStore;
 pulsar_kvstore_options pulsar_kvstore_default_options(void) {
     pulsar_kvstore_options o = {};
     o.min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS;
-    o.cold_max_tokens = KV_CACHE_DEFAULT_COLD_MAX_TOKENS;
     o.continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS;
-    o.boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS;
     o.boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS;
     o.sys_prefix_margin_tokens = KV_CACHE_DEFAULT_SYS_PREFIX_MARGIN_TOKENS;
     return o;
@@ -1492,10 +1474,6 @@ bool pulsar_kvstore_open(pulsar_kvstore *kc, const char *dir, uint64_t budget_mb
 
 void pulsar_kvstore_close(pulsar_kvstore *kc) {
     KvStore(*kc).close();
-}
-
-int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens) {
-    return KvStore(*const_cast<pulsar_kvstore *>(kc)).store_len(tokens);
 }
 
 int pulsar_kvstore_sys_prefix_cut(const pulsar_kvstore *kc, int anchor) {

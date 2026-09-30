@@ -2389,8 +2389,7 @@ struct gen_state {
     char ctx_span[48];   ///< human-readable context span, for logs ("1234-5678")
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata
-    int cold_store_len;  ///< prefix length to write as a COLD cache entry; 0 = no cold write
-    bool cold_store_is_anchor;  ///< cold_store_len is a chat_anchor_pos preamble cut (shared system prompt + tools, before the task message) -> stored as "sys-prefix" so eviction keeps the one file every new conversation can text-prefix restore from
+    int cold_store_len;  ///< the shared-preamble cut (chat_anchor_pos, system prompt + tools before the task message) written as a "sys-prefix" entry after its own prefill phase; always < the prompt; 0 = no cold write
     /** Saved continued-store schedule, suppressed while a cold write is
      * pending. The prefill callback would otherwise write the same prefix as
      * "continued" at the very frontier where we are deliberately stopping to
@@ -2946,7 +2945,6 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         const pulsar_text_span *spans,
         uint32_t n_spans,
         pulsar_tokens *out);
-int kv_cache_store_len(const kv_disk_cache *kc, int tokens);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const pulsar_tokens *prompt,

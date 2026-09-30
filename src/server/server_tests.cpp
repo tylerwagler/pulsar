@@ -4358,22 +4358,6 @@ static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
 
 
 
-static void test_kv_cache_store_len_uses_configured_boundary(void) {
-    kv_disk_cache kc = {0};
-    kc.opt = kv_cache_default_options();
-    TEST_ASSERT(kv_cache_store_len(&kc, 11011) == 10240);
-    TEST_ASSERT(kv_cache_store_len(&kc, 1695) == 1695);
-
-    kc.opt.boundary_trim_tokens = 0;
-    kc.opt.boundary_align_tokens = 1000;
-    TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3000);
-
-    kc.opt.boundary_align_tokens = 0;
-    TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
-}
-
-
-
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -8097,7 +8081,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
-    test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
