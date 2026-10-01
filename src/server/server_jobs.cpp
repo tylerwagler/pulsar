@@ -614,6 +614,19 @@ static bool gen_prefill_cancel_cb(void *ud) {
     return (uint32_t)(g->prefill_total - g->prefill_last_current) >= g->prefill_min_suffix;
 }
 
+/* Bind THIS slot's prefill callbacks to the shared pool session.  Every slot
+ * shares s->sess and the callbacks are per-session, so any other slot's
+ * begin (which binds its own) or stream begin (which clears them) replaces
+ * them: armed once per job, a long prefill lost its progress callback to the
+ * next request, never counted a chunk, and the cancel callback never yielded
+ * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
+ * before every sync this slot issues. */
+static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g, bool cancellable) {
+    pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
+    pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
+    pulsar_session_set_cancel(sess, cancellable ? gen_prefill_cancel_cb : NULL, g);
+}
+
 
 
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
@@ -952,28 +965,25 @@ void server::gen_begin(session_slot *sl) {
     pulsar_session_set_progress(s->sess, gen_prefill_progress_cb, g);
     pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
+    /* The one cold checkpoint is the shared preamble (system prompt + tools,
+     * before the task message): worth a separate prefill phase however long
+     * the conversation has grown behind it, because every new conversation
+     * can text-prefix restore from it.  The whole-prompt cold cut is gone
+     * (L260): it split every fresh prompt into an aligned prefix and a tail
+     * forward -- on the pair ~300 ms for a 61-token tail (the grouped MoE at
+     * small M reads ~every expert) plus ~167 ms of staging, ~24% of a 2K
+     * prompt -- for entries L261's baseline shows rarely hit.  A long
+     * conversation still checkpoints through the continued store. */
     int cold_store_len = 0;
-    g->cold_store_is_anchor = false;
     if (!image_request &&
         cached == 0 &&
         s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0)
+        prompt_for_sync->len >= s->kv.opt.min_tokens)
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     pulsar_token_user(s->engine),
                                                     pulsar_token_assistant(s->engine));
-        const int cut = kv_cache_sys_prefix_cut(&s->kv, anchor);
-        /* The shared preamble is worth checkpointing however long the
-         * conversation has grown behind it — that is exactly when a cold
-         * re-prefill is most expensive. Only a whole-prompt cold cut is bounded
-         * by cold_max_tokens, because that one is consumed on load. */
-        if (cut > 0) {
-            cold_store_len = cut;
-            g->cold_store_is_anchor = true;
-        } else if (prompt_for_sync->len <= s->kv.opt.cold_max_tokens) {
-            cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
-        }
+        cold_store_len = kv_cache_sys_prefix_cut(&s->kv, anchor);
     }
     g->cold_store_len = cold_store_len;
     g->suppressed_continued_last = -1;
@@ -1029,7 +1039,7 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
-    /* Arm the cancel callback on THIS slot's gen_state right before the sync.
+    /* Arm the callbacks on THIS slot's gen_state right before the sync.
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
      * jobs (each of which would set the callback) before prefilling any of them,
      * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
@@ -1044,7 +1054,7 @@ void server::gen_step_prefill(session_slot *sl) {
      * callback is armed and the mm call runs to completion; a client that has
      * gone away is noticed at the next quantum boundary. */
     const int n_images = g->j->req.n_images;
-    pulsar_session_set_cancel(s->sess, n_images > 0 ? NULL : gen_prefill_cancel_cb, g);
+    gen_arm_prefill_callbacks(s->sess, g, n_images == 0);
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
@@ -1077,7 +1087,7 @@ void server::gen_step_prefill(session_slot *sl) {
 
     if (cold) {
         s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
+        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "sys-prefix")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
@@ -1121,17 +1131,6 @@ void server::gen_stream_begin(session_slot *sl) {
                g->req_flags[0] ? " " : "",
                g->req_flags,
                server_now_sec() - g->t0);
-    if (g->cold_store_len == g->prompt_for_sync->len) {
-        s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
-            kv_cache_note_store(&s->kv, g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                                  g->cold_store_len);
-        }
-        s->kv_cache_tracker_flush(sl);
-    }
     /* Random ids, like the tool-call and Responses ids (L192 item 7): a
      * counter leaked request ordering and made the unseeded sampler seed
      * below guessable. */

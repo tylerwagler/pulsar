@@ -1,6 +1,7 @@
 #include "pulsar_kvstore.h"
 
 #include "sha1.hpp"
+#include "pulsar_writeback.h"
 
 /* Shared disk KV checkpoint file support (C++ port).
  *
@@ -39,13 +40,11 @@
  * pulsar_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
-#define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
  * still improves the cheap token-prefix path, while text-prefix lookup handles
  * cases where canonical prompt tokenization spells the same bytes differently.
  * The 2048 alignment also matches the backend prefill chunk schedule, which
  * keeps compressor row finalization identical to a cold full prompt. */
-#define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 /* Agent harnesses inject ephemeral blocks (task-tool nags, mode-change notices)
@@ -247,11 +246,12 @@ bool kv_cache_budget_required(uint64_t file_bytes,
     return true;
 }
 
-bool kv_cache_incoming_supersedes_continued(
+/* Is entry `e` a checkpoint of a strict PREFIX of the incoming text, loadable
+ * wherever the incoming one would be (same model, quant, and no wider ctx)? */
+bool kv_cache_entry_is_incoming_prefix(
         const pulsar_kvstore_entry *e,
         const pulsar_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != PULSAR_KVSTORE_REASON_CONTINUED) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -266,6 +266,13 @@ bool kv_cache_incoming_supersedes_continued(
     char prefix_sha[41];
     Sha1::bytes_hex(incoming->text, (size_t)e->text_bytes, prefix_sha);
     return !strcmp(prefix_sha, e->sha);
+}
+
+bool kv_cache_incoming_supersedes_continued(
+        const pulsar_kvstore_entry *e,
+        const pulsar_kvstore_eviction_context *incoming) {
+    return e && e->reason == PULSAR_KVSTORE_REASON_CONTINUED &&
+           kv_cache_entry_is_incoming_prefix(e, incoming);
 }
 
 /* Eviction score with the supersedes-continued decision SUPPLIED rather than
@@ -439,15 +446,13 @@ public:
         kc_.opt = opt;
         evict(NULL, 0, NULL);
         logf(PULSAR_KVSTORE_LOG_KVCACHE,
-             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, continued=%d, align=%d, hit_half_life=%llus)",
              this->log_name(),
              kc_.dir,
              (unsigned long long)(kc_.budget_bytes / (1024ull * 1024ull)),
              reject_different_quant ? "reject" : "accept",
              kc_.opt.min_tokens,
-             kc_.opt.cold_max_tokens,
              kc_.opt.continued_interval_tokens,
-             kc_.opt.boundary_trim_tokens,
              kc_.opt.boundary_align_tokens,
              (unsigned long long)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
         return true;
@@ -560,17 +565,6 @@ public:
             kc_.len--;
         }
         free(supersedes);
-    }
-
-    int store_len(int tokens) const {
-        const int trim = kc_.opt.boundary_trim_tokens;
-        const int align = kc_.opt.boundary_align_tokens;
-        if (tokens > kc_.opt.min_tokens + trim) {
-            int stable = tokens - trim;
-            if (align > 0) stable -= stable % align;
-            if (stable >= kc_.opt.min_tokens) return stable;
-        }
-        return tokens;
     }
 
     int chat_anchor_pos(const pulsar_tokens *prompt,
@@ -869,6 +863,40 @@ public:
             return true;
         }
 
+        /* L261: a continued snapshot a whole ~800 MB write away from one the store
+         * already holds buys at most one interval of prefill.  On the pair two
+         * banks sharing a history stored 307,109 and 307,201 tokens 7 s apart, and
+         * the second write evicted the first.  Skip the write when an entry is a
+         * prefix of this text within one continued interval, and report it
+         * stored: the caller advances its interval baseline instead of retrying
+         * every step. */
+        if (reason_code == PULSAR_KVSTORE_REASON_CONTINUED) {
+            const int step = continued_step();
+            pulsar_kvstore_eviction_context probe = {};
+            probe.text = text;
+            probe.text_len = text_len;
+            probe.model_id = (uint8_t)model_id;
+            probe.quant_bits = (uint8_t)quant_bits;
+            probe.ctx_size = (uint32_t)pulsar_session_ctx(session);
+            probe.reject_different_quant = kc_.reject_different_quant;
+            refresh();
+            for (int i = 0; step > 0 && i < kc_.len; i++) {
+                const pulsar_kvstore_entry *e = &kc_.entry[i];
+                if (e->tokens >= (uint32_t)store_tokens.len ||
+                    (uint32_t)store_tokens.len - e->tokens >= (uint32_t)step)
+                    continue;
+                if (!kv_cache_entry_is_incoming_prefix(e, &probe)) continue;
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                     "%s: kv cache skipped tokens=%d reason=continued because an entry already "
+                     "holds %u of them (within one %d-token interval): %s",
+                     log_name(), store_tokens.len, e->tokens, step, e->path ? e->path : "?");
+                free(text);
+                free(path);
+                pulsar_tokens_free(&store_tokens);
+                return true;
+            }
+        }
+
         pulsar_session_payload_file staged = {};
         /* Stage in the store's own dir (real disk), not /tmp (L110 F5). */
         /* L250: on a TP group every rank writes its own copy under this key;
@@ -961,6 +989,10 @@ public:
                   /* fsync before the atomic rename: without it a crash can leave
                    * a zero/partial .kv visible under the final name. */
                   fsync(fileno(fp)) == 0;
+        /* L261: a stored entry is read back rarely (18 hits in 4.5 days of agent
+         * traffic); its pages must not squat in the page cache and push the
+         * server into swap.  The payload copy above already streamed them out. */
+        if (ok) pulsar_writeback_drop_file(fp);
         int saved_errno = errno;
         if (fclose(fp) != 0) {
             if (!saved_errno) saved_errno = errno;
@@ -1191,15 +1223,15 @@ public:
              * continued-store scheduler then believed the file still existed,
              * so a second replay of the same deep prefix cold-prefilled the
              * whole thing. Disk reclamation belongs to budget eviction, not
-             * load. cold_max_tokens keeps its real job: gating cold-store
-             * writes. */
+             * load. */
             pulsar_kvstore_touch_file(path, hdr.hits + 1);
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                 "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                 "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s stored=%s hits=%u load=%.1f ms file=%s",
                  log_name(),
                  responses_protocol ? " " : "",
                  responses_protocol ? "RESPPROTO" : "",
-                 loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
+                 loaded, text_bytes, hdr.quant_bits, key_kind,
+                 pulsar_kvstore_reason_name(hdr.reason), hdr.hits + 1, load_ms, path);
             if (result) {
                 result->tokens = loaded;
                 result->text_bytes = text_bytes;
@@ -1237,9 +1269,7 @@ using pulsar::KvStore;
 pulsar_kvstore_options pulsar_kvstore_default_options(void) {
     pulsar_kvstore_options o = {};
     o.min_tokens = KV_CACHE_DEFAULT_MIN_TOKENS;
-    o.cold_max_tokens = KV_CACHE_DEFAULT_COLD_MAX_TOKENS;
     o.continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS;
-    o.boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS;
     o.boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS;
     o.sys_prefix_margin_tokens = KV_CACHE_DEFAULT_SYS_PREFIX_MARGIN_TOKENS;
     return o;
@@ -1255,6 +1285,19 @@ uint8_t pulsar_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "agent-session")) return PULSAR_KVSTORE_REASON_AGENT_SESSION;
     if (!strcmp(reason, "sys-prefix")) return PULSAR_KVSTORE_REASON_SYS_PREFIX;
     return PULSAR_KVSTORE_REASON_UNKNOWN;
+}
+
+const char *pulsar_kvstore_reason_name(uint8_t code) {
+    switch (code) {
+    case PULSAR_KVSTORE_REASON_COLD: return "cold";
+    case PULSAR_KVSTORE_REASON_CONTINUED: return "continued";
+    case PULSAR_KVSTORE_REASON_EVICT: return "evict";
+    case PULSAR_KVSTORE_REASON_SHUTDOWN: return "shutdown";
+    case PULSAR_KVSTORE_REASON_AGENT_SYSTEM: return "agent-system";
+    case PULSAR_KVSTORE_REASON_AGENT_SESSION: return "agent-session";
+    case PULSAR_KVSTORE_REASON_SYS_PREFIX: return "sys-prefix";
+    default: return "unknown";
+    }
 }
 
 const char *pulsar_kvstore_key_kind(uint8_t ext_flags) {
@@ -1492,10 +1535,6 @@ bool pulsar_kvstore_open(pulsar_kvstore *kc, const char *dir, uint64_t budget_mb
 
 void pulsar_kvstore_close(pulsar_kvstore *kc) {
     KvStore(*kc).close();
-}
-
-int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens) {
-    return KvStore(*const_cast<pulsar_kvstore *>(kc)).store_len(tokens);
 }
 
 int pulsar_kvstore_sys_prefix_cut(const pulsar_kvstore *kc, int anchor) {

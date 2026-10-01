@@ -1048,10 +1048,6 @@ typedef struct {
     /* results, filled by the batched redraft; committed into the bank's shadow
      * by pulsar_session_spec_redraft_commit under the server's bank switch */
     bool     done;
-    /** L190 C2: the "past the drafter batch cap" line was said for this round
-     * object; survives spec_round_begin's reset (like qrows) so it is said
-     * once per affected round, not once per process or once per step. */
-    bool     cap_said;
     bool     sample_drafts;
     uint32_t keep;
     bool     have_conf;
@@ -1105,10 +1101,8 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         /* the round is reused across rounds; its redraft record's lazily-owned
          * fallback rows (L150) survive the reset, everything else is cleared */
         float *qrows = r->redraft.qrows;
-        const bool cap_said = r->redraft.cap_said;
         memset(r, 0, sizeof(*r));
         r->redraft.qrows = qrows;
-        r->redraft.cap_said = cap_said;
     }
     /* L149 phase 2: accumulate, for the step this round will ride, whether
      * every round is in the sparse min-p contract and the most permissive
@@ -2261,12 +2255,23 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
         snprintf(err, errlen, "redraft batch: drafter scratch missing");
         return -1;
     }
+    /* Every live round drafts (L260): the groups below split them into
+     * drafter passes of at most PULSAR_DSPARK_BANKS_MAX banks (the markov
+     * kernel's register tile), each pass reusing the batch buffers after the
+     * previous one's results are read back.  Selection used to stop at
+     * PULSAR_DSPARK_BANKS_MAX, so past 8 live banks the rest took base-only
+     * steps -- at c10, two streams drafted nothing on every round. */
+    if (n > (int)PULSAR_MSEQ_MAX) {
+        snprintf(err, errlen, "redraft batch: %d rounds, more than the %u-bank pool", n,
+                 (unsigned)PULSAR_MSEQ_MAX);
+        return -1;
+    }
     /* greedy banks first, then sampled, so each group is contiguous in rows
      * and in the bank arrays */
-    int order[PULSAR_DSPARK_BANKS_MAX];
+    int order[PULSAR_MSEQ_MAX];
     int n_sel = 0, n_g = 0;
     for (int pass = 0; pass < 2; pass++)
-        for (int i = 0; i < n && n_sel < (int)PULSAR_DSPARK_BANKS_MAX; i++) {
+        for (int i = 0; i < n; i++) {
             spec_redraft_req *q = &rounds[i]->redraft;
             if (!q->valid || q->n_draft == 0) continue;
             const bool sampled = q->temperature > 0.0f;   /* vocab pinned at load; see the drafting loop */
@@ -2275,24 +2280,6 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
             order[n_sel++] = i;
             if (!sampled) n_g++;
         }
-    /* The drafter's batch buffers hold PULSAR_DSPARK_BANKS_MAX banks; the
-     * scheduler can pass more live rounds under an operator PULSAR_MSEQ_BANKS
-     * pin (auto-size stops at 8).  A round past the cap never gets done = true
-     * and takes base-only steps.  That is a per-ROUND condition, so it is said
-     * once per affected round object (the flag survives round_begin's reset,
-     * like qrows) -- not once per process, which after the first hid every
-     * later request it hit (L177 -> L190 C2). */
-    for (int i = 0; i < n; i++) {
-        spec_redraft_req *q = &rounds[i]->redraft;
-        if (!q->valid || q->n_draft == 0 || q->cap_said) continue;
-        bool picked = false;
-        for (int j = 0; j < n_sel && !picked; j++) picked = order[j] == i;
-        if (picked) continue;
-        q->cap_said = true;
-        fprintf(stderr, "pulsar: redraft batch: %d live rounds but the drafter batch holds %u banks -- "
-                        "round %d drafts nothing while that many are live (pin fewer banks)\n",
-                n, (unsigned)PULSAR_DSPARK_BANKS_MAX, i);
-    }
     if (n_sel == 0) return 0;
     (void)n_g;
 

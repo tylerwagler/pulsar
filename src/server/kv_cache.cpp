@@ -450,12 +450,6 @@ void build_prompt_from_exact_prefix_and_text_suffix(
 
 
 
-int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
-    return pulsar_kvstore_store_len(kc, tokens);
-}
-
-
-
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const pulsar_tokens *prompt,
                                     int user_token_id,
