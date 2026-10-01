@@ -1066,6 +1066,17 @@ typedef struct {
     uint64_t dspark_prompt_bank_bytes;   ///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
     pulsar_gpu_tensor *dspark_raw[3];       ///< per draft layer, bank-major drafter raw ring; NULL without a pool or drafter
     pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
+    /** L260: each PARKED bank's spec-frontier batched-copy tables (the graph's spec_snap_copies /
+     *  spec_restore_copies and their counts while that bank is installed).  The tables address the bank's state-lane
+     *  views, whose slabs are allocated once at pool build and never move, so a bank switch parks the outgoing
+     *  bank's tables here and installs the incoming bank's -- freeing them was a device-synchronizing cudaFree pair
+     *  on every switch, rebuilt with cudaMalloc at the next snapshot.  The installed bank's slot is NULL (its
+     *  tables live in the graph fields); NULL elsewhere = not built yet. */
+    void *spec_snap_copies[PULSAR_MSEQ_MAX];
+    void *spec_restore_copies[PULSAR_MSEQ_MAX];
+    uint32_t spec_frontier_copy_n[PULSAR_MSEQ_MAX];
+    uint64_t spec_frontier_copy_max_bytes[PULSAR_MSEQ_MAX];
+    int spec_frontier_copy_init[PULSAR_MSEQ_MAX];
 } pulsar_bank_slabs;
 
 /** Every device buffer one session needs, plus the host bookkeeping that says
@@ -1996,6 +2007,10 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
 #define PULSAR_DSPARK_PREFILTER_ROW_I32 (3u + 2u * PULSAR_DSPARK_PREFILTER_CAP)
 /** L149: widest proposal distribution stored per pending draft position. */
 #define PULSAR_DSPARK_QDIST_CAP 256u
+/** L149/L260: a pending draft's proposal q is held in the compact form (qids/qprobs, qn entries) exactly when
+ *  this holds; otherwise the verify walk rebuilds q from the draft's full row in dspark_pending_qrows.  The one
+ *  test for both the walk and the bank carry's row copy. */
+static inline bool pulsar_spec_q_compact(uint32_t qn) { return qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP; }
 
 typedef struct pulsar_spec_carry_state {
     /** Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
@@ -2014,6 +2029,12 @@ typedef struct pulsar_spec_carry_state {
     bool dspark_chain_conf;      ///< the confidence head ran for the in-flight chain
     uint32_t dspark_chain_n;     ///< drafted depth of the in-flight chain
     uint32_t dspark_n_pending;   ///< drafts proposed and awaiting verification
+    /** L260: draft positions whose proposal q may still be read from the session's dspark_pending_qrows (the
+     *  non-compact ones, pulsar_spec_q_compact).  Set where the rows are written (the drafting loop, redraft
+     *  commit); NOT reset by pulsar_spec_drop_pendings, because round_begin drops the pendings before the
+     *  in-flight round's walk reads their rows; cleared once that walk is done.  The bank carry copies these
+     *  rows and no others. */
+    uint32_t dspark_qrows_n;
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
@@ -2268,6 +2289,26 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
                                             const uint32_t *banks, uint64_t **rngs, int n,
                                             char *err, size_t errlen);
 void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_round *r);
+/** L260: the batch phases' local implementations (the steps' contract is on
+ * pulsar_session_spec_assemble_batch in pulsar.h); reqs may be NULL (the
+ * worker's rows ride the mixed-batch frame). */
+void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                              int eos_token, uint32_t row_budget,
+                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                               int eos_token, const float *rows);
+void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
+/** L260: a batch phase's verdict -- a positive fingerprint of what the phase
+ * decided for every step (statuses, base tokens and rows; frontiers and
+ * accepted tokens), identical on ranks that agree.  n_rows: assemble's total
+ * rows, 0 for the other phases. */
+typedef enum {
+    PULSAR_SPEC_PHASE_ASSEMBLE = 1,
+    PULSAR_SPEC_PHASE_ROUND_END = 2,
+    PULSAR_SPEC_PHASE_REDRAFT_COMMIT = 3,
+} pulsar_spec_phase;
+int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
+                              uint32_t n_rows);
 
 /** Slice 4e (L238): the failure report a void mirrored operation can make --
  * marks the pair failed and prints the reason once.  Defined in engine_api.cpp,

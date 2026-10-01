@@ -189,6 +189,14 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     g->spec_restore_copies = NULL;
     g->spec_frontier_copy_n = 0;
     g->spec_frontier_copy_init = 0;
+    /* L260: and every parked bank's tables (pulsar_bank_slabs) */
+    for (uint32_t bk = 0; bk < PULSAR_MSEQ_MAX; bk++) {
+        pulsar_gpu_batched_copy_free(g->banks.spec_snap_copies[bk]);
+        pulsar_gpu_batched_copy_free(g->banks.spec_restore_copies[bk]);
+        g->banks.spec_snap_copies[bk] = NULL;
+        g->banks.spec_restore_copies[bk] = NULL;
+        g->banks.spec_frontier_copy_init[bk] = 0;
+    }
     pulsar_gpu_tensor_free(g->kv);
     pulsar_gpu_tensor_free(g->attn_norm);
     pulsar_gpu_tensor_free(g->hc_comb);

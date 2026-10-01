@@ -3727,6 +3727,19 @@ int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec
     return ok;
 }
 
+int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
+                              const pulsar_tp_spec_command *steps) {
+    if (!tp || !cmd || cmd->count > PULSAR_TP_SPEC_STEPS_MAX || (cmd->count && !steps)) return 0;
+    const uint32_t bytes = (uint32_t)(sizeof(*cmd) + (size_t)cmd->count * sizeof(*steps));
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    memcpy(payload, cmd, sizeof(*cmd));
+    if (cmd->count) memcpy(payload + sizeof(*cmd), steps, (size_t)cmd->count * sizeof(*steps));
+    const int ok = tp_send_frame_to_peers(tp, frame_type, payload, bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
     return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
 }
@@ -4148,6 +4161,8 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     free(command->spec_rngs);
     command->spec_banks = NULL;
     command->spec_rngs = NULL;
+    free(command->spec_steps);
+    command->spec_steps = NULL;
     free(command->spill_key);
     command->spill_key = NULL;
     free(command->images);
@@ -4249,6 +4264,23 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
             memcpy(command->spec_banks, payload + sizeof(command->spec), (size_t)n * sizeof(uint32_t));
             memcpy(command->spec_rngs, payload + sizeof(command->spec) + (size_t)n * sizeof(uint32_t),
                    (size_t)n * sizeof(uint64_t));
+        }
+        break;
+    }
+    case PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH:
+    case PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH:
+    case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH: {
+        if (bytes < sizeof(command->spec)) { ok = 0; break; }
+        memcpy(&command->spec, payload, sizeof(command->spec));
+        command->session_id = command->spec.session_id;
+        command->value = command->spec.bank;
+        const uint32_t n = command->spec.count;
+        if (n > PULSAR_TP_SPEC_STEPS_MAX ||
+            sizeof(command->spec) + (uint64_t)n * sizeof(command->spec) != bytes) { ok = 0; break; }
+        if (n) {
+            command->spec_steps = static_cast<pulsar_tp_spec_command *>(malloc((size_t)n * sizeof(command->spec)));
+            if (!command->spec_steps) { ok = -1; break; }
+            memcpy(command->spec_steps, payload + sizeof(command->spec), (size_t)n * sizeof(command->spec));
         }
         break;
     }

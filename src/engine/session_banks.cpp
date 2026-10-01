@@ -539,6 +539,24 @@ int pulsar_session::bank_repoint(uint32_t bank) {
     return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
 }
 
+/* L260: the full q rows a bank carries -- rows j < dspark_qrows_n (the positions whose rows may still be read,
+ * which outlives the pendings: round_begin drops them before the in-flight round's walk reads the rows) of
+ * sampled drafts whose q did not fit the compact form (pulsar_spec_q_compact) -- copied from src to dst.  The
+ * rest of the n_draft x PULSAR_N_VOCAB capacity is never read, and copying it on every bank switch was ~2.6 MB
+ * per save and per restore at depth 5 under sampling (the c10 host-bookkeeping cost). */
+static void copy_pending_qrows(float *dst, uint32_t dst_cap, const float *src, uint32_t src_cap,
+                               const pulsar_spec_carry_state &sp) {
+    if (!sp.dspark_pending_sampled) return;
+    const uint32_t n = sp.dspark_qrows_n < 16u ? sp.dspark_qrows_n : 16u;
+    for (uint32_t j = 0; j < n; j++) {
+        if (pulsar_spec_q_compact(sp.dspark_pending_qn[j])) continue;
+        const uint64_t end = (uint64_t)(j + 1u) * PULSAR_N_VOCAB;
+        if (end > dst_cap || end > src_cap) return;   /* no row was drafted there: nothing to carry */
+        memcpy(dst + (size_t)j * PULSAR_N_VOCAB, src + (size_t)j * PULSAR_N_VOCAB,
+               (size_t)PULSAR_N_VOCAB * sizeof(float));
+    }
+}
+
 void pulsar_session::bank_state_save(uint32_t bank) {
     auto *s = this;
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
@@ -552,15 +570,10 @@ void pulsar_session::bank_state_save(uint32_t bank) {
     pulsar_tokens_copy(&c->checkpoint, &s->checkpoint);
     if (!c->logits) c->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
     memcpy(c->logits, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    if (s->dspark_pending_qrows && s->dspark_pending_qrows_cap > 0) {
-        if (c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
-            c->dspark_pending_qrows = (float *)xrealloc(
-                c->dspark_pending_qrows,
-                (size_t)s->dspark_pending_qrows_cap * sizeof(float));
-            c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
-        }
-        memcpy(c->dspark_pending_qrows, s->dspark_pending_qrows,
-               (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+    if (s->dspark_pending_qrows && c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
+        c->dspark_pending_qrows = (float *)xrealloc(c->dspark_pending_qrows,
+                                                    (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+        c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
     }
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
@@ -576,6 +589,9 @@ void pulsar_session::bank_state_save(uint32_t bank) {
      * per-bank frontier truth and clears it unconditionally. */
     pulsar_session_spec_chain_harvest(s);   /* L108 P2: never save an in-flight chain */
     c->spec = s->spec;
+    /* the q rows the saved pendings can read (after the harvest, which only finishes greedy chains) */
+    copy_pending_qrows(c->dspark_pending_qrows, c->dspark_pending_qrows_cap, s->dspark_pending_qrows,
+                       s->dspark_pending_qrows_cap, c->spec);
     c->valid = true;
 }
 
@@ -599,16 +615,13 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     pulsar_bank_carry *c = &s->bank_carry[bank];
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
     memcpy(s->logits, c->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    if (c->dspark_pending_qrows_cap > 0) {
-        if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
-            s->dspark_pending_qrows = (float *)xrealloc(
-                s->dspark_pending_qrows,
-                (size_t)c->dspark_pending_qrows_cap * sizeof(float));
-            s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
-        }
-        memcpy(s->dspark_pending_qrows, c->dspark_pending_qrows,
-               (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+    if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
+        s->dspark_pending_qrows = (float *)xrealloc(s->dspark_pending_qrows,
+                                                    (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+        s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
     }
+    copy_pending_qrows(s->dspark_pending_qrows, s->dspark_pending_qrows_cap, c->dspark_pending_qrows,
+                       c->dspark_pending_qrows_cap, c->spec);
     s->checkpoint_valid       = c->checkpoint_valid;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
     s->live_image_fp          = c->live_image_fp;      /* L226 */

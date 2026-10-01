@@ -604,7 +604,7 @@ static int spec_accept_walk(pulsar_session *s,
             if (pend_sampled) {
                 pulsar_sample_dist qd;
                 const uint32_t qn = s->spec.dspark_pending_qn[commit];
-                if (qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP) {
+                if (pulsar_spec_q_compact(qn)) {
                     /* L149: q_X exactly as built at draft time (drafting loop) */
                     memset(&qd, 0, sizeof(qd));
                     qd.n = qn;
@@ -965,6 +965,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * the residual rebuilds q from the qrows under THESE params, so the stored
      * accept denominator and the residual describe one proposal. */
     s->spec.dspark_pending_sampled = sample_drafts;
+    s->spec.dspark_qrows_n = sample_drafts ? n_draft : 0u;   /* L260: the rows the drafting loop wrote */
     s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->spec.dspark_pending_temp = temperature;
     s->spec.dspark_pending_top_k = top_k;
@@ -1319,6 +1320,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                      temperature, top_k, top_p, min_p,
                                      rng, &carry_tok);
     }
+    s->spec.dspark_qrows_n = 0u;   /* L260: the walk was the last reader of this round's q rows */
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
         (void)spec_frontier_restore(&frontier, s);
@@ -2331,6 +2333,7 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
     s->spec.dspark_n_pending = q->keep;
     for (uint32_t i = 0; i < q->keep; i++) s->spec.dspark_pending[i] = q->refined[i + 1];
     s->spec.dspark_pending_sampled = q->sample_drafts;
+    s->spec.dspark_qrows_n = q->sample_drafts ? q->n_draft : 0u;   /* L260: the rows this commit writes */
     s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->spec.dspark_pending_temp = q->temperature;
     s->spec.dspark_pending_top_k = q->top_k;
@@ -2343,7 +2346,7 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
         for (uint32_t i = 0; i < q->n_draft; i++) {
             s->spec.dspark_pending_q[i] = q->q_drawn[i];
             s->spec.dspark_pending_qn[i] = q->qn[i];
-            if (q->qn[i] > 0) {
+            if (pulsar_spec_q_compact(q->qn[i])) {
                 memcpy(s->spec.dspark_pending_qids[i], q->qids[i], (size_t)q->qn[i] * sizeof(int32_t));
                 memcpy(s->spec.dspark_pending_qprobs[i], q->qprobs[i], (size_t)q->qn[i] * sizeof(float));
             } else {
@@ -2366,6 +2369,139 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
     }
     q->done = false;
     q->valid = false;
+}
+
+/* ---- L260: the batched lane's per-bank bookkeeping, one call per phase ----
+ * Each is the per-bank sequence the server ran, in the same order on the same
+ * state: restore, the phase, save.  The public wrappers (engine_api.cpp) send
+ * ONE frame per phase and collect ONE verdict, pulsar_spec_steps_verdict. */
+static void spec_step_reset(pulsar_spec_step *st) {
+    st->status = PULSAR_SPEC_STEP_OK;
+    st->n_accepted = 0;
+    st->err[0] = '\0';
+}
+
+void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                              int eos_token, uint32_t row_budget,
+                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
+    uint32_t rows = 0;
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        st->first_token = -1;
+        st->row0 = 0;
+        st->n_rows = 0;
+        if (!s->bank_state_restore(st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        const uint32_t cap_rows = st->k_alloc >= 0 ? 1u + (uint32_t)st->k_alloc
+                                                   : pulsar_session_spec_next_rows_max(s);
+        if (s->pos() >= s->ctx()) {
+            st->status = PULSAR_SPEC_STEP_LENGTH;
+        } else if (rows + cap_rows > row_budget) {
+            /* Sit out BEFORE the base draw or begin touch anything: the carry
+             * (possibly a rejection residual, whose exact emission the
+             * acceptance proof needs) and the pendings stay intact. */
+            st->status = PULSAR_SPEC_STEP_SKIPPED;
+        } else {
+            const int first = pulsar_session_spec_next_base_local(s, st->temperature, st->top_k,
+                                                                  st->top_p, st->min_p, st->rng);
+            st->first_token = first;
+            if (first < 0) {
+                st->status = PULSAR_SPEC_STEP_FAILED;
+                snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
+            } else if (first == eos_token) {
+                st->status = PULSAR_SPEC_STEP_EOS;
+            } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
+                                                             st->accepted_cap, st->temperature,
+                                                             st->top_k, st->top_p, st->min_p,
+                                                             st->err, sizeof st->err) != 0) {
+                st->status = PULSAR_SPEC_STEP_FAILED;
+            } else if (rows + pulsar_spec_round_n_rows(st->round) > row_budget) {
+                /* Unreachable: begin only trims below cap_rows.  The backstop
+                 * runs BEFORE fill_reqs writes, so no change to begin's row
+                 * math can overflow reqs[]. */
+                pulsar_session_spec_round_abort_local(s, st->round);
+                st->status = PULSAR_SPEC_STEP_SKIPPED;
+            } else {
+                /* The worker has no reqs: its rows ride the mixed-batch frame. */
+                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, first, reqs + rows)
+                                  : pulsar_spec_round_n_rows(st->round);
+                st->row0 = rows;
+                rows += st->n_rows;
+            }
+        }
+        s->bank_state_save(st->bank);
+    }
+    *n_rows_out = rows;
+}
+
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                               int eos_token, const float *rows) {
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        st->pos_before = pulsar_spec_round_saved_len(st->round);
+        st->pos_after = -1;
+        if (!s->bank_state_restore(st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token, eos_token,
+                                                           st->temperature, st->top_k, st->top_p,
+                                                           st->min_p, st->rng, rows, st->row0,
+                                                           st->accepted, st->accepted_cap,
+                                                           st->err, sizeof st->err);
+        if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
+        else st->n_accepted = na;
+        st->pos_after = s->pos();
+        s->bank_state_save(st->bank);
+    }
+}
+
+void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        if (!s->bank_state_restore(st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        pulsar_session_spec_redraft_commit_local(s, st->round);
+        s->bank_state_save(st->bank);
+    }
+}
+
+/* FNV-1a over 32-bit words. */
+static uint32_t spec_fp(uint32_t h, uint32_t v) {
+    for (int b = 0; b < 4; b++) h = (h ^ ((v >> (8 * b)) & 0xffu)) * 16777619u;
+    return h;
+}
+
+int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
+                              uint32_t n_rows) {
+    /* Only what the phase itself decides, which both ranks hold the same way:
+     * a field the phase does not write is the caller's leftover on the leader
+     * and the wire's value on the worker. */
+    uint32_t h = spec_fp(2166136261u, (uint32_t)phase);
+    h = spec_fp(h, (uint32_t)n);
+    h = spec_fp(h, n_rows);
+    for (int i = 0; i < n; i++) {
+        const pulsar_spec_step *st = &steps[i];
+        h = spec_fp(h, st->bank);
+        h = spec_fp(h, (uint32_t)st->status);
+        if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
+            h = spec_fp(h, (uint32_t)st->first_token);
+            h = spec_fp(h, st->row0);
+            h = spec_fp(h, st->n_rows);
+        } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
+            h = spec_fp(h, (uint32_t)st->pos_after);
+            h = spec_fp(h, (uint32_t)st->n_accepted);
+            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t]);
+        }
+    }
+    return (int)(h & 0x3fffffffu) + 1;
 }
 
 int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],

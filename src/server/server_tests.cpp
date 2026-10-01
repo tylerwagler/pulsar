@@ -6446,7 +6446,11 @@ static void l179_fill_surv(float surv[][16], uint32_t *npend, int i, uint32_t np
  * cut -- once the best remaining candidate is below thr admission stops,
  * *thr_cut_rows counts what it left, and the budget may go unspent. */
 static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
+    /* Every case is sized from the budget, so the test holds whatever
+     * PULSAR_SPEC_ROW_BUDGET is: three decoding banks (3 base rows) plus an
+     * idle fourth, at most 16 pendings each -- demand tops out at 3 + 48. */
     const int B = (int)PULSAR_SPEC_ROW_BUDGET;
+    TEST_ASSERT(B > 3 + 12 && B < 3 + 48);
     float surv[PULSAR_SESSION_POOL_CAP][16];
     uint32_t npend[PULSAR_SESSION_POOL_CAP];
     int k_alloc[PULSAR_SESSION_POOL_CAP];
@@ -6456,36 +6460,47 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     const float thr_fallback = PULSAR_SPEC_ROW_MS / 45.0f;   /* spec_ms_per_tok_ema unset */
     const float thr_live = PULSAR_SPEC_ROW_MS / 30.0f;       /* a live EMA of 30 ms/tok */
 
-    /* (a) demand 3 + 12 = 15 < 16, one bank with hopeless confidence, a
+    /* (a) demand 3 + (B - 4) < B, one bank with hopeless confidence, a
      * fourth bank not decoding (npend 0): everything admitted, no cut. */
-    l179_fill_surv(surv, npend, 0, 4, 0.95f);
-    l179_fill_surv(surv, npend, 1, 5, 0.01f);
-    l179_fill_surv(surv, npend, 2, 3, 0.80f);
-    npend[3] = 0;
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_live, k_alloc, &cut) == 0);
-    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
-    TEST_ASSERT(cut == 0);
-    /* demand exactly the budget (3 + 13 = 16) still fits */
-    l179_fill_surv(surv, npend, 1, 6, 0.01f);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, 0.99f, k_alloc, &cut) == 0);
-    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
-    TEST_ASSERT(cut == 0);
+    for (int d = B - 4; d <= B - 3; d++) {
+        const uint32_t third = (uint32_t)d / 3u;
+        l179_fill_surv(surv, npend, 0, third, 0.95f);
+        l179_fill_surv(surv, npend, 1, third, 0.01f);
+        l179_fill_surv(surv, npend, 2, (uint32_t)d - 2u * third, 0.80f);
+        npend[3] = 0;
+        /* demand exactly the budget (d = B - 3) still fits, at any threshold */
+        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, d == B - 4 ? thr_live : 0.99f,
+                                    k_alloc, &cut) == 0);
+        for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
+        TEST_ASSERT(cut == 0);
+    }
 
-    /* (b) demand 3 + 17 = 20 > 16 with every survival above thr: ranked. The
-     * 13 rows go to the 13 highest survivals: bank 0 (0.95^k) all 6,
-     * bank 1 (0.9^k) 5, bank 2 (0.8^k) 2. */
-    l179_fill_surv(surv, npend, 0, 6, 0.95f);
-    l179_fill_surv(surv, npend, 1, 6, 0.90f);
-    l179_fill_surv(surv, npend, 2, 5, 0.80f);
+    /* (b) demand 3 + 48 > B with every admitted survival above thr: ranked.
+     * The B - 3 rows go to the B - 3 highest survivals (no ties across the
+     * three banks' powers), so bank i's share is how many of its survivals
+     * reach the (B - 3)-th best. */
+    l179_fill_surv(surv, npend, 0, 16, 0.99f);
+    l179_fill_surv(surv, npend, 1, 16, 0.97f);
+    l179_fill_surv(surv, npend, 2, 16, 0.95f);
+    float all[48];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 16; j++) all[i * 16 + j] = surv[i][j];
+    for (int x = 0; x < 48; x++)          /* descending */
+        for (int y = x + 1; y < 48; y++)
+            if (all[y] > all[x]) { const float t = all[x]; all[x] = all[y]; all[y] = t; }
+    const float kth = all[B - 3 - 1];
+    TEST_ASSERT(kth > thr_fallback && all[B - 3] < kth);
     TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_fallback, k_alloc, &cut) == 1);
     TEST_ASSERT(cut == 0);
     int admitted = 0;
     for (int i = 0; i < 4; i++) {
         TEST_ASSERT(k_alloc[i] >= 0 && k_alloc[i] <= (int)npend[i]);
         admitted += k_alloc[i];
+        int want = 0;
+        for (uint32_t j = 0; j < npend[i]; j++) want += surv[i][j] >= kth;
+        TEST_ASSERT(k_alloc[i] == want);
     }
     TEST_ASSERT(3 + admitted == B);
-    TEST_ASSERT(k_alloc[0] == 6 && k_alloc[1] == 5 && k_alloc[2] == 2 && k_alloc[3] == 0);
     /* global best: the weakest admitted row beats the strongest unadmitted */
     float min_admitted = 2.0f, max_unadmitted = -1.0f;
     for (int i = 0; i < 4; i++) {
@@ -6496,21 +6511,24 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     }
     TEST_ASSERT(min_admitted >= max_unadmitted);
 
-    /* (c) thr above every survival: nothing admitted, all 17 rows cut */
+    /* (c) thr above every survival: nothing admitted, all 48 rows cut */
+    l179_fill_surv(surv, npend, 0, 16, 0.95f);
+    l179_fill_surv(surv, npend, 1, 16, 0.90f);
+    l179_fill_surv(surv, npend, 2, 16, 0.80f);
     TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, 0.99f, k_alloc, &cut) == 1);
     for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 0);
-    TEST_ASSERT(cut == 17);
-    /* partial cut at the live threshold: demand 3 + 15 = 18 > 16, budget 13,
-     * but only 5 + 5 + 2 rows survive above 0.2 (bank 2 at 0.5^k: 0.5, 0.25,
-     * then 0.125) -- the cut fires with budget left, bank 2's other 3 rows
-     * are the cut count, and the budget goes unspent. */
-    l179_fill_surv(surv, npend, 0, 5, 0.95f);
-    l179_fill_surv(surv, npend, 1, 5, 0.90f);
-    l179_fill_surv(surv, npend, 2, 5, 0.50f);
+    TEST_ASSERT(cut == 48);
+    /* partial cut at the live threshold (0.239): demand 3 + 48 > B, but only
+     * 6 + 2 + 2 rows survive above it (0.8^k: 0.8^6 = 0.262, 0.8^7 = 0.210;
+     * 0.5^k: 0.5, 0.25, then 0.125) -- the cut fires with budget left, every
+     * other row (10 + 14 + 14) is the cut count, and the budget goes unspent. */
+    l179_fill_surv(surv, npend, 0, 16, 0.80f);
+    l179_fill_surv(surv, npend, 1, 16, 0.50f);
+    l179_fill_surv(surv, npend, 2, 16, 0.50f);
     TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_live, k_alloc, &cut) == 1);
-    TEST_ASSERT(k_alloc[0] == 5 && k_alloc[1] == 5 && k_alloc[2] == 2 && k_alloc[3] == 0);
-    TEST_ASSERT(cut == 3);
-    TEST_ASSERT(3 + 12 < B);
+    TEST_ASSERT(k_alloc[0] == 6 && k_alloc[1] == 2 && k_alloc[2] == 2 && k_alloc[3] == 0);
+    TEST_ASSERT(cut == 38);
+    TEST_ASSERT(3 + 10 < B);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the

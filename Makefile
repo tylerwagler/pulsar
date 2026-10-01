@@ -1872,6 +1872,9 @@ tests/bank_spec_gate.o: tests/bank_spec_gate.cpp src/engine/pulsar_engine_intern
 tests/dspark_batch_gate.o: tests/dspark_batch_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/dspark_batch_gate.cpp
 
+tests/bank_carry_identity.o: tests/bank_carry_identity.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_carry_identity.cpp
+
 tests/nt_crossover_sweep.o: tests/nt_crossover_sweep.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/nt_crossover_sweep.cpp
 
@@ -2001,6 +2004,10 @@ tests/mseq_rowcost_probe: tests/mseq_rowcost_probe.o src/lib/pulsar_help.o $(COR
 tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/dspark_batch_gate: tests/dspark_batch_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L260: the batched spec lane, byte-reproducible, for before/after identity of a bank-switch bookkeeping change
+# (not a gate: run it on both trees and diff; tests/bank_carry_identity.cpp).
+tests/bank_carry_identity: tests/bank_carry_identity.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/nt_crossover_sweep: tests/nt_crossover_sweep.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

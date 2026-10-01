@@ -1612,14 +1612,34 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
             ok = g->dspark_raw_cache[i] && g->dspark_prompt_h[i];
         }
     }
-    /* Stale pointer hygiene (mirrors gpu_graph_free). */
-    pulsar_gpu_batched_copy_free(g->spec_snap_copies);
-    pulsar_gpu_batched_copy_free(g->spec_restore_copies);
-    g->spec_snap_copies = NULL;
-    g->spec_restore_copies = NULL;
-    g->spec_frontier_copy_n = 0;
-    g->spec_frontier_copy_init = 0;
-    if (ok) b->cur_bank = bank;
+    if (ok) {
+        /* L260: park the outgoing bank's spec-frontier copy tables and install the incoming bank's (built lazily at
+         * its first snapshot): they address per-bank state-lane views that never move (pulsar_bank_slabs). */
+        const uint32_t out = b->cur_bank;
+        b->spec_snap_copies[out] = g->spec_snap_copies;
+        b->spec_restore_copies[out] = g->spec_restore_copies;
+        b->spec_frontier_copy_n[out] = g->spec_frontier_copy_n;
+        b->spec_frontier_copy_max_bytes[out] = g->spec_frontier_copy_max_bytes;
+        b->spec_frontier_copy_init[out] = g->spec_frontier_copy_init;
+        g->spec_snap_copies = b->spec_snap_copies[bank];
+        g->spec_restore_copies = b->spec_restore_copies[bank];
+        g->spec_frontier_copy_n = b->spec_frontier_copy_n[bank];
+        g->spec_frontier_copy_max_bytes = b->spec_frontier_copy_max_bytes[bank];
+        g->spec_frontier_copy_init = b->spec_frontier_copy_init[bank];
+        b->spec_snap_copies[bank] = NULL;
+        b->spec_restore_copies[bank] = NULL;
+        b->spec_frontier_copy_init[bank] = 0;
+        b->cur_bank = bank;
+    } else {
+        /* A half-repointed view set: the installed tables no longer match it.  Drop them (the next snapshot
+         * rebuilds from whatever views are installed); the parked banks' tables still match their own views. */
+        pulsar_gpu_batched_copy_free(g->spec_snap_copies);
+        pulsar_gpu_batched_copy_free(g->spec_restore_copies);
+        g->spec_snap_copies = NULL;
+        g->spec_restore_copies = NULL;
+        g->spec_frontier_copy_n = 0;
+        g->spec_frontier_copy_init = 0;
+    }
     return ok;
 }
 

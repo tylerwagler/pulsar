@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 16u           /* v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 17u           /* v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -466,6 +466,15 @@ typedef struct {
  * REDRAFT_BATCH's arrays (count entries each) and NULL elsewhere. */
 int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
                         const uint32_t *banks, const uint64_t *rngs);
+/* v17 (L260): a SPEC_*_BATCH frame -- `cmd` is the header (count = steps,
+ * at most PULSAR_TP_SPEC_STEPS_MAX; i0 = eos token, i1 = the row budget for
+ * ASSEMBLE) and `steps[count]` are the per-bank records in the same struct
+ * (bank, sampling, rng as it was before the phase; i0 = max_tokens / first
+ * token, i1 = k_alloc, i2 = accepted_cap, i3 = row0).  Received into
+ * pulsar_tp_command.spec_steps. */
+#define PULSAR_TP_SPEC_STEPS_MAX 64u
+int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
+                              const pulsar_tp_spec_command *steps);
 /* Increment 6.  free/alloc physical ride the value payload; save/load carry
  * the snapshot key. */
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
@@ -689,6 +698,12 @@ typedef enum {
      * the leader's commit, copies from another build), plus crash-abandoned
      * temp files.  Keys ride `spill_key` as n x 40 hex chars, n in `value`. */
     PULSAR_TP_FRAME_KVSTORE_RECONCILE = 46,
+    /* v17 (L260): the batched spec lane's per-bank bookkeeping, one frame per
+     * phase carrying every bank (pulsar_tp_send_spec_steps).  Verdict: the
+     * phase's outcome fingerprint (pulsar_spec_steps_verdict). */
+    PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH = 47,
+    PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH = 48,
+    PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH = 49,
 } pulsar_tp_frame_type;
 
 /** v16 (L250): a KVSTORE_SAVE / KVSTORE_DROP frame naming the entry by `key`;
@@ -739,6 +754,8 @@ typedef struct {
     pulsar_tp_spec_command spec;
     uint32_t *spec_banks;
     uint64_t *spec_rngs;
+    /* SPEC_*_BATCH: the per-bank records (malloc'd, spec.count). */
+    pulsar_tp_spec_command *spec_steps;
     /* BANK_KV_SAVE / BANK_KV_LOAD and KVSTORE_SAVE / LOAD / DROP: the key
      * (malloc'd, NUL-terminated); the bank (spill) or 0 rides `value`. */
     char *spill_key;
