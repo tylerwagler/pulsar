@@ -113,8 +113,12 @@
  * row-kind inference found no single-row runs, declared zero decode rows, and
  * every row ran on the tensor-core arm -- a bank's numerics then depended on
  * the batch width (Tyler, 2026-09-05: budget back to 16; L177).  The server's
- * allocator fits draft depths to this and the ALL_ROWS head refuses above it. */
-#define PULSAR_SPEC_ROW_BUDGET PULSAR_GPU_MNEUTRAL_ROWS_MAX
+ * allocator fits draft depths to this and the ALL_ROWS head refuses above it.
+ * 2026-09-30 (Tyler: batch invariance is not a requirement -- "if we get a
+ * slightly different token when we batch versus when we don't; who cares?"):
+ * back to the slab's 32 rows; a step past 16 runs its verify rows on the
+ * tensor-core arms, graded by the reference gate like the TP split-K. */
+#define PULSAR_SPEC_ROW_BUDGET PULSAR_SPEC_LOGITS_ROWS
 
 /** spec_logits row CAPACITY (>= PULSAR_SPEC_ROW_BUDGET, asserted in imatrix.cpp):
  * the slab the batched lane's head writes,

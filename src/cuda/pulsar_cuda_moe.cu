@@ -1671,7 +1671,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          *   step-to-step neutrality boundary.
          * A decode call whose buffers do not fit refuses -- it used to fall to
          * the grouped path. */
-        enum { MOE_PREFILL_GEMV_ROWS = 8 };
+        enum { MOE_PREFILL_GEMV_ROWS = 32 };   /* EXPERIMENT 2026-09-30: decode-width steps past 16 rows keep the expert GEMV */
         if (pulsar_gpu_matmul_batch_decode_rows() > 0 || n_tokens <= (uint32_t)MOE_PREFILL_GEMV_ROWS) {
             if (!(mid && mid->ptr && down && down->ptr && out && out->ptr &&
                   selected && selected->ptr && weights && weights->ptr && x && x->ptr &&

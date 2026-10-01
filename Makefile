@@ -121,7 +121,7 @@ cutlass:
 # makes the decoded pixels match.  vision-pixel-gate proves it per format.
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpng -ljpeg
 
-PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor
+PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor -I$(CUDA_HOME)/include
 
 ENGINE_SRCS = $(wildcard src/engine/*.cpp)
 ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o)

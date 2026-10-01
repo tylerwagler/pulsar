@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "pulsar_nvtx.h"
 
 /* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
  * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
@@ -1980,6 +1981,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                               const uint32_t *banks, uint64_t **rngs,
                               const int *order, int n_sel,
                               char *err, size_t errlen) {
+    PULSAR_NVTX("redraft group");
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;

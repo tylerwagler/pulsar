@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "pulsar_nvtx.h"
 #include "tp/pulsar_tp.h"
 
 
@@ -369,6 +370,7 @@ bool gpu_graph_dspark_draft_forward_banks(
         const uint32_t          *row_bank,
         const uint32_t         (*bank_n_raw)[3],
         const uint32_t          *bank_n_draft) {
+    PULSAR_NVTX("drafter forward");
     const bool banked = row_bank != NULL;
     if (banked && (n_banks == 0 || !bank_n_raw || !bank_n_draft || !g->dspark_row_meta ||
                    g->banks.n_banks == 0 || n_draft > PULSAR_SPEC_LOGITS_ROWS ||
