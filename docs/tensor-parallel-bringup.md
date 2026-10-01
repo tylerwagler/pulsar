@@ -143,6 +143,17 @@ Run the PLAN 102 probe's RDMA halves (not on production without a window):
 Pass: numbers recorded into `pulsar-notes` (1-link vs 2-link; merged 2-link if
 later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
 
+> **Two rails for the bulk lane (v18, 2026-09-30, L260).**  Each ConnectX-7
+> port on a Spark is reachable through two HCA functions, each behind its own
+> PCIe x4 link: one function caps near 109 Gb/s per direction, both together
+> reach the 200G port (ib_write_bw on the pair: 109 alone, 97.9 + 97.9 at
+> once).  `PULSAR_TP_RDMA_DEV2=<hca>` names the second function of the SAME
+> port (`mlx5_1` beside `mlx5_3` on the pair; it carries its own IP, here
+> 192.168.0.x); the bulk lane then splits every exchange over both, and the
+> log says `split over two rails, mlx5_3 + mlx5_1`.  Set it on both ranks or on
+> neither -- one-sided is refused at bring-up.  The row (decode) lane stays on
+> the primary device.
+
 > **RESULT (pair-verified 2026-09-02, perftest 6.28 both sides):**
 > 16 KiB send latency, 5000 iters:
 > - 9.x TP wire (`roceP2p1s0f1`, off vLLM): avg **4.64 µs**, typical 4.58, min

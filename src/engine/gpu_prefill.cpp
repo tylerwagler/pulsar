@@ -2623,14 +2623,6 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
         if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
         return ok;
     }
-    /* The prefill lanes fold the addend with the same add up front, then zero
-     * it: byte for byte the values the row lane's stage leaves behind. */
-    if (addend &&
-        (pulsar_gpu_add_tensor(t, t, addend, (uint32_t)nelt) == 0 ||
-         pulsar_gpu_tensor_fill_f32(addend, 0.0f, nelt) == 0)) {
-        fprintf(stderr, "pulsar: tp: layer %u %s addend fold refused (%u rows)\n", il, what, n_tokens);
-        return false;
-    }
     /* Prefill-sized exchanges on a pair ride the BULK LANE (v14): the same
      * stream-enqueued stage / publish / combine, but the rows go GPU-direct
      * through the registered bulk buffer and cross as RDMA writes on the
@@ -2638,7 +2630,11 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
      * bulk buffer is cut into buffer-sized row runs, each its own exchange.
      * The combine is the all-reduce's own + peer add -- bit-identical to the
      * host big gate below, which remains the lane for transports with no bulk
-     * buffer (TCP). */
+     * buffer (TCP).  The stage kernel folds the addend on its way into the
+     * out-region (t + addend, addend zeroed: the row lane's stage arithmetic)
+     * and the combine reads this rank's partial back from there, so t is
+     * written once, by the combine (L260: the copy-engine stage and the
+     * separate add + fill passes cost ~1.2 ms per 32 MiB exchange). */
     if (n_tokens > PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_bulk_lane(g->tp) && g->tp_slab_dev && g->tp_bulk_dev) {
         pulsar_tp_row_lane_layout_t L;
         pulsar_tp_row_lane_layout(g->tp, &L);
@@ -2655,10 +2651,11 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
             uint64_t exch = 0;
             uint32_t buf = 0;
             ok = pulsar_tp_bulk_begin(g->tp, len, &exch, &buf) != 0 &&
-                 pulsar_gpu_tp_bulk_stage(t, off, bulk + BL.out_off, len) != 0 &&
+                 pulsar_gpu_tp_bulk_stage(t, addend, off, bulk + BL.out_off, len) != 0 &&
                  pulsar_gpu_tp_publish_bulk(slab + L.desc_off, exch, len,
                                             PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
-                 pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.in_off[buf], len, slab + L.done_off,
+                 pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.out_off, bulk + BL.in_off[buf], len,
+                                                slab + L.done_off,
                                                 exch, slab + L.err_off, L.timeout_ns) != 0;
         }
         if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
@@ -2675,7 +2672,15 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
      *    memory.
      *  - a bigger prefill chunk does not fit there at all (a 2048-row chunk is
      *    ~33 MB against a batch region of 8 rows) and keeps its own buffer,
-     *    which the transport stages through the slab in message-sized pieces. */
+     *    which the transport stages through the slab in message-sized pieces.
+     * The host gate folds the addend with the same add up front, then zeroes
+     * it: byte for byte the values the lanes' stage kernels leave behind. */
+    if (addend &&
+        (pulsar_gpu_add_tensor(t, t, addend, (uint32_t)nelt) == 0 ||
+         pulsar_gpu_tensor_fill_f32(addend, 0.0f, nelt) == 0)) {
+        fprintf(stderr, "pulsar: tp: layer %u %s addend fold refused (%u rows)\n", il, what, n_tokens);
+        return false;
+    }
     float *out = NULL;
     float *in = NULL;
     bool heap = false;

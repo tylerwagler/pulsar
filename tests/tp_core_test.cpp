@@ -351,6 +351,22 @@ static void test_bulk_arrivals(void) {
     CHECK(!pulsar_tp_bulk_arrival_matches(&b, w, 7), "two arrivals ahead is a divergence");
 }
 
+/* The bulk lane's two-rail split (v18): both ranks cut every exchange at the
+ * same byte, the shares are page aligned and cover the payload exactly, and a
+ * payload under 8 KiB rides the primary whole. */
+static void test_bulk_rail_split(void) {
+    CHECK(pulsar_tp_bulk_rail_split(UINT64_C(32) << 20) == UINT64_C(16) << 20,
+          "a 32 MiB prefill exchange splits 16 + 16 MiB");
+    const uint64_t row = 4096u * sizeof(float);
+    for (uint64_t rows = 1; rows <= 2048; rows = rows * 3 + 1) {
+        const uint64_t bytes = rows * row, front = pulsar_tp_bulk_rail_split(bytes);
+        CHECK(front <= bytes && (bytes - front) % 4096u == 0 && front >= bytes - front,
+              "the second rail's share is page aligned and never the larger");
+    }
+    CHECK(pulsar_tp_bulk_rail_split(8191) == 8191, "under 8 KiB rides the primary whole");
+    CHECK(pulsar_tp_bulk_rail_split(8192) == 4096, "8 KiB splits 4 + 4 KiB");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
@@ -360,10 +376,11 @@ int main(void) {
     test_owned_range();
     test_logits_digest();
     test_bulk_arrivals();
+    test_bulk_rail_split();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range, logits digest, bulk arrivals)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range, logits digest, bulk arrivals, bulk rail split)\n");
     return 0;
 }
