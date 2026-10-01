@@ -370,7 +370,8 @@ int main(int argc, char **argv) {
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
                                            NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL,
-                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL)
+                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL,
+                                           NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
                                            n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,

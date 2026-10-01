@@ -842,9 +842,15 @@ static void proj_ring_span_commit(pulsar_gpu_graph *g, uint32_t bank, uint32_t a
     }
 }
 
-/* Deposit ONE row of a FUSED step into the ring of the bank that owns it, at
- * that row's own position, updating that bank's span where its span lives (the
- * live pair while the bank is installed, its per-bank mirror otherwise).  L226:
+/* Deposit ONE RUN of a FUSED step -- rows [t0, t0 + n) of one bank at the
+ * consecutive positions pos .. pos + n - 1 -- into the ring of the bank that
+ * owns it, updating that bank's span where its span lives (the live pair while
+ * the bank is installed, its per-bank mirror otherwise).  Only the run's last
+ * PULSAR_REWIND_RING_DEPTH rows can still be in the ring, so only they are
+ * copied, in one copy per ring tensor (L260: a 2048-row prompt chunk riding a
+ * fused step paid four copies per row per overlap source, row by row, which
+ * left the device idle behind the host).  The slots, bytes and span are the
+ * ones a row-by-row deposit of the same run leaves.  L226:
  * the ring is per bank -- `banks.attn_proj_kv[il]` is n_banks long and
  * `layer_attn_proj_kv` is a view of the installed one -- so a fused step's rows
  * can be deposited exactly, each into its owner.  The old code skipped the whole
@@ -852,10 +858,13 @@ static void proj_ring_span_commit(pulsar_gpu_graph *g, uint32_t bank, uint32_t a
  * bank's ring EMPTY: a fused step is the served default, so no ghost rewind over
  * decoded rows could ever be covered, and each tool round invalidated the
  * checkpoint for a full-conversation rebuild (~34 s measured). */
-static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32_t t) {
-    const uint32_t bank = (uint32_t)g->ms_seq_id[t];
+static bool proj_ring_deposit_fused_run(pulsar_gpu_graph *g, uint32_t il, uint32_t t0, uint32_t n) {
+    const uint32_t bank = (uint32_t)g->ms_seq_id[t0];
     if (bank >= PULSAR_MSEQ_MAX) return true;
-    const uint32_t pos = (uint32_t)g->ms_positions[t];
+    const uint32_t pos = (uint32_t)g->ms_positions[t0];
+    const uint32_t m = n > PULSAR_REWIND_RING_DEPTH ? PULSAR_REWIND_RING_DEPTH : n;
+    const uint32_t t = t0 + (n - m);
+    const uint32_t pos_first = pos + (n - m);
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const uint32_t attn_w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
     const uint32_t idx_w = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
@@ -886,18 +895,27 @@ static bool proj_ring_deposit_fused_row(pulsar_gpu_graph *g, uint32_t il, uint32
                                          b->index_proj_bank_bytes[il]);
         }
     }
+    /* An uninstalled bank's lanes are views opened above, owned here. */
+    const bool owned = !(bank == cur || g->banks.n_banks == 0);
+    bool ok = true;
     if (!akv && !asc && !ikv && !isc) return true;      /* coff 1: no ring on this source */
-    if (!akv || !asc) return false;                     /* half a ring is an impossible state */
-    bool ok = proj_ring_copy_rows(akv, g->batch_comp_kv, arow, t, 1u, pos, arow) &&
-              proj_ring_copy_rows(asc, g->batch_comp_sc, arow, t, 1u, pos, arow);
+    if (!akv || !asc) ok = false;                       /* half a ring is an impossible state */
+    if (ok) ok = proj_ring_copy_rows(akv, g->batch_comp_kv, arow, t, m, pos_first, arow) &&
+                 proj_ring_copy_rows(asc, g->batch_comp_sc, arow, t, m, pos_first, arow);
     if (ok && ikv && isc) {
-        ok = proj_ring_copy_rows(ikv, g->batch_index_comp_kv, irow, t, 1u, pos, irow) &&
-             proj_ring_copy_rows(isc, g->batch_index_comp_sc, irow, t, 1u, pos, irow);
+        ok = proj_ring_copy_rows(ikv, g->batch_index_comp_kv, irow, t, m, pos_first, irow) &&
+             proj_ring_copy_rows(isc, g->batch_index_comp_sc, irow, t, m, pos_first, irow);
+    }
+    if (owned) {
+        pulsar_gpu_tensor_free(isc);
+        pulsar_gpu_tensor_free(ikv);
+        pulsar_gpu_tensor_free(asc);
+        pulsar_gpu_tensor_free(akv);
     }
     if (!ok) return false;
-    proj_ring_span_commit(g, bank, pos, pos + 1u);
-    g->ring_dep_rows[bank] += 1u;
-    g->ring_dep_last[bank] = pos;
+    proj_ring_span_commit(g, bank, pos_first, pos + n);
+    g->ring_dep_rows[bank] += n;
+    g->ring_dep_last[bank] = pos + n - 1u;
     g->ring_dep_hi[bank] = (bank == gpu_graph_cur_bank(g) && g->banks.n_banks != 0)
                                ? g->proj_ring_hi : g->ms_proj_ring_hi[bank];
     return true;
@@ -912,8 +930,12 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0
      * prefill case. */
     if (g->batch_multiseq) {
         if (!g->ms_seq_id || !g->ms_positions) return true;
-        for (uint32_t t = row0; t < row0 + n_rows; t++) {
-            if (!proj_ring_deposit_fused_row(g, il, t)) return false;
+        for (uint32_t t = row0; t < row0 + n_rows; ) {
+            uint32_t rl = 1;
+            while (t + rl < row0 + n_rows && g->ms_seq_id[t + rl] == g->ms_seq_id[t] &&
+                   g->ms_positions[t + rl] == g->ms_positions[t] + (int32_t)rl) rl++;
+            if (!proj_ring_deposit_fused_run(g, il, t, rl)) return false;
+            t += rl;
         }
         return true;
     }
@@ -1377,6 +1399,11 @@ bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint3
              * and the counter clamp is then the honest half, exactly as before
              * the ring existed. */
             if (gpu_graph_overlap_rewind_layer(g, il, bank, pos)) continue;
+            /* Position 0 has no committed group to carry: pass 1's reset lane IS
+             * its state, so there is nothing to replay or stash (L260: an
+             * invalidate rewinds a reused bank to 0, and the stash below would
+             * copy the dead conversation's row 0 only for invalidate to disarm it). */
+            if (pos == 0u) continue;
             /* Uncovered.  The two shapes then behave DIFFERENTLY, because only
              * one of them has a safety net:
              *   - a group BOUNDARY survives an empty carry: the emit that pools
@@ -1851,7 +1878,7 @@ uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
 
 bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
                                    const int32_t *seq, uint32_t n_rows,
-                                   bool capture_cur) {
+                                   bool capture_cur, int32_t n_dec_declared) {
     if (!g || !pos || !seq || n_rows == 0 || n_rows > g->prefill_cap) {
         fprintf(stderr, "pulsar: multiseq step rejected: bad args (n_rows=%u)\n",
                 n_rows);
@@ -1864,13 +1891,15 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
     const uint32_t n_banks = gpu_graph_bank_pool_count(g);
     /* Constraint (relaxed for the batched-decode driver): contiguous per-bank
      * runs (each bank at most one run), positions consecutive WITHIN each
-     * bank's run, and every run starting at a position > 0.  Banks may sit at
-     * unrelated positions — the multi-session shape; the upstream batch
-     * stages (RoPE q/kv/indexer-q/inverse, compressor loop, raw scatter,
-     * attention, indexer) are all per-row-position driven.  Position-0 rows
-     * stay rejected: admission (from-zero) prefill runs on the classic
-     * single-bank view path in v1, and negative positions would wrap the
-     * uint32 casts below. */
+     * bank's run.  Banks may sit at unrelated positions — the multi-session
+     * shape; the upstream batch stages (RoPE q/kv/indexer-q/inverse,
+     * compressor loop, raw scatter, attention, indexer) are all
+     * per-row-position driven.  L260 (fusion phase A): a run may START at
+     * position 0 -- a fresh bank's first prompt chunk riding a mixed step --
+     * but never as the batch's FIRST row: the layer encode keys its from-zero
+     * single-sequence arms (zero_prefix) on row 0's position, and a multiseq
+     * batch must take the per-row arms (mixed_zero_prefill_gate).  Negative
+     * positions would wrap the uint32 casts below. */
     bool bank_seen[PULSAR_MSEQ_MAX] = {false};
     int32_t prev_bank = -1;
     for (uint32_t t = 0; t < n_rows; t++) {
@@ -1888,10 +1917,11 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             }
             bank_seen[seq[t]] = true;
             prev_bank = seq[t];
-            if (pos[t] <= 0) {
-                fprintf(stderr, "pulsar: multiseq step rejected: bank %d first "
-                                "position %d <= 0 (admission prefill is "
-                                "single-bank classic)\n", seq[t], pos[t]);
+            if (pos[t] < 0 || (pos[t] == 0 && t == 0)) {
+                fprintf(stderr, "pulsar: multiseq step rejected: bank %d run starts "
+                                "at position %d as row %u (a from-zero run must "
+                                "follow at least one row of another bank)\n",
+                        seq[t], pos[t], t);
                 return false;
             }
         } else if ((int64_t)pos[t] != (int64_t)pos[t - 1] + 1) {
@@ -1907,9 +1937,9 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         /* Bound EVERY row (not just each run's first): positions are cast to
          * uint32 downstream (ring slot, visible-comp, RoPE), and the
          * position-derived arithmetic below adds 1. */
-        if (pos[t] <= 0 || pos[t] == INT32_MAX) {
+        if (pos[t] < 0 || pos[t] == INT32_MAX) {
             fprintf(stderr, "pulsar: multiseq step rejected: bank %d row %u "
-                            "position %d out of range (want 0 < pos < "
+                            "position %d out of range (want 0 <= pos < "
                             "INT32_MAX)\n", seq[t], t, pos[t]);
             return false;
         }
@@ -2045,13 +2075,19 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
      * decode by it (the caller would have to pass the count).  The setter
      * refuses a count past the cap, which the PULSAR_MSEQ_MAX static_assert
      * makes unreachable from here. */
+    /* L260: a fused step declares where its decode rows END (its verify runs
+     * are multi-row, which the inference would read as prefill); the kinds
+     * WITHIN that prefix are inferred exactly as for a decode-only step of
+     * that width, so its verify rows take the arms they take without the
+     * prefill rows behind them. */
+    const uint32_t n_kind = n_dec_declared >= 0 ? (uint32_t)n_dec_declared : n_rows;
     uint32_t n_dec = 0;
-    if (n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
-        n_dec = n_rows;
+    if (n_kind <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        n_dec = n_kind;
     } else {
-        for (uint32_t t = 0; t < n_rows; ) {
+        for (uint32_t t = 0; t < n_kind; ) {
             uint32_t rl = 1;
-            while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
+            while (t + rl < n_kind && seq[t + rl] == seq[t]) rl++;
             if (rl == 1) { n_dec++; t++; } else break;
         }
     }
@@ -2060,6 +2096,11 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         g->batch_multiseq_rows = 0;
         return false;
     }
+    /* Where the prompt runs start: the declared decode prefix ends there (its
+     * verify runs are decode rows whatever their length), an inferred one ends
+     * at the first multi-row run, and a <= MNEUTRAL step has none. */
+    g->batch_multiseq_pf_row0 = n_dec_declared >= 0 ? (uint32_t)n_dec_declared
+                              : n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX ? n_rows : n_dec;
     return true;
 }
 
@@ -2069,6 +2110,7 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     g->batch_multiseq = false;
     const uint32_t n_rows = g->batch_multiseq_rows;
     g->batch_multiseq_rows = 0;
+    g->batch_multiseq_pf_row0 = 0;
     /* Self-check (host ints only): every batched bank's frontier advanced to
      * exactly its position-derived value — (last_pos+1)/ratio — and the
      * position-derived value -- (last_pos+1)/ratio.  A miss here is the

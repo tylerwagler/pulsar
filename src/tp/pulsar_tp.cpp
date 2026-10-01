@@ -1841,11 +1841,20 @@ static void *tp_row_proxy_main(void *arg) {
     std::atomic<uint64_t> *done = tp_row_done(tp);
     uint64_t last_exch = 0, next_msg = 1;
     double idle_since = tp_now_sec();
+    /* How long to keep busy-polling after the last exchange before backing off.
+     * Decode exchanges come microseconds apart, so 2 ms covers them.  A prefill
+     * chunk's BULK exchanges come one per half-layer, ~15 ms apart on the pair
+     * (the routed MoE sits between them), so a 2 ms window put nearly every bulk
+     * exchange behind a sleeping proxy -- a usleep wake-up on the critical path
+     * of each of the chunk's 86 all-reduces (L260).  After a bulk exchange the
+     * window covers the gap to the next; the cost is one CPU core spinning while
+     * a prefill is in flight. */
+    double busy_window = 0.002;
     while (!tp->proxy_stop.load(std::memory_order_acquire)) {
         const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
         if (e == last_exch) {
-            /* busy-poll while decode is running; back off once idle */
-            if (tp_now_sec() - idle_since > 0.002) usleep(50);
+            /* busy-poll while exchanges are coming; back off once idle */
+            if (tp_now_sec() - idle_since > busy_window) usleep(50);
             continue;
         }
         if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
@@ -1868,8 +1877,10 @@ static void *tp_row_proxy_main(void *arg) {
             last_exch = e;
             done->store(e, std::memory_order_release);
             idle_since = tp_now_sec();
+            busy_window = 0.050;
             continue;
         }
+        busy_window = 0.002;
         const uint64_t first = desc[1];
         const uint32_t rows = (uint32_t)desc[2];
         if (e != last_exch + 1u || first != next_msg || rows == 0 || rows > PULSAR_TP_BATCH_MAX_ROWS) {
@@ -3683,6 +3694,29 @@ int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
     return tp_send_batch(tp, PULSAR_TP_FRAME_MIXED_BATCH, items, count, max_head_runs);
 }
 
+/* v19: header, the shape, then the rows. */
+int pulsar_tp_send_fused_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
+                               uint32_t count, const pulsar_fused_shape *shape) {
+    const uint64_t bytes64 = sizeof(pulsar_tp_batch_command_header) + sizeof(*shape) +
+                             (uint64_t)count * sizeof(*items);
+    if (!tp || !items || !shape || count == 0 || bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+    if (!payload) return 0;
+    pulsar_tp_batch_command_header h = { count, 0u };
+    memcpy(payload, &h, sizeof(h));
+    memcpy(payload + sizeof(h), shape, sizeof(*shape));
+    memcpy(payload + sizeof(h) + sizeof(*shape), items, (size_t)count * sizeof(*items));
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_FUSED_BATCH, payload, bytes);
+    free(payload);
+    return ok;
+}
+
+int pulsar_tp_send_note_prefilled(pulsar_tp *tp, uint64_t session_id,
+                                  const int *tokens, uint32_t n_tokens, int32_t head) {
+    return tp_send_token_command(tp, PULSAR_TP_FRAME_NOTE_PREFILLED, session_id, tokens, n_tokens, head);
+}
+
 
 static int tp_send_bank_value(pulsar_tp *tp, uint32_t type, uint64_t session_id, uint32_t bank) {
     pulsar_tp_value_command msg = { session_id, (int32_t)bank, 0 };
@@ -4398,6 +4432,7 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     case PULSAR_TP_FRAME_VERIFY:
     case PULSAR_TP_FRAME_REWRITE_FROM_COMMON:
     case PULSAR_TP_FRAME_NOTE_COMMITTED:
+    case PULSAR_TP_FRAME_NOTE_PREFILLED:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
         break;
     case PULSAR_TP_FRAME_SPEC_NEXT_BASE:
@@ -4608,6 +4643,23 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
          * session divergence: the worker compared session_id 0 to its own. */
         command->session_id = command->items[0].session_id;
         command->value = (int)h.head_runs;
+        break;
+    }
+    case PULSAR_TP_FRAME_FUSED_BATCH: {
+        pulsar_tp_batch_command_header h;
+        if (bytes < sizeof(h) + sizeof(command->fused)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        const uint64_t want = sizeof(h) + sizeof(command->fused) +
+                              (uint64_t)h.count * sizeof(pulsar_tp_batch_item);
+        if (h.count == 0 || want != bytes) { ok = 0; break; }
+        memcpy(&command->fused, payload + sizeof(h), sizeof(command->fused));
+        command->items = static_cast<pulsar_tp_batch_item *>(
+            malloc((size_t)h.count * sizeof(*command->items)));
+        if (!command->items) { ok = -1; break; }
+        memcpy(command->items, payload + sizeof(h) + sizeof(command->fused),
+               (size_t)h.count * sizeof(*command->items));
+        command->n_items = h.count;
+        command->session_id = command->items[0].session_id;
         break;
     }
     case PULSAR_TP_FRAME_STOP:

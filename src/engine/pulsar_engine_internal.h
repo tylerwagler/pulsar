@@ -1267,6 +1267,7 @@ typedef struct {
      * the prefill path and cleared by the drain; 0 everywhere else. */
     pulsar_gpu_tensor *dspark_bulk_h[3];  ///< per-chunk anchor hiddens, one buffer per anchor layer
     uint32_t dspark_bulk_n;               ///< tokens armed for capture this chunk; 0 = off
+    uint32_t dspark_bulk_row0;            ///< L260: first batch row the bulk capture reads (a fused step's prefill rows follow its decode rows)
     /* plan-92 P0 teacher dump (PULSAR_DISTILL_DUMP, env-once at graph alloc):
      * per-position teacher top-64 ids/logits + tail logsumexp for the chunk,
      * filled by the all-rows head sweep after the prefill layer loop and
@@ -1574,6 +1575,11 @@ typedef struct {
      * and the banked arms publish per bank instead. */
     bool batch_multiseq;
     uint32_t batch_multiseq_rows;         ///< rows in the current step
+    /** L260: the first PREFILL row of the current step -- rows below it are the
+     *  decode/verify runs, rows from it on are prompt runs (step_begin's declared
+     *  or inferred split; == batch_multiseq_rows when the step has none).  The
+     *  compressor takes its batched arm per prompt run from here. */
+    uint32_t batch_multiseq_pf_row0;
     /** Borrowed for ONE prefill: the images to merge and the tower to encode them
      * with, or NULL for the text-only path.  Set and cleared by the prefill's
      * owner (pulsar_session::sync); nothing else may leave it set. */
@@ -2375,6 +2381,13 @@ struct pulsar_session {
     uint64_t live_image_fp;
     int live_image_barrier;
     int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
+    /** L260 fusion: the last successful fused step's logits block (the caller's
+     *  buffer), its decode-row count and its headed rows -- what
+     *  pulsar_session_note_prefilled's `head` indexes.  NULL when the last fused
+     *  step failed or none ran. */
+    const float *fused_logits = nullptr;
+    uint32_t fused_n_dec = 0;
+    uint32_t fused_heads = 0;
     int prefill_frontier;                  ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
     /** A multiseq step has run and this session's per-bank state is no longer
      * re-establishable by bookkeeping alone.
@@ -2567,6 +2580,10 @@ struct pulsar_session {
     int decode_mixed(const pulsar_multiseq_req *reqs, uint32_t n_rows,
                      float *logits, int logits_cap, uint32_t *out_n_rows,
                      uint32_t max_head_runs, char *err, size_t errlen);
+    /** L260 fusion: pulsar_session_decode_fused's local body (contract in pulsar.h). */
+    int decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                     const pulsar_fused_shape *shape, float *logits, int logits_cap,
+                     uint32_t *out_n_rows, char *err, size_t errlen);
     /** Release the host-side per-bank carry (checkpoints, logits, pendings). */
     void bank_carry_free();
     /** Number of banks in the pool; 1 when the pool is disabled. */
@@ -2596,6 +2613,8 @@ struct pulsar_session {
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
     void note_committed_tokens(const int *toks, int n);
+    /** L260 fusion: pulsar_session_note_prefilled's local body. */
+    int note_prefilled(const int *toks, int n, int head);
     /** Generate with the drafter: propose a block, verify it against the target
      * in one pass, and commit the accepted prefix.
      * @param temperature   sampling temperature; 0 selects argmax
@@ -3420,9 +3439,11 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
  * prints the reason.  Disarm + self-check with gpu_graph_multiseq_step_end
  * after the layer sweep (it validates every batched bank's frontier advanced
  * to its position-derived value and the superset equals max over banks). */
+/* n_dec_declared: the step's leading decode-row count when the caller knows it
+ * (a fused step, L260); < 0 infers it from the layout as before. */
 bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
                                    const int32_t *seq, uint32_t n_rows,
-                                   bool capture_cur);
+                                   bool capture_cur, int32_t n_dec_declared);
 bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g);
 /** Tier-2 batched multi-session decode: one token per live bank through ONE
  * weight sweep (see the definition comment in imatrix.cpp for the full driver
@@ -3440,7 +3461,8 @@ int gpu_graph_decode_multiseq_batch(
         float                 *logits,
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs,
-        bool                   capture_cur);
+        bool                   capture_cur,
+        const pulsar_fused_shape *fused);   /* L260: NULL = the plain mixed contract */
 
 /** Work shape of everything the process has run through the two graph funnels:
  * gpu_graph_prefill_layer_major (one call per prefill chunk, plus the L195
@@ -3857,6 +3879,11 @@ int sample_argmax(const float *logits, uint32_t n_vocab);
 /* The identity digest of a batched step's output (engine_api.cpp): argmax
  * rows, compact rows or logits rows, whichever the step read back. */
 uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows);
+/** L260 fusion: a fused step's digest -- its decode rows as
+ *  pulsar_session_batch_digest reads them, then its `n_heads` headed rows (full
+ *  logits rows after the decode rows' block). */
+uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
+                                     uint32_t n_heads);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
     int *ids;      ///< candidate token ids

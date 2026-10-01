@@ -2112,6 +2112,13 @@ struct server {
      * ghosts).
      */
     void worker_spec_batched_quantum(session_slot **dec, int n, int quantum_tokens);
+    /** L260 fusion: queued prompts ride the spec lane's forwards when this is true
+     * (pool mode; one Spark until the pair's fused frame lands). */
+    bool fusion_enabled() const;
+    /** L260 fusion: a prompt's first fused chunk -- install its bank once, start a
+     * fresh conversation's bank at 0 (invalidate), and refuse (no_fuse) a prompt
+     * that does not extend the bank's history; leaves no bank live. */
+    bool fuse_prepare(session_slot *sl);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
      * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
      * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
@@ -2482,6 +2489,11 @@ struct gen_state {
      * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
      * once by the fused quantum on giveup; the classic path handles it correctly. */
     bool no_fuse;
+    /** L260 fusion: this prompt rides the spec lane's fused steps -- its bank was
+     * installed once and found an exact extension point (or invalidated for a fresh
+     * conversation).  A prompt that is not an extension of its bank's history is
+     * marked no_fuse instead and prefills classically. */
+    bool fuse_ready;
 
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker

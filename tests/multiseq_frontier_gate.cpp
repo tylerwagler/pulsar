@@ -164,7 +164,7 @@ static bool run_step(pulsar_session *s, const step_row *rows, uint32_t n) {
     }
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, &vec, 0, n) &&
               gpu_graph_upload_prompt_embeddings_hc(g, &g_e->model, &g_e->weights, &vec, 0, n) &&
-              gpu_graph_multiseq_step_begin(g, pos, seq, n, false);
+              gpu_graph_multiseq_step_begin(g, pos, seq, n, false, -1);
     if (ok) {
         ok = pulsar_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {

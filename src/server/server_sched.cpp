@@ -2145,6 +2145,51 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
     return 1;
 }
 
+
+/* L260 fusion: where a chunk that does NOT finish its prompt may end -- a
+ * multiple of the widest compressor group (ratio 128).  Re-chunking a prompt at
+ * such a point left its last row unchanged where an unaligned split moved it
+ * 5.5e-2 (the classic envelope fused_step_gate measures, story prompt), and an
+ * unaligned cut falls wherever the round's leftover room does -- so a prompt's
+ * chunking, and its numerics with it, would depend on the load beside it. */
+#define PULSAR_SERVER_FUSED_CHUNK_ALIGN 128
+
+/* L260 fusion: the round width up to which a chunk that does NOT finish its
+ * prompt may still add rows (see fuse_rows in the spec quantum). */
+#define PULSAR_SERVER_FUSED_CONT_ROWS 2048u
+
+static bool slot_fusable_prefill(const session_slot *c) {
+    const gen_state *g = c->gen;
+    return c->active_job && g && g->phase == GEN_PREFILL_MAIN && !g->no_fuse &&
+           g->j->req.n_images == 0 && g->prompt_for_sync;
+}
+
+bool server::fusion_enabled() const {
+    return pool_banks > 0;
+}
+
+bool server::fuse_prepare(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    pulsar_session *pool = s->sess;
+    if (!s->bank_switch(sl->bank)) {
+        snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
+                 (unsigned)sl->bank);
+        s->gen_prefill_fail(sl);
+        return false;
+    }
+    const int pos = pulsar_session_pos(pool);
+    if (pos == 0) {
+        pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
+    } else if (pulsar_session_common_prefix(pool, g->prompt_for_sync) != pos) {
+        g->no_fuse = true;                   /* needs a rewind / stitch: the classic sync owns that */
+    }
+    pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
+    s->live_bank = -1;
+    g->fuse_ready = !g->no_fuse;
+    return g->fuse_ready;
+}
+
 /* plan-34 inc 6: the SPEC batched quantum. Same skeleton as
  * worker_batched_decode_quantum, but each sweep runs one speculative ROUND
  * per bank instead of one token: per bank under its restored state we draw
@@ -2204,7 +2249,26 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
 
     int emitted_total = 0;
     const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
+    const bool fuse_on = s->fusion_enabled();
+    /* L260 fusion: the prompt rows one round carries, at most -- a classic
+     * chunk's worth (prefill_cap) less the verify rows' budget, so a fused step
+     * is never wider than a classic one.  It used to be capped at 2048, and a
+     * 4096-row chunk runs ~9% more tokens/s than a 2048-row one (pulsar-bench,
+     * one Spark: 1272 vs 1165 -- the routed experts are dequantised once per
+     * tile, whatever the chunk), so a long prompt that rode fused rounds paid
+     * that against the classic schedule.  Only chunks that FINISH their prompt
+     * take that room: they bring a first token forward and pack (one Spark,
+     * 10 x 1.8k prompts: +15% prefill t/s, TTFT max -13%).  A chunk that does
+     * not finish only makes the decode streams wait, so the rows it may add stay
+     * at PULSAR_SERVER_FUSED_CONT_ROWS (a short request beside a 61k prompt
+     * finished in 13.7 s with 4064-row continuation rounds, 9.3 s with 2048). */
+    const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool);
+    const uint32_t fuse_rows = prefill_cap > PULSAR_SPEC_ROW_BUDGET ? prefill_cap - PULSAR_SPEC_ROW_BUDGET : 0u;
+    const uint32_t cont_rows = fuse_rows < PULSAR_SERVER_FUSED_CONT_ROWS ? fuse_rows : PULSAR_SERVER_FUSED_CONT_ROWS;
+    pulsar_multiseq_req *fused_reqs = NULL;
+    int round_ix = 0;
     while (emitted_total < quantum_tokens) {
+        const bool first_round = round_ix++ == 0;
         /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
          * At <=16 total rows the shared forward's marginal row cost is
          * near-flat, so the win is ALLOCATION under the cap, not budget
@@ -2272,6 +2336,51 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             if (k_overflow) s->w_spec_overflow_rounds++;
             s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
         }
+        /* ---- L260 fusion: the queued prompts that ride this round's forward,
+         * one chunk each, up to fuse_rows prompt rows in all.  A chunk that
+         * finishes its prompt gets a head row, reserved out of the verify
+         * rows' budget below.  The decode share is the classic scheduler's
+         * (worker_decode_budget): a chunk that FINISHES its prompt rides any
+         * round, and one that does not rides only the first round of a full
+         * decode quantum, so a long prompt alternates its ~2 s chunks with a
+         * quantum of decode-only rounds instead of riding every round (one
+         * Spark, a short request beside a 61k prompt: 60 s to finish where the
+         * classic alternation took ~14 s). */
+        const bool long_ok = first_round && quantum_tokens >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS;
+        struct fused_run { session_slot *sl; int p0, k; bool fin; };
+        fused_run fr[PULSAR_SESSION_POOL_CAP];
+        int n_fr = 0, n_fin = 0;
+        uint32_t pf_rows = 0;
+        for (int k = 0; fuse_on && k < s->n_slots && n_fr < PULSAR_SESSION_POOL_CAP && pf_rows < fuse_rows; k++) {
+            session_slot *c = &s->slots[k];
+            if (!slot_fusable_prefill(c)) continue;
+            gen_state *pg = c->gen;
+            if (gen_client_disconnected(pg->j->fd)) {
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
+                snprintf(pg->err, sizeof pg->err, "client disconnected");
+                s->gen_prefill_fail(c);
+                continue;
+            }
+            if (!pg->fuse_ready && !s->fuse_prepare(c)) continue;
+            const int p0 = pulsar_session_bank_pos(pool, (uint32_t)c->bank);
+            const int left = pg->prompt_for_sync->len - p0;
+            if (left <= 0) continue;
+            int kk = left < (int)(fuse_rows - pf_rows) ? left : (int)(fuse_rows - pf_rows);
+            if (kk < left) {
+                if (!long_ok || pf_rows >= cont_rows) continue;
+                if (kk > (int)(cont_rows - pf_rows)) kk = (int)(cont_rows - pf_rows);
+                kk = (p0 + kk) / PULSAR_SERVER_FUSED_CHUNK_ALIGN * PULSAR_SERVER_FUSED_CHUNK_ALIGN - p0;
+                if (kk <= 0) continue;
+            }
+            fr[n_fr].sl = c;
+            fr[n_fr].p0 = p0;
+            fr[n_fr].k = kk;
+            fr[n_fr].fin = p0 + kk == pg->prompt_for_sync->len;
+            c->state = SLOT_PREFILLING;
+            n_fin += fr[n_fr].fin ? 1 : 0;
+            pf_rows += (uint32_t)kk;
+            n_fr++;
+        }
         /* ---- assemble: ONE call restores each bank, draws its base, begins
          * its round and lays its rows, saving it after (L260: one mirrored
          * frame for every bank, where each bank paid three verdicts). */
@@ -2320,8 +2429,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
         uint32_t rows = 0;
         if (ns > 0)
-            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, eos_token, PULSAR_SPEC_ROW_BUDGET,
-                                                     reqs, &rows);
+            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, eos_token,
+                                                     PULSAR_SPEC_ROW_BUDGET - (uint32_t)n_fin, reqs, &rows);
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -2367,17 +2476,82 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
         if (m == 0) break;
 
+        /* ---- L260 fusion: a round's BASE token was sampled from the carried
+         * logits when the round began, so the forward cannot change it; a
+         * fused forward is a prompt chunk long (~2 s at 2048 rows), so each
+         * live bank streams its base token before it rather than after.  A
+         * prompt that just finished prefill gets its first token at once
+         * instead of a chunk later (c2: TTFT min 3.3 s against the 1.6 s its
+         * own prefill took).  Round end then emits from the first draft on. */
+        bool base_sent[PULSAR_SESSION_POOL_CAP], base_stop[PULSAR_SESSION_POOL_CAP];
+        for (int q = 0; q < m; q++) {
+            base_sent[q] = base_stop[q] = false;
+            if (n_fr == 0) continue;
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            slot_writer_install(&g->writer);
+            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+            base_stop[q] = s->gen_emit_token(sl, first_tok[q]);
+            base_sent[q] = true;
+        }
+
         /* ---- ONE shared forward over every bank's rows ------------------- */
         char err[160];
         pulsar_session_spec_arm_capture(pool, rows);
         uint32_t got = 0;
-        const int rc = pulsar_session_decode_mixed(pool, reqs, rows, logits,
-                                                 (int)(rows * (uint32_t)vocab),
-                                                 &got, PULSAR_MSEQ_HEAD_ALL_ROWS,
-                                                 err, sizeof err);
+        int rc;
+        if (n_fr > 0) {
+            /* L260 fusion: the verify rows, then each riding prompt's chunk */
+            if (!fused_reqs)
+                fused_reqs = (pulsar_multiseq_req *)server_xmalloc(
+                        ((size_t)PULSAR_SPEC_LOGITS_ROWS + fuse_rows) * sizeof(*fused_reqs));
+            memcpy(fused_reqs, reqs, (size_t)rows * sizeof(*reqs));
+            pulsar_fused_shape shape;
+            memset(&shape, 0, sizeof shape);
+            shape.n_dec = rows;
+            shape.n_pf = (uint32_t)n_fr;
+            uint32_t at = rows;
+            for (int r = 0; r < n_fr; r++) {
+                const pulsar_tokens *t = fr[r].sl->gen->prompt_for_sync;
+                for (int j = 0; j < fr[r].k; j++) {
+                    fused_reqs[at].bank = (uint32_t)fr[r].sl->bank;
+                    fused_reqs[at].pos = fr[r].p0 + j;
+                    fused_reqs[at].token = t->v[fr[r].p0 + j];
+                    at++;
+                }
+                shape.head_last[r] = fr[r].fin ? 1u : 0u;
+            }
+            rc = pulsar_session_decode_fused(pool, fused_reqs, at, &shape, logits,
+                                             (int)((rows + (uint32_t)n_fin) * (uint32_t)vocab), &got,
+                                             err, sizeof err);
+            if (rc == 0 && got == rows + (uint32_t)n_fin) got = rows;   /* the verify rows' share */
+            /* Rule 5: the lane announces that it RAN, once, with its shape --
+             * otherwise only its refusals print and "it ran" rests on inference
+             * (the pair's fusion measurement, 2026-10-01). */
+            if (rc == 0) {
+                static int announced = 0;
+                if (!announced) {
+                    announced = 1;
+                    server_log(PULSAR_LOG_DEFAULT,
+                               "pulsar-server: fused step ran: %u verify rows + %u prompt rows in %d runs (%d finishing)",
+                               rows, pf_rows, n_fr, n_fin);
+                }
+            }
+            else if (rc == 0) rc = -1;
+        } else {
+            rc = pulsar_session_decode_mixed(pool, reqs, rows, logits,
+                                             (int)(rows * (uint32_t)vocab),
+                                             &got, PULSAR_MSEQ_HEAD_ALL_ROWS,
+                                             err, sizeof err);
+        }
         pulsar_session_spec_arm_capture(pool, 0u);
         s->live_bank = -1;   /* pool is multiseq-poisoned until a bank_switch */
         if (rc != 0 || got != rows) {
+            for (int r = 0; r < n_fr; r++) {
+                gen_state *pg = fr[r].sl->gen;
+                snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
+                s->gen_prefill_fail(fr[r].sl);
+            }
             for (int q = 0; q < m; q++) {
                 session_slot *sl = dec[live_idx[q]];
                 gen_state *g = sl->gen;
@@ -2390,6 +2564,37 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
             }
             break;
+        }
+
+        /* ---- L260 fusion: each riding chunk joins its bank (checkpoint +
+         * prefill frontier); a finished prompt takes its head row as the bank's
+         * next-token logits and starts its stream (the classic sync's epilogue),
+         * then decodes from the next pass. */
+        for (int r = 0, fin_row = 0; r < n_fr; r++) {
+            session_slot *c = fr[r].sl;
+            gen_state *pg = c->gen;
+            const int head = fr[r].fin ? fin_row++ : -1;
+            if (!s->bank_switch(c->bank) ||
+                pulsar_session_note_prefilled(pool, pg->prompt_for_sync->v + fr[r].p0, fr[r].k, head) != 0) {
+                snprintf(pg->err, sizeof pg->err, "bank %u: the fused prompt chunk could not be recorded",
+                         (unsigned)c->bank);
+                s->gen_prefill_fail(c);
+            } else {
+                /* L114 counter, through the per-slot watermark the classic
+                 * progress callback ticks (the two compose without recounting). */
+                if (fr[r].p0 + fr[r].k > c->prefill_counted) {
+                    s->w_prefill_chunk_tokens += (uint64_t)(fr[r].p0 + fr[r].k - c->prefill_counted);
+                    c->prefill_counted = fr[r].p0 + fr[r].k;
+                }
+                if (fr[r].fin) {
+                    slot_writer_install(&pg->writer);
+                    s->gen_stream_begin(c);
+                }
+            }
+            if (s->live_bank == (int)c->bank) {
+                pulsar_session_bank_state_save(pool, (uint32_t)c->bank);
+                s->live_bank = -1;
+            }
         }
 
         /* ---- finish every bank's round in ONE call (restore, round_end,
@@ -2441,7 +2646,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             slot_writer_install(&g->writer);
             int done = 0;
             bool stopped = false;
-            for (int t = 0; t < na; t++) {
+            int t0 = 0;
+            if (base_sent[q] && na > 0) {
+                /* streamed before the forward (above); it is accepted[0] */
+                done = t0 = 1;
+                stopped = base_stop[q];
+            }
+            for (int t = t0; !stopped && t < na; t++) {
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
                 done = t + 1;
                 if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
@@ -2550,7 +2761,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * beat into 0 / 2x-rate flapping (the pulsar-tui square wave).
          * One mutex+copy per round (~0.35 s) is host noise. */
         s->publish_metrics_snapshot();
+        /* L260 fusion: a prompt finished this round -- end the quantum so its
+         * first-token init runs at the top of the next pass and it joins the
+         * very next round. */
+        if (n_fin > 0) break;
     }
+    free(fused_reqs);
     if (emitted_total > 0) {
         const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
                                          (double)emitted_total);
@@ -2950,6 +3166,12 @@ static bool slot_steppable_beside_decode(const session_slot *c) {
 
 static bool slot_active(const session_slot *c) { return c->active_job != NULL; }
 
+/* L260 fusion: beside a spec quantum a riding prompt advances inside the
+ * quantum's forwards, so the iteration's classic step leaves it alone. */
+static bool slot_steppable_beside_fused(const session_slot *c) {
+    return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
+}
+
 void *worker_main(void *arg) {
     server *s = (server *)arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
@@ -3077,7 +3299,10 @@ void *worker_main(void *arg) {
             }
             /* inc 5: skip the slot already advanced in-band by the fused
              * quantum (pf_fuse) so it does not also run a classic chunk. */
-            session_slot *other = worker_pick_step(s, &rr, pf_fuse, slot_steppable_beside_decode);
+            session_slot *other = worker_pick_step(s, &rr, pf_fuse,
+                                                   use_spec_batched && s->fusion_enabled()
+                                                       ? slot_steppable_beside_fused
+                                                       : slot_steppable_beside_decode);
             if (other && other->gen && other->gen->phase != GEN_DONE) {
                 s->generate_job_step(other);
                 if (other->gen) slot_writer_flush(&other->gen->writer);

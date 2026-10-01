@@ -2232,7 +2232,7 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     const int ms_rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights,
                                                       ms_tok, ms_pos, ms_bank, 1u,
                                                       s->logits, NULL, 0u,
-                                                      /*capture_cur=*/true);
+                                                      /*capture_cur=*/true, NULL);
     const bool decode_ok = (ms_rc == 1);
     if (!decode_ok) {
         snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
@@ -2254,8 +2254,39 @@ void pulsar_session::note_committed_tokens(const int *toks, int n) {
 }
 
 
+int pulsar_session::note_prefilled(const int *toks, int n, int head) {
+    auto *s = this;
+    if (!toks || n <= 0) return 1;
+    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
+        fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
+                head, s->fused_logits ? s->fused_heads : 0u);
+        return 1;
+    }
+    s->note_committed_tokens(toks, n);
+    /* The checkpoint now describes exactly the bank's committed KV, as after a
+     * classic sync: it started empty (an invalidated bank) or as the valid
+     * prefix this prompt extends.  Left invalid, the bank's frontier read 0 and
+     * the next chunk restarted the prompt at position 0 over rows it had already
+     * committed ("frontier not position-true ... n_comp 61 want 0"). */
+    s->checkpoint_valid = true;
+    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
+    if (head >= 0)
+        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
+               (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
+    return 0;
+}
+
+
 void pulsar_session::invalidate() {
     auto *s = this;
+    /* L260 (fusion phase A): an invalidated bank is EMPTY on the device too --
+     * its compressed frontier at the position law for 0 and its compressor
+     * group empty -- so any lane may start it at position 0.  The classic
+     * from-zero prefill reset those itself, which left a reused bank's
+     * counters at the dead conversation's frontier until then; a from-zero
+     * run riding a mixed step was refused ("frontier not position-true ...
+     * n_comp 625 want 0", mixed_zero_prefill_gate, dirty bank). */
+    s->rewind(0);
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     pulsar_spec_drop_pendings(&s->spec);

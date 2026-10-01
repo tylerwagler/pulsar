@@ -247,6 +247,53 @@ static void dspark_bulk_dump_close(void) {
     }
 }
 
+/* L260 fusion: a fused step's prefill runs (batch rows [n_dec, n_rows), one
+ * bank each) leave their anchor hiddens in dspark_bulk_h from row 0; seed each
+ * run's bank prompt ring exactly as dspark_bulk_drain seeds the installed
+ * bank's from a classic chunk -- the last <= PULSAR_DSPARK_DRAFT_WINDOW
+ * positions at position % window, the window bounds, and an empty committed
+ * window -- writing the bank's own ring slab and per-bank counters (the
+ * installed bank's scalars too, so a later capture cannot overwrite them). */
+static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, const int32_t *bank,
+                                   uint32_t n_dec, uint32_t n_rows) {
+    if (!g->dspark_bulk_h[0] || !g->banks.dspark_prompt[0] || g->banks.n_banks == 0) return;
+    const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
+    const uint64_t row = (uint64_t)PULSAR_N_EMBD * sizeof(float);
+    const uint32_t cur = gpu_graph_cur_bank(g);
+    for (uint32_t r0 = n_dec; r0 < n_rows;) {
+        uint32_t r1 = r0 + 1;
+        while (r1 < n_rows && bank[r1] == bank[r0]) r1++;
+        const uint32_t b = (uint32_t)bank[r0];
+        const uint32_t start = (uint32_t)pos[r0], n = r1 - r0;
+        const uint32_t take = n < win ? n : win;
+        const uint32_t p0 = start + n - take;
+        for (int s2 = 0; s2 < 3; s2++) {
+            uint32_t done = 0;
+            while (done < take) {
+                const uint32_t p = p0 + done;
+                const uint32_t slot = p % win;
+                uint32_t run = win - slot;
+                if (run > take - done) run = take - done;
+                (void)pulsar_gpu_tensor_copy(g->banks.dspark_prompt[s2],
+                                             (uint64_t)b * g->banks.dspark_prompt_bank_bytes + (uint64_t)slot * row,
+                                             g->dspark_bulk_h[s2],
+                                             (uint64_t)(r0 - n_dec + (p - start)) * row,
+                                             (uint64_t)run * row);
+                done += run;
+            }
+        }
+        if (start == 0 || start != g->ms_dspark_prompt_n[b]) g->ms_dspark_prompt_lo[b] = start;
+        g->ms_dspark_prompt_n[b] = start + n;
+        for (int i2 = 0; i2 < 3; i2++) g->ms_dspark_n_raw[b][i2] = 0;
+        if (b == cur) {
+            g->dspark_prompt_lo = g->ms_dspark_prompt_lo[b];
+            g->dspark_prompt_n = g->ms_dspark_prompt_n[b];
+            for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[i2] = 0;
+        }
+        r0 = r1;
+    }
+}
+
 static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
                               uint32_t start, uint32_t n, bool ok) {
     if (!g->dspark_bulk_n) return;
@@ -1021,7 +1068,8 @@ int gpu_graph_decode_multiseq_batch(
          * bank's truth -- pulsar_session::eval, via its mseq_dirty guard. Without
          * this the per-bank slots are consulted, and a classically-prefilled
          * bank has never populated them (n_comp 0), so the step is rejected. */
-        bool                   capture_cur) {
+        bool                   capture_cur,
+        const pulsar_fused_shape *fused) {
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
      * prefill chunk rides this entry); PULSAR_MSEQ_MAX bounds only the BANK count,
      * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
@@ -1070,9 +1118,35 @@ int gpu_graph_decode_multiseq_batch(
     }
     free(cur_tokens);   /* uploaded to device; host copy is dead */
 
+    /* L260 fusion: a fused step's layout -- n_dec decode / verify rows, then
+     * fused->n_pf prefill runs -- is the caller's; refuse a shape that does not
+     * match the rows before anything is armed (recoverable). */
+    uint32_t fused_heads = 0;
+    if (fused) {
+        uint32_t runs = 0;
+        for (uint32_t t = fused->n_dec; t < n_active; t++)
+            if (t == fused->n_dec || bank[t] != bank[t - 1]) runs++;
+        for (uint32_t r = 0; r < fused->n_pf && r < PULSAR_MSEQ_MAX; r++) fused_heads += fused->head_last[r] ? 1u : 0u;
+        if (fused->n_dec == 0 || fused->n_dec >= n_active || fused->n_pf == 0 || fused->n_pf > PULSAR_MSEQ_MAX ||
+            runs != fused->n_pf || fused->n_dec > PULSAR_SPEC_ROW_BUDGET ||
+            fused->n_dec + fused_heads > PULSAR_SPEC_LOGITS_ROWS) {
+            fprintf(stderr, "pulsar: fused step rejected: shape (n_dec %u, %u prefill runs, %u headed) does not "
+                            "fit %u rows holding %u prefill runs (decode rows <= %u, headed rows <= %u)\n",
+                    fused->n_dec, fused->n_pf, fused_heads, n_active, runs,
+                    (unsigned)PULSAR_SPEC_ROW_BUDGET, (unsigned)PULSAR_SPEC_LOGITS_ROWS);
+            return 0;
+        }
+    }
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
-    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur)) return 0;
+    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur,
+                                       fused ? (int32_t)fused->n_dec : -1)) return 0;
+    /* A fused step's prefill rows feed their banks' drafter prompt rings, as a
+     * classic chunk does: arm the bulk anchor capture past the decode rows. */
+    if (fused && g->dspark_bulk_h[0]) {
+        g->dspark_bulk_n = n_active - fused->n_dec;
+        g->dspark_bulk_row0 = fused->n_dec;
+    }
 
     /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
      * A K-row prefill run advances the KV by K but only its last row's logits
@@ -1108,12 +1182,32 @@ int gpu_graph_decode_multiseq_batch(
      * This is by construction the single-block identity path over the whole
      * batch (rows [0, n_active) head in place, no last-of-run gather), which
      * is what the batched speculative verify's accept walk consumes. */
-    const bool head_all_rows = (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS);
-    uint32_t head_runs = head_all_rows ? n_active
+    const bool head_all_rows = fused || (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS);
+    uint32_t head_runs = fused ? fused->n_dec + fused_heads
+                       : head_all_rows ? n_active
                        : (max_head_runs == 0u || max_head_runs > n_runs)
                        ? n_runs : max_head_runs;
+    /* head_src[k]: the batch row headed into logits row k.  A fused step heads
+     * its decode rows in place and gathers each headed prefill run's last row
+     * behind them (L260); otherwise the identity, or each run's last row. */
+    int head_src[PULSAR_SPEC_LOGITS_ROWS];
+    if (fused) {
+        uint32_t k = 0;
+        for (; k < fused->n_dec; k++) head_src[k] = (int)k;
+        uint32_t r = 0;
+        for (uint32_t t = fused->n_dec; t < n_active; t++) {
+            if (t + 1 == n_active || bank[t + 1] != bank[t]) {
+                if (fused->head_last[r]) head_src[k++] = (int)t;
+                r++;
+            }
+        }
+    } else if (!head_all_rows) {
+        for (uint32_t r = 0; r < head_runs && r < PULSAR_SPEC_LOGITS_ROWS; r++) head_src[r] = last_idx[r];
+    }
     bool head_single_block = true;
-    if (!head_all_rows)
+    if (fused)
+        head_single_block = fused_heads == 0;
+    else if (!head_all_rows)
         for (uint32_t r = 0; r < head_runs; r++)
             if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
@@ -1146,14 +1240,14 @@ int gpu_graph_decode_multiseq_batch(
         const uint64_t hc_row_bytes = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;   /* carrier */
         const uint64_t pre_row_bytes = (uint64_t)PULSAR_N_HC * sizeof(float);
         for (uint32_t r = 0; ok && r < head_runs; r++) {
-            if ((uint32_t)last_idx[r] == r) continue;
+            if ((uint32_t)head_src[r] == r) continue;
             /* the row's pre moves with it: the head collapses row r with the
              * pre row r's last FFN handed on */
             ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
-                                     g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
+                                     g->batch_cur_hc, (uint64_t)head_src[r] * hc_row_bytes,
                                      hc_row_bytes) != 0 &&
                  pulsar_gpu_tensor_copy(g->batch_hc_pre, (uint64_t)r * pre_row_bytes,
-                                     g->batch_hc_pre, (uint64_t)last_idx[r] * pre_row_bytes,
+                                     g->batch_hc_pre, (uint64_t)head_src[r] * pre_row_bytes,
                                      pre_row_bytes) != 0;
         }
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
@@ -1165,12 +1259,22 @@ int gpu_graph_decode_multiseq_batch(
      * step_end check covers EVERY bank (incl. a prefill run whose head we skipped),
      * so a skipped-head run's KV frontier is still validated. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
+    if (fused) {
+        if (ok && end_ok) dspark_bulk_drain_runs(g, pos, bank, fused->n_dec, n_active);
+        g->dspark_bulk_n = 0;
+        g->dspark_bulk_row0 = 0;
+    }
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
+    /* The decode / verify rows read back like PULSAR_MSEQ_HEAD_ALL_ROWS; a
+     * fused step's headed prefill rows always come back whole (the sampler
+     * draws the prompt's first token from them), after the decode rows. */
+    const uint32_t fused_read_dec = fused ? fused->n_dec : 0u;
 
     /* Logits readback: head_runs rows (one per emitted run, in run order = ascending
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
+    if (fused) head_runs = fused_read_dec;
     if (head_all_rows && g->spec_argmax_armed) {
         /* L219: every round in this step is greedy, so the walk consults only
          * each row's argmax.  Run the per-row argmax on device (the same
@@ -1206,6 +1310,10 @@ int gpu_graph_decode_multiseq_batch(
         ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
                                  (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok && fused && fused_heads > 0)
+        ok = pulsar_gpu_tensor_read(g->spec_logits, (uint64_t)fused->n_dec * PULSAR_N_VOCAB * sizeof(float),
+                                    logits + (size_t)fused->n_dec * PULSAR_N_VOCAB,
+                                    (uint64_t)fused_heads * PULSAR_N_VOCAB * sizeof(float)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as

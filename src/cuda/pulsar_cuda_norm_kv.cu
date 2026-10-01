@@ -262,7 +262,10 @@ __global__ static void rope_tail_kernel(
          * only.  See pulsar_cuda_attn_f16.cu's epilogue for the other half. */
         __nv_fp8_e4m3 * __restrict__ gact_data,
         unsigned char * __restrict__ gact_scale,
-        int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {
+        int gact_kbp, uint32_t gact_slab, uint32_t n_groups,
+        /* this launch's first row in the slab, and the slab's row count (L260:
+         * a mixed step ropes only the rows past its decode rows) */
+        uint32_t gact_tok0, uint32_t gact_ntok) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     /* pairs is a multiple of n_rot/2 (32 here), so this exit takes WHOLE warps
@@ -303,13 +306,14 @@ __global__ static void rope_tail_kernel(
         const uint32_t gd  = hpg * head_dim;            /* == group_dim */
         const uint32_t grp = h / hpg, hh = h % hpg;
         const uint32_t d0  = n_nope + i;                /* absolute head dim */
-        __nv_fp8_e4m3 *dst = gact_data + ((size_t)grp * n_tok + t) * gd + hh * head_dim;
+        const uint32_t arow = gact_tok0 + t;            /* slab row */
+        __nv_fp8_e4m3 *dst = gact_data + ((size_t)grp * gact_ntok + arow) * gd + hh * head_dim;
         dst[d0]      = pulsar_mx_encode(q0, se);
         dst[d0 + 1u] = pulsar_mx_encode(q1, se);
         if ((lane & 15u) == 0u) {
             const uint32_t kb = hh * (head_dim / 32u) + (d0 / 32u);
             gact_scale[(size_t)grp * gact_slab +
-                       pulsar_mx_sfoff((int)t, (int)kb, gact_kbp)] = pulsar_mx_scale_byte(se);
+                       pulsar_mx_sfoff((int)arow, (int)kb, gact_kbp)] = pulsar_mx_scale_byte(se);
         }
     }
 }
@@ -1021,8 +1025,13 @@ int pulsar_gpu_indexer_compressor_update_tensor(
 
 
 int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions,
-        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups,
+        uint32_t gact_tok0, uint32_t gact_ntok) {
     if (!x || n_rot > head_dim || (n_rot & 1)) return 0;
+    if (gact_data && gact_tok0 + n_tok > gact_ntok) {
+        fprintf(stderr, "pulsar: rope_tail MX rows %u+%u exceed the %u-row slab\n", gact_tok0, n_tok, gact_ntok);
+        return 0;
+    }
     /* Derived from the buffer, never passed in -- the same rule its f16-aware
      * twin (0731's head_rms_norm_rope_tail) stated, for the same reason: passing
      * the width is how decode came to hand an f16 Q to the f32 kernel.
@@ -1051,10 +1060,12 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     if (esz == sizeof(float))
         rope_tail_kernel<float><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
-                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups);
+                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups,
+                gact_tok0, gact_ntok);
     else
         rope_tail_kernel<__nv_bfloat16><<<(pairs + 255) / 256, 256>>>((__nv_bfloat16 *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
-                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups);
+                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups,
+                gact_tok0, gact_ntok);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 
@@ -1161,7 +1172,7 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_t
 int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
     return pulsar_gpu_rope_tail_mx_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
                                           freq_base, freq_scale, ext_factor, attn_factor,
-                                          beta_fast, beta_slow, positions, NULL, NULL, 0, 0u, 0u);
+                                          beta_fast, beta_slow, positions, NULL, NULL, 0, 0u, 0u, 0u, 0u);
 }
 
 
@@ -1182,7 +1193,7 @@ int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, u
     const uint32_t pairs = n_rows * (n_rot / 2);
     rope_tail_kernel<float><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_rows, 1u, head_dim, n_rot, pos0, pos_stride,
                                                           n_ctx_orig, 0, freq_base, freq_scale, ext_factor, attn_factor,
-                                                          beta_fast, beta_slow, NULL, NULL, NULL, 0, 0u, 0u);
+                                                          beta_fast, beta_slow, NULL, NULL, NULL, 0, 0u, 0u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "strided rope tail launch");
 }
 

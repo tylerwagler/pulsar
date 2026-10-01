@@ -522,6 +522,37 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         return -1;
     }
 
+    case PULSAR_TP_FRAME_FUSED_BATCH: {
+        int rc = 1;
+        float *logits = NULL;
+        uint32_t out_rows = 0;
+        const pulsar_fused_shape *shape = &c->fused;
+        if (!worker_refused(e, c, "fused batch", &slot, ferr, sizeof(ferr))) {
+            pulsar_multiseq_req *rows = (pulsar_multiseq_req *)xmalloc((size_t)c->n_items * sizeof(*rows));
+            worker_rows(c, rows);
+            /* The block holds the decode rows and the headed runs, not every
+             * row: a prompt chunk's rows are not headed. */
+            uint32_t heads = 0;
+            for (uint32_t r = 0; r < shape->n_pf && r < (uint32_t)sizeof(shape->head_last); r++)
+                heads += shape->head_last[r] ? 1u : 0u;
+            int cap = 0;
+            logits = worker_logits(e, slot, shape->n_dec + heads, &cap);
+            rc = slot->s->decode_fused(rows, c->n_items, shape, logits, cap, &out_rows, ferr, sizeof(ferr));
+            free(rows);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "pulsar: tp worker: fused batch refused: %s\n", ferr);
+            worker_abort_step(e, "fused batch", ferr);
+            return worker_ack(e, c->session_id, rc, err, errlen);
+        }
+        if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
+                                              pulsar_session_fused_digest(slot->s, logits, shape->n_dec,
+                                                                          out_rows - shape->n_dec)) != 0)
+            return 1;
+        snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
+        return -1;
+    }
+
     case PULSAR_TP_FRAME_REWIND:
     case PULSAR_TP_FRAME_INVALIDATE: {
         const char *op = c->type == PULSAR_TP_FRAME_REWIND ? "rewind" : "invalidate";
@@ -604,6 +635,16 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         }
         slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
         return 1;
+
+    case PULSAR_TP_FRAME_NOTE_PREFILLED: {
+        int status = -1;
+        if (!worker_refused(e, c, "note prefilled", &slot, ferr, sizeof(ferr))) {
+            status = slot->s->note_prefilled(c->tokens, (int)c->n_tokens, c->value) != 0 ? 1 : 0;
+        } else {
+            fprintf(stderr, "pulsar: tp worker: note prefilled refused: %s\n", ferr);
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
 
     case PULSAR_TP_FRAME_SET_LOGITS: {
         int status = -1;

@@ -599,10 +599,12 @@ __global__ static void mxfp8_decode_act_kernel(const __nv_fp8_e4m3 *data, const 
 template <typename T>
 __global__ static void mxfp8_quant_act_grouped_kernel(const T *X, int n_tokens, int n_groups,
                                                       int K, int KBp, __nv_fp8_e4m3 *data,
-                                                      unsigned char *scale, size_t scale_slab) {
+                                                      unsigned char *scale, size_t scale_slab,
+                                                      int row0, int n_rows) {
+    /* rows [row0, row0 + n_rows) of the n_tokens-row slab (L260) */
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
-    int KB = K / 32; if (warp >= n_tokens * n_groups * KB) return;
-    int row = warp / KB, kb = warp % KB;  ///< row = tok * n_groups + g
+    int KB = K / 32; if (warp >= n_rows * n_groups * KB) return;
+    int row = warp / KB + row0 * n_groups, kb = warp % KB;  ///< row = tok * n_groups + g
     int g = row % n_groups, tok = row / n_groups;
     float v = (float)X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
@@ -1501,10 +1503,28 @@ int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_
     const int warps = (int)n_tokens * (int)n_groups * (int)(group_dim / 32);
     mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
             (const pulsar_heads_t *)heads->ptr, (int)n_tokens, (int)n_groups, (int)group_dim, kbp,
-            (__nv_fp8_e4m3 *)q, (unsigned char *)sf, (size_t)slab);
+            (__nv_fp8_e4m3 *)q, (unsigned char *)sf, (size_t)slab, 0, (int)n_tokens);
     if (!cuda_ok(cudaGetLastError(), "gact emit heads")) return 0;
     pulsar_gpu_mxfp8_gact_note();
     return 1;
+}
+
+int pulsar_gpu_mxfp8_gact_emit_heads_rows(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                                          uint32_t row0, uint32_t n_rows,
+                                          uint32_t n_groups, uint64_t group_dim) {
+    if (n_rows == 0) return 1;
+    if (!heads || !heads->ptr || row0 + n_rows > n_tokens || !g_gact.xq || !g_gact.sx ||
+        g_gact.key_ptr != heads->ptr || g_gact.key_ntok != n_tokens ||
+        g_gact.key_ngroups != n_groups || g_gact.key_gdim != group_dim) {
+        fprintf(stderr, "pulsar: gact emit rows %u+%u of %u: no grouped slot armed for these heads -- refusing\n",
+                row0, n_rows, n_tokens);
+        return 0;
+    }
+    const int warps = (int)n_rows * (int)n_groups * (int)(group_dim / 32);
+    mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
+            (const pulsar_heads_t *)heads->ptr, (int)n_tokens, (int)n_groups, (int)group_dim, g_gact.kbp,
+            g_gact.xq, g_gact.sx, g_gact.scale_slab, (int)row0, (int)n_rows);
+    return cuda_ok(cudaGetLastError(), "gact emit heads rows");
 }
 
 /* Declare the E4M3 encoding current (producer filled the slots above). */

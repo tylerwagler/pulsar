@@ -222,6 +222,27 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed_batch", err, sizeof(err)),
               "leader mixed_batch ack: %s", err);
 
+        /* v19 (L260 fusion): the fused step -- the same rows behind its shape --
+         * and the record of a chunk it prefilled, whose head index rides the
+         * token header's value (-1 = an intermediate chunk). */
+        pulsar_tp_batch_item f[3] = { {3001, 1, 50, 81, 0}, {3001, 2, 0, 82, 0}, {3001, 2, 1, 83, 0} };
+        pulsar_fused_shape shape;
+        std::memset(&shape, 0, sizeof shape);
+        shape.n_dec = 1;
+        shape.n_pf = 1;
+        shape.head_last[0] = 1;
+        CHECK(pulsar_tp_send_fused_batch(tp, f, 3, &shape) == 1, "leader send_fused_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "fused_batch", err, sizeof(err)),
+              "leader fused_batch ack: %s", err);
+        const int chunk[2] = { 82, 83 };
+        CHECK(pulsar_tp_send_note_prefilled(tp, 3001, chunk, 2, 0) == 1, "leader send_note_prefilled");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "note_prefilled", err, sizeof(err)),
+              "leader note_prefilled ack: %s", err);
+        CHECK(pulsar_tp_send_note_prefilled(tp, 3001, chunk, 2, -1) == 1,
+              "leader send_note_prefilled (intermediate)");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "note_prefilled", err, sizeof(err)),
+              "leader note_prefilled (intermediate) ack: %s", err);
+
         const int drafts[3] = { 7, 8, 9 };
         CHECK(pulsar_tp_send_verify(tp, sid, drafts, 3) == 1,
               "leader send_verify");
@@ -269,6 +290,29 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         pulsar_tp_command_free(&cmd);
         CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
               "worker mixed_batch ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv fused_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_FUSED_BATCH, "worker fused_batch type %d", (int)cmd.type);
+        CHECK(cmd.n_items == 3 && cmd.session_id == 3001 && cmd.fused.n_dec == 1 &&
+              cmd.fused.n_pf == 1 && cmd.fused.head_last[0] == 1 && cmd.fused.head_last[1] == 0,
+              "worker fused_batch shape");
+        CHECK(cmd.items && cmd.items[0].bank == 1 && cmd.items[0].pos == 50 && cmd.items[0].token == 81 &&
+              cmd.items[2].bank == 2 && cmd.items[2].pos == 1 && cmd.items[2].token == 83,
+              "worker fused_batch rows");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker fused_batch ack");
+
+        for (int want_head = 0; want_head >= -1; want_head--) {
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "worker recv note_prefilled: %s", err);
+            CHECK(cmd.type == PULSAR_TP_FRAME_NOTE_PREFILLED && cmd.session_id == 3001 &&
+                  cmd.n_tokens == 2 && cmd.tokens && cmd.tokens[0] == 82 && cmd.tokens[1] == 83 &&
+                  cmd.value == want_head,
+                  "worker note_prefilled payload (head %d, got %d)", want_head, cmd.value);
+            pulsar_tp_command_free(&cmd);
+            CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker note_prefilled ack");
+        }
 
         CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
               "worker recv verify: %s", err);

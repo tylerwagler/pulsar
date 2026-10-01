@@ -209,7 +209,9 @@ static int attention_decode_batch_launch(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        const pulsar_gpu_q_prep *q_prep) {
+        const pulsar_gpu_q_prep *q_prep,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope) {
     /* Descriptor (banked) mode: both per-row arrays or neither; the KV
      * operands are whole bank pools, so byte bounds scale by n_banks and the
      * uint32 row ABI (seq*cap + local) must not overflow.  The scalar
@@ -340,7 +342,8 @@ static int attention_decode_batch_launch(
             0u, window, ratio, n_head, head_dim,
             (const int *)positions_ptr, (const int *)seq_id_ptr,
             comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, non_causal, q_prep,
-            NULL, NULL /* decode rows carry no image-span visibility */))
+            NULL, NULL /* decode rows carry no image-span visibility */,
+            gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope, 0u, n_tokens))
         return 1;
     fprintf(stderr, "pulsar: fp16 decode attention FAILED (n_tokens=%u n_head=%u "
                     "n_comp=%u non_causal=%u); refusing to fall through\n",
@@ -382,7 +385,7 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim,
                                       positions, seq_id, NULL /* raw path: no comp */, comp_cap, n_banks,
-                                      q_prep);
+                                      q_prep, NULL, NULL, 0, 0u, 0u, 0u);
 }
 
 int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -410,12 +413,46 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks,
         const pulsar_gpu_q_prep *q_prep) {
+    return pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(heads, model_map, model_size, sinks_offset,
+                                      q, raw_kv, comp_kv, n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                      n_comp, window, ratio, n_head, head_dim, non_causal,
+                                      positions, seq_id, comp_bank_ptrs, comp_cap, n_banks,
+                                      q_prep, NULL, NULL, 0, 0u, 0u, 0u);
+}
+
+int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
+        pulsar_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                non_causal,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
+        uint32_t                comp_cap,
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim,
                                       positions, seq_id, comp_bank_ptrs, comp_cap, n_banks,
-                                      q_prep);
+                                      q_prep, gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope);
 }
 
 int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -446,6 +483,42 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left,
         const pulsar_gpu_tensor *vis_right) {
+    return pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(heads, model_map, model_size, sinks_offset,
+            q, raw_kv, comp_kv, topk, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window,
+            ratio, n_head, head_dim, positions, seq_id, comp_bank_ptrs, comp_cap, n_banks, q_prep,
+            vis_left, vis_right, NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
+}
+
+int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
+        pulsar_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
+        uint32_t                comp_cap,
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
      * per-bank ring capacity, rejections fail-loud).  Banked rows take the same
@@ -595,7 +668,8 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
             raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
             (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
             comp_cap, descr ? n_banks : 1u, 0u /* causal */, q_prep,
-            vis_left_ptr, vis_right_ptr))
+            vis_left_ptr, vis_right_ptr,
+            gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope, gact_tok0, gact_ntok))
         return 1;
     fprintf(stderr, "pulsar: fp16 indexed attention FAILED (n_tokens=%u n_head=%u n_comp=%u "
                     "top_k=%u); refusing to fall through\n", n_tokens, n_head, n_comp, top_k);

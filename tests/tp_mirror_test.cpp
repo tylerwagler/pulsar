@@ -20,7 +20,7 @@
  * a graph -- no model, no weights, no GPU work -- and the assertions are the
  * plumbing that matters:
  *
- *   A. sync / eval / batched decode / mixed step for an unknown session
+ *   A. sync / eval / batched decode / mixed / fused step for an unknown session
  *      -> refused by name, and the refusal ACKED so the leader reads it at once;
  *      the verdict frames (bank restore, fork) answer a NEGATIVE status that
  *      the verdict collector reads as a refusal, never as a result
@@ -162,6 +162,20 @@ static int run_leader(pulsar_tp *tp) {
           std::strstr(err, "mixed batch failed") != NULL,
           "the leader must read the worker's mixed refusal: %s", err);
 
+    /* v19 (L260 fusion): the fused step, acked like the mixed step. */
+    {
+        pulsar_fused_shape shape;
+        std::memset(&shape, 0, sizeof shape);
+        shape.n_dec = 1;
+        shape.n_pf = 1;
+        shape.head_last[0] = 1;
+        CHECK(pulsar_tp_send_fused_batch(tp, items, 2, &shape) != 0, "send_fused_batch must report success as nonzero");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_ack(tp, SID, "fused batch", err, sizeof(err)) &&
+              std::strstr(err, "fused batch failed") != NULL,
+              "the leader must read the worker's fused refusal: %s", err);
+    }
+
     /* A'. The verdict frames for an unknown session: the worker answers a
      * NEGATIVE status and the verdict collector reads it as a refusal. */
     {
@@ -183,6 +197,11 @@ static int run_leader(pulsar_tp *tp) {
               std::strstr(err, "refused") != NULL,
               "an unknown-session rewrite must come back as a refusal: %s", err);
         const float lg[4] = { 0.f, 1.f, 2.f, 3.f };
+        CHECK(pulsar_tp_send_note_prefilled(tp, SID, t3, 3u, 0) != 0, "send_note_prefilled must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "note prefilled", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session note-prefilled must come back as a refusal: %s", err);
         CHECK(pulsar_tp_send_set_logits(tp, SID, lg, 4u) != 0, "send_set_logits must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "set logits", &status, err, sizeof(err)) &&

@@ -243,6 +243,7 @@ static bool gpu_graph_index_comp_prefill(
         uint32_t                    il,
         bool                        banked,
         uint32_t                    bank,
+        uint32_t                    row0,      /* the run's first BATCH ROW */
         uint32_t                    n_tokens,
         uint32_t                    out_row0,
         uint32_t                    pos0,
@@ -253,9 +254,9 @@ static bool gpu_graph_index_comp_prefill(
         float                       attn_factor) {
     const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
     const uint32_t n_groups = n_tokens / ratio;
-    pulsar_gpu_tensor *kv = pulsar_gpu_tensor_view(g->batch_index_comp_kv, 0,
+    pulsar_gpu_tensor *kv = pulsar_gpu_tensor_view(g->batch_index_comp_kv, (uint64_t)row0 * width * sizeof(float),
                                                    (uint64_t)n_tokens * width * sizeof(float));
-    pulsar_gpu_tensor *sc = pulsar_gpu_tensor_view(g->batch_index_comp_sc, 0,
+    pulsar_gpu_tensor *sc = pulsar_gpu_tensor_view(g->batch_index_comp_sc, (uint64_t)row0 * width * sizeof(float),
                                                    (uint64_t)n_tokens * width * sizeof(float));
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
                                                        (uint64_t)n_groups * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -397,11 +398,13 @@ static bool gpu_graph_comp_ape_fold(
 
 /* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
  * hold the kv / score projections of every row) and emit what completes.
- * Three arms, all bit-equivalent by construction:
- *   - aligned run: pos0 on a group boundary, one bank -- one batched pool over
- *     the whole run, the trailing partial group left in the state;
- *   - per row: anything else (an unaligned start finishing a pending group, or
- *     a multiseq step mixing banks) -- store each row, emit at each boundary.
+ * Two arms, bit-equivalent by construction:
+ *   - batched: a run of one bank starting on a group boundary -- one pool over
+ *     the run, the trailing partial group left in the state;
+ *   - per row: store each row, emit at each boundary.
+ * A single-bank aligned batch is one batched run; a mixed multiseq step runs its
+ * decode/verify rows per row and each prompt run per row up to its first group
+ * boundary, batched from there.
  * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
  * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
 static bool gpu_graph_csa2_produce(
@@ -462,11 +465,11 @@ static bool gpu_graph_csa2_produce(
                 return false;
         }
     }
-    const uint32_t run_bank = mseq ? (uint32_t)g->ms_seq_id[0] : gpu_graph_cur_bank(g);
-    const bool one_bank = !mseq || (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank;
-    const bool aligned = one_bank && (pos0 % ratio) == 0u;
-    bool ok = true;
-    if (aligned) {
+    /* The batched arm over batch rows [row0, row0 + n) of ONE bank at the
+     * positions rpos0 .. rpos0 + n - 1, rpos0 on a group boundary: one pool over
+     * the run, the trailing partial group left in the state. */
+    auto batched_run = [&](uint32_t row0, uint32_t run_bank, uint32_t rpos0, uint32_t n) -> bool {
+        bool ok = true;
         /* Banked state lanes are OWNED views and must be freed; the single-
          * session ones are borrowed. */
         pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
@@ -481,12 +484,12 @@ static bool gpu_graph_csa2_produce(
             }
         }
         const uint32_t before = g->ms_n_comp[run_bank][il];
-        const uint32_t n_groups = n_tokens / ratio;
+        const uint32_t n_groups = n / ratio;
         /* a run starting on a group boundary rebuilds the state from scratch */
         g->ms_comp_state_stale[run_bank] = false;
-        if (ok && before != pos0 / ratio) {
+        if (ok && before != rpos0 / ratio) {
             fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
-                    il, run_bank, before, pos0, ratio);
+                    il, run_bank, before, rpos0, ratio);
             ok = false;
         }
         if (ok && n_groups > g->attn_comp_stage_cap) {
@@ -494,21 +497,29 @@ static bool gpu_graph_csa2_produce(
                     il, n_groups, g->attn_comp_stage_cap);
             ok = false;
         }
-        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, g->batch_comp_sc, comp_width, ratio, pos0, n_tokens);
-        if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, g->batch_comp_kv, g->batch_comp_sc,
+        const uint64_t row_bytes = (uint64_t)comp_width * sizeof(float);
+        pulsar_gpu_tensor *kv = pulsar_gpu_tensor_view(g->batch_comp_kv, row0 * row_bytes, n * row_bytes);
+        pulsar_gpu_tensor *sc = pulsar_gpu_tensor_view(g->batch_comp_sc, row0 * row_bytes, n * row_bytes);
+        if (ok && (!kv || !sc)) {
+            fprintf(stderr, "pulsar: kv source %u: batch rows %u+%u are outside the projection batch -- refusing\n",
+                    il, row0, n);
+            ok = false;
+        }
+        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc, comp_width, ratio, rpos0, n);
+        if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, kv, sc,
                                                                st_kv, st_sc, tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                                layer->attn_compressor_norm->abs_offset,
                                                                layer->attn_compressor_norm->type,
-                                                               PULSAR_N_HEAD_DIM, ratio, pos0, n_tokens,
+                                                               PULSAR_N_HEAD_DIM, ratio, rpos0, n,
                                                                PULSAR_RMS_EPS) != 0;
         /* The indexer's own compression, before emit_rows: it needs this batch's
          * index projections and writes the index pool emit_rows would otherwise
          * fill from the latent -- and unlike the comp row it has no latent of its
          * own to hand over, so it must run here rather than inside that call. */
         if (ok && own_index) ok = gpu_graph_index_comp_prefill(g, model, layer, il, mseq, run_bank,
-                                                               n_tokens, before, pos0,
+                                                               row0, n, before, rpos0,
                                                                ratio, freq_base, freq_scale, ext_factor, attn_factor);
-        if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, pos0, ratio);
+        if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, rpos0, ratio);
         /* plan-33 inc C: the partial-fork boundary row -- byte-restore it over
          * whatever the emit just recomputed.  Both lanes: one emit writes the
          * comp row and (V4.1) the index-K row, and V4's own index compressor
@@ -517,101 +528,132 @@ static bool gpu_graph_csa2_produce(
         if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, true);
         /* L120 value half: the rows both stores just consumed go into the ring,
          * which is what a later rewind replays to rebuild the overlap's carry. */
-        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos0, 0u, n_tokens);
+        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, rpos0, row0, n);
         if (ok) {
             gpu_graph_set_n_comp(g, run_bank, il, before + n_groups);
-            for (uint32_t t = 0; t < n_tokens; t++) comp_counts[t] = (pos0 + t + 1u) / ratio;
+            for (uint32_t t = 0; t < n; t++) comp_counts[row0 + t] = (rpos0 + t + 1u) / ratio;
             if (has_state) {
                 const uint64_t lane_floats = (uint64_t)pulsar_comp_state_rows(ratio) * comp_width;
-                gpu_graph_debug_dump_tensor("attn_state_kv", st_kv, lane_floats, il, pos0);
-                gpu_graph_debug_dump_tensor("attn_state_score", st_sc, lane_floats, il, pos0);
+                gpu_graph_debug_dump_tensor("attn_state_kv", st_kv, lane_floats, il, rpos0);
+                gpu_graph_debug_dump_tensor("attn_state_score", st_sc, lane_floats, il, rpos0);
             }
         }
+        pulsar_gpu_tensor_free(sc);
+        pulsar_gpu_tensor_free(kv);
         if (mseq) {
             pulsar_gpu_tensor_free(st_sc);
             pulsar_gpu_tensor_free(st_kv);
         }
         return ok;
-    }
-    /* Per-row: row t belongs to bank ms_seq_id[t] at position ms_positions[t]
-     * (or to the current bank at pos0 + t); the store lands in THAT bank's
-     * pending slot and an emit lands at ITS frontier.  Per-bank groups are
-     * independent, and the shared staging row is safe across banks because
-     * each emit packs it before the next row's kernels run on the stream. */
-    for (uint32_t t = 0; ok && t < n_tokens; t++) {
-        const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
-        const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : gpu_graph_cur_bank(g);
-        const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
-        pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
-        pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
-        pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
-        if (has_state) {
-            st_kv = mseq ? gpu_graph_bank_attn_state_kv_view(g, il, bank) : g->layer_attn_state_kv[il];
-            st_sc = mseq ? gpu_graph_bank_attn_state_score_view(g, il, bank) : g->layer_attn_state_score[il];
-        }
-        pulsar_gpu_tensor *latent_row = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
-                                                               (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-        int emitted = 0;
-        if (has_state) {
-            /* A stale pending group (rewound mid-group past the verify saves)
-             * can only be joined at a group boundary; a store elsewhere would
-             * pool a wrong token in. */
-            if (pos % ratio == 0u) g->ms_comp_state_stale[bank] = false;
-            else if (g->ms_comp_state_stale[bank]) {
-                fprintf(stderr, "pulsar: kv source %u bank %u: store at %u would extend a stale pending group -- refusing\n",
-                        il, bank, pos);
+    };
+    /* Per-row over batch rows [t0, t1): row t belongs to bank ms_seq_id[t] at
+     * position ms_positions[t] (or to the current bank at pos0 + t); the store
+     * lands in THAT bank's pending slot and an emit lands at ITS frontier.
+     * Per-bank groups are independent, and the shared staging row is safe
+     * across banks because each emit packs it before the next row's kernels
+     * run on the stream. */
+    auto per_row = [&](uint32_t t0, uint32_t t1) -> bool {
+        bool ok = true;
+        for (uint32_t t = t0; ok && t < t1; t++) {
+            const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
+            const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : gpu_graph_cur_bank(g);
+            const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
+            pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
+            pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
+            pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
+            if (has_state) {
+                st_kv = mseq ? gpu_graph_bank_attn_state_kv_view(g, il, bank) : g->layer_attn_state_kv[il];
+                st_sc = mseq ? gpu_graph_bank_attn_state_score_view(g, il, bank) : g->layer_attn_state_score[il];
+            }
+            pulsar_gpu_tensor *latent_row = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
+                                                                   (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
+            int emitted = 0;
+            if (has_state) {
+                /* A stale pending group (rewound mid-group past the verify saves)
+                 * can only be joined at a group boundary; a store elsewhere would
+                 * pool a wrong token in. */
+                if (pos % ratio == 0u) g->ms_comp_state_stale[bank] = false;
+                else if (g->ms_comp_state_stale[bank]) {
+                    fprintf(stderr, "pulsar: kv source %u bank %u: store at %u would extend a stale pending group -- refusing\n",
+                            il, bank, pos);
+                    ok = false;
+                }
+            }
+            if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
+            ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
+                 pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
+                                                          tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
+                                                          layer->attn_compressor_norm->abs_offset,
+                                                          layer->attn_compressor_norm->type,
+                                                          PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
+            /* The indexer's own compressor walks the SAME rows on the same schedule:
+             * it stores this token whether or not the group closes, and its frontier
+             * IS the attention compressor's (one emit, one row -- the scorer reads
+             * the index pool with the comp frontier as its stride).  So it is called
+             * unconditionally and the two `emitted` flags are compared: a disagreement
+             * would mean the second pool's row indices had drifted off the first's,
+             * which no later check would notice. */
+            int idx_emitted = 0;
+            if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, mseq, bank, t, pos,
+                                                                  *n_comp_slot, ratio,
+                                                                  freq_base, freq_scale, ext_factor, attn_factor,
+                                                                  &idx_emitted);
+            if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
+                fprintf(stderr, "pulsar: index source %u: the indexer's compressor and the attention's "
+                                "disagree about the group boundary at %u (ratio %u) -- refusing\n", il, pos, ratio);
                 ok = false;
             }
-        }
-        if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
-        ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
-             pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
-                                                      tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
-                                                      layer->attn_compressor_norm->abs_offset,
-                                                      layer->attn_compressor_norm->type,
-                                                      PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
-        /* The indexer's own compressor walks the SAME rows on the same schedule:
-         * it stores this token whether or not the group closes, and its frontier
-         * IS the attention compressor's (one emit, one row -- the scorer reads
-         * the index pool with the comp frontier as its stride).  So it is called
-         * unconditionally and the two `emitted` flags are compared: a disagreement
-         * would mean the second pool's row indices had drifted off the first's,
-         * which no later check would notice. */
-        int idx_emitted = 0;
-        if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, mseq, bank, t, pos,
-                                                              *n_comp_slot, ratio,
-                                                              freq_base, freq_scale, ext_factor, attn_factor,
-                                                              &idx_emitted);
-        if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
-            fprintf(stderr, "pulsar: index source %u: the indexer's compressor and the attention's "
-                            "disagree about the group boundary at %u (ratio %u) -- refusing\n", il, pos, ratio);
-            ok = false;
-        }
-        /* L120 value half: this row's own slot in the ring, after both stores. */
-        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos, t, 1u);
-        if (ok && emitted) {
-            const uint32_t row = *n_comp_slot;
-            if (row != pos / ratio) {
-                fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
-                        il, bank, row, pos, ratio);
-                ok = false;
+            /* L120 value half: this row's own slot in the ring, after both stores. */
+            if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos, t, 1u);
+            if (ok && emitted) {
+                const uint32_t row = *n_comp_slot;
+                if (row != pos / ratio) {
+                    fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
+                            il, bank, row, pos, ratio);
+                    ok = false;
+                }
+                if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, bank, 1u, row, pos + 1u - ratio, ratio);
+                /* plan-33 inc C: same boundary-row restore as the batched arm. */
+                if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, false);
+                if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, true);
+                if (ok) gpu_graph_set_n_comp(g, bank, il, *n_comp_slot + 1u);
             }
-            if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, bank, 1u, row, pos + 1u - ratio, ratio);
-            /* plan-33 inc C: same boundary-row restore as the batched arm. */
-            if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, false);
-            if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, true);
-            if (ok) gpu_graph_set_n_comp(g, bank, il, *n_comp_slot + 1u);
+            if (ok) comp_counts[t] = *n_comp_slot;
+            pulsar_gpu_tensor_free(latent_row);
+            if (mseq) {
+                pulsar_gpu_tensor_free(st_sc);
+                pulsar_gpu_tensor_free(st_kv);
+            }
+            pulsar_gpu_tensor_free(sc_view);
+            pulsar_gpu_tensor_free(kv_view);
         }
-        if (ok) comp_counts[t] = *n_comp_slot;
-        pulsar_gpu_tensor_free(latent_row);
-        if (mseq) {
-            pulsar_gpu_tensor_free(st_sc);
-            pulsar_gpu_tensor_free(st_kv);
-        }
-        pulsar_gpu_tensor_free(sc_view);
-        pulsar_gpu_tensor_free(kv_view);
+        return ok;
+    };
+    const uint32_t bank0 = mseq ? (uint32_t)g->ms_seq_id[0] : gpu_graph_cur_bank(g);
+    const bool one_bank = !mseq || (uint32_t)g->ms_seq_id[n_tokens - 1u] == bank0;
+    if (one_bank && (pos0 % ratio) == 0u) return batched_run(0u, bank0, pos0, n_tokens);
+    if (!mseq) return per_row(0u, n_tokens);
+    /* A multiseq step: its decode/verify rows row by row, and each PROMPT run
+     * (from batch_multiseq_pf_row0 on) row by row only up to its first group
+     * boundary -- those rows finish the pending group the bank already holds --
+     * then batched from there, the arm a classic chunk takes at the same aligned
+     * position.  L260: a 2048-row prompt chunk riding a fused step went row by
+     * row, ~2600 kernel launches per kv source where the classic chunk pays a
+     * handful, and the fused step ran ~1.65x the classic chunk's wall. */
+    const uint32_t pf0 = g->batch_multiseq_pf_row0 < n_tokens ? g->batch_multiseq_pf_row0 : n_tokens;
+    if (!per_row(0u, pf0)) return false;
+    for (uint32_t t = pf0; t < n_tokens; ) {
+        uint32_t rl = 1;
+        while (t + rl < n_tokens && g->ms_seq_id[t + rl] == g->ms_seq_id[t] &&
+               g->ms_positions[t + rl] == g->ms_positions[t] + (int32_t)rl) rl++;
+        const uint32_t p = (uint32_t)g->ms_positions[t];
+        uint32_t h = (ratio - p % ratio) % ratio;
+        if (h > rl) h = rl;
+        if (!per_row(t, t + h)) return false;
+        if (rl > h && !batched_run(t + h, (uint32_t)g->ms_seq_id[t], p + h, rl - h)) return false;
+        t += rl;
     }
-    return ok;
+    return true;
 }
 
 
@@ -961,6 +1003,16 @@ struct gpu_graph_span_ops {
     uint32_t                 comp_cap;  ///< per-bank stride, 0 when scalar
     uint32_t                 n_banks;  ///< 1 when scalar
     bool                     mseq;          ///< build per-span descriptor views for the banked path
+    /* L260: the grouped E4M3 slot the attention epilogue fills (data NULL =
+     * none), and the batch row count it spans -- a span writes its rows at
+     * their batch row. */
+    void                    *gact_data;
+    void                    *gact_scale;
+    int                      gact_kbp;
+    uint32_t                 gact_slab;
+    uint32_t                 gact_n_groups;
+    uint32_t                 gact_n_nope;
+    uint32_t                 gact_ntok;
 };
 
 static bool gpu_graph_indexed_attention_span(
@@ -1124,8 +1176,23 @@ static bool gpu_graph_indexed_attention_span(
                                               (uint64_t)sn * PULSAR_N_INDEXER_TOP_K, il, spos0);
         }
     }
+    /* The attention launcher reads the step's decode-row count (the row-kind
+     * global) as the count of ITS leading rows that walk split-K and get their
+     * inverse rope in the combine.  A span is a sub-launch: its own decode rows
+     * are the step's that fall inside it -- all of them in the first span, none
+     * after.  L260: a fused step past the indexer's top-k runs a 2048-row prompt
+     * chunk in 512-row spans, and every later span took the step's count as its
+     * own, so the prompt row at each span start was split-K'd and roped twice
+     * (fused_step_gate's LONG leg). */
+    const int step_dec = pulsar_gpu_matmul_batch_decode_rows();
+    const uint32_t span_dec = step_dec > (int)s0 ? ((uint32_t)step_dec - s0 < sn ? (uint32_t)step_dec - s0 : sn) : 0u;
+    if (ok && span_dec != (uint32_t)(step_dec > 0 ? step_dec : 0) &&
+        !pulsar_gpu_matmul_set_batch_decode_rows((int)span_dec)) {
+        fprintf(stderr, "pulsar: indexed span at layer %u: decode-row count %u refused -- refusing\n", il, span_dec);
+        ok = false;
+    }
     if (ok) {
-        ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
+        ok = pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(sh_view,
                                                                   tensor_map_base(model, layer->attn_sinks),
                                                                   tensor_map_size(model, layer->attn_sinks),
                                                                   sinks_off,
@@ -1149,8 +1216,11 @@ static bool gpu_graph_indexed_attention_span(
                                                                   op->comp_cap,
                                                                   op->n_banks,
                                           g->q_prep_active ? &g->q_prep : NULL,
-                                          vleft_view, vright_view) != 0;
+                                          vleft_view, vright_view,
+                                          op->gact_data, op->gact_scale, op->gact_kbp, op->gact_slab,
+                                          op->gact_n_groups, op->gact_n_nope, s0, op->gact_ntok) != 0;
     }
+    (void)pulsar_gpu_matmul_set_batch_decode_rows(step_dec > 0 ? step_dec : 0);   /* the step's own, back */
     pulsar_gpu_tensor_free(sel_view);
     pulsar_gpu_tensor_free(vright_view);
     pulsar_gpu_tensor_free(vleft_view);
@@ -1353,7 +1423,9 @@ bool gpu_graph_encode_layer_attention_batch(
      * position/bank from the host mirrors (gpu_graph_multiseq_step_begin),
      * per-bank compressor frontiers, banked kernel operands (whole pool +
      * device descriptor arrays), scalar counters = read-only supersets.
-     * step_begin rejects position-0 rows, so zero_prefix is never multiseq. */
+     * step_begin rejects a position-0 FIRST row, so zero_prefix is never
+     * multiseq: a from-zero run inside a mixed step (L260) sits behind other
+     * banks' rows and takes the per-row arms. */
     const bool mseq = g->batch_multiseq;
     /* Single-sequence prefill has been dequantising the packed comp
      * cache into an f32 shadow and reading that: 2048 B/row instead of 584, on
@@ -1460,13 +1532,15 @@ bool gpu_graph_encode_layer_attention_batch(
      * exactly this store for a measured, bit-exact +4.0% prefill; the F32
      * detour of 08-16 made it impossible (cuBLAS SGEMM needed the f32) and it
      * was deleted with the F16 sweep; the bf16-core migration made it legal
-     * again and nobody put it back.  Same predicate family as attn_norm's skip:
-     * the mixed-batch split's offset views read f32 and key no slot, and dumps
-     * read f32.  Declared to the cache so a slot miss refuses, never converts
-     * unwritten bytes. */
-    const bool flat_skip_f32 = flat_hc_b &&
-                               pulsar_gpu_matmul_batch_decode_rows() == 0 &&
-                               !gpu_graph_f32_store_observed_any();
+     * again and nobody put it back.  Dumps read f32, so they keep it.  The
+     * mixed-batch split does NOT: unlike the mxfp8 dispatch (whose offset
+     * views key no slot -- the attn_norm/ffn_norm skips keep that predicate),
+     * the bf16 core reads its operand before any split, through the plane's
+     * row window (act_slot_find_window), so a fused step's suffix and a
+     * verify step's rows read the same bf16 bytes without the f32 rows (L260:
+     * the f32 store doubled this norm's cost on a fused step).  Declared to
+     * the cache so a slot miss refuses, never converts unwritten bytes. */
+    const bool flat_skip_f32 = flat_hc_b && !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b,
                                                       g->batch_cur_hc,
@@ -2055,6 +2129,22 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      mseq ? g->batch_positions : NULL,
                                                      mseq ? g->batch_seq_id : NULL,
                                                      mseq ? nb : 1) != 0;
+            /* L260: both arms below emit the attn-output 'a' GEMM's grouped E4M3
+             * from their epilogue for every row past the step's split-K decode
+             * rows; the rope tail adds those rows' rope blocks and the decode
+             * rows are encoded after it (below the rope tail).  Without this the
+             * whole batch -- a fused step's 2048-row prompt chunk, or any classic
+             * chunk past position 0 -- was re-read and encoded by a separate pass
+             * (~1 ms per layer at 2048 rows).  A slot that cannot be reserved
+             * refuses, as at the static arm: no second arithmetic chosen by a
+             * scratch reservation. */
+            if (ok && !pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
+                                                  &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
+                fprintf(stderr, "pulsar: layer %u: grouped E4M3 activation slot for %u x %u x %u heads "
+                                "unavailable -- refusing (no quantize-pass fallback)\n",
+                        il, n_tokens, n_groups, group_dim);
+                ok = false;
+            }
             /* The top-k path needs a top-k.  A FULL_UNINDEXED source never has
              * one however deep the pool grows, so it takes the mixed branch at
              * every depth -- which is exactly what the reference's unindexed
@@ -2081,7 +2171,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 pulsar_gpu_tensor *span_comp_src =
                     mseq ? gpu_graph_bank_attn_comp_pool(g, src)
                          : g->layer_attn_comp_cache[src];
-                const struct gpu_graph_span_ops sop = {
+                struct gpu_graph_span_ops sop = {
                     /* comp_src   */ span_comp_src,
                     /* raw_src    */ mseq ? gpu_graph_bank_raw_pool(g, il) : g->layer_raw_cache[il],
                     /* index_src  */ mseq ? gpu_graph_bank_index_comp_pool(g, src)
@@ -2092,6 +2182,13 @@ bool gpu_graph_encode_layer_attention_batch(
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
                 };
+                sop.gact_data = gact_data;
+                sop.gact_scale = gact_scale;
+                sop.gact_kbp = gact_kbp;
+                sop.gact_slab = (uint32_t)gact_slab;
+                sop.gact_n_groups = n_groups;
+                sop.gact_n_nope = PULSAR_N_HEAD_DIM - PULSAR_N_ROT;
+                sop.gact_ntok = n_tokens;
                 /* The span hands n_comp -- the source's frontier -- to the indexer as
                  * its row count and score stride too: one emit writes the comp row
                  * AND the index-K row, so the two pools share one frontier. */
@@ -2108,7 +2205,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             &sop);
                 }
             } else if (ok) {
-                ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
+                ok = pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(g->batch_heads,
                                                                          tensor_map_base(model, layer->attn_sinks),
                                                                          tensor_map_size(model, layer->attn_sinks),
                                                                          sinks_off,
@@ -2133,9 +2230,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           mseq ? gpu_graph_bank_attn_comp_bases(g, src) : NULL,
                                                                           mseq ? g->layer_comp_cap[src] : 0,
                                                                           mseq ? nb : 1,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          gact_data, gact_scale, gact_kbp, (uint32_t)gact_slab, n_groups,
+                                          PULSAR_N_HEAD_DIM - PULSAR_N_ROT) != 0;
             }
-            if (ok) batch_attention_done = true;
+            if (ok) { batch_attention_done = true; gact_emitted = 1; }
+            else { gact_data = NULL; gact_scale = NULL; }
         }
 
         const bool topk_prefill_needed = pulsar_attn_reads_index(attn->mode) &&
@@ -2438,18 +2538,14 @@ bool gpu_graph_encode_layer_attention_batch(
      * the split-K combine applies it as it stores the heads (the same two
      * roundings in the same order; the decode blob did not move) -- so this
      * launch covers the rows past them: a mixed step's prefill rows, or
-     * nothing.  Those rows never come with grouped slots (the epilogue that
-     * emits them is the dense prefill arm's, which a step with decode rows
-     * does not take); a slot here with decode rows present is a contradiction,
-     * refused rather than half-emitted. */
+     * nothing.  With grouped slots (L260: the mixed and indexed arms emit for
+     * the rows past the decode rows) it writes those rows' rope blocks at
+     * their batch row; the decode rows -- whose split-K combine has no
+     * epilogue -- are encoded whole right after it. */
     const int rope_dec_rows = pulsar_gpu_matmul_batch_decode_rows();
-    const uint32_t rope_row0 = (g->q_prep_active && rope_dec_rows > 0)
-                             ? ((uint32_t)rope_dec_rows < n_tokens ? (uint32_t)rope_dec_rows : n_tokens) : 0u;
-    if (ok && rope_row0 != 0u && gact_data) {
-        fprintf(stderr, "pulsar: layer %u: grouped heads slots with %u decode rows -- the split-K combine "
-                        "roped those rows without emitting; refusing\n", il, rope_row0);
-        ok = false;
-    }
+    const uint32_t dec_rows = rope_dec_rows > 0
+                            ? ((uint32_t)rope_dec_rows < n_tokens ? (uint32_t)rope_dec_rows : n_tokens) : 0u;
+    const uint32_t rope_row0 = g->q_prep_active ? dec_rows : 0u;
     if (ok && rope_row0 < n_tokens) {
         const uint32_t rope_rows = n_tokens - rope_row0;
         pulsar_gpu_tensor *heads_rows = rope_row0 ? pulsar_gpu_tensor_view(g->batch_heads,
@@ -2477,13 +2573,18 @@ bool gpu_graph_encode_layer_attention_batch(
                                             PULSAR_ROPE_YARN_BETA_SLOW,
                                             pos_rows,
                                             gact_data, gact_scale, gact_kbp,
-                                            (uint32_t)gact_slab, n_groups) != 0;
+                                            (uint32_t)gact_slab, n_groups, rope_row0, n_tokens) != 0;
         if (rope_row0) {
             if (heads_rows) pulsar_gpu_tensor_free(heads_rows);
             if (pos_rows) pulsar_gpu_tensor_free(pos_rows);
         }
     }
-    /* BOTH producers have now run: the encoding is complete and the "a" GEMM
+    /* The decode rows the attention epilogue skipped (split-K), encoded from the
+     * heads they now hold -- after the rope, as the read-back encoder always ran. */
+    if (ok && gact_data && dec_rows != 0u)
+        ok = pulsar_gpu_mxfp8_gact_emit_heads_rows(g->batch_heads, n_tokens, 0u, dec_rows,
+                                                   n_groups, group_dim) != 0;
+    /* EVERY producer has now run: the encoding is complete and the "a" GEMM
      * may consume it instead of running its own quantise pass. */
     if (ok && gact_data) pulsar_gpu_mxfp8_gact_note();
     /* L158 inc 4: the attention arms without the E4M3 epilogue (the indexed
@@ -2764,9 +2865,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     }
     /* L157: same dead-store skip as the attention-side flat_hc norm, same
      * predicate; the consumer is hc_ffn_fn's GEMM on the shared bf16 core. */
-    const bool flat_skip_f32_ffn = flat_hc_b_ffn &&
-                                   pulsar_gpu_matmul_batch_decode_rows() == 0 &&
-                                   !gpu_graph_f32_store_observed_any();
+    const bool flat_skip_f32_ffn = flat_hc_b_ffn && !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b_ffn,
                                                       g->batch_after_attn_hc,
@@ -3219,9 +3318,12 @@ bool gpu_graph_encode_layer_ffn_batch(
  * acceptance silently -- the class gpu_decode.cpp's KV seed documents (L190 D2).
  * Returns false, having captured nothing further, if any armed capture fails. */
 static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
-    struct { uint32_t n; pulsar_gpu_tensor **dst; const char *what; } cap[2] = {
-        { g->dspark_capture_batch_n, g->dspark_target_h_batch, "anchor" },
-        { g->dspark_bulk_n,          g->dspark_bulk_h,          "bulk"   },
+    /* row0: the anchor capture reads the step's leading (verify) rows; the bulk
+     * capture reads from dspark_bulk_row0 -- 0 for a classic chunk, the decode-row
+     * count for a fused step whose prefill rows follow them (L260). */
+    struct { uint32_t n; uint32_t row0; pulsar_gpu_tensor **dst; const char *what; } cap[2] = {
+        { g->dspark_capture_batch_n, 0u,                  g->dspark_target_h_batch, "anchor" },
+        { g->dspark_bulk_n,          g->dspark_bulk_row0, g->dspark_bulk_h,          "bulk"   },
     };
     for (int c = 0; c < 2; c++) {
         if (!cap[c].n) continue;
@@ -3232,12 +3334,26 @@ static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_
                                 "its buffer is not allocated -- refusing\n", cap[c].what, il, slot);
                 return false;
             }
-            uint32_t cap_n = cap[c].n;
-            if (cap_n > n_tokens) cap_n = n_tokens;
-            if (!pulsar_gpu_dspark_hc_mean_reduce_batch(cap[c].dst[slot], g->batch_cur_hc,
-                                                       PULSAR_N_EMBD, PULSAR_N_HC, cap_n)) {
+            if (cap[c].row0 >= n_tokens) {
+                fprintf(stderr, "pulsar: drafter %s capture: first row %u past the step's %u rows -- "
+                                "refusing\n", cap[c].what, cap[c].row0, n_tokens);
                 return false;
             }
+            uint32_t cap_n = cap[c].n;
+            if (cap_n > n_tokens - cap[c].row0) cap_n = n_tokens - cap[c].row0;
+            bool ok;
+            if (cap[c].row0 == 0) {
+                ok = pulsar_gpu_dspark_hc_mean_reduce_batch(cap[c].dst[slot], g->batch_cur_hc,
+                                                           PULSAR_N_EMBD, PULSAR_N_HC, cap_n) != 0;
+            } else {
+                const uint64_t hc_row = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;
+                pulsar_gpu_tensor *src = pulsar_gpu_tensor_view(g->batch_cur_hc, (uint64_t)cap[c].row0 * hc_row,
+                                                                (uint64_t)cap_n * hc_row);
+                ok = src && pulsar_gpu_dspark_hc_mean_reduce_batch(cap[c].dst[slot], src, PULSAR_N_EMBD,
+                                                                   PULSAR_N_HC, cap_n) != 0;
+                pulsar_gpu_tensor_free(src);
+            }
+            if (!ok) return false;
             break;
         }
     }

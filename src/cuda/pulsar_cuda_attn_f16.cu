@@ -1493,7 +1493,9 @@ int pulsar_gpu_attention_f16_indexed(
         const pulsar_gpu_q_prep *q_prep,
         /* vis_left/vis_right: see the prefill_mx entry.  Indexed by this
          * launch's own token axis, exactly like positions. */
-        const int *vis_left, const int *vis_right) {
+        const int *vis_left, const int *vis_right,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
@@ -1566,6 +1568,14 @@ int pulsar_gpu_attention_f16_indexed(
      * (decode rows never carry one); a launch asking for both is a shape this
      * kernel does not serve. */
     AF16_REQUIRE("indexed", !vis_left || n_dec == 0u, "vis with %u split-K decode rows", n_dec);
+    /* The same emission contract as the prefill entry's epilogue; the split-K
+     * rows return before it, so only the rows past n_dec are encoded (the
+     * caller encodes the decode rows after the combine and the rope tail). */
+    AF16_REQUIRE("indexed", !gact_data || (n_groups != 0u && (n_head % n_groups) == 0u &&
+                                           (n_nope % 32u) == 0u && n_nope <= AF16_DIM &&
+                                           gact_scale && gact_tok0 + n_tokens <= gact_ntok),
+                 "gact n_head=%u n_groups=%u n_nope=%u rows %u+%u of %u", n_head, n_groups, n_nope,
+                 gact_tok0, n_tokens, gact_ntok);
     uint32_t n_phys = 1u;
     float *partials = NULL;
     if (n_dec != 0u) {
@@ -1596,7 +1606,8 @@ int pulsar_gpu_attention_f16_indexed(
                                             positions ? n_banks : 1u,
                                             (const int32_t *)vis_left, (const int32_t *)vis_right, 1,
                                             non_causal != 0u,
-                                            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
+                                            (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale,
+                                            gact_kbp, gact_slab, n_groups, n_nope, gact_tok0, gact_ntok,
                                             qp, q_prep != NULL,
                                             af16_unified_rows(),
                                             partials, n_dec);

@@ -725,6 +725,27 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
                              char *err, size_t errlen);
+/** L260 fusion: a FUSED step -- the batched speculative lane's verify rows and
+ * queued prompts' prefill chunks in ONE forward.  Rows [0, n_dec) are decode /
+ * verify rows: decode row kind, every row headed in place (logits rows
+ * [0, n_dec), or the armed argmax / compact readbacks, exactly as
+ * PULSAR_MSEQ_HEAD_ALL_ROWS).  Rows [n_dec, n_rows) are n_pf prefill runs, one
+ * bank each, in order; a run may start at position 0 (a fresh bank's first
+ * chunk; invalidate it first).  head_last[r] != 0 heads prefill run r's LAST row
+ * into the next logits row after the decode rows, in run order -- the prompt's
+ * first-token distribution on its final chunk.  Every prefill run's drafter
+ * anchors fill its bank's prompt ring, as a classic prefill chunk does.
+ * *out_n_rows = n_dec + the headed runs.  n_dec <= PULSAR_SPEC_ROW_BUDGET and
+ * n_dec + headed runs <= PULSAR_SPEC_LOGITS_ROWS. */
+typedef struct {
+    uint32_t n_dec;
+    uint32_t n_pf;
+    uint8_t  head_last[16];   /* indexed by prefill run, n_pf <= 16 */
+} pulsar_fused_shape;
+int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs,
+                                uint32_t n_rows, const pulsar_fused_shape *shape,
+                                float *logits, int logits_cap, uint32_t *out_n_rows,
+                                char *err, size_t errlen);
 /** Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
  * hosts up to N co-scheduled conversations as banks; each server slot maps to a
  * bank id.  The pool size is chosen at session create (PULSAR_MSEQ_BANKS today);
@@ -938,6 +959,17 @@ int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
  * maintained them and bank_state_restore installed them); this only catches the
  * host checkpoint up to them. */
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n);
+/** L260 fusion: record a prompt chunk that a fused step (pulsar_session_decode_fused)
+ * prefilled for the INSTALLED bank -- what a classic sync of the same tokens leaves
+ * behind: the tokens join the checkpoint, the prefill frontier moves to its new
+ * end (L195: the rows were prefilled, so a rewind can rebuild from them), and on
+ * the chunk that finishes the prompt the session's next-token logits become its
+ * headed last row.  `head` names that row: the head-th headed run of the LAST
+ * fused step (0 = the first run with head_last set), read from the logits block
+ * that step returned, which must not have been reused since; -1 on an
+ * intermediate chunk.  An index rather than a pointer so a pair's worker can
+ * name the same row of its own step's block.  0 or 1. */
+int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head);
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,

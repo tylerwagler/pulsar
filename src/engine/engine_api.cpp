@@ -424,6 +424,14 @@ uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uin
     return pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
 }
 
+uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
+                                     uint32_t n_heads) {
+    const uint32_t width = (uint32_t)s->engine->logits_width();
+    const uint64_t dec = pulsar_session_batch_digest(s, logits, n_dec);
+    const uint64_t heads = pulsar_tp_logits_digest(logits + (size_t)n_dec * width, n_heads, width);
+    return dec * 0x100000001b3ull ^ heads;
+}
+
 /** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
  * L241 4g-2): before logits VALUES leave the engine (copy, logprobs) and
  * before the session ends.  Token decisions (sample, argmax) do not settle --
@@ -863,6 +871,44 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
     return tp_mirror_leader_ack_logits(s, tp, "mixed batch", body_rc, logits,
                                        out_n_rows ? *out_n_rows : 0u, err, errlen);
 }
+int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                                const pulsar_fused_shape *shape, float *logits, int logits_cap,
+                                uint32_t *out_n_rows, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->decode_fused(reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
+    if (tp_mirror_worker_drives_nothing(tp, "the fused step", err, errlen)) return 1;
+    if (tp_mirror_dead(tp, err, errlen)) return 1;
+    if (!reqs || n_rows == 0 || !shape) {
+        if (err) snprintf(err, errlen, "tp: refusing to mirror an empty fused step");
+        return 1;
+    }
+    /* The shape rides the frame: a worker has no caller to take the decode /
+     * prefill split and the head flags from, and both ranks must head the same
+     * rows.  `out_n_rows` is output and stays local on each rank. */
+    pulsar_tp_batch_item *items = tp_mirror_rows(s, reqs, n_rows);
+    const int sent = pulsar_tp_send_fused_batch(tp, items, n_rows, shape);
+    free(items);
+    if (!tp_mirror_sent(tp, "fused batch", sent, err, errlen)) return 1;
+    uint32_t got = 0;
+    const int body_rc = s->decode_fused(reqs, n_rows, shape, logits, logits_cap, &got, err, errlen);
+    if (out_n_rows) *out_n_rows = got;
+    if (body_rc != 0) {
+        pulsar_tp_drain_command_acks(tp);
+        return body_rc;
+    }
+    char peer_err[256];
+    peer_err[0] = '\0';
+    if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, "fused batch",
+                                           pulsar_session_fused_digest(s, logits, shape->n_dec,
+                                                                       got - shape->n_dec),
+                                           peer_err, sizeof(peer_err))) {
+        if (err) snprintf(err, errlen, "tp: a worker failed the mirrored fused batch: %s", peer_err);
+        return 1;
+    }
+    return 0;
+}
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
 /* ---- The bank surface (increment 2).  Bank SELECTION already rode the
  * decode rows; these mirror the leader scheduler's bank DECISIONS -- save,
@@ -1079,6 +1125,25 @@ int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s-
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->bank_prefix_match(bank, prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }
+int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head) {
+    PULSAR_NVTX_FN();
+    if (!s) return 1;
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->note_prefilled(toks, n, head);
+    char err[256];
+    if (tp_mirror_worker_drives_nothing(tp, "note prefilled", err, sizeof(err)) ||
+        tp_mirror_dead(tp, err, sizeof(err))) {
+        fprintf(stderr, "pulsar: %s\n", err);
+        return 1;
+    }
+    if (n <= 0 || !toks) return 1;
+    /* The head row is named by index: each rank reads its OWN fused step's
+     * block, whose digest the step's ack already matched across ranks. */
+    if (!tp_mirror_sent(tp, "note prefilled",
+                        pulsar_tp_send_note_prefilled(tp, s->tp_session_id, toks, (uint32_t)n, head),
+                        NULL, 0)) return 1;
+    return tp_mirror_bank_verdict(s, tp, "note prefilled", s->note_prefilled(toks, n, head), 1);
+}
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) {
     PULSAR_NVTX_FN();
     if (!s) return;

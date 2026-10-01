@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 18u           /* v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 19u           /* v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -440,6 +440,14 @@ int pulsar_tp_send_eval_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
 int pulsar_tp_send_mixed_batch(pulsar_tp *tp,
                                const pulsar_tp_batch_item *items,
                                uint32_t count, uint32_t max_head_runs);
+/** v19: the fused step -- the same row payload behind the step's shape (a worker
+ *  has no caller to take the decode/prefill split and the head flags from). */
+int pulsar_tp_send_fused_batch(pulsar_tp *tp, const pulsar_tp_batch_item *items,
+                               uint32_t count, const pulsar_fused_shape *shape);
+/** v19: a prompt chunk the last fused step prefilled, `head` as
+ *  pulsar_session_note_prefilled takes it. */
+int pulsar_tp_send_note_prefilled(pulsar_tp *tp, uint64_t session_id,
+                                  const int *tokens, uint32_t n_tokens, int32_t head);
 /* The bank frames (increment 2).  Leader -> workers. */
 int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
@@ -710,6 +718,13 @@ typedef enum {
     PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH = 47,
     PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH = 48,
     PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH = 49,
+    /* v19 (L260 fusion): pulsar_session_decode_fused's rows (the batch item
+     * payload) behind its pulsar_fused_shape.  Ack: the digest of what the step
+     * produced -- the decode rows as decode_mixed's, then the headed rows. */
+    PULSAR_TP_FRAME_FUSED_BATCH = 50,
+    /* v19 (L260 fusion): pulsar_session_note_prefilled -- the chunk's tokens,
+     * the headed run's index in `value` (-1 none).  Verdict: 0 ok, 1 refused. */
+    PULSAR_TP_FRAME_NOTE_PREFILLED = 51,
 } pulsar_tp_frame_type;
 
 /** v16 (L250): a KVSTORE_SAVE / KVSTORE_DROP frame naming the entry by `key`;
@@ -744,8 +759,10 @@ typedef struct {
     int value;
     int *tokens;          /* malloc'd for FRAME_SYNC/VERIFY/MIXED_BATCH */
     uint32_t n_tokens;
-    pulsar_tp_batch_item *items;  /* malloc'd for EVAL_BATCH/MIXED_BATCH */
+    pulsar_tp_batch_item *items;  /* malloc'd for EVAL_BATCH/MIXED_BATCH/FUSED_BATCH */
     uint32_t n_items;
+    /* FUSED_BATCH: the step's shape. */
+    pulsar_fused_shape fused;
     /* BANK_FORK / BANK_FORK_PARTIAL: the banks and the shared-prefix length;
      * the request tokens ride `tokens`/`n_tokens`.  The bank of a save /
      * restore / repoint rides `value`. */

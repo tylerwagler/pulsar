@@ -2112,7 +2112,7 @@ int generate_gpu_graph_raw_swa(
         ok = gpu_graph_decode_multiseq_batch(&g, model, weights,
                                              ms_tok, ms_pos, ms_bank, 1u,
                                              logits, NULL, 0u,
-                                             /*capture_cur=*/true) == 1;
+                                             /*capture_cur=*/true, NULL) == 1;
         if (!ok) break;
         n_decode_eval++;
         pos++;

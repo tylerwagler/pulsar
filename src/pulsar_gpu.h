@@ -590,7 +590,13 @@ int pulsar_gpu_attention_f16_indexed(
          * arrays are indexed by this launch's own token axis (like positions),
          * so a caller launching a sub-span offsets them by its first row. */
         const int               *vis_left,
-        const int               *vis_right);
+        const int               *vis_right,
+        /* Grouped E4M3 for the attn-output 'a' GEMM (pulsar_gpu_mxfp8_gact_slot), or
+         * NULL: the epilogue encodes the nope blocks of every row it stores --
+         * the rows past the launch's split-K decode rows -- at batch row
+         * gact_tok0 + t of a gact_ntok-row slab (L260). */
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok);
 
 /** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
@@ -892,6 +898,14 @@ int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n
  * projection; pulsar_gpu_mxfp8_gact_disarm after it. @return 1 on success. */
 int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
                                      uint32_t n_groups, uint64_t group_dim);
+/** L260: encode rows [row0, row0 + n_rows) of the n_tokens-row heads into the
+ *  grouped slot ALREADY armed for them (pulsar_gpu_mxfp8_gact_slot: an attention
+ *  epilogue and the rope tail filled the other rows) -- the split-K decode rows,
+ *  whose combine has no epilogue.  Run after the rope tail; refuses when no slot
+ *  is armed for exactly these heads.  Does not note. */
+int pulsar_gpu_mxfp8_gact_emit_heads_rows(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                                          uint32_t row0, uint32_t n_rows,
+                                          uint32_t n_groups, uint64_t group_dim);
 
 /** Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
@@ -1446,7 +1460,8 @@ int pulsar_gpu_rope_tail_mx_tensor(
         void             *gact_scale,
         int               gact_kbp,
         uint32_t          gact_slab,
-        uint32_t          n_groups);
+        uint32_t          n_groups,
+        uint32_t gact_tok0, uint32_t gact_ntok);
 
 /** The reference's per-head Q norm and tail rope, fused: RMS-normalise each
  * head of `x` in f32 (`x *= rsqrt(mean(x^2) + eps)`, no learned weight) and
@@ -1766,6 +1781,36 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks,
         const pulsar_gpu_q_prep *q_prep);
+/** L260: the same launch with the attn-output 'a' GEMM's grouped E4M3 emitted by
+ *  the attention epilogue for the rows past the step's split-K decode rows
+ *  (the arms below emit nothing; see pulsar_gpu_attention_f16_indexed). */
+int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
+        pulsar_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                non_causal,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
+        uint32_t                comp_cap,
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope);
 
 int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1795,6 +1840,39 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left,
         const pulsar_gpu_tensor *vis_right);
+/** L260: the same launch emitting the grouped E4M3 for its rows past the split-K
+ *  decode rows, at batch row gact_tok0 + t of a gact_ntok-row slab (a span of a
+ *  wider step passes its first row). */
+int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
+        pulsar_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv,
+        const pulsar_gpu_tensor *comp_kv,
+        const pulsar_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        const pulsar_gpu_tensor *comp_bank_ptrs,
+        uint32_t                comp_cap,
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok);
 
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         pulsar_gpu_tensor       *heads,
