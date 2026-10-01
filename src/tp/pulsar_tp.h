@@ -345,6 +345,29 @@ void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out);
 /* Number one bulk exchange of `bytes` (<= cap): *exch on the row lane's
  * sequence, *buf the receive buffer it lands in.  0 = refused (printed). */
 int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf);
+
+/** The bulk lane's arrival bookkeeping (L258).  Our k-th bulk exchange is
+ * answered by the peer's k-th imm arrival, and the peer can run ONE exchange
+ * ahead: it finishes exchange k as soon as our k arrives and posts k+1 while we
+ * may still be reaping our own send completion for k.  So an arrival is
+ * credited to its own index, never to "the latest": the old check compared the
+ * latest arrival's id and failed a correct pair under load ("exchange 352630
+ * received the peer's exchange 352631", 2026-09-30).  Pure host logic;
+ * tests/tp_core_test.cpp pins it. */
+typedef struct {
+    uint64_t mine;      ///< bulk exchanges this rank has started
+    uint64_t arrived;   ///< imm arrivals reaped from the peer
+    uint32_t imm[2];    ///< the exchange id each arrival carried, by arrival index & 1
+} pulsar_tp_bulk_arrivals;
+/** Start this rank's next bulk exchange; @return the arrival index that answers it. */
+uint64_t pulsar_tp_bulk_arrival_next(pulsar_tp_bulk_arrivals *a);
+/** Credit one imm arrival carrying exchange id `imm`. */
+void pulsar_tp_bulk_arrival_credit(pulsar_tp_bulk_arrivals *a, uint32_t imm);
+/** Has the arrival answering index `want` been reaped? */
+int pulsar_tp_bulk_arrival_ready(const pulsar_tp_bulk_arrivals *a, uint64_t want);
+/** Did arrival `want` carry exchange id `exch`, with the peer at most one exchange
+ * ahead?  0 = the ranks' exchange order really diverged. */
+int pulsar_tp_bulk_arrival_matches(const pulsar_tp_bulk_arrivals *a, uint64_t want, uint64_t exch);
 /* The row-lane descriptor's bulk flag (word 2; low bit = buffer). */
 #define PULSAR_TP_DESC_BULK_FLAG (UINT64_C(1) << 63)
 

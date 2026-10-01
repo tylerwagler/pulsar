@@ -239,9 +239,40 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
  * failure — there is no runtime create). */
 /* provision_bank's MemAvailable verdict (L179 branch 14). The FIRST bank is
  * exempt (see the caller); from the second on, an unreadable gauge (avail ==
- * 0) or a box below floor + marginal refuses. */
-static bool server_bank_floor_refuses(int n_provisioned, uint64_t avail, uint64_t marginal) {
-    return n_provisioned > 0 && (avail == 0 || !server_mem_floor_admits(avail, marginal));
+ * 0) or a box below floor + marginal refuses -- unless the bank's pages are
+ * already RESIDENT (a recycled bank: its engine high-water is non-zero).
+ * Reinstalling such a bank pages in nothing, so a tight box has no reason to
+ * refuse it; its growth past the high-water is the guard's to police, like any
+ * live bank's.  Refusing it was the 2026-09-29 pair's serialized c2: the pool
+ * was full, LRU eviction freed a bank, and the floor then refused to hand that
+ * same bank to the queued job. */
+static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident,
+                                      uint64_t avail, uint64_t marginal) {
+    return n_provisioned > 0 && !pages_resident &&
+           (avail == 0 || !server_mem_floor_admits(avail, marginal));
+}
+
+/* The free bank to provision: the one with the most resident pages (engine
+ * high-water bytes), lowest index on a tie, so a tight box reuses what it has
+ * already paged in before touching a bank that never was.  resident[i] is
+ * read only where provisioned[i] is false.  -1 when every bank is provisioned. */
+static int server_pick_free_bank(const bool *provisioned, const uint64_t *resident, int n) {
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (provisioned[i]) continue;
+        if (best < 0 || resident[i] > resident[best]) best = i;
+    }
+    return best;
+}
+
+/* A refusal one idle-bank eviction can relieve.  A full pool or a full ledger
+ * always; the MemAvailable floor only in pool mode, where an evicted bank keeps
+ * its pages and provision_bank reuses that resident hole without paging in
+ * anything (server_pick_free_bank prefers it, server_bank_floor_refuses admits
+ * it).  In classic mode an eviction frees nothing the floor can see. */
+static bool server_refusal_evictable(provision_refusal r, bool pool_mode) {
+    return r == PROVISION_REFUSED_POOL_FULL || r == PROVISION_REFUSED_ADMISSION ||
+           (pool_mode && r == PROVISION_REFUSED_MEM_FLOOR);
 }
 
 bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsigned *skipped) {
@@ -258,19 +289,25 @@ bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsign
 session_slot *server::provision_bank(provision_refusal *refusal) {
     auto *s = this;
     *refusal = PROVISION_OK;
-    int idx = -1;
     /* Pool mode: bank 0 is an ordinary bank (no boot pre-provisioning, no
      * pinning) — the uniform loop from 0 replaced the boot-phantom /
      * empty-reuse / soft-evict special-case family (2026-08-10). */
     int n_provisioned = 0;
+    bool provisioned[PULSAR_SESSION_POOL_CAP];
+    uint64_t resident[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->pool_banks; i++) {
-        if (s->slots[i].provisioned) { n_provisioned++; continue; }
-        if (idx < 0) idx = i;
+        provisioned[i] = s->slots[i].provisioned;
+        resident[i] = provisioned[i] ? 0
+                    : pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[i].bank);
+        if (provisioned[i]) n_provisioned++;
     }
+    const int idx = server_pick_free_bank(provisioned, resident, s->pool_banks);
     if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
     /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
-     * an unreadable gauge), matching provision_slot. The marginal is what the
-     * bank may still demand-page as it fills.
+     * an unreadable gauge), matching provision_slot, for a bank that would page
+     * in fresh memory; a recycled bank's pages are already resident (see
+     * server_bank_floor_refuses). The marginal is what the bank may still
+     * demand-page as it fills.
      * The FIRST bank is exempt: before the 2026-08-10 slot-0 rework it was
      * boot-provisioned and never floor-gated, and an empty-pool floor refusal
      * is a hang — worker_main's wait predicate stays false (head queued,
@@ -278,7 +315,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
     const uint64_t avail = server_mem_available_bytes();
-    if (server_bank_floor_refuses(n_provisioned, avail, s->bank_marginal_bytes)) {
+    if (server_bank_floor_refuses(n_provisioned, resident[idx] > 0, avail, s->bank_marginal_bytes)) {
         /* A per-request condition: the head job is re-tried every quantum and
          * the next job meets the same floor.  One line per period with the
          * count it swallowed (L190 C1); a once-per-process line hid every
@@ -620,7 +657,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * warm-turn TTFT never engaged (2.35 s vs the 0.6 s a fresh pool
          * gives).  Evict an LRU idle bank (live-tool owners protected, no
          * trunk to preserve) and retry once, mirroring the fork path. */
-        if (*refusal == PROVISION_REFUSED_POOL_FULL && s->fresh_make_room()) {
+        if (server_refusal_evictable(*refusal, s->pool_banks > 0) && s->fresh_make_room()) {
             fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
             if (fresh) return fresh;
         }
@@ -763,14 +800,16 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
  * LRU eviction just picks a better victim and keeps warmer conversations
  * alive.
  *
- * MemAvailable-floor refusals deliberately do NOT trigger eviction. Measured
- * on the GB10 (driver 610, 2026-07-14 smoke): freeing two 2.5 GiB sessions
- * moved MemAvailable only 5.98 -> 6.07 GiB — cudaFree'd memory does not
- * promptly return to the kernel's gauge, so post-eviction provisioning kept
- * refusing on the same floor while two warm conversations were lost for
- * nothing (and the server degraded to one effective slot). A floor refusal
- * means the machine is physically tight; the honest response is to queue the
- * head until a slot frees, not to churn snapshots.
+ * MemAvailable-floor refusals trigger eviction in POOL mode only
+ * (server_refusal_evictable).  Classic mode: freeing two 2.5 GiB sessions
+ * moved MemAvailable only 5.98 -> 6.07 GiB (GB10, driver 610, 2026-07-14) --
+ * cudaFree'd memory does not promptly return to the kernel's gauge, so an
+ * eviction there cannot relieve the floor and only churns snapshots.  Pool
+ * mode frees nothing either, and needs nothing freed: the evicted bank keeps
+ * its pages, provision_bank picks that resident hole first and reinstalls it
+ * without paging anything in (server_bank_floor_refuses).  Refusing it queued
+ * every new conversation behind a running one on a box that had served for a
+ * while (the 2026-09-29 pair: c2 ran serially).
  *
  * Restore path: none of it is new. gen_begin's cache resolution already
  * prefers a disk-text snapshot over cold prefill (kv_cache_try_load), and the
@@ -941,6 +980,29 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
 bool server::worker_eviction_could_help(const job *j,
                                        const bool *protect) {
     auto *s = this;
+    if (s->pool_banks > 0) {
+        /* Pool mode: a provision costs one bank's ledger marginal, and the
+         * hole an eviction leaves keeps its pages, which provision_bank reuses
+         * without consulting the floor (server_bank_floor_refuses).  So an
+         * eviction helps when some idle bank can go and the ledger then admits
+         * one marginal.  (The classic arithmetic below prices a whole
+         * session: at --ctx 1M that is the 44 GiB pool, which no box's
+         * MemAvailable ever admits, so this gate never opened in pool mode.) */
+        uint64_t reclaimable = 0;
+        bool any = false;
+        for (int i = 0; i < s->pool_banks; i++) {
+            const session_slot *sl = &s->slots[i];
+            if (!sl->provisioned || sl->active_job || (protect && protect[i])) continue;
+            reclaimable += sl->est_cost_bytes;
+            any = true;
+        }
+        if (!any) return false;
+        pthread_mutex_lock(&s->mu);
+        const uint64_t committed = s->kv_committed_bytes;
+        pthread_mutex_unlock(&s->mu);
+        const uint64_t after = committed > reclaimable ? committed - reclaimable : 0;
+        return server_kv_admits(s->kv_budget_bytes, after, s->bank_marginal_bytes);
+    }
     const uint64_t est =
         pulsar_engine_session_cost_bytes(s->engine, s->provision_ctx_for_job(j));
     if (est == 0) return false;
@@ -1201,8 +1263,9 @@ bool server::fresh_make_room() {
  * that cannot fit its owner slot — see choose_slot_for_job). When the head
  * cannot be placed cleanly (nothing fits, or only a warm slot it would
  * clobber), it is not waiting on a busy owner, and the provisioning refusal
- * is one eviction can relieve (full pool / full ledger — never the
- * MemAvailable floor, see the increment-4 block above), idle slots are
+ * is one eviction can relieve (server_refusal_evictable: full pool / full
+ * ledger, and in pool mode the MemAvailable floor -- see the increment-4
+ * block above), idle slots are
  * evicted LRU-first until the head binds without clobbering or eviction
  * stops helping — then the clobber fallback binds it exactly like the
  * increment-3 scheduler did. */
@@ -1249,15 +1312,12 @@ bool server::worker_try_bind() {
     session_slot *sl = s->choose_slot_for_job(j, &reject_ctx, &waiting_owner,
                                            &clobbers, &refusal);
     if ((!sl || clobbers) && !waiting_owner && reject_ctx == 0 &&
-        (refusal == PROVISION_REFUSED_POOL_FULL ||
-         refusal == PROVISION_REFUSED_ADMISSION))
+        server_refusal_evictable(refusal, s->pool_banks > 0))
     {
         bool protect[PULSAR_SESSION_POOL_CAP];
         s->worker_protect_queued_owner_slots(protect);
         if (s->worker_eviction_could_help(j, protect)) {
-            while ((!sl || clobbers) &&
-                   (refusal == PROVISION_REFUSED_POOL_FULL ||
-                    refusal == PROVISION_REFUSED_ADMISSION))
+            while ((!sl || clobbers) && server_refusal_evictable(refusal, s->pool_banks > 0))
             {
                 /* Refresh owner protection every iteration (2026-07-15
                  * review): each pass through choose_slot_for_job can stall

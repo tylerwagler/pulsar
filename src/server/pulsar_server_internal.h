@@ -1293,7 +1293,9 @@ typedef enum {
     PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps */
     PROVISION_REFUSED_MEM_FLOOR,   /* machine physically tight (incl. an
                                       unreadable /proc/meminfo, fail closed) —
-                                      eviction does NOT promptly help */
+                                      eviction helps in pool mode only (the
+                                      evicted bank's resident pages are
+                                      reused); see server_refusal_evictable */
     PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
                                       chain on (same physical pressure) */
     PROVISION_REFUSAL_COUNT,       /* sentinel: array bound for the /metrics

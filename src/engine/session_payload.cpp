@@ -937,7 +937,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp[il];
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, n_comp[il]);
     }
     /* L120: the restored ring's span, on the installed bank and mirrored for the
      * hand-off, so a resume below the checkpoint can replay the carry. */

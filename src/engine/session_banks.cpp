@@ -485,7 +485,7 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * rows, and each is backed by written KV. If repoint fails the ms counters stay
      * 0 (empty, safe). */
     if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) g->ms_n_comp[bank][il] = comp_cnt[il];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) gpu_graph_set_n_comp(g, bank, il, comp_cnt[il]);
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
     return 0;
 }

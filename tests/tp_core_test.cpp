@@ -311,6 +311,46 @@ static void test_logits_digest(void) {
     std::free(a);
 }
 
+/* L258: the bulk lane credits each imm arrival to its own exchange.  The peer
+ * finishes exchange k once our k arrives and may post k+1 while this rank is
+ * still reaping its own send completion for k, so one CQ poll can hand back
+ * the arrivals for k AND k+1.  The old bookkeeping kept only the latest
+ * arrival and failed a correct pair ("exchange 352630 received the peer's
+ * exchange 352631"); the in-order case, the one-ahead race, the next exchange
+ * finding its answer already reaped, and a real divergence are pinned here. */
+static void test_bulk_arrivals(void) {
+    pulsar_tp_bulk_arrivals a;
+    std::memset(&a, 0, sizeof(a));
+    /* in order: start, arrive, check */
+    uint64_t w = pulsar_tp_bulk_arrival_next(&a);
+    CHECK(w == 1 && !pulsar_tp_bulk_arrival_ready(&a, w), "first exchange waits for arrival 1");
+    pulsar_tp_bulk_arrival_credit(&a, 100);
+    CHECK(pulsar_tp_bulk_arrival_ready(&a, w) && pulsar_tp_bulk_arrival_matches(&a, w, 100),
+          "arrival 1 answers exchange 100");
+    /* the race: the peer's 101 lands in the same poll as its 100's successor */
+    w = pulsar_tp_bulk_arrival_next(&a);
+    pulsar_tp_bulk_arrival_credit(&a, 101);
+    pulsar_tp_bulk_arrival_credit(&a, 102);                 /* peer one ahead */
+    CHECK(pulsar_tp_bulk_arrival_matches(&a, w, 101),
+          "exchange 101 is answered by ITS arrival even with 102 already reaped (the 2026-09-30 false divergence)");
+    /* the next exchange finds its answer already reaped, and it is the right one */
+    w = pulsar_tp_bulk_arrival_next(&a);
+    CHECK(pulsar_tp_bulk_arrival_ready(&a, w) && pulsar_tp_bulk_arrival_matches(&a, w, 102),
+          "exchange 102's early arrival is kept for it");
+    /* a real divergence still fails: the arrival carries another exchange's id */
+    w = pulsar_tp_bulk_arrival_next(&a);
+    pulsar_tp_bulk_arrival_credit(&a, 104);
+    CHECK(!pulsar_tp_bulk_arrival_matches(&a, w, 103), "a mismatched id is a divergence");
+    /* and a peer two ahead is impossible without our answer: a divergence */
+    pulsar_tp_bulk_arrivals b;
+    std::memset(&b, 0, sizeof(b));
+    w = pulsar_tp_bulk_arrival_next(&b);
+    pulsar_tp_bulk_arrival_credit(&b, 7);
+    pulsar_tp_bulk_arrival_credit(&b, 8);
+    pulsar_tp_bulk_arrival_credit(&b, 9);
+    CHECK(!pulsar_tp_bulk_arrival_matches(&b, w, 7), "two arrivals ahead is a divergence");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
@@ -319,10 +359,11 @@ int main(void) {
     test_gate_schedule();
     test_owned_range();
     test_logits_digest();
+    test_bulk_arrivals();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range, logits digest)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule, owned range, logits digest, bulk arrivals)\n");
     return 0;
 }

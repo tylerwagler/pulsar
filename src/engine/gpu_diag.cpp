@@ -612,8 +612,10 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         pulsar_gpu_tensor_free(b->index[il][bank]);
         b->index[il][bank] = NULL;
         table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
-        /* Finding 2: a freed bank contributes 0 resident KV. */
+        /* Finding 2: a freed bank contributes 0 resident KV -- its frontier AND
+         * its resident high-water, the one place the pages actually go. */
         g->ms_n_comp[bank][il] = 0;
+        g->ms_comp_hw[bank][il] = 0;
     }
     /* plan-33: an evicted bank's boundary stash is meaningless -- disarm the
      * emit-restore hook so a later cold refill cannot restore stale bytes. */
@@ -1038,7 +1040,7 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
                                          b->index[il][src], (uint64_t)boundary * idx_row,
                                          idx_row) != 0;
         }
-        if (ok && source) g->ms_n_comp[dst][il] = R / attn->ratio;
+        if (ok && source) gpu_graph_set_n_comp(g, dst, il, R / attn->ratio);
     }
     if (ok && keep) g->ms_emit_keep[dst] = keep;
     /* The cut copies KV rows, not projection rows: dst's ring has nothing until
@@ -1075,7 +1077,7 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
                                  b->raw[il], (uint64_t)src * b->raw_bank_bytes,
                                  b->raw_bank_bytes) != 0;
         if (!ok || !gpu_graph_layer_is_kv_source(il)) continue;
-        g->ms_n_comp[dst][il] = g->ms_n_comp[src][il];
+        gpu_graph_set_n_comp(g, dst, il, g->ms_n_comp[src][il]);
         const uint64_t rows = g->ms_n_comp[src][il];
         if (rows) {
             ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, rows * attn_row) != 0;
@@ -1776,34 +1778,29 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
 }
 
 /* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
- * demand-paged KV bytes across the whole pool — Σ over live banks Σ over layers
- * of (comp frontier rows × comp row bytes + index frontier rows × index row
- * bytes).  Deterministic from the position-driven compressor frontier; no
- * cudaMemGetInfo / MemAvailable.  This is the number the increment-2 eviction
- * guard triggers on, and the accounting-exactness gate proves it tracks the real
- * physical delta.  Every bank's frontier is its ms_n_comp row (one per kv
- * source).  Pool disabled (n_banks==0) → pool_count 1, cur 0 → the classic
- * single-session frontier is summed. Only the ctx-
- * scaled comp/index are counted; the eager raw ring + state lanes are the fixed
- * floor and are already resident (not part of the growing touched set). */
-/* Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
- * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
- * read their captured ms_n_comp.  The increment-2b guard uses this for the
- * per-bank Δ projection and the smallest-frontier victim tie-break. */
+ * demand-paged KV bytes across the whole pool -- Σ over banks Σ over kv sources
+ * of resident rows × (comp row + index-K row) bytes.  Deterministic, no
+ * cudaMemGetInfo / MemAvailable: the number the increment-2 eviction guard
+ * triggers on and the server's budget and provisioning read.  RESIDENT rows are
+ * the bank's high-water (ms_comp_hw), not its frontier: a rewind, an invalidate
+ * or an eviction to an empty conversation lowers the frontier and frees no page,
+ * and counting the frontier let the books read a 1M-token pool 17% used on a box
+ * with 4 GiB left (2026-09-29, the pair).  Only gpu_graph_bank_free_physical
+ * returns pages, and only it clears the high-water.  The accounting gate proves
+ * both halves: growth tracks the physical delta, and a rewind leaves both still.
+ * Only the ctx-scaled comp/index are counted; the eager raw ring + state lanes
+ * are the fixed floor and are already resident. */
 uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank) {
     if (!g) return 0;
     const uint32_t nb = gpu_graph_bank_pool_count(g);
     if (bank >= nb) return 0;
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
-    const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        const uint32_t ncomp = (bank == cur) ? gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)
-                                             : g->ms_n_comp[bank][il];
         /* one emit writes a comp row AND an index-K row */
-        bytes += (uint64_t)ncomp * (attn_row + idx_row);
+        bytes += (uint64_t)g->ms_comp_hw[bank][il] * (attn_row + idx_row);
     }
     return bytes;
 }

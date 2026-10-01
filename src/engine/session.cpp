@@ -350,7 +350,7 @@ static void register_model_fds(const pulsar_model *m) {
  * exchange sums.  Both ranks do identical work (every selected expert, half
  * width), so there is no skew by construction.  Byte geometry: one authority,
  * cutlass_mxfp4_expert_layout, for the full and the half shapes. */
-static bool tp_register_expert_half(const void *key, const pulsar_model *m,
+static bool tp_register_expert_half(pulsar_engine *e, const pulsar_model *m,
                                     const pulsar_layer_weights *L, int rank, uint32_t nr) {
     if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */
     const pulsar_tensor *G = L->ffn_gate_exps, *U = L->ffn_up_exps, *D = L->ffn_down_exps;
@@ -375,15 +375,19 @@ static bool tp_register_expert_half(const void *key, const pulsar_model *m,
     cutlass_mxfp4_expert_layout(in, hi - lo, &hgd, &hgsf, &hgs);
     cutlass_mxfp4_expert_layout(mid, out, &dd, &dsf, &ds);
     cutlass_mxfp4_expert_layout(hi - lo, out, &hdd, &hdsf, &hds);
-    return pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, G),
-                                                 tensor_map_base(m, G), G->abs_offset, n_exp,
-                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
-           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, U),
-                                                 tensor_map_base(m, U), U->abs_offset, n_exp,
-                                                 in, mid, 0, lo, hi, gs, gd, hgs, hgd) &&
-           pulsar_gpu_register_mxfp4_expert_half(key, pulsar_tp_expert_half_offset(m, D),
-                                                 tensor_map_base(m, D), D->abs_offset, n_exp,
-                                                 mid, out, 1, lo, hi, ds, dd, hds, hdd);
+    if (!pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, G),
+                                               tensor_map_base(m, G), G->abs_offset, n_exp,
+                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
+        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, U),
+                                               tensor_map_base(m, U), U->abs_offset, n_exp,
+                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
+        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, D),
+                                               tensor_map_base(m, D), D->abs_offset, n_exp,
+                                               mid, out, 1, lo, hi, ds, dd, hds, hdd))
+        return false;
+    /* what the three half-stacks just built hold: n_exp experts at the half strides */
+    e->tp_expert_half_bytes += (uint64_t)n_exp * (2u * hgs + hds);
+    return true;
 }
 
 /* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by
@@ -1027,6 +1031,12 @@ uint64_t pulsar_engine::weights_resident_bytes() {
         bytes += e->dspark_model.mapped_bytes - pulsar_model_unstaged_expert_bytes(&e->dspark_model);
     }
     if (e->overlay_ready) bytes += e->overlay_model.mapped_bytes;
+    /* Under TP the stored expert stacks are unstaged (subtracted above) and this
+     * rank's HALF of every expert is built on the device at open instead: ~73 GiB
+     * per rank on V4-Flash that the admission budget read as free memory
+     * (2026-09-29: static bound 89 GiB on a box with 16 GiB for KV).  The small
+     * shared-expert K-slice repacks are left to the process overhead reserve. */
+    bytes += e->tp_expert_half_bytes;
     return bytes;
 }
 
@@ -1382,6 +1392,11 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  */
 int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
                          int n_images, char *err, size_t errlen) {
+    return sync_impl(prompt, images, n_images, false, err, errlen);
+}
+
+int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                              int n_images, bool logits_owed, char *err, size_t errlen) {
     auto *s = this;
     s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -1547,8 +1562,21 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
-            if (ahead) s->rewind(s->checkpoint.len);
+            if (ahead) {
+                s->rewind(s->checkpoint.len);
+                logits_owed = true;
+            }
         }
+        /* A rewind -- ours just above, or the seam rescue's that re-entered here
+         * -- leaves s->logits describing the frontier the bank was cut FROM.  With
+         * rows still to evaluate the prefill below refreshes them; with none
+         * (the prompt is exactly the cut: a retried or regenerated request on a
+         * bank that went on to answer it) they would be a finished answer's
+         * distribution, and the request sampled EOS and returned nothing
+         * (2026-09-30, the pair: the same 16-token prompt twice, the second
+         * 0 tokens).  Owe one row: step back one token, and the resume below
+         * re-prefills from its grid point, byte for byte the cold prefill. */
+        if (logits_owed && prompt->len == s->checkpoint.len) s->rewind(prompt->len - 1);
         /* L183/L194/L195/L218: a resume is a COLD PREFILL FROM A GRID POINT.  A
          * prefill chunk's bytes depend on the chunk's row count and on a row's
          * offset within the call (L183), so a suffix evaluated from an off-grid
@@ -1728,8 +1756,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             memcpy(stitched.v + live_n, prompt->v + prompt_n,
                    (size_t)(prompt->len - prompt_n) * sizeof(int));
             stitched.len = stitched.cap;
-            const int rc = s->sync(&stitched, n_images > 0 ? images : NULL,
-                                   n_images > 0 ? n_images : 0, err, errlen);
+            const int rc = s->sync_impl(&stitched, n_images > 0 ? images : NULL,
+                                        n_images > 0 ? n_images : 0, true, err, errlen);
             free(stitched.v);
             return rc;
         }
@@ -2279,7 +2307,7 @@ void pulsar_session::rewind(int pos) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
-        if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
+        if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(&s->graph, rw_bank, il, want);
     }
     /* Value half (L218): the ratio-2 sources' pending group.  At an even
      * position it is the empty group; inside a group it is rebuilt from the
@@ -2320,7 +2348,7 @@ void pulsar_session::rewind(int pos) {
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
                 if (!gpu_graph_layer_is_kv_source(il)) continue;
                 const uint32_t want = floor / pulsar_layer_compress_ratio(il);
-                if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
+                if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(&s->graph, rw_bank, il, want);
             }
             if (floor < (uint32_t)s->live_image_barrier) {
                 s->live_image_fp = 0;

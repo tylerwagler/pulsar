@@ -30,6 +30,10 @@
  *      its witness is the e2e shorter-echo probe (in-place extension vs
  *      `live kv cache miss` + disk load), not this gate.
  *
+ *   5. ROLLBACK TO THE PROMPT (2026-09-30): a re-sent prompt the bank has
+ *      since answered is cut back to exactly the prompt; its logits must be
+ *      byte-identical to a cold prefill (the cut left the answer's in place).
+ *
  * The seam pair is discovered from the model's own vocabulary at runtime: a
  * multi-byte token whose text re-tokenizes as 2+ non-empty-text tokens with
  * identical bytes.  MODEL-DEPENDENT, GPU-resident.  NOT part of `make test`.
@@ -303,6 +307,45 @@ int GATE_ENTRY(int argc, char **argv) {
                 }
             }
         }
+        pulsar_session_free(s);
+    }
+
+    /* ---- leg 5: ROLLBACK to exactly the prompt re-evaluates its last row --
+     * A client that re-sends a prompt the bank has since answered (a retry,
+     * a regenerate) lands here as a strict prefix of live: the rescue cuts
+     * the bank back to it and there is nothing left to prefill.  The cut
+     * leaves s->logits describing the ANSWER's frontier, so the request
+     * sampled from a finished conversation -- EOS, zero tokens (2026-09-30,
+     * the pair).  The logits must be the prompt's own, byte for byte what a
+     * cold prefill of it produces (the resume re-prefills from its grid
+     * point).  The old code fails the memcmp outright. */
+    {
+        pulsar_session *s = NULL, *cold = NULL;
+        char err[256];
+        const int n = k + 1 + 8 + 24;
+        if (pulsar_session_create(&s, e, 4096) != 0 ||
+            pulsar_session_create(&cold, e, 4096) != 0) {
+            fprintf(stderr, "session create failed\n");
+            pulsar_session_free(s);
+            goto done;
+        }
+        pulsar_tokens pp;
+        memset(&pp, 0, sizeof(pp));
+        pp.v = canon.v;
+        pp.len = pp.cap = n;
+        CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 prompt sync failed: %s", err);
+        for (int i = 0; i < 8 && canon.len > n + i; i++)            /* the bank answers it */
+            CHECK(pulsar_session_eval(s, canon.v[n + i], err, sizeof(err)) == 0,
+                  "leg5 eval %d failed: %s", i, err);
+        CHECK(pulsar_session_pos(s) > n, "leg5 bank did not advance past the prompt");
+        CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 re-sync failed: %s", err);
+        CHECK(pulsar_session_pos(s) == n, "leg5 re-sync ended at %d want %d", pulsar_session_pos(s), n);
+        CHECK(pulsar_session_sync(cold, &pp, err, sizeof(err)) == 0, "leg5 cold sync failed: %s", err);
+        const bool same = memcmp(s->logits, cold->logits, (size_t)PULSAR_N_VOCAB * sizeof(float)) == 0;
+        CHECK(same, "leg5 logits after rollback to the prompt differ from its cold prefill -- "
+                    "the rescue left the answer's distribution in place");
+        printf("leg5 rollback-to-prompt logits: %s\n", same ? "byte-identical to cold" : "STALE");
+        pulsar_session_free(cold);
         pulsar_session_free(s);
     }
 

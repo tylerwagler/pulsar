@@ -519,7 +519,7 @@ static bool gpu_graph_csa2_produce(
          * which is what a later rewind replays to rebuild the overlap's carry. */
         if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos0, 0u, n_tokens);
         if (ok) {
-            g->ms_n_comp[run_bank][il] = before + n_groups;
+            gpu_graph_set_n_comp(g, run_bank, il, before + n_groups);
             for (uint32_t t = 0; t < n_tokens; t++) comp_counts[t] = (pos0 + t + 1u) / ratio;
             if (has_state) {
                 const uint64_t lane_floats = (uint64_t)pulsar_comp_state_rows(ratio) * comp_width;
@@ -541,7 +541,7 @@ static bool gpu_graph_csa2_produce(
     for (uint32_t t = 0; ok && t < n_tokens; t++) {
         const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
         const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : gpu_graph_cur_bank(g);
-        uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
+        const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
         pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
         pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
         pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
@@ -600,7 +600,7 @@ static bool gpu_graph_csa2_produce(
             /* plan-33 inc C: same boundary-row restore as the batched arm. */
             if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, false);
             if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, bank, row, 1u, true);
-            if (ok) (*n_comp_slot)++;
+            if (ok) gpu_graph_set_n_comp(g, bank, il, *n_comp_slot + 1u);
         }
         if (ok) comp_counts[t] = *n_comp_slot;
         pulsar_gpu_tensor_free(latent_row);
@@ -3450,7 +3450,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                 pulsar_gpu_tensor_free(idx_latent);
             }
         }
-        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = (pos0 + n_positions) / ratio;
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, (pos0 + n_positions) / ratio);
     }
     return true;
 }
