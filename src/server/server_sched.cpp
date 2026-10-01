@@ -1927,7 +1927,7 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
     g->phase = GEN_FINISH;
 }
 
-void server::worker_batched_decode_quantum(session_slot **dec, int n) {
+void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantum_tokens) {
     PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0) return;
@@ -2006,7 +2006,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
     pulsar_multiseq_req reqs[PULSAR_SESSION_POOL_CAP];
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
-    for (int step = 0; step < PULSAR_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+    for (int step = 0; step < quantum_tokens; step++) {
         int m = 0;
         for (int i = 0; i < n && m < PULSAR_SESSION_POOL_CAP; i++) {
             session_slot *sl = dec[i];
@@ -2162,7 +2162,7 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
  * carries tokens the client did not see (pulsar_session_rewind also clears
  * the pendings/carry, which is exactly right -- they were conditioned on the
  * ghosts). */
-void server::worker_spec_batched_quantum(session_slot **dec, int n) {
+void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_tokens) {
     PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0) return;
@@ -2204,7 +2204,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
 
     int emitted_total = 0;
     const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
-    while (emitted_total < PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
+    while (emitted_total < quantum_tokens) {
         /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
          * At <=16 total rows the shared forward's marginal row cost is
          * near-flat, so the win is ALLOCATION under the cap, not budget
@@ -2896,6 +2896,60 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     pf->last_serviced_us = now_us;
 }
 
+/* L260: the decode budget of one scheduler iteration, and which non-decode
+ * slot it advances.  A prompt's prefill chunk and the running streams' decode
+ * alternate one-for-one; a full decode quantum (16 tokens -- several spec
+ * rounds, ~0.3-0.6 s) before EVERY queued prompt's chunk put ~0.5 s of decode
+ * in front of each prompt's first token (pair, 5 x 2K prompts: ~9.8 s to the
+ * last first token against ~7.4 s of prefill).  So while a queued prompt is
+ * within one chunk of finishing, the running streams get ONE round per chunk
+ * -- what a chunked-prefill step with decode rows riding along gives them --
+ * and a long multi-chunk prompt still alternates with full quanta, so it
+ * cannot starve decode (the 214 s stall). */
+static bool slot_prefilling(const session_slot *c) {
+    return c->active_job && c->gen &&
+           (c->gen->phase == GEN_PREFILL_COLD || c->gen->phase == GEN_PREFILL_MAIN);
+}
+
+static int worker_decode_budget(server *s) {
+    const int cap = pulsar_session_prefill_cap(s->sess);
+    for (int i = 0; i < s->n_slots; i++) {
+        const session_slot *c = &s->slots[i];
+        if (!slot_prefilling(c)) continue;
+        const gen_state *g = c->gen;
+        const pulsar_tokens *target = g->phase == GEN_PREFILL_COLD ? &g->cold_prefix : g->prompt_for_sync;
+        if (!target) continue;
+        const int left = target->len - pulsar_session_bank_pos(s->sess, (uint32_t)c->bank);
+        if (left <= cap) return 1;
+    }
+    return PULSAR_SERVER_DECODE_QUANTUM_TOKENS;
+}
+
+/* The next non-decode slot to advance, round-robin from *rr.  A slot past its
+ * prefill (first-token init, finish) goes before another prompt's chunk: its
+ * step is cheap, and round-robin alone made a prompt that had just finished
+ * prefill wait for every other queued prompt before its first token (one
+ * Spark, 10 x 1.8k prompts: TTFT min 14.2 s where 1.6 s is possible). */
+static session_slot *worker_pick_step(server *s, int *rr, const session_slot *skip,
+                                      bool (*eligible)(const session_slot *)) {
+    for (int pass = 0; pass < 2; pass++) {
+        for (int k = 0; k < s->n_slots; k++) {
+            session_slot *c = &s->slots[(*rr + k) % s->n_slots];
+            if (c == skip || !eligible(c)) continue;
+            if (pass == 0 && slot_prefilling(c)) continue;
+            *rr = (int)(c - s->slots) + 1;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static bool slot_steppable_beside_decode(const session_slot *c) {
+    return c->active_job && !slot_is_batchable_decode(c) && !(c->gen && c->gen->batch_active);
+}
+
+static bool slot_active(const session_slot *c) { return c->active_job != NULL; }
+
 void *worker_main(void *arg) {
     server *s = (server *)arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
@@ -2937,6 +2991,20 @@ void *worker_main(void *arg) {
              * the condvar wait has had_head == false and binds immediately. */
             if (had_head) usleep(10000);
             continue;
+        }
+
+        /* L260: a prompt that finished prefill takes its first-token init
+         * (host bookkeeping, no GPU work) HERE, so it rides this iteration's
+         * decode round.  Stepped after the quantum as an "other" slot, it
+         * waited out a full quantum it was not in (c2 on one Spark: ~600 ms
+         * of the second prompt's TTFT). */
+        for (int i = 0; i < s->n_slots; i++) {
+            session_slot *c = &s->slots[i];
+            if (!c->active_job || !c->gen || c->gen->phase != GEN_DECODE_INIT) continue;
+            s->generate_job_step(c);
+            if (c->gen) slot_writer_flush(&c->gen->writer);
+            c->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+            if (!c->gen || c->gen->phase == GEN_DONE) s->worker_finish_slot(c);
         }
 
         /* Gather steady-state batchable decode slots. n_batched > 0 means a
@@ -2985,12 +3053,13 @@ void *worker_main(void *arg) {
              * admissible) => pf_fuse==NULL => today's exact decode-quantum +
              * separate-prefill time-slice, byte-identical. */
             session_slot *pf_fuse = NULL;
+            const int budget = worker_decode_budget(s);
             if (use_spec_batched) {
-                s->worker_spec_batched_quantum(dec, n_dec);
+                s->worker_spec_batched_quantum(dec, n_dec, budget);
             } else {
                 pf_fuse = s->worker_find_fuse_prefill();
                 if (pf_fuse) s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse);
-                else         s->worker_batched_decode_quantum(dec, n_dec);
+                else         s->worker_batched_decode_quantum(dec, n_dec, budget);
             }
             /* Finish any slot the batched quantum stopped (per-slot path
              * reconciles its checkpoint). Then also advance ONE non-decode
@@ -3006,18 +3075,9 @@ void *worker_main(void *arg) {
                         s->worker_finish_slot(d);
                 }
             }
-            session_slot *other = NULL;
-            for (int k = 0; k < s->n_slots; k++) {
-                session_slot *c = &s->slots[(rr + k) % s->n_slots];
-                /* inc 5: skip the slot already advanced in-band by the fused
-                 * quantum (pf_fuse) so it does not also run a classic chunk. */
-                if (c->active_job && c != pf_fuse && !slot_is_batchable_decode(c) &&
-                    !(c->gen && c->gen->batch_active)) {
-                    other = c;
-                    rr = (int)(c - s->slots) + 1;
-                    break;
-                }
-            }
+            /* inc 5: skip the slot already advanced in-band by the fused
+             * quantum (pf_fuse) so it does not also run a classic chunk. */
+            session_slot *other = worker_pick_step(s, &rr, pf_fuse, slot_steppable_beside_decode);
             if (other && other->gen && other->gen->phase != GEN_DONE) {
                 s->generate_job_step(other);
                 if (other->gen) slot_writer_flush(&other->gen->writer);
@@ -3029,15 +3089,7 @@ void *worker_main(void *arg) {
             continue;
         }
 
-        session_slot *sl = NULL;
-        for (int k = 0; k < s->n_slots; k++) {
-            session_slot *c = &s->slots[(rr + k) % s->n_slots];
-            if (c->active_job) {
-                sl = c;
-                rr = (int)(c - s->slots) + 1;
-                break;
-            }
-        }
+        session_slot *sl = worker_pick_step(s, &rr, NULL, slot_active);
         if (!sl) continue; /* unreachable: n_active > 0 */
 
         /* L118: this fall-through only runs when NO decode slot exists
