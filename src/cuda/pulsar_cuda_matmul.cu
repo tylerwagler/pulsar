@@ -1575,6 +1575,15 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
 
 
 
+/* L260 (Tyler 2026-10-01: decode rows may take width-dependent arithmetic -- the
+ * fastest arm at each width): DECODE rows from this many up take cuBLASLt, in both
+ * dense arms -- the bf16 weights (bf16_lt_decode_matmul) and the MXFP8 weights
+ * (cuda_matmul_fp8_mx_window); the GEMV kernels keep the rows below.  ONE threshold:
+ * every decode step at or below it is byte-identical to its rows at any narrower
+ * width, and the gates read that range from pulsar_gpu_matmul_decode_exact_rows(). */
+#define PULSAR_LT_DECODE_MIN_ROWS 11
+int pulsar_gpu_matmul_decode_exact_rows(void) { return PULSAR_LT_DECODE_MIN_ROWS - 1; }
+
 /* L158 inc 4: the tensor-core dense arm over a ROW WINDOW of full tensors --
  * rows [row0, row0 + n_tok) of x and out.  row0 = 0 is the ordinary call; the
  * mixed-batch prefix split uses row0 = n_dec for its prefill suffix, so the
@@ -1651,11 +1660,12 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * one is about to hand to cublasLtMatmul -- and `cache_next` is a plain
      * non-atomic counter two threads would both advance onto the same slot.
      * Per-thread costs one heuristic search per thread per shape; the entries
-     * are small metadata objects, not device memory. */
-    static thread_local lt_shape_cache cache[16];
+     * are small metadata objects, not device memory.  64: since L260 the decode
+     * widths from PULSAR_LT_DECODE_MIN_ROWS up share this cache with prefill. */
+    static thread_local lt_shape_cache cache[64];
     static thread_local int cache_next;
     lt_shape_cache *e = NULL;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 64; i++) {
         if (cache[i].valid && cache[i].in_dim == in_dim &&
             cache[i].out_dim == out_dim && cache[i].ntok == ntok &&
             cache[i].out_f16 == out_f16) { e = &cache[i]; break; }
@@ -1700,7 +1710,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
         }
         ne.valid = 1;
         e = &cache[cache_next];
-        cache_next = (cache_next + 1) & 15;
+        cache_next = (cache_next + 1) & 63;
         if (e->valid) {
             cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
             cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
@@ -1756,7 +1766,8 @@ static int cuda_attention_output_a_mx_gemm(
         uint32_t n_groups,
         const pulsar_gpu_tensor *heads,
         uint32_t n_tokens,
-        uint32_t row0) {   ///< L158 inc 4: rows [row0, row0+n_tokens) of a FULL-width heads encoding
+        uint32_t row0,     /* L158 inc 4: rows [row0, row0+n_tokens) of a FULL-width heads encoding */
+        int pick_rows) {   /* the row count the kernel is chosen at: CANON for prefill rows, n_tokens for decode (L260) */
     if (group_dim % 32 != 0 || rank % 128 != 0 || !cublaslt_ensure()) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t KB = group_dim / 32;
@@ -1817,24 +1828,27 @@ static int cuda_attention_output_a_mx_gemm(
      * byte-identical heads in (census 11, layer 2, 2026-09-06): cuBLASLt's
      * heuristic picks by M and two fixed-order kernels accumulate K
      * differently.  The heuristic must see MX scale pointers on the desc or
-     * it picks a non-MX algo; the per-group loop re-sets them per call. */
+     * it picks a non-MX algo; the per-group loop re-sets them per call.
+     * L260: DECODE rows (from PULSAR_LT_DECODE_MIN_ROWS) pass their own row
+     * count as pick_rows -- the fastest kernel per width, which decode rows
+     * may now take (Tyler 2026-10-01); prefill rows keep the canonical pick. */
     struct lt_group_shape {
-        uint64_t group_dim, rank; uint32_t n_groups; int valid;
+        uint64_t group_dim, rank; uint32_t n_groups; int pick_rows; int valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
     };
     /** thread_local -- same destroy-on-evict hazard as the shape cache above. */
-    static thread_local lt_group_shape shapes[4];
+    static thread_local lt_group_shape shapes[32];
     static thread_local int shapes_next;
     lt_group_shape *sh = NULL;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 32; i++) {
         if (shapes[i].valid && shapes[i].group_dim == group_dim && shapes[i].rank == rank &&
-            shapes[i].n_groups == n_groups) { sh = &shapes[i]; break; }
+            shapes[i].n_groups == n_groups && shapes[i].pick_rows == pick_rows) { sh = &shapes[i]; break; }
     }
     if (!sh) {
         lt_group_shape ns = {};
-        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups;
+        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups; ns.pick_rows = pick_rows;
         if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
@@ -1846,8 +1860,8 @@ static int cuda_attention_output_a_mx_gemm(
         cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
         cublasLtMatrixLayoutCreate(&ns.la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
         cublasLtMatrixLayout_t lb_c, ld_c;
-        cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, group_dim, PULSAR_BF16_LT_CANON_ROWS, group_dim);
-        cublasLtMatrixLayoutCreate(&ld_c, CUDA_R_32F, rank, PULSAR_BF16_LT_CANON_ROWS, low_dim);
+        cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, group_dim, pick_rows, group_dim);
+        cublasLtMatrixLayoutCreate(&ld_c, CUDA_R_32F, rank, pick_rows, low_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
         {
@@ -1865,32 +1879,34 @@ static int cuda_attention_output_a_mx_gemm(
             cublasLtMatrixLayoutDestroy(ns.la); cublasLtMatmulDescDestroy(ns.op);
             fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): no fixed-order cuBLASLt "
                             "kernel at %d rows -- refusing\n", (unsigned long long)group_dim,
-                    (unsigned long long)rank, n_groups, PULSAR_BF16_LT_CANON_ROWS);
+                    (unsigned long long)rank, n_groups, pick_rows);
             return 0;
         }
         ns.algo = hr.algo;
         ns.valid = 1;
         sh = &shapes[shapes_next];
-        shapes_next = (shapes_next + 1) & 3;
+        shapes_next = (shapes_next + 1) & 31;
         if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
         *sh = ns;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct lt_group_call {
-        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
+        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int pick_rows; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
-    static thread_local lt_group_call calls[8];
+    static thread_local lt_group_call calls[32];
     static thread_local int calls_next;
     lt_group_call *e = NULL;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 32; i++) {
         if (calls[i].valid && calls[i].group_dim == group_dim && calls[i].rank == rank &&
-            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens) { e = &calls[i]; break; }
+            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens &&
+            calls[i].pick_rows == pick_rows) { e = &calls[i]; break; }
     }
     if (!e) {
         lt_group_call ne = {};
         ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
+        ne.pick_rows = pick_rows;
         cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
         cublasLtMatmulHeuristicResult_t chk;
@@ -1900,12 +1916,12 @@ static int cuda_attention_output_a_mx_gemm(
             fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): the shape's fixed kernel "
                             "(chosen at %d rows) does not support %u rows -- refusing\n",
                     (unsigned long long)group_dim, (unsigned long long)rank, n_groups,
-                    PULSAR_BF16_LT_CANON_ROWS, n_tokens);
+                    pick_rows, n_tokens);
             return 0;
         }
         ne.valid = 1;
         e = &calls[calls_next];
-        calls_next = (calls_next + 1) & 7;
+        calls_next = (calls_next + 1) & 31;
         if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
         *e = ne;
     }
@@ -2515,7 +2531,27 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * serves every row; each row's result is bit-identical to the n == 1
          * kernel's below, so a row's bytes do not depend on the batch width.
          * (Until L158 an f32-activation twin of each kernel sat behind this
-         * arm for the no-slot case; the no-slot case refuses.) */
+         * arm for the no-slot case; the no-slot case refuses.)
+         * L260: from PULSAR_LT_DECODE_MIN_ROWS rows the cuBLASLt MX GEMM instead,
+         * heuristic asked at the call's own row count (split-K masked, as for
+         * prefill rows).  Measured, spec off, 16 banks, ABAB x2: c16 decode
+         * 75.6 -> 80.5 tok/s (+6.4%), c1/c5/c10 unchanged; all widths on it cost
+         * c1 -11.6% and c5 -5.8%, so the GEMV keeps the rows below. */
+        if (n_tok >= PULSAR_LT_DECODE_MIN_ROWS) {
+            static int said_mx = 0;
+            if (!said_mx) {
+                said_mx = 1;
+                fprintf(stderr, "pulsar: mxfp8 decode GEMMs from %d rows = cuBLASLt MX (heuristic at the "
+                                "call's row count)\n", PULSAR_LT_DECODE_MIN_ROWS);
+            }
+            if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
+                    weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+            fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (decode rows, n_tok=%llu "
+                            "in_dim=%llu out_dim=%llu) -- refusing\n",
+                    label ? label : "weights", (unsigned long long)n_tok,
+                    (unsigned long long)in_dim, (unsigned long long)out_dim);
+            return 0;
+        }
         if (n_tok >= 2) {
             if (in_dim % 128 != 0) {
                 fprintf(stderr, "pulsar: mxfp8 '%s' decode GEMV needs in_dim %% 128 == 0 (in_dim=%llu) "
@@ -2572,14 +2608,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     case 7: if (out_f16) PULSAR_FP8_NT_A8(7, __half); else PULSAR_FP8_NT_A8(7, float); break;
                     case 8: if (out_f16) PULSAR_FP8_NT_A8(8, __half); else PULSAR_FP8_NT_A8(8, float); break;
                     case 9: if (out_f16) PULSAR_FP8_NT_A8(9, __half); else PULSAR_FP8_NT_A8(9, float); break;
-                    case 10: if (out_f16) PULSAR_FP8_NT_A8(10, __half); else PULSAR_FP8_NT_A8(10, float); break;
-                    case 11: if (out_f16) PULSAR_FP8_NT_A8(11, __half); else PULSAR_FP8_NT_A8(11, float); break;
-                    case 12: if (out_f16) PULSAR_FP8_NT_A8(12, __half); else PULSAR_FP8_NT_A8(12, float); break;
-                    case 13: if (out_f16) PULSAR_FP8_NT_A8(13, __half); else PULSAR_FP8_NT_A8(13, float); break;
-                    case 14: if (out_f16) PULSAR_FP8_NT_A8(14, __half); else PULSAR_FP8_NT_A8(14, float); break;
-                    case 15: if (out_f16) PULSAR_FP8_NT_A8(15, __half); else PULSAR_FP8_NT_A8(15, float); break;
-                    default: if (out_f16) PULSAR_FP8_NT_A8(16, __half); else PULSAR_FP8_NT_A8(16, float); break;  ///< n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX
+                    default: if (out_f16) PULSAR_FP8_NT_A8(10, __half); else PULSAR_FP8_NT_A8(10, float); break;  ///< n_tok == 10 == PULSAR_LT_DECODE_MIN_ROWS - 1
                     }
+                    static_assert(PULSAR_LT_DECODE_MIN_ROWS == 11, "the mxfp8 nt switch covers 2..10 rows");
                     #undef PULSAR_FP8_NT_A8
                     #undef PULSAR_FP8_NT_A8_RO
                     return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
@@ -2828,6 +2859,92 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
     return 1;
 }
 
+
+/* L260 (Tyler 2026-10-01: decode rows may take width-dependent arithmetic -- the
+ * fastest arm at each width): DECODE rows from PULSAR_LT_DECODE_MIN_ROWS up
+ * take cuBLASLt with its heuristic asked AT THE CALL'S OWN ROW COUNT (split-K
+ * allowed; the prefill arm above pins one kernel per shape at 4096 rows and masks
+ * split-K out, which is right for chunk-invariant prefill and wrong here), the
+ * heuristic's first suggestion, cached per (shape, rows).  Measured, spec off, 16
+ * banks, ABAB: the output head at 9-16 rows 4.8 vs 6.0 ms; c16 decode +4.1%, c10 a
+ * tie, c5 -3.7% and c1 -7.2% had all widths moved -- so the nt / one-row kernels
+ * keep the rows below.  Graded: decode_reference_probe (same KL band as the nt
+ * arms) and spec_teacher_forced_probe (E[accept] 0.5409 -> 0.5432, sub-point). */
+static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *xb,
+                                 uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    if (!cublaslt_ensure()) {
+        fprintf(stderr, "pulsar: bf16 GEMM on decode rows: cuBLASLt handle not ready -- refusing\n");
+        return 0;
+    }
+    const size_t wz = 32u << 20;
+    struct bf16_lt_decode_ent {
+        uint64_t in_dim, out_dim; int ntok; int valid;
+        cublasLtMatmulDesc_t op;
+        cublasLtMatrixLayout_t la, lb, ld;
+        cublasLtMatmulAlgo_t algo;
+    };
+    static thread_local bf16_lt_decode_ent cache[64];
+    static thread_local int cache_next;
+    const int ntok = (int)n_tok;
+    bf16_lt_decode_ent *e = NULL;
+    for (int i = 0; i < 64; i++)
+        if (cache[i].valid && cache[i].in_dim == in_dim && cache[i].out_dim == out_dim && cache[i].ntok == ntok) {
+            e = &cache[i];
+            break;
+        }
+    if (!e) {
+        bf16_lt_decode_ent ne = {};
+        ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
+        if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+        cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_16BF, in_dim, out_dim, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_16BF, in_dim, ntok, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
+        cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+        cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        cublasLtMatmulHeuristicResult_t hr; int got = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &hr, &got);
+        cublasLtMatmulPreferenceDestroy(pf);
+        if (hs != CUBLAS_STATUS_SUCCESS || !got) {
+            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb); cublasLtMatrixLayoutDestroy(ne.ld);
+            cublasLtMatmulDescDestroy(ne.op);
+            fprintf(stderr, "pulsar: bf16 GEMM on %d decode rows (in_dim=%llu out_dim=%llu): no cuBLASLt kernel -- refusing\n",
+                    ntok, (unsigned long long)in_dim, (unsigned long long)out_dim);
+            return 0;
+        }
+        ne.algo = hr.algo;
+        ne.valid = 1;
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: bf16 decode GEMMs from %d rows = cuBLASLt, heuristic at the call's row count "
+                            "(first: %d rows, in %llu out %llu); below = the nt / one-row kernels\n",
+                    PULSAR_LT_DECODE_MIN_ROWS, ntok, (unsigned long long)in_dim, (unsigned long long)out_dim);
+        }
+        e = &cache[cache_next];
+        cache_next = (cache_next + 1) & 63;
+        if (e->valid) {
+            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld);
+            cublasLtMatmulDescDestroy(e->op);
+        }
+        *e = ne;
+    }
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, wz, "bf16 lt decode scratch")) return 0;
+    void *ws = cuda_arena_take(&ar, wz, 256);
+    if (!ws) return 0;
+    const float al = 1.0f, be = 0.0f;
+    const cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, w, e->la, xb, e->lb, &be, out, e->ld, out, e->ld,
+                                             &e->algo, ws, wz, cudaStreamPerThread);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "pulsar: cuBLASLt bf16 decode matmul failed: status %d\n", (int)st);
+        return 0;
+    }
+    return 1;
+}
+
 static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
                             uint64_t in_dim, uint64_t out_dim,
                             const pulsar_gpu_tensor *x, uint64_t n_tok) {
@@ -2897,11 +3014,15 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
     {
         /* Row kind (see the header at g_batch_decode_rows): prefill rows take
          * the fixed-order cuBLASLt arm at any n_tok, one included (L183);
-         * decode rows take the nt kernels at 2..cap and the one-row kernel
-         * below at 1. */
+         * decode rows take cuBLASLt at the call's own row count from
+         * PULSAR_LT_DECODE_MIN_ROWS (L260), the nt kernels below that and
+         * the one-row kernel at 1. */
         const int decode_kind = g_batch_decode_rows > 0;
         if (!decode_kind) {
             return bf16_lt_matmul(out->ptr, w, (const uint16_t *)xb16, in_dim, out_dim, n_tok);
+        }
+        if (n_tok >= PULSAR_LT_DECODE_MIN_ROWS) {
+            return bf16_lt_decode_matmul(out->ptr, w, (const uint16_t *)xb16, in_dim, out_dim, n_tok);
         }
         if (n_tok >= 2) {
             #define PULSAR_NT_LAUNCH_R(N, RR) matmul_nt_kernel<N, RR, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
@@ -2920,14 +3041,9 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
             case 7: PULSAR_NT_LAUNCH(7); break;
             case 8: PULSAR_NT_LAUNCH(8); break;
             case 9: PULSAR_NT_LAUNCH(9); break;
-            case 10: PULSAR_NT_LAUNCH(10); break;
-            case 11: PULSAR_NT_LAUNCH(11); break;
-            case 12: PULSAR_NT_LAUNCH(12); break;
-            case 13: PULSAR_NT_LAUNCH(13); break;
-            case 14: PULSAR_NT_LAUNCH(14); break;
-            case 15: PULSAR_NT_LAUNCH(15); break;
-            default: PULSAR_NT_LAUNCH(16); break;  ///< n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX
+            default: PULSAR_NT_LAUNCH(10); break;  ///< n_tok == 10 == PULSAR_LT_DECODE_MIN_ROWS - 1
             }
+            static_assert(PULSAR_LT_DECODE_MIN_ROWS == 11, "the nt switch covers 2..10 rows");
             #undef PULSAR_NT_LAUNCH
             #undef PULSAR_NT_LAUNCH_R
             return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
@@ -3069,17 +3185,11 @@ static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, i
     case 8: PULSAR_OA_NT(8); break;
     case 9: PULSAR_OA_NT(9); break;
     case 10: PULSAR_OA_NT(10); break;
-    case 11: PULSAR_OA_NT(11); break;
-    case 12: PULSAR_OA_NT(12); break;
-    case 13: PULSAR_OA_NT(13); break;
-    case 14: PULSAR_OA_NT(14); break;
-    case 15: PULSAR_OA_NT(15); break;
-    case 16: PULSAR_OA_NT(16); break;
     default:
         #undef PULSAR_OA_NT
-        fprintf(stderr, "pulsar: %s: n_tokens=%u is above the row cap %u -- refusing "
-                        "(the tensor-core 'a' arm owns this width)\n",
-                what, n_tokens, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        static_assert(PULSAR_LT_DECODE_MIN_ROWS == 11, "the 'a' nt switch covers 2..10 rows");
+        fprintf(stderr, "pulsar: %s: n_tokens=%u is past %d -- refusing (the cuBLASLt 'a' arm owns "
+                        "this width)\n", what, n_tokens, PULSAR_LT_DECODE_MIN_ROWS - 1);
         return 0;
     }
     return cuda_ok(cudaGetLastError(), what);
@@ -3207,7 +3317,8 @@ int pulsar_gpu_attention_output_a_tensor(
              * full-width grouped encoding through a row window (L158 inc 4). */
             const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
             int r2 = cuda_attention_output_a_mx_gemm(&low_suf, model_map, model_size, out_a_offset,
-                                                     group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec);
+                                                     group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec,
+                                                     PULSAR_BF16_LT_CANON_ROWS);
             g_batch_decode_rows = saved;
             return r1 && r2;
         }
@@ -3226,13 +3337,33 @@ int pulsar_gpu_attention_output_a_tensor(
      * call refuses; the tensor-core arm's failure used to fall to the GEMV. */
     if (g_batch_decode_rows == 0) {
         if (!cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
-                                             group_dim, rank, n_groups, heads, n_tokens, 0)) {
+                                             group_dim, rank, n_groups, heads, n_tokens, 0,
+                                             PULSAR_BF16_LT_CANON_ROWS)) {
             fprintf(stderr, "pulsar: attn-out 'a' tensor-core GEMM failed (n_tokens=%u rank=%llu "
                             "group_dim=%llu) -- refusing\n",
                     n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
             return 0;
         }
         return 1;
+    }
+    /* L260: DECODE rows from PULSAR_LT_DECODE_MIN_ROWS take the same cuBLASLt
+     * grouped arm with the kernel chosen at their own row count.  Measured, spec
+     * off, 16 banks, ABAB x2 (b750f34a + probe): c16 decode 75.8 -> 76.7 tok/s
+     * (+1.2%, sd 0.25), c1/c5/c10 unchanged; all widths on it cost c1 -10.7%. */
+    if (n_tokens >= PULSAR_LT_DECODE_MIN_ROWS) {
+        static int said_a = 0;
+        if (!said_a) {
+            said_a = 1;
+            fprintf(stderr, "pulsar: attn-out 'a' decode GEMMs from %d rows = cuBLASLt grouped MX (kernel "
+                            "chosen at the call's row count)\n", PULSAR_LT_DECODE_MIN_ROWS);
+        }
+        if (cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
+                                            group_dim, rank, n_groups, heads, n_tokens, 0, (int)n_tokens))
+            return 1;
+        fprintf(stderr, "pulsar: attn-out 'a' cuBLASLt GEMM failed (decode rows, n_tokens=%u rank=%llu "
+                        "group_dim=%llu) -- refusing\n",
+                n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
+        return 0;
     }
     return launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
                                   group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,

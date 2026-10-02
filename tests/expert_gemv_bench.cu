@@ -17,7 +17,16 @@
  * The checksum folds every set's output.  mid defaults to the pair's half
  * width; 2048 is the one-box shape.
  *
- *   tests/expert_gemv_bench [n_tokens=1] [iters=200] [mid=1024]
+ * arm=grouped times pulsar_cutlass_grouped_moe -- the prefill arm (E4M3
+ * gather, grouped gate/up, SwiGLU pack, grouped down) -- on the same rows and
+ * sets, with the engine's padded-row upper bound (routed_moe_launch_cutlass_
+ * grouped), so the decode-width question "would the tensor-core arm win here?"
+ * is answered at the shape it would run.  Not timed: the engine's on-device
+ * count/offset build and the scatter + moe_sum after (small passes), so the
+ * grouped figure is a lower bound.  Its checksum is its own (a different
+ * arithmetic); bytes are the same distinct experts.
+ *
+ *   tests/expert_gemv_bench [n_tokens=1] [iters=200] [mid=1024] [arm=gemv|grouped]
  */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
@@ -80,6 +89,11 @@ int main(int argc, char **argv) {
     const int n_tokens = argc > 1 ? atoi(argv[1]) : 1;
     const int iters = argc > 2 ? atoi(argv[2]) : 200;
     const int mid = argc > 3 ? atoi(argv[3]) : 1024;
+    const bool grouped = argc > 4 && strcmp(argv[4], "grouped") == 0;
+    if (argc > 4 && !grouped && strcmp(argv[4], "gemv") != 0) {
+        fprintf(stderr, "expert_gemv_bench: arm must be gemv or grouped (got %s)\n", argv[4]);
+        return 1;
+    }
     const int n_total = 256, n_expert = 6, in = 4096, out = 4096;
     const int n_slots = n_tokens * n_expert;
     enum { N_SETS = 16 };
@@ -116,7 +130,51 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&dxq, xq.size())); CK(cudaMemcpy(dxq, xq.data(), xq.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dxs, xs.size())); CK(cudaMemcpy(dxs, xs.data(), xs.size(), cudaMemcpyHostToDevice));
 
+    /* grouped arm: per set, each expert's rows at 128-row-padded offsets, the
+     * padded row -> token map and per-row routing weight; the padded bound is
+     * the engine's (pair_count + 128 * min(n_total, pair_count), rounded). */
+    const int nact = n_total < n_slots ? n_total : n_slots;
+    const int padded_total = (int)(((uint64_t)n_slots + 128ull * nact + 127ull) / 128ull * 128ull);
+    uint32_t *dcounts = NULL, *doffs = NULL; int32_t *dsrc = NULL; float *dwg = NULL, *dgout = NULL;
+    uint8_t *dscr = NULL; size_t scr_bytes = 0;
+    if (grouped) {
+        std::vector<uint32_t> counts((size_t)N_SETS * n_total), offs((size_t)N_SETS * n_total);
+        std::vector<int32_t> src((size_t)N_SETS * padded_total, -1);
+        std::vector<float> wg((size_t)N_SETS * padded_total, 0.0f);
+        for (int set = 0; set < N_SETS; set++) {
+            uint32_t *c = counts.data() + (size_t)set * n_total, *o = offs.data() + (size_t)set * n_total;
+            const int32_t *sl = sel.data() + (size_t)set * n_slots;
+            for (int q = 0; q < n_slots; q++) c[sl[q]]++;
+            uint32_t at = 0;
+            for (int e = 0; e < n_total; e++) { o[e] = at; at += (c[e] + 127u) / 128u * 128u; }
+            if ((int)at > padded_total) { fprintf(stderr, "expert_gemv_bench: padded rows %u > bound %d\n", at, padded_total); return 1; }
+            std::vector<uint32_t> fill(n_total, 0);
+            for (int q = 0; q < n_slots; q++) {
+                const int e = sl[q];
+                const size_t row = (size_t)set * padded_total + o[e] + fill[e]++;
+                src[row] = q / n_expert;
+                wg[row] = rw[q];
+            }
+        }
+        CK(cudaMalloc(&dcounts, counts.size() * 4)); CK(cudaMemcpy(dcounts, counts.data(), counts.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&doffs, offs.size() * 4));     CK(cudaMemcpy(doffs, offs.data(), offs.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dsrc, src.size() * 4));       CK(cudaMemcpy(dsrc, src.data(), src.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dwg, wg.size() * 4));         CK(cudaMemcpy(dwg, wg.data(), wg.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dgout, (size_t)padded_total * out * 4));
+        scr_bytes = pulsar_cutlass_grouped_moe_scratch_bytes(padded_total, n_total, in, mid, out);
+        CK(cudaMalloc(&dscr, scr_bytes));
+    }
     auto call = [&](int set) {
+        if (grouped) {
+            const int k = set % N_SETS;
+            const int rc = pulsar_cutlass_grouped_moe(dgout, NULL, dwg + (size_t)k * padded_total, gt, ut, dt, gd, dd,
+                                                      7.0f, n_total, in, mid, out,
+                                                      dcounts + (size_t)k * n_total, doffs + (size_t)k * n_total,
+                                                      padded_total, dscr, scr_bytes, dxq, dxs, kbp,
+                                                      dsrc + (size_t)k * padded_total);
+            if (rc) { fprintf(stderr, "expert_gemv_bench: the grouped GEMM refused (rc %d)\n", rc); exit(1); }
+            return;
+        }
         const int rc = pulsar_cutlass_expert_ffn_gemv_small(dout, dsel + (size_t)(set % N_SETS) * n_slots, drw, gt, ut, dt, gs, gd, ds, dd,
                                                             7.0f, n_tokens, n_expert, (unsigned)n_total,
                                                             in, mid, out, dxq, dxs, kbp);
@@ -145,13 +203,14 @@ int main(int argc, char **argv) {
     const double distinct = distinct_sum / iters;
     const double bytes = distinct * (gs + us + ds);
     uint64_t sum = 1469598103934665603ull;
-    std::vector<float> h((size_t)n_slots * out);
+    std::vector<float> h((size_t)(grouped ? padded_total : n_slots) * out);
     for (int set = 0; set < N_SETS; set++) {
         call(set);
-        CK(cudaMemcpy(h.data(), dout, h.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h.data(), grouped ? dgout : dout, h.size() * 4, cudaMemcpyDeviceToHost));
         for (float f : h) { uint32_t w; memcpy(&w, &f, 4); sum = (sum ^ w) * 1099511628211ull; }
     }
-    printf("expert_gemv_bench: n_tokens=%d mid=%d slots=%d distinct=%.2f  %.2f us/call  %.1f GB/s  checksum %016llx\n",
-           n_tokens, mid, n_slots, distinct, us_call, bytes / (us_call * 1e3), (unsigned long long)sum);
+    printf("expert_gemv_bench: arm=%s n_tokens=%d mid=%d slots=%d distinct=%.2f  %.2f us/call  %.1f GB/s  checksum %016llx\n",
+           grouped ? "grouped" : "gemv", n_tokens, mid, n_slots, distinct, us_call, bytes / (us_call * 1e3),
+           (unsigned long long)sum);
     return 0;
 }

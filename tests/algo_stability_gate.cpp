@@ -164,6 +164,20 @@ int GATE_ENTRY(int argc, char **argv) {
         const bool batched = widths[wi] >= 2;
         if (d < 0) {
             printf("ALGO-STABILITY: bank0 logits M=%d == M=2 (byte-identical)\n", widths[wi]);
+        } else if (batched && gate_width_inexact(widths[wi])) {
+            /* L260: past the width-exact range the step takes width-dependent
+             * arithmetic by design (Tyler 2026-10-01) -- graded, not byte-gated. */
+            const double kl = gate_row_kl(row[ref], row[wi], vocab);
+            if (kl <= GATE_DECODE_WIDTH_KL_TOL) {
+                printf("ALGO-STABILITY: bank0 logits M=%d vs M=2: KL %.3e <= %.2g (width-dependent arithmetic "
+                       "past %d rows)\n", widths[wi], kl, GATE_DECODE_WIDTH_KL_TOL,
+                       pulsar_gpu_matmul_decode_exact_rows());
+            } else {
+                fprintf(stderr, "ALGO-STABILITY GATE FAIL: bank0 logits M=%d vs M=2: KL %.3e > %.2g -- adding rows "
+                        "perturbed a co-scheduled decode bank beyond the arithmetic's measured spread\n",
+                        widths[wi], kl, GATE_DECODE_WIDTH_KL_TOL);
+                g_fail = 1;
+            }
         } else if (batched) {
             fprintf(stderr, "ALGO-STABILITY GATE FAIL: bank0 logits M=%d DIFFER from "
                     "M=2 at float %ld (%.9g vs %.9g) — adding rows perturbed a "

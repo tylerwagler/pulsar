@@ -11,6 +11,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,34 @@ static inline long gate_first_diff(const float *a, const float *b, long n) {
     for (long i = 0; i < n; i++) if (a[i] != b[i]) return i;
     return -1;
 }
+
+/* L260: the per-row bound for a decode row compared ACROSS the width-exact
+ * boundary (pulsar_gpu_matmul_decode_exact_rows): KL(narrow || wide) over the
+ * softmax.  Measured worst rows, width 12/16 vs narrower (2026-10-02, all three
+ * cuBLASLt decode arms): 4.7e-2 on the B300 reference text
+ * (decode_reference_probe), 0.39 on GATE 5R's replayed-prompt rows (off-
+ * distribution context; 0.32 with a top-1 flip already under the bf16 arm
+ * alone).  2.5x the worst measured.  GATE 5R checks in-gate that a row from the
+ * WRONG bank's context clears this bound, so it still separates corruption. */
+#define GATE_DECODE_WIDTH_KL_TOL 1.0
+
+/* KL(ref || cur) over the softmax of two logit rows, in double. */
+static inline double gate_row_kl(const float *ref, const float *cur, long n) {
+    double mr = -INFINITY, mc = -INFINITY;
+    for (long i = 0; i < n; i++) { if (ref[i] > mr) mr = ref[i]; if (cur[i] > mc) mc = cur[i]; }
+    double zr = 0, zc = 0;
+    for (long i = 0; i < n; i++) { zr += exp((double)ref[i] - mr); zc += exp((double)cur[i] - mc); }
+    const double lzr = mr + log(zr), lzc = mc + log(zc);
+    double kl = 0;
+    for (long i = 0; i < n; i++) {
+        const double lp = (double)ref[i] - lzr;
+        kl += exp(lp) * (lp - ((double)cur[i] - lzc));
+    }
+    return kl < 0 ? 0 : kl;
+}
+
+/* True when a decode step of `rows` rows takes width-dependent arithmetic. */
+static inline bool gate_width_inexact(int rows) { return rows > pulsar_gpu_matmul_decode_exact_rows(); }
 
 /* Populate bank `bank` of session s from the token view [v, v+len): repoint
  * the graph at the bank (when a pool exists), invalidate (no prefix reuse

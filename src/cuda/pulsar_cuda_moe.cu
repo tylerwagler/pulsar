@@ -613,8 +613,8 @@ static int routed_moe_launch_mixed40(
     /* the CUTLASS side's inner (K) dim: in_dim for gate/up (A), mid_dim for down (B) */
     /* Row KIND chooses (pulsar_gpu_matmul_batch_decode_rows, pulsar_gpu.h;
      * the two-pass split in routed_moe_batch_impl leaves the count at 0 or
-     * >= n_tokens here).  Decode rows take the PER-EXPERT single-proj CUTLASS
-     * path: fixed compile-time tiles, each row's output independent of the
+     * >= n_tokens here).  Decode rows take the pair-layout W4A8 GEMV (L219,
+     * the else-arms below; no CUTLASS): each row's output independent of the
      * batch.  Prefill rows take the grouped, no-host-sync path at any
      * n_tokens, whose per-expert group sizes -- and therefore its numerics --
      * depend on the batch composition.  (Row count chose this until L167: > 4
@@ -785,7 +785,7 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter (E4M3)");
             }
         } else {
-            /* decode/verify (n<=4): lean W4A8 GEMV -> mid's E4M3 slot (fused swiglu+routing
+            /* decode/verify rows (any width to the row cap): lean W4A8 GEMV -> mid's E4M3 slot (fused swiglu+routing
              * weight), pair layout, ONE launch over all slots -- no gather/scatter, no host
              * sync, no TC underfill, and no separate encode (L219). */
             (void)gate_g; (void)up_g; (void)mid_g;
@@ -889,7 +889,7 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40B down scatter");
             }
         } else if (ok) {
-            /* decode/verify (n<=4): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
+            /* decode/verify rows (any width to the row cap): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
              * slots (the routing weight is already in the mid E4M3 the gate/up epilogue emitted). */
             (void)out_g;
             if (pulsar_cutlass_gemv_down(down_flat, selected_ptr,

@@ -29,6 +29,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
+#include "gate_fixture.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -266,6 +267,13 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
                 CHECK(0, "%s: tick %d batched redraft: %s", name, t, err);
         }
         peek_all(r, g_nb, bat);
+        /* L260: a batched drafter step wider than the width-exact range takes
+         * width-dependent arithmetic by design -- its rows are graded against the
+         * serialized ones (KL), and draft identity (ids, conf, rng) is no longer
+         * owed; structure is. */
+        uint32_t bat_rows = 0;
+        for (int b = 0; b < g_nb; b++) bat_rows += ser_nd[b];
+        const bool graded = gate_width_inexact((int)bat_rows);
         /* stage comparison: batched rows sit at [base_row_b, +n_draft) with the
          * greedy banks first in bank order (all-greedy: bank order) */
         {
@@ -292,6 +300,11 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
                         if (nl || nh)
                             printf("  STAGE %s tick %d bank %d row %u: hidden differs in %d/%u (max %.3g), logits differ in %d/%d (max %.3g)\n",
                                    name, t, b, k, nh, PULSAR_N_EMBD, (double)mh, nl, vocab, (double)ml);
+                        if (graded && nl) {
+                            const double kl = gate_row_kl(sl, ql, vocab);
+                            CHECK(kl <= GATE_DECODE_WIDTH_KL_TOL, "%s: tick %d bank %d row %u: KL %.3e > %.2g at width %u",
+                                  name, t, b, k, kl, GATE_DECODE_WIDTH_KL_TOL, bat_rows);
+                        }
                     }
                     off += ser_nd[b];
                 }
@@ -302,6 +315,14 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
             CHECK(ser[b].present == bat[b].present, "%s: tick %d bank %d present %d vs %d", name, t, b,
                   ser[b].present, bat[b].present);
             if (!ser[b].present || !bat[b].present) continue;
+            if (graded) {
+                CHECK(ser[b].n_draft == bat[b].n_draft, "%s: tick %d bank %d n_draft %u vs %u", name, t, b,
+                      ser[b].n_draft, bat[b].n_draft);
+                compared++;
+                if ((int)ser[b].n_draft > deepest) deepest = (int)ser[b].n_draft;
+                if ((int)ser[b].n_draft < shallowest) shallowest = (int)ser[b].n_draft;
+                continue;
+            }
             CHECK(ser[b].n_draft == bat[b].n_draft && ser[b].keep == bat[b].keep &&
                   ser[b].sampled == bat[b].sampled,
                   "%s: tick %d bank %d n_draft/keep/sampled %u/%u/%d vs %u/%u/%d", name, t, b,

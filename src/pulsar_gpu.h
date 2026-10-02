@@ -761,9 +761,9 @@ void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, 
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
 
-/** The widest DECODE batch the M-independent kernels take (the nt GEMV
- * instantiations in pulsar_cuda_matmul.cu, the small-batch expert FFN GEMV
- * and per-expert projection in pulsar_cuda_moe.cu enumerate up to it).  It
+/** The widest DECODE batch the decode arms take (the small-batch expert FFN
+ * GEMV and per-expert projection in pulsar_cuda_moe.cu enumerate up to it; the
+ * dense GEMMs switch to cuBLASLt past pulsar_gpu_matmul_decode_exact_rows()).  It
  * bounds pulsar_gpu_matmul_set_batch_decode_rows, and the PULSAR_MSEQ_MAX
  * static_assert in the engine keeps the bank count inside it: a decode row
  * past this width would have no M-independent arm, so growing PULSAR_MSEQ_MAX
@@ -773,10 +773,13 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
 /** ROW KIND.  `n` is the number of leading DECODE rows in the batch being
  * encoded -- a fact about the rows, declared by the lane that owns them, and
  * the ONE thing every dense GEMM and MoE dispatcher reads to choose its arm:
- *   - decode rows (n > 0, n >= the call's n_tok) take the M-INDEPENDENT arms
- *     (one-row GEMV at 1, nt / small-batch FFN / per-expert projection at
- *     2..PULSAR_GPU_MNEUTRAL_ROWS_MAX), so a decode row's bytes depend on
- *     neither its batchmates nor the batch width;
+ *   - decode rows (n > 0, n >= the call's n_tok) take the decode arms: the
+ *     one-row GEMV at 1; the dense nt GEMVs at 2..pulsar_gpu_matmul_decode_exact_rows()
+ *     and cuBLASLt at the call's own row count above it (L260, Tyler 2026-10-01:
+ *     the fastest arm per width, graded by KL rather than byte-gated); the
+ *     small-batch FFN / per-expert projection at 2..PULSAR_GPU_MNEUTRAL_ROWS_MAX.
+ *     A decode row's bytes never depend on its batchmates' VALUES, and within
+ *     the exact range not on the batch width either;
  *   - prefill rows (n == 0) take the TENSOR-CORE arms (cuBLAS(Lt), grouped
  *     CUTLASS) at ANY n_tok, one row included -- the arm the B300 reference
  *     computes prefill rows with;
@@ -799,6 +802,11 @@ int pulsar_gpu_model_reads_host_pages(void);
 
 int pulsar_gpu_matmul_set_batch_decode_rows(int n);
 int pulsar_gpu_matmul_batch_decode_rows(void);
+/** L260: the widest decode step whose rows are still BYTE-IDENTICAL to the same
+ *  rows at any narrower width (and alone).  Wider decode steps take width-
+ *  dependent arithmetic (Tyler 2026-10-01: the fastest arm per width), graded,
+ *  not byte-gated -- the gates read this rather than restating the threshold. */
+int pulsar_gpu_matmul_decode_exact_rows(void);
 
 int pulsar_gpu_matmul_bf16_tensor(
         pulsar_gpu_tensor       *out,
