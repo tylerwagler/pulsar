@@ -678,6 +678,20 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
+int pulsar_image_block_starts(const pulsar_tokens *tokens, int len, int *starts, int cap) {
+    if (!tokens || len < 0 || len > tokens->len) return -1;
+    int n = 0;
+    for (int i = 0; i < len; ) {
+        if (tokens->v[i] < (int)PULSAR_N_VOCAB) { i++; continue; }
+        int blk = 0;
+        if (!vision_span_extent(tokens->v, len, (int)PULSAR_N_VOCAB, i, &blk) || blk <= 0) return -1;
+        if (n < cap && starts) starts[n] = i;
+        n++;
+        i += blk;
+    }
+    return n;
+}
+
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen) {
