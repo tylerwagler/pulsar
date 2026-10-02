@@ -888,6 +888,9 @@ typedef struct {
 
 void slot_writer_init(slot_writer *w, int fd);
 void slot_writer_install(slot_writer *w);  ///< thread-local; NULL uninstalls
+/** A prefill chunk is done for the slot whose gen_state is `ud`: progress, SSE keepalive,
+ * the prefill log line and the L114 counter (server_jobs.cpp). */
+void gen_prefill_progress_cb(void *ud, const char *event, int current, int total);
 bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
