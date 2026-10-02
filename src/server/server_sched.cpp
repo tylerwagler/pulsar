@@ -2625,12 +2625,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                          (unsigned)c->bank);
                 s->gen_prefill_fail(c, false);
             } else {
-                /* L114 counter, through the per-slot watermark the classic
-                 * progress callback ticks (the two compose without recounting). */
-                if (fr[r].p0 + fr[r].k > c->prefill_counted) {
-                    s->w_prefill_chunk_tokens += (uint64_t)(fr[r].p0 + fr[r].k - c->prefill_counted);
-                    c->prefill_counted = fr[r].p0 + fr[r].k;
-                }
+                /* The classic sync's per-chunk callback: slot progress for
+                 * /metrics, the SSE headers and keepalive (a long prompt riding
+                 * fused rounds was silent to its client for minutes), the
+                 * prefill log line with its rate, and the L114 counter through
+                 * the per-slot watermark. */
+                gen_prefill_progress_cb(pg, "prefill_chunk", fr[r].p0 + fr[r].k,
+                                        pg->prompt_for_sync->len);
                 if (fr[r].fin) {
                     slot_writer_install(&pg->writer);
                     s->gen_stream_begin(c);

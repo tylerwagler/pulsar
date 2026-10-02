@@ -553,8 +553,11 @@ done:
 
 /* Chunk-note wrapper around server_progress_cb: counts completed prefill
  * chunks in the CURRENT pulsar_session_sync call so the cancel callback can
- * interrupt after exactly one chunk. Counters are reset before each sync. */
-static void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+ * interrupt after exactly one chunk. Counters are reset before each sync.
+ * The fused lane calls it too, once per recorded chunk (server_sched.cpp), so a
+ * prompt riding fused rounds reports progress, keeps its SSE stream alive and
+ * logs its rate exactly like a classic sync. */
+void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     gen_state *g = (gen_state *)ud;
     if (event && strcmp(event, "prefill_chunk") == 0) {
         if (g->prefill_last_current >= 0 && current > g->prefill_last_current) {
