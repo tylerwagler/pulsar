@@ -190,7 +190,12 @@ static bool worker_kv_blob_save(pulsar_engine *e, pulsar_session *s, const char 
 /* L250 phase 2: load this rank's own copy, but only the RIGHT one.  Every field
  * a stale or foreign copy could get wrong is checked before a byte of payload
  * is read, and the restored state is checked against the leader's afterwards.
- * A partial load leaves this session in a state the leader then invalidates. */
+ * A partial load leaves this session in a state the leader then invalidates.
+ * The writer's BUILD is not one of them (L261, 2026-10-02): the copy's format is
+ * the blob version plus the payload's own magic/version, the transport's is the
+ * protocol, and the state digest is checked before and after the load -- keyed
+ * to the build, every redeploy made every worker copy a miss (the head's .kv
+ * files were never build-keyed).  A copy from another build is said so. */
 static bool worker_kv_blob_load(pulsar_engine *e, pulsar_session *s, const char *path,
                                 int want_tokens, uint64_t want_digest,
                                 char *err, size_t errlen) {
@@ -207,9 +212,9 @@ static bool worker_kv_blob_load(pulsar_engine *e, pulsar_session *s, const char 
     else if (h.rank != (uint32_t)pulsar_tp_rank(e->tp) || h.n_ranks != pulsar_tp_n_ranks(e->tp))
         { ok = false; snprintf(err, errlen, "copy is for rank %u/%u, this is rank %d/%u", h.rank, h.n_ranks,
                                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp)); }
-    else if (h.protocol != PULSAR_TP_PROTOCOL_VERSION || h.build_digest != e->tp_build_digest)
-        { ok = false; snprintf(err, errlen, "copy was written by another build (protocol %u, build %016llx)",
-                               h.protocol, (unsigned long long)h.build_digest); }
+    else if (h.protocol != PULSAR_TP_PROTOCOL_VERSION)
+        { ok = false; snprintf(err, errlen, "copy was written under protocol %u, this rank speaks %u",
+                               h.protocol, PULSAR_TP_PROTOCOL_VERSION); }
     else if ((int)h.n_tokens != want_tokens || h.state_digest != want_digest)
         { ok = false; snprintf(err, errlen, "copy holds %u tokens digest %016llx, the leader restored %d digest %016llx",
                                h.n_tokens, (unsigned long long)h.state_digest, want_tokens,
@@ -226,6 +231,11 @@ static bool worker_kv_blob_load(pulsar_engine *e, pulsar_session *s, const char 
                  s->checkpoint.len, (unsigned long long)pulsar_session_checkpoint_digest(s),
                  want_tokens, (unsigned long long)want_digest);
     }
+    if (ok && h.build_digest != e->tp_build_digest)
+        fprintf(stderr, "pulsar: tp worker: kv cache copy written by build %016llx loaded under build %016llx "
+                        "(blob v%u, protocol %u, %d tokens, state digest matched before and after)\n",
+                (unsigned long long)h.build_digest, (unsigned long long)e->tp_build_digest,
+                h.version, h.protocol, want_tokens);
     return ok;
 }
 
