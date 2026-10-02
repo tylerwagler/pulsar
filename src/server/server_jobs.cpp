@@ -649,7 +649,18 @@ void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
                    g->disk_cache_path, g->err);
     }
     sl->continued_last_store_tokens = 0;
-    pulsar_session_invalidate(s->sess);
+    /* pulsar_session_invalidate acts on the LIVE bank.  A fused round abandons a
+     * rider while another conversation's bank is live (L261 2026-10-02: a client
+     * that disconnected during a fused prefill wiped a decoding bank's KV, its next
+     * step failed on both ranks and the pair was marked failed), so install the
+     * slot's own bank first.  A bank that cannot be installed is left alone, and so
+     * is every other bank. */
+    if (s->bank_switch(sl->bank))
+        pulsar_session_invalidate(s->sess);
+    else
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: bank %d not installed after a failed prefill; left as is "
+                   "(no other bank is invalidated)", sl->bank);
     s->trace_event(g->trace_id, "prefill failed: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
