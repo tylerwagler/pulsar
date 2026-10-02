@@ -75,8 +75,8 @@ __global__ static void matmul_nt_kernel(
      * row (the 1 GB head at NT=16: 129280 rows x 128 KB = 16 GB of L2 traffic
      * per call, +0.5 ms per row in the L151 sweep).  With R rows per block the
      * per-token activation loads are issued once and applied to R weight rows.
-     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 1 up to 4 rows, 2 up to 8,
-     * 4 above, capped by out_dim) -- that is allowed because R never changes
+     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 1 up to 4 rows, 2 above,
+     * capped by out_dim) -- that is allowed because R never changes
      * a (row, token) accumulator's sequence: the per-(row, token) FMA
      * sequence and the 256-wide tree reduction below are exactly the R=1
      * kernel's, so every output is bit-identical at every M and every R.
@@ -165,9 +165,14 @@ __global__ static void matmul_nt_kernel(
  * accumulator's sequence, so it may follow the row count.  1 up to 4 rows
  * (roofline already), 2 up to 8, 4 above; capped by out_dim (the 1 GB head
  * takes 4, N >= 8192 takes 2, small shapes stay 1). */
+/* L260: 4 rows per block above 8 tokens held 4 x 16 accumulators per thread and
+ * ran the 1 GB output head at ~130 GB/s (8.2 ms a call at 9-16 rows, against 4.2
+ * at <= 4); 2 rows per block runs it at 6.2 ms and c5 decode +6% (one Spark,
+ * nsys).  R changes no accumulator's sequence (see the kernel), so every R is
+ * bit-identical. */
 static int nt_rows_per_block(int NT, uint64_t out_dim) {
-    const int by_rows = NT <= 4 ? 1 : (NT <= 8 ? 2 : 4);
-    const int by_shape = out_dim >= 65536 ? 4 : out_dim >= 8192 ? 2 : 1;
+    const int by_rows = NT <= 4 ? 1 : 2;
+    const int by_shape = out_dim >= 8192 ? 2 : 1;
     return by_rows < by_shape ? by_rows : by_shape;
 }
 
@@ -2912,8 +2917,7 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
                     xb16, in_dim, out_dim)
             #define PULSAR_NT_LAUNCH(N) do { const int R = nt_rows_per_block(N, out_dim); \
                                              dim3 g(((unsigned)out_dim + (unsigned)R - 1u) / (unsigned)R); \
-                                             if (R == 4) PULSAR_NT_LAUNCH_R(N, 4); \
-                                             else if (R == 2) PULSAR_NT_LAUNCH_R(N, 2); \
+                                             if (R == 2) PULSAR_NT_LAUNCH_R(N, 2); \
                                              else PULSAR_NT_LAUNCH_R(N, 1); } while (0)
             switch (n_tok) {
             case 2: PULSAR_NT_LAUNCH(2); break;
