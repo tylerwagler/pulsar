@@ -1569,6 +1569,24 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
         }
     }
 
+    /* The images are BORROWED for exactly this sync's prefill -- the resume
+     * below as well as the cold rebuild: a licensed resume merges the NEW images
+     * in the chunks that own their blocks (L261; before, only the cold path set
+     * the borrow and a resumed image prefilled its sentinels zero-masked).  The
+     * driver reads them off the graph so that four prefill signatures do not
+     * grow a parameter that only this caller can ever fill; the scope clears the
+     * borrow on every exit, including the interrupted ones and the seam rescue's
+     * re-entry, so no later decode can see it. */
+    struct vision_scope {
+        pulsar_gpu_graph *g;
+        const pulsar_vision_request *prev;
+        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
+            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
+        ~vision_scope() { g->vision_req = prev; }
+    };
+    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
+    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
+
     /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
      * carry path re-prefills from a grid point at or above the salvage floor and
      * the rebuild path prefills from 0 -- so a decode is legal again once it
@@ -1812,20 +1830,6 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             return rc;
         }
     }
-
-    /* The images are BORROWED for exactly this prefill.  The driver reads them
-     * off the graph so that four prefill signatures do not grow a parameter that
-     * only this caller can ever fill; the scope clears the borrow on every exit,
-     * including the interrupted ones, so no later decode can see it. */
-    struct vision_scope {
-        pulsar_gpu_graph *g;
-        const pulsar_vision_request *prev;
-        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
-            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
-        ~vision_scope() { g->vision_req = prev; }
-    };
-    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
-    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
 
     bool ok;
     s->checkpoint_valid = false;
