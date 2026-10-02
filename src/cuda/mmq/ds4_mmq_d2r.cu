@@ -1214,14 +1214,14 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
 #pragma unroll
         for (int cw = 0; cw < 8; ++cw) {
             const uint2 cg = cgw[cw];
-            const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
-            float lsu = 0.0f;
-            if constexpr (PAIR) lsu = (float)((int)(cuw[cw].y >> 27) | 1) * 0.125f;
-            /* The weights of this 32-wide group, decoded ONCE for the whole group
-             * of assignments (the work duplicates used to repeat). */
-            float mgv[32], muv[32];
+            float sg[GROUP], su[GROUP];
+#pragma unroll
+            for (int r = 0; r < GROUP; ++r) { sg[r] = 0.0f; su[r] = 0.0f; }
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
+                /* Eight weights decoded ONCE, then applied to every assignment of the
+                 * group -- the per-assignment fma order (g-major, j-minor) is the
+                 * one-row block's, so each output is bit-identical. */
                 const uint64_t grid_g = s_grid[(cg.x >> (8 * g)) & 0xffu];
                 const uint32_t sgn_g = ds4_unpack_ksigns((uint8_t)((cg.y >> (7 * g)) & 0x7fu));
                 const uint32_t glo = (uint32_t)grid_g, ghi = (uint32_t)(grid_g >> 32);
@@ -1232,37 +1232,41 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
                     sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
                     ulo = (uint32_t)grid_u, uhi = (uint32_t)(grid_u >> 32);
                 }
+                float mg[8], mu[8];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     /* byte j of the 8-byte grid entry, zero-extended in one op */
                     const uint32_t bg = __byte_perm(j < 4 ? glo : ghi, 0u, 0x4440u | (uint32_t)(j & 3));
                     /* sign = bit j of the sign byte, moved to the float sign bit */
-                    mgv[g * 8 + j] = __uint_as_float(__float_as_uint((float)bg) | (((sgn_g >> j) & 1u) << 31));
+                    mg[j] = __uint_as_float(__float_as_uint((float)bg) | (((sgn_g >> j) & 1u) << 31));
                     if constexpr (PAIR) {
                         const uint32_t bu = __byte_perm(j < 4 ? ulo : uhi, 0u, 0x4440u | (uint32_t)(j & 3));
-                        muv[g * 8 + j] = __uint_as_float(__float_as_uint((float)bu) | (((sgn_u >> j) & 1u) << 31));
+                        mu[j] = __uint_as_float(__float_as_uint((float)bu) | (((sgn_u >> j) & 1u) << 31));
                     }
                 }
-            }
 #pragma unroll
-            for (int r = 0; r < GROUP; ++r) {
-                if (r >= n) break;
-                /* The activations come out of shared memory as two float4 broadcasts
-                 * per 8-weight group -- ONE shared load per 4 MACs per matrix. */
-                const float4 *x4 = reinterpret_cast<const float4 *>(s_x + r * K + b256 * 256 + cw * 32);
-                float sg = 0.0f, su = 0.0f;
-#pragma unroll
-                for (int g = 0; g < 4; ++g) {
+                for (int r = 0; r < GROUP; ++r) {
+                    if (r >= n) break;
+                    /* The activations come out of shared memory as two float4 broadcasts
+                     * per 8-weight group -- ONE shared load per 4 MACs per matrix. */
+                    const float4 *x4 = reinterpret_cast<const float4 *>(s_x + r * K + b256 * 256 + cw * 32);
                     const float4 xa = x4[g * 2], xb4 = x4[g * 2 + 1];
                     const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb4.x, xb4.y, xb4.z, xb4.w};
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        sg = fmaf(mgv[g * 8 + j], xv[j], sg);
-                        if constexpr (PAIR) su = fmaf(muv[g * 8 + j], xv[j], su);
+                        sg[r] = fmaf(mg[j], xv[j], sg[r]);
+                        if constexpr (PAIR) su[r] = fmaf(mu[j], xv[j], su[r]);
                     }
                 }
-                acc_g[r] = fmaf(dgb * lsg, sg, acc_g[r]);
-                if constexpr (PAIR) acc_u[r] = fmaf(dub * lsu, su, acc_u[r]);
+            }
+            const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
+            float lsu = 0.0f;
+            if constexpr (PAIR) lsu = (float)((int)(cuw[cw].y >> 27) | 1) * 0.125f;
+#pragma unroll
+            for (int r = 0; r < GROUP; ++r) {
+                if (r >= n) break;
+                acc_g[r] = fmaf(dgb * lsg, sg[r], acc_g[r]);
+                if constexpr (PAIR) acc_u[r] = fmaf(dub * lsu, su[r], acc_u[r]);
             }
         }
     }
@@ -1290,7 +1294,7 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
 /* L262: launch the decode GEMV with `group` assignments per block (1 or
  * kDecodeGemvGroup).  The dynamic activation slab is group * K floats; above the
  * 48 KB default the kernel is opted in once per instantiation. */
-constexpr int kDecodeGemvGroup = 4;
+constexpr int kDecodeGemvGroup = 4;   /* PROBE: PULSAR_IQ2_GROUP=2 selects the 2-row block */
 template <bool PAIR, int GROUP>
 static cudaError_t iq2_decode_gemv_launch_g(const void *gate_soa, const void *up_soa, const void *act,
                                             const int32_t *ids_dst, const int32_t *expert_bounds,
@@ -1329,11 +1333,16 @@ static cudaError_t iq2_decode_gemv_launch(const void *gate_soa, const void *up_s
                                           const int32_t *ids_dst, const int32_t *expert_bounds,
                                           float *out_gate, float *out_up, int M, int K, int n_assign,
                                           int E, cudaStream_t stream) {
-    return iq2_decode_group_for(n_assign) == 1
-        ? iq2_decode_gemv_launch_g<PAIR, 1>(gate_soa, up_soa, act, ids_dst, expert_bounds,
-                                            out_gate, out_up, M, K, n_assign, E, stream)
-        : iq2_decode_gemv_launch_g<PAIR, kDecodeGemvGroup>(gate_soa, up_soa, act, ids_dst, expert_bounds,
-                                                           out_gate, out_up, M, K, n_assign, E, stream);
+    static int g2 = -1;
+    if (g2 < 0) { const char *v = getenv("PULSAR_IQ2_GROUP"); g2 = v && atoi(v) == 2; }
+    if (iq2_decode_group_for(n_assign) == 1)
+        return iq2_decode_gemv_launch_g<PAIR, 1>(gate_soa, up_soa, act, ids_dst, expert_bounds,
+                                                 out_gate, out_up, M, K, n_assign, E, stream);
+    if (g2)
+        return iq2_decode_gemv_launch_g<PAIR, 2>(gate_soa, up_soa, act, ids_dst, expert_bounds,
+                                                 out_gate, out_up, M, K, n_assign, E, stream);
+    return iq2_decode_gemv_launch_g<PAIR, kDecodeGemvGroup>(gate_soa, up_soa, act, ids_dst, expert_bounds,
+                                                            out_gate, out_up, M, K, n_assign, E, stream);
 }
 
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
