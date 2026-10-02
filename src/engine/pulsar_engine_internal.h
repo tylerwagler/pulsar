@@ -3161,6 +3161,11 @@ int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in
  * Returns 0 if the ids there are not such a block.  The ONE place the sentinel
  * roles are resolved for a scan. */
 int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
+/** Where an image request's blocks may sit (vision.cpp): every image names a block
+ * the prompt carries and the last block ends inside the first prefill chunk
+ * (`chunk_cap`).  The one statement of the rule; 0 with `err` filled otherwise. */
+int vision_spans_fit(const int32_t *ids, int n, const pulsar_image_ref *images, int n_images,
+                     uint32_t chunk_cap, int *end_out, char *err, size_t errlen);
 
 /** The reference's get_image_visible(): per-token visible counts to the
  * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function

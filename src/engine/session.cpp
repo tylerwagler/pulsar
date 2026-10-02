@@ -1449,22 +1449,11 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
             return 1;
         }
-        for (int i = 0; i < n_images; i++) {
-            if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
-                snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
-                return 1;
-            }
-            int span_len = 0;
-            if (!vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB,
-                                    images[i].start_pos, &span_len) ||
-                span_len <= 0) {
-                snprintf(err, errlen, "image %d at %d is not a sentinel block in this prompt",
-                         i, images[i].start_pos);
-                return 1;
-            }
-            if (images[i].start_pos + span_len > image_barrier)
-                image_barrier = images[i].start_pos + span_len;
-        }
+        /* Before any state moves: an image past the first chunk is refused here
+         * (and by the TP leader before it mirrors anything), not mid-prefill. */
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+                              &image_barrier, err, errlen))
+            return 1;
         /* L226: an image ALREADY inside the live KV is not a reason to redo the
          * prompt.  Reuse is licensed when this session's checkpoint holds those
          * blocks AND holds THESE IMAGES: the fingerprint is what makes that true,
