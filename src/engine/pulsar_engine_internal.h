@@ -966,11 +966,12 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
  * refused (n past PULSAR_GPU_MNEUTRAL_ROWS_MAX); the caller refuses too. */
 class pulsar_decode_rows_scope {
 public:
-    explicit pulsar_decode_rows_scope(uint32_t n)
+    explicit pulsar_decode_rows_scope(uint32_t n, uint32_t cap = PULSAR_GPU_MNEUTRAL_ROWS_MAX)
         : saved_(pulsar_gpu_matmul_batch_decode_rows()),
-          ok_(pulsar_gpu_matmul_set_batch_decode_rows((int)n) != 0) {}
+          ok_(pulsar_gpu_matmul_set_batch_decode_rows_capped((int)n, (int)cap) != 0) {}
     ~pulsar_decode_rows_scope() {
-        (void)pulsar_gpu_matmul_set_batch_decode_rows(saved_);   /* restoring an accepted value */
+        /* restoring an accepted value (it passed its own lane's cap) */
+        (void)pulsar_gpu_matmul_set_batch_decode_rows_capped(saved_, (int)PULSAR_DSPARK_DRAFT_ROWS_MAX);
     }
     bool ok() const { return ok_; }
     pulsar_decode_rows_scope(const pulsar_decode_rows_scope &) = delete;

@@ -2487,7 +2487,7 @@ bool gpu_graph_alloc_raw_cap(
      * only by gpu_graph_init_dspark_target (session create, dspark_ready
      * only), which left the multiseq driver rejecting every step whenever
      * speculation was off. */
-    g->spec_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_N_VOCAB * sizeof(float));
+    g->spec_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS * PULSAR_N_VOCAB * sizeof(float));
     g->batch_cur_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
     g->batch_next_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -2769,11 +2769,11 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
          * confidence row per drafted row); the single-bank paths use slot 0. */
         g->dspark_markov_logits = pulsar_gpu_tensor_alloc(
             (uint64_t)PULSAR_DSPARK_BANKS_MAX * PULSAR_N_VOCAB * sizeof(float));
-        g->dspark_conf_scores = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(float));
-        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        g->dspark_conf_scores = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(float));
+        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
         g->dspark_bank_meta = pulsar_gpu_tensor_alloc(2ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
         ok = ok && g->dspark_bank_meta;
-        g->dspark_embed_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
+        g->dspark_embed_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
         g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
         /* One compact block per admitted speculative row: the lane admits up
          * to PULSAR_SPEC_LOGITS_ROWS rows per forward and the host mirror below
@@ -2784,7 +2784,7 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
          * forward. */
         g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
             (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
-        g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
         ok = ok && g->dspark_row_meta;
         g->spec_compact_host = (int32_t *)xmalloc(
             (size_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));

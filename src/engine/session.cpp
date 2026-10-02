@@ -1130,7 +1130,7 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     const uint64_t n_ranks = pulsar_tp_n_ranks(tp);
     const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
-    const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
+    const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
     g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",

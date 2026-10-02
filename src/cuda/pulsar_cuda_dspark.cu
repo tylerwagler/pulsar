@@ -815,7 +815,8 @@ int pulsar_gpu_distill_top64_tensor(
  * Layouts: refined_logits [n_banks][vocab]; per-block partials
  * [n_banks][gridDim.x]; the bank's base row is base_logits[(base_row[b] +
  * base_row_add) * base_row_stride]; the previous token for bank b is
- * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_BANKS_MAX. */
+ * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_MARKOV_TILE (the launcher
+ * splits a larger group into tiles; banks are independent). */
 template <bool W1BF16, int W2FMT>
 __global__ static void dspark_markov_step_banks_kernel(
         float *__restrict__ refined_logits,
@@ -832,7 +833,7 @@ __global__ static void dspark_markov_step_banks_kernel(
         uint32_t n_banks,
         uint32_t vocab_size,
         uint32_t embed_dim) {
-    enum { MAXB = PULSAR_DSPARK_BANKS_MAX };
+    enum { MAXB = PULSAR_DSPARK_MARKOV_TILE };
     uint64_t embed_base[MAXB];
     const float *base[MAXB];
     float best_val[MAXB];
@@ -977,11 +978,11 @@ static int dspark_markov_banks_launch(
     const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
     static thread_local DsparkReduceBufsBanks bb = {};
-    const uint32_t need = n_banks * grid_dim;
+    const uint32_t need = (n_banks < PULSAR_DSPARK_MARKOV_TILE ? n_banks : PULSAR_DSPARK_MARKOV_TILE) * grid_dim;
     if (need > bb.cap) {
         pulsar_gpu_tensor_free(bb.id);
         pulsar_gpu_tensor_free(bb.val);
-        const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;
+        const uint32_t cap = PULSAR_DSPARK_MARKOV_TILE * grid_dim;
         bb.id  = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
         bb.val = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(float));
         bb.cap = (bb.id && bb.val) ? cap : 0;
@@ -990,22 +991,29 @@ static int dspark_markov_banks_launch(
 
     int32_t *ids = (int32_t *)ids_dev->ptr;
     for (uint32_t pos = pos_first; pos < pos_first + pos_count; pos++) {
-        const int32_t *prev = prev_override ? (const int32_t *)prev_override->ptr : ids + pos;
-        const uint32_t prev_stride = prev_override ? 1u : ids_stride;
+        /* L260: a group of up to PULSAR_DSPARK_BANKS_MAX banks runs as tiles of
+         * the kernel's register width; every bank's arithmetic is its own, so a
+         * bank's bytes do not depend on which tile carries it. */
+        for (uint32_t b0 = 0; b0 < n_banks; b0 += PULSAR_DSPARK_MARKOV_TILE) {
+            const uint32_t nb = (n_banks - b0) < PULSAR_DSPARK_MARKOV_TILE ? (n_banks - b0) : PULSAR_DSPARK_MARKOV_TILE;
+            const int32_t *prev = prev_override ? (const int32_t *)prev_override->ptr + b0
+                                                : ids + (uint64_t)b0 * ids_stride + pos;
+            const uint32_t prev_stride = prev_override ? 1u : ids_stride;
 #define PULSAR_MARKOV_BANKS_LAUNCH(A, B)                                    \
-        dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim>>>(       \
-            (float *)refined_logits->ptr,                                     \
-            (int32_t *)bb.id->ptr, (float *)bb.val->ptr,                      \
-            (const float *)base_logits->ptr, (const int32_t *)base_row_dev->ptr, \
-            pos, base_row_stride_bytes / sizeof(float),                       \
-            w1, w2, prev, prev_stride, n_banks, vocab_size, embed_dim)
-        if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, true)
-        else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, false)
+            dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim>>>(   \
+                (float *)refined_logits->ptr + (uint64_t)b0 * vocab_size,     \
+                (int32_t *)bb.id->ptr, (float *)bb.val->ptr,                  \
+                (const float *)base_logits->ptr, (const int32_t *)base_row_dev->ptr + b0, \
+                pos, base_row_stride_bytes / sizeof(float),                   \
+                w1, w2, prev, prev_stride, nb, vocab_size, embed_dim)
+            if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, true)
+            else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, false)
 #undef PULSAR_MARKOV_BANKS_LAUNCH
-        dspark_markov_reduce_banks_kernel<<<n_banks, 256>>>(
-            ids + pos + 1, ids_stride,
-            (const int32_t *)bb.id->ptr, (const float *)bb.val->ptr,
-            grid_dim);
+            dspark_markov_reduce_banks_kernel<<<nb, 256>>>(
+                ids + (uint64_t)b0 * ids_stride + pos + 1, ids_stride,
+                (const int32_t *)bb.id->ptr, (const float *)bb.val->ptr,
+                grid_dim);
+        }
     }
     return cudaGetLastError() == cudaSuccess;
 }

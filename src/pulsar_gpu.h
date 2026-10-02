@@ -801,6 +801,10 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
 int pulsar_gpu_model_reads_host_pages(void);
 
 int pulsar_gpu_matmul_set_batch_decode_rows(int n);
+/** The same declaration with an explicit row cap: the drafter forward declares
+ *  up to PULSAR_DSPARK_DRAFT_ROWS_MAX decode rows (every decode arm takes any
+ *  width past the exact range); everything else stays at the M-neutral cap. */
+int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap);
 int pulsar_gpu_matmul_batch_decode_rows(void);
 /** L260: the widest decode step whose rows are still BYTE-IDENTICAL to the same
  *  rows at any narrower width (and alone).  Wider decode steps take width-
@@ -2345,7 +2349,19 @@ int pulsar_gpu_minp_prefilter_rows(
  * base_row_stride_bytes apart. The chain runs positions 0..n_draft-1 with the
  * device feed; the single step takes the previous token per bank from prev_dev
  * ([n_banks] i32, caller-written -- the sampled path's host draw). */
-#define PULSAR_DSPARK_BANKS_MAX 8u
+#define PULSAR_DSPARK_BANKS_MAX 16u
+/** L260: the most drafter rows one redraft forward carries (every bank of a
+ *  16-bank pool at depth 4 -- ONE group per step at c16, so the drafter's head,
+ *  dense and markov weights are read once per step, not once per 8-bank /
+ *  16-row group).  Its own decode-rows bound (pulsar_decode_rows_scope with
+ *  this cap); PULSAR_GPU_MNEUTRAL_ROWS_MAX keeps inferring row kinds. */
+#define PULSAR_DSPARK_DRAFT_ROWS_MAX 64u
+/** The markov kernel's register tile: banks per launch (a group of up to
+ *  PULSAR_DSPARK_BANKS_MAX banks runs as sub-launches of at most this many). */
+#define PULSAR_DSPARK_MARKOV_TILE 8u
+/** spec_logits rows: the verify slab and the drafter forward both write it. */
+#define PULSAR_SPEC_LOGITS_ALLOC_ROWS \
+    (PULSAR_DSPARK_DRAFT_ROWS_MAX > PULSAR_SPEC_LOGITS_ROWS ? PULSAR_DSPARK_DRAFT_ROWS_MAX : PULSAR_SPEC_LOGITS_ROWS)
 int pulsar_gpu_dspark_markov_chain_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,

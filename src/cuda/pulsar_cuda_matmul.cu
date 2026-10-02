@@ -2405,18 +2405,19 @@ void cuda_fp8_weight_cache_clear(void) {
  * it on the lane's entry thread and dispatches from that thread
  * (pulsar_decode_rows_scope). */
 static thread_local int g_batch_decode_rows = 0;
-int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
-    /* Refuse, do not warn: decode rows past the cap would take a
-     * batch-shape-dependent GEMM.  The engine static_asserts PULSAR_MSEQ_MAX
-     * against the cap, so the batched lane cannot reach this; a probe can. */
-    if (n > (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
-        fprintf(stderr, "pulsar: batched step declares %d decode rows; the row cap is %u -- "
-                        "refusing (rows past the cap would take a batch-shape-dependent GEMM)\n",
-                        n, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap) {
+    /* Refuse, do not warn: a lane declares at most its own cap.  The engine
+     * static_asserts PULSAR_MSEQ_MAX against the M-neutral cap, so the batched
+     * lane cannot reach this; the drafter forward passes its own (L260). */
+    if (n > cap) {
+        fprintf(stderr, "pulsar: a lane declares %d decode rows; its row cap is %d -- refusing\n", n, cap);
         return 0;
     }
     g_batch_decode_rows = (n > 0) ? n : 0;
     return 1;
+}
+int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
+    return pulsar_gpu_matmul_set_batch_decode_rows_capped(n, (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
 }
 /* Read cross-TU by the MoE dispatch (pulsar_cuda_moe.cu) to place its split,
  * and by the prefill encoder's f32-store skips (the split's offset views key no

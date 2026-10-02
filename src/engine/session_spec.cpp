@@ -2012,8 +2012,8 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     for (int j = 0; j < n_sel; j++) if (!rounds[order[j]]->redraft.sample_drafts) n_g++;
     const int n_s = n_sel - n_g;
     /* rows */
-    int32_t draft_ids[PULSAR_SPEC_LOGITS_ROWS];
-    uint32_t row_bank[PULSAR_SPEC_LOGITS_ROWS];
+    int32_t draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+    uint32_t row_bank[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t bank_n_raw[PULSAR_MSEQ_MAX][3];
     uint32_t bank_n_draft[PULSAR_MSEQ_MAX];
     int32_t base_row[PULSAR_DSPARK_BANKS_MAX] = {0};
@@ -2021,7 +2021,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     for (int j = 0; j < n_sel; j++) {
         spec_redraft_req *q = &rounds[order[j]]->redraft;
         const uint32_t bank = banks[order[j]];
-        if (bank >= g->banks.n_banks || n_rows + q->n_draft > PULSAR_SPEC_LOGITS_ROWS) {
+        if (bank >= g->banks.n_banks || n_rows + q->n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX) {
             snprintf(err, errlen, "redraft batch: rows exceed the drafter budget");
             return -1;
         }
@@ -2045,7 +2045,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
      * depth: a shallower bank's extra positions read the next bank's rows or
      * the slab tail -- harmless, discarded -- but must stay inside the block */
     if ((uint32_t)base_row[n_sel - 1] + (n_g == n_sel ? max_draft_g : max_draft_s) >
-        PULSAR_SPEC_LOGITS_ROWS) {
+        PULSAR_SPEC_LOGITS_ALLOC_ROWS) {
         snprintf(err, errlen, "redraft batch: chain rows exceed the block");
         return -1;
     }
@@ -2215,8 +2215,8 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
      * single-bank path feeds it (tok_dev <- refined[0..n_draft)) */
     const float tau = dspark_conf_sched_tau();
     if (tau > 0.0f) {
-        int32_t toks[PULSAR_SPEC_LOGITS_ROWS];
-        float confs[PULSAR_SPEC_LOGITS_ROWS];
+        int32_t toks[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+        float confs[PULSAR_DSPARK_DRAFT_ROWS_MAX];
         for (int j = 0; j < n_sel; j++) {
             const spec_redraft_req *q = &rounds[order[j]]->redraft;
             for (uint32_t k = 0; k < q->n_draft; k++) toks[base_row[j] + k] = q->refined[k];
@@ -2281,7 +2281,7 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
     }
     /* Every live round drafts (L260): the groups below split them into
      * drafter passes of at most PULSAR_DSPARK_BANKS_MAX banks (the markov
-     * kernel's register tile), each pass reusing the batch buffers after the
+     * launcher runs them in PULSAR_DSPARK_MARKOV_TILE-bank tiles), each pass reusing the batch buffers after the
      * previous one's results are read back.  Selection used to stop at
      * PULSAR_DSPARK_BANKS_MAX, so past 8 live banks the rest took base-only
      * steps -- at c10, two streams drafted nothing on every round. */
@@ -2307,16 +2307,18 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
     if (n_sel == 0) return 0;
     (void)n_g;
 
-    /* groups: consecutive banks whose rows fit the widest decode batch the
-     * M-independent kernels take (PULSAR_GPU_MNEUTRAL_ROWS_MAX; the forward
-     * declares its rows decode), at most PULSAR_DSPARK_BANKS_MAX banks each;
-     * production (3 banks x <=4 drafts) is one group. A bank whose depth alone
-     * exceeds the cap is refused. */
+    /* groups: consecutive banks whose rows fit the drafter forward
+     * (PULSAR_DSPARK_DRAFT_ROWS_MAX; the forward declares them decode rows
+     * under its own cap), at most PULSAR_DSPARK_BANKS_MAX banks each -- L260:
+     * a full 16-bank pool at depth <= 4 is ONE group, so the drafter's head,
+     * dense and markov weights are read once per step (16 rows / 8 banks made
+     * it three groups at c16, each re-reading them: ~1/6 of the step).  A bank
+     * whose depth alone exceeds the cap is refused. */
     for (int gs = 0; gs < n_sel;) {
         int ge = gs;
         uint32_t rows = 0;
         while (ge < n_sel && ge - gs < (int)PULSAR_DSPARK_BANKS_MAX &&
-               rows + rounds[order[ge]]->redraft.n_draft <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+               rows + rounds[order[ge]]->redraft.n_draft <= PULSAR_DSPARK_DRAFT_ROWS_MAX) {
             rows += rounds[order[ge]]->redraft.n_draft;
             ge++;
         }

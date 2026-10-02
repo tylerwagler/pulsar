@@ -366,18 +366,18 @@ bool gpu_graph_dspark_seed_rows_banked(
         pulsar_decode_rows_scope rows(m);
         if (!rows.ok()) return false;
         /* positions: row t of bank b lands at ms_dspark_n_raw[b][li] + (rows of b before it) */
-        int32_t meta[7 * PULSAR_SPEC_LOGITS_ROWS] = {0};
+        int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX] = {0};
         uint32_t chunk_added[PULSAR_MSEQ_MAX] = {0};
         for (uint32_t t = 0; t < m; t++) {
             const uint32_t b = row_bank[c0 + t];
             if (b >= g->banks.n_banks) return false;
             const uint32_t k = added[b] + chunk_added[b]++;
             for (uint32_t li = 0; li < 3; li++)
-                meta[(li * 2 + 0) * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)(g->ms_dspark_n_raw[b][li] + k);
-            meta[6 * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)b;
+                meta[(li * 2 + 0) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)(g->ms_dspark_n_raw[b][li] + k);
+            meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
         if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
-        const uint64_t rb = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t);
+        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
         pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb, (uint64_t)m * sizeof(int32_t));
         /* main_x rows: concat -> main_proj -> main_norm (E4M3 into main_x's slot) */
         void *cq = NULL, *csf = NULL; int ckbp = 0;
@@ -498,7 +498,7 @@ bool gpu_graph_dspark_draft_forward_banks(
     PULSAR_NVTX("drafter forward");
     const bool banked = row_bank != NULL;
     if (banked && (n_banks == 0 || !bank_n_raw || !bank_n_draft || !g->dspark_row_meta ||
-                   g->banks.n_banks == 0 || n_draft > PULSAR_SPEC_LOGITS_ROWS ||
+                   g->banks.n_banks == 0 || n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX ||
                    !g->banks.dspark_raw[0] || !g->banks.dspark_raw[1] || !g->banks.dspark_raw[2]))
         return false;
     /* per-row device arrays: rope/store position per layer, visibility per
@@ -507,7 +507,7 @@ bool gpu_graph_dspark_draft_forward_banks(
     pulsar_gpu_tensor *meta_vis[3] = {NULL, NULL, NULL};
     pulsar_gpu_tensor *meta_seq = NULL;
     if (banked) {
-        int32_t meta[7 * PULSAR_SPEC_LOGITS_ROWS];
+        int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX];
         uint32_t k = 0, prev_bank = UINT32_MAX;
         for (uint32_t t = 0; t < n_draft; t++) {
             const uint32_t b = row_bank[t];
@@ -515,14 +515,14 @@ bool gpu_graph_dspark_draft_forward_banks(
             k = (b == prev_bank) ? k + 1u : 0u;
             prev_bank = b;
             for (uint32_t li = 0; li < 3; li++) {
-                meta[(li * 2 + 0) * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)(bank_n_raw[b][li] + k);
-                meta[(li * 2 + 1) * PULSAR_SPEC_LOGITS_ROWS + t] =
+                meta[(li * 2 + 0) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)(bank_n_raw[b][li] + k);
+                meta[(li * 2 + 1) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] =
                     (int32_t)(bank_n_raw[b][li] + bank_n_draft[b] - 1u);
             }
-            meta[6 * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)b;
+            meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
         if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
-        const uint64_t rb = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t);
+        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
         bool vok = true;
         for (uint32_t li = 0; li < 3; li++) {
             meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 0) * rb,
@@ -555,7 +555,7 @@ bool gpu_graph_dspark_draft_forward_banks(
      * batch width (until L167 the single-bank forward declared nothing and
      * its 5..16-row GEMMs took cuBLASLt by row count).  The setter refuses a
      * forward wider than the cap; the caller groups banks to fit it. */
-    pulsar_decode_rows_scope rows(n_draft);
+    pulsar_decode_rows_scope rows(n_draft, PULSAR_DSPARK_DRAFT_ROWS_MAX);
     if (!rows.ok()) return false;
     /* L106 K2a: the drafter hand-rolls its attention half and never passes
      * through the batch encode whose first act is the gact disarm -- so a
@@ -568,7 +568,7 @@ bool gpu_graph_dspark_draft_forward_banks(
      * here, unconditionally, exactly as the batch encode does per layer. */
     pulsar_gpu_mxfp8_gact_disarm();
     if (!g || !base_model || !base_weights || !dspark_model || !w ||
-        !base_logits_out || n_draft == 0 || n_draft > 16 ||
+        !base_logits_out || n_draft == 0 || n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX ||
         n_draft > g->prefill_cap)
         return false;
 
@@ -1222,7 +1222,7 @@ static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
     if (pulsar_tp_row_lane(g->tp)) {
         uint32_t plo = 0, phi = 0;
         if (!pulsar_tp_owned_range(1 - rank, n_ranks, n_vocab, &plo, &phi) ||
-            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ROWS || !g->tp_vocab_own || !g->tp_slab_dev ||
+            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ALLOC_ROWS || !g->tp_vocab_own || !g->tp_slab_dev ||
             !g->tp_stage_ticket) {
             fprintf(stderr, "pulsar: tp vocab gather refused (%u rows, scratch %s) -- refusing\n",
                     n_rows, g->tp_vocab_own ? "ok" : "MISSING");
@@ -1344,7 +1344,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
         uint64_t               vocab_dim,
         pulsar_gpu_tensor      *out) {
     if (!out || n_tokens == 0 || row0 > g->prefill_cap || n_tokens > g->prefill_cap - row0 ||
-        n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
+        n_tokens > PULSAR_SPEC_LOGITS_ALLOC_ROWS || !g->spec_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     pulsar_gpu_tensor *rows_hc = NULL;
@@ -1499,7 +1499,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
         uint32_t                  n_tokens,
         uint64_t                  vocab_dim) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap ||
-        n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
+        n_tokens > PULSAR_DSPARK_DRAFT_ROWS_MAX || !g->spec_logits) return false;
     pulsar_gpu_tensor *rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
