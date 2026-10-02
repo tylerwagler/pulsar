@@ -396,7 +396,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         uint64_t rank,
         uint32_t n_groups,
         uint32_t n_tokens,
-        uint32_t x_tok_stride,   ///< rows per group in the ENCODING (the slot's row count, >= n_tokens)
+        uint32_t x_tok_stride,   // rows per group in the ENCODING (the slot's row count, >= n_tokens)
         uint64_t blocks) {
     const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS_A8;
     const uint64_t tok = (uint64_t)blockIdx.y;

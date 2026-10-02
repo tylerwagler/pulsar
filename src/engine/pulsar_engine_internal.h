@@ -337,7 +337,7 @@ typedef struct {
      * too small (dev's Qcur max 15.1 vs the branch's 0.51 for one prompt) and
      * drove layer 0's attention to NaN.  Restored from dev per PLAN 96 s5. */
     bool q_head_norm;
-    /** The chat template writes a <｜System｜> MARKER before the lead-in system
+    /** The chat template writes a `<｜System｜>` MARKER before the lead-in system
      * region (V4.1's format).  0731's does not: dev -- the engine that served
      * 0731 -- writes the system text straight after BOS.  A profile fact
      * because the template is the model family's, and because the difference is

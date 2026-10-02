@@ -804,15 +804,15 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
  * the terminal projection is rewritten. */
 /** The agent's sink for pulsar_think_scan: tags are prose only outside a DSML
  * block; a held DSML start tail flushes before the reasoning state flips; the
- * blank line owed after </think> is swallowed by agent_stream_normal_byte
+ * blank line owed after `</think>` is swallowed by agent_stream_normal_byte
  * while post_think_gap is set. */
 struct agent_stream_think_sink {
     agent_stream_renderer *sr;  ///< the stream being projected
     /** DSML bytes are not prose: no tag recognition while a block is parsed. */
     bool tags_enabled() const { return !sr->dsml_active; }
-    /** <think> consumed: release a held marker tail in the pre-think state. */
+    /** `<think>` consumed: release a held marker tail in the pre-think state. */
     void think_open_tag() { sr->post_think_gap = false; agent_stream_flush_start_tail(sr); }
-    /** </think> consumed: release the tail, drop the dim style, arm the gap. */
+    /** `</think>` consumed: release the tail, drop the dim style, arm the gap. */
     void think_close_tag() {
         agent_stream_flush_start_tail(sr);
         renderer_reset_color(sr->renderer);

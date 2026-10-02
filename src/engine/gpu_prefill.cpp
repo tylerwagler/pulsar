@@ -1025,8 +1025,8 @@ static bool gpu_graph_indexed_attention_span(
         uint32_t                    sn,
         uint32_t                    spos0,
         uint64_t                    q_dim,
-        uint32_t                    n_head,      ///< the OWNED heads (slice 4g)
-        uint64_t                    sinks_off,   ///< the first owned head's sink
+        uint32_t                    n_head,      // the OWNED heads (slice 4g)
+        uint64_t                    sinks_off,   // the first owned head's sink
         uint32_t                    n_comp,
         uint32_t                    ratio,
         float                       index_scale,

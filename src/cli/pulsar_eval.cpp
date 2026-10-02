@@ -2108,14 +2108,14 @@ static void stream_append_visible(eval_ui *ui, const char *p, size_t n) {
 }
 
 /** The eval TUI's sink for pulsar_think_scan: bytes land in `stream` with a
- * per-byte style, the reply starts on the line after </think>. */
+ * per-byte style, the reply starts on the line after `</think>`. */
 struct eval_think_sink {
     eval_ui *ui;    ///< the TUI whose stream buffer receives the bytes
     /** No DSML lane here: tags are always prose markers. */
     bool tags_enabled() const { return true; }
-    /** Nothing to do at <think>: the next byte takes the thinking style. */
+    /** Nothing to do at `<think>`: the next byte takes the thinking style. */
     void think_open_tag() {}
-    /** Nothing to undo at </think>: styles are per byte. */
+    /** Nothing to undo at `</think>`: styles are per byte. */
     void think_close_tag() {}
     /** Whether the stream buffer is empty or ends in '\n'. */
     bool at_line_start() const {

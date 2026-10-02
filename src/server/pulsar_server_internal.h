@@ -2656,7 +2656,7 @@ typedef struct {
     bool pending_assistant;   ///< a user-side turn is open; the next assistant turn (or the tail) opens with the role marker
     bool user_turn_open;      ///< a user-side turn (text and/or tool results) is open; further user-side parts join it with "\n\n"
     /** V4 only: a tool-result message already opened its own turn, so further
-     * results continue it instead of opening another <｜User｜>.  The V4.1 rule
+     * results continue it instead of opening another `<｜User｜>`.  The V4.1 rule
      * merges every user-side part into one turn (user_turn_open), so this flag
      * is inert there -- but it is what V4's renderer keyed on, and keeping the
      * two flags separate is what lets both rules live in one function. */

@@ -969,7 +969,7 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,
-        /** Optional BF16 copy of the normalised rows (L086 T3), from
+        /* Optional BF16 copy of the normalised rows (L086 T3), from
          *  pulsar_gpu_bf16_act_slot().  NULL emits nothing.  This buffer's
          *  consumer is a BF16 GEMM -- pulsar_gpu_matmul_f32_tensor resolves a
          *  bf16 weight and runs the shared bf16 core -- so emitting from the
@@ -979,7 +979,7 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps,
-        /** L157: nonzero skips the f32 rows entirely (requires out_b).  Legal
+        /* L157: nonzero skips the f32 rows entirely (requires out_b).  Legal
          *  only when every consumer reads the bf16 copy -- the caller must also
          *  declare it with pulsar_gpu_act_note_f32_skipped_for() so a
          *  consumer that misses the bf16 slot refuses instead of converting
@@ -1053,7 +1053,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps,
-        void                   *out_b,     ///< bf16 plane for a bf16-weight consumer, or NULL (L159)
+        void                   *out_b,     // bf16 plane for a bf16-weight consumer, or NULL (L159)
         int                     w_bf16);
 
 /** As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
@@ -2271,7 +2271,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps,
-        /** Storage of norm_w (attn_norm / ffn_norm): 1 = bf16, 0 = f32. */
+        /* Storage of norm_w (attn_norm / ffn_norm): 1 = bf16, 0 = f32. */
         int                     norm_w_bf16);
 
 

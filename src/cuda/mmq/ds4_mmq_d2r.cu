@@ -1505,7 +1505,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
      * predicate the pair launch uses.  A second copy of the same arm used to sit
      * here and called the kernel with no template argument (the tree it was
      * written in had no <PAIR> parameter), which does not compile -- it survived
-     * because this object was never rebuilt: the shipped tree's mmq/*.o files
+     * because this object was never rebuilt: the shipped tree's mmq object files
      * predated the source.  Do not reintroduce a bare call. */
 
     /* z = 1: leg is pinned to 0, so only W_soa / out are ever touched. */

@@ -319,7 +319,7 @@ typedef struct {
     pulsar_engine *engine;      ///< engine handle, for detokenising
     agent_worker *worker;       ///< owning worker (output routing, capture)
     bool format_markdown;       ///< apply markdown styling at all
-    /** <think> tag state, fed by agent_stream_text: `think.in_think` selects the
+    /** `<think>` tag state, fed by agent_stream_text: `think.in_think` selects the
      * dimmed reasoning style, `think.pending` holds a tag prefix split across
      * tokens. */
     pulsar_think_scanner think;
@@ -936,17 +936,6 @@ void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
                                   const char *text, uint32_t text_bytes,
                                   const char *title,
                                   char sha_out[41]);
-/** Load a KV file.  @param rebuild_from_text  a payload-less ("stripped")
- *   checkpoint carries only rendered text.  When the file carries the agent
- *   TOKEN trailer (every file written since 2026-09-16, and every file /strip
- *   has copied) its exact ids are used and this argument does not matter.  Only
- *   a LEGACY stripped file falls through: `true` rebuilds its tokens by
- *   tokenising the text -- LOSSY by nature, the text cannot distinguish a
- *   control token from its literal spelling and BPE may re-merge across token
- *   boundaries -- while `false` refuses the form ("no KV payload") so the caller
- *   can supply the tokens it already holds (the sysprompt bootstrap renders the
- *   very text that would be rebuilt, so re-tokenising could only produce a
- *   DIFFERENT, injectable list). */
 /** The optional agent TOKEN trailer (PULSAR_KVSTORE_EXT_AGENT_TOKENS): the
  * exact ids a file's rendered text renders.  Written by the saver for every
  * agent file and copied by /strip, so a payload-less file is restored exactly
@@ -957,6 +946,17 @@ bool agent_kv_write_token_trailer(FILE *fp, const pulsar_tokens *tokens,
  * filled on success; false when the trailer is absent or malformed. */
 bool agent_kv_read_token_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
                                  pulsar_tokens *out, char *err, size_t err_len);
+/** Load a KV file.  `rebuild_from_text`: a payload-less ("stripped")
+ *   checkpoint carries only rendered text.  When the file carries the agent
+ *   TOKEN trailer (every file written since 2026-09-16, and every file /strip
+ *   has copied) its exact ids are used and this argument does not matter.  Only
+ *   a LEGACY stripped file falls through: `true` rebuilds its tokens by
+ *   tokenising the text -- LOSSY by nature, the text cannot distinguish a
+ *   control token from its literal spelling and BPE may re-merge across token
+ *   boundaries -- while `false` refuses the form ("no KV payload") so the caller
+ *   can supply the tokens it already holds (the sysprompt bootstrap renders the
+ *   very text that would be rebuilt, so re-tokenising could only produce a
+ *   DIFFERENT, injectable list). */
 bool agent_kv_load_path(agent_worker *w, const char *path,
                                const char *expected_sha,
                                const char *expected_text,

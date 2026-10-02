@@ -200,12 +200,12 @@ static void token_printer_write_char(token_printer *p, char c) {
 }
 
 /** The CLI's sink for pulsar_think_scan: grey thinking text, the reply starts
- * on the line after </think> (no blank line). */
+ * on the line after `</think>` (no blank line). */
 struct token_printer_think_sink {
     token_printer *p;   ///< the printer being driven
     /** The CLI has no DSML lane: tags are always prose markers. */
     bool tags_enabled() const { return true; }
-    /** Nothing to do at <think>: the next text byte turns grey. */
+    /** Nothing to do at `<think>`: the next text byte turns grey. */
     void think_open_tag() {}
     /** Close the grey SGR run. */
     void think_close_tag() { token_printer_reset_color(p); }

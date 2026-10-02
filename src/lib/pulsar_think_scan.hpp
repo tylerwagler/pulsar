@@ -31,7 +31,7 @@ static inline bool bytes_is_partial_prefix(const char *p, size_t n, const char *
 }
 
 /** Scanner state.  Zero-initialise, or set `in_think` when generation starts
- * inside a reasoning block (the assistant prefix already emitted <think>). */
+ * inside a reasoning block (the assistant prefix already emitted `<think>`). */
 struct pulsar_think_scanner {
     bool in_think;      ///< between `<think>` and `</think>`
     char pending[8];    ///< '<'-led bytes withheld while a tag may still be forming
@@ -43,16 +43,16 @@ struct pulsar_think_scanner {
  * Sink contract (duck-typed, resolved at compile time):
  *   bool tags_enabled()   -- tags are recognised at this byte (false while a
  *                            DSML block is being parsed: its bytes are not prose)
- *   void think_open_tag() -- a complete <think> was consumed; fires BEFORE
+ *   void think_open_tag() -- a complete `<think>` was consumed; fires BEFORE
  *                            in_think flips so a held prefix flushes in the old state
- *   void think_close_tag()-- a complete </think> was consumed; fires BEFORE
+ *   void think_close_tag()-- a complete `</think>` was consumed; fires BEFORE
  *                            in_think flips (reset styling here)
  *   bool at_line_start()  -- the last byte the sink wrote was '\n' (or nothing yet)
  *   void newline()        -- write one raw '\n' outside any text formatting
  *   void text(char c)     -- one byte of prose or thinking text; read
  *                            scanner.in_think for styling
  *
- * After </think> the scanner brings the output to a line start and then
+ * After `</think>` the scanner brings the output to a line start and then
  * writes `blank_lines_after_close` more newlines (CLI: 0, agent: 1).
  * `finish` (end of generation) releases a held prefix as text: an unfinished
  * "<thi" at the very end is prose. */
