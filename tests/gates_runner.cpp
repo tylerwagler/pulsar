@@ -405,6 +405,9 @@ int main(int argc, char **argv) {
         /* L177: the widest admissible speculative step -- 3 banks x (1 + 4) = 15
          * rows, one under PULSAR_SPEC_ROW_BUDGET -- batched == serialized. */
         {"cuda-dspark-batch-gate-depth4", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "4", NULL}},
+        /* L260: one redraft group of 10 banks (> the markov tile) and 20 drafter rows (> 16), graded,
+         * plus the byte-exact markov tile identity; depth 2 keeps the 30 verify rows inside the slab */
+        {"cuda-dspark-batch-gate-wide", gate_dspark_batch_gate_main, 10, NULL, NULL, {"4", "2", "10", NULL}},
     };
     /* Configuration B: drafter off -- the prefill gates below pin the chunk
      * to the default grid, so they share this engine (four opens per battery,

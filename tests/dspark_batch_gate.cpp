@@ -25,7 +25,15 @@
  *
  * WHY THIS AND NOT THE MULTISEQ FINGERPRINTS: with exact verification the
  * emitted tokens never depend on the drafts, so a token-stream gate cannot see
- * a wrong drafter. Only the drafts themselves can. */
+ * a wrong drafter. Only the drafts themselves can.
+ *
+ * L260 wide leg (argv[4] = 10 banks at depth 2): ONE redraft group of more than
+ * PULSAR_DSPARK_MARKOV_TILE banks and more than 16 drafter rows -- the markov
+ * launcher's tiles and the drafter forward past the M-neutral width.  That width
+ * is graded (width-dependent arithmetic), so the tiling is pinned separately and
+ * byte-for-byte: markov_tile_identity runs one markov chain over every bank and
+ * the same chain one bank at a time from identical inputs; banks are independent,
+ * so ids and refined logits must match bank by bank. */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
@@ -48,10 +56,11 @@ static int g_fail;
         } \
     } while (0)
 
-enum { NB = 3, ROWS = 32 };
-static int g_nb = NB;   /* banks in play this run (argv[4], <= NB) */
-static const int g_prompt_off[NB] = {0, 401, 700};
-static const int g_prompt_len[NB] = {130, 258, 160};
+enum { NB = 10, ROWS = 32 };
+static int g_nb = 3;    /* banks in play this run (argv[4], <= NB) */
+/* banks 0-2 are the original shapes; 3.. extend the story at fixed offsets */
+static const int g_prompt_off[NB] = {0, 401, 700, 1100, 1500, 1900, 2300, 2700, 3100, 3500};
+static const int g_prompt_len[NB] = {130, 258, 160, 140, 190, 120, 230, 150, 170, 210};
 
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -357,15 +366,84 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
     return compared;
 }
 
+/* L260: the markov launcher's tiles are invisible to a caller -- the same chain
+ * over n banks at once and over each bank alone must give the same bytes. */
+static void markov_tile_identity(int n_banks) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "tile identity: session create"); return; }
+    pulsar_gpu_graph *g = &s->graph;
+    const pulsar_dspark_weights *w = &g_e->dspark_weights;
+    const uint32_t vocab = w->vocab_size, embed_dim = 256, depth = 4;
+    const uint64_t row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    const uint64_t vb = (uint64_t)vocab * sizeof(float);
+    bool ok = g->spec_logits && g->dspark_markov_logits && g->dspark_refined_ids && g->dspark_bank_meta &&
+              n_banks <= (int)PULSAR_DSPARK_BANKS_MAX && n_banks > (int)PULSAR_DSPARK_MARKOV_TILE &&
+              (uint64_t)(n_banks * depth) <= PULSAR_SPEC_LOGITS_ALLOC_ROWS;
+    CHECK(ok, "tile identity: scratch missing or %d banks out of range", n_banks);
+    /* base logits: n_banks x depth rows of a fixed pseudo-random field */
+    const uint32_t rows = (uint32_t)n_banks * depth;
+    float *base = ok ? (float *)malloc((size_t)rows * PULSAR_N_VOCAB * sizeof(float)) : NULL;
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    for (size_t i = 0; base && i < (size_t)rows * PULSAR_N_VOCAB; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        base[i] = (float)((int64_t)(x >> 40) - (1ll << 23)) / (float)(1 << 21);
+    }
+    ok = ok && base && pulsar_gpu_tensor_write(g->spec_logits, 0, base, (uint64_t)rows * row_bytes);
+    int32_t meta[2 * PULSAR_DSPARK_BANKS_MAX] = {0}, seed[PULSAR_DSPARK_BANKS_MAX * 17] = {0};
+    for (int b = 0; b < n_banks; b++) { meta[b] = (int32_t)(b * depth); seed[b * 17] = (int32_t)(1000 + 37 * b); }
+    const void *map = tensor_map_base(&g_e->dspark_model, w->markov_w1);
+    const uint64_t map_size = tensor_map_size(&g_e->dspark_model, w->markov_w1);
+    const int w1_bf16 = w->markov_w1->type == PULSAR_TENSOR_BF16;
+    const int w2_fmt = pulsar_markov_w2_fmt(w->markov_w2->type);
+    auto chain = [&](int nb) {
+        return pulsar_gpu_dspark_markov_chain_banks_model(
+                   g->dspark_markov_logits, g->dspark_refined_ids, 17u, g->spec_logits, row_bytes,
+                   g->dspark_bank_meta, map, map_size, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
+                   (uint32_t)nb, depth, vocab, embed_dim, w1_bf16, w2_fmt) != 0;
+    };
+    /* all banks at once */
+    int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
+    float *lg_all = ok ? (float *)malloc((size_t)n_banks * vb) : NULL;
+    ok = ok && lg_all && pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, meta, sizeof(meta)) &&
+         pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, seed, (uint64_t)n_banks * 17 * sizeof(int32_t)) &&
+         chain(n_banks) &&
+         pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_banks * 17 * sizeof(int32_t)) &&
+         pulsar_gpu_tensor_read(g->dspark_markov_logits, 0, lg_all, (uint64_t)n_banks * vb);
+    CHECK(ok, "tile identity: the %d-bank chain failed", n_banks);
+    /* each bank alone */
+    float *lg_one = ok ? (float *)malloc((size_t)vb) : NULL;
+    int differ = 0;
+    for (int b = 0; ok && b < n_banks; b++) {
+        int32_t m1[2 * PULSAR_DSPARK_BANKS_MAX] = {0}, s1[17] = {0}, ids1[17];
+        m1[0] = meta[b]; s1[0] = seed[b * 17];
+        ok = lg_one && pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, m1, sizeof(m1)) &&
+             pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, s1, sizeof(s1)) && chain(1) &&
+             pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids1, sizeof(ids1)) &&
+             pulsar_gpu_tensor_read(g->dspark_markov_logits, 0, lg_one, vb);
+        CHECK(ok, "tile identity: bank %d alone failed", b);
+        if (!ok) break;
+        const bool ids_eq = memcmp(ids1, ids_all + b * 17, (depth + 1) * sizeof(int32_t)) == 0;
+        const bool lg_eq = memcmp(lg_one, lg_all + (size_t)b * vocab, vb) == 0;
+        CHECK(ids_eq && lg_eq, "tile identity: bank %d (tile %d) differs alone vs in a %d-bank chain (ids %s, "
+              "last refined logits %s)", b, b / (int)PULSAR_DSPARK_MARKOV_TILE, n_banks,
+              ids_eq ? "equal" : "DIFFER", lg_eq ? "equal" : "DIFFER");
+        differ += !(ids_eq && lg_eq);
+    }
+    if (ok) printf("markov tile identity: %d banks in %d tiles == each bank alone (%d differ)\n", n_banks,
+                   (n_banks + (int)PULSAR_DSPARK_MARKOV_TILE - 1) / (int)PULSAR_DSPARK_MARKOV_TILE, differ);
+    free(base); free(lg_all); free(lg_one);
+    pulsar_session_free(s);
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     g_e = NULL;
     memset(&g_toks, 0, sizeof(g_toks));
     g_fail = 0;
-    g_nb = NB;
-    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [DRAFT_DEPTH] [BANKS<=3]\n", argv[0]); return 2; }
+    g_nb = 3;
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [DRAFT_DEPTH] [BANKS<=10]\n", argv[0]); return 2; }
     const int ticks = argc > 2 ? atoi(argv[2]) : 8;
     const int depth = argc > 3 ? atoi(argv[3]) : 0;
-    g_nb = argc > 4 ? atoi(argv[4]) : NB;
+    g_nb = argc > 4 ? atoi(argv[4]) : 3;
     if (g_nb < 1 || g_nb > NB) { fprintf(stderr, "bad bank count\n"); return 2; }
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -384,9 +462,10 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
 
-    const float greedy[NB] = {0.0f, 0.0f, 0.0f};
-    const float mixed[NB] = {0.0f, 1.0f, 1.0f};
-    const float sampled[NB] = {1.0f, 1.0f, 1.0f};
+    float greedy[NB], mixed[NB], sampled[NB];
+    for (int b = 0; b < NB; b++) { greedy[b] = 0.0f; mixed[b] = b ? 1.0f : 0.0f; sampled[b] = 1.0f; }
+    /* the wide leg's direct tile check: one chain over every bank vs each alone */
+    if (g_nb > (int)PULSAR_DSPARK_MARKOV_TILE) markov_tile_identity(g_nb);
     const int c1 = run_shape("greedy x3", greedy, NULL, ticks);
     const int c2 = run_shape("greedy + sampled x2", mixed, NULL, ticks);
     /* The readback-arm alternation: tick 0 all-sampled (compact arm), tick 1

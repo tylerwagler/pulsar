@@ -763,6 +763,7 @@ cuda-nt-sweep: tests/nt_crossover_sweep
 cuda-dspark-batch-gate: tests/dspark_batch_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 8 0
 	PULSAR_MSEQ_BANKS=3 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 6 1
+	PULSAR_MSEQ_BANKS=10 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 4 2 10
 
 # Tier-2 overcommit accounting-exactness gate (task #55, increment 1): the
 # exact-frontier touched-KV number the eviction guard triggers on must track the
