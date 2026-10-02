@@ -1122,6 +1122,9 @@ int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t d
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
+bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
+    return s && bank < s->graph.banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph.ms_comp_state_stale[bank];
+}
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->bank_prefix_match(bank, prompt, out); } else if (out) { out->live_cut = 0; out->prompt_cut = 0; out->seamed = false; } }
