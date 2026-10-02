@@ -2673,7 +2673,7 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
              g->dspark_raw_cache[i];
     }
     g->dspark_capture_batch_n = 0;
-    g->dspark_main_x = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
+    g->dspark_main_x = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
     /* Bulk prefill capture buffers: always allocated when the drafter is
      * loaded (~200 MB at prefill_cap 4096) -- the prompt-window seeding
@@ -2756,10 +2756,13 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->spec_comp_scratch_row = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         ok = ok && g->spec_comp_scratch_row;
         g->spec_comp_save_n = 0;
-        g->dspark_concat = pulsar_gpu_tensor_alloc(3ull * PULSAR_N_EMBD * sizeof(float));
-        g->dspark_proj_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-        g->dspark_seed_kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-        g->dspark_seed_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
+        /* L260: the seed scratch holds one batched-seed chunk (every bank's
+         * committed rows, PULSAR_DSPARK_SEED_ROWS at a time); the one-row seed
+         * uses row 0. */
+        g->dspark_concat = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * 3ull * PULSAR_N_EMBD * sizeof(float));
+        g->dspark_proj_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_EMBD * sizeof(float));
+        g->dspark_seed_kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_HEAD_DIM * sizeof(float));
+        g->dspark_seed_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_HEAD_DIM * sizeof(float));
         g->dspark_seed_rot = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         /* L150: the drafter scratch holds every bank of a batched redraft
          * (PULSAR_DSPARK_BANKS_MAX banks of refined logits / chain ids, a

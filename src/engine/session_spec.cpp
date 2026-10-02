@@ -504,6 +504,15 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
 static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
     pulsar_gpu_graph *g = &s->graph;
     pulsar_engine *e = s->engine;
+    if (s->seed_defer.active) {
+        /* L260: the batched round end seeds every bank's rows together after
+         * its walks; record this row against the installed bank. */
+        if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
+        s->seed_defer.src_row[s->seed_defer.n] = row;
+        s->seed_defer.bank[s->seed_defer.n] = g->banks.cur_bank;
+        s->seed_defer.n++;
+        return true;
+    }
     for (int i = 0; i < 3; i++) {
         if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
         /* Async: project_main_x below reads these on the same (per-thread)
@@ -1563,7 +1572,22 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * (server_sched.cpp) checks the same equality after every round. */
     const int exposed_end = saved_len + n_accept;
     const bool trimmed = exposed_end < s->checkpoint.len;
-    if (trimmed) s->rewind(exposed_end);
+    if (trimmed) {
+        /* rewind() drops the drafter window, so this bank's seed rows go too:
+         * the deferred batch must not advance counters the rewind has reset. */
+        if (s->seed_defer.active) {
+            const uint32_t cur = s->graph.banks.cur_bank;
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < s->seed_defer.n; i++) {
+                if (s->seed_defer.bank[i] == cur) continue;
+                s->seed_defer.src_row[k] = s->seed_defer.src_row[i];
+                s->seed_defer.bank[k] = s->seed_defer.bank[i];
+                k++;
+            }
+            s->seed_defer.n = k;
+        }
+        s->rewind(exposed_end);
+    }
 
     /* The carry IS the next base (already correctly distributed). Persist it
      * so the next generate_speculative call forwards it as batch position 0;
@@ -2426,6 +2450,11 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
 
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
                                                int eos_token, const float *rows) {
+    /* L260: each bank's walk records its committed capture rows; one banked seed
+     * after the loop shares the drafter's main_proj / attn_kv reads across every
+     * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
+    s->seed_defer.active = s->graph.banks.n_banks > 0;
+    s->seed_defer.n = 0;
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
@@ -2445,6 +2474,24 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         st->pos_after = s->pos();
         s->bank_state_save(st->bank);
     }
+    if (!s->seed_defer.active) return;
+    s->seed_defer.active = false;
+    pulsar_engine *e = s->engine;
+    if (!gpu_graph_dspark_seed_rows_banked(&s->graph, &e->dspark_model, &e->dspark_weights,
+                                           s->seed_defer.src_row, s->seed_defer.bank, s->seed_defer.n)) {
+        /* No counter advanced: every bank that had rows refuses its round, as a
+         * failed one-row seed did ("DSpark fused state update failed"). */
+        for (int i = 0; i < n; i++) {
+            pulsar_spec_step *st = &steps[i];
+            bool had = false;
+            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
+            if (!had || st->status != PULSAR_SPEC_STEP_OK) continue;
+            st->status = PULSAR_SPEC_STEP_FAILED;
+            st->round->redraft.valid = false;
+            snprintf(st->err, sizeof st->err, "DSpark batched drafter seed failed");
+        }
+    }
+    s->seed_defer.n = 0;
 }
 
 void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {

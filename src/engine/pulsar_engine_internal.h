@@ -2339,6 +2339,17 @@ struct pulsar_session {
      *  channel, so any other frame (a disk-KV store/drop from a mid-prefill
      *  "continued" checkpoint) would desync them -- those ops refuse instead. */
     bool tp_in_sync;
+    /** L260: the batched round end's deferred drafter seed.  While `active`
+     *  (pulsar_session_spec_round_end_batch_local), each bank's round end records
+     *  its committed capture rows here instead of seeding them one GEMV row at a
+     *  time; the batch then seeds every bank in one pass
+     *  (gpu_graph_dspark_seed_rows_banked). */
+    struct {
+        bool active;
+        uint32_t n;
+        uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];
+        uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
+    } seed_defer;
     pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
@@ -3569,6 +3580,20 @@ bool gpu_graph_dspark_seed_draft_kv(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
+        uint32_t                 n_rows);
+/** L260: seed the drafter rings of SEVERAL banks from verify-capture rows in one
+ *  pass: row t (capture row src_rows[t]) seeds bank row_bank[t]'s three rings at
+ *  that bank's next position; a bank's rows are contiguous and in commit order.
+ *  The projections run over all rows at once (chunks of at most the exact decode
+ *  range, so each row is bit-identical to the one-row seed), the stores go
+ *  through the bank-major slabs, and each bank's ring counters advance by its
+ *  rows only when every chunk succeeded.  false = nothing advanced. */
+bool gpu_graph_dspark_seed_rows_banked(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        const uint32_t            *src_rows,
+        const uint32_t            *row_bank,
         uint32_t                 n_rows);
 bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_graph          *g,

@@ -1063,27 +1063,49 @@ int pulsar_gpu_dspark_markov_step_banks_model(
  * one warp per 32-block; N_EMBD is a multiple of 32, so no block straddles two
  * sources.  The f32 concat is never written -- the caller declares the f32
  * store skipped and the GEMV reads the slot. */
+/* Row r of the slot is the concat of source row src.r[r] of each of h0/h1/h2
+ * (L260: the batched drafter seed gathers the committed rows of every bank
+ * from the verify capture in one launch; the one-row entry is src {0}). */
+struct dspark_concat_rows { uint32_t r[PULSAR_DSPARK_SEED_ROWS]; };
 __global__ static void dspark_concat3_e4m3_kernel(const float *h0, const float *h1, const float *h2,
-                                                  uint32_t E, __nv_fp8_e4m3 *data,
+                                                  uint32_t E, dspark_concat_rows src_rows,
+                                                  __nv_fp8_e4m3 *data,
                                                   unsigned char *scale, int KBp) {
     const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t col = warp * 32u + lane;
     if (col >= 3u * E) return;
+    const uint32_t row = blockIdx.y;
     const uint32_t src = col / E, off = col - src * E;
-    const float v = src == 0 ? h0[off] : src == 1 ? h1[off] : h2[off];
-    pulsar_mx_emit_block(v, col, 0u, 3u * E, KBp, data, scale);
+    const uint64_t at = (uint64_t)src_rows.r[row] * E + off;
+    const float v = src == 0 ? h0[at] : src == 1 ? h1[at] : h2[at];
+    pulsar_mx_emit_block(v, col, row, 3u * E, KBp, data, scale);
+}
+
+int pulsar_gpu_dspark_concat3_e4m3_rows(void *slot_data, void *slot_scale, int sf_pitch,
+                                        const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                        const pulsar_gpu_tensor *h2, const uint32_t *src_rows,
+                                        uint32_t n_rows, uint32_t n_embd) {
+    if (!slot_data || !slot_scale || !h0 || !h1 || !h2 || !src_rows || n_rows == 0 ||
+        n_rows > PULSAR_DSPARK_SEED_ROWS || n_embd == 0 || n_embd % 32u != 0) return 0;
+    dspark_concat_rows rows = {};
+    uint32_t max_src = 0;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        rows.r[i] = src_rows[i];
+        if (src_rows[i] > max_src) max_src = src_rows[i];
+    }
+    const uint64_t need = ((uint64_t)max_src + 1u) * n_embd * sizeof(float);
+    if (h0->bytes < need || h1->bytes < need || h2->bytes < need) return 0;
+    const uint32_t warps = 3u * n_embd / 32u;
+    dspark_concat3_e4m3_kernel<<<dim3((warps * 32u + 255u) / 256u, n_rows), 256>>>(
+        (const float *)h0->ptr, (const float *)h1->ptr, (const float *)h2->ptr, n_embd, rows,
+        (__nv_fp8_e4m3 *)slot_data, (unsigned char *)slot_scale, sf_pitch);
+    return cuda_ok(cudaGetLastError(), "dspark concat3 e4m3");
 }
 
 int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pitch,
                                    const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
                                    const pulsar_gpu_tensor *h2, uint32_t n_embd) {
-    if (!slot_data || !slot_scale || !h0 || !h1 || !h2 || n_embd == 0 || n_embd % 32u != 0) return 0;
-    const uint64_t need = (uint64_t)n_embd * sizeof(float);
-    if (h0->bytes < need || h1->bytes < need || h2->bytes < need) return 0;
-    const uint32_t warps = 3u * n_embd / 32u;
-    dspark_concat3_e4m3_kernel<<<(warps * 32u + 255u) / 256u, 256>>>(
-        (const float *)h0->ptr, (const float *)h1->ptr, (const float *)h2->ptr, n_embd,
-        (__nv_fp8_e4m3 *)slot_data, (unsigned char *)slot_scale, sf_pitch);
-    return cuda_ok(cudaGetLastError(), "dspark concat3 e4m3");
+    const uint32_t row0 = 0;
+    return pulsar_gpu_dspark_concat3_e4m3_rows(slot_data, slot_scale, sf_pitch, h0, h1, h2, &row0, 1u, n_embd);
 }

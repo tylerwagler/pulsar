@@ -884,6 +884,15 @@ void pulsar_gpu_mxfp8_gact_disarm(void);
 int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pitch,
                                    const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
                                    const pulsar_gpu_tensor *h2, uint32_t n_embd);
+/** The most rows one batched drafter seed chunk carries (scratch capacity; the
+ *  chunk is also bounded by pulsar_gpu_matmul_decode_exact_rows()). */
+#define PULSAR_DSPARK_SEED_ROWS 16u
+/** L260: n_rows concat rows at once -- slot row r is [h0|h1|h2] of source row
+ *  src_rows[r] of the [rows, n_embd] tensors h0/h1/h2 (the verify capture). */
+int pulsar_gpu_dspark_concat3_e4m3_rows(void *slot_data, void *slot_scale, int sf_pitch,
+                                        const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                        const pulsar_gpu_tensor *h2, const uint32_t *src_rows,
+                                        uint32_t n_rows, uint32_t n_embd);
 
 /** L158: give an OFFSET ROW VIEW of an encoded activation its own slot, filled
  * from the producer's encoding (byte copy + scale re-base; no quantise).  Used

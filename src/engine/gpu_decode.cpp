@@ -329,6 +329,131 @@ bool gpu_graph_dspark_seed_draft_kv(
     return true;
 }
 
+/* L260: the batched lane's drafter seed.  The per-bank round end used to seed
+ * each committed row with its own one-row GEMVs (main_proj, ~50 MB, and three
+ * attn_kv) -- 16 to 32 reads of the same weights per step at c16.  Here every
+ * bank's rows share each weight read.  Chunks stay inside the exact decode
+ * range, where the MXFP8 GEMV gives every row the one-row kernel's bytes; the
+ * norms (one block per row), the rope (per-row positions) and the ring packer
+ * are the one-row path's kernels, so the rings hold exactly what the per-row
+ * seed wrote. */
+bool gpu_graph_dspark_seed_rows_banked(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        const uint32_t            *src_rows,
+        const uint32_t            *row_bank,
+        uint32_t                 n_rows) {
+    PULSAR_NVTX("drafter seed (banked)");
+    if (n_rows == 0) return true;
+    const int64_t E = PULSAR_N_EMBD;
+    const uint64_t concat_dim = 3u * (uint64_t)E;
+    if (!src_rows || !row_bank || g->banks.n_banks == 0 || !g->dspark_row_meta ||
+        !g->dspark_concat || !g->dspark_proj_out || !g->dspark_main_x || !g->dspark_seed_kv ||
+        !g->dspark_seed_norm || !g->banks.dspark_raw[0] || !g->banks.dspark_raw[1] ||
+        !g->banks.dspark_raw[2]) {
+        fprintf(stderr, "pulsar: batched drafter seed: no banked rings or seed scratch -- refusing\n");
+        return false;
+    }
+    for (int i = 0; i < 3; i++) if (!g->dspark_target_h_batch[i]) return false;
+    const int exact = pulsar_gpu_matmul_decode_exact_rows();
+    const uint32_t chunk_max = exact < (int)PULSAR_DSPARK_SEED_ROWS ? (uint32_t)exact : PULSAR_DSPARK_SEED_ROWS;
+    if (chunk_max == 0) return false;
+    uint32_t added[PULSAR_MSEQ_MAX] = {0};   /* rows seeded per bank so far: its next ring position */
+    bool ok = true;
+    for (uint32_t c0 = 0; ok && c0 < n_rows; ) {
+        const uint32_t m = (n_rows - c0) < chunk_max ? (n_rows - c0) : chunk_max;
+        pulsar_decode_rows_scope rows(m);
+        if (!rows.ok()) return false;
+        /* positions: row t of bank b lands at ms_dspark_n_raw[b][li] + (rows of b before it) */
+        int32_t meta[7 * PULSAR_SPEC_LOGITS_ROWS] = {0};
+        uint32_t chunk_added[PULSAR_MSEQ_MAX] = {0};
+        for (uint32_t t = 0; t < m; t++) {
+            const uint32_t b = row_bank[c0 + t];
+            if (b >= g->banks.n_banks) return false;
+            const uint32_t k = added[b] + chunk_added[b]++;
+            for (uint32_t li = 0; li < 3; li++)
+                meta[(li * 2 + 0) * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)(g->ms_dspark_n_raw[b][li] + k);
+            meta[6 * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)b;
+        }
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        const uint64_t rb = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t);
+        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb, (uint64_t)m * sizeof(int32_t));
+        /* main_x rows: concat -> main_proj -> main_norm (E4M3 into main_x's slot) */
+        void *cq = NULL, *csf = NULL; int ckbp = 0;
+        pulsar_gpu_mxfp8_act_cache_arm(g->dspark_concat, m, concat_dim);
+        ok = meta_seq && pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_concat, m, concat_dim, &cq, &csf, &ckbp);
+        if (ok) ok = pulsar_gpu_dspark_concat3_e4m3_rows(cq, csf, ckbp, g->dspark_target_h_batch[0],
+                                                         g->dspark_target_h_batch[1], g->dspark_target_h_batch[2],
+                                                         src_rows + c0, m, (uint32_t)E) != 0;
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+            pulsar_gpu_mxfp8_act_cache_note_f32_skipped(m);
+            ok = pulsar_gpu_matmul_mxfp8_tensor(g->dspark_proj_out,
+                                              tensor_map_base(dspark_model, w->main_proj),
+                                              tensor_map_size(dspark_model, w->main_proj),
+                                              w->main_proj->abs_offset, concat_dim, E,
+                                              g->dspark_concat, m) != 0;
+        }
+        pulsar_gpu_mxfp8_act_cache_disarm();
+        void *mx_q = NULL, *mx_sf = NULL; int mx_kbp = 0;
+        if (ok) ok = pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_main_x, m, E, &mx_q, &mx_sf, &mx_kbp);
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_mx_tensor(NULL, g->dspark_proj_out,
+                                                             tensor_map_base(dspark_model, w->main_norm),
+                                                             tensor_map_size(dspark_model, w->main_norm),
+                                                             w->main_norm->abs_offset, (uint32_t)E, m,
+                                                             PULSAR_RMS_EPS, mx_q, mx_sf, mx_kbp, NULL,
+                                                             w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_arm(g->dspark_main_x, m, E);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        }
+        /* each layer: kv projection, its norm, rope at each row's position, banked ring store */
+        for (int li = 0; ok && li < 3; li++) {
+            pulsar_gpu_tensor *rope_pos = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2) * rb,
+                                                                 (uint64_t)m * sizeof(int32_t));
+            ok = rope_pos && pulsar_gpu_matmul_mxfp8_tensor(g->dspark_seed_kv,
+                                              tensor_map_base(dspark_model, w->layer[li].attn_kv),
+                                              tensor_map_size(dspark_model, w->layer[li].attn_kv),
+                                              w->layer[li].attn_kv->abs_offset,
+                                              PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
+                                              g->dspark_main_x, m) != 0;
+            if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->dspark_seed_norm, g->dspark_seed_kv,
+                                             tensor_map_base(dspark_model, w->layer[li].attn_kv_a_norm),
+                                             tensor_map_size(dspark_model, w->layer[li].attn_kv_a_norm),
+                                             w->layer[li].attn_kv_a_norm->abs_offset,
+                                             PULSAR_N_HEAD_DIM, m, PULSAR_RMS_EPS, NULL,
+                                             w->layer[li].attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+            if (ok) ok = pulsar_gpu_rope_tail_tensor(g->dspark_seed_norm, m, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM,
+                                                     PULSAR_N_ROT, 0, 0, false,
+                                                     (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                                                     rope_pos) != 0;
+            if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(g->banks.dspark_raw[li], g->dspark_seed_norm,
+                                                              PULSAR_DSPARK_DRAFT_WINDOW, 0u, m, PULSAR_N_HEAD_DIM,
+                                                              rope_pos, meta_seq, g->banks.n_banks) != 0;
+            pulsar_gpu_tensor_free(rope_pos);
+        }
+        pulsar_gpu_mxfp8_act_cache_disarm();
+        pulsar_gpu_tensor_free(meta_seq);
+        for (uint32_t b = 0; b < g->banks.n_banks && b < PULSAR_MSEQ_MAX; b++) added[b] += chunk_added[b];
+        c0 += m;
+    }
+    if (!ok) {
+        fprintf(stderr, "pulsar: batched drafter seed failed (%u rows); no ring counter advanced -- "
+                        "refusing those banks' spec rounds rather than drafting unseeded\n", n_rows);
+        return false;
+    }
+    /* every chunk landed: advance each bank's counters (and the installed bank's live copy) */
+    for (uint32_t b = 0; b < g->banks.n_banks && b < PULSAR_MSEQ_MAX; b++) {
+        if (!added[b]) continue;
+        for (int li = 0; li < 3; li++) g->ms_dspark_n_raw[b][li] += added[b];
+        if (b == g->banks.cur_bank)
+            for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = g->ms_dspark_n_raw[b][li];
+    }
+    return true;
+}
+
 bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_graph          *g,
         const pulsar_model         *base_model,
