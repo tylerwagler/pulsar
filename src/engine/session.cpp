@@ -1468,27 +1468,45 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
             return 1;
         }
-        /* Before any state moves: an image past the first chunk is refused here
-         * (and by the TP leader before it mirrors anything), not mid-prefill. */
+        /* Before any state moves: a block that cannot sit whole in one chunk is
+         * refused here (and by the TP leader before it mirrors anything). */
         if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
                               &image_barrier, err, errlen))
             return 1;
-        /* L226: an image ALREADY inside the live KV is not a reason to redo the
-         * prompt.  Reuse is licensed when this session's checkpoint holds those
-         * blocks AND holds THESE IMAGES: the fingerprint is what makes that true,
-         * since block ids are geometry (see image_set_fingerprint).  Licensing it
-         * is all that is needed -- the carry path below and the L115 seam rescue
-         * then do the work, and `image_barrier` (see the resume) keeps either one
-         * from re-evaluating a merged row.  Anything else -- a new image, a
-         * different image of the same size, a block the checkpoint does not cover
-         * -- clears checkpoint_valid exactly as before, so the cold rebuild (the
-         * one pass that merges) runs.
+        /* L226 + L261: reuse the live KV across an image request.  The images the
+         * checkpoint already holds must be exactly the live set -- the fingerprint
+         * is the pixels, since block ids are only geometry (image_set_fingerprint)
+         * -- and every other image must begin at or after the checkpoint, so the
+         * resumed prefill merges it in the chunk that owns it (the planner never
+         * splits a block).  The checkpoint must be a token prefix of this prompt:
+         * the seam rescue rewinds to an arbitrary common prefix and could land
+         * inside a merged block.  Anything else -- a different image, a block that
+         * straddles the checkpoint, an edited history -- clears checkpoint_valid and
+         * the cold pass merges every image from token 0.
          *
          * No sentinel id can reach a cache surface this way.  The server never
          * plans a cold store for an image request (server_jobs.cpp gates the
          * whole disk/prefix resolver on !image_request), and a LATER prompt whose
          * sentinel ids outlive their images is still refused by the scan below. */
-        const uint64_t request_fp = image_set_fingerprint(images, n_images);
+        const uint32_t ck = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+        enum { LIVE_IMAGES_MAX = 64 };
+        pulsar_image_ref held[LIVE_IMAGES_MAX];
+        int n_held = 0, n_new = 0, held_end = 0;
+        bool straddles = n_images > LIVE_IMAGES_MAX;
+        for (int i = 0; i < n_images && !straddles; i++) {
+            int len = 0;
+            (void)vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB, images[i].start_pos, &len);
+            const uint32_t bs = (uint32_t)images[i].start_pos, be = bs + (uint32_t)len;
+            if (be <= ck) {
+                held[n_held++] = images[i];
+                if ((int)be > held_end) held_end = (int)be;
+            } else if (bs >= ck) {
+                n_new++;
+            } else {
+                straddles = true;
+            }
+        }
+        const uint64_t held_fp = n_held > 0 ? image_set_fingerprint(held, n_held) : 0;
         /* A bank whose compressor state is STALE (a mid-group rewind with no state
          * coverage) can only be joined at a group boundary: the per-row producer
          * refuses the store anywhere else, so extending it fails the request
@@ -1501,35 +1519,37 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
         /* The resume must start at a PULSAR_RESUME_GRID multiple: that is what
          * makes a resumed prefill reproduce the cold one byte for byte (chunk
          * boundaries and kernel calls are the cold prefill's, and every grid point
-         * is an empty compressor group), and it must start at or above the barrier
-         * so no merged row is re-evaluated.  Both together mean reuse is legal only
-         * when such a grid point fits inside the checkpoint AND the raw ring can
-         * still replay from it.  Otherwise there is no byte-identical extension to
-         * take and the cold rebuild runs -- which is the common answer early in a
-         * conversation, when the images are near the frontier. */
-        resume_floor = image_barrier > 0
-            ? (((uint32_t)image_barrier + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
+         * is an empty compressor group), and at or above the end of the last HELD
+         * block so no merged row is re-evaluated.  With held images, reuse is legal
+         * only when such a grid point fits inside the checkpoint AND the raw ring
+         * can still replay from it; with none, the carry path's own ring rule
+         * applies. */
+        resume_floor = held_end > 0
+            ? (((uint32_t)held_end + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
             : 0u;
         const uint32_t raw_reach = s->graph.raw_cap > s->graph.raw_window
                                  ? s->graph.raw_cap - s->graph.raw_window : 0u;
-        const bool grid_reachable =
-            resume_floor > 0 && resume_floor <= (uint32_t)s->checkpoint.len &&
-            (uint32_t)s->checkpoint.len - resume_floor <= raw_reach;
-        const bool images_all_live =
+        const bool floor_ok =
+            resume_floor == 0 ||
+            (resume_floor <= ck && ck - resume_floor <= raw_reach);
+        const bool reuse =
             s->checkpoint_valid &&
+            !straddles &&
             bank_extendable &&
-            grid_reachable &&
-            s->live_image_fp == request_fp &&
-            s->live_image_barrier == image_barrier;
-        if (!images_all_live) {
+            floor_ok &&
+            prompt->len >= s->checkpoint.len &&
+            pulsar_tokens_starts_with(prompt, &s->checkpoint) &&
+            s->live_image_fp == held_fp &&
+            s->live_image_barrier == held_end;
+        if (!reuse) {
             s->checkpoint_valid = false;
             if (!bank_extendable)
-                fprintf(stderr, "pulsar: image request: %d image(s) are live but this bank's "
-                                "compressor state is stale -- rebuilding cold\n", n_images);
+                fprintf(stderr, "pulsar: image request: this bank's compressor state is stale -- "
+                                "rebuilding cold\n");
         } else {
-            fprintf(stderr, "pulsar: image request: %d image(s) already live (prefix %d tokens, "
-                            "blocks end at %d) -- reuse licensed\n",
-                    n_images, s->checkpoint.len, image_barrier);
+            fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
+                            "(merged where their blocks fall) -- reuse licensed\n",
+                    n_held, ck, n_new);
         }
     } else {
         /* A prompt carrying sentinel ids with no image to fill them would prefill
