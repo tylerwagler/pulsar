@@ -735,24 +735,40 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    /* An image span is prefilled WHOLE, and only on the pass that begins at token
-     * 0: the reference merges images solely when start_pos == 0 and asserts
-     * `(input_ids < vocab_size).all()` for a continuation, i.e. no sentinel id may
-     * survive into a chunk that does not start at 0.  So every span must lie
-     * inside the FIRST chunk.  Refuse rather than degrade -- a split span would
-     * prefill sentinels whose embeddings were never merged. */
-    int vision_span_end = 0;
+    /* Image blocks: each is prefilled WHOLE inside one chunk -- the merge writes
+     * the block's rows after the embedding gather and the block's bidirectional
+     * visibility is computed per chunk -- so the planner below never ends a chunk
+     * inside one.  A block that begins before `start` is already in the KV (the
+     * session licensed this resume only with those images live); one that begins
+     * at or after `start` is merged by the chunk that owns it.  A `start` INSIDE
+     * a block would re-evaluate merged rows as zero-masked sentinels: refused. */
+    enum { VISION_BLOCKS_MAX = 64 };
+    int32_t blk_s[VISION_BLOCKS_MAX], blk_e[VISION_BLOCKS_MAX];
+    int n_blk = 0;
     if (g->vision_req && g->vision_req->n_images > 0) {
-        if (start != 0) {
-            fprintf(stderr, "pulsar: an image request cannot extend a cached prefix (start=%u); "
-                            "image spans are prefilled from token 0 in one chunk\n", start);
-            return false;
-        }
         char verr[384];
         if (!vision_spans_fit(prompt->v, prompt->len, g->vision_req->images, g->vision_req->n_images,
-                              chunk_cap, &vision_span_end, verr, sizeof(verr))) {
+                              chunk_cap, NULL, verr, sizeof(verr))) {
             fprintf(stderr, "pulsar: %s\n", verr);
             return false;
+        }
+        if (g->vision_req->n_images > VISION_BLOCKS_MAX) {
+            fprintf(stderr, "pulsar: %d images in one request; the chunk planner holds %d\n",
+                    g->vision_req->n_images, (int)VISION_BLOCKS_MAX);
+            return false;
+        }
+        for (int i = 0; i < g->vision_req->n_images; i++) {
+            int len = 0;
+            const int s0 = g->vision_req->images[i].start_pos;
+            (void)vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB, s0, &len);   /* fit checked it */
+            if ((uint32_t)s0 < start && (uint32_t)(s0 + len) > start) {
+                fprintf(stderr, "pulsar: prefill from %u would start inside image %d's block [%d, %d) -- "
+                                "refusing (its merged rows cannot be re-evaluated)\n", start, i, s0, s0 + len);
+                return false;
+            }
+            blk_s[n_blk] = s0;
+            blk_e[n_blk] = s0 + len;
+            n_blk++;
         }
     }
 
@@ -775,7 +791,12 @@ bool gpu_graph_prefill_chunked_range(
         }
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
-        if (start != 0 && g->prefill_cap != 0) {
+        /* Snap to the absolute prefill_cap grid after any unaligned start: a
+         * resume (start != 0) lands on the cold prefill's boundaries, and so does
+         * the chunk after an image cut below -- on the cold pass too, which is
+         * what keeps a resumed image prefill the cold one's chunk for chunk.  A
+         * text-only cold pass starts aligned and never cuts, so it is unchanged. */
+        if (g->prefill_cap != 0) {
             const uint32_t mod = pos0 % g->prefill_cap;
             if (mod != 0) {
                 const uint32_t to_boundary = g->prefill_cap - mod;
@@ -802,12 +823,19 @@ bool gpu_graph_prefill_chunked_range(
                 if (aligned_end > pos0) chunk = aligned_end - pos0;
             }
         }
-        /* The ratio alignment above may have pulled the boundary back INTO the
-         * span.  Only the first chunk can be inside one (the plan already refused
-         * a span that does not fit), so this only ever widens that chunk, at the
-         * cost of the compressor fallback for one boundary. */
-        if (pos0 < (uint32_t)vision_span_end && chunk < (uint32_t)vision_span_end - pos0)
-            chunk = (uint32_t)vision_span_end - pos0;
+        /* Never end a chunk inside an image block: cut before a block the chunk
+         * would split, or -- when the chunk STARTS at the block -- carry the whole
+         * block (it fits: vision_spans_fit).  Positions only, so the cold pass and
+         * any resume over the same prompt cut alike; the cost is the compressor
+         * fallback for one unaligned boundary. */
+        for (int b = 0; b < n_blk; b++) {
+            const uint32_t bs = (uint32_t)blk_s[b], be = (uint32_t)blk_e[b];
+            const uint32_t ce = pos0 + chunk;
+            if (bs < ce && ce < be) {
+                if (bs > pos0) chunk = bs - pos0;
+                else chunk = be - pos0;
+            }
+        }
         const uint32_t chunk_end = pos0 + chunk;
         /* Only the final chunk's logits are consumed (the progress callback below
          * reports position only, never reads logits). Running the full output
