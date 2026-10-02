@@ -646,6 +646,12 @@ void cuda_fp8_weight_cache_clear(void);
  * non-finite value, 0 when the flag is clear, -1 on a CUDA error.  Called once
  * per step at the stream drain (pulsar_gpu_end_commands); a 1 fails the step. */
 int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm);
+/** L262: the same take with the flag word already read (`code`): the step
+ *  drain enqueues the read before its stream sync (pulsar_gpu_routed_moe_flag
+ *  _dev), so no CUDA call sits between steps.  Clears the flag only when set. */
+int pulsar_gpu_routed_moe_nonfinite_take_code(uint32_t code, uint32_t *layer_index, const char **arm);
+/** L262: the flag's device address (cached), for the drain's async read. */
+const uint32_t *pulsar_gpu_routed_moe_nonfinite_dev(void);
 /** PLAN 94 phase 1 (L217): read-and-clear the routed experts' ROUTE BOUNDS flag
  * (pulsar_cuda_moe_pairs.cu).  Returns 1 and names the first (layer, arm) whose
  * sorted-pair build saw a `selected[]` expert id with no expert behind it (an
@@ -656,6 +662,10 @@ int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm
  * of the two invariants `pulsar_gpu_end_commands` enforces before a step's
  * bytes are used. */
 int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm);
+/** L262: as pulsar_gpu_routed_moe_nonfinite_take_code, for the route-bounds flag. */
+int pulsar_gpu_routed_moe_route_oob_take_code(uint32_t code, uint32_t *layer_index, const char **arm);
+/** L262: the route-bounds flag's device address (cached). */
+const uint32_t *pulsar_gpu_routed_moe_route_oob_dev(void);
 
 /* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
  * (CUTLASS MXFP4) stack (pulsar_cuda_moe.cu).  Returns a device array of

@@ -114,10 +114,21 @@ __device__ static __forceinline__ void moe_flag_nonfinite(float acc, uint32_t nf
     if (!isfinite(acc)) atomicCAS(&g_moe_nonfinite, 0u, nf_code);
 }
 
+const uint32_t *pulsar_gpu_routed_moe_nonfinite_dev(void) {
+    static uint32_t *addr = NULL;
+    if (!addr && !cuda_ok(cudaGetSymbolAddress((void **)&addr, g_moe_nonfinite),
+                          "routed MoE non-finite flag address")) return NULL;
+    return addr;
+}
+
 int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm) {
     uint32_t code = 0u;
     if (!cuda_ok(cudaMemcpyFromSymbol(&code, g_moe_nonfinite, sizeof code, 0, cudaMemcpyDeviceToHost),
                  "routed MoE non-finite flag read")) return -1;
+    return pulsar_gpu_routed_moe_nonfinite_take_code(code, layer_index, arm);
+}
+
+int pulsar_gpu_routed_moe_nonfinite_take_code(uint32_t code, uint32_t *layer_index, const char **arm) {
     if (code == 0u) return 0;
     const uint32_t zero = 0u;
     if (!cuda_ok(cudaMemcpyToSymbol(g_moe_nonfinite, &zero, sizeof zero, 0, cudaMemcpyHostToDevice),

@@ -1794,6 +1794,21 @@ static int tp_err_word_ok(void) {
 
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
+    /* L262: the two routed-MoE flag words ride THIS drain -- enqueued as 4-byte
+     * async reads into pinned memory before the sync -- where they were read
+     * after it with cudaMemcpyFromSymbol: two synchronous calls between every
+     * pair of steps, ~1.6 ms (up to ~5 ms) of idle GPU each time in the c16
+     * decode trace (61% of all GPU idle, spec off). */
+    static thread_local uint32_t *flags_h = NULL;   /* [0] non-finite, [1] route bounds */
+    if (!flags_h && !cuda_ok(cudaHostAlloc((void **)&flags_h, 2 * sizeof(uint32_t), cudaHostAllocDefault),
+                             "MoE flag readback buffer")) return 0;
+    const uint32_t *nf_dev = pulsar_gpu_routed_moe_nonfinite_dev();
+    const uint32_t *oob_dev = pulsar_gpu_routed_moe_route_oob_dev();
+    if (!nf_dev || !oob_dev ||
+        !cuda_ok(cudaMemcpyAsync(&flags_h[0], nf_dev, sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                                 cudaStreamPerThread), "MoE non-finite flag read") ||
+        !cuda_ok(cudaMemcpyAsync(&flags_h[1], oob_dev, sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                                 cudaStreamPerThread), "MoE route-bounds flag read")) return 0;
     if (!cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands")) return 0;
     if (!tp_err_word_ok()) return 0;
     /* L188: the stream is drained -- this is where every step reads its logits
@@ -1807,11 +1822,11 @@ int pulsar_gpu_end_commands(void) {
      * next step's bytes. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
-    const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
+    const int nf = pulsar_gpu_routed_moe_nonfinite_take_code(flags_h[0], &nf_layer, &nf_arm);
     if (nf < 0) return 0;
     uint32_t oob_layer = 0u;
     const char *oob_arm = NULL;
-    const int oob = pulsar_gpu_routed_moe_route_oob_take(&oob_layer, &oob_arm);
+    const int oob = pulsar_gpu_routed_moe_route_oob_take_code(flags_h[1], &oob_layer, &oob_arm);
     if (oob < 0) return 0;
     if (nf > 0) {
         fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) -- refusing the step "
