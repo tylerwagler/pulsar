@@ -4010,6 +4010,73 @@ static void test_responses_request_keeps_image_refusal_message(void) {
  * the content at the block's position.  A remote-URL source, a malformed
  * payload, an unsupported media_type and an unknown block type all refuse with
  * a message; the silent drop was the bug this reader exists to remove. */
+/* L261: an image INSIDE a tool_result's content (an agent's screenshot) is
+ * attached, with its placeholder inside the tool_result tags between the text
+ * pieces; json_content alone kept only the text and the image vanished.  A
+ * text-only tool_result renders exactly as before, and an unknown block type
+ * inside one is refused, not dropped. */
+static void test_anthropic_tool_result_image(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    buf json = {0};
+    buf_puts(&json, "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\","
+                    "\"content\":[{\"type\":\"text\",\"text\":\"before\"},{\"type\":\"image\",\"source\":"
+                    "{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, png_b64);
+    buf_puts(&json, "\"}},\"after\"]}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    char err[200] = {0};
+    const bool parsed = parse_anthropic_messages(&p, &msgs, err, sizeof err);
+    TEST_ASSERT(parsed);
+    if (parsed && msgs.len == 1) {
+        const char *c = msgs.v[0].content;
+        const char *open = strstr(c, "<tool_result>");
+        const char *ph = strstr(c, PULSAR_IMAGE_PLACEHOLDER);
+        const char *close = strstr(c, "</tool_result>");
+        TEST_ASSERT(msgs.v[0].images_len == 1);
+        TEST_ASSERT(open && ph && close && open < ph && ph < close);
+        TEST_ASSERT(strstr(c, "before") && strstr(c, "before") < ph);
+        TEST_ASSERT(strstr(c, "after") && ph < strstr(c, "after"));
+    } else if (!parsed) {
+        fprintf(stderr, "tool_result image parse refused: %s\n", err);
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* a text-only tool_result is the text path's exact bytes */
+    const char *text_only =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_2\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"a<b\"},\"c\"]}]}]";
+    chat_msgs tmsgs = {0};
+    p = text_only; err[0] = 0;
+    TEST_ASSERT(parse_anthropic_messages(&p, &tmsgs, err, sizeof err));
+    if (tmsgs.len == 1) {
+        buf want = {0};
+        buf_puts(&want, "<tool_result>");
+        append_tool_result_text(&want, "a<bc");
+        buf_puts(&want, "</tool_result>");
+        TEST_ASSERT(tmsgs.v[0].images_len == 0);
+        TEST_ASSERT(!strcmp(tmsgs.v[0].content, want.ptr));
+        buf_free(&want);
+    }
+    chat_msgs_free(&tmsgs);
+
+    /* an unknown block type inside a tool_result that carries an image: refused */
+    buf bad = {0};
+    buf_puts(&bad, "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_3\","
+                   "\"content\":[{\"type\":\"document\",\"x\":1},{\"type\":\"image\",\"source\":"
+                   "{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&bad, png_b64);
+    buf_puts(&bad, "\"}}]}]}]");
+    chat_msgs bmsgs = {0};
+    p = bad.ptr; err[0] = 0;
+    TEST_ASSERT(!parse_anthropic_messages(&p, &bmsgs, err, sizeof err));
+    TEST_ASSERT(strstr(err, "inside a tool_result") != NULL);
+    chat_msgs_free(&bmsgs);
+    buf_free(&bad);
+}
+
 static void test_anthropic_image_content_blocks(void) {
     static const char png_b64[] =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -8141,6 +8208,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_multi_image_blocks_and_offsets();
     test_responses_request_keeps_image_refusal_message();
     test_anthropic_image_content_blocks();
+    test_anthropic_tool_result_image();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();

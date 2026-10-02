@@ -1783,6 +1783,124 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
 
 
 
+static bool parse_anthropic_content_block(const char **p, const char *role,
+                                          chat_msg *msg, char *err, size_t errlen);
+
+/* Read one content block object's "type" and "text" string values, leaving *p
+ * after the object.  Other keys are skipped. */
+static bool tool_result_block_fields(const char **p, char **type, char **text) {
+    *type = NULL;
+    *text = NULL;
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') { free(key); return false; }
+        (*p)++;
+        json_ws(p);
+        bool ok;
+        if (!strcmp(key, "type") && **p == '"') { free(*type); ok = json_string(p, type); }
+        else if (!strcmp(key, "text") && **p == '"') { free(*text); ok = json_string(p, text); }
+        else ok = json_skip_value(p);
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+/* Does a tool_result's content (an array of blocks) carry an image block? */
+static bool tool_result_content_has_image(const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    json_ws(&p);
+    bool found = false;
+    while (*p && *p != ']' && !found) {
+        if (*p == '{') {
+            char *type = NULL, *text = NULL;
+            const bool ok = tool_result_block_fields(&p, &type, &text);
+            found = ok && type && !strcmp(type, "image");
+            free(type);
+            free(text);
+            if (!ok) return false;
+        } else if (!json_skip_value(&p)) {
+            return false;
+        }
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return found;
+}
+
+static void msg_append_tool_text(chat_msg *msg, const char *s, bool escape) {
+    buf b = {0};
+    buf_puts(&b, msg->content ? msg->content : "");
+    if (escape) append_tool_result_text(&b, s);
+    else buf_puts(&b, s);
+    free(msg->content);
+    msg->content = buf_take(&b);
+}
+
+/* A tool_result whose content array carries an image: the tags, then each
+ * block in order -- a string or a text block escaped exactly as the text-only
+ * path escapes the whole result, an image block attached through the one image
+ * reader (placeholder at its position inside the tags).  Any other block type is
+ * refused by name rather than dropped. */
+static bool append_tool_result_blocks(chat_msg *msg, const char *role, const char *raw,
+                                      char *err, size_t errlen) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    msg_append_tool_text(msg, "<tool_result>", false);
+    json_ws(&p);
+    while (*p && *p != ']') {
+        if (*p == '"') {
+            char *s = NULL;
+            if (!json_string(&p, &s)) return false;
+            msg_append_tool_text(msg, s, true);
+            free(s);
+        } else if (*p == '{') {
+            const char *el = p;
+            char *type = NULL, *text = NULL;
+            if (!tool_result_block_fields(&p, &type, &text)) { free(type); free(text); return false; }
+            bool ok = true;
+            if (type && !strcmp(type, "text")) {
+                msg_append_tool_text(msg, text ? text : "", true);
+            } else if (type && !strcmp(type, "image")) {
+                const char *q = el;
+                ok = parse_anthropic_content_block(&q, role, msg, err, errlen);
+            } else {
+                snprintf(err, errlen, "unsupported block type \"%s\" inside a tool_result; this server "
+                                      "accepts text and image there", type ? type : "(missing)");
+                ok = false;
+            }
+            free(type);
+            free(text);
+            if (!ok) return false;
+        } else if (!json_skip_value(&p)) {
+            return false;
+        }
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    msg_append_tool_text(msg, "</tool_result>", false);
+    return true;
+}
+
+
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, keeps tool_result blocks as escaped
@@ -1957,21 +2075,31 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
-        char *tool_result = NULL;
-        const char *cp = content_raw ? content_raw : "";
-        if (content_raw && !json_content(&cp, &tool_result)) {
+        if (content_raw && tool_result_content_has_image(content_raw)) {
+            /* L261: a tool result that returns an image (an agent's screenshot)
+             * keeps it: the content's blocks are walked in order, text escaped as
+             * below and each image block attached at its place inside the tags.
+             * json_content keeps only text, which silently dropped the image
+             * ("the screenshot tool returned an empty result"). */
+            chat_msg_add_tool_call_id(msg, id);
+            if (!append_tool_result_blocks(msg, role, content_raw, err, errlen)) goto bad;
+        } else {
+            char *tool_result = NULL;
+            const char *cp = content_raw ? content_raw : "";
+            if (content_raw && !json_content(&cp, &tool_result)) {
+                free(tool_result);
+                goto bad;
+            }
+            chat_msg_add_tool_call_id(msg, id);
+            buf b = {0};
+            buf_puts(&b, msg->content ? msg->content : "");
+            buf_puts(&b, "<tool_result>");
+            append_tool_result_text(&b, tool_result);
+            buf_puts(&b, "</tool_result>");
+            free(msg->content);
+            msg->content = buf_take(&b);
             free(tool_result);
-            goto bad;
         }
-        chat_msg_add_tool_call_id(msg, id);
-        buf b = {0};
-        buf_puts(&b, msg->content ? msg->content : "");
-        buf_puts(&b, "<tool_result>");
-        append_tool_result_text(&b, tool_result);
-        buf_puts(&b, "</tool_result>");
-        free(msg->content);
-        msg->content = buf_take(&b);
-        free(tool_result);
     } else if (type && !strcmp(type, "image")) {
         if (!source_type) {
             snprintf(err, errlen, "image block has no source.type");
