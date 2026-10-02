@@ -208,6 +208,7 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
     pulsar_spec_round *r[NB];
     for (int b = 0; b < g_nb; b++) r[b] = pulsar_spec_round_new();
     uint64_t rngs[NB] = {0x2545F4914F6CDD1Dull, 0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull};
+    for (int b = 3; b < NB; b++) rngs[b] = 0x9E3779B97F4A7C15ull * (uint64_t)(b + 1) ^ 0xD1B54A32D192ED03ull;
     int compared = 0, deepest = 0, shallowest = 99;
     char err[256];
     for (int t = 0; t < ticks; t++) {
@@ -265,8 +266,9 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
         /* (b) batched, from equal rng copies; the rounds still hold their
          * requests (peek does not consume them) */
         {
-            uint32_t banks[NB] = {0, 1, 2};
-            uint64_t *rps[NB] = {&rng_b[0], &rng_b[1], &rng_b[2]};
+            uint32_t banks[NB];
+            uint64_t *rps[NB];
+            for (int b = 0; b < NB; b++) { banks[b] = (uint32_t)b; rps[b] = &rng_b[b]; }
             if (dump_dir) {
                 char pfx[512];
                 snprintf(pfx, sizeof(pfx), "%s/%s_bat", dump_dir, t == 0 ? "t0" : "tn");
