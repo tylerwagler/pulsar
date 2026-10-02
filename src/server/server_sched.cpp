@@ -630,17 +630,20 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * stream drop, so the conversation's bank is still BUSY with a request
      * nobody will read -- and routing past it took the disk and a fresh bank
      * (25,306 tokens re-prefilled, pair, 2026-10-01).  When the deepest match
-     * for this job is a busy slot whose client is gone, wait for it: every
-     * phase frees such a slot within a quantum or a chunk (the lanes'
-     * per-quantum liveness poll, the prefill cancel callback), and
-     * *waiting_owner keeps the caller from evicting or provisioning meanwhile. */
+     * for this job is a busy slot whose client is gone and whose prompt is
+     * fully prefilled (decode init / decode), wait for it: the lanes'
+     * per-quantum liveness poll abandons it within a quantum and the abandon
+     * keeps the bank's history, and *waiting_owner keeps the caller from
+     * evicting or provisioning meanwhile.  Not mid-prefill: that abandon
+     * invalidates the bank (gen_prefill_fail), so waiting would only delay. */
     {
         session_slot *gone = NULL;
         int gone_common = -1;
         for (int i = 0; i < s->n_slots; i++) {
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
-            const bool writer_failed = sl->gen && sl->gen->writer.failed;
+            if (!sl->gen || (sl->gen->phase != GEN_DECODE_INIT && sl->gen->phase != GEN_DECODE)) continue;
+            const bool writer_failed = sl->gen->writer.failed;
             if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
             const int common = s->slot_common_prefix(sl, &j->req.prompt);
             if (common > gone_common) {
