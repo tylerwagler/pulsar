@@ -741,29 +741,17 @@ bool gpu_graph_prefill_chunked_range(
      * survive into a chunk that does not start at 0.  So every span must lie
      * inside the FIRST chunk.  Refuse rather than degrade -- a split span would
      * prefill sentinels whose embeddings were never merged. */
-    int32_t vision_span_end = 0;
+    int vision_span_end = 0;
     if (g->vision_req && g->vision_req->n_images > 0) {
         if (start != 0) {
             fprintf(stderr, "pulsar: an image request cannot extend a cached prefix (start=%u); "
                             "image spans are prefilled from token 0 in one chunk\n", start);
             return false;
         }
-        for (int i = 0; i < g->vision_req->n_images; i++) {
-            int len = 0;
-            if (!vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB,
-                                    g->vision_req->images[i].start_pos, &len)) {
-                fprintf(stderr, "pulsar: image %d claims a span at token %d that the prompt does not "
-                                "carry (no IMAGE_START sentinel there, or no IMAGE_END after it)\n",
-                        i, g->vision_req->images[i].start_pos);
-                return false;
-            }
-            const int32_t e = g->vision_req->images[i].start_pos + len;
-            if (e > vision_span_end) vision_span_end = e;
-        }
-        if (vision_span_end > (int32_t)chunk_cap) {
-            fprintf(stderr, "pulsar: image spans reach token %d but one prefill chunk holds only %u; "
-                            "an image span must fit in a single chunk (raise --prefill-chunk or send "
-                            "a smaller image)\n", vision_span_end, chunk_cap);
+        char verr[384];
+        if (!vision_spans_fit(prompt->v, prompt->len, g->vision_req->images, g->vision_req->n_images,
+                              chunk_cap, &vision_span_end, verr, sizeof(verr))) {
+            fprintf(stderr, "pulsar: %s\n", verr);
             return false;
         }
     }
