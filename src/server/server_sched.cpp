@@ -2220,6 +2220,14 @@ bool server::fuse_prepare(session_slot *sl) {
         pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
     } else if (pulsar_session_common_prefix(pool, g->prompt_for_sync) != pos) {
         g->no_fuse = true;                   /* needs a rewind / stitch: the classic sync owns that */
+    } else if (pulsar_session_bank_comp_stale(pool, (uint32_t)sl->bank)) {
+        /* A fused round would extend the stale compressor group at the frontier
+         * and fail the step on both ranks (the pair 2026-10-02 17:11:55); the
+         * classic sync's resume starts at a grid point, a group boundary. */
+        g->no_fuse = true;
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: bank %d compressor state is stale at %d: "
+                   "the prompt takes the classic sync (grid-point resume), not a fused round",
+                   sl->bank, pos);
     }
     pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
     s->live_bank = -1;

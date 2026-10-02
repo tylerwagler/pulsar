@@ -950,6 +950,13 @@ int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);
+/** True when `bank`'s compressor state is stale: a rewind into a group the
+ * verify saves and the projection ring do not cover (on the pair: a 1-token ghost
+ * rewind from a ratio-128 group boundary).  Such a bank can only be extended from
+ * a group boundary, so a continuation must take the classic sync, whose resume
+ * starts at a PULSAR_RESUME_GRID point, not a fused round at the bank's frontier.
+ * Pure host read; false for an out-of-range bank. */
+bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank);
 /** Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
  * steps advanced the LIVE (just bank_state_restore'd) bank's device KV frontier
  * without touching the host token history. Append the tokens multiseq committed,
