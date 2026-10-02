@@ -73,6 +73,7 @@ __pycache__/
 /tests/mixed_prefill_gate
 /tests/mixed_zero_prefill_gate
 /tests/fused_step_gate
+/tests/decode_reference_probe
 /tests/mixed_neutrality_gate
 
 # ad-hoc pre-cutover backup binaries
