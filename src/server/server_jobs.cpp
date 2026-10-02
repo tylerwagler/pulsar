@@ -672,6 +672,37 @@ void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
 
 
 
+/* L261: place an image request's images on a live-continuation effective prompt
+ * (the live tokens [0, live_len) + freshly tokenized request text).  The images
+ * arrive in prompt order; the first ones are HELD -- the live history already
+ * carries their blocks, so their start_pos is where those blocks begin -- and
+ * the rest are NEW -- their placeholders sit in the suffix and the one producer
+ * of sentinel blocks expands them at their positions in the effective prompt
+ * (a block's length depends on its position).  Any disagreement (a live block
+ * that does not parse, more blocks than images, a placeholder count that does
+ * not match) is refused by name; the engine's fingerprint check then decides
+ * whether the held images are really the live ones. */
+static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int live_len,
+                                     pulsar_image_ref *images, int n_images,
+                                     char *why, size_t whylen) {
+    enum { HELD_MAX = 64 };
+    int starts[HELD_MAX];
+    const int held = pulsar_image_block_starts(eff, live_len, starts, HELD_MAX);
+    if (held < 0 || held > HELD_MAX || held > n_images) {
+        snprintf(why, whylen, "the live history carries %d image block(s) for %d image(s)", held, n_images);
+        return false;
+    }
+    for (int i = 0; i < held; i++) images[i].start_pos = starts[i];
+    pulsar_tokens out = {0};
+    if (!pulsar_expand_image_placeholders(e, eff, images + held, n_images - held, &out, why, whylen))
+        return false;
+    pulsar_tokens_free(eff);
+    *eff = out;
+    return true;
+}
+
+
+
 /* Resolve the prompt against every cache layer and decide the prefill plan.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -688,13 +719,12 @@ void server::gen_begin(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    /* An image request is a COLD prefill from token 0 through
-     * pulsar_session_sync_mm(): the engine refuses any continuation for one
-     * (the reference merges images only on the start_pos == 0 pass and no
-     * sentinel id may survive into a cached prefix).  The whole live/disk
-     * prefix resolver is skipped for it, so a stale prefix can never be
-     * reported as a cache read and no continuation prompt can re-derive a
-     * different start_pos than the one expansion computed. */
+    /* An image request rides the LIVE resolvers like any other (L261): a live
+     * continuation keeps the bank's history and the engine merges the new
+     * images where their blocks fall (image_continuation_place re-derives every
+     * image's start_pos on the effective prompt).  The DISK resolvers stay off
+     * for it -- no snapshot ever holds an image block, and a text-prefix restore
+     * would REPLACE a live history that might. */
     const bool image_request = j->req.n_images > 0;
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
@@ -733,15 +763,14 @@ void server::gen_begin(session_slot *sl) {
     int disk_cached = 0;
     uint8_t disk_cache_ext_flags = 0;
     if (image_request) {
-        /* No continued checkpoint exists for a cold image prompt; clear the
-         * slot watermark so a later request cannot resume from the previous
-         * conversation's frontier. */
+        /* No continued disk checkpoint is written for an image conversation;
+         * clear the slot watermark so a later request cannot resume from the
+         * previous conversation's frontier. */
         sl->continued_last_store_tokens = 0;
         server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: image request (%d image%s): disk/prefix resolver and cold store "
-                   "bypassed; the engine reuses the live prefix when the images are already in it",
-                   j->req.n_images, j->req.n_images == 1 ? "" : "s");
-    } else {
+                   "pulsar-server: image request (%d image%s): live resolvers apply, disk resolver and "
+                   "cold store bypassed", j->req.n_images, j->req.n_images == 1 ? "" : "s");
+    }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -860,8 +889,6 @@ void server::gen_begin(session_slot *sl) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    int disk_cached = 0;
-    uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = s->live_text_prefix_prompt(sl, &j->req, &effective_prompt);
         if (text_cached > 0) {
@@ -877,14 +904,36 @@ void server::gen_begin(session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
+    /* An effective prompt is the live tokens plus freshly tokenized request
+     * text: place the images on it -- the held ones where the live history
+     * already carries their blocks, the new ones expanded from their
+     * placeholders at their positions there.  A request whose images do not
+     * line up with the live history prefills the rendered prompt instead,
+     * said by name. */
+    if (image_request && cached > 0 && prompt_for_sync == &effective_prompt) {
+        char why[256];
+        if (!image_continuation_place(s->engine, &effective_prompt, cached, j->req.images,
+                                      j->req.n_images, why, sizeof(why))) {
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: image request: the %s continuation cannot place its images "
+                       "(%s) -- prefilling the rendered prompt", cache_source, why);
+            pulsar_tokens_free(&effective_prompt);
+            prompt_for_sync = &j->req.prompt;
+            cached = 0;
+            cache_source = "none";
+            responses_live_continuation = false;
+            anthropic_live_continuation = false;
+            thinking_live_continuation = false;
+        }
+    }
     if (cached == 0) sl->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (!image_request && s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live GPU session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         s->kv_cache_store_current(sl, "evict");
     }
-    if (cached == 0) {
+    if (!image_request && cached == 0) {
         disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
                                         &g->disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -894,7 +943,6 @@ void server::gen_begin(session_slot *sl) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    }  /* !image_request */
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||

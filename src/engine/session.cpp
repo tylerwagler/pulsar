@@ -1469,7 +1469,15 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
          * plans a cold store for an image request (server_jobs.cpp gates the
          * whole disk/prefix resolver on !image_request), and a LATER prompt whose
          * sentinel ids outlive their images is still refused by the scan below. */
-        const uint32_t ck = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+        /* The live history this prompt can keep: its common token prefix with the
+         * checkpoint (an echo that stops short of the live tail -- stripped
+         * reasoning, a rollback -- shares a prefix without extending it). */
+        uint32_t common = 0;
+        if (s->checkpoint_valid) {
+            const uint32_t lim = (uint32_t)(s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len);
+            while (common < lim && s->checkpoint.v[common] == prompt->v[common]) common++;
+        }
+        const uint32_t ck = common;
         enum { LIVE_IMAGES_MAX = 64 };
         pulsar_image_ref held[LIVE_IMAGES_MAX];
         int n_held = 0, n_new = 0, held_end = 0;
@@ -1510,18 +1518,32 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             : 0u;
         const uint32_t raw_reach = s->graph.raw_cap > s->graph.raw_window
                                  ? s->graph.raw_cap - s->graph.raw_window : 0u;
+        /* Short of the live tail, the kept history ends at the grid point at or
+         * below the common prefix (a resume starts on the grid), never below the
+         * last held block's end. */
+        const uint32_t keep = ck < (uint32_t)s->checkpoint.len
+            ? (ck / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID : ck;
+        const uint32_t live_len = (uint32_t)s->checkpoint.len;
         const bool floor_ok =
-            resume_floor == 0 ||
-            (resume_floor <= ck && ck - resume_floor <= raw_reach);
-        const bool reuse =
+            resume_floor <= keep &&
+            (resume_floor == 0 || live_len - resume_floor <= raw_reach) &&   /* the held floor is replayable */
+            (keep == live_len || live_len - keep <= raw_reach);               /* and so is the cut */
+        bool reuse =
             s->checkpoint_valid &&
+            keep > 0 &&
             !straddles &&
             bank_extendable &&
             floor_ok &&
-            prompt->len >= s->checkpoint.len &&
-            pulsar_tokens_starts_with(prompt, &s->checkpoint) &&
             s->live_image_fp == held_fp &&
             s->live_image_barrier == held_end;
+        if (reuse && keep < (uint32_t)s->checkpoint.len) {
+            s->rewind((int)keep);
+            if (!s->checkpoint_valid) {
+                fprintf(stderr, "pulsar: image request: the live history could not be rewound to %u -- "
+                                "rebuilding cold\n", keep);
+                reuse = false;
+            }
+        }
         if (!reuse) {
             s->checkpoint_valid = false;
             if (!bank_extendable)
@@ -1530,7 +1552,7 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
         } else {
             fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
                             "(merged where their blocks fall) -- reuse licensed\n",
-                    n_held, ck, n_new);
+                    n_held, keep, n_new);
         }
     } else {
         /* A prompt carrying sentinel ids with no image to fill them would prefill
