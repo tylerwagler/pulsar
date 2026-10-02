@@ -2439,21 +2439,13 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 (unsigned long long)out_dim, (unsigned long long)n_tok);
         return 0;
     }
-    /* The mixed-batch split below recurses on OFFSET row pointers, which key no
-     * slot, so BOTH halves quantize from f32 -- including the half whose store
-     * was skipped.  The check above cannot see that case (the base pointer is
-     * covered by a valid slot), so it is made here, where the split is decided. */
-    if (g_batch_decode_rows > 0 && (uint64_t)g_batch_decode_rows < n_tok) {
-        for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
-            if (g_act_slots[i].key_ptr == x->ptr && g_act_slots[i].f32_absent) {
-                fprintf(stderr, "pulsar: mxfp8 '%s' mixed-batch split (n_dec=%d of %llu) on a "
-                                "buffer whose f32 store was SKIPPED -- refusing; the split "
-                                "halves cannot reach the E4M3 cache.\n",
-                        label ? label : "?", g_batch_decode_rows, (unsigned long long)n_tok);
-                return 0;
-            }
-        }
-    }
+    /* L260: the mixed-batch split below reads no f32 rows -- its decode prefix
+     * keeps the base pointer (a prefix lookup finds the producer's slot) and its
+     * prefill suffix is the window arm over the producer's full-width slot
+     * (L158 inc 4); both refuse by name without an encoding.  A guard that stood
+     * here refused the split whenever the f32 store was skipped, on the premise
+     * that the halves quantized from f32 -- true before inc 4, and what kept four
+     * producers storing f32 rows nobody read in every mixed step. */
     /* inc 4 prefix-split: 0<n_dec<n_tok => mixed decode+prefill batch. Run the
      * decode prefix [0,n_dec) in the M-independent (decode) regime and the prefill
      * suffix [n_dec,n_tok) in the tensor-core (prefill) regime, by recursing with

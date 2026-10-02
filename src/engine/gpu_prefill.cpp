@@ -1595,11 +1595,11 @@ bool gpu_graph_encode_layer_attention_batch(
          * bf16 plane -- the ratio-4 compressor's last-four-rows view included:
          * it goes through the bf16 core, which finds the plane's window by row
          * offset (act_slot_find_window), so the f32 bytes under the view are
-         * never read.  The rows are stored only when a dump wants them, or
-         * when the mixed-batch split is armed (its offset views key no slot). */
+         * never read.  The rows are stored only when a dump wants them -- the
+         * mixed-batch split reads the slot too (both halves; L260), so it no
+         * longer keeps them. */
         attn_norm_keep_from = 0u;
         if (attn_norm_q && attn_norm_b &&
-            pulsar_gpu_matmul_batch_decode_rows() == 0 &&
             !gpu_graph_f32_store_observed_any()) {
             attn_norm_keep_from = n_tokens;
             static int announced_ans = 0;
@@ -1722,11 +1722,9 @@ bool gpu_graph_encode_layer_attention_batch(
          * two cannot disagree.  Unlike batch_attn_norm there is no offset
          * VIEW of this buffer anywhere (checked), which is what makes it
          * eliminable at all. */
-        /* Same mixed-batch condition as the shared_mid skip below -- see the
-         * comment there for why the cache-lookup invariant does not cover the
-         * prefix split. */
+        /* Mixed steps skip it too: the mxfp8 split reads the slot in both
+         * halves (L260; see the shared_mid skip below). */
         const bool qr_skip_f32 = (qr_norm_q != NULL) &&
-                                 pulsar_gpu_matmul_batch_decode_rows() == 0 &&
                                  !gpu_graph_f32_store_observed("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
@@ -2914,7 +2912,6 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the f32 rows on the host (imatrix.cpp) and marks the graph while it
          * runs. */
         if (ffn_norm_q && ffn_norm_b && !g->imatrix_f32_rows &&
-            pulsar_gpu_matmul_batch_decode_rows() == 0 &&
             !gpu_graph_f32_store_observed_any()) {
             ffn_norm_keep_from = n_tokens;
             static int announced_fns = 0;
@@ -3082,17 +3079,13 @@ bool gpu_graph_encode_layer_ffn_batch(
          * consumer's cache hit certain rather than likely; \
          * act_f32_absent_hazard() in pulsar_cuda_matmul.cu is the loud \
          * backstop if that adjacency is ever broken by reordering. */ \
-        /* ⚠ AND mixed-batch must be DISARMED.  cuda-mixed-neutrality-gate \
-         * caught this: at n_dec=2 of 66 the mxfp8 dispatch splits the batch \
-         * and recurses on OFFSET row pointers, which key no cache slot, so \
-         * BOTH halves quantize from f32 -- the store we just skipped.  The \
-         * backstop refused (correctly) and the GEMM failed.  d967327's \
-         * predicate required batch_decode_rows == 0 for exactly this reason; \
-         * dropping it was my error.  The invariant "valid => every arm takes \
-         * A8" holds only for arms that LOOK UP the cache, and the split does \
-         * not. */ \
-        const int shmid_skip_f32 = (shmid_q != NULL) && \
-                                   pulsar_gpu_matmul_batch_decode_rows() == 0; \
+        /* Mixed steps included (L260).  This skip once had to exclude them: \
+         * cuda-mixed-neutrality-gate caught the mxfp8 split recursing on \
+         * OFFSET row pointers that keyed no slot, so both halves quantised \
+         * from the skipped f32.  Since L158 inc 4 the split's halves read the \
+         * producer's slot (prefix lookup / window arm), so the exclusion -- \
+         * and the split-side guard that enforced it -- is deleted. */ \
+        const int shmid_skip_f32 = (shmid_q != NULL); \
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
