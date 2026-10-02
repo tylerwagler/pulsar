@@ -632,7 +632,7 @@ static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g, bool c
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
  * after each pulsar_session_sync failure). Token vectors and the disk path are
  * freed centrally by gen_state_free. */
-void server::gen_prefill_fail(session_slot *sl) {
+void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
     auto *s = this;
     gen_state *g = sl->gen;
     pulsar_session_set_cancel(s->sess, NULL, NULL);
@@ -642,7 +642,14 @@ void server::gen_prefill_fail(session_slot *sl) {
     kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                           g->cold_store_len);
     s->kv_cache_tracker_flush(sl);
-    s->kv_cache_discard_failed_disk_entry(sl, g->disk_cache_path);
+    if (discard_loaded_entry) {
+        s->kv_cache_discard_failed_disk_entry(g->disk_cache_path);
+    } else if (g->disk_cache_path) {
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept file=%s (prefill ended: %s)",
+                   g->disk_cache_path, g->err);
+    }
+    sl->continued_last_store_tokens = 0;
+    pulsar_session_invalidate(s->sess);
     s->trace_event(g->trace_id, "prefill failed: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
@@ -683,7 +690,7 @@ void server::gen_begin(session_slot *sl) {
     if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-        s->gen_prefill_fail(sl);
+        s->gen_prefill_fail(sl, false);
         return;
     }
     const int old_pos = pulsar_session_pos(s->sess);
@@ -1071,17 +1078,17 @@ void server::gen_step_prefill(session_slot *sl) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: client disconnected during prefill, abandoning");
             snprintf(g->err, sizeof(g->err), "client disconnected");
-            s->gen_prefill_fail(sl);
+            s->gen_prefill_fail(sl, false);
             return;
         }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
         /* Interrupted without progress cannot be our cancel callback; fail
          * rather than risk a live-lock re-issuing the same sync forever. */
-        s->gen_prefill_fail(sl);
+        s->gen_prefill_fail(sl, false);
         return;
     }
     if (rc != 0) {
-        s->gen_prefill_fail(sl);
+        s->gen_prefill_fail(sl, true);
         return;
     }
 
