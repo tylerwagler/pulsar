@@ -641,10 +641,8 @@ void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
 
 
 
-void server::kv_cache_discard_failed_disk_entry(session_slot *sl,
-                                               const char *path) {
-    auto *s = this;
-    if (!s || !path) return;
+void server::kv_cache_discard_failed_disk_entry(const char *path) {
+    if (!path) return;
     if (unlink(path) == 0) {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache discarded reason=prefill-failed file=%s",
@@ -654,8 +652,6 @@ void server::kv_cache_discard_failed_disk_entry(session_slot *sl,
                    "pulsar-server: kv cache failed to discard prefill-failed file=%s: %s",
                    path, strerror(errno));
     }
-    sl->continued_last_store_tokens = 0;
-    pulsar_session_invalidate(s->sess);
 }
 
 

@@ -525,8 +525,9 @@ static void warm_inplace_commit(session_slot *sl, int resume_pos) {
  * Returns NULL when the job must wait for a slot to free — except when
  * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
  * job can never run and must be failed, not left queued. *waiting_owner is
- * set when the NULL means "the continuation's owner slot is busy": eviction
- * cannot help that job, only the owner finishing can. *clobbers is set when
+ * set when the NULL means "the continuation's owner slot is busy" -- or (L261)
+ * "the deepest match is a busy slot whose client is gone": eviction cannot
+ * help that job, only that slot finishing can. *clobbers is set when
  * the returned slot would overwrite another conversation's warm KV — the
  * caller may prefer evict(LRU)+provision over that (increment 4). *refusal
  * reports why a fresh provisioning was refused (PROVISION_OK when none was
@@ -624,6 +625,39 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         const int anchor_ceiling =
             job_anchor + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
         if (anchor_ceiling > share_ceiling) share_ceiling = anchor_ceiling;
+    }
+    /* L261: an interrupted client re-sends before the server has seen the old
+     * stream drop, so the conversation's bank is still BUSY with a request
+     * nobody will read -- and routing past it took the disk and a fresh bank
+     * (25,306 tokens re-prefilled, pair, 2026-10-01).  When the deepest match
+     * for this job is a busy slot whose client is gone, wait for it: every
+     * phase frees such a slot within a quantum or a chunk (the lanes'
+     * per-quantum liveness poll, the prefill cancel callback), and
+     * *waiting_owner keeps the caller from evicting or provisioning meanwhile. */
+    {
+        session_slot *gone = NULL;
+        int gone_common = -1;
+        for (int i = 0; i < s->n_slots; i++) {
+            session_slot *sl = &s->slots[i];
+            if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
+            const bool writer_failed = sl->gen && sl->gen->writer.failed;
+            if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
+            const int common = s->slot_common_prefix(sl, &j->req.prompt);
+            if (common > gone_common) {
+                gone_common = common;
+                gone = sl;
+            }
+        }
+        if (gone && gone_common > best_common &&
+            !server_slot_match_is_trivial(gone_common, s->slot_frontier_pos(gone),
+                                          share_ceiling, s->slot_trivial_common_tokens)) {
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: slot routing: deepest match is busy bank %u whose client "
+                       "is gone (common=%d, best free %d); waiting for it to abandon",
+                       gone->bank, gone_common, best_common);
+            *waiting_owner = true;
+            return NULL;
+        }
     }
     const bool best_clobbers_warm_state =
         best && server_slot_match_is_trivial(best_common,
@@ -2175,7 +2209,7 @@ bool server::fuse_prepare(session_slot *sl) {
     if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
                  (unsigned)sl->bank);
-        s->gen_prefill_fail(sl);
+        s->gen_prefill_fail(sl, false);
         return false;
     }
     const int pos = pulsar_session_pos(pool);
@@ -2358,7 +2392,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             if (gen_client_disconnected(pg->j->fd)) {
                 server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
                 snprintf(pg->err, sizeof pg->err, "client disconnected");
-                s->gen_prefill_fail(c);
+                s->gen_prefill_fail(c, false);
                 continue;
             }
             if (!pg->fuse_ready && !s->fuse_prepare(c)) continue;
@@ -2550,7 +2584,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int r = 0; r < n_fr; r++) {
                 gen_state *pg = fr[r].sl->gen;
                 snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
-                s->gen_prefill_fail(fr[r].sl);
+                s->gen_prefill_fail(fr[r].sl, false);   /* shared by every rider: no one file is implicated */
             }
             for (int q = 0; q < m; q++) {
                 session_slot *sl = dec[live_idx[q]];
@@ -2578,7 +2612,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 pulsar_session_note_prefilled(pool, pg->prompt_for_sync->v + fr[r].p0, fr[r].k, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %u: the fused prompt chunk could not be recorded",
                          (unsigned)c->bank);
-                s->gen_prefill_fail(c);
+                s->gen_prefill_fail(c, false);
             } else {
                 /* L114 counter, through the per-slot watermark the classic
                  * progress callback ticks (the two compose without recounting). */

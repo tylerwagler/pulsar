@@ -1653,9 +1653,10 @@ struct server {
      * @param reason  logged, and classifies the write in metrics
      * @return true when an entry was written. */
     bool kv_cache_store_current(session_slot *sl, const char *reason);
-    /** Forget a disk entry whose write failed or whose file is unusable, so a
-     * later load does not keep retrying a broken path. */
-    void kv_cache_discard_failed_disk_entry(session_slot *sl, const char *path);
+    /** Unlink a disk entry whose file is unusable, so a later load does not keep
+     * retrying a broken path.  Only a failure that implicates the file may call it
+     * (L261: a client disconnect used to unlink the snapshot it had just loaded). */
+    void kv_cache_discard_failed_disk_entry(const char *path);
     /** Point the continued-store tracker at `sl` before an engine call that may
      * cross a store threshold. */
     void kv_cache_tracker_bind(session_slot *sl);
@@ -1815,9 +1816,12 @@ struct server {
     void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
     /** Shared failure epilogue for both prefill phases (the old duplicated blocks
      * after each pulsar_session_sync failure). Token vectors and the disk path are
-     * freed centrally by gen_state_free.
+     * freed centrally by gen_state_free.  `discard_loaded_entry`: the engine refused
+     * the prefill on top of a snapshot this request loaded from disk, so that file is
+     * suspect and is unlinked.  Every other failure -- a client disconnect, a bank
+     * restore, a fused forward shared with other slots -- keeps the file (L261).
      */
-    void gen_prefill_fail(session_slot *sl);
+    void gen_prefill_fail(session_slot *sl, bool discard_loaded_entry);
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
      * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,

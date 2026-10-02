@@ -522,6 +522,24 @@ public:
                 supersedes[i] =
                     kv_cache_incoming_supersedes_continued(&kc_.entry[i], incoming) ? 1 : 0;
             }
+            /* L261: keep ONE rung.  The longest superseded snapshot is this
+             * conversation's previous one, and the only copy below the incoming
+             * snapshot's text: a client that rewrites recent history (a re-sent
+             * tool result with different bytes) diverges between the two, and
+             * with the rung evicted first the next request re-prefilled from the
+             * system prefix (247k and 103k tokens, pair, 2026-10-01).  It
+             * competes on its own score; older rungs keep the demotion. */
+            int rung = -1;
+            for (int i = 0; i < kc_.len; i++) {
+                if (supersedes[i] && (rung < 0 || kc_.entry[i].text_bytes > kc_.entry[rung].text_bytes))
+                    rung = i;
+            }
+            if (rung >= 0) {
+                supersedes[rung] = 0;
+                logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                     "%s: kv cache keeps the previous snapshot of this conversation undemoted tokens=%u file=%s",
+                     log_name(), kc_.entry[rung].tokens, kc_.entry[rung].path ? kc_.entry[rung].path : "?");
+            }
         }
         while (total > target && kc_.len > 0) {
             int victim = 0;
@@ -544,10 +562,11 @@ public:
             if (unlink(e.path) == 0) {
                 if (session) pulsar_session_kv_mirror_drop(session, e.sha);   /* L250 */
                 logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                     "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
+                     "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u superseded=%d size=%.2f MiB file=%s",
                      log_name(),
                      e.tokens,
                      e.hits,
+                     supersedes ? (int)supersedes[victim] : 0,
                      (double)e.file_size / (1024.0 * 1024.0),
                      e.path ? e.path : "?");
                 if (total >= e.file_size) total -= e.file_size;

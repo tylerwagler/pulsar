@@ -5029,25 +5029,35 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
 
 
 
+/* L261: of a conversation's continued snapshots that the incoming one
+ * supersedes, the OLDER ones take the demotion and go first; the newest (the
+ * previous snapshot, the one rung below the incoming text) keeps its own
+ * score -- it is what a client history rewrite between snapshots restores
+ * from.  The unrelated cold anchor survives too. */
 static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    const char *continued_text = "system: hello world";
+    const char *older_text = "system: hello";
+    const char *rung_text = "system: hello world";
     const char *cold_text = "different stable prefix";
     const char *incoming_text = "system: hello world\nuser: prompt";
-    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, older_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, rung_text, KV_REASON_CONTINUED, 4096, 2048);
     test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
 
-    char continued_sha[41], cold_sha[41];
-    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    char older_sha[41], rung_sha[41], cold_sha[41];
+    sha1_bytes_hex(older_text, strlen(older_text), older_sha);
+    sha1_bytes_hex(rung_text, strlen(rung_text), rung_sha);
     sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
-    char continued_name[44], cold_name[44];
-    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    char older_name[44], rung_name[44], cold_name[44];
+    snprintf(older_name, sizeof(older_name), "%.40s.kv", older_sha);
+    snprintf(rung_name, sizeof(rung_name), "%.40s.kv", rung_sha);
     snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
-    char *continued_path = path_join(dir, continued_name);
+    char *older_path = path_join(dir, older_name);
+    char *rung_path = path_join(dir, rung_name);
     char *cold_path = path_join(dir, cold_name);
 
     kv_disk_cache kc = {0};
@@ -5056,8 +5066,9 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     kc.opt = kv_cache_default_options();
     uint64_t incoming_bytes =
         KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
-    kc.budget_bytes =
-        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(cold_text) + 2048u;
+    kc.budget_bytes = incoming_bytes +
+        KV_CACHE_FIXED_HEADER + 4u + strlen(rung_text) + 2048u +
+        KV_CACHE_FIXED_HEADER + 4u + strlen(cold_text) + 2048u;
     pulsar_kvstore_eviction_context incoming = {
         .text = incoming_text,
         .text_len = strlen(incoming_text),
@@ -5068,13 +5079,16 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     };
     kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
 
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(older_path, F_OK) != 0);
+    TEST_ASSERT(access(rung_path, F_OK) == 0);
     TEST_ASSERT(access(cold_path, F_OK) == 0);
 
     kv_cache_close(&kc);
-    unlink(continued_path);
+    unlink(older_path);
+    unlink(rung_path);
     unlink(cold_path);
-    free(continued_path);
+    free(older_path);
+    free(rung_path);
     free(cold_path);
     rmdir(dir);
 }
