@@ -192,11 +192,8 @@ int gpu_graph_spec_dump_active(void) {
  * speculative (23.8 vs 19.9 t/s) was being quenched to plain.  The plain table
  * below is re-measured on the same instrument; guard = step / plain, so both sides
  * carry the same ~3% profiler overhead and the ratio is clean. */
-#define PULSAR_QUENCH_FLAT_MS    45.0f
-/* The row term is the engine-wide authority (PULSAR_SPEC_ROW_MS, pulsar.h):
- * the server's overflow K-allocator prices the same row, so the number lives
- * in exactly one place. */
-#define PULSAR_QUENCH_ROW_MS     PULSAR_SPEC_ROW_MS
+/* The step and plain terms are now per deployment shape (pulsar_spec_cost,
+ * L263): the census above is the ONE-SPARK profile below; the pair has its own. */
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
@@ -253,25 +250,62 @@ int gpu_graph_spec_dump_active(void) {
  * (~105.9 ms) is a bounded guess. Also unmeasured: whether structured/tool
  * output shifts plain ms/token at depth (all five anchors are prose). */
 #define PULSAR_QUENCH_PLAIN_CAP_POS 256000.0f
-static float spec_quench_plain_ms(int pos) {
-    static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
-    /* 2026-09-10 (L214): all five anchors MEASURED (served plain, --no-dspark, 256-token prose): 0.3k = the census plain step, 2.3k/9.3k by the decode-span ratios, 38k/100k from the server's own decoding avg= line at 52k and 135k context (53.3 / 55.0 ms per token, scaled to the census method by 1.034).  Plain's depth slope is ~0.03 ms per 1k now; the July table's 70.0 / 80.2 predate split-K attention. */
-    static const float py[5] = { 51.7f, 52.8f, 54.3f, 54.7f, 56.1f };
+
+/* The measured profiles, one per deployment shape (pulsar_spec_cost).  Each is
+ * set the way the quench wants its error: the step a little UNDER measured and
+ * plain a little OVER, so a mis-measurement biases against quenching. */
+static const pulsar_spec_cost k_spec_cost_spark = {
+    /* One Spark, IQ2_XXS routed experts (sparky): the L214 pinned-width census
+     * above (step = 45.0 + 7.17 x n_batch) and the plain table, 2026-09-10: all
+     * five anchors MEASURED (served plain, --no-dspark, 256-token prose): 0.3k =
+     * the census plain step, 2.3k/9.3k by the decode-span ratios, 38k/100k from
+     * the server's own decoding avg= line at 52k and 135k context (53.3 / 55.0 ms
+     * per token, scaled to the census method by 1.034).  Plain's depth slope is
+     * ~0.03 ms per 1k now; the July table's 70.0 / 80.2 predate split-K attention. */
+    "one Spark, IQ2 experts (L214 census 2026-09-10)",
+    45.0f, 7.17f,
+    { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f },
+    { 51.7f, 52.8f, 54.3f, 54.7f, 56.1f },
+};
+static const pulsar_spec_cost k_spec_cost_pair = {
+    /* The TP pair, full-weight MXFP4 experts (L263 census 2026-10-02, aa0c428d):
+     * nsys per decode step at c1, cycle = start to start of consecutive
+     * decode_mixed steps (forward + redraft + host), prose/code/structured at 1k
+     * and prose at 7.5k / 26k / 90k: fits 36.1 + 7.84, 35.4 + 8.6, 40.7 + 6.7,
+     * 38.8 + 7.2 ms per row -> 36.0 + 7.2 (under every fit at the 2-4 rows the
+     * depth controller runs).  The pair's plain batched lane fails its cross-rank
+     * check (L259), so plain is the 1-row verify forward through the spec lane
+     * (36.4 / 36.8 / 37.7 / 40.9 ms at 1k / 7.5k / 26k / 90k) + 3 ms of host and
+     * sampling.  Break-even at 3 rows: ~1.46 tokens per step (measured ~1.60),
+     * where the one-Spark constants gave the pair 1.29. */
+    "TP pair, full-weight experts (L263 census 2026-10-02)",
+    36.0f, 7.2f,
+    { 300.0f, 1000.0f, 7500.0f, 26000.0f, 90000.0f },
+    { 39.4f, 39.4f, 39.8f, 40.7f, 43.9f },
+};
+
+const pulsar_spec_cost *pulsar_spec_cost_for_ranks(uint32_t n_ranks) {
+    if (n_ranks <= 1) return &k_spec_cost_spark;
+    if (n_ranks == 2) return &k_spec_cost_pair;
+    return NULL;
+}
+
+static float spec_quench_plain_ms(const pulsar_spec_cost *c, int pos) {
+    const float *px = c->plain_px, *py = c->plain_py;
     const float p = (float)pos;
     if (p <= px[0]) return py[0];
     for (int i = 1; i < 5; i++)
         if (p <= px[i])
             return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
                                    (px[i] - px[i - 1]);
-    /* pos > 100000: extend the last segment's slope, capped at the 256k value. */
+    /* past the last anchor: extend the last segment's slope, capped at 256k. */
     const float slope = (py[4] - py[3]) / (px[4] - px[3]);
     const float q = p < PULSAR_QUENCH_PLAIN_CAP_POS ? p : PULSAR_QUENCH_PLAIN_CAP_POS;
     return py[4] + slope * (q - px[4]);
 }
 
-static float spec_quench_guard(uint32_t n_batch, int pos) {
-    return (PULSAR_QUENCH_FLAT_MS + PULSAR_QUENCH_ROW_MS * (float)n_batch) /
-           spec_quench_plain_ms(pos);
+static float spec_quench_guard(const pulsar_spec_cost *c, uint32_t n_batch, int pos) {
+    return (c->flat_ms + c->row_ms * (float)n_batch) / spec_quench_plain_ms(c, pos);
 }
 
 /* Re-arm at request boundaries (the same sites that drop the carry and
@@ -1438,7 +1472,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         bool fire = false;
         if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(n_batch, saved_len);
+                                 spec_quench_guard(s->engine->spec_cost, n_batch, saved_len);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */

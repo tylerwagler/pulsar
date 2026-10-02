@@ -279,6 +279,7 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { e->dump_tokens(tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
+float pulsar_engine_spec_row_ms(pulsar_engine *e) { return e && e->spec_cost ? e->spec_cost->row_ms : 0.0f; }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
 
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }

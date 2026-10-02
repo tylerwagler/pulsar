@@ -1827,6 +1827,7 @@ struct pulsar_engine {
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
     uint64_t tp_build_digest;   ///< L250: FNV-1a of the build id, stamped into disk-KV copies
+    const struct pulsar_spec_cost *spec_cost;   ///< L263: the measured spec-step cost profile of this deployment shape (session_spec.cpp); NULL without a drafter
     uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
@@ -2275,6 +2276,25 @@ typedef struct {
  *  name a path. */
 bool pulsar_tp_kv_key_ok(const char *key);
 uint64_t pulsar_build_digest(const char *build_id);
+
+/** L263: the measured cost of speculative decoding on ONE deployment shape --
+ *  what the terminal yield quench prices a step and a plain token at, and what
+ *  the server's overflow allocator prices a verify row at.  A spec cycle costs
+ *  flat_ms + row_ms x n_batch; plain decode costs plain_py[] ms per token at the
+ *  context depths plain_px[] (piecewise-linear, see spec_quench_plain_ms).  The
+ *  shapes differ by ~20% in the quench's break-even (one Spark with IQ2 experts
+ *  vs the TP pair with full weights), so each is measured on its own shape and
+ *  there is no shared default: a drafter on an unmeasured shape refuses to open. */
+typedef struct pulsar_spec_cost {
+    const char *name;     ///< the census it came from, for the open-time line
+    float flat_ms;        ///< a spec cycle at zero verify rows (forward fixed cost + drafting + host)
+    float row_ms;         ///< each verify row's marginal cost
+    float plain_px[5];    ///< context depths (tokens) of the plain-decode anchors, ascending
+    float plain_py[5];    ///< plain decode ms per token at those depths
+} pulsar_spec_cost;
+/** The profile measured for a deployment of `n_ranks` tensor-parallel ranks
+ *  (1 = one Spark, 2 = the pair); NULL when that shape has no census. */
+const pulsar_spec_cost *pulsar_spec_cost_for_ranks(uint32_t n_ranks);
 
 /** Slice 4e (L238 increment 4): the speculative round family's LOCAL
  * implementations (session_spec.cpp).  The public pulsar_session_spec_*

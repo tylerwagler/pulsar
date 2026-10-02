@@ -981,6 +981,25 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
     }
 
+    /* L263: the spec cost profile is measured per deployment shape; a drafter on
+     * a shape with no census would price the yield quench and the row allocator
+     * with another machine's numbers, so it refuses instead. */
+    if (e->has_dspark()) {
+        const uint32_t n_ranks = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
+        e->spec_cost = pulsar_spec_cost_for_ranks(n_ranks);
+        if (!e->spec_cost) {
+            fprintf(stderr, "pulsar: no measured speculative-decoding cost profile for %u tensor-parallel "
+                            "ranks (L263: run the spec census on this shape, or start with --no-dspark)\n",
+                    n_ranks);
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "pulsar: spec cost profile: %s -- step %.1f + %.2f ms/row, plain %.1f..%.1f ms/token\n",
+                e->spec_cost->name, (double)e->spec_cost->flat_ms, (double)e->spec_cost->row_ms,
+                (double)e->spec_cost->plain_py[0], (double)e->spec_cost->plain_py[4]);
+    }
+
     *out = e;
     return 0;
 }

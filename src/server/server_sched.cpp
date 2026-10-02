@@ -2361,7 +2361,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * term, not a property of the engine).  L136 set the price
              * to 6.0 from L134's stage attribution; L214's pinned-width
              * refit then measured 7.17 ms/row on the a309ff8 kernels,
-             * and the row price is ONE fact (PULSAR_SPEC_ROW_MS,
+             * and the row price is ONE fact (pulsar_engine_spec_row_ms,
              * pulsar.h) shared with the engine's yield quench -- this
              * site's private 6.0f was the stale copy.  L219/B4 drove
              * demand past the row budget and measured the correction's
@@ -2372,7 +2372,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * (L134) puts ~83% of this in routed-MoE expert compute, so
              * expect the number to move with MoE kernel work, not with
              * KV/indexer work. */
-            const float marginal_ms = PULSAR_SPEC_ROW_MS;
+            const float marginal_ms = pulsar_engine_spec_row_ms(s->engine);
             const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                               s->spec_ms_per_tok_ema : 45.0f;
             int thr_cut_rows = 0;

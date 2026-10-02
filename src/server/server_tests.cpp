@@ -6507,8 +6507,12 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     int cut = -1;
     memset(surv, 0, sizeof surv);
     memset(npend, 0, sizeof npend);
-    const float thr_fallback = PULSAR_SPEC_ROW_MS / 45.0f;   /* spec_ms_per_tok_ema unset */
-    const float thr_live = PULSAR_SPEC_ROW_MS / 30.0f;       /* a live EMA of 30 ms/tok */
+    /* The allocator takes thr = row price / ms-per-token; the price is a
+     * per-deployment measurement (pulsar_engine_spec_row_ms), so the cases use
+     * the one-Spark census row, which they were written against. */
+    const float row_ms = 7.17f;
+    const float thr_fallback = row_ms / 45.0f;   /* spec_ms_per_tok_ema unset */
+    const float thr_live = row_ms / 30.0f;       /* a live EMA of 30 ms/tok */
 
     /* (a) demand 3 + (B - 4) < B, one bank with hopeless confidence, a
      * fourth bank not decoding (npend 0): everything admitted, no cut. */
