@@ -2356,9 +2356,9 @@ int pulsar_gpu_minp_prefilter_rows(
  *  16-row group).  Its own decode-rows bound (pulsar_decode_rows_scope with
  *  this cap); PULSAR_GPU_MNEUTRAL_ROWS_MAX keeps inferring row kinds. */
 #define PULSAR_DSPARK_DRAFT_ROWS_MAX 64u
-/** The markov kernel's register tile: banks per launch (a group of up to
- *  PULSAR_DSPARK_BANKS_MAX banks runs as sub-launches of at most this many). */
-#define PULSAR_DSPARK_MARKOV_TILE 8u
+/** w2 steps the banked markov kernel loads ahead of their products (L262);
+ *  the drafter's embed_dim must be a multiple. */
+#define PULSAR_DSPARK_MARKOV_PREFETCH 8u
 /** spec_logits rows: the verify slab and the drafter forward both write it. */
 #define PULSAR_SPEC_LOGITS_ALLOC_ROWS \
     (PULSAR_DSPARK_DRAFT_ROWS_MAX > PULSAR_SPEC_LOGITS_ROWS ? PULSAR_DSPARK_DRAFT_ROWS_MAX : PULSAR_SPEC_LOGITS_ROWS)

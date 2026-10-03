@@ -2280,8 +2280,8 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
         return -1;
     }
     /* Every live round drafts (L260): the groups below split them into
-     * drafter passes of at most PULSAR_DSPARK_BANKS_MAX banks (the markov
-     * launcher runs them in PULSAR_DSPARK_MARKOV_TILE-bank tiles), each pass reusing the batch buffers after the
+     * drafter passes of at most PULSAR_DSPARK_BANKS_MAX banks (one markov
+     * launch per position carries them all, L262), each pass reusing the batch buffers after the
      * previous one's results are read back.  Selection used to stop at
      * PULSAR_DSPARK_BANKS_MAX, so past 8 live banks the rest took base-only
      * steps -- at c10, two streams drafted nothing on every round. */
