@@ -983,6 +983,226 @@ __global__ static void expert_gemv_down_kernel(
 }
 
 
+/* L262: DECODE rows past pulsar_gpu_matmul_decode_exact_rows() run the small FFN as
+ * e4m3 tensor-core MMAs over expert groups.  At the spec-on widths (drafter and
+ * verify steps of 32-37 rows: ~200 slots, ~68 distinct experts) the GEMVs above
+ * read the distinct experts at ~50% of peak.  Here:
+ *  - ffn_group_slots_kernel sorts the slots by expert (ascending expert, then slot)
+ *    into groups of at most FFN_MMA_GROUP; an invalid id is its own group and
+ *    writes zeros, as the GEMVs do;
+ *  - one CTA per (group, FFN_MMA_R x 32 output rows): each warp streams its 32
+ *    weight rows once for all of the group's slots (MMA rows; the e2m1 nibbles
+ *    expand exactly to e4m3, so the e4m3 MMA serves both operands), one MMA per
+ *    32-wide block, the two block scales applied to its partial in f32;
+ *  - weights are read 16 B per lane (one whole block of one row) and handed to
+ *    the fragment layout by a 4-round rotation inside each lane quad: 4 B per
+ *    lane flooded the global-load queue (ncu: lg_throttle + long_scoreboard,
+ *    ~115 GB/s whatever the shape; rows/L262.md).
+ * Gate/up applies SwiGLU (the clamp of swiglu_kernel) and the routing weight
+ * and emits the E4M3 mid through pulsar_mx_emit_block; down reads that mid.
+ * A slot's value depends only on its own rows, so it is the same at every width
+ * this arm serves; it differs from the GEMVs (width-dependent decode arithmetic
+ * is the rule since Tyler 2026-10-01). */
+enum { FFN_MMA_GROUP = 16, FFN_MMA_R = 4, FFN_MMA_U = 4 };
+
+/* One block: sel[n_slots] -> groups {expert or -1, m, first index into list, 0},
+ * list[n_slots] (slots in group order), *n_groups.  smem: n_slots + 2 (n_total + 1) ints. */
+__global__ static void ffn_group_slots_kernel(const int32_t *sel, unsigned n_slots, unsigned n_total,
+                                              int4 *groups, int32_t *list, int32_t *n_groups) {
+  extern __shared__ int32_t g_sm[];
+  int32_t *bk = g_sm;                       /* [n_slots] bucket per slot (n_total = invalid) */
+  int32_t *cnt = bk + n_slots;              /* [n_total + 1] */
+  int32_t *off = cnt + n_total + 1;         /* [n_total + 1] slot offset; group offset reuses cnt after */
+  for (unsigned i = threadIdx.x; i <= n_total; i += blockDim.x) cnt[i] = 0;
+  __syncthreads();
+  for (unsigned t = threadIdx.x; t < n_slots; t += blockDim.x) {
+    const int e = sel[t];
+    const int b = (e < 0 || (unsigned)e >= n_total) ? (int)n_total : e;
+    bk[t] = b;
+    atomicAdd(&cnt[b], 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int so = 0, go = 0;
+    for (unsigned b = 0; b <= n_total; b++) {
+      const int c = cnt[b];
+      off[b] = so;
+      cnt[b] = go;                            /* from here: the bucket's first group */
+      so += c;
+      go += (c + FFN_MMA_GROUP - 1) / FFN_MMA_GROUP;
+    }
+    *n_groups = go;
+  }
+  __syncthreads();
+  for (unsigned t = threadIdx.x; t < n_slots; t += blockDim.x) {
+    const int b = bk[t];
+    int rank = 0, total = 0;
+    for (unsigned u = 0; u < n_slots; u++) { const bool same = bk[u] == b; total += same; rank += same && u < t; }
+    const int pos = off[b] + rank;
+    list[pos] = (int32_t)t;
+    if (rank % FFN_MMA_GROUP == 0) {
+      const int m = total - rank < FFN_MMA_GROUP ? total - rank : FFN_MMA_GROUP;
+      groups[cnt[b] + rank / FFN_MMA_GROUP] = make_int4(b == (int)n_total ? -1 : b, m, pos, 0);
+    }
+  }
+}
+
+__device__ __forceinline__ static void ffn_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                    uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+               : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
+}
+/* 4 e2m1 nibbles (low 16 bits, nibble j = value j) -> 4 e4m3 bytes, exact:
+ * magnitudes {0,.5,1,1.5,2,3,4,6} = e4m3 0x00 0x30 0x38 0x3C 0x40 0x44 0x48 0x4C. */
+__device__ __forceinline__ static uint32_t ffn_e2m1x4_to_e4m3(uint32_t w) {
+  const uint32_t mag = __byte_perm(0x3C383000u, 0x4C484440u, w & 0x7777u);
+  const uint32_t s = w & 0x8888u;
+  return mag | ((s & 0x8u) << 4) | ((s & 0x80u) << 8) | ((s & 0x800u) << 12) | ((s & 0x8000u) << 16);
+}
+__device__ __forceinline__ static uint32_t ffn_sel4(uint4 v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+/* The quad rotation: lane q holds block (4*kb4 + q) of its row as 16 B; afterwards
+ * w[b] is word q of block b -- the 8 values the m16n8k32 fragment wants. */
+__device__ __forceinline__ static void ffn_quad_rotate(uint4 W, int lane, int q, uint32_t w[4]) {
+  uint32_t r[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++)
+    r[k] = __shfl_sync(0xffffffffu, ffn_sel4(W, (q + k) & 3), (lane & ~3) | ((q - k) & 3));
+  const uint4 R = make_uint4(r[0], r[1], r[2], r[3]);
+#pragma unroll
+  for (int b = 0; b < 4; b++) w[b] = ffn_sel4(R, (q - b) & 3);
+}
+
+/* NMAT 2: gate + up -> SwiGLU -> E4M3 mid.  NMAT 1: down -> f32 out.  xrow_div maps a
+ * slot to its activation row (n_expert for gate/up: the token; 1 for down: the slot). */
+template <class SFL, int NMAT>
+__global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
+    const int4 *groups, const int32_t *list, const int32_t *n_groups,
+    const uint8_t *xq8, const uint8_t *xsf, int xkbp, int xrow_div,
+    const uint8_t *const *tab0, const uint8_t *const *tab1, uint64_t data_bytes, SFL sfl,
+    const float *rw, float clampv,
+    uint8_t *midq, uint8_t *midsf, int mid_kbp,      /* NMAT 2 out */
+    float *out,                                       /* NMAT 1 out */
+    int K, int N) {
+  __shared__ float s_v[FFN_MMA_R][FFN_MMA_GROUP][32];
+  if ((int)blockIdx.y >= *n_groups) return;
+  const int4 gi = groups[blockIdx.y];
+  const int e = gi.x, m = gi.y;
+  const int32_t *slots = list + gi.z;
+  const int lane = (int)(threadIdx.x & 31u), warp = (int)(threadIdx.x >> 5), grp = lane >> 2, q = lane & 3;
+  const int row0 = ((int)blockIdx.x * FFN_MMA_R + warp) * 32;
+  if (e < 0) {   /* invalid expert: its slots contribute zero, as in the GEMVs */
+    for (int t = 0; t < m; t++) {
+      if constexpr (NMAT == 2) pulsar_mx_emit_block(0.f, (uint32_t)(row0 + lane), (uint32_t)slots[t], (uint32_t)N,
+                                                    mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
+      else out[(size_t)slots[t] * N + row0 + lane] = 0.f;
+    }
+    return;
+  }
+  const uint8_t *w0 = tab0[e];
+  const uint8_t *w1 = NMAT == 2 ? tab1[e] : w0;
+  const uint8_t *sf0 = w0 + data_bytes, *sf1 = w1 + data_bytes;
+  const uint8_t *xr[2];
+  int xrow[2];
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const int t = h * 8 + grp;
+    xrow[h] = t < m ? slots[t] / xrow_div : -1;
+    xr[h] = t < m ? xq8 + (size_t)xrow[h] * K : nullptr;
+  }
+  float acc[NMAT][4][4];
+#pragma unroll
+  for (int a = 0; a < NMAT; a++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) acc[a][j][i] = 0.f;
+  constexpr int U = FFN_MMA_U;
+  for (int c = 0; c < K / (32 * U); c++) {
+    uint32_t wv[NMAT][4][U];
+    uint32_t sw[NMAT][4][2];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int n = row0 + j * 8 + grp;
+      const size_t off = (size_t)n * (K / 2) + (size_t)c * U * 16 + q * 16;
+      ffn_quad_rotate(__ldcs((const uint4 *)(w0 + off)), lane, q, wv[0][j]);
+      if constexpr (NMAT == 2) ffn_quad_rotate(__ldcs((const uint4 *)(w1 + off)), lane, q, wv[1][j]);
+      const int nr = row0 + j * 8 + q * 2, kw = c * U * 32;
+      sw[0][j][0] = *(const uint32_t *)(sf0 + sfl(nr, kw, 0));
+      sw[0][j][1] = *(const uint32_t *)(sf0 + sfl(nr + 1, kw, 0));
+      if constexpr (NMAT == 2) {
+        sw[1][j][0] = *(const uint32_t *)(sf1 + sfl(nr, kw, 0));
+        sw[1][j][1] = *(const uint32_t *)(sf1 + sfl(nr + 1, kw, 0));
+      }
+    }
+    uint2 av[2][U];
+    uint32_t sa[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+      for (int kb = 0; kb < U; kb++)
+        av[h][kb] = xr[h] ? *(const uint2 *)(xr[h] + (c * U + kb) * 32 + q * 8) : make_uint2(0u, 0u);
+      sa[h] = xr[h] ? *(const uint32_t *)(xsf + pulsar_mx_sfoff(xrow[h], c * U, xkbp)) : 0u;
+    }
+#pragma unroll
+    for (int kb = 0; kb < U; kb++) {
+      const int sh = 8 * kb;
+      const float sa0 = gemv_sf_val((uint8_t)(sa[0] >> sh)), sa1 = gemv_sf_val((uint8_t)(sa[1] >> sh));
+#pragma unroll
+      for (int a = 0; a < NMAT; a++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const uint32_t b0 = ffn_e2m1x4_to_e4m3(wv[a][j][kb] & 0xFFFFu), b1 = ffn_e2m1x4_to_e4m3(wv[a][j][kb] >> 16);
+          const float s0 = gemv_sf_val((uint8_t)(sw[a][j][0] >> sh)), s1 = gemv_sf_val((uint8_t)(sw[a][j][1] >> sh));
+          float d[4];
+          ffn_mma_e4m3(d, av[0][kb].x, av[1][kb].x, av[0][kb].y, av[1][kb].y, b0, b1);
+          acc[a][j][0] += d[0] * (sa0 * s0);
+          acc[a][j][1] += d[1] * (sa0 * s1);
+          acc[a][j][2] += d[2] * (sa1 * s0);
+          acc[a][j][3] += d[3] * (sa1 * s1);
+        }
+    }
+  }
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const int t = h * 8 + grp;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        const int col = j * 8 + q * 2 + i;
+        if constexpr (NMAT == 2) {
+          if (t < m) {
+            /* swiglu_kernel's clamp, then silu(gate) * up * rweight */
+            float gg = acc[0][j][h * 2 + i], uu = acc[1][j][h * 2 + i];
+            if (clampv > 1.0e-6f) {
+              if (gg > clampv) gg = clampv;
+              if (uu > clampv) uu = clampv;
+              if (uu < -clampv) uu = -clampv;
+            }
+            s_v[warp][t][col] = (gg / (1.f + expf(-gg))) * uu * rw[slots[t]];
+          }
+        } else if (t < m) {
+          out[(size_t)slots[t] * N + row0 + col] = acc[0][j][h * 2 + i];
+        }
+      }
+  }
+  if constexpr (NMAT == 2) {
+    __syncwarp();
+    for (int t = 0; t < m; t++)
+      pulsar_mx_emit_block(s_v[warp][t][lane], (uint32_t)(row0 + lane), (uint32_t)slots[t], (uint32_t)N,
+                           mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
+  }
+}
+
+/* Grouping scratch: [n_slots] int4 groups, [n_slots] list, one count. */
+static thread_local void *g_ffn_grp = nullptr;
+static thread_local size_t g_ffn_grp_bytes = 0;
+
+
 
 
 /* Persistent E4M3 staging for the small FFN's mid, grown on demand and reused
@@ -1056,6 +1276,50 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     announced = 1;
     fprintf(stderr, "pulsar: fp4 small-batch FFN: gate/up emits E4M3 mid from the epilogue "
                     "(mid_dim=%d n_slots=%u)\n", mid_dim, n_slots);
+  }
+  if (pulsar_gpu_matmul_batch_decode_rows() > 0 && n_tokens > pulsar_gpu_matmul_decode_exact_rows()) {
+    /* L262: the MMA arm.  Its loads need 16-B rows of whole blocks, 32-row warps
+     * and 4-block scale words (the SF atom keeps a row's 4 consecutive blocks in
+     * one word -- checked here against the layout object, not assumed). */
+    if (in_dim % (32 * FFN_MMA_U) || mid_dim % (32 * FFN_MMA_U) || mid_dim % (32 * FFN_MMA_R) ||
+        out_dim % (32 * FFN_MMA_R) || (gate_stride & 15u) || (down_stride & 15u) ||
+        (int)sfl_gu(0, 32, 0) != (int)sfl_gu(0, 0, 0) + 1 || (int)sfl_gu(0, 96, 0) != (int)sfl_gu(0, 0, 0) + 3 ||
+        (int)sfl_dn(0, 32, 0) != (int)sfl_dn(0, 0, 0) + 1 || (int)sfl_dn(0, 96, 0) != (int)sfl_dn(0, 0, 0) + 3) {
+      static int said_shape = 0;
+      if (!said_shape) {
+        said_shape = 1;
+        fprintf(stderr, "pulsar: small-batch FFN MMA arm: shape (in %d mid %d out %d) or layout unsupported -- refusing\n",
+                in_dim, mid_dim, out_dim);
+      }
+      return 1;
+    }
+    const size_t grp_bytes = (size_t)n_slots * (sizeof(int4) + sizeof(int32_t)) + 16;
+    if (grp_bytes > g_ffn_grp_bytes) {
+      if (g_ffn_grp) { pulsar_gpu_seg_note_device_free(); cudaFree(g_ffn_grp); }
+      g_ffn_grp = nullptr;
+      if (cudaMalloc(&g_ffn_grp, grp_bytes) != cudaSuccess) { g_ffn_grp_bytes = 0; return 1; }
+      g_ffn_grp_bytes = grp_bytes;
+    }
+    int4 *groups = (int4 *)g_ffn_grp;
+    int32_t *list = (int32_t *)(groups + n_slots);
+    int32_t *n_groups = list + n_slots;
+    static int said_mma = 0;
+    if (!said_mma) {
+      said_mma = 1;
+      fprintf(stderr, "pulsar: small-batch FFN decode rows past %d = e4m3 MMA over expert groups of %d (16-B loads)\n",
+              pulsar_gpu_matmul_decode_exact_rows(), (int)FFN_MMA_GROUP);
+    }
+    ffn_group_slots_kernel<<<1, 256, (size_t)(n_slots + 2 * (n_total_expert + 1)) * sizeof(int32_t)>>>(
+        selected, n_slots, n_total_expert, groups, list, n_groups);
+    ffn_mma_kernel<decltype(sfl_gu), 2><<<dim3((unsigned)(mid_dim / (32 * FFN_MMA_R)), n_slots), FFN_MMA_R * 32>>>(
+        groups, list, n_groups, (const uint8_t *)act_q, (const uint8_t *)act_sf, x_kbp, n_expert,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, rweights, clamp, midq8, midsf, mid_kbp, nullptr,
+        in_dim, mid_dim);
+    ffn_mma_kernel<decltype(sfl_dn), 1><<<dim3((unsigned)(out_dim / (32 * FFN_MMA_R)), n_slots), FFN_MMA_R * 32>>>(
+        groups, list, n_groups, midq8, midsf, mid_kbp, 1,
+        down_tab, nullptr, down_data_bytes, sfl_dn, nullptr, 0.f, nullptr, nullptr, 0, down_out,
+        mid_dim, out_dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
   }
   {
     dim3 g((unsigned)(mid_dim / 32), n_slots);
