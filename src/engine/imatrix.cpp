@@ -1139,8 +1139,11 @@ int gpu_graph_decode_multiseq_batch(
     }
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
-    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur,
-                                       fused ? (int32_t)fused->n_dec : -1)) return 0;
+    /* The spec lane's verify step (every row read back) is all decode rows; it
+     * declares them so their multi-row verify runs are not read as prefill. */
+    const int32_t n_dec_declared = fused ? (int32_t)fused->n_dec
+                                 : max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS ? (int32_t)n_active : -1;
+    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur, n_dec_declared)) return 0;
     /* A fused step's prefill rows feed their banks' drafter prompt rings, as a
      * classic chunk does: arm the bulk anchor capture past the decode rows. */
     if (fused && g->dspark_bulk_h[0]) {

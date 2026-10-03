@@ -2075,23 +2075,29 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
      * decode by it (the caller would have to pass the count).  The setter
      * refuses a count past the cap, which the PULSAR_MSEQ_MAX static_assert
      * makes unreachable from here. */
-    /* L260: a fused step declares where its decode rows END (its verify runs
-     * are multi-row, which the inference would read as prefill); the kinds
-     * WITHIN that prefix are inferred exactly as for a decode-only step of
-     * that width, so its verify rows take the arms they take without the
-     * prefill rows behind them. */
-    const uint32_t n_kind = n_dec_declared >= 0 ? (uint32_t)n_dec_declared : n_rows;
+    /* L260: a caller that KNOWS its decode rows declares them -- a fused step
+     * (where its decode / verify prefix ends) and the spec lane's verify step
+     * (every row; PULSAR_MSEQ_HEAD_ALL_ROWS) -- and the declared rows are all
+     * decode rows, multi-row verify runs included, up to the verify slab
+     * (L262: a c16 verify step is 16 runs of 2 rows; inferred, it declared 0
+     * decode rows and ran its experts on the IQ2 tile at ~4.5 ms a layer where
+     * the decode GEMV takes ~3.0, and its dense GEMMs on the 4096-row picks --
+     * width-dependent arithmetic is the decode rule now, Tyler 2026-10-01).
+     * Without a declaration the kinds are inferred as before. */
     uint32_t n_dec = 0;
-    if (n_kind <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
-        n_dec = n_kind;
+    const int dec_cap = n_dec_declared >= 0 ? (int)PULSAR_SPEC_LOGITS_ROWS : (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX;
+    if (n_dec_declared >= 0) {
+        n_dec = (uint32_t)n_dec_declared;
+    } else if (n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        n_dec = n_rows;
     } else {
-        for (uint32_t t = 0; t < n_kind; ) {
+        for (uint32_t t = 0; t < n_rows; ) {
             uint32_t rl = 1;
-            while (t + rl < n_kind && seq[t + rl] == seq[t]) rl++;
+            while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
             if (rl == 1) { n_dec++; t++; } else break;
         }
     }
-    if (!pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec)) {
+    if (!pulsar_gpu_matmul_set_batch_decode_rows_capped((int)n_dec, dec_cap)) {
         g->batch_multiseq = false;
         g->batch_multiseq_rows = 0;
         return false;
