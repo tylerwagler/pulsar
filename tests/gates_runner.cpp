@@ -70,6 +70,7 @@ int gate_chunk_neutrality_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
 int gate_session_payload_gate_main(int, char **);
 int gate_tp_head_split_gate_main(int, char **);
+int gate_decode_reference_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -432,6 +433,13 @@ int main(int argc, char **argv) {
                                   NULL}};
     const gate_spec ref_code = {"cuda-reference-gate-code", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                 {"--check-reference", code_ref, code_tok, ref_tol, "--known-high", "3840", NULL}};
+    /* L262: decode rows at every served width (1..32) against the same blobs --
+     * the fidelity grade for width-dependent decode arithmetic. */
+    /* the story blob's near-tie row is the prefill reference gate's known flip too */
+    const gate_spec dref_story = {"cuda-decode-reference-gate-story", gate_decode_reference_gate_main, 2, NULL, NULL,
+                                  {story_ref, story_tok, "--known-flip", "30464", NULL}};
+    const gate_spec dref_code = {"cuda-decode-reference-gate-code", gate_decode_reference_gate_main, 2, NULL, NULL,
+                                 {code_ref, code_tok, NULL}};
 
     /* The known sub-gate set, in run order.  The validator and the selection
      * report both read it, so --only/--except can never name a gate that does
@@ -444,7 +452,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) KNOWN(group_depth1[i]);
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) KNOWN(group_nodspark[i]);
     KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality);
-    KNOWN(ref_story); KNOWN(ref_code);
+    KNOWN(ref_story); KNOWN(ref_code); KNOWN(dref_story); KNOWN(dref_code);
 #undef KNOWN
     if (validate_names(g_only, "--only", known, n_known) ||
         validate_names(g_except, "--except", known, n_known)) return 2;
@@ -458,8 +466,10 @@ int main(int argc, char **argv) {
         printf("\n  skipped (%d):", n_known - n_sel);
         for (int i = 0; i < n_known; i++) if (!gate_selected(known[i])) printf(" %s", known[i]);
         printf("\n");
-        if (!have_ref && (gate_selected(ref_story.name) || gate_selected(ref_code.name)))
-            printf("  note: cuda-reference-gate-* selected but PULSAR_REF_DIR is unset -- they will SKIP\n");
+        if (!have_ref && (gate_selected(ref_story.name) || gate_selected(ref_code.name) ||
+                          gate_selected(dref_story.name) || gate_selected(dref_code.name)))
+            printf("  note: cuda-reference-gate-* / cuda-decode-reference-gate-* selected but PULSAR_REF_DIR is unset "
+                   "-- they will SKIP\n");
         fflush(stdout);
     }
 
@@ -493,7 +503,10 @@ int main(int argc, char **argv) {
         if (kl_code_ok) { c.args[n++] = "--kl-baseline"; c.args[n++] = kl_code; }
         c.args[n] = NULL;
         RUN(c);
-    } else if (ref_dir && (gate_selected(ref_story.name) || gate_selected(ref_code.name))) {
+        RUN(dref_story);
+        RUN(dref_code);
+    } else if (ref_dir && (gate_selected(ref_story.name) || gate_selected(ref_code.name) ||
+                           gate_selected(dref_story.name) || gate_selected(dref_code.name))) {
         /* The caller ASKED for the reference grade (--ref-dir was passed) and the
          * blob is not readable: that is a misconfiguration, not "not
          * configured", and it must not leave the battery green.  This is how
@@ -505,8 +518,9 @@ int main(int argc, char **argv) {
                ref_dir, story_ref);
         rc_all = 1;
     } else {
-        printf("\n  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir\n"
-               "        (blobs live outside the repo; without them this gate grades nothing)\n");
+        printf("\n  SKIP  cuda-reference-gate, cuda-decode-reference-gate: set PULSAR_REF_DIR to the "
+               "reference-capture dir\n"
+               "        (blobs live outside the repo; without them these gates grade nothing)\n");
     }
 #undef RUN
 

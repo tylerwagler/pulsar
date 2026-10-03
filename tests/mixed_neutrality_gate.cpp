@@ -323,41 +323,69 @@ static void gate5r_run(const char *spec, bool fatal) {
         if (!all || !solo || !multirun_step_rows(rpb_of, -1, rev != 0, all, issued)) {
             fprintf(stderr, "%s: batched step failed\n", tag); g_fail = 1; free(all); free(solo); continue;
         }
-        /* L260: the corruption floor the width tolerance must sit under -- each
-         * graded row against ANOTHER bank's batched row at the same position (a
-         * row computed from the wrong context, which is what a bank, frontier or
-         * KV mix-up produces).  The smallest such KL must clear the tolerance, or
-         * the tolerance could not tell arithmetic from corruption on this data. */
+        /* L260/L262: the corruption floor -- each graded row against ANOTHER
+         * bank's batched row at the same position (a row computed from the wrong
+         * context, which is what a bank, frontier or KV mix-up produces).  Pass
+         * one computes every graded row's KL and the floor; pass two grades each
+         * row against GATE_5R_FLOOR_FRACTION of that floor, so the bound is the
+         * one thing this gate exists to separate, measured on this step's data. */
         size_t slot_off[N_DEC_MAX];
         { size_t o = 0; for (int sl = 0; sl < g_n_dec; sl++) { slot_off[sl] = o; o += (size_t)rpb_of[issued[sl]]; } }
         double cross_min = INFINITY, graded_max = 0.0;
-        size_t row_off = 0;
-        for (int slot = 0; slot < g_n_dec; slot++) {
-            const int k = issued[slot];
-            const int RPB = rpb_of[k];
-            snprintf(solo_tag, sizeof(solo_tag), "solo%d", k);
-            g_dump_tag = solo_tag;
-            if (!multirun_step_rows(rpb_of, k, false, solo, one)) { fprintf(stderr, "%s: solo %d failed\n", tag, k); g_fail = 1; break; }
-            int bad = 0, graded = 0;
-            for (int j = 0; j < RPB; j++) {
-                const float *a = all + (row_off + (size_t)j) * vocab;
-                const float *b = solo + (size_t)j * vocab;
-                long d = gate_first_diff(a, b, (long)vocab);
-                /* L260: a batched step past the width-exact range is graded,
-                 * not byte-gated (the solo run is narrower by construction). */
-                if (d >= 0 && gate_width_inexact(total)) {
+        float *solos = (float *)malloc((size_t)total * vocab * sizeof(float));
+        double *row_kl = (double *)malloc((size_t)total * sizeof(double));   /* < 0: byte-identical */
+        bool solo_ok = solos && row_kl;
+        {
+            size_t ro = 0;
+            for (int slot = 0; slot < g_n_dec && solo_ok; slot++) {
+                const int k = issued[slot];
+                const int RPB = rpb_of[k];
+                snprintf(solo_tag, sizeof(solo_tag), "solo%d", k);
+                g_dump_tag = solo_tag;
+                if (!multirun_step_rows(rpb_of, k, false, solo, one)) {
+                    fprintf(stderr, "%s: solo %d failed\n", tag, k); g_fail = 1; solo_ok = false; break;
+                }
+                memcpy(solos + ro * vocab, solo, (size_t)RPB * vocab * sizeof(float));
+                for (int j = 0; j < RPB; j++) {
+                    const float *a = all + (ro + (size_t)j) * vocab;
+                    const float *b = solo + (size_t)j * vocab;
+                    row_kl[ro + (size_t)j] = -1.0;
+                    if (gate_first_diff(a, b, (long)vocab) < 0 || !gate_width_inexact(total)) continue;
                     const double kl = gate_row_kl(b, a, (long)vocab);
+                    row_kl[ro + (size_t)j] = kl;
+                    if (kl > graded_max) graded_max = kl;
                     for (int os = 0; os < g_n_dec; os++) {
                         if (os == slot || j >= rpb_of[issued[os]]) continue;
                         const double x = gate_row_kl(b, all + (slot_off[os] + (size_t)j) * vocab, (long)vocab);
                         if (x < cross_min) cross_min = x;
                     }
-                    if (kl > graded_max) graded_max = kl;
-                    if (kl <= GATE_DECODE_WIDTH_KL_TOL) {
-                        printf("%s %s: bank %d (slot %d) row %d/%d: KL %.3e vs solo (width %d, graded)\n", tag,
-                               rev ? "reversed" : "forward", k, slot, j, RPB, kl, total);
-                        d = -1; graded++;
-                    }
+                }
+                ro += (size_t)RPB;
+            }
+        }
+        if (graded_max > 0.0 && !(cross_min < INFINITY)) {
+            fprintf(stderr, "GATE 5R FAIL: %s %s: graded rows but no cross-bank floor (one bank?) -- nothing "
+                            "separates width arithmetic from corruption on this step\n", tag, rev ? "reversed" : "forward");
+            g_fail = 1;
+            solo_ok = false;
+        }
+        const double tol = cross_min < INFINITY ? GATE_5R_FLOOR_FRACTION * cross_min : 0.0;
+        size_t row_off = 0;
+        for (int slot = 0; slot < g_n_dec && solo_ok; slot++) {
+            const int k = issued[slot];
+            const int RPB = rpb_of[k];
+            int bad = 0, graded = 0;
+            for (int j = 0; j < RPB; j++) {
+                const float *a = all + (row_off + (size_t)j) * vocab;
+                const float *b = solos + (row_off + (size_t)j) * vocab;
+                long d = gate_first_diff(a, b, (long)vocab);
+                /* L260: a batched step past the width-exact range is graded,
+                 * not byte-gated (the solo run is narrower by construction). */
+                const double kl = row_kl[row_off + (size_t)j];
+                if (d >= 0 && kl >= 0.0 && kl <= tol) {
+                    printf("%s %s: bank %d (slot %d) row %d/%d: KL %.3e vs solo (width %d, graded)\n", tag,
+                           rev ? "reversed" : "forward", k, slot, j, RPB, kl, total);
+                    d = -1; graded++;
                 }
                 if (d < 0) {
                     if (!fatal) printf("%s %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", tag, rev ? "reversed" : "forward", k, slot, j, RPB);
@@ -379,23 +407,19 @@ static void gate5r_run(const char *spec, bool fatal) {
             }
             if (fatal) {
                 if (bad) g_fail = 1;
-                else if (graded) printf("%s %s: bank %d (slot %d) all %d rows batched (%d) vs solo: %d graded within KL %.2g\n",
-                                        tag, rev ? "reversed" : "forward", k, slot, RPB, total, graded, GATE_DECODE_WIDTH_KL_TOL);
+                else if (graded) printf("%s %s: bank %d (slot %d) all %d rows batched (%d) vs solo: %d graded within KL %.3g "
+                                        "(%.2g of the floor)\n", tag, rev ? "reversed" : "forward", k, slot, RPB, total, graded,
+                                        tol, GATE_5R_FLOOR_FRACTION);
                 else printf("%s %s: bank %d (slot %d) all %d rows batched (%d) == solo BYTE-IDENTICAL\n",
                             tag, rev ? "reversed" : "forward", k, slot, RPB, total);
             }
             row_off += (size_t)RPB;
         }
-        if (graded_max > 0.0) {
-            const bool sep = cross_min > GATE_DECODE_WIDTH_KL_TOL;
-            fprintf(sep || !fatal ? stdout : stderr,
-                    "%s%s %s: width spread max KL %.3e, tolerance %.2g, cross-bank floor min KL %.3e -- %s\n",
-                    sep || !fatal ? "" : "GATE 5R FAIL: ", tag, rev ? "reversed" : "forward", graded_max,
-                    GATE_DECODE_WIDTH_KL_TOL, cross_min,
-                    sep ? "the tolerance separates them" : "the tolerance does NOT separate width noise from a wrong-context row");
-            if (!sep && fatal) g_fail = 1;
-        }
-        free(all); free(solo);
+        if (graded_max > 0.0 && solo_ok)
+            printf("%s %s: width spread max KL %.3e, cross-bank floor min KL %.3e, bound %.3e (%.2g of the floor), "
+                   "spread / floor %.3f\n", tag, rev ? "reversed" : "forward", graded_max, cross_min, tol,
+                   GATE_5R_FLOOR_FRACTION, graded_max / cross_min);
+        free(all); free(solo); free(solos); free(row_kl);
     }
 }
 

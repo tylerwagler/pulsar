@@ -81,12 +81,30 @@ static inline long gate_first_diff(const float *a, const float *b, long n) {
 /* L260: the per-row bound for a decode row compared ACROSS the width-exact
  * boundary (pulsar_gpu_matmul_decode_exact_rows): KL(narrow || wide) over the
  * softmax.  Measured worst rows, width 12/16 vs narrower (2026-10-02, all three
- * cuBLASLt decode arms): 4.7e-2 on the B300 reference text
- * (decode_reference_probe), 0.39 on GATE 5R's replayed-prompt rows (off-
- * distribution context; 0.32 with a top-1 flip already under the bf16 arm
- * alone).  2.5x the worst measured.  GATE 5R checks in-gate that a row from the
- * WRONG bank's context clears this bound, so it still separates corruption. */
+ * cuBLASLt decode arms): 4.7e-2 on the B300 reference text, 0.39 on GATE 5R's
+ * replayed-prompt rows.  Used by the dspark-batch and algo-stability gates.
+ * L262: GATE 5R no longer uses it (its replayed off-distribution rows reached
+ * 0.82 at 8c76d808 while the reference text moved < 0.05) -- 5R separates
+ * corruption with GATE_5R_FLOOR_FRACTION, and FIDELITY across widths is graded
+ * against the B300 reference by cuda-decode-reference-gate-*. */
 #define GATE_DECODE_WIDTH_KL_TOL 1.0
+
+/* L262 GATE 5R: a graded row passes when its KL vs the solo row is at most this
+ * fraction of the step's own cross-bank floor (the smallest KL of a row against
+ * ANOTHER bank's row at the same position -- what a bank / frontier / KV mix-up
+ * produces), measured in the same step.  4: at 8c76d808 the worst graded row was
+ * 0.82 against a floor of 8.49 (ratio 0.097). */
+#define GATE_5R_FLOOR_FRACTION 0.25
+
+/* L262 cuda-decode-reference-gate-*: a w-wide decode step's last row, against
+ * the SAME tokens over the SAME prefill decoded as w one-row steps (the width
+ * effect alone), must stay within this fraction of the one-row run's own
+ * distance from the B300 reference -- KL(serial || wide) <= max(FRACTION *
+ * KL(ref || serial), FLOOR) -- and keep the serial or the reference top-1.
+ * Measured at 3d5d2430, widths 16..32: worst ratio 0.14 (code depth 3840 at 24:
+ * 0.036 vs KL(ref||serial) 0.25), the tiny-KL depths under 1e-5 absolute. */
+#define GATE_REF_WIDTH_KL_FRACTION 0.5
+#define GATE_REF_WIDTH_KL_FLOOR 1e-4
 
 /* KL(ref || cur) over the softmax of two logit rows, in double. */
 static inline double gate_row_kl(const float *ref, const float *cur, long n) {

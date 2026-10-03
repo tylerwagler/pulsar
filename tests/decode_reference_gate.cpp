@@ -1,4 +1,4 @@
-/* L260 PROBE: decode rows graded against the B300 reference, at each width served.
+/* L260 / L262 GATE: decode rows graded against the B300 reference, at each width served.
  *
  * Tyler's decision (2026-10-01): decode rows may take width-dependent arithmetic
  * -- the fastest arm at each width.  Rule 7 says that is graded, not argued, and
@@ -15,7 +15,15 @@
  *   reported 2-7 logits of "width" effect that was prefix arithmetic).
  *
  *   PULSAR_MSEQ_BANKS=2 ./tests/decode_reference_probe MODEL REF.bin TOKENS.bin [w,w,...]
- * Report only: it prints, it does not enforce (the gate built on it will).
+ * L262: it ENFORCES (cuda-decode-reference-gate-story / -code in the battery):
+ * for every depth and width w > 1, KL(serial || wide) <= max(GATE_REF_WIDTH_KL_FRACTION
+ * x KL(ref || serial), GATE_REF_WIDTH_KL_FLOOR), and the wide top-1 is the
+ * serial's or the reference's.  Widths up to PULSAR_SPEC_LOGITS_ROWS (the
+ * spec-on verify slab); widths <= pulsar_gpu_matmul_decode_exact_rows() are byte-identical to the
+ * serial run and byte-gated elsewhere, so the default grades 12/16/24/32 only.  --known-flip
+ * D[,D] names depths whose top-1 is a near tie (the prefill reference gate's list): KL still
+ * enforced, a top-1 flip accepted by name.  This, not GATE 5R's replayed rows, is the fidelity
+ * grade for width-dependent decode arithmetic (Tyler 2026-10-03: "go ahead").
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -25,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define MAGIC "DS4PFXG1"
 #define MAX_DEPTHS 8u
@@ -72,7 +81,7 @@ static bool decode_last_row(pulsar_engine *e, const int *toks, uint32_t d, uint3
     const int ctx = (int)(((d + 4095u) / 4096u + 1u) * 4096u);
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed (ctx %d)\n", ctx); return false; }
     bool ok = gate_pool_fits(s, 2) && gate_populate_bank(s, 0, toks, (int)(d - w), NULL, "decode reference prefix");
-    pulsar_multiseq_req rq[16];
+    pulsar_multiseq_req rq[PULSAR_SPEC_LOGITS_ROWS];
     for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = (int32_t)(d - w + j); rq[j].token = toks[d - w + j]; }
     float *lg = (float *)malloc((size_t)w * (size_t)width * sizeof(float));
     uint32_t nr = 0;
@@ -94,17 +103,27 @@ static bool decode_last_row(pulsar_engine *e, const int *toks, uint32_t d, uint3
 
 int GATE_ENTRY(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s MODEL REF.bin TOKENS.bin [w,w,...]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL REF.bin TOKENS.bin [w,w,...] [--known-flip D[,D...]]\n", argv[0]);
         return 2;
     }
-    uint32_t widths[8] = {1, 4, 9, 16};
+    uint32_t widths[8] = {12, 16, 24, 32};
     int n_w = 4;
-    if (argc > 4) {
-        n_w = 0;
-        for (char *p = strtok(argv[4], ","); p && n_w < 8; p = strtok(NULL, ",")) widths[n_w++] = (uint32_t)atoi(p);
+    uint32_t known_flip[MAX_DEPTHS];
+    int n_kf = 0;
+    for (int a = 4; a < argc; a++) {
+        if (!strcmp(argv[a], "--known-flip") && a + 1 < argc) {
+            for (char *p = strtok(argv[++a], ","); p && n_kf < (int)MAX_DEPTHS; p = strtok(NULL, ","))
+                known_flip[n_kf++] = (uint32_t)atoi(p);
+        } else {
+            n_w = 0;
+            for (char *p = strtok(argv[a], ","); p && n_w < 8; p = strtok(NULL, ",")) widths[n_w++] = (uint32_t)atoi(p);
+        }
     }
     for (int i = 0; i < n_w; i++) {
-        if (widths[i] < 1 || widths[i] > 16) { fprintf(stderr, "width %u out of [1, 16]\n", widths[i]); return 2; }
+        if (widths[i] < 1 || widths[i] > PULSAR_SPEC_LOGITS_ROWS) {
+            fprintf(stderr, "width %u out of [1, %u]\n", widths[i], (unsigned)PULSAR_SPEC_LOGITS_ROWS);
+            return 2;
+        }
     }
     FILE *fp = fopen(argv[2], "rb");
     blob_header h;
@@ -140,8 +159,9 @@ int GATE_ENTRY(int argc, char **argv) {
     const int ncmp = (int)h.width < width ? (int)h.width : width;
     float *one = (float *)malloc((size_t)width * sizeof(float));
     float *cur = (float *)malloc((size_t)width * sizeof(float));
-    printf("decode reference probe: %s (engine '%.*s', %u depths)\n", argv[2], (int)REF_LEN, h.build_ref, h.n_depths);
-    printf("  depth  w   KL(ref||ours)  top1(ref/ours)   KL vs serial   max|d| vs serial\n");
+    printf("decode reference gate: %s (engine '%.*s', %u depths)\n", argv[2], (int)REF_LEN, h.build_ref, h.n_depths);
+    printf("  depth  w   KL(ref||ours)  top1(ref/ours)   KL vs serial   max|d| vs serial   bound\n");
+    int violations = 0;
     double sum_kl[8] = {0}, sum_kw[8] = {0};
     int flips[8] = {0};
     int rc = 0;
@@ -159,7 +179,18 @@ int GATE_ENTRY(int argc, char **argv) {
             const int ar = argmax_of(rr, ncmp), ao = argmax_of(dst, ncmp);
             const double klw = kl_of(one, dst, ncmp);
             const double mw = maxabs_of(one, dst, ncmp);
-            printf("  %5u %2u   %.3e      %6d/%-6d %s  %.3e   %.3e\n", d, w, kl, ar, ao, ar == ao ? " " : "*", klw, mw);
+            /* the bound is relative to the one-row run's own distance from the reference */
+            const double kl_one = kl_of(rr, one, ncmp);
+            const double bound = fmax(GATE_REF_WIDTH_KL_FRACTION * kl_one, GATE_REF_WIDTH_KL_FLOOR);
+            const int a1 = argmax_of(one, ncmp);
+            bool flip_named = false;
+            for (int f = 0; f < n_kf; f++) flip_named |= known_flip[f] == d;
+            const bool top_ok = ao == a1 || ao == ar || flip_named;
+            const bool ok = w == 1 || (klw <= bound && top_ok);
+            printf("  %5u %2u   %.3e      %6d/%-6d %s  %.3e   %.3e        %.3e%s%s\n", d, w, kl, ar, ao,
+                   ar == ao ? " " : "*", klw, mw, bound, ok ? "" : top_ok ? "  FAIL (KL)" : "  FAIL (top-1)",
+                   flip_named && ao != a1 && ao != ar ? "  (known-flip depth: top-1 accepted by name)" : "");
+            violations += !ok;
             sum_kl[k] += kl;
             sum_kw[k] += klw;
             flips[k] += ar != ao;
@@ -176,5 +207,10 @@ int GATE_ENTRY(int argc, char **argv) {
     free(ref);
     free(traw);
     gate_engine_close(e);
+    if (rc == 0) {
+        printf("DECODE REFERENCE GATE: %s -- %d violation(s) over %u depths x %d widths\n",
+               violations ? "FAIL" : "PASS", violations, h.n_depths, n_w);
+        if (violations) rc = 1;
+    }
     return rc;
 }
