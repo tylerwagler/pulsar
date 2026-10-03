@@ -509,25 +509,28 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
     }
 }
 
-/* L262: decode rows from PULSAR_LT_DECODE_MIN_ROWS take the 'a' projection as
- * ONE launch of e4m3 tensor-core MMAs (m16n8k32 = one 32-wide MX block per MMA)
- * instead of n_groups separate cuBLASLt GEMMs (39% of peak at 16 rows: 326 us
- * per call on the c16 trace).  Each warp owns OA_MMA_NT x 8 consecutive weight
- * rows (inside one group) over the full K, streams every weight byte once, and
- * dots it against up to MT x 16 tokens; a block's partial is scaled by its two
- * E8M0 scales and accumulated in f32, in block order.  A row's result depends
- * only on its own activation row, so it is the same at every width this arm
- * serves (its arithmetic differs from the 1..10-row CUDA-core arm -- width-
- * dependent decode arithmetic is the rule since Tyler 2026-10-01).
+/* L262: MXFP8 DECODE rows from PULSAR_LT_DECODE_MIN_ROWS run one launch of e4m3
+ * tensor-core MMAs (m16n8k32 = one 32-wide MX block per MMA): the grouped attn-out
+ * 'a' (it replaced n_groups separate cuBLASLt GEMMs at 39% of peak) and every
+ * plain MXFP8 projection (cuBLASLt picked per shape: attn-out 'b' ran 32 CTAs on
+ * 48 SMs at ~42% of peak, kv at ~21%).  A warp owns PULSAR_MMA_NT x 8
+ * consecutive weight rows (inside one group); a block is R such row tiles x S
+ * warps splitting K (a K slice is every S-th 256-wide chunk), the S partials
+ * summed in warp order through shared memory.  Each weight byte is streamed
+ * once and dotted against up to MT x 16 tokens; a block's MMA partial is scaled
+ * by its two E8M0 scales and accumulated in f32, in chunk order.  A row's value
+ * depends only on its own activation row and the (R, S) the shape launches
+ * with, so it is the same at every width this arm serves; it differs from the
+ * 1..10-row CUDA-core arms (width-dependent decode arithmetic is the rule since
+ * Tyler 2026-10-01).
  * Operand permutation: physical byte q*8+i of a block is logical k q*4+i (i < 4)
  * and 16+q*4+(i-4) (i >= 4) for BOTH operands, so one 8-byte load per operand
  * per block fills the fragment and the block sum is unchanged. */
-#define OA_MMA_NT    4   /* n8 tiles per warp: 32 weight rows */
-#define OA_MMA_WARPS 2   /* warps per block */
-#define OA_MMA_U     8   /* MX blocks per iteration (two scale words) */
-#define OA_MMA_TOK   32  /* tokens per launch (MT <= 2) */
-__device__ __forceinline__ static void oa_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                                   uint32_t b0, uint32_t b1) {
+#define PULSAR_MMA_NT  4   /* n8 tiles per warp: 32 weight rows */
+#define PULSAR_MMA_U   8   /* MX blocks per chunk (two scale words); 4 measured slower on every shape */
+#define PULSAR_MMA_TOK 32  /* tokens per launch (MT <= 2) */
+__device__ __forceinline__ static void mma_e4m3_m16n8k32(float d[4], uint32_t a0, uint32_t a1, uint32_t a2,
+                                                         uint32_t a3, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
@@ -535,89 +538,96 @@ __device__ __forceinline__ static void oa_mma_e4m3(float d[4], uint32_t a0, uint
 }
 /* Byte offset of the scale word holding blocks 4*kb4 .. 4*kb4+3 of `row`
  * (pulsar_mx_sfoff at kb % 4 == 0). */
-__device__ __forceinline__ static int oa_mma_sfword(int row, int kb4, int KBp) {
+__device__ __forceinline__ static int mma_sfword(int row, int kb4, int KBp) {
     return pulsar_mx_sfoff(row, kb4 * 4, KBp);
 }
-template <int MT>
-__global__ static void __launch_bounds__(OA_MMA_WARPS * 32) grouped_fp8mx_a_mma_kernel(
-        float *low,
+__device__ __forceinline__ static void mma_store2(float *p, float a, float b) {
+    *(float2 *)p = make_float2(a, b);
+}
+__device__ __forceinline__ static void mma_store2(__half *p, float a, float b) {
+    *(__half2 *)p = __floats2half2_rn(a, b);
+}
+template <int MT, int R, int S, typename OT>
+__global__ static void __launch_bounds__(R * S * 32) fp8mx_mma_kernel(
+        OT *out,
         const __nv_fp8_e4m3 *wdata,
         const unsigned char *wscale,
         int KBp,
         const __nv_fp8_e4m3 *xdata,
         const unsigned char *xscale,
         int xKBp,
-        uint64_t scale_slab,
-        int group_dim,
-        int rank,
+        uint64_t x_group_bytes,   ///< activation offset between groups (0: one group)
+        uint64_t scale_slab,      ///< activation scale offset between groups
+        int K,
+        int rank,                 ///< weight rows per group
         int n_groups,
         int tok0,
-        int n_tok,
-        int x_tok_stride) {
+        int n_tok) {
+    __shared__ float red[R][S][MT * PULSAR_MMA_NT * 4][32];
     const int lane = threadIdx.x & 31, grp = lane >> 2, q = lane & 3;
-    const int row0 = ((int)blockIdx.x * OA_MMA_WARPS + (int)(threadIdx.x >> 5)) * OA_MMA_NT * 8;
-    const int low_dim = n_groups * rank;
-    if (row0 >= low_dim) return;
+    const int ks = (int)(threadIdx.x >> 5) % S, rt = (int)(threadIdx.x >> 5) / S;
+    const int row0 = ((int)blockIdx.x * R + rt) * PULSAR_MMA_NT * 8;
+    const int low_dim = n_groups * rank;   /* the launcher sizes the grid exactly: no partial blocks */
     const int group = row0 / rank;
     const unsigned char *w = (const unsigned char *)wdata;
-    const unsigned char *xg = (const unsigned char *)xdata + (uint64_t)group * x_tok_stride * group_dim;
+    const unsigned char *xg = (const unsigned char *)xdata + (uint64_t)group * x_group_bytes;
     const unsigned char *xs = xscale + (uint64_t)group * scale_slab;
-    float acc[MT][OA_MMA_NT][4];
+    float acc[MT][PULSAR_MMA_NT][4];
 #pragma unroll
     for (int m = 0; m < MT; m++)
 #pragma unroll
-        for (int j = 0; j < OA_MMA_NT; j++)
+        for (int j = 0; j < PULSAR_MMA_NT; j++)
 #pragma unroll
             for (int i = 0; i < 4; i++) acc[m][j][i] = 0.f;
-    const int nchunk = group_dim / (32 * OA_MMA_U);
-    for (int c = 0; c < nchunk; c++) {
-        uint2 wv[OA_MMA_NT][OA_MMA_U];
-        uint32_t swv[OA_MMA_NT][OA_MMA_U / 4][2];
+    const int nchunk = K / (32 * PULSAR_MMA_U);
+    for (int c = ks; c < nchunk; c += S) {
+        uint2 wv[PULSAR_MMA_NT][PULSAR_MMA_U];
+        uint32_t swv[PULSAR_MMA_NT][PULSAR_MMA_U / 4][2];
 #pragma unroll
-        for (int j = 0; j < OA_MMA_NT; j++) {
-            const unsigned char *wr = w + (uint64_t)(row0 + j * 8 + grp) * group_dim + c * 32 * OA_MMA_U + q * 8;
+        for (int j = 0; j < PULSAR_MMA_NT; j++) {
+            const unsigned char *wr = w + (uint64_t)(row0 + j * 8 + grp) * K + c * 32 * PULSAR_MMA_U + q * 8;
 #pragma unroll
-            for (int kb = 0; kb < OA_MMA_U; kb++) wv[j][kb] = __ldcs((const uint2 *)(wr + kb * 32));
+            for (int kb = 0; kb < PULSAR_MMA_U; kb++) wv[j][kb] = __ldcs((const uint2 *)(wr + kb * 32));
 #pragma unroll
-            for (int u = 0; u < OA_MMA_U / 4; u++) {
-                const int kb4 = c * (OA_MMA_U / 4) + u;
-                swv[j][u][0] = *(const uint32_t *)(wscale + oa_mma_sfword(row0 + j * 8 + q * 2, kb4, KBp));
-                swv[j][u][1] = *(const uint32_t *)(wscale + oa_mma_sfword(row0 + j * 8 + q * 2 + 1, kb4, KBp));
+            for (int u = 0; u < PULSAR_MMA_U / 4; u++) {
+                const int kb4 = c * (PULSAR_MMA_U / 4) + u;
+                swv[j][u][0] = *(const uint32_t *)(wscale + mma_sfword(row0 + j * 8 + q * 2, kb4, KBp));
+                swv[j][u][1] = *(const uint32_t *)(wscale + mma_sfword(row0 + j * 8 + q * 2 + 1, kb4, KBp));
             }
         }
-        uint2 av[MT][2][OA_MMA_U];
-        uint32_t sav[MT][2][OA_MMA_U / 4];
+        uint2 av[MT][2][PULSAR_MMA_U];
+        uint32_t sav[MT][2][PULSAR_MMA_U / 4];
 #pragma unroll
         for (int m = 0; m < MT; m++)
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 const int t = m * 16 + h * 8 + grp;
                 if (t < n_tok) {
-                    const unsigned char *xr = xg + (uint64_t)(tok0 + t) * group_dim + c * 32 * OA_MMA_U + q * 8;
+                    const unsigned char *xr = xg + (uint64_t)(tok0 + t) * K + c * 32 * PULSAR_MMA_U + q * 8;
 #pragma unroll
-                    for (int kb = 0; kb < OA_MMA_U; kb++) av[m][h][kb] = *(const uint2 *)(xr + kb * 32);
+                    for (int kb = 0; kb < PULSAR_MMA_U; kb++) av[m][h][kb] = *(const uint2 *)(xr + kb * 32);
 #pragma unroll
-                    for (int u = 0; u < OA_MMA_U / 4; u++)
-                        sav[m][h][u] = *(const uint32_t *)(xs + oa_mma_sfword(tok0 + t, c * (OA_MMA_U / 4) + u, xKBp));
+                    for (int u = 0; u < PULSAR_MMA_U / 4; u++)
+                        sav[m][h][u] = *(const uint32_t *)(xs + mma_sfword(tok0 + t, c * (PULSAR_MMA_U / 4) + u, xKBp));
                 } else {
 #pragma unroll
-                    for (int kb = 0; kb < OA_MMA_U; kb++) av[m][h][kb] = make_uint2(0u, 0u);
+                    for (int kb = 0; kb < PULSAR_MMA_U; kb++) av[m][h][kb] = make_uint2(0u, 0u);
 #pragma unroll
-                    for (int u = 0; u < OA_MMA_U / 4; u++) sav[m][h][u] = 0u;
+                    for (int u = 0; u < PULSAR_MMA_U / 4; u++) sav[m][h][u] = 0u;
                 }
             }
 #pragma unroll
-        for (int kb = 0; kb < OA_MMA_U; kb++)
+        for (int kb = 0; kb < PULSAR_MMA_U; kb++)
 #pragma unroll
             for (int m = 0; m < MT; m++) {
                 const int sh = 8 * (kb % 4);
                 const float sa0 = __int_as_float(((sav[m][0][kb / 4] >> sh) & 0xffu) << 23);
                 const float sa1 = __int_as_float(((sav[m][1][kb / 4] >> sh) & 0xffu) << 23);
 #pragma unroll
-                for (int j = 0; j < OA_MMA_NT; j++) {
+                for (int j = 0; j < PULSAR_MMA_NT; j++) {
                     float d[4];
-                    oa_mma_e4m3(d, av[m][0][kb].x, av[m][1][kb].x, av[m][0][kb].y, av[m][1][kb].y,
-                                wv[j][kb].x, wv[j][kb].y);
+                    mma_e4m3_m16n8k32(d, av[m][0][kb].x, av[m][1][kb].x, av[m][0][kb].y, av[m][1][kb].y,
+                                      wv[j][kb].x, wv[j][kb].y);
                     const float sw0 = __int_as_float(((swv[j][kb / 4][0] >> sh) & 0xffu) << 23);
                     const float sw1 = __int_as_float(((swv[j][kb / 4][1] >> sh) & 0xffu) << 23);
                     acc[m][j][0] += d[0] * (sa0 * sw0);
@@ -627,6 +637,27 @@ __global__ static void __launch_bounds__(OA_MMA_WARPS * 32) grouped_fp8mx_a_mma_
                 }
             }
     }
+    if (S > 1) {   /* the K slices' partials, summed in slice order */
+#pragma unroll
+        for (int m = 0; m < MT; m++)
+#pragma unroll
+            for (int j = 0; j < PULSAR_MMA_NT; j++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) red[rt][ks][(m * PULSAR_MMA_NT + j) * 4 + i][lane] = acc[m][j][i];
+        __syncthreads();
+        if (ks != 0) return;
+#pragma unroll
+        for (int m = 0; m < MT; m++)
+#pragma unroll
+            for (int j = 0; j < PULSAR_MMA_NT; j++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float v = red[rt][0][(m * PULSAR_MMA_NT + j) * 4 + i][lane];
+#pragma unroll
+                    for (int s2 = 1; s2 < S; s2++) v += red[rt][s2][(m * PULSAR_MMA_NT + j) * 4 + i][lane];
+                    acc[m][j][i] = v;
+                }
+    }
 #pragma unroll
     for (int m = 0; m < MT; m++)
 #pragma unroll
@@ -634,10 +665,51 @@ __global__ static void __launch_bounds__(OA_MMA_WARPS * 32) grouped_fp8mx_a_mma_
             const int t = m * 16 + h * 8 + grp;
             if (t >= n_tok) continue;
 #pragma unroll
-            for (int j = 0; j < OA_MMA_NT; j++)
-                *(float2 *)(low + (uint64_t)(tok0 + t) * low_dim + row0 + j * 8 + q * 2) =
-                        make_float2(acc[m][j][h * 2], acc[m][j][h * 2 + 1]);
+            for (int j = 0; j < PULSAR_MMA_NT; j++)
+                mma_store2(out + (uint64_t)(tok0 + t) * low_dim + row0 + j * 8 + q * 2,
+                           acc[m][j][h * 2], acc[m][j][h * 2 + 1]);
         }
+}
+
+/* The (R, S) a shape launches with -- part of its arithmetic (S sets the
+ * partial-sum order), so ONE rule: the grouped 'a' takes R = 2 row tiles (its
+ * groups read separate activations; K-split measured 184-194 us against 161),
+ * plain projections split K over S = 2 warps, S = 4 below 1024 output rows
+ * (kv 4096>512: 12.3 us against 13.6).  Bench, 16 rows, cold weights. */
+static void mma_shape(bool grouped, uint64_t low_dim, int *R, int *S) {
+    if (grouped) { *R = 2; *S = 1; }
+    else         { *R = 1; *S = low_dim < 1024 ? 4 : 2; }
+}
+
+template <typename OT>
+static int fp8mx_mma_launch(OT *out, const fp8_mx_weight *w, int KBp,
+        const __nv_fp8_e4m3 *xq, const unsigned char *sx, int xKBp,
+        uint64_t x_group_bytes, uint64_t scale_slab,
+        uint64_t K, uint64_t rank, uint32_t n_groups, uint32_t n_tokens, const char *what) {
+    int R, S;
+    mma_shape(n_groups > 1, (uint64_t)n_groups * rank, &R, &S);
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t rows_per_block = (uint64_t)R * PULSAR_MMA_NT * 8;
+    if (K % (32 * PULSAR_MMA_U) != 0 || rank % (PULSAR_MMA_NT * 8) != 0 || low_dim % rows_per_block != 0 ||
+        K > INT32_MAX || low_dim > INT32_MAX) {
+        fprintf(stderr, "pulsar: %s: the MMA decode arm needs K %% %d == 0, rows per group %% %d == 0 and "
+                        "rows %% %llu == 0 (K=%llu rank=%llu groups=%u) -- refusing\n",
+                what, 32 * PULSAR_MMA_U, PULSAR_MMA_NT * 8, (unsigned long long)rows_per_block,
+                (unsigned long long)K, (unsigned long long)rank, n_groups);
+        return 0;
+    }
+    const unsigned gx = (unsigned)(low_dim / rows_per_block);
+    for (uint32_t t0 = 0; t0 < n_tokens; t0 += PULSAR_MMA_TOK) {
+        const uint32_t nt = n_tokens - t0 < PULSAR_MMA_TOK ? n_tokens - t0 : PULSAR_MMA_TOK;
+        #define PULSAR_MMA_GO(MT, RR, SS) fp8mx_mma_kernel<MT, RR, SS, OT><<<gx, RR * SS * 32>>>( \
+                out, w->data, w->scale, KBp, xq, sx, xKBp, x_group_bytes, scale_slab, (int)K, (int)rank, \
+                (int)n_groups, (int)t0, (int)nt)
+        if (R == 2)      { if (nt <= 16) PULSAR_MMA_GO(1, 2, 1); else PULSAR_MMA_GO(2, 2, 1); }
+        else if (S == 2) { if (nt <= 16) PULSAR_MMA_GO(1, 1, 2); else PULSAR_MMA_GO(2, 1, 2); }
+        else             { if (nt <= 16) PULSAR_MMA_GO(1, 1, 4); else PULSAR_MMA_GO(2, 1, 4); }
+        #undef PULSAR_MMA_GO
+    }
+    return cuda_ok(cudaGetLastError(), what);
 }
 
 
@@ -1710,7 +1782,7 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
  * fastest arm at each width): DECODE rows from this many up take cuBLASLt, in both
  * dense arms -- the bf16 weights (bf16_lt_decode_matmul) and the MXFP8 weights
  * (cuda_matmul_fp8_mx_window) -- and the grouped attn-out 'a' takes its one-launch
- * MMA kernel (grouped_fp8mx_a_mma_kernel, L262); the GEMV kernels keep the rows below.  ONE threshold:
+ * MMA kernel (fp8mx_mma_kernel, L262); the GEMV kernels keep the rows below.  ONE threshold:
  * every decode step at or below it is byte-identical to its rows at any narrower
  * width, and the gates read that range from pulsar_gpu_matmul_decode_exact_rows(). */
 #define PULSAR_LT_DECODE_MIN_ROWS 11
@@ -1792,12 +1864,11 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * one is about to hand to cublasLtMatmul -- and `cache_next` is a plain
      * non-atomic counter two threads would both advance onto the same slot.
      * Per-thread costs one heuristic search per thread per shape; the entries
-     * are small metadata objects, not device memory.  64: since L260 the decode
-     * widths from PULSAR_LT_DECODE_MIN_ROWS up share this cache with prefill. */
-    static thread_local lt_shape_cache cache[64];
+     * are small metadata objects, not device memory. */
+    static thread_local lt_shape_cache cache[32];
     static thread_local int cache_next;
     lt_shape_cache *e = NULL;
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 32; i++) {
         if (cache[i].valid && cache[i].in_dim == in_dim &&
             cache[i].out_dim == out_dim && cache[i].ntok == ntok &&
             cache[i].out_f16 == out_f16) { e = &cache[i]; break; }
@@ -1842,7 +1913,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
         }
         ne.valid = 1;
         e = &cache[cache_next];
-        cache_next = (cache_next + 1) & 63;
+        cache_next = (cache_next + 1) & 31;
         if (e->valid) {
             cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
             cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
@@ -2660,25 +2731,36 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * kernel's below, so a row's bytes do not depend on the batch width.
          * (Until L158 an f32-activation twin of each kernel sat behind this
          * arm for the no-slot case; the no-slot case refuses.)
-         * L260: from PULSAR_LT_DECODE_MIN_ROWS rows the cuBLASLt MX GEMM instead,
-         * heuristic asked at the call's own row count (split-K masked, as for
-         * prefill rows).  Measured, spec off, 16 banks, ABAB x2: c16 decode
-         * 75.6 -> 80.5 tok/s (+6.4%), c1/c5/c10 unchanged; all widths on it cost
-         * c1 -11.6% and c5 -5.8%, so the GEMV keeps the rows below. */
+         * L262: from PULSAR_LT_DECODE_MIN_ROWS rows the e4m3 MMA family
+         * (fp8mx_mma_kernel) -- it replaced L260's cuBLASLt MX GEMM there,
+         * which ran 21-75% of peak by shape (attn-out 'b' 294 us -> 168 bench). */
         if (n_tok >= PULSAR_LT_DECODE_MIN_ROWS) {
-            static int said_mx = 0;
-            if (!said_mx) {
-                said_mx = 1;
-                fprintf(stderr, "pulsar: mxfp8 decode GEMMs from %d rows = cuBLASLt MX (heuristic at the "
-                                "call's row count)\n", PULSAR_LT_DECODE_MIN_ROWS);
+            const fp8_mx_weight *mw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes, in_dim, out_dim, label);
+            if (!mw) {
+                fprintf(stderr, "pulsar: mxfp8 '%s' MMA decode arm: de-interleaved weight did not resolve "
+                                "(in_dim=%llu out_dim=%llu) -- refusing\n",
+                        label ? label : "?", (unsigned long long)in_dim, (unsigned long long)out_dim);
+                return 0;
             }
-            if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
-                    weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
-            fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (decode rows, n_tok=%llu "
-                            "in_dim=%llu out_dim=%llu) -- refusing\n",
-                    label ? label : "weights", (unsigned long long)n_tok,
-                    (unsigned long long)in_dim, (unsigned long long)out_dim);
-            return 0;
+            const mxfp8_act_cache_t *acm = act_slot_find_rows(x->ptr, n_tok, in_dim);
+            if (!acm && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
+                return act_a8_contract_fail("MMA decode arm", n_tok, in_dim, out_dim);
+            if (!acm || !acm->valid) return act_a8_missing_fail("MMA decode arm", n_tok, in_dim, out_dim);
+            {
+                static pulsar_shape_once seen_mma = {};
+                if (pulsar_shape_once_first(&seen_mma, pulsar_shape_key(in_dim, out_dim),
+                                            "MMA decode arm announce")) {
+                    fprintf(stderr, "pulsar: mxfp8 decode rows from %d = one-launch e4m3 MMA for "
+                                    "in_dim=%llu out_dim=%llu\n", PULSAR_LT_DECODE_MIN_ROWS,
+                            (unsigned long long)in_dim, (unsigned long long)out_dim);
+                }
+            }
+            const int KBp = pulsar_mx_kbp((int)in_dim);
+            if (out_f16)
+                return fp8mx_mma_launch((__half *)out->ptr, mw, KBp, acm->xq, acm->sx, KBp, 0, 0,
+                                        in_dim, out_dim, 1u, (uint32_t)n_tok, label ? label : "mxfp8 MMA");
+            return fp8mx_mma_launch((float *)out->ptr, mw, KBp, acm->xq, acm->sx, KBp, 0, 0,
+                                    in_dim, out_dim, 1u, (uint32_t)n_tok, label ? label : "mxfp8 MMA");
         }
         if (n_tok >= 2) {
             if (in_dim % 128 != 0) {
@@ -3285,41 +3367,23 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 /* L141: one A8 launch for every decode-row count the setter admits.  n == 1
  * keeps the one-token kernel; 2..PULSAR_LT_DECODE_MIN_ROWS-1 stage each weight
  * block once for all rows; from PULSAR_LT_DECODE_MIN_ROWS the tensor-core MMA
- * kernel (L262), one launch per OA_MMA_TOK rows.  Prefill rows take the
+ * kernel family (fp8mx_mma_kernel, L262).  Prefill rows take the
  * tensor-core 'a' GEMM and never reach here. */
 static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, int KBp,
         const __nv_fp8_e4m3 *xq, const unsigned char *sx, int xKBp, uint64_t slab,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint32_t n_tokens,
         uint64_t blocks, uint64_t low_dim, const char *what, uint32_t x_tok_stride) {
     if (n_tokens >= PULSAR_LT_DECODE_MIN_ROWS) {
-        if (group_dim % (32 * OA_MMA_U) != 0 || rank % (OA_MMA_NT * 8) != 0 ||
-            group_dim > INT32_MAX || low_dim > INT32_MAX) {
-            fprintf(stderr, "pulsar: %s: the MMA arm needs group_dim %% %d == 0 and rank %% %d == 0 "
-                            "(group_dim=%llu rank=%llu) -- refusing\n", what, 32 * OA_MMA_U, OA_MMA_NT * 8,
-                    (unsigned long long)group_dim, (unsigned long long)rank);
-            return 0;
-        }
         static int said_mma = 0;
         if (!said_mma) {
             said_mma = 1;
             fprintf(stderr, "pulsar: attn-out 'a' decode rows from %d = one-launch e4m3 MMA "
                             "(%d rows/warp, %d-token slabs)\n", PULSAR_LT_DECODE_MIN_ROWS,
-                    OA_MMA_NT * 8, OA_MMA_TOK);
+                    PULSAR_MMA_NT * 8, PULSAR_MMA_TOK);
         }
-        const unsigned rows_per_block = OA_MMA_WARPS * OA_MMA_NT * 8;
-        const unsigned gx = ((unsigned)low_dim + rows_per_block - 1u) / rows_per_block;
-        for (uint32_t t0 = 0; t0 < n_tokens; t0 += OA_MMA_TOK) {
-            const uint32_t nt = n_tokens - t0 < OA_MMA_TOK ? n_tokens - t0 : OA_MMA_TOK;
-            if (nt <= 16)
-                grouped_fp8mx_a_mma_kernel<1><<<gx, OA_MMA_WARPS * 32>>>(
-                        low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab, (int)group_dim, (int)rank,
-                        (int)n_groups, (int)t0, (int)nt, (int)x_tok_stride);
-            else
-                grouped_fp8mx_a_mma_kernel<2><<<gx, OA_MMA_WARPS * 32>>>(
-                        low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab, (int)group_dim, (int)rank,
-                        (int)n_groups, (int)t0, (int)nt, (int)x_tok_stride);
-        }
-        return cuda_ok(cudaGetLastError(), what);
+        return fp8mx_mma_launch(low, dw, KBp, xq, sx, xKBp,
+                                (uint64_t)x_tok_stride * group_dim, slab,
+                                group_dim, rank, n_groups, n_tokens, what);
     }
     const unsigned gx = ((unsigned)low_dim + PULSAR_FP8MX_ROWS_A8_PER_BLOCK - 1u)
                         / PULSAR_FP8MX_ROWS_A8_PER_BLOCK;
