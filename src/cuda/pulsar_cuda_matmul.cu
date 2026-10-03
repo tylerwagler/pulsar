@@ -3079,7 +3079,15 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
  * banks, ABAB: the output head at 9-16 rows 4.8 vs 6.0 ms; c16 decode +4.1%, c10 a
  * tie, c5 -3.7% and c1 -7.2% had all widths moved -- so the nt / one-row kernels
  * keep the rows below.  Graded: decode_reference_probe (same KL band as the nt
- * arms) and spec_teacher_forced_probe (E[accept] 0.5409 -> 0.5432, sub-point). */
+ * arms) and spec_teacher_forced_probe (E[accept] 0.5409 -> 0.5432, sub-point).
+ * L262: outputs of PULSAR_BF16_LT_WIDE_OUT rows or more (the output head) take
+ * the kernel the heuristic picks at PULSAR_GPU_MNEUTRAL_ROWS_MAX rows, checked at
+ * the call's own: at the spec-on widths the per-width pick streams the 1.06 GB
+ * head at 61-66% of peak, the 16-row pick at 75-80% (24 rows 5883 -> 4843 us,
+ * 32 rows 6279 -> 4968, 37 rows 6372 -> 5202), bytes identical to the per-width
+ * pick.  Narrower shapes keep the per-width pick: on 4096 > 512 / 256 / 64 the
+ * 16-row kernel is 25-80% slower (head_lt_algos.cu, rows/L262.md). */
+#define PULSAR_BF16_LT_WIDE_OUT 8192u
 static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *xb,
                                  uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
     if (!cublaslt_ensure()) {
@@ -3114,9 +3122,29 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        /* the row count the kernel is picked at: the call's own, or 16 for a wide output */
+        const int pick_rows = out_dim >= PULSAR_BF16_LT_WIDE_OUT ? (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX : ntok;
+        cublasLtMatrixLayout_t lb_p = ne.lb, ld_p = ne.ld;
+        if (pick_rows != ntok) {
+            cublasLtMatrixLayoutCreate(&lb_p, CUDA_R_16BF, in_dim, pick_rows, in_dim);
+            cublasLtMatrixLayoutCreate(&ld_p, CUDA_R_32F, out_dim, pick_rows, out_dim);
+        }
         cublasLtMatmulHeuristicResult_t hr; int got = 0;
-        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &hr, &got);
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, lb_p, ld_p, ld_p, pf, 1, &hr, &got);
         cublasLtMatmulPreferenceDestroy(pf);
+        if (pick_rows != ntok) { cublasLtMatrixLayoutDestroy(lb_p); cublasLtMatrixLayoutDestroy(ld_p); }
+        if (hs == CUBLAS_STATUS_SUCCESS && got && pick_rows != ntok) {
+            cublasLtMatmulHeuristicResult_t chk;
+            const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, &hr.algo, &chk);
+            if (cs != CUBLAS_STATUS_SUCCESS || chk.state != CUBLAS_STATUS_SUCCESS || chk.workspaceSize > wz) {
+                cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb); cublasLtMatrixLayoutDestroy(ne.ld);
+                cublasLtMatmulDescDestroy(ne.op);
+                fprintf(stderr, "pulsar: bf16 GEMM on %d decode rows (in_dim=%llu out_dim=%llu): the kernel picked at "
+                                "%d rows does not support %d -- refusing\n", ntok, (unsigned long long)in_dim,
+                        (unsigned long long)out_dim, pick_rows, ntok);
+                return 0;
+            }
+        }
         if (hs != CUBLAS_STATUS_SUCCESS || !got) {
             cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb); cublasLtMatrixLayoutDestroy(ne.ld);
             cublasLtMatmulDescDestroy(ne.op);
