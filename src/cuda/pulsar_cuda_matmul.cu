@@ -509,6 +509,137 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
     }
 }
 
+/* L262: decode rows from PULSAR_LT_DECODE_MIN_ROWS take the 'a' projection as
+ * ONE launch of e4m3 tensor-core MMAs (m16n8k32 = one 32-wide MX block per MMA)
+ * instead of n_groups separate cuBLASLt GEMMs (39% of peak at 16 rows: 326 us
+ * per call on the c16 trace).  Each warp owns OA_MMA_NT x 8 consecutive weight
+ * rows (inside one group) over the full K, streams every weight byte once, and
+ * dots it against up to MT x 16 tokens; a block's partial is scaled by its two
+ * E8M0 scales and accumulated in f32, in block order.  A row's result depends
+ * only on its own activation row, so it is the same at every width this arm
+ * serves (its arithmetic differs from the 1..10-row CUDA-core arm -- width-
+ * dependent decode arithmetic is the rule since Tyler 2026-10-01).
+ * Operand permutation: physical byte q*8+i of a block is logical k q*4+i (i < 4)
+ * and 16+q*4+(i-4) (i >= 4) for BOTH operands, so one 8-byte load per operand
+ * per block fills the fragment and the block sum is unchanged. */
+#define OA_MMA_NT    4   /* n8 tiles per warp: 32 weight rows */
+#define OA_MMA_WARPS 2   /* warps per block */
+#define OA_MMA_U     8   /* MX blocks per iteration (two scale words) */
+#define OA_MMA_TOK   32  /* tokens per launch (MT <= 2) */
+__device__ __forceinline__ static void oa_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                   uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
+}
+/* Byte offset of the scale word holding blocks 4*kb4 .. 4*kb4+3 of `row`
+ * (pulsar_mx_sfoff at kb % 4 == 0). */
+__device__ __forceinline__ static int oa_mma_sfword(int row, int kb4, int KBp) {
+    return pulsar_mx_sfoff(row, kb4 * 4, KBp);
+}
+template <int MT>
+__global__ static void __launch_bounds__(OA_MMA_WARPS * 32) grouped_fp8mx_a_mma_kernel(
+        float *low,
+        const __nv_fp8_e4m3 *wdata,
+        const unsigned char *wscale,
+        int KBp,
+        const __nv_fp8_e4m3 *xdata,
+        const unsigned char *xscale,
+        int xKBp,
+        uint64_t scale_slab,
+        int group_dim,
+        int rank,
+        int n_groups,
+        int tok0,
+        int n_tok,
+        int x_tok_stride) {
+    const int lane = threadIdx.x & 31, grp = lane >> 2, q = lane & 3;
+    const int row0 = ((int)blockIdx.x * OA_MMA_WARPS + (int)(threadIdx.x >> 5)) * OA_MMA_NT * 8;
+    const int low_dim = n_groups * rank;
+    if (row0 >= low_dim) return;
+    const int group = row0 / rank;
+    const unsigned char *w = (const unsigned char *)wdata;
+    const unsigned char *xg = (const unsigned char *)xdata + (uint64_t)group * x_tok_stride * group_dim;
+    const unsigned char *xs = xscale + (uint64_t)group * scale_slab;
+    float acc[MT][OA_MMA_NT][4];
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int j = 0; j < OA_MMA_NT; j++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) acc[m][j][i] = 0.f;
+    const int nchunk = group_dim / (32 * OA_MMA_U);
+    for (int c = 0; c < nchunk; c++) {
+        uint2 wv[OA_MMA_NT][OA_MMA_U];
+        uint32_t swv[OA_MMA_NT][OA_MMA_U / 4][2];
+#pragma unroll
+        for (int j = 0; j < OA_MMA_NT; j++) {
+            const unsigned char *wr = w + (uint64_t)(row0 + j * 8 + grp) * group_dim + c * 32 * OA_MMA_U + q * 8;
+#pragma unroll
+            for (int kb = 0; kb < OA_MMA_U; kb++) wv[j][kb] = __ldcs((const uint2 *)(wr + kb * 32));
+#pragma unroll
+            for (int u = 0; u < OA_MMA_U / 4; u++) {
+                const int kb4 = c * (OA_MMA_U / 4) + u;
+                swv[j][u][0] = *(const uint32_t *)(wscale + oa_mma_sfword(row0 + j * 8 + q * 2, kb4, KBp));
+                swv[j][u][1] = *(const uint32_t *)(wscale + oa_mma_sfword(row0 + j * 8 + q * 2 + 1, kb4, KBp));
+            }
+        }
+        uint2 av[MT][2][OA_MMA_U];
+        uint32_t sav[MT][2][OA_MMA_U / 4];
+#pragma unroll
+        for (int m = 0; m < MT; m++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int t = m * 16 + h * 8 + grp;
+                if (t < n_tok) {
+                    const unsigned char *xr = xg + (uint64_t)(tok0 + t) * group_dim + c * 32 * OA_MMA_U + q * 8;
+#pragma unroll
+                    for (int kb = 0; kb < OA_MMA_U; kb++) av[m][h][kb] = *(const uint2 *)(xr + kb * 32);
+#pragma unroll
+                    for (int u = 0; u < OA_MMA_U / 4; u++)
+                        sav[m][h][u] = *(const uint32_t *)(xs + oa_mma_sfword(tok0 + t, c * (OA_MMA_U / 4) + u, xKBp));
+                } else {
+#pragma unroll
+                    for (int kb = 0; kb < OA_MMA_U; kb++) av[m][h][kb] = make_uint2(0u, 0u);
+#pragma unroll
+                    for (int u = 0; u < OA_MMA_U / 4; u++) sav[m][h][u] = 0u;
+                }
+            }
+#pragma unroll
+        for (int kb = 0; kb < OA_MMA_U; kb++)
+#pragma unroll
+            for (int m = 0; m < MT; m++) {
+                const int sh = 8 * (kb % 4);
+                const float sa0 = __int_as_float(((sav[m][0][kb / 4] >> sh) & 0xffu) << 23);
+                const float sa1 = __int_as_float(((sav[m][1][kb / 4] >> sh) & 0xffu) << 23);
+#pragma unroll
+                for (int j = 0; j < OA_MMA_NT; j++) {
+                    float d[4];
+                    oa_mma_e4m3(d, av[m][0][kb].x, av[m][1][kb].x, av[m][0][kb].y, av[m][1][kb].y,
+                                wv[j][kb].x, wv[j][kb].y);
+                    const float sw0 = __int_as_float(((swv[j][kb / 4][0] >> sh) & 0xffu) << 23);
+                    const float sw1 = __int_as_float(((swv[j][kb / 4][1] >> sh) & 0xffu) << 23);
+                    acc[m][j][0] += d[0] * (sa0 * sw0);
+                    acc[m][j][1] += d[1] * (sa0 * sw1);
+                    acc[m][j][2] += d[2] * (sa1 * sw0);
+                    acc[m][j][3] += d[3] * (sa1 * sw1);
+                }
+            }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int t = m * 16 + h * 8 + grp;
+            if (t >= n_tok) continue;
+#pragma unroll
+            for (int j = 0; j < OA_MMA_NT; j++)
+                *(float2 *)(low + (uint64_t)(tok0 + t) * low_dim + row0 + j * 8 + q * 2) =
+                        make_float2(acc[m][j][h * 2], acc[m][j][h * 2 + 1]);
+        }
+}
+
 
 
 
@@ -1578,7 +1709,8 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
 /* L260 (Tyler 2026-10-01: decode rows may take width-dependent arithmetic -- the
  * fastest arm at each width): DECODE rows from this many up take cuBLASLt, in both
  * dense arms -- the bf16 weights (bf16_lt_decode_matmul) and the MXFP8 weights
- * (cuda_matmul_fp8_mx_window); the GEMV kernels keep the rows below.  ONE threshold:
+ * (cuda_matmul_fp8_mx_window) -- and the grouped attn-out 'a' takes its one-launch
+ * MMA kernel (grouped_fp8mx_a_mma_kernel, L262); the GEMV kernels keep the rows below.  ONE threshold:
  * every decode step at or below it is byte-identical to its rows at any narrower
  * width, and the gates read that range from pulsar_gpu_matmul_decode_exact_rows(). */
 #define PULSAR_LT_DECODE_MIN_ROWS 11
@@ -1766,8 +1898,7 @@ static int cuda_attention_output_a_mx_gemm(
         uint32_t n_groups,
         const pulsar_gpu_tensor *heads,
         uint32_t n_tokens,
-        uint32_t row0,     /* L158 inc 4: rows [row0, row0+n_tokens) of a FULL-width heads encoding */
-        int pick_rows) {   /* the row count the kernel is chosen at: CANON for prefill rows, n_tokens for decode (L260) */
+        uint32_t row0) {   /* L158 inc 4: rows [row0, row0+n_tokens) of a FULL-width heads encoding */
     if (group_dim % 32 != 0 || rank % 128 != 0 || !cublaslt_ensure()) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t KB = group_dim / 32;
@@ -1829,11 +1960,9 @@ static int cuda_attention_output_a_mx_gemm(
      * heuristic picks by M and two fixed-order kernels accumulate K
      * differently.  The heuristic must see MX scale pointers on the desc or
      * it picks a non-MX algo; the per-group loop re-sets them per call.
-     * L260: DECODE rows (from PULSAR_LT_DECODE_MIN_ROWS) pass their own row
-     * count as pick_rows -- the fastest kernel per width, which decode rows
-     * may now take (Tyler 2026-10-01); prefill rows keep the canonical pick. */
+     * Prefill rows only: decode rows take the MMA arm (L262). */
     struct lt_group_shape {
-        uint64_t group_dim, rank; uint32_t n_groups; int pick_rows; int valid;
+        uint64_t group_dim, rank; uint32_t n_groups; int valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
@@ -1844,11 +1973,11 @@ static int cuda_attention_output_a_mx_gemm(
     lt_group_shape *sh = NULL;
     for (int i = 0; i < 32; i++) {
         if (shapes[i].valid && shapes[i].group_dim == group_dim && shapes[i].rank == rank &&
-            shapes[i].n_groups == n_groups && shapes[i].pick_rows == pick_rows) { sh = &shapes[i]; break; }
+            shapes[i].n_groups == n_groups) { sh = &shapes[i]; break; }
     }
     if (!sh) {
         lt_group_shape ns = {};
-        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups; ns.pick_rows = pick_rows;
+        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups;
         if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
@@ -1860,8 +1989,8 @@ static int cuda_attention_output_a_mx_gemm(
         cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
         cublasLtMatrixLayoutCreate(&ns.la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
         cublasLtMatrixLayout_t lb_c, ld_c;
-        cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, group_dim, pick_rows, group_dim);
-        cublasLtMatrixLayoutCreate(&ld_c, CUDA_R_32F, rank, pick_rows, low_dim);
+        cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, group_dim, PULSAR_BF16_LT_CANON_ROWS, group_dim);
+        cublasLtMatrixLayoutCreate(&ld_c, CUDA_R_32F, rank, PULSAR_BF16_LT_CANON_ROWS, low_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
         {
@@ -1879,7 +2008,7 @@ static int cuda_attention_output_a_mx_gemm(
             cublasLtMatrixLayoutDestroy(ns.la); cublasLtMatmulDescDestroy(ns.op);
             fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): no fixed-order cuBLASLt "
                             "kernel at %d rows -- refusing\n", (unsigned long long)group_dim,
-                    (unsigned long long)rank, n_groups, pick_rows);
+                    (unsigned long long)rank, n_groups, (int)PULSAR_BF16_LT_CANON_ROWS);
             return 0;
         }
         ns.algo = hr.algo;
@@ -1892,7 +2021,7 @@ static int cuda_attention_output_a_mx_gemm(
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct lt_group_call {
-        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int pick_rows; int valid;
+        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
     static thread_local lt_group_call calls[32];
@@ -1900,13 +2029,11 @@ static int cuda_attention_output_a_mx_gemm(
     lt_group_call *e = NULL;
     for (int i = 0; i < 32; i++) {
         if (calls[i].valid && calls[i].group_dim == group_dim && calls[i].rank == rank &&
-            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens &&
-            calls[i].pick_rows == pick_rows) { e = &calls[i]; break; }
+            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens) { e = &calls[i]; break; }
     }
     if (!e) {
         lt_group_call ne = {};
         ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
-        ne.pick_rows = pick_rows;
         cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
         cublasLtMatmulHeuristicResult_t chk;
@@ -1916,7 +2043,7 @@ static int cuda_attention_output_a_mx_gemm(
             fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): the shape's fixed kernel "
                             "(chosen at %d rows) does not support %u rows -- refusing\n",
                     (unsigned long long)group_dim, (unsigned long long)rank, n_groups,
-                    pick_rows, n_tokens);
+                    (int)PULSAR_BF16_LT_CANON_ROWS, n_tokens);
             return 0;
         }
         ne.valid = 1;
@@ -3156,16 +3283,44 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 /* Decode grouped "a" projection: prefer the de-interleaved cached weight (vectorized
  * coalesced loads) over the raw 33B kernel. Bit-exact. */
 /* L141: one A8 launch for every decode-row count the setter admits.  n == 1
- * keeps the one-token kernel; 2..PULSAR_GPU_MNEUTRAL_ROWS_MAX stage each
- * weight block once for all rows.  Prefill rows take the tensor-core 'a' arm
- * and never reach here; a wider call is refused (the per-token grid that used
- * to catch it was a fallback nobody measured). */
-static_assert(PULSAR_GPU_MNEUTRAL_ROWS_MAX == 16u,
-              "grouped_fp8mx_a_a8_rows enumerates NT up to the row cap");
+ * keeps the one-token kernel; 2..PULSAR_LT_DECODE_MIN_ROWS-1 stage each weight
+ * block once for all rows; from PULSAR_LT_DECODE_MIN_ROWS the tensor-core MMA
+ * kernel (L262), one launch per OA_MMA_TOK rows.  Prefill rows take the
+ * tensor-core 'a' GEMM and never reach here. */
 static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, int KBp,
         const __nv_fp8_e4m3 *xq, const unsigned char *sx, int xKBp, uint64_t slab,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint32_t n_tokens,
         uint64_t blocks, uint64_t low_dim, const char *what, uint32_t x_tok_stride) {
+    if (n_tokens >= PULSAR_LT_DECODE_MIN_ROWS) {
+        if (group_dim % (32 * OA_MMA_U) != 0 || rank % (OA_MMA_NT * 8) != 0 ||
+            group_dim > INT32_MAX || low_dim > INT32_MAX) {
+            fprintf(stderr, "pulsar: %s: the MMA arm needs group_dim %% %d == 0 and rank %% %d == 0 "
+                            "(group_dim=%llu rank=%llu) -- refusing\n", what, 32 * OA_MMA_U, OA_MMA_NT * 8,
+                    (unsigned long long)group_dim, (unsigned long long)rank);
+            return 0;
+        }
+        static int said_mma = 0;
+        if (!said_mma) {
+            said_mma = 1;
+            fprintf(stderr, "pulsar: attn-out 'a' decode rows from %d = one-launch e4m3 MMA "
+                            "(%d rows/warp, %d-token slabs)\n", PULSAR_LT_DECODE_MIN_ROWS,
+                    OA_MMA_NT * 8, OA_MMA_TOK);
+        }
+        const unsigned rows_per_block = OA_MMA_WARPS * OA_MMA_NT * 8;
+        const unsigned gx = ((unsigned)low_dim + rows_per_block - 1u) / rows_per_block;
+        for (uint32_t t0 = 0; t0 < n_tokens; t0 += OA_MMA_TOK) {
+            const uint32_t nt = n_tokens - t0 < OA_MMA_TOK ? n_tokens - t0 : OA_MMA_TOK;
+            if (nt <= 16)
+                grouped_fp8mx_a_mma_kernel<1><<<gx, OA_MMA_WARPS * 32>>>(
+                        low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab, (int)group_dim, (int)rank,
+                        (int)n_groups, (int)t0, (int)nt, (int)x_tok_stride);
+            else
+                grouped_fp8mx_a_mma_kernel<2><<<gx, OA_MMA_WARPS * 32>>>(
+                        low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab, (int)group_dim, (int)rank,
+                        (int)n_groups, (int)t0, (int)nt, (int)x_tok_stride);
+        }
+        return cuda_ok(cudaGetLastError(), what);
+    }
     const unsigned gx = ((unsigned)low_dim + PULSAR_FP8MX_ROWS_A8_PER_BLOCK - 1u)
                         / PULSAR_FP8MX_ROWS_A8_PER_BLOCK;
     #define PULSAR_OA_NT(N) grouped_fp8mx_a_nt_a8_kernel<N><<<dim3(gx, 1, 1), 256>>>( \
@@ -3189,9 +3344,7 @@ static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, i
     default:
         #undef PULSAR_OA_NT
         static_assert(PULSAR_LT_DECODE_MIN_ROWS == 11, "the 'a' nt switch covers 2..10 rows");
-        fprintf(stderr, "pulsar: %s: n_tokens=%u is past %d -- refusing (the cuBLASLt 'a' arm owns "
-                        "this width)\n", what, n_tokens, PULSAR_LT_DECODE_MIN_ROWS - 1);
-        return 0;
+        return 0;   /* unreachable: n_tokens >= PULSAR_LT_DECODE_MIN_ROWS took the MMA arm above */
     }
     return cuda_ok(cudaGetLastError(), what);
 }
@@ -3318,8 +3471,7 @@ int pulsar_gpu_attention_output_a_tensor(
              * full-width grouped encoding through a row window (L158 inc 4). */
             const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
             int r2 = cuda_attention_output_a_mx_gemm(&low_suf, model_map, model_size, out_a_offset,
-                                                     group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec,
-                                                     PULSAR_BF16_LT_CANON_ROWS);
+                                                     group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec);
             g_batch_decode_rows = saved;
             return r1 && r2;
         }
@@ -3338,33 +3490,13 @@ int pulsar_gpu_attention_output_a_tensor(
      * call refuses; the tensor-core arm's failure used to fall to the GEMV. */
     if (g_batch_decode_rows == 0) {
         if (!cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
-                                             group_dim, rank, n_groups, heads, n_tokens, 0,
-                                             PULSAR_BF16_LT_CANON_ROWS)) {
+                                             group_dim, rank, n_groups, heads, n_tokens, 0)) {
             fprintf(stderr, "pulsar: attn-out 'a' tensor-core GEMM failed (n_tokens=%u rank=%llu "
                             "group_dim=%llu) -- refusing\n",
                     n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
             return 0;
         }
         return 1;
-    }
-    /* L260: DECODE rows from PULSAR_LT_DECODE_MIN_ROWS take the same cuBLASLt
-     * grouped arm with the kernel chosen at their own row count.  Measured, spec
-     * off, 16 banks, ABAB x2 (b750f34a + probe): c16 decode 75.8 -> 76.7 tok/s
-     * (+1.2%, sd 0.25), c1/c5/c10 unchanged; all widths on it cost c1 -10.7%. */
-    if (n_tokens >= PULSAR_LT_DECODE_MIN_ROWS) {
-        static int said_a = 0;
-        if (!said_a) {
-            said_a = 1;
-            fprintf(stderr, "pulsar: attn-out 'a' decode GEMMs from %d rows = cuBLASLt grouped MX (kernel "
-                            "chosen at the call's row count)\n", PULSAR_LT_DECODE_MIN_ROWS);
-        }
-        if (cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
-                                            group_dim, rank, n_groups, heads, n_tokens, 0, (int)n_tokens))
-            return 1;
-        fprintf(stderr, "pulsar: attn-out 'a' cuBLASLt GEMM failed (decode rows, n_tokens=%u rank=%llu "
-                        "group_dim=%llu) -- refusing\n",
-                n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
-        return 0;
     }
     return launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
                                   group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
