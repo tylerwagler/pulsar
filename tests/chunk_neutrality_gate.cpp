@@ -329,9 +329,11 @@ int GATE_ENTRY(int argc, char **argv) {
              * enough for the warm-up: a disk-restored bank resumes too */
             {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, true, 0, 0, 0},
             {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, true, 0, 0, 0},
-            /* the cut: prefilled to 4500, rewound to 4300 (a partial fork, an edited
-             * tail); the resume starts at 4224, the grid point below the cut */
-            {"J: sync 4500, cut to 4300, resume from 4224", 4500, 0, 4224, false, 4300, 0, 0},
+            /* the cut: prefilled to 4500, rewound to 4300 (an edited tail); the
+             * resume starts at the deepest grid CHECKPOINT at or below the cut's
+             * grid point 4224 -- the prefill's chunks ended at 4096 and 4480, so
+             * 4096 (L264: before it, the projection ring reached 4224) */
+            {"J: sync 4500, cut to 4300, resume from 4096", 4500, 0, 4096, false, 4300, 0, 0},
             /* L264: a turn whose generation ran past the raw ring's reach, echoed
              * back without it (the client stripped its reasoning): every raw slot
              * of [3840, 3968) was rewritten by decode rows 8192.. that the cut

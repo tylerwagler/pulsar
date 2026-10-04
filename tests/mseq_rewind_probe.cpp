@@ -154,7 +154,11 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* The sync that follows a rewind in production restores the grid checkpoint
      * the prefill left at 512 (its last grid point below 600) and re-prefills to
-     * the frontier; the same step is then accepted. */
+     * the frontier; the same step is then accepted.  As in the server, the bank
+     * is re-established first (server::bank_switch -> bank_state_restore): a
+     * multiseq step invalidates the session's single-bank bookkeeping, and a
+     * sync without it rebuilds from 0 by contract. */
+    CHECK(pulsar_session_bank_state_restore(s, 0u), "bank_state_restore(0) before the restoring sync failed");
     {
         pulsar_tokens q;
         memset(&q, 0, sizeof(q));
