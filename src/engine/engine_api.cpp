@@ -1439,6 +1439,23 @@ void pulsar_session_invalidate(pulsar_session *s) {
                         pulsar_tp_send_invalidate(tp, s->tp_session_id), NULL, 0)) return;
     s->invalidate();
 }
+int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
+    if (!s || limit <= 0) return 0;
+    return (int)gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), (uint32_t)limit);
+}
+int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s || G <= 0) { snprintf(err, errlen, "restore checkpoint: no session or position %d", G); return 1; }
+    if (tp_mirror_target(s)) {
+        snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
+        return 1;
+    }
+    if (!s->restore_checkpoint((uint32_t)G)) {
+        snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G);
+        return 1;
+    }
+    return 0;
+}
 void pulsar_session_rewind(pulsar_session *s, int pos) {
     PULSAR_NVTX_FN();
     pulsar_tp *tp = tp_mirror_target(s);

@@ -617,6 +617,8 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = 0;
         g->ms_comp_hw[bank][il] = 0;
     }
+    /* L264: the rows a checkpoint references are gone with the pages. */
+    gpu_graph_ckpt_drop_bank(g, bank);
     /* plan-33: an evicted bank's boundary stash is meaningless -- disarm the
      * emit-restore hook so a later cold refill cannot restore stale bytes. */
     g->ms_emit_keep[bank] = 0u;
@@ -996,6 +998,10 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
     if (src != dst && gpu_graph_bank_is_evicted(g, dst) &&
         !gpu_graph_bank_alloc_physical(g, dst)) return false;
     pulsar_bank_slabs *b = &g->banks;
+    /* L264: a copy into another bank replaces its rows, and with them every
+     * checkpoint it held; an in-place cut lowers the frontier, which drops only
+     * the checkpoints above R. */
+    if (src != dst) gpu_graph_ckpt_drop_bank(g, dst);
     /* Wrapped-ring window guard: ring holds positions [oldest, src_len); the
      * replay from R reads raw rows [R - raw_window, R). */
     const uint32_t rcap = g->raw_cap;
@@ -1091,6 +1097,7 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
     pulsar_bank_slabs *b = &g->banks;
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+    gpu_graph_ckpt_drop_bank(g, dst);   /* L264: dst's rows are replaced wholesale */
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         /* Raw ring: copy the whole bank region (bounded by raw_cap; the ring is
@@ -2640,12 +2647,16 @@ bool gpu_graph_alloc_raw_cap(
      * "sampled CLI generation requires a session backend" -- three layers away
      * from the actual cause, and against rule 9 (fail closed, LOUDLY).  The two
      * named flags are the aggregates the per-tensor checks fold into. */
-    if (!ok) {
-        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s -- refusing\n",
-                state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED");
+    /* L264: the grid-checkpoint slabs size themselves from the layer views just
+     * installed, so they come last. */
+    const bool ckpt_ok = ok && gpu_graph_ckpt_alloc(g, banked ? g->banks.n_banks : 1u);
+    if (!ok || !ckpt_ok) {
+        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s, checkpoints %s -- refusing\n",
+                state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED", ckpt_ok ? "ok" : "FAILED");
         gpu_graph_release(g);
+        return false;
     }
-    return ok;
+    return true;
 }
 
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]) {

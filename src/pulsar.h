@@ -991,6 +991,16 @@ void pulsar_session_invalidate(pulsar_session *s);
  * dropping trailing tokens the client never saw (mid-block speculative stop);
  * rewound rows are overwritten by the next prefill/eval. */
 void pulsar_session_rewind(pulsar_session *s, int pos);
+/** L264 grid checkpoints.  A prefill captures the installed bank's state at each
+ * grid point it ends a chunk on (every multiple of 128 a chunk boundary lands on,
+ * and the last one below the prompt's end); restoring one puts the bank back at
+ * that position so the next sync evaluates only the tokens after it -- the cold
+ * prefill's computation, byte for byte.  best: the deepest checkpoint <= limit
+ * the installed bank holds, 0 when none.  restore: 0 on success; 1 when the bank
+ * holds none at G (nothing changed), or on a tensor-parallel engine, which does
+ * not mirror the restore. */
+int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
+int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);

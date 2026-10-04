@@ -2332,22 +2332,7 @@ void pulsar_session::rewind(int pos) {
      * crosses a group boundary (those slots belong to a newer group and the
      * group's rows must be rebuilt).  See gpu_graph_compressor_state_rewind. */
     const uint32_t prev_len = (uint32_t)s->checkpoint.len;
-    /* The image blocks above the new end are gone from the live KV: their
-     * identity must go with them or a later request could reuse rows that no
-     * longer exist (L226). */
-    if (pos < s->live_image_barrier) {
-        s->live_image_fp = 0;
-        s->live_image_barrier = 0;
-    }
-    s->checkpoint.len = pos;
-    pulsar_spec_drop_pendings(&s->spec);
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
-    /* Rewound positions' drafter rows are stale; empty the window (it refills
-     * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
-    if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
+    s->trim_history(pos);
     /* The compressed frontier of every kv source follows the position law on
      * the bank this session's checkpoint describes (other banks hold other
      * slots' positions).  Clamp DOWN only -- a counter can only be AHEAD of a
@@ -2421,6 +2406,49 @@ void pulsar_session::rewind(int pos) {
             s->checkpoint_valid = false;
         }
     }
+}
+
+
+void pulsar_session::trim_history(int pos) {
+    auto *s = this;
+    /* The image blocks above the new end are gone from the live KV: their
+     * identity must go with them or a later request could reuse rows that no
+     * longer exist (L226). */
+    if (pos < s->live_image_barrier) {
+        s->live_image_fp = 0;
+        s->live_image_barrier = 0;
+    }
+    s->checkpoint.len = pos;
+    pulsar_spec_drop_pendings(&s->spec);
+    s->spec.spec_carry_valid = false;
+    spec_quench_reset(s);
+    /* Rewound positions' drafter rows are stale; empty the window (it refills
+     * from the prompt capture on the next prefill, or from commits). */
+    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
+    s->graph.dspark_prompt_n = 0;
+    if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
+}
+
+
+bool pulsar_session::restore_checkpoint(uint32_t G) {
+    auto *s = this;
+    const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+    if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
+        gpu_graph_ckpt_best(&s->graph, bank, G) != G) return false;
+    if (!gpu_graph_ckpt_restore(&s->graph, G)) {
+        /* The device copies were issued in part: the bank's state is no longer
+         * any position's.  Nothing reads it before a rebuild. */
+        s->checkpoint_valid = false;
+        return false;
+    }
+    s->trim_history((int)G);
+    /* The checkpoint was captured where a prefill reached G, and a frontier
+     * that fell below G since would have dropped it. */
+    s->prefill_frontier = (int)G;
+    /* L218: the verify-save span described positions above G. */
+    s->graph.ms_spec_save_rows[bank] = 0u;
+    s->kv_salvaged = false;
+    return true;
 }
 
 

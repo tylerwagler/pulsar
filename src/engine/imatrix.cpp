@@ -208,6 +208,7 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     {
         const uint32_t b = gpu_graph_cur_bank(g);
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
+        gpu_graph_ckpt_drop_bank(g, b);   /* L264: the zeroing bypasses the frontier writer */
     }
     return gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g));
 }
@@ -820,6 +821,16 @@ bool gpu_graph_prefill_chunked_range(
          * cost of the compressor fallback for one boundary. */
         if (pos0 < (uint32_t)vision_span_end && chunk < (uint32_t)vision_span_end - pos0)
             chunk = (uint32_t)vision_span_end - pos0;
+        /* L264: the final chunk stops at the last grid point inside it, so the
+         * prefill leaves a checkpoint where the next turn of this conversation
+         * resumes.  A chunk that starts on the 128 grid is exactly the cold
+         * prefill's computation (L195), so the split moves no byte -- the
+         * chunk-neutrality gate's resumes are this same cut. */
+        if (pos0 + chunk == end) {
+            const uint32_t grid_end = (end / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
+            if (grid_end > pos0 && grid_end < end && grid_end >= (uint32_t)vision_span_end)
+                chunk = grid_end - pos0;
+        }
         const uint32_t chunk_end = pos0 + chunk;
         /* Only the final chunk's logits are consumed (the progress callback below
          * reports position only, never reads logits). Running the full output
@@ -843,6 +854,12 @@ bool gpu_graph_prefill_chunked_range(
             }
             return false;
         }
+        /* L264: a chunk that ended on the grid -- every non-final boundary does,
+         * and the final split above makes the last grid point one too -- is a
+         * checkpoint.  Never inside an image span: a resume may not re-evaluate
+         * a row of an image block (L226). */
+        if (chunk_end % PULSAR_RESUME_GRID == 0u && chunk_end >= (uint32_t)vision_span_end &&
+            !gpu_graph_ckpt_capture(g, chunk_end)) return false;
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }

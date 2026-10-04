@@ -744,6 +744,9 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->spec.spec_carry_valid = false;
     pulsar_spec_drop_pendings(&s->spec);
     spec_quench_reset(s);
+    /* L264: same argument for the bank's grid checkpoints -- they reference the
+     * rows this load overwrites. */
+    gpu_graph_ckpt_drop_bank(&s->graph, gpu_graph_cur_bank(&s->graph));
     payload_io io;
     io.fp = fp;
     payload_digest_init(&io.digest);

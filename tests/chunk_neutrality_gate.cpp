@@ -22,6 +22,14 @@
  *                                resume's window needs were overwritten by
  *                                decode rows the cut then removed; the resume
  *                                must still equal the cold prefill
+ *   L  sync(N), restore the grid checkpoint at 4096, sync(N) -> L264's resume:
+ *                                the prefill left a checkpoint at every grid
+ *                                point a chunk ended on; restoring one is a
+ *                                resume from it
+ *   M  K's history, restored to the checkpoint 3968 the first sync left -- the
+ *                                reasoning-stripping turn resumed the L264 way
+ *   N  sync(N), restore the checkpoint at 8576 -- the split the prefill makes at
+ *                                the last grid point below the prompt's end
  * The resume grid is 128 (PULSAR_RESUME_GRID, L195): a resume rewinds to the grid
  * point below the PREFILL frontier, warms the compressor state up over the 32 tokens
  * before it, and redoes < 128 tokens plus whatever was generated since.  Nothing is
@@ -59,7 +67,7 @@
 
 #define GATE_N 8600
 #define GATE_CTX 8704
-#define GATE_SCHEDULES 11
+#define GATE_SCHEDULES 14
 #define GATE_EVALS 200   /* decode steps that carry schedules F and G across a grid boundary */
 #define GATE_EVALS_PAST_RING 4600   /* schedule K: more than raw_cap (4352) decode rows past the prefill */
 
@@ -86,7 +94,8 @@ static char *read_file(const char *path, size_t *len_out) {
  * the schedule it claims to be if the resume started there.  -1 is a sync
  * that did not resume at all (schedule A: a fresh session rebuilds). */
 static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, int evals, int origin,
-                        bool via_snapshot, int cut, int width, float *frontier, float *decoded, char *err, size_t errlen) {
+                        bool via_snapshot, int cut, int restore, int width, float *frontier, float *decoded,
+                        char *err, size_t errlen) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); return 1; }
     int rc = 1;
@@ -103,6 +112,18 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
          * prefill frontier; the resume must start at the grid point below the
          * cut (the dogfood case of 2026-09-06 12:08 was cold from 0 here) */
         pulsar_session_rewind(s, cut);
+    }
+    if (restore > 0) {
+        /* L264: the grid checkpoint the first sync's prefill captured.  Say which
+         * one, and that it was there: a restore that silently found nothing would
+         * leave the sync below resuming some other way. */
+        const int best = pulsar_session_checkpoint_best(s, restore);
+        printf("  [restore] checkpoints <= %d: deepest %d\n", restore, best);
+        if (best != restore) {
+            snprintf(err, errlen, "no grid checkpoint at %d (deepest at or below it: %d)", restore, best);
+            goto done;
+        }
+        if (pulsar_session_restore_checkpoint(s, restore, err, errlen) != 0) goto done;
     }
     if (via_snapshot) {
         /* the disk-cache path: serialise, throw the session away, restore into
@@ -175,38 +196,43 @@ int GATE_ENTRY(int argc, char **argv) {
         /* GATE_SCHEDULES x (frontier, decoded) */
         rows = (float *)malloc((size_t)(2 * GATE_SCHEDULES) * (size_t)width * sizeof(float));
         if (!rows) goto done;
-        struct { const char *label; int first; int evals; int origin; bool via_snapshot; int cut; } sched[GATE_SCHEDULES] = {
+        struct { const char *label; int first; int evals; int origin; bool via_snapshot; int cut; int restore; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
              * every crossing; a prompt under 128 tokens has none (cold) */
-            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, false, 0},   /* a fresh session: the sync is a rebuild, not a resume */
-            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, false, 0},
-            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, false, 0},
-            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, false, 0},
-            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, false, 0},
+            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, false, 0, 0},   /* a fresh session: the sync is a rebuild, not a resume */
+            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, false, 0, 0},
+            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, false, 0, 0},
+            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, false, 0, 0},
+            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, false, 0, 0},
             /* decode saves nothing (its rows are the decode kernels'); the
              * resume redoes the generated tokens from the last PREFILL grid
              * point -- the only way it equals the cold prefill */
-            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, false, 0},
-            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, false, 0},
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, false, 0, 0},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, false, 0, 0},
             /* the payload carries the prefill frontier and a raw window deep
              * enough for the warm-up: a disk-restored bank resumes too */
-            {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, true, 0},
-            {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, true, 0},
+            {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, true, 0, 0},
+            {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, true, 0, 0},
             /* the cut: prefilled to 4500, rewound to 4300 (a partial fork, an edited
              * tail); the resume starts at 4224, the grid point below the cut */
-            {"J: sync 4500, cut to 4300, resume from 4224", 4500, 0, 4224, false, 4300},
+            {"J: sync 4500, cut to 4300, resume from 4224", 4500, 0, 4224, false, 4300, 0},
             /* L264: a turn whose generation ran past the raw ring's reach, echoed
              * back without it (the client stripped its reasoning): every raw slot
              * of [3840, 3968) was rewritten by decode rows 8192.. that the cut
              * removes.  The prefill's grid point 3968 is the exact resume. */
-            {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 4100},
+            {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 4100, 0},
+            /* L264: resumes from the grid checkpoints the prefills captured */
+            {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, false, 0, 4096},
+            {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 0, 3968},
+            {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, false, 0, 8576},
         };
         char err[256];
         printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",
                GATE_N, opt.prefill_chunk, GATE_SCHEDULES);
         for (int k = 0; k < GATE_SCHEDULES; k++) {
-            if (run_schedule(e, &toks, sched[k].first, sched[k].evals, sched[k].origin, sched[k].via_snapshot, sched[k].cut, width,
+            if (run_schedule(e, &toks, sched[k].first, sched[k].evals, sched[k].origin, sched[k].via_snapshot, sched[k].cut,
+                             sched[k].restore, width,
                              rows + (size_t)(2 * k) * width,
                              rows + (size_t)(2 * k + 1) * width, err, sizeof err) != 0) {
                 fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s failed: %s\n", sched[k].label, err);
