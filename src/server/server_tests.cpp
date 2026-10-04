@@ -4706,6 +4706,41 @@ static void test_l264_segstore_chain_lookup(void) {
     TEST_ASSERT(system(cmd) == 0);
 }
 
+/* L264: releasing one chain's KV (the agent's /strip and /del) takes only the
+ * stretch no other chain shares, never past the stop (the system prompt), and
+ * nothing at all from a tip a longer chain extends. */
+static void test_l264_segstore_release(void) {
+    char tmpl[] = "/tmp/pulsar-seg-release.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char sys[41], a1[41], a2[41], a3[41], b1[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, sys));
+    TEST_ASSERT(test_seg_put(st, sys, 128, 256, "A1", 100, 0x22, a1));
+    TEST_ASSERT(test_seg_put(st, a1, 256, 384, "A2", 100, 0x33, a2));
+    TEST_ASSERT(test_seg_put(st, a2, 384, 512, "A3", 100, 0x44, a3));
+    TEST_ASSERT(test_seg_put(st, a1, 256, 384, "B1", 100, 0x55, b1));
+    /* a tip a longer chain extends gives nothing back */
+    TEST_ASSERT(pulsar_segstore_release(st, a2, sys) == 0 && pulsar_segstore_contains(st, a2));
+    /* A's own stretch is a2..a3 (a1 is shared with B): both go, a1 stays */
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    const uint64_t freed = pulsar_segstore_release(st, a3, sys);
+    TEST_ASSERT(freed > 0 && pulsar_segstore_used_bytes(st) == used - freed);
+    TEST_ASSERT(!pulsar_segstore_contains(st, a3) && !pulsar_segstore_contains(st, a2));
+    TEST_ASSERT(pulsar_segstore_contains(st, a1) && pulsar_segstore_contains(st, b1));
+    /* B is now alone below the system prompt: its stretch reaches a1, never sys */
+    TEST_ASSERT(pulsar_segstore_release(st, b1, sys) > 0);
+    TEST_ASSERT(!pulsar_segstore_contains(st, b1) && !pulsar_segstore_contains(st, a1));
+    TEST_ASSERT(pulsar_segstore_contains(st, sys) && pulsar_segstore_count(st) == 1);
+    /* the stop itself is never released */
+    TEST_ASSERT(pulsar_segstore_release(st, sys, sys) == 0 && pulsar_segstore_contains(st, sys));
+    pulsar_segstore_close(st);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_l264_segstore_eviction_and_hygiene(void) {
     char tmpl[] = "/tmp/pulsar-seg-evict.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -7539,6 +7574,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();
     test_l264_segstore_eviction_and_hygiene();
+    test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();
     test_l179_deep_guard_blocks_two_deep_decoders();
     test_l179_bank_floor_exempts_first_bank();

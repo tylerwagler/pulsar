@@ -36,6 +36,9 @@
  *                                resumes at 8576 -- the disk cache end to end
  *   P  M's history persisted as a segment chain to 3968 and resumed from it --
  *                                the reasoning-stripping turn coming back from disk
+ * And one leg outside the table, X: a segment chain to 8576 restored, then
+ * sync(8576) EXACTLY -- no new rows, so the sync must re-evaluate the last one
+ * (the load moved the KV, not the logits) and match the cold prefill of 8576.
  * The resume grid is 128 (PULSAR_RESUME_GRID, L195): a resume rewinds to the grid
  * point below the PREFILL frontier, warms the compressor state up over the 32 tokens
  * before it, and redoes < 128 tokens plus whatever was generated since.  Nothing is
@@ -363,6 +366,38 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int k = 1; k < GATE_SCHEDULES; k++) {
             fails += compare_rows("frontier", sched[k].label, rows, rows + (size_t)(2 * k) * width, width);
             fails += compare_rows("decode+1", sched[k].label, rows + (size_t)width, rows + (size_t)(2 * k + 1) * width, width);
+        }
+        /* L264: a request that ends EXACTLY where a restored chain ends needs no
+         * new rows -- but the load moved the KV, not the logits.  The sync must
+         * re-evaluate the last row (logits_stale) and come out byte-identical to
+         * the cold prefill of the same tokens, not sample whatever the session
+         * held before. */
+        {
+            const int X = 8576;   /* a grid point the cold prefill captures (its final split) */
+            pulsar_tokens px = toks;
+            px.len = X;
+            float *cold = (float *)malloc((size_t)width * sizeof(float));
+            float *back = (float *)malloc((size_t)width * sizeof(float));
+            pulsar_session *sx = NULL;
+            err[0] = '\0';
+            bool ok = cold && back && pulsar_session_create(&sx, e, GATE_CTX) == 0 &&
+                      pulsar_session_sync(sx, &px, err, sizeof err) == 0 &&
+                      pulsar_session_copy_logits(sx, cold, width) == width &&
+                      segment_round_trip(e, &sx, &px, X, err, sizeof err) == 0 &&
+                      pulsar_session_pos(sx) == X &&
+                      pulsar_session_sync(sx, &px, err, sizeof err) == 0 &&
+                      pulsar_session_copy_logits(sx, back, width) == width;
+            if (!ok) {
+                fprintf(stderr, "CHUNK-NEUTRALITY GATE: exact-length restore leg failed: %s\n", err);
+                fails++;
+            } else {
+                printf("  [exact] chain to %d restored, sync(%d) resumed from %d\n", X, X,
+                       pulsar_session_resume_origin(sx));
+                fails += compare_rows("frontier", "X: segment chain to 8576, sync(8576) exactly", cold, back, width);
+            }
+            pulsar_session_free(sx);
+            free(cold);
+            free(back);
         }
         printf(fails == 0 ? "CHUNK-NEUTRALITY GATE: PASS\n" : "CHUNK-NEUTRALITY GATE: FAIL (%d rows differ)\n", fails);
         rc = fails == 0 ? 0 : 1;
