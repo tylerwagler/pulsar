@@ -151,6 +151,16 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
                                       pulsar_segstore_log_fn log, void *log_ud) {
     if (!dir || !dir[0]) return nullptr;
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return nullptr;
+    /* Refuse a directory this process cannot write up front, instead of
+     * failing every store later. */
+    {
+        char probe[4096];
+        snprintf(probe, sizeof probe, "%s/.probe.%ld", dir, (long)getpid());
+        const int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return nullptr;
+        close(fd);
+        ::unlink(probe);
+    }
     auto *st = new pulsar_segstore();
     st->dir = dir;
     st->budget = budget_bytes;
