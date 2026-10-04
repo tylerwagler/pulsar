@@ -952,6 +952,18 @@ int main(int argc, char **argv) {
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
         uint64_t budget = kv_budget_final;
+        /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
+         * tools/tp2-l264 -- the spill/restore through the segment chain has no
+         * other way to fire at a test's fills). */
+        const char *ov = getenv("PULSAR_SERVER_KV_BUDGET_OVERRIDE");
+        if (ov && ov[0]) {
+            const unsigned long long b = strtoull(ov, NULL, 10);
+            if (b > 0) {
+                budget = (uint64_t)b;
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test hook)",
+                           (double)budget / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
         s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
         s.guard_touched_budget = budget > s.guard_eager_bytes
                                ? budget - s.guard_eager_bytes : 0;
