@@ -1443,6 +1443,10 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
     if (!s || limit <= 0) return 0;
     return (int)gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), (uint32_t)limit);
 }
+int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit) {
+    if (!s || limit <= 0 || bank >= PULSAR_MSEQ_MAX) return 0;
+    return (int)gpu_graph_ckpt_best(&s->graph, bank, (uint32_t)limit);
+}
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s || G <= 0) { snprintf(err, errlen, "restore checkpoint: no session or position %d", G); return 1; }

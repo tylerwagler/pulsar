@@ -187,22 +187,6 @@ int server::slot_frontier_pos(const session_slot *sl) const {
     return pulsar_session_pos(s->sess);
 }
 
-/* Human name for a pulsar_session_bank_fork_partial refusal code, for the
- * routing logs (a bare "refused" hid the ring-scrolled class for a day). */
-static const char *server_fork_rc_name(int rc) {
-    switch (rc) {
-    case PULSAR_FORK_OK:            return "ok";
-    case PULSAR_FORK_EINVAL:        return "einval";
-    case PULSAR_FORK_SHALLOW:       return "cut-too-shallow";
-    case PULSAR_FORK_NOHIST:        return "no-history";
-    case PULSAR_FORK_MISMATCH:      return "token-mismatch";
-    case PULSAR_FORK_EVICTED:       return "src-evicted";
-    case PULSAR_FORK_RING_SCROLLED: return "ring-scrolled";
-    case PULSAR_FORK_COPY_FAIL:     return "copy-fail";
-    default:                        return "unknown";
-    }
-}
-
 int server::slot_common_prefix(const session_slot *sl,
                                const pulsar_tokens *prompt) const {
     const auto *s = this;
@@ -447,49 +431,18 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 
 
 
-/* CROSS-WIRE ROOT FIX (L179 branch 3): the router's divergent-match verdict.
- * In-place continuation is safe ONLY for a linear extension of THIS bank's
- * own conversation (best_common == frontier). When best_common < frontier the
- * bank holds a DIFFERENT conversation past the shared prefix (typically just
- * the system-prompt header); continuing in place REWINDS-and-clobbers it. On
- * the shared pool session that conversation is often still live under
- * concurrency, so the two interleave and a request decodes another's KV (the
- * cross-wire). Deep divergent matches (best_common >= warm_partial_min)
- * already FORKED and never reach here.
- *   NOT_DIVERGENT : no best, or best_common >= frontier -- the caller
- *                   continues on best as before.
- *   FRESH         : divergent and a fresh bank was provisioned (the shared
- *                   prefix is cheap and prefix-cached): route there.
- *   QUEUE         : divergent, no fresh bank, and some job is active: queue
- *                   rather than clobber -- the active job frees a bank as it
- *                   finishes AND there is a live conversation worth protecting.
- *   IN_PLACE      : divergent, no fresh bank, NOTHING active: no bank will
- *                   ever free (idle banks may all be protected), so queuing
- *                   would LIVE-LOCK the worker -- and with no live reader there
- *                   is nothing to corrupt -- so continue in place (progress
- *                   over warmth). The corruption only ever happened while a
- *                   concurrent conversation was live.
- * The side effects (provisioning, the log line, *refusal) stay in the caller. */
-enum divergent_route { ROUTE_NOT_DIVERGENT, ROUTE_FRESH, ROUTE_QUEUE, ROUTE_IN_PLACE };
-
-static int divergent_route_decision(bool have_best, int best_common, int frontier,
-                                    bool provisioned_fresh, bool any_active) {
-    if (!have_best || best_common >= frontier) return ROUTE_NOT_DIVERGENT;
-    if (provisioned_fresh) return ROUTE_FRESH;
-    return any_active ? ROUTE_QUEUE : ROUTE_IN_PLACE;
-}
-
-/* The commit after a successful in-place cut (warm-advance-in-place:
- * pulsar_session_bank_fork_partial with src == dst, the engine's documented
- * truncate-reuse degenerate). The cut moved the frontier
- * BACKWARD to the engine's R-aligned resume position; the pre-truncation
- * continued-store watermark would then refuse every continued disk checkpoint
- * until the new conversation outgrows the old frontier (gen_begin only resets
- * it when cached == 0, which a successful cut is exactly not) -- so it is
- * reset here, with the committed position. Nothing else on the slot moves. */
-static void warm_inplace_commit(session_slot *sl, int resume_pos) {
-    sl->committed_pos = resume_pos;
-    sl->continued_last_store_tokens = 0;
+/* L264 S3: whether a request continues on the free bank that scores best for it
+ * or goes to a fresh one.  The score is the deepest grid checkpoint at or below
+ * the request's byte match with the bank -- exactly where the sync will resume
+ * -- and continuing there costs the bank whatever it holds past that point
+ * (`frontier - score` tokens of some conversation's warm state).  It continues
+ * in place when the match reaches past the shared scaffolding (`common >=
+ * share_ceiling`: it IS that conversation, e.g. the next turn of an agent whose
+ * client dropped the previous turn's reasoning) or when what it would discard is
+ * under the protect floor.  Otherwise a fresh bank is cheaper than the clobber. */
+bool server_route_in_place(int common, int score, int frontier,
+                           int share_ceiling, int protect_floor) {
+    return common >= share_ceiling || frontier - score < protect_floor;
 }
 
 /* Route the job to a slot. Preferences, in order:
@@ -503,25 +456,14 @@ static void warm_inplace_commit(session_slot *sl, int resume_pos) {
  *      front door sends (http_server.cpp / request_exceeds_context; the front
  *      door checks against slot 0's ctx and cannot see the owner's smaller
  *      one).
- *   2. A free fitting slot whose live thinking binding byte-matches the
- *      request's visible transcript is that conversation's warm continuation
- *      and wins outright (thinking_live_binds_prompt): for thinking chats
- *      the client replays visible content while the slot's frontier holds
- *      the hidden reasoning, so the token common prefix understates
- *      relatedness and must not out-vote the binding.
- *   3. Among free slots with enough context, the longest common token prefix
- *      wins, keeping a client's follow-ups on their warm KV.
- *   4. A job whose best token match is TRIVIAL — header-deep only, against a
- *      slot holding meaningful warm state past the match
- *      (server_slot_match_is_trivial) — prefers a fresh lazily provisioned
- *      slot over clobbering that conversation (budget permitting); with the
- *      pool exhausted it falls back to the warmest free slot exactly like
- *      the single-session server did. (Through v0.2.0 this gate required
- *      common == 0, which rendered chat traffic can never produce — every
- *      rendered prompt shares the template header, measured 4–9 common
- *      tokens across distinct conversations — so sequential conversations
- *      always clobbered slot 0 and the pool never provisioned; task #24
- *      bounce repro, fixed in task #30.)
+ *   2. Among free slots with enough context, the highest SCORE wins (L264):
+ *      the deepest grid checkpoint at or below the request's byte match, i.e.
+ *      where the sync will resume; the longer match breaks a tie.
+ *   3. The winner continues in place unless that would discard meaningful
+ *      warm state of a DIFFERENT conversation (server_route_in_place); then a
+ *      fresh lazily provisioned slot is preferred (budget permitting, after
+ *      an eviction if that is what it takes), and with the pool exhausted it
+ *      falls back to the winner exactly like the single-session server did.
  * Returns NULL when the job must wait for a slot to free — except when
  * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
  * job can never run and must be failed, not left queued. *waiting_owner is
@@ -558,56 +500,22 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
 
     const int needed = s->job_needed_ctx(j);
     session_slot *best = NULL;
-    int best_common = -1;
-    session_slot *bound = NULL;   /* thinking-binding match (preference 2) */
-    size_t bound_visible = 0;     /* longest key = most recent frontier */
+    int best_common = -1, best_score = -1;
     static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
-        if (route_debug) {
-            const int dbg_common = sl->provisioned && !sl->active_job
-                ? s->slot_common_prefix(sl, &j->req.prompt) : -1;
-            const pulsar_tokens *bank_toks = sl->provisioned
-                ? pulsar_session_bank_tokens(s->sess, sl->bank) : NULL;
-            const int bt = (bank_toks && dbg_common >= 0 &&
-                            dbg_common < bank_toks->len) ? bank_toks->v[dbg_common] : -1;
-            const int pt = (dbg_common >= 0 && dbg_common < j->req.prompt.len)
-                ? j->req.prompt.v[dbg_common] : -1;
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: route-scan slot %d bank %u: active=%d "
-                       "provisioned=%d ctx=%d needed=%d frontier=%d common=%d "
-                       "bank[c]=%d prompt[c]=%d",
-                       i, sl->bank, sl->active_job != NULL, (int)sl->provisioned,
-                       sl->ctx_size, needed,
-                       sl->provisioned ? s->slot_frontier_pos(sl) : -1,
-                       dbg_common, bt, pt);
-        }
-        if (sl->active_job || !sl->provisioned) continue;
-        if (sl->ctx_size < needed) continue;
-        const size_t visible =
-            s->thinking_live_binds_prompt(sl, &j->req,
-                                       s->slot_frontier_pos(sl));
-        if (visible > bound_visible) {
-            bound_visible = visible;
-            bound = sl;
-        }
+        if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
         const int common = s->slot_common_prefix(sl, &j->req.prompt);
-        if (common > best_common) {
+        const int score = pulsar_session_bank_checkpoint_best(s->sess, sl->bank, common);
+        if (route_debug)
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: route-scan slot %d bank %u: frontier=%d common=%d score=%d",
+                       i, sl->bank, s->slot_frontier_pos(sl), common, score);
+        if (score > best_score || (score == best_score && common > best_common)) {
+            best_score = score;
             best_common = common;
             best = sl;
         }
-    }
-    if (bound) {
-        /* Same never-silent rule as the fork log below: a thinking-bind hit
-         * routes onto live KV whose retained reasoning EXCEEDS the visible
-         * transcript, so whether it fired must be answerable from the log
-         * (the 2026-08-09 eval-variance hunt could not tell). */
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: route: thinking-bind bank %u visible=%zu "
-                   "prompt=%zu",
-                   bound->bank, bound_visible,
-                   j->req.prompt_text ? strlen(j->req.prompt_text) : 0);
-        return bound;
     }
     /* The shared-prefix ceiling is per job, not a global constant: a
      * tools-advertising client renders a large fixed tool/system block before
@@ -651,9 +559,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                 gone = sl;
             }
         }
-        if (gone && gone_common > best_common &&
-            !server_slot_match_is_trivial(gone_common, s->slot_frontier_pos(gone),
-                                          share_ceiling, s->slot_trivial_common_tokens)) {
+        if (gone && gone_common > best_common && gone_common >= share_ceiling) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: slot routing: deepest match is busy bank %u whose client "
                        "is gone (common=%d, best free %d); waiting for it to abandon",
@@ -662,157 +568,33 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             return NULL;
         }
     }
-    const bool best_clobbers_warm_state =
-        best && server_slot_match_is_trivial(best_common,
-                                             s->slot_frontier_pos(best),
-                                             share_ceiling,
-                                             s->slot_trivial_common_tokens);
-    if (!best || best_clobbers_warm_state) {
-        if (best_clobbers_warm_state) {
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: slot routing: best match is trivial "
-                       "(common=%d pos=%d ceiling=%d floor=%d anchor=%d); "
-                       "preferring a fresh slot",
-                       best_common, s->slot_frontier_pos(best),
-                       share_ceiling, s->slot_trivial_common_tokens, job_anchor);
-        }
-        session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j),
-                                             refusal);
-        if (fresh) {
-            if (route_debug)
-                server_log(PULSAR_LOG_DEFAULT,
-                           "pulsar-server: route-branch: FRESH bank %u "
-                           "(best_common %d, best %d)",
-                           fresh->bank, best_common,
-                           best ? (int)best->bank : -1);
-            return fresh;
-        }
-        /* Pool full of idle stale banks: without eviction HERE, every new
-         * conversation falls through to the same trivial-match bank and
-         * clobbers it serially while the other banks sit pinned with dead
-         * state forever — measured 2026-08-10: an 8-bank pool pre-churned by
-         * 12 one-shots served every later conversation cold off bank 1, and
-         * warm-turn TTFT never engaged (2.35 s vs the 0.6 s a fresh pool
-         * gives).  Evict an LRU idle bank (live-tool owners protected, no
-         * trunk to preserve) and retry once, mirroring the fork path. */
-        if (server_refusal_evictable(*refusal, s->pool_banks > 0) && s->fresh_make_room()) {
-            fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
-            if (fresh) return fresh;
-        }
-    }
-    /* Warm routing (plan-33 inc D, re-cut 2026-09-06). `best`'s committed
-     * history shares a token prefix `best_common` with the request (validated
-     * bit-for-bit inside the engine before any device write).  An exact
-     * extension (best_common == frontier) continues in place.  A DIVERGENT
-     * match on an idle bank ALSO advances in place: the bank is cut at the
-     * R-aligned common (pulsar_session_bank_fork_partial with src == dst) and
-     * the request re-prefills only [R..).  Tyler 2026-09-06: "an exact
-     * extension should just stay in the same slot" and, for the divergent
-     * case, "yes, let's do that" -- the fork-into-another-bank policy
-     * preserved the trunk for a hypothetical sibling and, under Claude Code
-     * (whose injected reminders re-render the last user turn every request),
-     * left a superseded copy of the whole conversation in the pool every
-     * turn, filling the 8 banks in a few turns and then snapshotting one to
-     * disk per fork.  A sibling that returns after its trunk advanced
-     * re-prefills from the disk checkpoints; nothing is corrupted (the cut is
-     * byte-validated).  Any engine refusal (history moved, evicted bank, cut
-     * below the ring's reach) degrades to the divergent/fresh path below --
-     * never a client error. */
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
-    /* `best_common <= prompt.len`, NOT `<`. A client that ROLLS BACK or compacts
-     * history resends a prompt that is a strict prefix of the trunk's committed
-     * tokens, giving best_common == prompt.len < frontier. Under `<` that case
-     * failed warm_ok, skipped both fork paths, and fell into the cross-wire guard
-     * below — which correctly refuses to clobber the trunk and provisions a FRESH
-     * bank, i.e. a FULL cold prefill of an already-resident prompt. Measured
-     * 2026-08-11: `common 164812 frontier 165045 prompt 164812` re-prefilled
-     * 123,852 tokens (~2.5 min) with the whole prompt already in bank 0. It also
-     * broke the invariant the cross-wire comment below asserts ("deep divergent
-     * matches already FORKED above and never reach here"). The partial cut handles
-     * it exactly: align down from best_common, re-prefill only the remainder. */
-    const bool warm_ok = s->pool_banks > 0 && s->warm_fork_enabled && best &&
-                         !best_clobbers_warm_state && !best->active_job &&
-                         best_common > 0 && best_common <= j->req.prompt.len;
-    /* inc D geometry alone isn't enough: the engine's raw ring may have
-     * scrolled past the cut (typical after a client compacts history on a
-     * deep bank), which makes every partial fork AND the in-place advance
-     * permanently infeasible — the ring only moves forward. Probe before
-     * proposing, so a doomed in-place cut routes to the divergent/fresh path
-     * immediately instead of re-attempting an impossible fork every quantum
-     * (observed 2026-08-10: ~30 s of refusal retries stalled a compacted
-     * 42k-token turn before an eviction finally let it cold-prefill). */
-    const bool partial_geom = warm_ok && best_common >= s->warm_partial_min &&
-                              best_common < frontier;
-    const int  partial_rc   = partial_geom
-        ? pulsar_session_bank_fork_partial_feasible(s->sess, best->bank, best_common)
-        : PULSAR_FORK_OK;
-    const bool partial = partial_geom && partial_rc == PULSAR_FORK_OK;       /* inc D */
-    /* Always-on routing-decision inputs (the verbose KVCACHE stream; one line
-     * per bind, not per token). Confirmed nuance: re-tokenized generated tail
-     * rarely reproduces the trunk's exact frontier, so best_common < frontier
-     * (the in-place CUT) is the common case; an exact continuation
-     * (best_common == frontier) continues without a cut. */
-    char infeasible[48] = "";
-    if (partial_geom && !partial)
-        snprintf(infeasible, sizeof infeasible, " [partial-infeasible: %s]",
-                 server_fork_rc_name(partial_rc));
-    if (s->pool_banks > 0 && s->warm_fork_enabled)
+    const bool in_place = best && server_route_in_place(best_common, best_score, frontier, share_ceiling,
+                                                        s->slot_trivial_common_tokens);
+    /* One line per bind, always: which bank, how deep the match, where it
+     * resumes, and what it costs the bank. */
+    if (best)
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: route: best bank %d common %d frontier %d prompt %d "
-                   "partial_min %d -> %s%s%s%s",
-                   best ? (int)best->bank : -1, best_common, frontier,
-                   j->req.prompt.len, s->warm_partial_min,
-                   partial ? "advance-in-place" : "in-place/cold",
-                   best_clobbers_warm_state ? " [trivial]" : "",
-                   (best && best->active_job) ? " [busy]" : "",
-                   infeasible);
-    if (partial) {
-        const int rc = pulsar_session_bank_fork_partial(
-                s->sess, best->bank, best->bank,
-                j->req.prompt.v, j->req.prompt.len, best_common);
-        if (rc == 0) {
-            warm_inplace_commit(best, pulsar_session_bank_pos(s->sess, best->bank));
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: warm-advance-in-place: bank %u cut "
-                       "(frontier %d, common %d) resume %d",
-                       best->bank, frontier, best_common, best->committed_pos);
-            *clobbers = false;
-            return best;
-        }
-        /* Refused (history moved / evicted bank / cut below the ring's reach):
-         * fall through to the divergent guard, which provisions a fresh bank
-         * or queues -- it never clobbers a live conversation. */
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: warm-advance-in-place refused (bank %u, %s); "
-                   "falling through", best->bank, server_fork_rc_name(rc));
+                   "pulsar-server: route: best bank %u common %d resume %d frontier %d prompt %d "
+                   "ceiling %d -> %s",
+                   best->bank, best_common, best_score, frontier, j->req.prompt.len, share_ceiling,
+                   in_place ? "in place" : "fresh preferred");
+    if (in_place) return best;
+    session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
+    /* Pool full of idle stale banks: without eviction HERE, every new
+     * conversation falls through to the same bank and clobbers it serially
+     * while the other banks sit pinned with dead state forever -- measured
+     * 2026-08-10: an 8-bank pool pre-churned by 12 one-shots served every later
+     * conversation cold off bank 1.  Evict an LRU idle bank (live-tool owners
+     * protected) and retry once. */
+    if (!fresh && server_refusal_evictable(*refusal, s->pool_banks > 0) && s->fresh_make_room())
+        fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
+    if (fresh) {
+        if (route_debug)
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: route-branch: FRESH bank %u", fresh->bank);
+        return fresh;
     }
-    /* CROSS-WIRE ROOT FIX: the verdict is divergent_route_decision's (see it
-     * for the four routes); the provisioning, the log line and *refusal are
-     * this caller's. */
-    if (divergent_route_decision(best != NULL, best_common, frontier, false, false)
-            != ROUTE_NOT_DIVERGENT) {
-        session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
-        bool any_active = false;
-        for (int i = 0; i < s->n_slots; i++)
-            if (s->slots[i].active_job) { any_active = true; break; }
-        switch (divergent_route_decision(best != NULL, best_common, frontier, fresh != NULL,
-                                         any_active)) {
-        case ROUTE_FRESH:
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: divergent match bank %u (common %d < frontier %d): "
-                       "fresh bank %u, no in-place clobber",
-                       best->bank, best_common, frontier, fresh->bank);
-            *clobbers = false;
-            return fresh;
-        case ROUTE_QUEUE:
-            if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
-            return NULL;   /* an active job will free a bank; worker retries */
-        case ROUTE_IN_PLACE:
-        case ROUTE_NOT_DIVERGENT:
-            break;         /* in place: no live reader; a queue would deadlock */
-        }
-    }
-    *clobbers = best_clobbers_warm_state;
+    *clobbers = best != NULL;
     return best;
 }
 
@@ -953,26 +735,12 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
 /* Soft eviction protection: OR into protect[] every bank that is some QUEUED
  * job's best USABLE warm match. Without this the fresh-path domino recurs:
  * job A's eviction lands on job B's warm trunk, and B — often the very next
- * bind — cold-replays its whole history. "Usable" is the operative word: a
- * match whose partial cut the raw ring has scrolled past (a compacted client)
- * is dead warmth and stays evictable — protecting it would evict live warmth
- * in its stead. Best-effort by contract: callers retry without this overlay
- * when it leaves no victim, so binding always progresses. Worker thread only
+ * bind — cold-replays its whole history. "Usable" (L264): the bank holds a grid
+ * checkpoint inside the job's byte match, i.e. the job would resume there
+ * rather than from 0; a match with none below it is no warmth worth keeping.
+ * Best-effort by contract: callers retry without this overlay when it leaves
+ * no victim, so binding always progresses. Worker thread only
  * (slot_common_prefix reads engine host carries). */
-
-/* The overlay's usability rule (L179 branch 6): a queued job's best match
- * protects its bank iff best_common >= warm_partial_min AND it is either an
- * exact extension (best_common == frontier, continued in place) or a partial
- * cut the raw ring can still replay (feasible_rc == PULSAR_FORK_OK). A ring-scrolled cut is dead warmth
- * and stays evictable; best_common == prompt.len (bank holds the whole
- * prompt) rides the partial predicate too -- conservative, never protects
- * dead warmth. */
-static bool warm_match_usable(int best_common, int warm_partial_min, int frontier,
-                              int feasible_rc) {
-    if (best_common < warm_partial_min) return false;
-    return best_common == frontier || feasible_rc == PULSAR_FORK_OK;
-}
-
 void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]) {
     PULSAR_NVTX_FN();
     auto *s = this;
@@ -986,24 +754,15 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
     pthread_mutex_unlock(&s->mu);
     for (int i = 0; i < n; i++) {
         const job *q = queued[i];
-        int best_i = -1, best_common = 0;
+        int best_i = -1, best_score = 0;
         for (int k = 0; k < s->n_slots && k < PULSAR_SESSION_POOL_CAP; k++) {
             const session_slot *sl = &s->slots[k];
             if (!sl->provisioned) continue;
-            const int common = s->slot_common_prefix(sl, &q->req.prompt);
-            if (common > best_common) { best_common = common; best_i = k; }
+            const int score = pulsar_session_bank_checkpoint_best(
+                    s->sess, sl->bank, s->slot_common_prefix(sl, &q->req.prompt));
+            if (score > best_score) { best_score = score; best_i = k; }
         }
-        if (best_i < 0) continue;
-        const session_slot *sl = &s->slots[best_i];
-        const int frontier = s->slot_frontier_pos(sl);
-        /* The ring probe is only consulted for a PARTIAL cut at/above the
-         * minimum; an exact extension or a below-minimum match needs none. */
-        const bool probe = best_common >= s->warm_partial_min && best_common != frontier;
-        const int feasible_rc = probe
-            ? pulsar_session_bank_fork_partial_feasible(s->sess, sl->bank, best_common)
-            : PULSAR_FORK_OK;
-        if (warm_match_usable(best_common, s->warm_partial_min, frontier, feasible_rc))
-            protect[best_i] = true;
+        if (best_i >= 0) protect[best_i] = true;
     }
 }
 
@@ -1149,7 +908,6 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * them). A later continuation of those ids gets the protocol's 409. */
     s->responses_live_clear(sl);
     s->anthropic_live_clear(sl);
-    s->thinking_live_clear(sl);
 
     const uint64_t committed = sl->est_cost_bytes;
     uint64_t freed = 0;

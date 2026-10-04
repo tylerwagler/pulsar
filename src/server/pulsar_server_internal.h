@@ -188,7 +188,6 @@
 #define KV_CACHE_HIT_HALF_LIFE_SECONDS PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS
 #define KV_EXT_TOOL_MAP PULSAR_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE PULSAR_KVSTORE_EXT_RESPONSES_VISIBLE
-#define KV_EXT_THINKING_VISIBLE PULSAR_KVSTORE_EXT_THINKING_VISIBLE
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -576,7 +575,6 @@ typedef struct {
     /** The replayed prompt still contains the model's prior reasoning. When
      * false the reasoning was stripped by the client, and the server must not
      * assume the live KV and the replayed text agree about it. */
-    bool prompt_preserves_reasoning;
     /** For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -1279,7 +1277,6 @@ typedef struct {
      * so a continuation can never match another slot's frontier. */
     live_tool_state responses_live;      ///< Responses call-id binding at this slot's frontier
     live_tool_state anthropic_live;      ///< Anthropic tool_use binding at this slot's frontier
-    visible_live_state thinking_live;    ///< what the client can replay at this slot's frontier
 } session_slot;
 
 /* Forward declarations / relocated types referenced by struct server's member
@@ -1368,17 +1365,6 @@ struct server {
      * steps (vs one big chunk on one step) is what trades the time-slice's per-
      * interval decode STALL for a small uniform per-token cost — the p99 lever. */
     int          mixed_chunk_tokens;
-    /** plan-33 inc B: warm full-prefix FORK routing (PULSAR_WARM_FORK, default on;
-     * read once at startup). When a request's prompt token-extends an idle warm
-     * bank's committed history, the router forks that trunk into a FREE bank and
-     * continues there, leaving the trunk intact for siblings. */
-    bool         warm_fork_enabled;
-    /** plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
-     * be worth it (below this, reusing so few tokens loses to a plain cold
-     * prefill; a full-prefix match still forks regardless). PULSAR_WARM_PARTIAL_MIN,
-     * read once at startup; floored to the ratio-4 align (partial cuts below R
-     * reuse nothing). */
-    int          warm_partial_min;
     /** The pool's shared per-bank context (boot --ctx).  Its own field
      * because slot 0's ctx_size used to double as this reference — and a
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
@@ -1685,16 +1671,6 @@ struct server {
      * @param loaded_ext_flags_out  which trailers that file carried
      * @return prefix tokens loaded, 0 for a miss. */
     int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out);
-    /** Continue from the LIVE session when the request's prompt text is a byte
-     * prefix of what the session already holds.
-     *
-     * Byte-prefix, not token-prefix, and deliberately: the live graph's own
-     * tokenization is authoritative, so only the bytes AFTER it are tokenized.
-     * Reusing the request's token suffix would be wrong -- BPE over the full
-     * prompt can merge across that boundary. Returns 0 under PULSAR_EVAL_PIN,
-     * which is one of the choke points that makes evals history-independent.
-     * @return live prefix tokens reused, 0 if not applicable. */
-    int live_text_prefix_prompt(session_slot *sl, const request *req, pulsar_tokens *effective_prompt);
     /** Tool-output-only Responses continuation.
      * Some clients send just the new tool outputs after a tool call.  There is no
      * long visible prefix to match in that shape; the call_id itself is the
@@ -1722,33 +1698,6 @@ struct server {
      * cold starts, edits, restarts, or cross-client replays.
      */
     int responses_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
-    /** Tool-less thinking continuation.
-     * Chat/completions and Anthropic do not have a previous_response_id object that
-     * binds a later request to the last sampled turn.  Still, after a normal
-     * tool-less thinking answer, the next prompt renderer intentionally omits that
-     * hidden reasoning.  The live KV state is richer than the visible transcript.
-     * Remembering the visible transcript as a key lets us keep the sampled hidden
-     * KV when the next request clearly extends that same visible history.  This is
-     * the same byte-prefix idea used by the disk cache: the client-visible text
-     * selects the checkpoint, while the payload stays the exact sampled token
-     * frontier.  If the visible key does not match, callers fall back to ordinary
-     * token/text/disk matching.
-     */
-    int thinking_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
-    /** Routing probe (choose_slot_for_job): does this slot's live thinking
-     * binding mark it as the warm continuation of req's visible transcript?
-     * Same guards as thinking_live_visible_prefix_prompt above, but byte-prefix
-     * check only — no tokenization, no effective-prompt build (gen_begin redoes
-     * the full resolution on the chosen slot). The router needs this because
-     * the token common prefix UNDERSTATES relatedness for thinking chats: the
-     * client replays visible content while the slot's sampled frontier holds
-     * the hidden reasoning too, so a short token match can still be the same
-     * conversation. Returns the matched visible-key length (>0) so the caller
-     * can prefer the most recent frontier if several slots hold bindings for
-     * prefixes of one conversation, or 0 for no match. Never dereferences
-     * s->sess (the caller passes the slot's live position).
-     */
-    size_t thinking_live_binds_prompt(session_slot *sl, const request *req, int live_pos);
     /** Validate Responses tool outputs before rendering.
      * A tool output with a call_id is meaningful only if either:
      * 1. DS4 still has the matching live assistant call in memory, or
@@ -1787,29 +1736,6 @@ struct server {
      * headers already went out for the keepalive: the error must then be an
      * event in the open stream, not an HTTP status. */
     void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
-    /** Record where the reasoning block ended, so a later turn can continue the
-     * conversation without replaying hidden thinking the client never saw. */
-    void remember_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content);
-    /** Tool-call finish WITH thinking on: the model emitted \<think\>reasoning\</think\>
-     * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
-     * remember the exact bytes the NEXT request will render for this turn as a visible
-     * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
-     * next request byte-matches the key and continues from live KV — no rewrite, no
-     * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
-     * same visible transcript on disk (kv_cache_store_current).
-     * render_chat_prompt_text ALWAYS re-renders the reasoning inside \<think\>…\</think\>
-     * for a tool-context turn (prompt_render.cpp: `tool_context || i > last_user_idx`),
-     * because agentic clients (opencode et al.) replay reasoning_content verbatim so
-     * the model keeps its chain of thought across tool rounds.  So the key MUST carry
-     * the reasoning too — an earlier version dropped it (\<think\>\</think\>), which byte-
-     * diverges from every reasoning-preserving replay at the first reasoning byte and
-     * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
-     * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
-     * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
-     * for non-tool-context requests (should_remember_thinking_checkpoint bails when
-     * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay.
-     */
-    void remember_tool_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
     /** After a successful tool-call finish, make the live checkpoint match what the
      * next request will render.  Usually that is just the exact DSML remembered by
      * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -1897,11 +1823,6 @@ struct server {
      *  conversation, and appended to rather than cold-prefilled.
      *  @{
      */
-    /** Forget the slot's remembered reasoning checkpoint. */
-    void thinking_live_clear(session_slot *sl);
-    /** Record the visible text at the slot's current frontier, so a later turn
-     * can tell what the client actually saw from what stayed hidden. */
-    void thinking_live_remember(session_slot *sl, const char *visible_text);
     /** Bind `calls` and the visible text to the slot's current frontier as a
      * Responses continuation point. */
     void responses_live_remember(session_slot *sl, const char *visible_text, const tool_calls *calls);
@@ -2175,25 +2096,13 @@ struct server {
      * front door sends (http_server.cpp / request_exceeds_context; the front
      * door checks against slot 0's ctx and cannot see the owner's smaller
      * one).
-     * 2. A free fitting slot whose live thinking binding byte-matches the
-     * request's visible transcript is that conversation's warm continuation
-     * and wins outright (thinking_live_binds_prompt): for thinking chats
-     * the client replays visible content while the slot's frontier holds
-     * the hidden reasoning, so the token common prefix understates
-     * relatedness and must not out-vote the binding.
-     * 3. Among free slots with enough context, the longest common token prefix
-     * wins, keeping a client's follow-ups on their warm KV.
-     * 4. A job whose best token match is TRIVIAL — header-deep only, against a
-     * slot holding meaningful warm state past the match
-     * (server_slot_match_is_trivial) — prefers a fresh lazily provisioned
-     * slot over clobbering that conversation (budget permitting); with the
-     * pool exhausted it falls back to the warmest free slot exactly like
-     * the single-session server did. (Through v0.2.0 this gate required
-     * common == 0, which rendered chat traffic can never produce — every
-     * rendered prompt shares the template header, measured 4–9 common
-     * tokens across distinct conversations — so sequential conversations
-     * always clobbered slot 0 and the pool never provisioned; task #24
-     * bounce repro, fixed in task #30.)
+     * 2. Among free slots with enough context, the highest SCORE wins (L264):
+     * the deepest grid checkpoint at or below the request's byte match, i.e.
+     * where the sync will resume; the longer match breaks a tie.
+     * 3. The winner continues in place unless that would discard meaningful
+     * warm state of a DIFFERENT conversation (server_route_in_place); then a
+     * fresh slot is preferred (after an eviction if that is what it takes),
+     * and with the pool exhausted it falls back to the winner.
      * Returns NULL when the job must wait for a slot to free — except when
      * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
      * job can never run and must be failed, not left queued. *waiting_owner is
@@ -2394,7 +2303,6 @@ struct gen_state {
     bool responses_protocol;          ///< request came in on the /responses API
     bool responses_live_continuation;   ///< resuming a live /responses stream rather than starting one
     bool anthropic_live_continuation;   ///< resuming a live Anthropic stream
-    bool thinking_live_continuation;    ///< resuming mid-reasoning-block, so the block is not re-opened
     char *disk_cache_path;            ///< KV file backing this prompt, owned; NULL when none
     int prompt_tokens;                ///< prompt length actually prefilled
     double t0;                        ///< wall time the request began, for latency accounting
@@ -2638,8 +2546,6 @@ void append_json_object_or_empty(buf *b, const char *json);
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41 = true);
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas);
-bool chat_history_preserves_reasoning(const chat_msgs *msgs,
-                                             const char *tool_schemas);
 /* ---- how a chat turn renders: the ONE authority (prompt_render.cpp, L185) ----
  *
  * render_chat_prompt_text (the full replay), render_live_tool_tail (the
@@ -3004,16 +2910,15 @@ void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
                                                   int suppressed_tokens);
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size);
-/* Routing probe: does this slot's live thinking binding mark it as the warm
- * continuation of req's visible transcript? Same guards as
- * thinking_live_visible_prefix_prompt but byte-prefix check only — no
- * tokenization, no effective-prompt build. Returns the matched visible-key
- * length (>0), or 0 for no match (defined in kv_cache.cpp; unit-tested in
- * cli_main.cpp). */
-/* Trivial-match classifier for the router's choose-vs-provision decision
- * (defined in generate.cpp; unit-tested in cli_main.cpp). */
+/* Trivial-match classifier for the memory-token resolver (defined in
+ * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
                                          int share_ceiling, int protect_floor);
+/* L264 S3: does the best-scoring free bank take the request in place, or is a
+ * fresh bank preferred (defined in server_sched.cpp; unit-tested in
+ * server_tests.cpp). */
+bool server_route_in_place(int common, int score, int frontier,
+                           int share_ceiling, int protect_floor);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
@@ -3089,9 +2994,6 @@ char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
                                                  const char *detail,
                                                  chat_text_span **spans_out,
                                                  uint32_t *n_spans_out);
-bool should_remember_thinking_checkpoint(const request *r,
-                                                const thinking_state *thinking,
-                                                const char *finish);
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls);
 /** As above, plus the suffix's CLIENT-DATA ranges (L223): the sampled content
@@ -3110,8 +3012,6 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
                                                      const tool_calls *calls,
                                                      chat_text_span **spans_out,
                                                      uint32_t *n_spans_out);
-char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content);
 void *worker_main(void *arg);
 /* Job-lifecycle entry points (server_jobs.cpp), driven by the scheduler/
  * worker (server_sched.cpp): bind/step/unbind plus the three per-token

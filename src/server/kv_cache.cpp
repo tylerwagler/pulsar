@@ -577,14 +577,6 @@ bool server::kv_cache_store_current(session_slot *sl, const char *reason) {
         visible_text = xstrdup(sl->responses_live.visible_text);
         visible_ext = KV_EXT_RESPONSES_VISIBLE;
         visible_key = "responses-visible";
-    } else if (sl->thinking_live.valid &&
-               sl->thinking_live.live_tokens == tokens->len &&
-               sl->thinking_live.visible_text &&
-               sl->thinking_live.visible_text[0])
-    {
-        visible_text = xstrdup(sl->thinking_live.visible_text);
-        visible_ext = KV_EXT_THINKING_VISIBLE;
-        visible_key = "thinking-visible";
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -762,44 +754,6 @@ int server::kv_cache_try_load(session_slot *sl, const request *req,
 
 
 
-int server::live_text_prefix_prompt(session_slot *sl, const request *req,
-                                   pulsar_tokens *effective_prompt) {
-    auto *s = this;
-    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
-    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
-    if (!live_tokens || live_tokens->len <= 0) return 0;
-
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
-    const size_t prompt_text_len = strlen(req->prompt_text);
-    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                           live_text, live_text_len))
-    {
-        free(live_text);
-        return 0;
-    }
-
-    /* This is the core text-prefix case.  The live graph is authoritative, so
-     * keep its sampled tokenization and tokenize only the request bytes that
-     * come after it.  Reusing req->prompt's token suffix would be wrong: full
-     * prompt BPE may have merged across this byte boundary. */
-    /* The appended tail is a slice of the rendered prompt, so its client-data
-     * ranges are the request's, rebased (L223). */
-    uint32_t tail_n = 0;
-    pulsar_text_span *tail_spans =
-        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, live_text_len,
-                                prompt_text_len - live_text_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        tail_spans, tail_n, effective_prompt);
-    free(tail_spans);
-    free(live_text);
-    return live_tokens->len;
-}
-
-
-
 /* Tool-output-only Responses continuation.
  *
  * Some clients send just the new tool outputs after a tool call.  There is no
@@ -918,96 +872,4 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
 }
 
 
-
-/* Tool-less thinking continuation.
- *
- * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
- *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
-int server::thinking_live_visible_prefix_prompt(session_slot *sl,
-                                               const request *req,
-                                               int live_pos,
-                                               pulsar_tokens *effective_prompt) {
-    auto *s = this;
-    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = sl->thinking_live.valid &&
-              sl->thinking_live.live_tokens == live_pos &&
-              sl->thinking_live.visible_text &&
-              sl->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                sl->thinking_live.visible_text,
-                                sl->thinking_live.visible_len);
-    if (ok) visible_len = sl->thinking_live.visible_len;
-    pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
-        server_log(PULSAR_LOG_ERROR,
-                   "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
-                   "with the last live token (L196)", live_pos);
-        return 0;
-    }
-
-    uint32_t tail_n = 0;
-    pulsar_text_span *tail_spans =
-        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
-                                prompt_len - visible_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        tail_spans, tail_n, effective_prompt);
-    free(tail_spans);
-    return live_tokens->len;
-}
-
-
-
-/* Routing probe (choose_slot_for_job): does this slot's live thinking
- * binding mark it as the warm continuation of req's visible transcript?
- * Same guards as thinking_live_visible_prefix_prompt above, but byte-prefix
- * check only — no tokenization, no effective-prompt build (gen_begin redoes
- * the full resolution on the chosen slot). The router needs this because
- * the token common prefix UNDERSTATES relatedness for thinking chats: the
- * client replays visible content while the slot's sampled frontier holds
- * the hidden reasoning too, so a short token match can still be the same
- * conversation. Returns the matched visible-key length (>0) so the caller
- * can prefer the most recent frontier if several slots hold bindings for
- * prefixes of one conversation, or 0 for no match. Never dereferences
- * s->sess (the caller passes the slot's live position). */
-size_t server::thinking_live_binds_prompt(session_slot *sl,
-                                  const request *req, int live_pos) {
-    auto *s = this;
-    if (!s || !sl || !req || !req->prompt_text) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    if (sl->thinking_live.valid &&
-        sl->thinking_live.live_tokens == live_pos &&
-        sl->thinking_live.visible_text &&
-        sl->thinking_live.visible_len < prompt_len &&
-        byte_prefix_match(req->prompt_text, prompt_len,
-                          sl->thinking_live.visible_text,
-                          sl->thinking_live.visible_len))
-    {
-        visible_len = sl->thinking_live.visible_len;
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    return visible_len;
-}
 

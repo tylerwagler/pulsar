@@ -100,8 +100,6 @@ model.  Record pass/fail against the release commit:
   Discovers a seam pair from the model's own vocabulary, then pins the byte
   walk, the sync rescue, the shorter-echo shape, and a fork across seams.
   Needs `PULSAR_MSEQ_BANKS>=2` for its fork leg (the target sets it).
-- `warm_fork_3way` / `warm_partial_fork_3way` (`make warm-fork-3way
-  warm-partial-fork-3way`) — server-level warm-fork determinism.
 - `make cuda-frontier-gate`, `make cuda-multiseq-gate`,
   `make cuda-multiseq-gate-nodspark` — multiseq isolation and throughput.
 - `make cuda-bank-spec-gate`, `make cuda-accounting-gate`,

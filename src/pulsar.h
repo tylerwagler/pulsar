@@ -1000,6 +1000,10 @@ void pulsar_session_rewind(pulsar_session *s, int pos);
  * holds none at G (nothing changed), or on a tensor-parallel engine, which does
  * not mirror the restore. */
 int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
+/** The same question for any bank of the pool, installed or not -- a host scan,
+ * no device work.  The router's score for a bank (L264 S3): a request whose bytes
+ * match the bank's history to `limit` tokens resumes there from this position. */
+int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);

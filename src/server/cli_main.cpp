@@ -266,7 +266,6 @@ void server::close_resources() {
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
-        visible_live_free(&s->slots[i].thinking_live);
         s->slots[i].provisioned = false;
     }
     if (s->sess) pulsar_session_free(s->sess);
@@ -917,25 +916,6 @@ int main(int argc, char **argv) {
                                          : "disabled (PULSAR_MIXED_BATCH)",
                    s.mixed_chunk_tokens,
                    s.mixed_deep_guard_rows);
-    }
-    /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
-     * pool mode; PULSAR_WARM_FORK=0 restores today's in-place-continuation routing
-     * exactly. One startup read — never on a hot path. */
-    {
-        const char *wf = getenv("PULSAR_WARM_FORK");
-        s.warm_fork_enabled = s.pool_banks > 0 &&
-                              !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
-        /* inc D: partial-cut floor. Default 256 tokens (2 ratio-4 groups of
-         * reuse); floor to 128 so a cut always aligns to >= one group of R. */
-        s.warm_partial_min = 256;
-        const char *wpm = getenv("PULSAR_WARM_PARTIAL_MIN");
-        if (wpm && *wpm) {
-            int v = atoi(wpm);
-            if (v < 128) v = 128;
-            s.warm_partial_min = v;
-        }
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm routing %s (in-place advance at the aligned cut; partial-min %d)",
-                   s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;

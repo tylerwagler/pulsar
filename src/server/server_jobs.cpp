@@ -240,98 +240,6 @@ void server::send_prefill_failure_response(const job *j,
 
 
 
-void server::remember_thinking_checkpoint(session_slot *sl,
-                                         const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    auto *s = this;
-    /* The key must byte-match what render_chat_prompt_text emits for this turn
-     * once it becomes historical on the next request.  With tools advertised
-     * (tool_context) a stripped historical assistant turn renders
-     * "<think></think>{content}<eos>", so keep prompt_text's trailing "<think>"
-     * and append the empty-reasoning, no-calls suffix.  Without tools the turn
-     * renders "</think>{content}<eos>" (no "<think>") — the toolless form. */
-    char *visible = NULL;
-    if (j->req.has_tools) {
-        if (!j->req.prompt_text || !pulsar_think_mode_enabled(j->req.think_mode))
-            return;
-        char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", NULL);
-        buf b = {0};
-        buf_puts(&b, j->req.prompt_text);
-        buf_puts(&b, suffix);
-        free(suffix);
-        visible = buf_take(&b);
-    } else {
-        visible = build_toolless_thinking_visible_text(&j->req, content);
-    }
-    if (!visible) return;
-
-    s->thinking_live_remember(sl, visible);
-    server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, pulsar_session_pos(s->sess), strlen(visible));
-    s->trace_event(trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                pulsar_session_pos(s->sess), strlen(visible));
-    free(visible);
-}
-
-/* Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
- * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
- * remember the exact bytes the NEXT request will render for this turn as a visible
- * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
- * next request byte-matches the key and continues from live KV — no rewrite, no
- * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
- * same visible transcript on disk (kv_cache_store_current).
- *
- * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
- * for a tool-context turn (prompt_render.cpp append_chat_msg: `tool_context ||
- * i > last_user_idx`; the suffix below is built from the renderer's own
- * append_assistant_turn_close, L185),
- * because agentic clients (opencode et al.) replay reasoning_content verbatim so
- * the model keeps its chain of thought across tool rounds.  So the key MUST carry
- * the reasoning too — an earlier version dropped it (<think></think>), which byte-
- * diverges from every reasoning-preserving replay at the first reasoning byte and
- * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
- * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
- * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
- * for non-tool-context requests (should_remember_thinking_checkpoint bails when
- * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay. */
-void server::remember_tool_thinking_checkpoint(session_slot *sl,
-                                              const job *j, const char *ctx,
-                                              uint64_t trace_id, const char *content,
-                                              const char *reasoning,
-                                              const tool_calls *calls) {
-    auto *s = this;
-    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
-    if (!pulsar_think_mode_enabled(j->req.think_mode)) return;
-
-    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
-     * suffix "{reasoning}</think>{content}{DSML}" — byte-identical to the sampled
-     * bytes in the live KV, which stop at the closing tool_calls tag: the turn ended
-     * at saw_tool_end, no EOS was sampled (L196).  The next request's render
-     * continues with "<EOS><｜User｜><tool_result>..." (DSML from the id-keyed raw
-     * sample via tool_memory, reasoning replayed verbatim), and the consumer
-     * tokenises exactly those bytes after the key, EOS first. */
-    char *suffix = build_tool_checkpoint_suffix(&j->req, content,
-                                                reasoning ? reasoning : "", calls);
-    buf visible = {0};
-    buf_puts(&visible, j->req.prompt_text);
-    buf_puts(&visible, suffix);
-    if (visible.ptr) {
-        s->thinking_live_remember(sl, visible.ptr);
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
-                   ctx, pulsar_session_pos(s->sess), visible.len);
-        s->trace_event(trace_id,
-                    "tool thinking checkpoint remembered: live=%d visible=%zu",
-                    pulsar_session_pos(s->sess), visible.len);
-    }
-    free(suffix);
-    buf_free(&visible);
-}
-
-
-
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -724,7 +632,6 @@ void server::gen_begin(session_slot *sl) {
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
-    bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
@@ -830,46 +737,6 @@ void server::gen_begin(session_slot *sl) {
         cached = (pm.prompt_cut > 0 && !trivial) ? pm.prompt_cut : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
-    /* L155 (2026-09-02): the thinking-visible resolution used to run only when
-     * the token match was ZERO.  For a thinking-chat continuation it never is:
-     * the rendered prompt shares the system and user turns with the live
-     * history and diverges at the assistant turn's think tag (the client
-     * replays visible content; the template renders a closed think block), so
-     * memory-token matched 27-odd tokens, won, and sync rewound the whole
-     * assistant turn -- discarding exactly the reasoning KV the binding exists
-     * to keep and re-prefilling the answer on every turn (30/30 continuations
-     * in the L154 witness, after the ROUTE had correctly chosen the slot on the
-     * binding).  The routing comment already says the token prefix "must not
-     * out-vote the binding"; now the resolution follows it: when the slot's
-     * binding matches, the live frontier is the continuation and it wins over
-     * a shorter token match.  Protocol-bound resolutions (Responses/Anthropic
-     * tool state) still take precedence -- only memory-token is out-voted. */
-    if (cached == 0 || !strcmp(cache_source, "memory-token")) {
-        int thinking_cached =
-            s->thinking_live_visible_prefix_prompt(sl, &j->req, old_pos,
-                                                &effective_prompt);
-        if (thinking_cached > cached) {
-            if (cached > 0)
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: thinking-visible continuation keeps live=%d "
-                           "over token match=%d",
-                           thinking_cached, cached);
-            cached = thinking_cached;
-            cache_source = "thinking-visible";
-            thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
-        }
-    }
-    int disk_cached = 0;
-    uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0) {
-        int text_cached = s->live_text_prefix_prompt(sl, &j->req, &effective_prompt);
-        if (text_cached > 0) {
-            cached = text_cached;
-            cache_source = "memory-text";
-            prompt_for_sync = &effective_prompt;
-        }
-    }
     if (cached == 0 && old_pos > 0) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
@@ -954,11 +821,6 @@ void server::gen_begin(session_slot *sl) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
-    } else if (thinking_live_continuation) {
-        server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
-                   cached,
-                   prompt_tokens);
     }
     if (responses_visible_replay_without_reasoning) {
         /* The request replays a prior tool-call turn but omits the hidden
@@ -1029,7 +891,6 @@ void server::gen_begin(session_slot *sl) {
     g->responses_protocol = responses_protocol;
     g->responses_live_continuation = responses_live_continuation;
     g->anthropic_live_continuation = anthropic_live_continuation;
-    g->thinking_live_continuation = thinking_live_continuation;
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
      * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
@@ -1139,7 +1000,6 @@ void server::gen_stream_begin(session_slot *sl) {
      * a binding only when this request explicitly continued from it. */
     if (!g->responses_live_continuation) s->responses_live_clear(sl);
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
-    if (!g->thinking_live_continuation) s->thinking_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
     /* An image prompt's KV is never checkpointed: its sentinel ids cannot be
@@ -1905,16 +1765,12 @@ void server::gen_step_finish(session_slot *sl) {
         pulsar_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
     {
-        /* Tool call with thinking on: the reasoning is in the live KV, and the
-         * client replays this turn with the reasoning preserved (agentic clients
-         * echo reasoning_content so the model keeps its chain of thought), so we
-         * remember the reasoning-PRESERVED bytes the next request will render as a
-         * key and keep the live tokens — the next request byte-matches the key and
-         * continues from live KV (or a disk-reloaded checkpoint keyed by the same
-         * visible transcript) with no rebuild. */
-        s->remember_tool_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
-                                          parsed_content ? parsed_content : "",
-                                          parsed_reasoning, &parsed_calls);
+        /* Tool call with thinking on: nothing to remember or rewrite (L264).  A
+         * client that replays the reasoning byte-matches the live KV through it;
+         * one that strips it resumes from this turn's prompt-end grid checkpoint.
+         * Either way the next request's sync finds its own resume point, so the
+         * canonical rewrite below -- which would re-render hidden reasoning --
+         * stays out of this turn. */
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         s->should_canonicalize_tool_checkpoint(&parsed_calls))
@@ -1928,15 +1784,6 @@ void server::gen_step_finish(session_slot *sl) {
         s->canonicalize_tool_checkpoint(sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        s->thinking_live_clear(sl);
-    } else if (parsed_calls.len) {
-        s->thinking_live_clear(sl);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &g->thinking, final_finish)) {
-        s->remember_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        s->thinking_live_clear(sl);
     }
 
     if (!strcmp(final_finish, "error")) {

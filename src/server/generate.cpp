@@ -287,23 +287,6 @@ char *build_invalid_dsml_tool_error_suffix(const request *r,
 
 
 
-bool should_remember_thinking_checkpoint(const request *r,
-                                                const thinking_state *thinking,
-                                                const char *finish) {
-    if (!r || r->kind != REQ_CHAT) return false;
-    /* has_tools is NOT a disqualifier: a client can advertise tools and still
-     * strip reasoning on replay (openwebui).  prompt_preserves_reasoning now
-     * reflects the client's ACTUAL replay behavior, so it is the sole gate;
-     * remember_thinking_checkpoint renders the tool-context vs toolless form. */
-    if (r->prompt_preserves_reasoning) return false;
-    if (!pulsar_think_mode_enabled(r->think_mode)) return false;
-    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
-    if (thinking && thinking->inside) return false;
-    return true;
-}
-
-
-
 /* The assistant turn after prompt_text's generation prefix ("<｜Assistant｜>"
  * + "<think>" or "</think>") as the model SAMPLED it: reasoning, think closed,
  * content, DSML, and the EOS only when the turn sampled one (a tool-call turn
@@ -372,41 +355,6 @@ char *build_responses_visible_assistant_suffix(const request *r,
                                                       const tool_calls *calls) {
     return build_responses_visible_assistant_suffix_spans(r, content, reasoning, calls,
                                                           NULL, NULL);
-}
-
-
-
-/* In thinking mode without tools, old assistant reasoning is intentionally not
- * rendered back into later prompts.  The sampled live graph still contains the
- * reasoning bytes, so the next request would miss the session cache even though
- * the visible conversation prefix is logically the same.
- *
- *   prompt-without-final-<think> + </think> + visible-content + eos
- *
- * is exactly the visible prefix that render_chat_prompt_text() will produce on
- * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
- * that caused long post-answer pauses and threw away useful sampled state.
- * Instead, remember the visible bytes as a key for the current sampled frontier.
- * The next request can then continue from live KV while tokenizing only the new
- * visible suffix. */
-char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
-    if (!r || !r->prompt_text) return NULL;
-    if (!pulsar_think_mode_enabled(r->think_mode)) return NULL;
-
-    size_t pt_len = strlen(r->prompt_text);
-    const char *think_tag = "<think>";
-    size_t tag_len = strlen(think_tag);
-    if (pt_len < tag_len ||
-        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
-        return NULL;
-    }
-
-    buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    /* the stripped turn: no opener, the think close, the content, EOS */
-    append_assistant_turn_close(&visible, true, NULL, content, NULL, r->chat_v41);
-    return buf_take(&visible);
 }
 
 

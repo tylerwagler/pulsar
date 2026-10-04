@@ -335,8 +335,6 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
     }
     const char *active_tool_schemas;
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     /* L223: keep the client-data ranges; the tokeniser below turns a spelling
      * inside client text into ordinary tokens instead of a control token. */
     free(r->prompt_spans);
@@ -614,8 +612,6 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas;
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     /* L223: keep the client-data ranges; the tokeniser below turns a spelling
      * inside client text into ordinary tokens instead of a control token. */
     free(r->prompt_spans);
@@ -1760,8 +1756,6 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
         s->kv_cache_restore_tool_memory_for_messages(&msgs);
         s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
     }
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     /* L223: keep the client-data ranges; the tokeniser below turns a spelling
      * inside client text into ordinary tokens instead of a control token. */

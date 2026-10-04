@@ -4480,38 +4480,6 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
 
 
 
-static void test_thinking_checkpoint_remember_gate(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = PULSAR_THINK_HIGH;
-    thinking_state st = {.inside = true};
-
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-
-    st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
-
-    r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.prompt_preserves_reasoning = false;
-    r.has_tools = true;
-    /* has_tools is NOT a disqualifier since the openwebui/opencode replay
-     * fixes: a client can advertise tools and still strip reasoning on
-     * replay, so prompt_preserves_reasoning is the sole gate (see
-     * should_remember_thinking_checkpoint). The old expectation here was
-     * stale from before that change. */
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.has_tools = false;
-    r.think_mode = PULSAR_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-
-    request_free(&r);
-}
-
-
-
 static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
@@ -5538,91 +5506,6 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
 
 
 
-static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
-    /* Simulate: user sends a single message, thinking mode on, no tools.
-     * Model generates reasoning + content.  The next request will drop the
-     * reasoning from this turn.  Verify that:
-     *   prompt_text[:-len("<think>")] + "</think>" + content + "<|eos|>"
-     * equals what render_chat_prompt_text produces for the history. */
-
-    chat_msgs prefix_msgs = {0};
-    chat_msg user1 = {0};
-    user1.role = xstrdup("user");
-    user1.content = xstrdup("What is 2+2?");
-    chat_msgs_push(&prefix_msgs, user1);
-
-    /* This is what prompt_text looks like for the first generation */
-    char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, PULSAR_THINK_HIGH);
-    /* prompt_text should end with <think> */
-    size_t pt_len = strlen(prompt_text);
-    TEST_ASSERT(pt_len >= 7);
-    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
-
-    /* The model generates: reasoning + </think> + content */
-    const char *reasoning = "Let me think... 2+2 = 4";
-    const char *content = "The answer is 4.";
-
-    /* Build the canonical checkpoint text (what we'd produce after canonicalization) */
-    buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
-    buf_puts(&canonical, "</think>");
-    buf_puts(&canonical, content);
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
-
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = PULSAR_THINK_HIGH;
-    r.prompt_text = xstrdup(prompt_text);
-    char *visible = build_toolless_thinking_visible_text(&r, content);
-    TEST_ASSERT(visible != NULL);
-    TEST_ASSERT(!strcmp(visible, canonical.ptr));
-    free(visible);
-    request_free(&r);
-
-    /* Now build what the NEXT request would render: history includes this
-     * assistant message, plus a new user message.  Extract just the prefix
-     * up to and including the eos of the assistant turn. */
-    chat_msgs history_msgs = {0};
-    chat_msg h_user1 = {0};
-    h_user1.role = xstrdup("user");
-    h_user1.content = xstrdup("What is 2+2?");
-    chat_msgs_push(&history_msgs, h_user1);
-    chat_msg h_asst = {0};
-    h_asst.role = xstrdup("assistant");
-    h_asst.reasoning = xstrdup(reasoning);
-    h_asst.content = xstrdup(content);
-    chat_msgs_push(&history_msgs, h_asst);
-    chat_msg h_user2 = {0};
-    h_user2.role = xstrdup("user");
-    h_user2.content = xstrdup("Thanks!");
-    chat_msgs_push(&history_msgs, h_user2);
-
-    char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, PULSAR_THINK_HIGH);
-
-    /* The future prompt should START with our canonical text */
-    size_t clen = canonical.len;
-    TEST_ASSERT(strlen(future_prompt) > clen);
-    TEST_ASSERT(!memcmp(future_prompt, canonical.ptr, clen));
-
-    /* And what comes after is the new user turn + assistant prefix */
-    const char *rest = future_prompt + clen;
-    TEST_ASSERT(strstr(rest, "Thanks!") != NULL);
-    TEST_ASSERT(strstr(rest, "<think>") != NULL);  /* new turn starts thinking */
-
-    /* Verify reasoning is NOT in the future prompt for this turn */
-    const char *asst_turn = strstr(future_prompt, "<" "\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c" ">");
-    TEST_ASSERT(asst_turn != NULL);
-    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);  /* reasoning dropped */
-
-    free(future_prompt);
-    buf_free(&canonical);
-    free(prompt_text);
-    chat_msgs_free(&prefix_msgs);
-    chat_msgs_free(&history_msgs);
-}
-
-
-
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -6009,6 +5892,26 @@ static void test_session_eviction_victim_selection(void) {
  * UPSTREAM of this classifier in choose_slot_for_job and is untouched;
  * its slot lookup needs a live session frontier, so it is exercised by the
  * e2e gates rather than here. */
+/* L264 S3: the router's in-place verdict for the best-scoring free bank. */
+static void test_l264_route_in_place(void) {
+    const int ceil = 5000, floor_ = 157;
+    /* the same conversation (match past the scaffolding): in place, however
+     * much the bank holds past the resume point -- the reasoning-stripped
+     * agent turn: frontier 51233, resume 44416, common 44534 */
+    TEST_ASSERT(server_route_in_place(44534, 44416, 51233, ceil, floor_));
+    /* an unrelated conversation that shares only the scaffolding, against a
+     * bank with real warmth past the resume point: fresh preferred */
+    TEST_ASSERT(!server_route_in_place(4800, 4736, 30000, ceil, floor_));
+    /* ...unless what it would discard is under the protect floor */
+    TEST_ASSERT(server_route_in_place(4800, 4736, 4736 + floor_ - 1, ceil, floor_));
+    TEST_ASSERT(!server_route_in_place(4800, 4736, 4736 + floor_, ceil, floor_));
+    /* an empty bank is simply free */
+    TEST_ASSERT(server_route_in_place(0, 0, 0, ceil, floor_));
+    /* a match at the ceiling is the conversation; one below it is not */
+    TEST_ASSERT(server_route_in_place(ceil, 0, 30000, ceil, floor_));
+    TEST_ASSERT(!server_route_in_place(ceil - 1, 0, 30000, ceil, floor_));
+}
+
 static void test_slot_route_trivial_match_decision(void) {
     const int T = PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
     /* Legacy single-threshold behavior: share_ceiling == protect_floor == T. */
@@ -6053,66 +5956,6 @@ static void test_slot_route_trivial_match_decision(void) {
     /* raised ceiling must NOT change the protect side: a slot with only a
      * sub-floor tail past a shared-prefix match is still reused, not protected */
     TEST_ASSERT(!server_slot_match_is_trivial(1500, 1500 + T - 1, CEIL, T));
-}
-
-
-
-/* Routing probe for thinking chats (task #30): a slot whose live thinking
- * binding byte-matches the request's visible transcript is that
- * conversation's warm continuation, even when the token common prefix is
- * header-short (the client replays visible content; the slot's sampled
- * frontier holds the hidden reasoning). choose_slot_for_job must route such
- * a request back to its slot instead of provisioning a "fresh conversation"
- * slot for it. Host fields only — the session is never touched (the caller
- * passes the live position). */
-static void test_thinking_binding_routes_visible_continuation(void) {
-    server s;
-    memset(&s, 0, sizeof(s));
-    pthread_mutex_init(&s.tool_mu, NULL);
-
-    char vis[] = "<BOS>sys<U>hi<A></think>hello<EOS>";
-    session_slot sl;
-    memset(&sl, 0, sizeof(sl));
-    sl.thinking_live.valid = true;
-    sl.thinking_live.visible_text = vis;
-    sl.thinking_live.visible_len = strlen(vis);
-    sl.thinking_live.live_tokens = 40;
-
-    char prompt[] = "<BOS>sys<U>hi<A></think>hello<EOS><U>again";
-    request req;
-    memset(&req, 0, sizeof(req));
-    req.kind = REQ_CHAT;
-    req.api = API_OPENAI;
-    req.prompt_text = prompt;
-
-    /* the continuation matches its slot at the remembered frontier */
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == strlen(vis));
-    /* frontier moved (slot served someone else meanwhile): stale, no match */
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 41) == 0);
-    /* a different conversation sharing only the header must not match —
-     * longer than the binding key so the BYTE COMPARE is what rejects it,
-     * not the visible_len < prompt_len guard (2026-07-16 review) */
-    char other[] = "<BOS>sys<U>completely different much longer conversation";
-    req.prompt_text = other;
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == 0);
-    /* an exact replay (no new suffix) is not a continuation */
-    char exact[] = "<BOS>sys<U>hi<A></think>hello<EOS>";
-    req.prompt_text = exact;
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == 0);
-    /* owner-routed protocols resolve via live call ids upstream; the probe
-     * must not claim them */
-    req.prompt_text = prompt;
-    req.api = API_RESPONSES;
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == 0);
-    req.api = API_OPENAI;
-    req.kind = REQ_COMPLETION;
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == 0);
-    /* invalidated binding (clobbered/evicted slot) never matches */
-    req.kind = REQ_CHAT;
-    sl.thinking_live.valid = false;
-    TEST_ASSERT(s.thinking_live_binds_prompt(&sl, &req, 40) == 0);
-
-    pthread_mutex_destroy(&s.tool_mu);
 }
 
 
@@ -7202,21 +7045,15 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         free(prompt_text);
     }
 
-    /* 6. toolless: historical reasoning is stripped, and the toolless visible
-     *    key is a prefix of the next turn's replay */
+    /* 6. toolless: historical reasoning is stripped, and a reasoning-carrying
+     *    assistant turn after the last user message replays it */
     {
         chat_msgs tl = {0};
         chat_msgs_push(&tl, l185_msg("user", "hi", NULL));
         char *prompt_text = render_chat_prompt_text(&tl, NULL, NULL, PULSAR_THINK_HIGH);
-        request r;
-        request_init(&r, REQ_CHAT, 128);
-        r.think_mode = PULSAR_THINK_HIGH;
-        r.prompt_text = xstrdup(prompt_text);
-        char *visible = build_toolless_thinking_visible_text(&r, "hello");
         chat_msgs_push(&tl, l185_msg("assistant", "hello", "greet"));
         chat_msgs_push(&tl, l185_msg("user", "thanks", NULL));
         char *future = render_chat_prompt_text(&tl, NULL, NULL, PULSAR_THINK_HIGH);
-        TEST_ASSERT(visible && !strncmp(future, visible, strlen(visible)));
         TEST_ASSERT(strstr(future, "<｜User｜>hi<｜Assistant｜></think>hello<｜end▁of▁sentence｜>"
                                    "<｜User｜>thanks<｜Assistant｜><think>") != NULL);
         /* an assistant turn AFTER the last user message replays its reasoning */
@@ -7226,8 +7063,6 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         tl.len = 3;
         free(prefill);
         free(future);
-        free(visible);
-        request_free(&r);
         free(prompt_text);
         chat_msgs_free(&tl);
     }
@@ -7446,32 +7281,6 @@ static void test_l179_superseded_pick_prefers_redundant_history(void) {
     TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
 }
 
-/* L179 branch 6 (ii) -- the eviction overlay's usability rule
- * (warm_match_usable, worker_protect_queued_warm_matches). Invariant: a
- * queued job's best match protects its bank iff best_common >=
- * warm_partial_min AND (best_common == frontier -- a full fork, no ring probe
- * -- OR the partial cut is ring-feasible, feasible_rc == PULSAR_FORK_OK). A
- * ring-scrolled or otherwise infeasible cut is dead warmth and stays
- * evictable; below the minimum nothing is protected. */
-static void test_l179_warm_match_usable_rule(void) {
-    const int min = 64;
-    /* partial cut at / above the minimum, ring feasible: usable */
-    TEST_ASSERT(warm_match_usable(min, min, 500, PULSAR_FORK_OK));
-    TEST_ASSERT(warm_match_usable(200, min, 500, PULSAR_FORK_OK));
-    /* below the minimum: not, even when feasible */
-    TEST_ASSERT(!warm_match_usable(min - 1, min, 500, PULSAR_FORK_OK));
-    TEST_ASSERT(!warm_match_usable(0, min, 500, PULSAR_FORK_OK));
-    /* ring-scrolled (or any other refusal): dead warmth */
-    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_RING_SCROLLED));
-    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_EVICTED));
-    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_SHALLOW));
-    /* full fork at the frontier: usable regardless of the probe value */
-    TEST_ASSERT(warm_match_usable(500, min, 500, PULSAR_FORK_OK));
-    TEST_ASSERT(warm_match_usable(500, min, 500, PULSAR_FORK_RING_SCROLLED));
-    /* ...but a full match below the minimum is still not */
-    TEST_ASSERT(!warm_match_usable(min - 1, min, min - 1, PULSAR_FORK_OK));
-}
-
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
  * pulsar_session_bank_fork_pinned reads false, bank_touched_kv_bytes 0).
  * Invariant: bank 0 is never a victim; nothing in the live decode set is;
@@ -7548,64 +7357,6 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
     /* growth alone can breach an empty pool: nothing resident to drop, so
      * every victim is "spilled" to no effect and the caller back-pressures */
     TEST_ASSERT(guard_spill_plan(0, 2 * GiB, GiB, drops, 3) == 3);
-}
-
-/* L179 branch 3 -- choose_slot_for_job's cross-wire divergent route
- * (divergent_route_decision). Invariant: no best, or best_common >=
- * frontier (a linear continuation), is NOT_DIVERGENT; a divergent match
- * (best_common < frontier) routes to a FRESH bank when one was provisioned,
- * else QUEUEs while any job is active (its finish frees a bank, and there is
- * a live reader to protect), else continues IN_PLACE (no bank will ever
- * free and nothing live can be corrupted -- the deadlock-avoidance
- * fallthrough). */
-static void test_l179_divergent_route_four_ways(void) {
-    /* linear continuation / past the frontier: not divergent, whatever else */
-    TEST_ASSERT(divergent_route_decision(true, 500, 500, false, true) == ROUTE_NOT_DIVERGENT);
-    TEST_ASSERT(divergent_route_decision(true, 500, 500, true, false) == ROUTE_NOT_DIVERGENT);
-    TEST_ASSERT(divergent_route_decision(true, 600, 500, true, true) == ROUTE_NOT_DIVERGENT);
-    /* no best: not divergent even with a would-be divergent geometry */
-    TEST_ASSERT(divergent_route_decision(false, 0, 0, true, true) == ROUTE_NOT_DIVERGENT);
-    TEST_ASSERT(divergent_route_decision(false, 5, 500, false, true) == ROUTE_NOT_DIVERGENT);
-    /* divergent with a fresh bank: FRESH, active or not */
-    TEST_ASSERT(divergent_route_decision(true, 7, 500, true, true) == ROUTE_FRESH);
-    TEST_ASSERT(divergent_route_decision(true, 7, 500, true, false) == ROUTE_FRESH);
-    /* divergent, pool full, a live job: QUEUE */
-    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, true) == ROUTE_QUEUE);
-    TEST_ASSERT(divergent_route_decision(true, 499, 500, false, true) == ROUTE_QUEUE);
-    /* divergent, pool full, nothing running: IN_PLACE */
-    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) == ROUTE_IN_PLACE);
-    TEST_ASSERT(divergent_route_decision(true, 0, 1, false, false) == ROUTE_IN_PLACE);
-    /* the caller's first probe (no fresh, no active) is a divergence test:
-     * it must never read NOT_DIVERGENT for a divergent match */
-    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) != ROUTE_NOT_DIVERGENT);
-}
-
-/* L179 branch 5 -- the commit after choose_slot_for_job's warm-advance-in-place
- * (since 2026-09-06 the route for every divergent match on an idle bank, not
- * only at a full pool). The commit moves exactly two fields: committed_pos to
- * the engine's resume position and the continued-store watermark to 0 (the cut
- * moved the frontier backward; a stale watermark would refuse every continued
- * checkpoint). */
-static void test_l179_warm_inplace_commit_moves_two_fields(void) {
-    session_slot sl;
-    memset(&sl, 0, sizeof sl);
-    sl.provisioned = true;
-    sl.bank = 3;
-    sl.committed_pos = 165045;               /* the old frontier */
-    sl.continued_last_store_tokens = 160000; /* a watermark ABOVE the cut */
-    sl.state = SLOT_IDLE;
-    sl.ctx_size = 262144;
-    sl.est_cost_bytes = 7;
-    sl.tokens_emitted = 11;
-    sl.prefill_counted = 13;
-    sl.last_serviced_us = 17;
-    warm_inplace_commit(&sl, 164800);        /* the R-aligned cut of common 164812 */
-    TEST_ASSERT(sl.committed_pos == 164800);
-    TEST_ASSERT(sl.continued_last_store_tokens == 0);
-    /* nothing else on the slot moved */
-    TEST_ASSERT(sl.provisioned && sl.bank == 3 && sl.state == SLOT_IDLE);
-    TEST_ASSERT(sl.ctx_size == 262144 && sl.est_cost_bytes == 7 && sl.tokens_emitted == 11);
-    TEST_ASSERT(sl.prefill_counted == 13 && sl.last_serviced_us == 17);
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
@@ -8237,7 +7988,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
     test_slot_route_trivial_match_decision();
-    test_thinking_binding_routes_visible_continuation();
+    test_l264_route_in_place();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
@@ -8319,7 +8070,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
-    test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
@@ -8345,7 +8095,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
-    test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
@@ -8387,11 +8136,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l185_every_renderer_produces_the_authority_bytes();
     test_l192_tool_history_validation_is_nearest_preceding();
     test_l179_superseded_pick_prefers_redundant_history();
-    test_l179_warm_match_usable_rule();
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
-    test_l179_divergent_route_four_ways();
-    test_l179_warm_inplace_commit_moves_two_fields();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
     test_l179_mixed_giveup_only_on_recoverable_prefill_reject();

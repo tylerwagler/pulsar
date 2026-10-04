@@ -198,7 +198,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -948,14 +948,6 @@ cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
 # non-grouped path at those widths, same byte-identity demand as the 2-bank run.
 cuda-mixed-neutrality-gate-wide: tests/mixed_neutrality_gate
 	PULSAR_GATE_NDEC=12 PULSAR_MSEQ_BANKS=13 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
-
-# plan-33 inc B: 3-way output-equality harness (server-level; see the script).
-warm-fork-3way: pulsar-server
-	bash tests/warm_fork_3way.sh $(FRONTIER_MODEL)
-
-# plan-33 inc D: partial-prefix fork 3-way output-equality harness (server-level).
-warm-partial-fork-3way: pulsar-server
-	bash tests/warm_partial_fork_3way.sh $(FRONTIER_MODEL)
 
 # ---- client-side serving gates (stdlib Python; need a RUNNING pulsar-server) ----
 # These measure what a client experiences, so they talk HTTP to an already-started
