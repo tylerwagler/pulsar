@@ -2234,13 +2234,6 @@ void pulsar_session::invalidate() {
     pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
-    {
-        const uint32_t b = gpu_graph_cur_bank(&s->graph);
-        /* plan-33 inc C: a partial cut's boundary-row stash describes the replay
-         * that followed it.  A new conversation's emits start over row 0, so the
-         * hook must not byte-restore the dead conversation's row. */
-        s->graph.ms_emit_keep[b] = 0u;
-    }
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
      * attended over the PREVIOUS request's window rows for its first ~128

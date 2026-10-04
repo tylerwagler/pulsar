@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 19u           /* v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 20u           /* v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -452,8 +452,7 @@ int pulsar_tp_send_note_prefilled(pulsar_tp *tp, uint64_t session_id,
 int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
-/* `partial` selects BANK_FORK_PARTIAL over BANK_FORK; the payload is the same. */
-int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
+int pulsar_tp_send_bank_fork(pulsar_tp *tp, uint64_t session_id,
                              uint32_t src, uint32_t dst,
                              const int *tokens, uint32_t n_tokens, int n_cached);
 /* Increment 3.  `common` rides the token header beside the tokens. */
@@ -643,7 +642,7 @@ typedef enum {
     PULSAR_TP_FRAME_BANK_STATE_RESTORE = 21,
     PULSAR_TP_FRAME_BANK_REPOINT = 22,
     PULSAR_TP_FRAME_BANK_FORK = 23,
-    PULSAR_TP_FRAME_BANK_FORK_PARTIAL = 24,
+    /* 24 was BANK_FORK_PARTIAL, retired with the partial fork (L264, v20). */
     /* Increment 3: the rest of the server's mutating surface.  REWRITE is a
      * verdict frame whose result enum includes -1 (ERROR), so the wire status
      * is result + 1 (a negative wire status stays a worker refusal).
@@ -763,7 +762,7 @@ typedef struct {
     uint32_t n_items;
     /* FUSED_BATCH: the step's shape. */
     pulsar_fused_shape fused;
-    /* BANK_FORK / BANK_FORK_PARTIAL: the banks and the shared-prefix length;
+    /* BANK_FORK: the banks and the shared-prefix length;
      * the request tokens ride `tokens`/`n_tokens`.  The bank of a save /
      * restore / repoint rides `value`. */
     int32_t bank_src;

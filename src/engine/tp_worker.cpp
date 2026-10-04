@@ -591,18 +591,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         return worker_ack(e, c->session_id, status, err, errlen);
     }
 
-    case PULSAR_TP_FRAME_BANK_FORK:
-    case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
-        const bool partial = c->type == PULSAR_TP_FRAME_BANK_FORK_PARTIAL;
-        const char *op = partial ? "partial bank fork" : "bank fork";
+    case PULSAR_TP_FRAME_BANK_FORK: {
+        const char *op = "bank fork";
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
-            status = partial
-                ? slot->s->bank_fork_partial((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
-                                             c->tokens, (int)c->n_tokens, c->n_cached)
-                : slot->s->bank_fork((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
-                                     c->tokens, (int)c->n_tokens, c->n_cached);
-            if (status < 0) status = PULSAR_FORK_EINVAL;   /* a verdict is never negative */
+            status = slot->s->bank_fork((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
+                                        c->tokens, (int)c->n_tokens, c->n_cached);
+            if (status < 0) status = 1;   /* a verdict is never negative */
         } else {
             fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         }

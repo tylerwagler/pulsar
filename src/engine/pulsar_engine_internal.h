@@ -1481,39 +1481,6 @@ typedef struct {
      * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
      * initialised with the graph. */
     uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
-    /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment C).
-     * ms_emit_keep[bank] is the boundary-row restore threshold: 0 = inactive (a
-     * full-prefix fork clears it; the partial cut sets R/ratio + 1 and the emit
-     * hook overwrites the recomputed boundary row with the packed stash while
-     * row0 < it).  An overlapping compressor (coff 2, 0731's ratio 4) pools a
-     * group's row from tokens on BOTH sides of the group, so the row at the cut
-     * is not reproducible from the replay's own rows; a coff-1 compressor's
-     * boundary row is, and its threshold is never armed. */
-    uint32_t ms_emit_keep[PULSAR_MSEQ_MAX];  ///< boundary-row restore threshold; 0 = inactive
-    /** Boundary-row stash (increment C): one PACKED row per (bank, layer) -- the
-     * overlapping compressor's comp row R/ratio and (where the source has one)
-     * its index-K row, copied byte-for-byte at fork_copy_cut and byte-REPLACED
-     * over the replay's recomputed row by gpu_graph_emit_keep_restore (never
-     * re-encoded: bit-exact for the MXFP8 pack AND the non-idempotent MXFP4 QAT
-     * alike).  Sized n_banks * PULSAR_N_LAYER * row_bytes at slab alloc; NULL
-     * when the pool is disabled. */
-    pulsar_gpu_tensor *emit_stash_comp;   ///< stashed packed comp row per (bank, layer)
-    pulsar_gpu_tensor *emit_stash_index;  ///< stashed packed index row per (bank, layer)
-
-    /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
-     * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
-     * NOT already hold: the raw window [G - raw_window, G) of every layer and the
-     * overlapping (coff 2) sources' recurrent lanes, attention and indexer.  The
-     * compressed and index-K rows below G/ratio are append-only, so a checkpoint
-     * references them through the frontier instead of copying them; a coff-1
-     * (ratio-128) lane is canonical-empty at a 128 boundary and is reset, not
-     * stored.  ckpt_pos[bank][slot] is the slot's G, 0 = empty.  A checkpoint is
-     * valid while its bank still holds rows [0, G/ratio) unmodified: lowering the
-     * frontier below that drops it (gpu_graph_set_n_comp), and replacing a bank's
-     * rows wholesale drops all of its checkpoints (gpu_graph_ckpt_drop_bank). */
-    pulsar_gpu_tensor *ckpt_slab[PULSAR_MSEQ_MAX];  ///< per bank, PULSAR_CKPT_SLOTS slots of ckpt_slot_bytes; [0] only without a pool
-    uint64_t ckpt_slot_bytes;                       ///< one checkpoint: raw window rows + coff-2 lanes
-    uint32_t ckpt_pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS];  ///< the grid point each slot holds; 0 = empty
 
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
@@ -2461,18 +2428,6 @@ struct pulsar_session {
     /** Is `bank` pinned against eviction because a fork is cloning from it?
      * The guard's victim picker must not free physical pages mid-clone. */
     bool bank_fork_pinned(uint32_t bank) const;
-    /** PARTIAL-prefix fork: clone only the shared prefix, cut at a ratio-4
-     * boundary, and replay the rest.
-     * @param src       bank to clone FROM
-     * @param dst       bank to clone INTO
-     * @param tokens    the full prompt the forked bank should hold
-     * @param n_tokens  its length
-     * @param n_cached  shared prefix length to cut at
-     * @return tokens reused, negative on failure. */
-    int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
-    /** Would a partial fork from `src` at `n_cached` reuse enough to be worth
-     * it? @return the reusable token count, 0 when a cold prefill is better. */
-    int bank_fork_partial_feasible(uint32_t src, int n_cached);
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
@@ -3313,10 +3268,6 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
 /** Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
  * KV into dst + mirror frontier counters. Caller validates + pins src first. */
 bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
-/** plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.cpp). */
-uint32_t pulsar_partial_fork_base_align(void);
-bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t dst,
-                                  uint32_t R, uint32_t src_len);
 
 /** L264 grid checkpoints (checkpoint.cpp; layout at pulsar_gpu_graph::ckpt_slab).
  * Allocated with the graph -- one slab per bank, priced by the dry run like
@@ -3337,6 +3288,8 @@ bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
 uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
 /** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
 void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
+/** A full-prefix fork made dst a byte copy of src: dst takes src's checkpoints. */
+bool gpu_graph_ckpt_copy_bank(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
 /** The session payload carries one checkpoint as opaque slot bytes (layout:
  * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
  * claim: a slot for an incoming G, emptied until commit marks it filled. */
@@ -3361,12 +3314,6 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t 
  * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il);
-/** plan-33 inc C: after an emit wrote rows [row0, row0+rows) for kv source `il`
- * on `bank`, byte-replace the overlapping compressor's boundary row with the
- * stash a partial cut left.  `indexer` selects the index-K lane.  A no-op for a
- * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
-bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
-                                 uint32_t row0, uint32_t rows, bool indexer);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

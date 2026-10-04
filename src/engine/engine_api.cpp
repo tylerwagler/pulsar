@@ -291,7 +291,6 @@ uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_
 /* The bank wrappers are defined with the mirror below (increment 2). */
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
 
-int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, int n_cached) { return s ? s->bank_fork_partial_feasible(src, n_cached) : PULSAR_FORK_EINVAL; }
 
 /* ---------------------------------------------------------------------------
  * Slice 4e: lockstep mirroring of the session's input -- the LEADER half.
@@ -1009,32 +1008,28 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
     const int own = s->bank_state_restore(bank) ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, "bank state restore", own, 1) == 0;
 }
-static int tp_mirror_bank_fork(pulsar_session *s, int partial, uint32_t src, uint32_t dst,
+static int tp_mirror_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
                                const int *tokens, int n_tokens, int n_cached) {
-    const char *operation = partial ? "partial bank fork" : "bank fork";
+    const char *operation = "bank fork";
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) {
-        return partial ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached)
-                       : s->bank_fork(src, dst, tokens, n_tokens, n_cached);
-    }
+    if (!tp) return s->bank_fork(src, dst, tokens, n_tokens, n_cached);
     char err[256];
     if (tp_mirror_worker_drives_nothing(tp, operation, err, sizeof(err)) ||
         tp_mirror_dead(tp, err, sizeof(err))) {
         fprintf(stderr, "pulsar: %s\n", err);
-        return PULSAR_FORK_EINVAL;
+        return 1;
     }
-    if (n_tokens < 0 || (n_tokens > 0 && !tokens)) return PULSAR_FORK_EINVAL;
+    if (n_tokens < 0 || (n_tokens > 0 && !tokens)) return 1;
     if (!tp_mirror_sent(tp, operation,
-                        pulsar_tp_send_bank_fork(tp, partial, s->tp_session_id, src, dst,
+                        pulsar_tp_send_bank_fork(tp, s->tp_session_id, src, dst,
                                                  tokens, (uint32_t)n_tokens, n_cached),
-                        NULL, 0)) return PULSAR_FORK_EINVAL;
-    const int own = partial ? s->bank_fork_partial(src, dst, tokens, n_tokens, n_cached)
-                            : s->bank_fork(src, dst, tokens, n_tokens, n_cached);
-    return tp_mirror_bank_verdict(s, tp, operation, own, PULSAR_FORK_EINVAL);
+                        NULL, 0)) return 1;
+    const int own = s->bank_fork(src, dst, tokens, n_tokens, n_cached);
+    return tp_mirror_bank_verdict(s, tp, operation, own, 1);
 }
 int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
     PULSAR_NVTX_FN();
-    return s ? tp_mirror_bank_fork(s, 0, src, dst, tokens, n_tokens, n_cached) : 1;
+    return s ? tp_mirror_bank_fork(s, src, dst, tokens, n_tokens, n_cached) : 1;
 }
 /* ---- The eviction guard's spill path (increment 6).  KV is replicated per
  * rank, so a spill is per rank to its own disk.  The snapshot's identity is
@@ -1115,10 +1110,6 @@ int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char
 int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_kv(s, 1, bank, fp, err, errlen) : 1;
-}
-int pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
-    PULSAR_NVTX_FN();
-    return s ? tp_mirror_bank_fork(s, 1, src, dst, tokens, n_tokens, n_cached) : PULSAR_FORK_EINVAL;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }

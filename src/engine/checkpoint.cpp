@@ -171,9 +171,7 @@ bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G) {
         fprintf(stderr, "pulsar: grid checkpoint restore to %u on bank %u: copy failed\n", G, bank);
         return false;
     }
-    /* A boundary stash describes a cut that no longer exists, and the stale
-     * flag a lane that is now exact. */
-    g->ms_emit_keep[bank] = 0u;
+    /* The stale flag described a lane that is now exact. */
     g->ms_comp_state_stale[bank] = false;
     for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS; k++)
         if (g->ckpt_pos[bank][k] > G) g->ckpt_pos[bank][k] = 0u;
@@ -215,6 +213,19 @@ bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **s
 
 void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G) {
     if (slot < PULSAR_CKPT_SLOTS) g->ckpt_pos[gpu_graph_cur_bank(g)][slot] = G;
+}
+
+bool gpu_graph_ckpt_copy_bank(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
+    if (src >= PULSAR_MSEQ_MAX || dst >= PULSAR_MSEQ_MAX || !g->ckpt_slab[src] || !g->ckpt_slab[dst]) return false;
+    gpu_graph_ckpt_drop_bank(g, dst);
+    for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS; k++) {
+        if (g->ckpt_pos[src][k] == 0u) continue;
+        const uint64_t off = (uint64_t)k * g->ckpt_slot_bytes;
+        if (pulsar_gpu_tensor_copy_async(g->ckpt_slab[dst], off, g->ckpt_slab[src], off, g->ckpt_slot_bytes) == 0)
+            return false;
+        g->ckpt_pos[dst][k] = g->ckpt_pos[src][k];
+    }
+    return true;
 }
 
 void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank) {

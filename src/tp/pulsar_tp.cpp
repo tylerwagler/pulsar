@@ -3740,7 +3740,7 @@ typedef struct {
     uint32_t count;      /* request tokens following the header */
 } pulsar_tp_fork_command_header;
 
-int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
+int pulsar_tp_send_bank_fork(pulsar_tp *tp, uint64_t session_id,
                              uint32_t src, uint32_t dst,
                              const int *tokens, uint32_t n_tokens, int n_cached) {
     const uint64_t bytes64 = sizeof(pulsar_tp_fork_command_header) + (uint64_t)n_tokens * sizeof(int32_t);
@@ -3752,8 +3752,7 @@ int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire = reinterpret_cast<int32_t *>(payload + sizeof(h));
     for (uint32_t i = 0; i < n_tokens; i++) wire[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame_to_peers(tp,
-            partial ? PULSAR_TP_FRAME_BANK_FORK_PARTIAL : PULSAR_TP_FRAME_BANK_FORK, payload, bytes);
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_BANK_FORK, payload, bytes);
     free(payload);
     return ok;
 }
@@ -4490,8 +4489,7 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->session_id = h.session_id;
         break;
     }
-    case PULSAR_TP_FRAME_BANK_FORK:
-    case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
+    case PULSAR_TP_FRAME_BANK_FORK: {
         pulsar_tp_fork_command_header h;
         if (bytes < sizeof(h)) { ok = 0; break; }
         memcpy(&h, payload, sizeof(h));
