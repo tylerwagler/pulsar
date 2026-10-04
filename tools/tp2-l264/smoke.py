@@ -149,10 +149,9 @@ def phase_guard(st):
         r = again[s]
         show(f"H resend {s}", r)
         # The answer must match.  The whole output is reported, not graded: these
-        # decode two banks at a time, and the batch a bank decodes in differs
-        # between the runs (observed 2026-10-04: the same answer, reasoning that
-        # diverged mid-way, with the resume itself byte-exact) -- open question,
-        # see README "Reasoning drift under concurrency".
+        # decode two banks at a time, and batched decode is not bitwise
+        # deterministic by design (a speed tradeoff) -- see README "Reasoning
+        # drift under concurrency".
         leg(f"H resend {s}: same answer after the guard's spill/restore", r["status"] == 200 and
             r["answer"] == first[s]["answer"])
         if r["text"] != first[s]["text"]:
