@@ -1482,6 +1482,21 @@ typedef struct {
      * initialised with the graph. */
     uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
 
+    /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
+     * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
+     * NOT already hold: the raw window [G - raw_window, G) of every layer and the
+     * overlapping (coff 2) sources' recurrent lanes, attention and indexer.  The
+     * compressed and index-K rows below G/ratio are append-only, so a checkpoint
+     * references them through the frontier instead of copying them; a coff-1
+     * (ratio-128) lane is canonical-empty at a 128 boundary and is reset, not
+     * stored.  ckpt_pos[bank][slot] is the slot's G, 0 = empty.  A checkpoint is
+     * valid while its bank still holds rows [0, G/ratio) unmodified: lowering the
+     * frontier below that drops it (gpu_graph_set_n_comp), and replacing a bank's
+     * rows wholesale drops all of its checkpoints (gpu_graph_ckpt_drop_bank). */
+    pulsar_gpu_tensor *ckpt_slab[PULSAR_MSEQ_MAX];  ///< per bank, PULSAR_CKPT_SLOTS slots of ckpt_slot_bytes; [0] only without a pool
+    uint64_t ckpt_slot_bytes;                       ///< one checkpoint: raw window rows + coff-2 lanes
+    uint32_t ckpt_pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS];  ///< the grid point each slot holds; 0 = empty
+
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
     pulsar_gpu_tensor *batch_positions;   ///< DEVICE copy of ms_positions, read by the kernels
