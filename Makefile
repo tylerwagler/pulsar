@@ -1467,13 +1467,13 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                comp_state_gate chunk_neutrality_gate session_payload_gate tp_head_split_gate \
                decode_reference_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
-tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h
+tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
 	@mkdir -p tests/runner
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
 tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
-tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o $(CORE_OBJS)
+tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # The runner receives exactly what the individual targets passed: the prefill
 # baseline blob and its ref, the reference-capture dir (skips loudly when
