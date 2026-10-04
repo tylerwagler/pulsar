@@ -82,10 +82,7 @@ model.  Record pass/fail against the release commit:
   (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the
   shipped artifact and the gate cannot certify the release.  Rebuild the blob
   with `make cuda-prefill-gate-baseline` after bumping the ref.
-- `make cuda-evict-restore-gate` and `make cuda-fork-gate` — bank evict/restore
-  bit-identity and fork==cold oracle (covers warm-fork routing).  Since L115
-  the fork validators compare BYTES, not token ids, so this gate also covers
-  forking a conversation onto its own history across token-boundary seams.
+- `make cuda-evict-restore-gate` — bank evict/restore bit-identity.
 - `make cuda-rewind-gate` — compressor frontier position-truth across ghost
   rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
   ratio-128 boundary, plus the value leg (a ghost rewind must not contaminate

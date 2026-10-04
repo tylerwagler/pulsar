@@ -3727,31 +3727,6 @@ int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t ban
     return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, bank);
 }
 
-typedef struct {
-    uint64_t session_id;
-    int32_t src;
-    int32_t dst;
-    int32_t n_cached;
-    uint32_t count;      /* request tokens following the header */
-} pulsar_tp_fork_command_header;
-
-int pulsar_tp_send_bank_fork(pulsar_tp *tp, uint64_t session_id,
-                             uint32_t src, uint32_t dst,
-                             const int *tokens, uint32_t n_tokens, int n_cached) {
-    const uint64_t bytes64 = sizeof(pulsar_tp_fork_command_header) + (uint64_t)n_tokens * sizeof(int32_t);
-    if (!tp || (n_tokens && !tokens) || bytes64 > UINT32_MAX) return 0;
-    const uint32_t bytes = (uint32_t)bytes64;
-    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
-    if (!payload) return 0;
-    pulsar_tp_fork_command_header h = { session_id, (int32_t)src, (int32_t)dst, (int32_t)n_cached, n_tokens };
-    memcpy(payload, &h, sizeof(h));
-    int32_t *wire = reinterpret_cast<int32_t *>(payload + sizeof(h));
-    for (uint32_t i = 0; i < n_tokens; i++) wire[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_BANK_FORK, payload, bytes);
-    free(payload);
-    return ok;
-}
-
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
  * and pulsar_tp_wait_command_status_digest (want_digest 1). */
 static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen);
@@ -4337,25 +4312,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         memcpy(command->logits, payload + sizeof(h), (size_t)h.count * sizeof(float));
         command->n_logits = h.count;
         command->session_id = h.session_id;
-        break;
-    }
-    case PULSAR_TP_FRAME_BANK_FORK: {
-        pulsar_tp_fork_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        const uint64_t want = sizeof(h) + (uint64_t)h.count * sizeof(int32_t);
-        if (want != bytes) { ok = 0; break; }
-        command->session_id = h.session_id;
-        command->bank_src = h.src;
-        command->bank_dst = h.dst;
-        command->n_cached = h.n_cached;
-        if (h.count) {
-            command->tokens = static_cast<int *>(malloc((size_t)h.count * sizeof(int)));
-            if (!command->tokens) { ok = -1; break; }
-            const int32_t *wire = reinterpret_cast<const int32_t *>(payload + sizeof(h));
-            for (uint32_t i = 0; i < h.count; i++) command->tokens[i] = wire[i];
-        }
-        command->n_tokens = h.count;
         break;
     }
     case PULSAR_TP_FRAME_SYNC_MM: {

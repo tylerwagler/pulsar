@@ -866,15 +866,6 @@ static int evict_reset_slot_fields(session_slot *sl) {
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
-     * eviction (belt-and-suspenders — fork and evict are both worker-thread ops
-     * and never interleave, but the invariant "a pinned source is never freed"
-     * must hold for both eviction paths). */
-    if (s->pool_banks > 0 && s->sess) {
-        for (int i = 0; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
-            if (pulsar_session_bank_fork_pinned(s->sess, s->slots[i].bank)) protect[i] = true;
-        }
-    }
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect,
                                             /*allow_slot0=*/s->pool_banks > 0);
     if (vi < 0) return false;
@@ -962,8 +953,8 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
  * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
  * host-carry reads routing already uses on idle banks; no CUDA, no install). */
 /* The supersession scan itself (L179 branch 6), over injected per-slot facts:
- * a is a CANDIDATE iff eligible[a] (provisioned, idle, not fork-pinned -- the
- * caller's engine reads), not protected, and hist_len[a] > 0 (an empty bank
+ * a is a CANDIDATE iff eligible[a] (provisioned and idle -- the caller's
+ * reads), not protected, and hist_len[a] > 0 (an empty bank
  * is plain LRU's business). Slot k SUPERSEDES a iff frontier[k] > hist_len[a]
  * (k is strictly longer; an unprovisioned k has frontier 0) AND common[a][k]
  * >= hist_len[a] (a's whole history is k's prefix). Among superseded
@@ -1001,8 +992,7 @@ int server::pick_superseded_idle(const bool *protect) {
     const int *common[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->n_slots; i++) {
         const session_slot *a = &s->slots[i];
-        eligible[i] = a->provisioned && !a->active_job &&
-                      !pulsar_session_bank_fork_pinned(pool, a->bank);
+        eligible[i] = a->provisioned && !a->active_job;
         hist[i] = eligible[i] ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
         hist_len[i] = hist[i] ? hist[i]->len : 0;
         frontier[i] = s->slot_frontier_pos(a);      /* 0 when unprovisioned */
@@ -1510,8 +1500,6 @@ int server::guard_pick_victim(session_slot **dec, int n) {
     for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->active_job) continue;
-        /* plan-33: never free a bank that is a live fork SOURCE mid-clone. */
-        if (pulsar_session_bank_fork_pinned(pool, sl->bank)) continue;
         bool live = false;
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;

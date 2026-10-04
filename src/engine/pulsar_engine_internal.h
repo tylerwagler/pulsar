@@ -1476,11 +1476,6 @@ typedef struct {
     bool ms_comp_state_stale[PULSAR_MSEQ_MAX];
     uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
     uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
-    /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33). fork_pin[bank] is a
-     * transient eviction pin so the guard's victim picker cannot free_physical
-     * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
-     * initialised with the graph. */
-    uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
 
     /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
      * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
@@ -2148,7 +2143,7 @@ typedef struct pulsar_bank_carry {
     int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
     /** L226: mirror of pulsar_session::live_image_fp / _barrier -- the image
      * identity travels with the bank, exactly like the checkpoint it describes,
-     * so a fork or a bank switch can never pair one conversation's barrier with
+     * so a bank switch can never pair one conversation's barrier with
      * another's KV. */
     uint64_t  live_image_fp;
     int       live_image_barrier;
@@ -2159,7 +2154,6 @@ typedef struct pulsar_bank_carry {
      * gpu_graph_bank_counters_install and then clears it unconditionally.  The
      * old mirror field was write-only (saved, never read) and has been dropped. */
     pulsar_spec_carry_state spec;
-    void copy(const pulsar_bank_carry *sc);  ///< was bank_carry_copy
     void free_one();  ///< was bank_carry_free_one
 } pulsar_bank_carry;
 
@@ -2381,7 +2375,7 @@ struct pulsar_session {
      * figure, which is below the reserved capacity on a short session. */
     uint64_t touched_kv_bytes() const;
 
-    /* ---- Tier-2 bank pool: physical residency, spill, fork ---------------- */
+    /* ---- Tier-2 bank pool: physical residency, spill --------------------- */
 
     /** Release one idle bank's ctx-scaled physical pages (cudaFree on its managed
      * comp/index allocations). The only reclaim primitive that actually returns
@@ -2399,20 +2393,6 @@ struct pulsar_session {
      * `q` -- the admission question "can this session take another step" priced
      * before committing to it. */
     uint64_t quantum_growth_bytes_per_bank(uint32_t q);
-    /** FULL-prefix fork: clone `src`'s committed KV into `dst` and continue
-     * there, leaving the trunk intact for other siblings. This is what makes a
-     * branching conversation cheap -- the shared history is copied, not
-     * recomputed.
-     * @param src       bank to clone FROM; left intact
-     * @param dst       bank to clone INTO
-     * @param tokens    the full prompt the forked bank should hold
-     * @param n_tokens  its length
-     * @param n_cached  how many of `tokens` are already committed in src
-     * @return tokens reused, negative on failure. */
-    int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
-    /** Is `bank` pinned against eviction because a fork is cloning from it?
-     * The guard's victim picker must not free physical pages mid-clone. */
-    bool bank_fork_pinned(uint32_t bank) const;
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
@@ -2785,7 +2765,7 @@ static inline bool gpu_graph_layer_has_comp_state(uint32_t il) {
  * indexer.  0731's ratio-128 HCA layers are kv sources that run none, so they
  * publish no index pool, own no index base table and store no index rows -- the
  * single authority every index-pool consumer asks (the allocator, the sizing
- * estimate, the bank snapshot, the fork's checksum). */
+ * estimate, the bank snapshot). */
 static inline bool gpu_graph_layer_has_index_pool(uint32_t il) {
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     return pulsar_attn_owns_kv(a->mode) && pulsar_attn_runs_indexer(a->mode);
@@ -3244,9 +3224,6 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
  * server checks this before restoring on a returning request.
  */
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
-/** Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
- * KV into dst + mirror frontier counters. Caller validates + pins src first. */
-bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
 
 /** L264 grid checkpoints (checkpoint.cpp; layout at pulsar_gpu_graph::ckpt_slab).
  * Allocated with the graph -- one slab per bank, priced by the dry run like
@@ -3267,8 +3244,6 @@ bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
 uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
 /** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
 void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
-/** A full-prefix fork made dst a byte copy of src: dst takes src's checkpoints. */
-bool gpu_graph_ckpt_copy_bank(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
 /** The session payload carries one checkpoint as opaque slot bytes (layout:
  * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
  * claim: a slot for an incoming G, emptied until commit marks it filled. */

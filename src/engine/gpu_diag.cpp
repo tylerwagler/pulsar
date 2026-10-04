@@ -649,9 +649,9 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
      * That holds for eviction, but NOT for a FAILED (re)allocation:
      * gpu_graph_bank_alloc_physical can fail partway and leave layers 0..k
      * allocated, at which point a layer-0 sample reports the bank LIVE while it
-     * is really half-built — and bank_fork_copy would then read NULL/garbage
-     * slabs from it (silent cross-conversation KV corruption).  A bank is only
-     * "live" when every compressed layer has the physical it is entitled to --
+     * is really half-built — and a consumer would then read NULL slabs from
+     * it.  A bank is only "live" when every compressed layer has the physical
+     * it is entitled to --
      * an index pool only where the layer runs an indexer, so an unindexed
      * source's absent index slab is not eviction. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -662,70 +662,10 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
     return false;
 }
 
-/* Tier-2 PATH-A FULL-PREFIX FORK (plan-33 increment A). Device-side D2D clone of
- * bank `src`'s entire committed KV into bank `dst`: per layer the raw ring (whole
- * bank region — position-indexed, stale slots harmlessly copied), the comp
- * frontier rows (ms_n_comp[src] rows at offset 0 of the split alloc), the index-K
- * frontier rows, and the compressor state lanes; the per-bank frontier counters
- * are mirrored src->dst. No captured-graph invalidation (pure
- * D2D + host counters). The CALLER (pulsar_session_bank_fork) has already memcmp-
- * validated the request prefix against src's committed history and pinned src
- * against eviction — this routine performs the copy only. Refuses if src is
- * evicted (no physical to clone; the caller restores from disk first) and
- * reallocs dst if it was freed. Returns false on a bad geometry / copy error. */
-bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
-    if (!g || g->banks.n_banks == 0) return false;
-    if (src >= g->banks.n_banks || dst >= g->banks.n_banks || src == dst) return false;
-    if (gpu_graph_bank_is_evicted(g, src)) return false;   /* caller restores src first */
-    if (gpu_graph_bank_is_evicted(g, dst) && !gpu_graph_bank_alloc_physical(g, dst)) return false;
-    pulsar_bank_slabs *b = &g->banks;
-    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
-    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
-    gpu_graph_ckpt_drop_bank(g, dst);   /* L264: dst's rows are replaced wholesale */
-    bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        /* Raw ring: copy the whole bank region (bounded by raw_cap; the ring is
-         * position-indexed so any stale slots are never read at dst's pos). */
-        ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
-                                 b->raw[il], (uint64_t)src * b->raw_bank_bytes,
-                                 b->raw_bank_bytes) != 0;
-        if (!ok || !gpu_graph_layer_is_kv_source(il)) continue;
-        gpu_graph_set_n_comp(g, dst, il, g->ms_n_comp[src][il]);
-        const uint64_t rows = g->ms_n_comp[src][il];
-        if (rows) {
-            ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, rows * attn_row) != 0;
-            if (ok && gpu_graph_layer_has_index_pool(il))
-                ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, rows * idx_row) != 0;
-        }
-        if (ok && b->astate_bank_bytes[il]) {
-            ok = pulsar_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                     b->askv[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                     b->astate_bank_bytes[il]) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                             b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                             b->astate_bank_bytes[il]) != 0;
-        }
-        /* V4's indexer-compressor lane is a second recurrent lane and clones with
-         * the rest of the bank. */
-        if (ok && b->istate_bank_bytes[il]) {
-            ok = pulsar_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                     b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                     b->istate_bank_bytes[il]) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                             b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                             b->istate_bank_bytes[il]) != 0;
-        }
-    }
-    /* L264: the clone holds src's rows byte for byte, so src's grid
-     * checkpoints describe it too. */
-    if (ok) ok = gpu_graph_ckpt_copy_bank(g, src, dst);
-    return ok;
-}
-
 /* A ratio-2 kv source's compressor state at any EVEN position is the canonical
  * empty group (the two rows were consumed at the emit; the next two stores
  * rewrite both before the next emit reads them): kv 0, score -INF -- what a
- * cold prefill that ends on an even position leaves.  A rewound or forked bank
+ * cold prefill that ends on an even position leaves.  A rewound bank
  * holds whatever its frontier left; reset it so the continuation's state is
  * the cold prefill's byte for byte.  Ratio-1 sources keep no state. */
 static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {

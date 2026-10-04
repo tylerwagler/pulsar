@@ -354,8 +354,8 @@ worker "blocks in the wrapper", read "the loop applies the frame".
   slice deviates from its objective on safety grounds rather than preference.
 - **Banks are a LIVENESS gap, not a safety gap (round 10).**  Bank *selection*
   for decodes is already mirrored: the rows carry bank ids, and the worker
-  decodes into the leader's banks.  Bank *contents* are not -- `bank_fork`,
-  `bank_fork_partial`, `bank_state_save`/`_restore` and eviction are the server
+  decodes into the leader's banks.  Bank *contents* are not --
+  `bank_state_save`/`_restore` and eviction are the server
   scheduler's own decisions (`server_sched.cpp`), made against LOCAL memory
   state, so a pair whose schedulers diverge would decode a leader-chosen bank
   whose KV does not match on the worker.

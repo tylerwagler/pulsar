@@ -198,7 +198,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -776,13 +776,8 @@ cuda-accounting-gate: tests/accounting_gate
 
 # Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
 # memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
-cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
+cuda-evict-restore-gate: tests/bank_evict_restore_gate
 	PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
-
-# Tier-2 PATH-A full-prefix fork gate (plan-33 inc A): fork==cold oracle. See
-# tests/bank_fork_gate.c. MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=3.
-cuda-fork-gate: tests/bank_fork_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
 
 # Session payload SAVE -> LOAD round trip. Nothing covered this before
 # 2026-08-18, and the gap hid a raw-ring stride bug that read past the end of
@@ -1462,7 +1457,7 @@ SPEC_TF_POSITIONS ?= 2000
 # standalone binaries above are the same sources built without those defines.
 RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe token_seam_gate \
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
-               bank_evict_restore_gate bank_fork_gate algo_stability_gate mixed_prefill_gate \
+               bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate session_payload_gate tp_head_split_gate \
                decode_reference_gate
@@ -1689,7 +1684,7 @@ gates: tests/gates_runner pulsar-eval
 # classified by the lane it belongs to and mapped to a sub-gate list below; the
 # runner runs them in ONE process (--only=), so the tier pays a single engine
 # open.  The mapping is deliberately NARROW: the expensive general gates
-# (chunk-neutrality, prefill, spec-sampling, fork, accounting, rewind) stay in
+# (chunk-neutrality, prefill, spec-sampling, accounting, rewind) stay in
 # `make gates` only, and the always-on block -- seam-check, the reap-router
 # audit, and the host-only pulsar_test switches -- is cheap and lane-independent.
 # GATES_DEV_ONLY="a b" overrides the selection outright (the runner refuses an
@@ -1898,9 +1893,6 @@ tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
 
-tests/bank_fork_gate.o: tests/bank_fork_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.cpp
-
 tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/session_payload_gate.cpp
 
@@ -2048,9 +2040,6 @@ tests/comp_state_gate: tests/comp_state_gate.o src/lib/pulsar_help.o $(CORE_OBJS
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/session_payload_gate: tests/session_payload_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -2292,7 +2281,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

@@ -19,7 +19,7 @@
  * before quantising: the reference quantises a bf16 tensor and our staging
  * carries fp32.
  *
- * Quantise EXACTLY ONCE, here.  Every later move of a row (ring scatter, fork,
+ * Quantise EXACTLY ONCE, here.  Every later move of a row (ring scatter,
  * evict/restore, session payload) is a byte move; there is no re-encode and no
  * conversion from any other format. */
 #include "pulsar_cuda_internal.h"

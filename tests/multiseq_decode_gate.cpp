@@ -43,8 +43,7 @@
  * L160 measured byte-identical to a fresh trajectory), so the gate prefills
  * MAXN + 1 times instead of once per bank per run.  Assertion 2 at N=MAXN
  * compares a snapshot-loaded run against the cold-prefilled one, so it also
- * witnesses load == cold prefill on this tree (cuda-fork-gate is the
- * dedicated check for the fork form of that identity).
+ * witnesses load == cold prefill on this tree.
  *
  * WHAT THIS GATE IS BLIND TO (do not add it here -- it is S6's job in the
  * frontier gate): per-row POSITIONS.  reqs[k].pos below is a function of the

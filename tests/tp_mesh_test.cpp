@@ -694,13 +694,12 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
-    /* Increment 2: the bank frames and the VERDICT collector.  Four rounds:
+    /* Increment 2: the bank frames and the VERDICT collector.  Three rounds:
      * a void save followed by an acked restore (a stray ack from the save
-     * would be read by the restore's collect and fail it); a partial fork
-     * whose workers all answer the same nonzero verdict (a fork refusal code
-     * is a result, not a failure); a SPLIT verdict at n>=3 that the collector
-     * must refuse while still draining every peer's ack; and a negative
-     * status, which is a worker's refusal, never a verdict. */
+     * would be read by the restore's collect and fail it); a SPLIT verdict at
+     * n>=3 that the collector must refuse while still draining every peer's
+     * ack; and a negative status, which is a worker's refusal, never a
+     * verdict. */
     {
         const uint64_t sid = 0xC0DE7000ULL;
         char cerr[256];
@@ -712,12 +711,6 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             CHECK(pulsar_tp_wait_command_status(tp, sid, "bank state restore", &status, cerr, sizeof(cerr)) &&
                   status == 0,
                   "rank 0 restore verdict: want agreed 0, got rc/status %d (%s)", status, cerr);
-            const int toks[6] = { 5, 6, 7, 8, 9, 10 };
-            CHECK(pulsar_tp_send_bank_fork(tp, sid, 3u, 4u, toks, 6u, 5) != 0, "rank 0 fork send failed");
-            status = -99;
-            CHECK(pulsar_tp_wait_command_status(tp, sid, "bank fork", &status, cerr, sizeof(cerr)) &&
-                  status == 3,
-                  "rank 0 fork verdict: want agreed 3, got %d (%s)", status, cerr);
             /* split verdict (n>=3 only: with one worker there is nobody to disagree) */
             CHECK(pulsar_tp_send_bank_repoint(tp, sid, 1u) != 0, "rank 0 repoint send failed");
             status = -99;
@@ -757,17 +750,6 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             else {
                 CHECK(cmd.type == PULSAR_TP_FRAME_BANK_STATE_RESTORE && cmd.value == 2, "rank %d restore frame", rank);
                 CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d restore ack failed", rank);
-                pulsar_tp_command_free(&cmd);
-            }
-            /* fork: fields + tokens survive the wire; verdict 3 */
-            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d fork recv: %s", rank, cerr);
-            else {
-                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_FORK && cmd.session_id == sid &&
-                      cmd.bank_src == 3 && cmd.bank_dst == 4 && cmd.n_cached == 5 && cmd.n_tokens == 6 &&
-                      cmd.tokens && cmd.tokens[0] == 5 && cmd.tokens[5] == 10,
-                      "rank %d fork frame fields: src %d dst %d n_cached %d n_tokens %u",
-                      rank, cmd.bank_src, cmd.bank_dst, cmd.n_cached, cmd.n_tokens);
-                CHECK(pulsar_tp_send_command_ack(tp, sid, 3), "rank %d fork ack failed", rank);
                 pulsar_tp_command_free(&cmd);
             }
             /* repoint(1): rank 1 says 0, every other worker says 1 -> split at n>=3 */

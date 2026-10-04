@@ -16,7 +16,7 @@
  * rank never created is a divergence and is refused by name.
  *
  * Acked frames (create, sync, eval, batched and mixed decode, bank restore /
- * repoint / fork) always answer,
+ * repoint) always answer,
  * even with a refusal: a rank that stays silent hangs the leader into its
  * deadline instead of failing it at once.  Void frames (destroy, rewind,
  * invalidate, rng state) cannot answer; a refusal there marks the pair failed
@@ -391,19 +391,6 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             status = restore ? (slot->s->bank_state_restore((uint32_t)c->value) ? 0 : 1)
                              : slot->s->bank_repoint((uint32_t)c->value);
             if (status < 0) status = 1;
-        } else {
-            fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
-        }
-        return worker_ack(e, c->session_id, status, err, errlen);
-    }
-
-    case PULSAR_TP_FRAME_BANK_FORK: {
-        const char *op = "bank fork";
-        int status = -1;
-        if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
-            status = slot->s->bank_fork((uint32_t)c->bank_src, (uint32_t)c->bank_dst,
-                                        c->tokens, (int)c->n_tokens, c->n_cached);
-            if (status < 0) status = 1;   /* a verdict is never negative */
         } else {
             fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         }

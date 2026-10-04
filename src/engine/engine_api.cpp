@@ -289,7 +289,6 @@ bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { re
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { return s ? s->bank_touched_kv_bytes(bank) : 0; }
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { return s->quantum_growth_bytes_per_bank(q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
-bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank) { return s ? s->bank_fork_pinned(bank) : false; }
 
 
 /* ---------------------------------------------------------------------------
@@ -889,7 +888,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
 int pulsar_session_bank_count(pulsar_session *s) { return s ? s->bank_count() : 0; }
 /* ---- The bank surface (increment 2).  Bank SELECTION already rode the
  * decode rows; these mirror the leader scheduler's bank DECISIONS -- save,
- * restore, repoint, fork, partial fork -- so both ranks' pools hold the same
+ * restore, repoint -- so both ranks' pools hold the same
  * state.  The leader's decision is the authority and the ordinal names the
  * target.  save is void and fire-and-forget; the others return a verdict the
  * ranks must AGREE on: the same inputs on the same state give the same
@@ -985,29 +984,6 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
                         NULL, 0)) return false;
     const int own = s->bank_state_restore(bank) ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, "bank state restore", own, 1) == 0;
-}
-static int tp_mirror_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
-                               const int *tokens, int n_tokens, int n_cached) {
-    const char *operation = "bank fork";
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return s->bank_fork(src, dst, tokens, n_tokens, n_cached);
-    char err[256];
-    if (tp_mirror_worker_drives_nothing(tp, operation, err, sizeof(err)) ||
-        tp_mirror_dead(tp, err, sizeof(err))) {
-        fprintf(stderr, "pulsar: %s\n", err);
-        return 1;
-    }
-    if (n_tokens < 0 || (n_tokens > 0 && !tokens)) return 1;
-    if (!tp_mirror_sent(tp, operation,
-                        pulsar_tp_send_bank_fork(tp, s->tp_session_id, src, dst,
-                                                 tokens, (uint32_t)n_tokens, n_cached),
-                        NULL, 0)) return 1;
-    const int own = s->bank_fork(src, dst, tokens, n_tokens, n_cached);
-    return tp_mirror_bank_verdict(s, tp, operation, own, 1);
-}
-int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached) {
-    PULSAR_NVTX_FN();
-    return s ? tp_mirror_bank_fork(s, src, dst, tokens, n_tokens, n_cached) : 1;
 }
 /* ---- The eviction guard's physical-bank pair (increment 6): verdicts, each
  * rank frees or allocates its own replicated bank. */

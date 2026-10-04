@@ -225,7 +225,7 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
         if (pulsar_session_eval(s, toks->v[first + i], err, errlen) != 0) goto done;
     }
     if (cut > 0) {
-        /* a partial fork's cut / an edited tail: the bank is rewound BELOW its
+        /* an edited tail (a client that drops what it saw): the bank is rewound BELOW its
          * prefill frontier; the resume must start at the grid point below the
          * cut (the dogfood case of 2026-09-06 12:08 was cold from 0 here) */
         pulsar_session_rewind(s, cut);

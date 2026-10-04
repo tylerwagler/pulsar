@@ -341,17 +341,6 @@ uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
 /** Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
-/** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
- * Clone bank `src`'s committed KV + host carry into bank `dst` (dst continues src's
- * conversation; the caller re-prefills only the divergent suffix). VALIDATES the
- * request tokens[0..n_cached) against src's committed history BEFORE any device
- * write (mismatch/short history -> refuse, non-zero return -> caller cold-prefills);
- * n_cached must equal src's committed length (full-prefix). Pins src against the
- * eviction guard for the clone. Returns 0 on success. fork_pinned: whether a bank
- * is currently mid-fork (the guard's victim picker must skip it). */
-int  pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
-                           const int *tokens, int n_tokens, int n_cached);
-bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank);
 /** GPU bytes the session's create allocated (allocator delta measured across
  * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the
  * same context and pool size -- the server asserts it after each create. */
@@ -512,8 +501,7 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
 
 /** L115 — THE prefix-reuse authority.  Every "can this state serve this
  * prompt, and from which cut?" decision (routing, the worker's cache
- * resolver, session sync, and the bank fork validators) asks this and
- * nothing else.
+ * resolver, session sync) asks this and nothing else.
  *
  * The comparison is over BYTES, not token ids: generated text freezes the
  * boundaries the model SAMPLED into the live history, while the client's

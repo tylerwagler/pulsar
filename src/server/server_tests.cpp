@@ -6754,7 +6754,7 @@ static void test_l179_superseded_pick_prefers_redundant_history(void) {
 }
 
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
- * pulsar_session_bank_fork_pinned reads false, bank_touched_kv_bytes 0).
+ * bank_touched_kv_bytes reads 0).
  * Invariant: bank 0 is never a victim; nothing in the live decode set is;
  * unprovisioned, spilled and bound slots are skipped; among the rest the
  * smallest last_serviced_us wins (touched-bytes tie-break, then first
