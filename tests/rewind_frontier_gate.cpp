@@ -18,20 +18,22 @@
  *   3. the incident anatomy in miniature: after a boundary-crossing rewind,
  *      sync a continuation (the incremental prefill path — the one that
  *      preserved the skew in production) and re-assert at the new frontier;
- *   4. VALUE leg (L120 value-half): a ghost rewind with a DIVERGENT ghost
- *      branch, then byte-compare the re-emitted attn+index comp rows of
- *      every ratio-4 layer against a never-ghosted control.  The scenario
- *      deliberately avoids crossing a 128-emit boundary so it asserts the
- *      ratio-4 claim in isolation;
- *   5. RATIO-128 leg (L124): the same divergent-ghost shape SHIFTED so the
- *      ghost span crosses the first 128-emit boundary (ghosts 126..129,
- *      rewind to 126).  Ghost stores past the boundary alias the slots of
- *      committed positions g-128, and the re-emit of comp row 0 fires at
- *      re-decode of position 127 -- BEFORE re-decode reaches the aliased
- *      owners -- pooling wrong-POSITION values.  The undo log restores the
- *      aliased slots byte-exactly on rewind; this leg byte-compares the
- *      re-emitted ratio-128 comp row 0 across every ratio-128 layer against
- *      a never-ghosted control.
+ *   4. VALUE leg (L264): a ghost rewind with a DIVERGENT ghost branch, then
+ *      the continuation, byte-compared on the re-emitted attn+index comp rows
+ *      of every ratio-4 layer against a control that took the SAME rewind
+ *      after ghosts that were the true tokens.  Since L264 a rewind off a grid
+ *      checkpoint leaves the bank stale and the continuation's sync restores
+ *      the checkpoint at 128 and re-prefills from there, so both sessions run
+ *      one computation and differ only in what the ghosts were: any trace of
+ *      the divergent branch is a byte difference;
+ *   5. RATIO-128 leg (L124): the same shape SHIFTED so the ghost span crosses
+ *      the first 128-emit boundary (ghosts 126..129, rewind to 126) -- the
+ *      shape whose ghost stores alias committed ratio-128 slots.  With no
+ *      checkpoint below 126 the continuation rebuilds from 0, and comp row 0
+ *      of every ratio-128 layer must match the true-ghost control;
+ *   6. STALE leg (L264): a decode straight after a rewind off a grid
+ *      checkpoint must REFUSE -- the bank's lanes and window describe a
+ *      position it no longer stands at -- and a sync must clear it.
  *
  * MODEL-DEPENDENT, GPU-resident.  Run under the memory discipline.  NOT part
  * of `make test`.
@@ -327,7 +329,14 @@ int GATE_ENTRY(int argc, char **argv) {
      * row 30 is a pre-rewind sanity row, row 31 is the re-emitted group
      * [124..127] (the window-contamination target), row 32 is the first
      * post-heal group. */
-    const uint64_t ctl = value_leg_hash(e, &toks, NULL);
+    /* The control's "ghosts" are the true tokens: same rewind, same resume. */
+    pulsar_tokens true_branch;
+    memset(&true_branch, 0, sizeof(true_branch));
+    true_branch.v = (int *)malloc(sizeof(int) * 4);
+    true_branch.len = true_branch.cap = 4;
+    for (int i = 0; i < 4; i++) true_branch.v[i] = toks.v[142 + i];
+    const uint64_t ctl = value_leg_hash(e, &toks, &true_branch);
+    free(true_branch.v);
     pulsar_tokens ghost_branch;
     memset(&ghost_branch, 0, sizeof(ghost_branch));
     ghost_branch.v = (int *)malloc(sizeof(int) * 4);
@@ -346,7 +355,13 @@ int GATE_ENTRY(int argc, char **argv) {
      * boundary; ghost stores at 128/129 alias committed slots 0/1; the
      * re-emit of ratio-128 comp row 0 at position 127 pools them.  With the
      * undo log the rewind restores the aliased slots byte-exactly. */
-    const uint64_t rctl = r128_leg_hash(e, &toks, NULL);
+    pulsar_tokens rtrue;
+    memset(&rtrue, 0, sizeof(rtrue));
+    rtrue.v = (int *)malloc(sizeof(int) * 4);
+    rtrue.len = rtrue.cap = 4;
+    for (int i = 0; i < 4; i++) rtrue.v[i] = toks.v[126 + i];
+    const uint64_t rctl = r128_leg_hash(e, &toks, &rtrue);
+    free(rtrue.v);
     pulsar_tokens rghost;
     memset(&rghost, 0, sizeof(rghost));
     rghost.v = (int *)malloc(sizeof(int) * 4);
@@ -360,6 +375,29 @@ int GATE_ENTRY(int argc, char **argv) {
           "r128 leg: boundary-crossing ghost rewind aliased committed slots "
           "into comp row 0 (ctl=%llx vic=%llx)",
           (unsigned long long)rctl, (unsigned long long)rvic);
+
+    /* ---- 6. STALE leg (L264): prefill past a grid point, rewind off it, and
+     * decode directly: the eval must refuse; a sync then restores the grid
+     * checkpoint and the decode goes through. */
+    {
+        pulsar_session *st = NULL;
+        if (pulsar_session_create(&st, e, 4096) != 0) { fprintf(stderr, "stale leg: session create failed\n"); goto done; }
+        char err[256];
+        bool leg_ok = sync_prefix(st, &toks, 200);
+        if (leg_ok) {
+            pulsar_session_rewind(st, 190);
+            const int erc = pulsar_session_eval(st, toks.v[190], err, sizeof(err));
+            CHECK(erc != 0, "stale leg: eval after a rewind off the grid did not refuse");
+            if (erc != 0) printf("  stale leg: eval refused as required (%s)\n", err);
+            leg_ok = sync_prefix(st, &toks, 191);
+            CHECK(leg_ok && pulsar_session_resume_origin(st) == 128,
+                  "stale leg: the sync resumed from %d, want the grid checkpoint 128",
+                  pulsar_session_resume_origin(st));
+            CHECK(pulsar_session_eval(st, toks.v[191], err, sizeof(err)) == 0,
+                  "stale leg: eval after the restoring sync failed: %s", err);
+        }
+        pulsar_session_free(st);
+    }
 
     rc = 0;
     }

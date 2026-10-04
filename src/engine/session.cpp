@@ -2287,7 +2287,14 @@ void pulsar_session::rewind(int pos) {
      * 0).  Nothing decodes from a rewound position directly: a rewind ends a
      * generation (a stop's ghost tail, L073) or is the first half of a sync. */
     bool ok = true;
-    if (pos == 0) ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
+    if (pos == 0) {
+        /* Position 0 is where a bank changes conversations (invalidate, a cold
+         * rebuild, an evicted bank's reuse): none of its checkpoints describes
+         * the next one, including those a spill kept while its frontier sat at 0
+         * and the clamp above therefore could not drop. */
+        gpu_graph_ckpt_drop_bank(&s->graph, rw_bank);
+        ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
+    }
     else if (gpu_graph_ckpt_best(&s->graph, rw_bank, (uint32_t)pos) == (uint32_t)pos)
         ok = gpu_graph_ckpt_restore(&s->graph, (uint32_t)pos);
     else {

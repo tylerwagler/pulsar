@@ -429,6 +429,13 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
     }
+    /* L264: the bank's grid checkpoints survived the spill (free_physical keeps
+     * them) and describe exactly the rows this load brings back -- but only if
+     * it brings them back.  Hold them aside; every failure below leaves them
+     * dropped, and the one success path reinstates them. */
+    uint32_t ckpt_keep[PULSAR_CKPT_SLOTS];
+    memcpy(ckpt_keep, g->ckpt_pos[bank], sizeof ckpt_keep);
+    gpu_graph_ckpt_drop_bank(g, bank);
     uint32_t hdr[5];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != PULSAR_BANK_KV_MAGIC ||
         hdr[1] != PULSAR_BANK_KV_VERSION || hdr[3] != (uint32_t)PULSAR_N_LAYER) {
@@ -487,6 +494,14 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) gpu_graph_set_n_comp(g, bank, il, comp_cnt[il]);
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
+    /* Reinstate each checkpoint whose rows the snapshot carried. */
+    for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS; k++) {
+        bool covered = ckpt_keep[k] != 0u;
+        for (uint32_t il = 0; covered && il < PULSAR_N_LAYER; il++)
+            if (gpu_graph_layer_is_kv_source(il) && comp_cnt[il] < ckpt_keep[k] / pulsar_layer_compress_ratio(il))
+                covered = false;
+        g->ckpt_pos[bank][k] = covered ? ckpt_keep[k] : 0u;
+    }
     return 0;
 }
 

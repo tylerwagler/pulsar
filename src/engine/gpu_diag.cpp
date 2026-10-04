@@ -598,8 +598,11 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = 0;
         g->ms_comp_hw[bank][il] = 0;
     }
-    /* L264: the rows a checkpoint references are gone with the pages. */
-    gpu_graph_ckpt_drop_bank(g, bank);
+    /* L264: the bank's grid checkpoints are KEPT.  Their slab is eager, the
+     * rows they reference come back bit-identical through bank_kv_load (which
+     * drops them on any failure), and a bank reused for another conversation
+     * goes through rewind(0), which drops them -- so the frontier zeroed above
+     * is the one write that must not count as "rows below G changed". */
     /* plan-33: an evicted bank's boundary stash is meaningless -- disarm the
      * emit-restore hook so a later cold refill cannot restore stale bytes. */
     g->ms_emit_keep[bank] = 0u;
