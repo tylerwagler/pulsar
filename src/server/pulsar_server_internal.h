@@ -11,7 +11,7 @@
  * self-contained backend seam (stdlib includes only). */
 #include "pulsar_gpu.h"
 #include "pulsar_help.h"
-#include "pulsar_kvstore.h"
+#include "pulsar_kvtext.h"
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
@@ -892,10 +892,6 @@ typedef struct {
     bool enabled;
     kv_cache_options opt;
 } kv_disk_cache;
-
-/** Longest chain a lookup or a store walks: a 1M-token conversation persisted
- * at prompt ends of ~2k tokens stays well under it. */
-#define PULSAR_KV_CHAIN_MAX 512
 
 /** Where a remembered tool entry came from. */
 typedef enum {

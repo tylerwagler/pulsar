@@ -158,33 +158,6 @@ static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, ch
 
 
 
-static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
-    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
-    int rc = 0;
-    pulsar_writeback wb;
-    pulsar_writeback_init(&wb, dst);
-    while (bytes != 0) {
-        const size_t n = bytes > PULSAR_SESSION_IO_CHUNK ? PULSAR_SESSION_IO_CHUNK : (size_t)bytes;
-        if (fread(buf, 1, n, src) != n) {
-            payload_set_err(err, errlen, "failed to read staged session payload");
-            rc = 1;
-            break;
-        }
-        if (fwrite(buf, 1, n, dst) != n) {
-            payload_set_err(err, errlen, "failed to write staged session payload");
-            rc = 1;
-            break;
-        }
-        bytes -= n;
-        pulsar_writeback_step(&wb);
-    }
-    free(buf);
-    if (rc == 0) pulsar_writeback_finish(&wb);
-    return rc;
-}
-
-
-
 /* An index-K pool exists only where the layer runs an indexer: 0731's ratio-128
  * (HCA) layers publish compressed KV and no indexer at all, so their
  * layer_index_comp_cache is never allocated.  One emit writes a comp row AND an
@@ -379,7 +352,6 @@ static int payload_read_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint
 
 
 
-
 uint64_t pulsar_session::payload_bytes() {
     auto *s = this;
     if (!s || !s->checkpoint_valid) return 0;
@@ -402,116 +374,6 @@ uint64_t pulsar_session::payload_bytes() {
     /* v10: the trailing digest, appended raw after the data. */
     bytes += sizeof(uint64_t);
     return bytes;
-}
-
-
-
-int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
-                                     FILE *fp, char *err, size_t errlen) {
-    if (!payload || !payload->path || !fp) {
-        payload_set_err(err, errlen, "invalid staged session payload");
-        return 1;
-    }
-    FILE *src = fopen(payload->path, "rb");
-    if (!src) {
-        payload_set_err(err, errlen, "failed to open staged session payload");
-        return 1;
-    }
-    int rc = payload_copy_file_bytes(src, fp, payload->bytes, err, errlen);
-    if (fclose(src) != 0 && rc == 0) {
-        payload_set_err(err, errlen, "failed to close staged session payload");
-        return 1;
-    }
-    return rc;
-}
-
-
-
-void pulsar_session_payload_file_free(pulsar_session_payload_file *payload) {
-    if (!payload) return;
-    if (payload->path) {
-        unlink(payload->path);
-        free(payload->path);
-    }
-    memset(payload, 0, sizeof(*payload));
-}
-
-
-
-int pulsar_session::stage_payload(pulsar_session_payload_file *out,
-                              const char *stage_dir,
-                              char *err, size_t errlen) {
-    auto *s = this;
-    if (!out) {
-        payload_set_err(err, errlen, "invalid session payload staging request");
-        return 1;
-    }
-    memset(out, 0, sizeof(*out));
-    if (!s || !s->checkpoint_valid) {
-        payload_set_err(err, errlen, "session has no valid checkpoint to stage");
-        return 1;
-    }
-
-    /* L110 F5: stage in the CALLER's disk directory, not /tmp. On the GB10
-     * serving box /tmp is tmpfs, and unified memory means a multi-GiB staged
-     * payload competes with GPU KV banks for the same physical pool -- worst
-     * at deep-session stores, exactly when memory is tightest. NULL falls
-     * back to /tmp for callers with no disk dir (tests). */
-    char tmpl[1024];
-    const int n = snprintf(tmpl, sizeof tmpl, "%s/ds4-session-payload.XXXXXX",
-                           stage_dir && stage_dir[0] ? stage_dir : "/tmp");
-    if (n < 0 || (size_t)n >= sizeof tmpl - 32) {
-        payload_set_err(err, errlen, "session payload staging dir path too long");
-        return 1;
-    }
-    int fd = mkstemp(tmpl);
-    /* Rename onto the house "<name>.tmp.<pid>" convention, which names the
-     * writer of a crash-abandoned staged file.  (The retired server kvstore's
-     * boot scan reclaimed these; the agent, the one stager now, has no such
-     * scan.)  Best-effort: on rename failure keep the mkstemp name. */
-    char named[1056];
-    if (fd >= 0) {
-        snprintf(named, sizeof named, "%s.tmp.%ld", tmpl, (long)getpid());
-        if (rename(tmpl, named) == 0) memcpy(tmpl, named, strlen(named) + 1);
-    }
-    if (fd < 0) {
-        payload_set_err(err, errlen, "failed to create staged session payload");
-        return 1;
-    }
-    FILE *fp = fdopen(fd, "wb");
-    if (!fp) {
-        int saved = errno;
-        close(fd);
-        unlink(tmpl);
-        if (errlen) snprintf(err, errlen, "failed to open staged session payload: %s",
-                             strerror(saved));
-        return 1;
-    }
-
-    int rc = s->save_payload(fp, err, errlen);
-    if (rc == 0 && fflush(fp) != 0) {
-        payload_set_err(err, errlen, "failed to flush staged session payload");
-        rc = 1;
-    }
-    off_t pos = -1;
-    if (rc == 0) {
-        pos = ftello(fp);
-        if (pos < 0) {
-            payload_set_err(err, errlen, "failed to measure staged session payload");
-            rc = 1;
-        }
-    }
-    if (fclose(fp) != 0 && rc == 0) {
-        payload_set_err(err, errlen, "failed to close staged session payload");
-        rc = 1;
-    }
-    if (rc != 0) {
-        unlink(tmpl);
-        return 1;
-    }
-    out->path = pulsar_strdup(tmpl);
-    out->bytes = (uint64_t)pos;
-    return 0;
 }
 
 

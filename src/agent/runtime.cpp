@@ -501,13 +501,13 @@ static int run_agent(pulsar_engine *engine, agent_config *cfg) {
                         while (*arg && *arg != ' ' && *arg != '\t') arg++;
                         if (*arg) *arg = '\0';
                         char sha[41] = {0};
-                        uint32_t tokens = 0;
+                        uint64_t freed = 0;
                         char err[160] = {0};
                         if (agent_worker_strip_session(&worker, sha_arg,
-                                                       sha, &tokens,
+                                                       sha, &freed,
                                                        err, sizeof(err)))
-                            printf("stripped session %.8s (%u tokens)\n",
-                                   sha, tokens);
+                            printf("stripped session %.8s (released %.1f MiB of cached KV)\n",
+                                   sha, (double)freed / (1024.0 * 1024.0));
                         else
                             printf("strip failed: %s\n", err);
                     }

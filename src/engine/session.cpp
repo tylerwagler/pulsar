@@ -13,14 +13,13 @@ int pulsar_engine::routed_quant_bits() {
      * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
      * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
      * routed experts. pulsar_engine_model_id() is a compile-time constant, so
-     * this is the model-variant discriminator in the agent's session-file
-     * header (the agent refuses a file whose value differs) — a value change
-     * invalidates old session payloads (one-time re-prefill; fine in dev). */
+     * this is the model-variant discriminator in the KV segment store's
+     * identity (pulsar_segstore_identity): a value change puts a build on a
+     * fresh store (one-time re-prefill). */
     /* EXL3 (L245) is its own value space -- 20 + the rate in half-bit units
      * (24 = K2, 25 = K2.5, 26 = K3; the highest rate present wins) -- so an
-     * EXL3 artifact never shares a session file with the IQ2 (2) or MXFP4 (4)
-     * tier of the same model id.  pulsar_kvstore_quant_bits_valid() enumerates
-     * the accepted set; the header reader refuses anything else. */
+     * EXL3 artifact never shares KV with the IQ2 (2) or MXFP4 (4) tier of the
+     * same model id. */
     int bits = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_tensor *proj[3] = {
@@ -1410,11 +1409,6 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  */
 int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
                          int n_images, char *err, size_t errlen) {
-    return sync_impl(prompt, images, n_images, false, err, errlen);
-}
-
-int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images,
-                              int n_images, bool logits_owed, char *err, size_t errlen) {
     auto *s = this;
     s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -1560,13 +1554,12 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
                 if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
-            if (ahead) {
-                s->rewind(s->checkpoint.len);
-                logits_owed = true;
-            }
+            if (ahead) s->rewind(s->checkpoint.len);
         }
-        /* A rewind -- ours just above, or the seam rescue's that re-entered here
-         * -- leaves s->logits describing the frontier the bank was cut FROM.  With
+        /* A cut -- a rewind (ours just above, the seam rescue's that re-entered
+         * here, a stop's ghost tail) or a restore to a grid checkpoint (a disk
+         * chain's load, L264) -- leaves s->logits describing some other position
+         * (logits_stale).  With
          * rows still to evaluate the prefill below refreshes them; with none
          * (the prompt is exactly the cut: a retried or regenerated request on a
          * bank that went on to answer it) they would be a finished answer's
@@ -1574,7 +1567,7 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
          * (2026-09-30, the pair: the same 16-token prompt twice, the second
          * 0 tokens).  Owe one row: step back one token, and the resume below
          * re-prefills from its grid point, byte for byte the cold prefill. */
-        if (logits_owed && prompt->len == s->checkpoint.len) s->rewind(prompt->len - 1);
+        if (s->logits_stale && prompt->len == s->checkpoint.len) s->rewind(prompt->len - 1);
         /* L183/L194/L195/L264: a resume is a COLD PREFILL FROM A GRID POINT.  A
          * prefill chunk's bytes depend on the chunk's row count and on a row's
          * offset within the call (L183), so a suffix evaluated from an off-grid
@@ -1651,6 +1644,7 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             pulsar_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
             s->prefill_frontier = prompt->len;   /* L195 */
+            s->logits_stale = false;
             return 0;
         }
 
@@ -1716,8 +1710,8 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
             memcpy(stitched.v + live_n, prompt->v + prompt_n,
                    (size_t)(prompt->len - prompt_n) * sizeof(int));
             stitched.len = stitched.cap;
-            const int rc = s->sync_impl(&stitched, n_images > 0 ? images : NULL,
-                                        n_images > 0 ? n_images : 0, true, err, errlen);
+            const int rc = s->sync(&stitched, n_images > 0 ? images : NULL,
+                                   n_images > 0 ? n_images : 0, err, errlen);
             free(stitched.v);
             return rc;
         }
@@ -1791,6 +1785,7 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
     pulsar_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     s->prefill_frontier = prompt->len;   /* L195 */
+    s->logits_stale = false;
     /* A rebuild replaces what the checkpoint describes, so the image identity
      * goes with it: this pass merged THESE images (barrier included), or there
      * are none in the prompt at all.  A carry/extension keeps the previous
@@ -2170,6 +2165,7 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    s->logits_stale = false;
     /* a token evaluated outside the speculative path (tool injection, plain
      * fallback loops) advances the state past any in-flight carry */
     s->spec.spec_carry_valid = false;
@@ -2246,6 +2242,7 @@ void pulsar_session::rewind(int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->trim_history(pos);
+    s->logits_stale = true;
     /* The compressed frontier of every kv source follows the position law on
      * the bank this session's checkpoint describes (other banks hold other
      * slots' positions).  Clamp DOWN only -- a counter can only be AHEAD of a
@@ -2324,6 +2321,7 @@ bool pulsar_session::restore_checkpoint(uint32_t G) {
         return false;
     }
     s->trim_history((int)G);
+    s->logits_stale = true;
     /* The checkpoint was captured where a prefill reached G, and a frontier
      * that fell below G since would have dropped it. */
     s->prefill_frontier = (int)G;

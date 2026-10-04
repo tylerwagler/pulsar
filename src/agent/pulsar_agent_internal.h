@@ -6,7 +6,9 @@
 
 #include "pulsar.h"
 #include "pulsar_help.h"
-#include "pulsar_kvstore.h"
+#include "pulsar_kvtext.h"
+#include "pulsar_segstore.h"
+#include "pulsar_kvchain.h"
 #include "pulsar_think_scan.hpp"
 #include "pulsar_dsml.h"
 #include "linenoise.h"
@@ -204,15 +206,11 @@ typedef struct {
     pulsar_session *session;    ///< KV session backing the transcript
     pulsar_tokens transcript;   ///< the conversation as tokens; source of truth for context use
 
-    char *cache_dir;            ///< directory holding persisted sessions
-    char *sysprompt_path;       ///< file the system prompt was loaded from, if any
+    char *cache_dir;            ///< directory holding saved sessions (<sha>.session) and segments/
+    pulsar_segstore *kv;        ///< the KV segment store under cache_dir; NULL when unusable
     char session_sha[41];       ///< session identity: 40 hex chars + NUL
     char *session_title;        ///< human-readable session name for the picker
     uint64_t session_created_at;///< unix seconds when the session was first created
-    /** A pre-rename session file to unlink once the new one is safely written.
-     * Deferred rather than deleted eagerly so a crash mid-save cannot leave the
-     * session with no file at all. */
-    char *legacy_session_path_to_delete;
     bool user_activity;         ///< the user has typed something this session (gates autosave)
     bool session_dirty;         ///< transcript has changed since the last save
 
@@ -578,14 +576,16 @@ typedef struct {
     bool truncated;  ///< the cap was hit; content is incomplete
 } agent_buf;
 
-/** Session identity and title read back from a KV-store file. */
+/** A saved session as its <sha>.session file holds it (kvstore_session.cpp):
+ *  the KV is not in it -- it lives in the segment store, found by the rendered
+ *  text of `tokens`. */
 typedef struct {
-    bool has_title_trailer;  ///< the file carries a title trailer record
-    bool legacy_identity;    ///< identity came from the pre-trailer scheme (older file)
-    char *title;             ///< session title, owned; NULL when absent
-    uint64_t created_at;     ///< unix seconds the session was created
-    char sha[41];            ///< session identity: 40 hex chars + NUL
-} agent_kv_session_meta;
+    char *title;             ///< session title, owned
+    uint64_t created_at;     ///< unix seconds the session was created (part of its identity)
+    uint64_t last_used;      ///< unix seconds of the last save
+    uint32_t model_id;       ///< pulsar_engine_model_id the ids belong to
+    pulsar_tokens tokens;    ///< the transcript's exact ids, owned
+} agent_session_file;
 
 /** Role marker attached to a line of rendered history, so the transcript view
  * can style turns without re-parsing the token stream. */
@@ -605,24 +605,12 @@ typedef struct {
     int cap;                  ///< lines allocated
 } agent_history_ptrs;
 
-/** One row in the session picker: the store entry plus its resolved title. */
+/** One row in the session picker. */
 typedef struct {
-    pulsar_kvstore_entry entry;  ///< the KV-store record
-    char *title;                 ///< display title, owned
+    char sha[41];            ///< session identity: 40 hex chars + NUL
+    agent_session_file f;    ///< the file's contents, owned
 } agent_session_list_item;
 
-/** A session remembered for tab-completion, ordered by recency. */
-typedef struct {
-    char sha[41];        ///< session identity: 40 hex chars + NUL
-    uint64_t last_used;  ///< unix seconds of last use; the sort key
-} agent_completion_session;
-
-/** Growable list of completion candidates. */
-typedef struct {
-    agent_completion_session *v;  ///< the sessions
-    int len;                      ///< entries present
-    int cap;                      ///< entries allocated
-} agent_completion_sessions;
 
 /** One line located inside a file buffer, as byte offsets.
  *
@@ -920,51 +908,29 @@ char *agent_buf_take(agent_buf *b);
 bool agent_tokens_equal(const pulsar_tokens *a, const pulsar_tokens *b);
 bool agent_mkdir_p(const char *path);
 char *agent_default_cache_dir(void);
-char *agent_kv_path_for_sha(const char *dir, const char sha[41]);
+char *agent_session_path_for_sha(const char *dir, const char sha[41]);
 void agent_session_identity_sha(const char *title, uint64_t created_at,
                                        char sha_out[41]);
 void agent_worker_clear_session_identity(agent_worker *w);
-void agent_kv_session_meta_free(agent_kv_session_meta *m);
-bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
-                               char **text_out, char *err, size_t err_len);
-bool agent_kv_write_title_trailer(FILE *fp, const char *title,
-                                         char *err, size_t err_len);
-bool agent_kv_read_title_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
-                                        char **title_out,
-                                        char *err, size_t err_len);
-void agent_kv_identity_sha(const pulsar_kvstore_entry *hdr,
-                                  const char *text, uint32_t text_bytes,
-                                  const char *title,
-                                  char sha_out[41]);
-/** The optional agent TOKEN trailer (PULSAR_KVSTORE_EXT_AGENT_TOKENS): the
- * exact ids a file's rendered text renders.  Written by the saver for every
- * agent file and copied by /strip, so a payload-less file is restored exactly
- * instead of by re-tokenising its text (L223). */
-bool agent_kv_write_token_trailer(FILE *fp, const pulsar_tokens *tokens,
-                                  char *err, size_t err_len);
-/** Reads it, leaving the file positioned where it was.  `out` is cleared and
- * filled on success; false when the trailer is absent or malformed. */
-bool agent_kv_read_token_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
-                                 pulsar_tokens *out, char *err, size_t err_len);
-/** Load a KV file.  `rebuild_from_text`: a payload-less ("stripped")
- *   checkpoint carries only rendered text.  When the file carries the agent
- *   TOKEN trailer (every file written since 2026-09-16, and every file /strip
- *   has copied) its exact ids are used and this argument does not matter.  Only
- *   a LEGACY stripped file falls through: `true` rebuilds its tokens by
- *   tokenising the text -- LOSSY by nature, the text cannot distinguish a
- *   control token from its literal spelling and BPE may re-merge across token
- *   boundaries -- while `false` refuses the form ("no KV payload") so the caller
- *   can supply the tokens it already holds (the sysprompt bootstrap renders the
- *   very text that would be rebuilt, so re-tokenising could only produce a
- *   DIFFERENT, injectable list). */
-bool agent_kv_load_path(agent_worker *w, const char *path,
-                               const char *expected_sha,
-                               const char *expected_text,
-                               size_t expected_text_len,
-                               pulsar_tokens *loaded_tokens,
-                               agent_kv_session_meta *meta_out,
-                               bool rebuild_from_text,
-                               char *err, size_t err_len);
+/** The KV segment store holds this much before evicting least-recently-used
+ *  leaves -- the server's default budget. */
+#define AGENT_KV_BUDGET_MB 65536
+void agent_session_file_free(agent_session_file *f);
+bool agent_session_file_write(const char *path, const agent_session_file *f, char *err, size_t err_len);
+/** Reads and verifies (size, digest) a session file; false with `err` when it
+ *  is not one. */
+bool agent_session_file_read(const char *path, agent_session_file *f, char *err, size_t err_len);
+/** Opens w->kv at <cache_dir>/segments, keyed by model and routed format;
+ *  false (said once) leaves sessions saving without cached KV. */
+bool agent_kv_open(agent_worker *w);
+/** Loads the deepest stored chain for `tokens`' rendered text into the live
+ *  session; returns the tokens it covers.  The caller syncs `tokens` after. */
+int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens);
+/** Extends the store's chain for the live session's history; a failure is
+ *  reported (`what` names it), never fatal. */
+void agent_kv_persist(agent_worker *w, const char *what);
+/** The system prompt's stored chain tip ("" when none). */
+void agent_kv_system_tip(agent_worker *w, char tip[41]);
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);
 /** When a model turn finishes with a tool call, queued user messages should not
@@ -978,11 +944,10 @@ void worker_answer_queued_user_drain(agent_worker *w, char *text);
 int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
-/** Start a new session at the system/tool prompt.  A fixed sysprompt.kv
- * checkpoint avoids paying this prefill cost repeatedly, but only when the
- * rendered prompt text still matches the file.  The same fixed path is shared
- * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
- * model families rebuilds this cache instead of restoring incompatible KV.
+/** Start a new session at the system/tool prompt: its KV is the shortest chain
+ * in the segment store, restored when the rendered prompt is unchanged and
+ * prefilled and stored when not.  The store is per model and routed format, so
+ * switching model families never restores incompatible KV.
  */
 bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len);
 bool agent_worker_has_user_session(agent_worker *w);
@@ -1006,9 +971,12 @@ void agent_switch_completion_callback(const char *buf,
 bool agent_worker_delete_session(agent_worker *w, const char *prefix,
                                         char sha_out[41],
                                         char *err, size_t err_len);
+/** Releases a saved session's cached KV that no other chain shares (never the
+ *  system prompt's); the session stays and later prefills what was released.
+ *  *bytes_out: what was freed. */
 bool agent_worker_strip_session(agent_worker *w, const char *prefix,
                                        char sha_out[41],
-                                       uint32_t *tokens_out,
+                                       uint64_t *bytes_out,
                                        char *err, size_t err_len);
 bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,

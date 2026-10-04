@@ -172,12 +172,6 @@ typedef struct {
     uint64_t cap;   ///< allocated capacity in bytes
 } pulsar_session_snapshot;
 
-/** An on-disk session payload: where it landed and how large it is. */
-typedef struct {
-    char *path;      ///< owned path string; free with the payload API
-    uint64_t bytes;  ///< file size in bytes
-} pulsar_session_payload_file;
-
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
 /** Tensor parallelism (slice 4e, L238): is this engine a WORKER rank of a TP
  * group?  A worker drives no sessions of its own -- its driver must call
@@ -1057,14 +1051,6 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
-/** stage_dir: directory for the transient staged file (the caller's disk
- * dir). NULL/"" falls back to /tmp -- avoid on tmpfs boxes, where staged
- * bytes are RAM (L110 F5). */
-int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
-                              const char *stage_dir, char *err, size_t errlen);
-int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
-                                     FILE *fp, char *err, size_t errlen);
-void pulsar_session_payload_file_free(pulsar_session_payload_file *payload);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);

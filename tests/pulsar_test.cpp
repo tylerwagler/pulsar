@@ -4070,7 +4070,7 @@ static void test_control_token_suffix(void) {
 
     /* (5) the two composite shapes the served call sites build: the request
      * prompt + a checkpoint suffix (canonicalize_tool_checkpoint), and the
-     * kvstore entry the continuation sites call with a prefix + a suffix */
+     * kvtext helper the continuation sites call with a prefix + a suffix */
     {
         char body[2048];
         snprintf(body, sizeof body,
@@ -4099,12 +4099,12 @@ static void test_control_token_suffix(void) {
             test_suffix_contract(e, "canonicalize composite", rendered.ptr, rendered.spans,
                                  rendered.n_spans, &control_ids);
 
-            /* the kvstore entry itself: the prefix's tokens are untouched and the
+            /* the kvtext helper itself: the prefix's tokens are untouched and the
              * suffix follows exactly as the span tokeniser produces it */
             pulsar_tokens prefix = {0}, want_suffix = {0}, out = {0};
             pulsar_tokenize_text(e, "PREFIX", &prefix);
             pulsar_tokenize_rendered_chat_spans(e, suffix, suf_spans, suf_n, &want_suffix);
-            pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+            pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
                 e, &prefix, suffix, suf_spans, suf_n, &out);
             TEST_ASSERT(out.len == prefix.len + want_suffix.len);
             bool same = out.len == prefix.len + want_suffix.len;

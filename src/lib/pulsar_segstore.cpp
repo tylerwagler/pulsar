@@ -411,6 +411,24 @@ void pulsar_segstore_drop(pulsar_segstore *st, const char key[41]) {
     }
 }
 
+uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const char *stop) {
+    if (!st) return 0;
+    std::string cur(tip, 40);
+    if (!st->segs.count(cur) || (stop && cur == stop)) return 0;
+    auto ch = st->children.find(cur);
+    if (ch != st->children.end() && !ch->second.empty()) return 0;
+    for (;;) {
+        const std::string parent = st->segs[cur].parent;
+        if (parent.empty() || (stop && parent == stop) || st->children[parent].size() != 1) break;
+        cur = parent;
+    }
+    const uint64_t before = st->used;
+    char key[41];
+    memcpy(key, cur.c_str(), 41);
+    pulsar_segstore_drop(st, key);
+    return before - st->used;
+}
+
 void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_trailer_fn fn, void *ud) {
     if (!st || !fn) return;
     for (auto &kv : st->segs) {

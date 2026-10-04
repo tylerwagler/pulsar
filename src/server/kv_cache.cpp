@@ -1,6 +1,7 @@
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 #include "lib/pulsar_segstore.h"
+#include "lib/pulsar_kvchain.h"
 
 #include <string>
 
@@ -18,14 +19,14 @@ kv_cache_options kv_cache_default_options(void) {
 
 
 void le_put32(uint8_t *p, uint32_t v) {
-    pulsar_kvstore_le_put32(p, v);
+    pulsar_kvtext_le_put32(p, v);
 }
 
 
 
 
 static uint32_t le_get32(const uint8_t *p) {
-    return pulsar_kvstore_le_get32(p);
+    return pulsar_kvtext_le_get32(p);
 }
 
 
@@ -34,7 +35,7 @@ static uint32_t le_get32(const uint8_t *p) {
 #ifdef PULSAR_SERVER_TEST
 
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
-    pulsar_kvstore_sha1_bytes_hex(ptr, len, out);
+    pulsar_kvtext_sha1_bytes_hex(ptr, len, out);
 }
 
 
@@ -83,7 +84,7 @@ void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
 
 
 char *path_join(const char *dir, const char *name) {
-    return pulsar_kvstore_path_join(dir, name);
+    return pulsar_kvtext_path_join(dir, name);
 }
 
 
@@ -305,16 +306,16 @@ void kv_cache_close(kv_disk_cache *kc) {
 }
 
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len) {
-    return pulsar_kvstore_render_tokens_text(engine, tokens, out_len);
+    return pulsar_kvtext_render_tokens_text(engine, tokens, out_len);
 }
 
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
-    return pulsar_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
+    return pulsar_kvtext_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
-    pulsar_kvstore_tokens_copy_prefix(dst, src, n);
+    pulsar_kvtext_tokens_copy_prefix(dst, src, n);
 }
 
 void build_prompt_from_exact_prefix_and_text_suffix(
@@ -325,7 +326,7 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out)
 {
-    pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+    pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, spans, n_spans, out);
 }
 
@@ -356,19 +357,12 @@ int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
 }
 
 namespace {
-struct seg_write_ctx {
-    server *s;
-    int G_prev, G;
-    const char *text;   ///< NUL-terminated segment text (the tool-map scan reads a C string)
-};
-int seg_write_payload(FILE *fp, void *ud, char *err, size_t errlen) {
-    const seg_write_ctx *c = (const seg_write_ctx *)ud;
-    return pulsar_session_save_segment(c->s->sess, fp, c->G_prev, c->G, err, errlen);
+bool seg_trailer_size(void *ud, const char *text, uint64_t *bytes) {
+    return ((server *)ud)->kv_tool_map_serialized_size(text, bytes);
 }
-int seg_write_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
-    const seg_write_ctx *c = (const seg_write_ctx *)ud;
+int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t errlen) {
     uint64_t written = 0;
-    if (c->s->kv_tool_map_write(fp, c->text, &written)) return 0;
+    if (((server *)ud)->kv_tool_map_write(fp, text, &written)) return 0;
     snprintf(err, errlen, "tool map write failed");
     return 1;
 }
@@ -378,79 +372,17 @@ int server::kv_cache_persist(session_slot *sl, const char *reason) {
     auto *s = this;
     (void)sl;   /* the caller installed the slot's bank */
     if (!s->kv.enabled) return 0;
-    const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
-    if (!toks) return 0;
-    /* The bank's grid checkpoints, deepest first: where new segments can end. */
-    int Gs[PULSAR_KV_CHAIN_MAX];
-    int n = 0;
-    for (int G = pulsar_session_checkpoint_best(s->sess, toks->len); G > 0 && n < PULSAR_KV_CHAIN_MAX;
-         G = pulsar_session_checkpoint_best(s->sess, G - 1)) Gs[n++] = G;
-    if (n == 0 || Gs[0] < s->kv.opt.min_tokens) return 0;
     const double t0 = server_now_sec();
-    /* Extend the chain the store already holds for this text, so a write costs
-     * only the tokens past it -- whatever boundaries the bank still keeps.  The
-     * stored chain is this history only if the bank's own tokens up to its end
-     * render to exactly its text (same bytes at the same position: the L115 rule
-     * for reusing a history); otherwise a fresh chain starts at the root. */
-    pulsar_tokens head;
-    memset(&head, 0, sizeof(head));
-    head.v = toks->v;
-    head.len = head.cap = Gs[0];
-    size_t full_len = 0;
-    char *full = render_tokens_text(s->engine, &head, &full_len);
-    char parent[41] = "";
-    int prev = 0;
-    {
-        pulsar_segstore_seg chain[PULSAR_KV_CHAIN_MAX];
-        const int c = pulsar_segstore_lookup(s->kv.st, full, full_len, chain, PULSAR_KV_CHAIN_MAX);
-        if (c > 0 && (int)chain[c - 1].G <= Gs[0]) {
-            pulsar_tokens upto = head;
-            upto.len = upto.cap = (int)chain[c - 1].G;
-            size_t upto_len = 0;
-            free(render_tokens_text(s->engine, &upto, &upto_len));
-            if (upto_len == chain[c - 1].text_end) {
-                memcpy(parent, chain[c - 1].key, 41);
-                prev = (int)chain[c - 1].G;
-            }
-        }
-    }
-    int written = 0;
-    uint64_t bytes = 0;
-    for (int k = n - 1; k >= 0; k--) {
-        const int G = Gs[k];
-        if (G <= prev) continue;
-        pulsar_tokens span;
-        memset(&span, 0, sizeof(span));
-        span.v = toks->v + prev;
-        span.len = span.cap = G - prev;
-        size_t text_len = 0;
-        char *text = render_tokens_text(s->engine, &span, &text_len);
-        uint64_t trailer = 0;
-        if (!s->kv_tool_map_serialized_size(text, &trailer)) trailer = 0;
-        seg_write_ctx ctx = { s, prev, G, text };
-        const uint64_t payload = pulsar_session_segment_bytes(s->sess, prev, G);
-        char key[41];
-        char err[256] = {0};
-        const bool ok = pulsar_segstore_put(s->kv.st, parent, (uint32_t)prev, (uint32_t)G, text, text_len,
-                                            payload, seg_write_payload, trailer,
-                                            trailer ? seg_write_trailer : NULL, &ctx, key, err, sizeof(err));
-        free(text);
-        if (!ok) {
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache segment [%d,%d) not stored (reason=%s): %s",
-                       prev, G, reason, err);
-            break;
-        }
-        written++;
-        bytes += payload + trailer;
-        memcpy(parent, key, 41);
-        prev = G;
-    }
-    free(full);
-    if (written)
+    const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
+    pulsar_kvchain_persist_result r;
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, &tool_maps, &r);
+    if (r.err[0])
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
+    if (r.written)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) %.1f ms",
-                   reason, prev, written, (double)bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
-    return written;
+                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
+    return r.written;
 }
 
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
@@ -464,41 +396,18 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
     if (loaded_key_out) *loaded_key_out = NULL;
     if (!s->kv.enabled || !prompt_text) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
-    pulsar_segstore_seg chain[PULSAR_KV_CHAIN_MAX];
-    const int n = pulsar_segstore_lookup(s->kv.st, prompt_text, prompt_bytes, chain, PULSAR_KV_CHAIN_MAX);
-    if (n == 0 || (int)chain[n - 1].G < s->kv.opt.min_tokens) return 0;
     const double t0 = server_now_sec();
-    for (int i = 0; i < n; i++) {
-        uint64_t pb = 0;
-        FILE *fp = pulsar_segstore_open_payload(s->kv.st, chain[i].key, &pb);
-        char err[256] = "segment file unreadable";
-        int G = 0;
-        const int rc = fp ? pulsar_session_load_segment(s->sess, fp, pb, i == n - 1, &G, err, sizeof(err)) : 1;
-        if (fp) fclose(fp);
-        if (rc != 0) {
-            /* A segment this engine cannot load is removed with everything
-             * below it, so the next store rewrites the chain from there. */
-            server_log(PULSAR_LOG_WARNING,
-                       "pulsar-server: kv cache segment %s [%u,%u) failed to load (%s) -- dropped with its chain",
-                       chain[i].key, chain[i].G_prev, chain[i].G, err);
-            pulsar_segstore_drop(s->kv.st, chain[i].key);
-            pulsar_session_invalidate(s->sess);
-            return 0;
-        }
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    int n = 0;
+    char err[384];
+    const int G = pulsar_kvchain_restore(s->kv.st, s->engine, s->sess, prompt_text, prompt_bytes,
+                                         s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
+    if (G == 0) {
+        if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+        return 0;
     }
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const uint64_t text_end = chain[n - 1].text_end;
-    /* L196: a chain whose text ends with an EOS its tokens never sampled (or
-     * the reverse) would have the suffix tokenised from the wrong byte. */
-    if (!loaded || loaded->len != (int)chain[n - 1].G ||
-        !pulsar_kvstore_text_ends_with_live(s->engine, prompt_text, text_end, loaded)) {
-        server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: kv cache chain to %u disagrees with its tokens at the boundary -- dropped",
-                   chain[n - 1].G);
-        pulsar_segstore_drop(s->kv.st, chain[n - 1].key);
-        pulsar_session_invalidate(s->sess);
-        return 0;
-    }
     /* The chain's tool maps: the exact DSML of every tool call inside it. */
     for (int i = 0; i < n; i++) {
         FILE *fp = pulsar_segstore_open_trailer(s->kv.st, chain[i].key, NULL);
@@ -518,7 +427,6 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                                        tail, tail_n, effective_prompt);
         free(tail);
     }
-    pulsar_segstore_touch(s->kv.st, chain, n);
     if (loaded_key_out) *loaded_key_out = xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms",
@@ -672,7 +580,7 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
-    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
+    if (!pulsar_kvtext_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
         server_log(PULSAR_LOG_ERROR,
                    "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
                    "with the last live token (L196)", live_pos);

@@ -502,157 +502,61 @@ static void test_agent_dsml_parser_recognises_every_syntax(void) {
     agent_dsml_parser_free(&p);
 }
 
-/* A payload-less ("stripped") agent checkpoint carries only rendered text.  A
- * caller that already holds the tokens whose render that text is (the sysprompt
- * bootstrap) must get a MISS, never a re-tokenisation of the text: the text
- * cannot distinguish a control token from its literal spelling, so rebuilding it
- * turns a client or tool byte that spells a marker back into a control token
- * (L223).  Host-only -- the refusal happens before any engine or session is
- * touched, which is the point. */
-static void test_agent_kv_stripped_checkpoint_is_a_miss(void) {
-    char dir[] = "/tmp/pulsar-agent-kv-test.XXXXXX";
+/* L264: a saved session file round-trips its title, times, model id and exact
+ * ids -- including a control-token id, which no re-tokenised text could keep
+ * (L223) -- and every damaged form (a flipped byte, a truncation, a trailing
+ * byte) is refused rather than read.  Host-only. */
+static void test_agent_session_file_round_trip(void) {
+    char dir[] = "/tmp/pulsar-agent-session-test.XXXXXX";
     if (!mkdtemp(dir)) {
         AGENT_TEST_ASSERT(!"mkdtemp failed");
         return;
     }
     char path[512];
-    snprintf(path, sizeof path, "%s/stripped.kv", dir);
-    const char *text = "<｜begin▁of▁sentence｜>PREFIX ｜User｜hello <think>"
-                       "｜DSML｜ calls><｜end▁of▁sentence｜>";
-    const uint32_t text_bytes = (uint32_t)strlen(text);
-
-    FILE *fp = fopen(path, "wb");
-    AGENT_TEST_ASSERT(fp != NULL);
-    if (fp) {
-        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
-        pulsar_kvstore_fill_header(h, 0, 2, PULSAR_KVSTORE_REASON_AGENT_SYSTEM, 0,
-                                  12, 0, 4096, 1, 2, 0);
-        uint8_t tb[4];
-        pulsar_kvstore_le_put32(tb, text_bytes);
-        bool wrote = fwrite(h, 1, sizeof h, fp) == sizeof h &&
-                     fwrite(tb, 1, sizeof tb, fp) == sizeof tb &&
-                     fwrite(text, 1, text_bytes, fp) == text_bytes;
-        fclose(fp);
-        AGENT_TEST_ASSERT(wrote);
-
-        agent_worker w;
-        memset(&w, 0, sizeof w);
-        char err[160] = {0};
-        AGENT_TEST_ASSERT(!agent_kv_load_path(&w, path, NULL, text, text_bytes,
-                                              NULL, NULL, false, err, sizeof err));
-        AGENT_TEST_ASSERT(strstr(err, "no KV payload") != NULL);
-        unlink(path);
-    }
-    rmdir(dir);
-}
-
-/* The agent TOKEN trailer (L223/L224): the exact ids a file's rendered text
- * renders, stored so a payload-less ("stripped") file is restored WITHOUT
- * re-tokenising that text.  Host-only file I/O: the trailers are read and
- * written exactly as the saver, /strip and the loader use them. */
-static void test_agent_kv_token_trailer_round_trip(void) {
-    char dir[] = "/tmp/pulsar-agent-kv-tokens.XXXXXX";
-    if (!mkdtemp(dir)) {
-        AGENT_TEST_ASSERT(!"mkdtemp failed");
-        return;
-    }
-    char path[512];
-    snprintf(path, sizeof path, "%s/tok.kv", dir);
-    const char *text = "<｜begin▁of▁sentence｜>PREFIX ｜User｜hello ｜DSML｜ calls>";
-    const uint32_t text_bytes = (uint32_t)strlen(text);
-    const int ids[] = {128000, 7, 42, 128825, 999};
-    const int n_ids = (int)(sizeof ids / sizeof ids[0]);
-    pulsar_tokens want = {0};
-    for (int i = 0; i < n_ids; i++) pulsar_tokens_push(&want, ids[i]);
-
+    snprintf(path, sizeof path, "%s/s.session", dir);
+    int ids[] = { 0, 128803, 17, 128804, 42 };
+    agent_session_file want;
+    memset(&want, 0, sizeof(want));
+    want.title = (char *)"a title";
+    want.created_at = 1759500000ull;
+    want.last_used = 1759600000ull;
+    want.model_id = 3u;
+    want.tokens.v = ids;
+    want.tokens.len = want.tokens.cap = 5;
     char err[160] = {0};
-    FILE *fp = fopen(path, "wb");
-    AGENT_TEST_ASSERT(fp != NULL);
-    if (fp) {
-        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
-        pulsar_kvstore_fill_header(h, 0, 2, PULSAR_KVSTORE_REASON_AGENT_SESSION,
-                                   PULSAR_KVSTORE_EXT_SESSION_TITLE |
-                                       PULSAR_KVSTORE_EXT_AGENT_TOKENS,
-                                   (uint32_t)n_ids, 0, 4096, 1, 2, 0);
-        uint8_t tb[4];
-        pulsar_kvstore_le_put32(tb, text_bytes);
-        bool wrote = fwrite(h, 1, sizeof h, fp) == sizeof h &&
-                     fwrite(tb, 1, sizeof tb, fp) == sizeof tb &&
-                     fwrite(text, 1, text_bytes, fp) == text_bytes &&
-                     agent_kv_write_title_trailer(fp, "a title", err, sizeof err) &&
-                     agent_kv_write_token_trailer(fp, &want, err, sizeof err);
-        fclose(fp);
-        AGENT_TEST_ASSERT(wrote);
-    }
+    AGENT_TEST_ASSERT(agent_session_file_write(path, &want, err, sizeof err));
+    agent_session_file got;
+    AGENT_TEST_ASSERT(agent_session_file_read(path, &got, err, sizeof err));
+    AGENT_TEST_ASSERT(!strcmp(got.title, "a title") && got.created_at == want.created_at &&
+                      got.last_used == want.last_used && got.model_id == 3u && got.tokens.len == 5);
+    for (int i = 0; got.tokens.len == 5 && i < 5; i++) AGENT_TEST_ASSERT(got.tokens.v[i] == ids[i]);
+    agent_session_file_free(&got);
 
-    fp = fopen(path, "rb");
-    AGENT_TEST_ASSERT(fp != NULL);
-    if (fp) {
-        pulsar_kvstore_entry hdr = {0};
-        uint32_t tb = 0;
-        char *got_text = NULL;
-        char *title = NULL;
-        bool ok = pulsar_kvstore_read_header(fp, &hdr, &tb) &&
-                  agent_kv_read_text(fp, tb, &got_text, err, sizeof err) &&
-                  agent_kv_read_title_trailer(fp, &hdr, &title, err, sizeof err);
-        const off_t after_text = ftello(fp);   /* the title reader restored it */
-        pulsar_tokens got = {0};
-        ok = ok && agent_kv_read_token_trailer(fp, &hdr, &got, err, sizeof err);
-        AGENT_TEST_ASSERT(ok);
-        AGENT_TEST_ASSERT(got_text && !strcmp(got_text, text));
-        AGENT_TEST_ASSERT(title && !strcmp(title, "a title"));
-        AGENT_TEST_ASSERT(got.len == n_ids);
-        for (int i = 0; i < n_ids && i < got.len; i++) AGENT_TEST_ASSERT(got.v[i] == ids[i]);
-        /* left exactly where the session loader expects the payload to start */
-        AGENT_TEST_ASSERT(ftello(fp) == after_text);
-        pulsar_tokens_free(&got);
-        free(title);
-        free(got_text);
-        fclose(fp);
+    FILE *fp = fopen(path, "rb");
+    uint8_t buf[256];
+    const size_t n = fp ? fread(buf, 1, sizeof buf, fp) : 0;
+    if (fp) fclose(fp);
+    AGENT_TEST_ASSERT(n > 40 && n < sizeof buf);
+    for (int leg = 0; n > 40 && leg < 3; leg++) {
+        uint8_t bad[260];
+        memcpy(bad, buf, n);
+        size_t len = n;
+        if (leg == 0) bad[40] ^= 0x01u;   /* a title byte: the digest catches it */
+        if (leg == 1) len = n - 3;        /* truncated */
+        if (leg == 2) bad[len++] = 0u;    /* a trailing byte */
+        fp = fopen(path, "wb");
+        if (fp) { fwrite(bad, 1, len, fp); fclose(fp); }
+        AGENT_TEST_ASSERT(!agent_session_file_read(path, &got, err, sizeof err));
     }
-
-    /* the flag with no trailer bytes is a CLEAN failure, not a short read */
-    fp = fopen(path, "wb");
-    if (fp) {
-        uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
-        /* 1 byte of text, no title trailer, flag set, no token trailer */
-        pulsar_kvstore_fill_header(h, 0, 2, PULSAR_KVSTORE_REASON_AGENT_SESSION,
-                                   PULSAR_KVSTORE_EXT_AGENT_TOKENS, 1, 0, 4096, 1, 2, 0);
-        uint8_t tb[4];
-        pulsar_kvstore_le_put32(tb, 1);
-        bool wrote = fwrite(h, 1, sizeof h, fp) == sizeof h &&
-                     fwrite(tb, 1, sizeof tb, fp) == sizeof tb &&
-                     fwrite("x", 1, 1, fp) == 1;
-        fclose(fp);
-        AGENT_TEST_ASSERT(wrote);
-        fp = fopen(path, "rb");
-        if (fp) {
-            pulsar_kvstore_entry hdr = {0};
-            uint32_t tb = 0;
-            char *got_text = NULL;
-            pulsar_tokens got = {0};
-            pulsar_tokens_push(&got, 77);        /* must be cleared on failure */
-            bool ok = pulsar_kvstore_read_header(fp, &hdr, &tb) &&
-                      agent_kv_read_text(fp, tb, &got_text, err, sizeof err);
-            AGENT_TEST_ASSERT(ok);
-            AGENT_TEST_ASSERT(!agent_kv_read_token_trailer(fp, &hdr, &got, err, sizeof err));
-            AGENT_TEST_ASSERT(got.len == 0 && got.v == NULL);
-            free(got_text);
-            fclose(fp);
-        }
-    }
-
     unlink(path);
     rmdir(dir);
-    pulsar_tokens_free(&want);
 }
 
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
-    test_agent_kv_stripped_checkpoint_is_a_miss();
-    test_agent_kv_token_trailer_round_trip();
+    test_agent_session_file_round_trip();
 }
 
 

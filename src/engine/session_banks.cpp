@@ -271,6 +271,7 @@ void pulsar_session::bank_state_save(uint32_t bank) {
     }
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
+    c->logits_stale           = s->logits_stale;
     c->prefill_frontier       = s->prefill_frontier;   /* L195 */
     c->live_image_fp          = s->live_image_fp;      /* L226: travels with the checkpoint */
     c->live_image_barrier     = s->live_image_barrier;
@@ -317,6 +318,7 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     copy_pending_qrows(s->dspark_pending_qrows, s->dspark_pending_qrows_cap, c->dspark_pending_qrows,
                        c->dspark_pending_qrows_cap, c->spec);
     s->checkpoint_valid       = c->checkpoint_valid;
+    s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
     s->live_image_fp          = c->live_image_fp;      /* L226 */
     s->live_image_barrier     = c->live_image_barrier;

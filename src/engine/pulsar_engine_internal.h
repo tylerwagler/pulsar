@@ -2144,6 +2144,7 @@ typedef struct pulsar_bank_carry {
     uint32_t  dspark_pending_qrows_cap;  ///< floats allocated in dspark_pending_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
+    bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
     int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
     /** L226: mirror of pulsar_session::live_image_fp / _barrier -- the image
      * identity travels with the bank, exactly like the checkpoint it describes,
@@ -2281,6 +2282,13 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
+    /** L264: s->logits do NOT describe the next token after `checkpoint` -- the
+     *  bank was cut (rewind) or put at a grid checkpoint (restore, a segment
+     *  chain's load), which moves the KV but not the logits.  Set by every cut,
+     *  cleared by a prefill or eval that writes them; a sync whose prompt needs
+     *  no new rows re-evaluates the last one while it is set.  Fails safe: a
+     *  writer that forgets to clear it costs one row, never a wrong sample. */
+    bool logits_stale;
     /** Identity of the images whose sentinel blocks are inside `checkpoint`
      * (0 = none), and the exclusive end of the last of those blocks.  The
      * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never
@@ -2355,8 +2363,8 @@ struct pulsar_session {
      * constructors/destructors.
      * NOTE: pulsar_session_prefill_cap and pulsar_session_resident_bytes stay
      * free functions — members would collide with the same-named data members.
-     * pulsar_session_rewrite_requires_rebuild / _write_staged_payload /
-     * _payload_file_free / _snapshot_free do not take a session and stay free. */
+     * pulsar_session_rewrite_requires_rebuild / _snapshot_free do not take a
+     * session and stay free. */
     static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
     /** Tear down the session and release its GPU allocations. Behind pulsar_session_free(). */
     void destroy();
@@ -2409,12 +2417,6 @@ struct pulsar_session {
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
              char *err, size_t errlen);
-    /** sync's body.  `logits_owed`: the caller has just CUT this bank (a rewind
-     * leaves s->logits describing the old frontier), so if the prompt turns out
-     * to need no new rows the last one is re-evaluated anyway -- else the
-     * request samples from a finished conversation's distribution. */
-    int sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
-                  bool logits_owed, char *err, size_t errlen);
     /** Rewrite the session to `prompt` given an already-computed `common`
      * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
@@ -2569,10 +2571,6 @@ struct pulsar_session {
     const pulsar_tokens *tokens();
     /** Serialized size of this session's payload, in bytes. */
     uint64_t payload_bytes();
-    /** Write the payload to a fresh file under `stage_dir` and report where it
-     * landed -- the disk-KV store's write path. @return 0 on success. */
-    int stage_payload(pulsar_session_payload_file *out, const char *stage_dir,
-                      char *err, size_t errlen);
     /** Write the payload to an open stream. @return 0 on success. */
     int save_payload(FILE *fp, char *err, size_t errlen);
     /** Read a payload back, replacing this session's state. Refuses a payload

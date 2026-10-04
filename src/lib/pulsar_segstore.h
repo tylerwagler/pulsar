@@ -91,6 +91,12 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** Remove a segment and every segment below it (a payload that would not load). */
 void pulsar_segstore_drop(pulsar_segstore *st, const char key[41]);
+/** Release the stretch of a chain only `tip` uses: walk up from a LEAF tip while
+ * each parent has no other child, stopping below `stop` (a chain to keep, e.g. a
+ * shared system prompt; NULL for none), and drop from there down.  A tip with
+ * children is shared by a longer chain and nothing goes.  Returns the bytes
+ * released. */
+uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const char *stop);
 
 /** Visit every segment that carries a trailer: fp is positioned at the trailer,
  * and `text` is the segment's own text.  The visitor returns false to stop. */
