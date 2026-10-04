@@ -1109,6 +1109,23 @@ int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);
+
+/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G), every kv source's
+ * compressed and index-K rows for those positions, and the grid checkpoint at G
+ * (G_prev and G are grid points; G_prev may be 0).  A chain of segments from
+ * position 0 rebuilds a bank exactly at its last G, which is how the server's
+ * disk cache persists a conversation: each new prefill adds the segments past the
+ * chain's last one, so a write costs the new tokens, not the whole history.
+ *   save: the installed bank must hold the history to G and its checkpoint at G.
+ *   load: the installed bank must stand at G_prev (a root, G_prev 0, resets it).
+ *         Every segment's checkpoint is kept; `last` restores the final one, so
+ *         the bank stands LIVE at G and the next sync evaluates from there. */
+#define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(1)
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, char *err, size_t errlen);
+int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
+                                int *G_out, char *err, size_t errlen);
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen);
 void pulsar_session_snapshot_free(pulsar_session_snapshot *snap);
 

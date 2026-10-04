@@ -1593,6 +1593,21 @@ int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t p
 int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out, const char *stage_dir, char *err, size_t errlen) { return s ? s->stage_payload(out, stage_dir, err, errlen) : 1; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G) {
+    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G) : 0;
+}
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, char *err, size_t errlen) {
+    if (!s || G_prev < 0 || G <= G_prev) { snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev, G); return 1; }
+    return s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+}
+int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
+                                int *G_out, char *err, size_t errlen) {
+    if (!s) { snprintf(err, errlen, "load segment: no session"); return 1; }
+    uint32_t G = 0;
+    const int rc = s->load_segment(fp, bytes, last, &G, err, errlen);
+    if (G_out) *G_out = (int)G;
+    return rc;
+}
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) { return s ? s->save_snapshot(snap, err, errlen) : 1; }
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) { return s ? s->load_snapshot(snap, err, errlen) : 1; }
 
