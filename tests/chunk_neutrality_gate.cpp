@@ -131,7 +131,7 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     const char *tmp = getenv("TMPDIR");
     char dir[512];
     snprintf(dir, sizeof dir, "%s/chunk_neutrality_segs.XXXXXX", tmp && *tmp ? tmp : "/tmp");
-    if (!mkdtemp(dir)) { snprintf(err, errlen, "mkdtemp %s failed", dir); return 1; }
+    if (!mkdtemp(dir)) { snprintf(err, errlen, "mkdtemp %.200s failed", dir); return 1; }
     const uint32_t model = pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e),
                                                    (uint32_t)pulsar_engine_routed_quant_bits(e));
     int rc = 1;
