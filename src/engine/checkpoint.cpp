@@ -51,7 +51,7 @@ static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint3
     const uint32_t *pos = st->pos[bank];
     for (uint32_t s = 0; s < n; s++) if (pos[s] == G) return s;
     for (uint32_t s = 0; s < n; s++) if (pos[s] == 0u) return s;
-    uint32_t order[PULSAR_CKPT_SLOTS_MAX];
+    uint32_t order[PULSAR_CKPT_SLOTS_MAX] = {0};
     for (uint32_t s = 0; s < n; s++) order[s] = s;
     for (uint32_t i = 1; i < n; i++) {          /* ascending by position */
         const uint32_t v = order[i];
