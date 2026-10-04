@@ -5366,22 +5366,23 @@ static void test_session_eviction_victim_selection(void) {
  * e2e gates rather than here. */
 /* L264 S3: the router's in-place verdict for the best-scoring free bank. */
 static void test_l264_route_in_place(void) {
-    const int ceil = 5000, floor_ = 157;
-    /* the same conversation (match past the scaffolding): in place, however
-     * much the bank holds past the resume point -- the reasoning-stripped
-     * agent turn: frontier 51233, resume 44416, common 44534 */
-    TEST_ASSERT(server_route_in_place(44534, 44416, 51233, ceil, floor_));
-    /* an unrelated conversation that shares only the scaffolding, against a
-     * bank with real warmth past the resume point: fresh preferred */
-    TEST_ASSERT(!server_route_in_place(4800, 4736, 30000, ceil, floor_));
+    const int floor_ = 157;
+    /* the next turn of the same conversation, its previous reply's reasoning
+     * stripped by the client: the match reaches the end of what the bank
+     * prefilled (51200), then diverges in the generated tail -- in place,
+     * however much the tail holds */
+    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_));
+    /* the measured clobber (2026-10-04): another conversation behind the same
+     * 2.3k-token system prompt matches 2318 of a bank that prefilled 2723 --
+     * fresh preferred */
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_));
     /* ...unless what it would discard is under the protect floor */
-    TEST_ASSERT(server_route_in_place(4800, 4736, 4736 + floor_ - 1, ceil, floor_));
-    TEST_ASSERT(!server_route_in_place(4800, 4736, 4736 + floor_, ceil, floor_));
+    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_));
     /* an empty bank is simply free */
-    TEST_ASSERT(server_route_in_place(0, 0, 0, ceil, floor_));
-    /* a match at the ceiling is the conversation; one below it is not */
-    TEST_ASSERT(server_route_in_place(ceil, 0, 30000, ceil, floor_));
-    TEST_ASSERT(!server_route_in_place(ceil - 1, 0, 30000, ceil, floor_));
+    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_));
+    /* one token short of the bank's prefill is a different branch */
+    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_));
 }
 
 static void test_slot_route_trivial_match_decision(void) {

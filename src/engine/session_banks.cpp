@@ -235,6 +235,17 @@ int pulsar_session::bank_pos(uint32_t bank) {
     return t ? t->len : 0;
 }
 
+/* L264: how far the bank's PREFILL reached (decode rows past it are the decode
+ * kernels'; L195) -- the end of the last prompt it served, the same live-vs-
+ * carry rule as bank_frontier_tokens.  0 when nothing valid. */
+int pulsar_session::bank_prefill_frontier(uint32_t bank) {
+    auto *s = this;
+    if (!bank_frontier_tokens(s, bank)) return 0;
+    const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
+    const int pf = bank == cur ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
+    return pf > 0 ? pf : 0;
+}
+
 const pulsar_tokens *pulsar_session::bank_tokens(uint32_t bank) {
     auto *s = this;
     return bank_frontier_tokens(s, bank);

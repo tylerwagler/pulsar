@@ -893,6 +893,9 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
  * must keep idle banks' carries current (bank_state_save at job end). Return
  * 0 / NULL for an out-of-range or never-populated bank. */
 int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
+/** L264: the end of the last prompt the bank PREFILLED (its generated tokens lie
+ *  past it).  A request that carries all of it is that conversation's next turn. */
+int  pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);

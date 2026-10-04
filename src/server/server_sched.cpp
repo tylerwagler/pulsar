@@ -430,18 +430,18 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 
 
 
-/* L264 S3: whether a request continues on the free bank that scores best for it
- * or goes to a fresh one.  The score is the deepest grid checkpoint at or below
- * the request's byte match with the bank -- exactly where the sync will resume
- * -- and continuing there costs the bank whatever it holds past that point
- * (`frontier - score` tokens of some conversation's warm state).  It continues
- * in place when the match reaches past the shared scaffolding (`common >=
- * share_ceiling`: it IS that conversation, e.g. the next turn of an agent whose
- * client dropped the previous turn's reasoning) or when what it would discard is
- * under the protect floor.  Otherwise a fresh bank is cheaper than the clobber. */
-bool server_route_in_place(int common, int score, int frontier,
-                           int share_ceiling, int protect_floor) {
-    return common >= share_ceiling || frontier - score < protect_floor;
+/* L264: does the job continue on its best bank?  Yes when it carries everything
+ * that bank PREFILLED (common >= prefilled: it IS that conversation's next turn,
+ * whatever it did to the bank's generated tail -- an agent client drops the
+ * previous turn's reasoning, so the echo diverges exactly there), or when what
+ * the resume would discard is under the protect floor.  A job that shares only
+ * a prefix -- a long common system prompt, the measured case (2026-10-04: four
+ * SWE-agent conversations behind one 2.3k-token prompt all landed on bank 0 and
+ * clobbered one another every turn) -- diverges INSIDE the bank's last prompt,
+ * so it takes a fresh bank, which restores the shared prefix from the disk
+ * chain. */
+bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor) {
+    return common >= prefilled || frontier - score < protect_floor;
 }
 
 /* Route the job to a slot. Preferences, in order:
@@ -568,15 +568,16 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         }
     }
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
-    const bool in_place = best && server_route_in_place(best_common, best_score, frontier, share_ceiling,
+    const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
+    const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens);
     /* One line per bind, always: which bank, how deep the match, where it
      * resumes, and what it costs the bank. */
     if (best)
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: route: best bank %u common %d resume %d frontier %d prompt %d "
-                   "ceiling %d -> %s",
-                   best->bank, best_common, best_score, frontier, j->req.prompt.len, share_ceiling,
+                   "pulsar-server: route: best bank %u common %d resume %d frontier %d prefilled %d "
+                   "prompt %d -> %s",
+                   best->bank, best_common, best_score, frontier, prefilled, j->req.prompt.len,
                    in_place ? "in place" : "fresh preferred");
     if (in_place) return best;
     session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);

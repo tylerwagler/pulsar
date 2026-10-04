@@ -2809,8 +2809,7 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 /* L264 S3: does the best-scoring free bank take the request in place, or is a
  * fresh bank preferred (defined in server_sched.cpp; unit-tested in
  * server_tests.cpp). */
-bool server_route_in_place(int common, int score, int frontier,
-                           int share_ceiling, int protect_floor);
+bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,

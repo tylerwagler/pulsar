@@ -1014,6 +1014,7 @@ bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
+int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) { return s ? s->bank_prefill_frontier(bank) : 0; }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     return s && bank < s->graph.banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph.ms_comp_state_stale[bank];

@@ -2480,6 +2480,7 @@ struct pulsar_session {
     bool bank_state_restore(uint32_t bank);
     /** Committed token count for `bank`, live or idle. */
     int bank_pos(uint32_t bank);
+    int bank_prefill_frontier(uint32_t bank);
     /** Adaptive draft depth for `bank`, read from the live state or its carry. */
     int bank_spec_depth(uint32_t bank);
     /** Borrowed view of `bank`'s committed token history. Do not free. */
