@@ -1080,8 +1080,16 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * committed-projection ring an OVERLAPPING compressor replays to rebuild its
  * carry, plus that ring's covered span once in the counter region.  Earlier
  * files are refused: the per-layer layout differs at the same strides. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(12)
-/** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
+/* v13 (L264, 2026-10-04): a payload is the bank's compressed and index-K rows
+ * plus ONE grid checkpoint -- the deepest at or below the prefill frontier, as
+ * opaque slot bytes (checkpoint.cpp) -- instead of the raw rows, the frontier's
+ * compressor lanes, the logits and v12's projection ring.  A restored bank holds
+ * the full token history and resumes from that checkpoint, which is what v12's
+ * ring replay did, exact by construction instead of by coverage.  Field 12 is
+ * now the checkpoint slot size, field 15 the checkpoint's grid point (the
+ * prefill frontier the restored bank resumes from).  Earlier files are refused. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(13)
+/** 13 shape/counters + 2 row strides (main, indexer fp4) + the checkpoint grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);

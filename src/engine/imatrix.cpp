@@ -210,7 +210,9 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
         gpu_graph_ckpt_drop_bank(g, b);   /* L264: the zeroing bypasses the frontier writer */
     }
-    return gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g));
+    if (!gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g))) return false;
+    g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;   /* position 0: the canonical state, re-established */
+    return true;
 }
 
 

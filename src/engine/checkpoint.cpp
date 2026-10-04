@@ -171,13 +171,8 @@ bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G) {
         fprintf(stderr, "pulsar: grid checkpoint restore to %u on bank %u: copy failed\n", G, bank);
         return false;
     }
-    /* The rewind aids describe the history this restore just left: a projection
-     * ring span would claim rows above G, a boundary stash a cut that no longer
-     * exists, a stale flag a lane that is now exact. */
-    g->ms_proj_ring_lo[bank] = 0u;
-    g->ms_proj_ring_hi[bank] = 0u;
-    g->proj_ring_lo = 0u;
-    g->proj_ring_hi = 0u;
+    /* A boundary stash describes a cut that no longer exists, and the stale
+     * flag a lane that is now exact. */
     g->ms_emit_keep[bank] = 0u;
     g->ms_comp_state_stale[bank] = false;
     for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS; k++)
@@ -193,6 +188,33 @@ uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t 
         if (p != 0u && p <= limit && p > best) best = p;
     }
     return best;
+}
+
+bool gpu_graph_ckpt_locate(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off) {
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS; k++) {
+        if (G == 0u || g->ckpt_pos[bank][k] != G) continue;
+        *slab = g->ckpt_slab[bank];
+        *off = (uint64_t)k * g->ckpt_slot_bytes;
+        return true;
+    }
+    return false;
+}
+
+bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
+                          uint32_t *slot) {
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    if (G < g->raw_window || G % PULSAR_RESUME_GRID != 0u || !g->ckpt_slab[bank]) return false;
+    const uint32_t k = ckpt_pick_slot(g, bank, G);
+    g->ckpt_pos[bank][k] = 0u;   /* filled by the caller, committed after */
+    *slab = g->ckpt_slab[bank];
+    *off = (uint64_t)k * g->ckpt_slot_bytes;
+    *slot = k;
+    return true;
+}
+
+void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G) {
+    if (slot < PULSAR_CKPT_SLOTS) g->ckpt_pos[gpu_graph_cur_bank(g)][slot] = G;
 }
 
 void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank) {

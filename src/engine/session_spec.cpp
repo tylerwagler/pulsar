@@ -1276,14 +1276,6 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     const uint32_t K = r->K;
     const uint32_t n_batch = r->n_batch;
     const int saved_len = r->saved_len;
-    {   /* L218: the span a rewind inside this round (the trim below, the
-         * server's ghost rewind after it) rebuilds ratio-2 pending slots from:
-         * positions [saved_len, saved_len + n_batch) at save rows row0.. */
-        const uint32_t b = gpu_graph_cur_bank(g);
-        g->ms_spec_save_pos0[b] = (uint32_t)saved_len;
-        g->ms_spec_save_row0[b] = row0;
-        g->ms_spec_save_rows[b] = n_batch;
-    }
     const bool pend_sampled = r->pend_sampled;
     int32_t (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
@@ -1563,13 +1555,13 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * way the two can still differ is accepted_cap binding below 1 + commit,
      * which no current caller does (the server passes its array size).  Enforce
      * the invariant anyway, where both counts are known: rewind() clamps the
-     * compressor frontier, drops the carry and drafter window (right -- the
-     * carry was conditioned on positions that no longer exist), and rebuilds the
-     * compressor state from the L120 projection ring -- `exposed_end` is an
-     * arbitrary position and the replay's span covers a mid-group one as readily
-     * as a boundary.  `spec_carry_valid` is dropped just below regardless, since
-     * the carry described positions that no longer exist.  The server's tripwire
-     * (server_sched.cpp) checks the same equality after every round. */
+     * compressor frontier and drops the carry and drafter window (right -- the
+     * carry was conditioned on positions that no longer exist).  `exposed_end`
+     * is an arbitrary position, so the bank is left stale (L264): a further
+     * block on this session refuses until a sync restores a grid checkpoint,
+     * which is the fail-closed answer for a caller that bound accepted_cap.
+     * The server's tripwire (server_sched.cpp) checks the same equality after
+     * every round. */
     const int exposed_end = saved_len + n_accept;
     const bool trimmed = exposed_end < s->checkpoint.len;
     if (trimmed) {

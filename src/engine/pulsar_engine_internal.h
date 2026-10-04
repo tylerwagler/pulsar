@@ -942,18 +942,6 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
               "boundary in pulsar_cuda_moe.cu, then raise "
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
-/** L120 value half: depth of the committed-projection ring an OVERLAPPING
- * compressor (coff 2 -- 0731's ratio 4, and only that) uses to rebuild its state
- * on a rewind.  A group's row is pooled from that group's tokens AND the group
- * before them, so a replay that starts at the cut needs the previous group's
- * projection rows, which nothing else retains.  The worst replay span is
- * `ratio - 1 + 1` positions and a ghost overshoot is bounded by the draft depth,
- * so 32 keeps every slot a replay reads collision-free; the ring's [lo, hi) span
- * check is the structural half of the same guarantee.  coff-1 sources deposit
- * nothing -- their state at a boundary is canonically empty and is rebuilt
- * outright, which is what the CSA2 rewrite relied on when it deleted the ring
- * (correct for V4.1, a V4 regression). */
-#define PULSAR_REWIND_RING_DEPTH 288u
 
 /** L264: grid checkpoints kept per bank (pulsar_gpu_graph::ckpt_pos).  The
  * newest PULSAR_CKPT_RECENT are always kept -- the prompt ends of the turns a
@@ -1042,17 +1030,6 @@ typedef struct {
     pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];  ///< compressor state lane, score half
     pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, KV half
     pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, score half
-    /** L120 value half: per-bank lanes for the committed-projection ring an
-     * OVERLAPPING compressor replays (see PULSAR_REWIND_RING_DEPTH).  One bank's
-     * lane is PULSAR_REWIND_RING_DEPTH rows of `pulsar_comp_row_width(ratio,
-     * head_dim)` f32, kv and score plane separate; index_proj_* exists only where
-     * the source owns an index-K pool AND its indexer compresses its own key. */
-    uint64_t attn_proj_bank_bytes[PULSAR_MAX_LAYER];   ///< one bank's attention projection ring, f32 bytes; 0 where the compressor does not overlap
-    uint64_t index_proj_bank_bytes[PULSAR_MAX_LAYER];  ///< one bank's indexer projection ring; 0 without one
-    pulsar_gpu_tensor *attn_proj_kv[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, KV plane
-    pulsar_gpu_tensor *attn_proj_sc[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, score plane
-    pulsar_gpu_tensor *index_proj_kv[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, KV plane
-    pulsar_gpu_tensor *index_proj_sc[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, score plane
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -1158,44 +1135,6 @@ typedef struct {
      * V4.1 artifact: nothing would ever write it. */
     pulsar_gpu_tensor *layer_index_state_kv[PULSAR_MAX_LAYER];    ///< indexer compressor accumulator, KV half
     pulsar_gpu_tensor *layer_index_state_score[PULSAR_MAX_LAYER]; ///< indexer compressor accumulator, score half
-
-    /** L120 value half: rolling COMMITTED-projection rings for the overlapping
-     * compressor (coff 2, ratio 4 -- 0731 only), PULSAR_REWIND_RING_DEPTH slots
-     * at `pos % PULSAR_REWIND_RING_DEPTH` of one `pulsar_comp_row_width(ratio,
-     * head_dim)` f32 row each, kv and score plane separate, attention and
-     * indexer compressors.  A rewind replays store + shift over
-     * [ratio*(pos/ratio - 1), pos) from these to rebuild the carry half the
-     * overlap needs; nothing else retains the previous group's projection rows.
-     * Deposits happen at COMMIT points only -- the CSA2 produce path, never a
-     * speculative candidate row -- and never under a multiseq step, so the
-     * [lo, hi) span below is what tells a rewind whether the range it needs is
-     * still covered.  Banked mode: views into the slab's per-bank lanes,
-     * repointed with the state views. */
-    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];   ///< projection ring view, attention KV; NULL where the compressor does not overlap
-    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];   ///< projection ring view, attention score
-    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];  ///< projection ring view, indexer KV; NULL without one
-    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];  ///< projection ring view, indexer score
-    /** Contiguously-deposited span [lo, hi) of the projection ring, in absolute
-     * positions.  A rewind replays only when the span COVERS the range it needs;
-     * an uncovered span skips the value restore and degrades to the counter clamp
-     * (the pre-ring behaviour).  A gap forward restarts the span and a run wholly
-     * behind it replaces it, so slots claimed under a stale hi -- a ghost
-     * position's deposit -- can never be read back; a run INSIDE the span leaves
-     * it alone, because that is a re-deposit of rows the ring still holds and
-     * shrinking there would discard live coverage.  `proj_ring_span_cover`
-     * (gpu_diag.cpp) is the one authority for the rule; a ghost rewind narrows
-     * the span with its own explicit clamp. */
-    uint32_t proj_ring_lo;   ///< first position the ring still covers
-    uint32_t proj_ring_hi;   ///< one past the newest; lo == hi means empty
-    /** L226 DIAGNOSTIC: per-bank rows deposited into the ring and the newest
-     * position deposited.  A rewind refusal prints these so a reader can tell
-     * "the ring never saw the generated region" from "the ring is empty on this
-     * bank" from "the span is right but the stash is missing" without a
-     * rebuild-and-diff.  Counters, not state: nothing reads them but the
-     * message. */
-    uint64_t ring_dep_rows[PULSAR_MSEQ_MAX];
-    uint64_t ring_dep_last[PULSAR_MSEQ_MAX];
-    uint32_t ring_dep_hi[PULSAR_MSEQ_MAX];   ///< the span's hi as the last deposit left it
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
@@ -1527,18 +1466,13 @@ typedef struct {
      * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
      * window under N=2 spec-time-slice — the whole point of Option F. */
     uint32_t ms_dspark_n_raw[PULSAR_MSEQ_MAX][3];   ///< per-bank raw-ring fill for each of the drafter's 3 rings
-    /** L218: the last verify round's compressor-projection save span, per
-     * bank -- positions [pos0, pos0 + rows) sit at save rows [row0, row0 + rows)
-     * of spec_comp_kv/sc_save.  A rewind to an odd position inside the round
-     * rebuilds the ratio-2 pending slot from them (pulsar_session::rewind);
-     * rows == 0 means no round has saved for this bank. */
-    uint32_t ms_spec_save_pos0[PULSAR_MSEQ_MAX];
-    uint32_t ms_spec_save_row0[PULSAR_MSEQ_MAX];
-    uint32_t ms_spec_save_rows[PULSAR_MSEQ_MAX];
-    /** L218: the bank's ratio-2 pending groups do not describe its position
-     * (a rewind landed on an odd position outside the saved span).  Only a
-     * store at a group boundary makes the state consistent again; a store at
-     * any other position on a stale bank refuses (gpu_graph_csa2_produce). */
+    /** L264: the bank's recurrent compressor lanes and raw window do not
+     * describe its frontier -- a rewind landed somewhere other than 0 or a grid
+     * checkpoint.  Set only by pulsar_session::rewind; cleared only where the
+     * state at the frontier is re-established whole (a checkpoint restore, a
+     * reset to position 0).  Every compressor store on a stale bank refuses
+     * (gpu_graph_csa2_produce), eval refuses up front, and the server keeps a
+     * stale bank out of fused rounds until a sync restores it. */
     bool ms_comp_state_stale[PULSAR_MSEQ_MAX];
     uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
     uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
@@ -1547,12 +1481,6 @@ typedef struct {
      * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
      * initialised with the graph. */
     uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
-    /** L120 value half: the projection ring's covered span is per bank, captured
-     * and installed with the frontiers (a bank's deposits say nothing about
-     * another bank's positions).  `lo == hi` means the bank's ring is empty; both
-     * are zeroed on fork, on eviction and on install of a fresh bank. */
-    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];  ///< oldest position the bank's projection ring still covers
-    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];  ///< one past the newest
     /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment C).
      * ms_emit_keep[bank] is the boundary-row restore threshold: 0 = inactive (a
      * full-prefix fork clears it; the partial cut sets R/ratio + 1 and the emit
@@ -2404,13 +2332,6 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
-    /** L226: a rewind whose compressor state could not be re-established was
-     * SALVAGED to the last prefill frontier (rounded to PULSAR_RESUME_GRID)
-     * rather than invalidating the whole checkpoint.  The tokens below that floor
-     * are still correct and the next sync re-prefills from it, but a DECODE in
-     * between would run against KV the rollback dropped -- so eval refuses until
-     * a sync has re-established the session (the same shape as mseq_dirty). */
-    bool kv_salvaged;
     /** Identity of the images whose sentinel blocks are inside `checkpoint`
      * (0 = none), and the exclusive end of the last of those blocks.  The
      * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never
@@ -3416,6 +3337,13 @@ bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
 uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
 /** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
 void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
+/** The session payload carries one checkpoint as opaque slot bytes (layout:
+ * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
+ * claim: a slot for an incoming G, emptied until commit marks it filled. */
+bool gpu_graph_ckpt_locate(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off);
+bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
+                          uint32_t *slot);
+void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G);
 /** Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
@@ -3439,20 +3367,6 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
  * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
 bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
                                  uint32_t row0, uint32_t rows, bool indexer);
-/** L120 value half: deposit the staged projection rows [row0, row0+n_rows) of
- * kv source `il` -- whose absolute positions are [pos0, pos0+n_rows) -- into the
- * installed bank's ring, and advance its covered span.  A no-op on a coff-1
- * source (no ring lane), under a multiseq step (those rows belong to other
- * banks' positions and the span is per bank), and on a layer with no ring.
- *
- * RANGE, not per token: a contiguous source run maps to contiguous ring slots
- * modulo the depth, so this is at most two ranged copies per lane.  The
- * per-token shape cost 17% of prefill -- 4 copies x 21 overlapping layers x 4096
- * tokens is ~344k small D2D launches per chunk, against ~52 MB of bytes.
- * Copies are ASYNC on the current stream, ordered after whatever produced the
- * rows and before any later rewind could read them. */
-bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
-                                 uint32_t row0, uint32_t n_rows);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
@@ -3917,22 +3831,6 @@ static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ra
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,
  *  score -INF): their state at any even position. */
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank);
-/** L218: make a bank's compressor state describe position `pos` after a
- *  rewind FROM `prev_pos` (the length the session held before it; the caller
- *  has already clamped the frontier counters).  At a group boundary that is the
- *  empty group.  Inside a group the pending slots are rebuilt from the
- *  PROJECTION RING -- a coff-2 (overlapping) source replays the previous group
- *  plus the straddled rows -- falling back to the last verify round's saved
- *  projections when the ring misses the span; a coff-1 source has no ring, so a
- *  rewind that stays inside the group its lane is already FILLING keeps that
- *  group's committed slots and clears only the rest (`prev_pos` is what says
- *  so), and one that crosses a group boundary needs the saves.  Only when a
- *  needed rebuild has no source is the state reset and the bank marked stale
- *  (see ms_comp_state_stale).  Returns false on a device failure, and for an
- *  overlapping boundary that has neither ring coverage nor an armed boundary
- *  stash. */
-bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos,
-                                       uint32_t prev_pos);
 /** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
  * spec_logits rows [row0, row0+n_rows) and read the compact block into
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to

@@ -485,8 +485,11 @@ static bool gpu_graph_csa2_produce(
         }
         const uint32_t before = g->ms_n_comp[run_bank][il];
         const uint32_t n_groups = n / ratio;
-        /* a run starting on a group boundary rebuilds the state from scratch */
-        g->ms_comp_state_stale[run_bank] = false;
+        if (ok && g->ms_comp_state_stale[run_bank]) {
+            fprintf(stderr, "pulsar: kv source %u bank %u: store at %u on a bank whose state is stale "
+                            "(rewound off its grid checkpoints) -- refusing\n", il, run_bank, rpos0);
+            ok = false;
+        }
         if (ok && before != rpos0 / ratio) {
             fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
                     il, run_bank, before, rpos0, ratio);
@@ -526,9 +529,6 @@ static bool gpu_graph_csa2_produce(
          * wrote its row before this call. */
         if (ok) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, false);
         if (ok && own_index) ok = gpu_graph_emit_keep_restore(g, il, run_bank, before, n_groups, true);
-        /* L120 value half: the rows both stores just consumed go into the ring,
-         * which is what a later rewind replays to rebuild the overlap's carry. */
-        if (ok) ok = gpu_graph_proj_ring_deposit(g, il, rpos0, row0, n);
         if (ok) {
             gpu_graph_set_n_comp(g, run_bank, il, before + n_groups);
             for (uint32_t t = 0; t < n; t++) comp_counts[row0 + t] = (rpos0 + t + 1u) / ratio;
@@ -568,16 +568,10 @@ static bool gpu_graph_csa2_produce(
             pulsar_gpu_tensor *latent_row = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
                                                                    (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
             int emitted = 0;
-            if (has_state) {
-                /* A stale pending group (rewound mid-group past the verify saves)
-                 * can only be joined at a group boundary; a store elsewhere would
-                 * pool a wrong token in. */
-                if (pos % ratio == 0u) g->ms_comp_state_stale[bank] = false;
-                else if (g->ms_comp_state_stale[bank]) {
-                    fprintf(stderr, "pulsar: kv source %u bank %u: store at %u would extend a stale pending group -- refusing\n",
-                            il, bank, pos);
-                    ok = false;
-                }
+            if (g->ms_comp_state_stale[bank]) {
+                fprintf(stderr, "pulsar: kv source %u bank %u: store at %u on a bank whose state is stale "
+                                "(rewound off its grid checkpoints) -- refusing\n", il, bank, pos);
+                ok = false;
             }
             if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
             ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
@@ -603,8 +597,6 @@ static bool gpu_graph_csa2_produce(
                                 "disagree about the group boundary at %u (ratio %u) -- refusing\n", il, pos, ratio);
                 ok = false;
             }
-            /* L120 value half: this row's own slot in the ring, after both stores. */
-            if (ok) ok = gpu_graph_proj_ring_deposit(g, il, pos, t, 1u);
             if (ok && emitted) {
                 const uint32_t row = *n_comp_slot;
                 if (row != pos / ratio) {
