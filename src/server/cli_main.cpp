@@ -539,7 +539,7 @@ int main(int argc, char **argv) {
     server_resolve_kv_disk_dir(&cfg);
     /* L264 S4e: a TP worker keeps its own copy of every disk KV segment the
      * leader's store names, under its own KV directory. */
-    char *tp_kv_dir = cfg.kv_disk_dir ? (char *)xmalloc(strlen(cfg.kv_disk_dir) + 8) : NULL;
+    char *tp_kv_dir = cfg.kv_disk_dir ? (char *)malloc(strlen(cfg.kv_disk_dir) + 8) : NULL;
     if (tp_kv_dir) sprintf(tp_kv_dir, "%s/tp-seg", cfg.kv_disk_dir);
     cfg.engine.tp_kv_dir = tp_kv_dir;
     /* Every rank tells the group its build (the NODE frame), so the leader's
