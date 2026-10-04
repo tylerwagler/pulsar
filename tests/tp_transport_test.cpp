@@ -243,6 +243,32 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_wait_command_ack(tp, sid, "note_prefilled", err, sizeof(err)),
               "leader note_prefilled (intermediate) ack: %s", err);
 
+        /* L264 S4e: the segment frames -- save and load are acked verdicts,
+         * drop and reconcile are void; a key that is not a key never ships. */
+        {
+            pulsar_tp_segment_command sc;
+            std::memset(&sc, 0, sizeof sc);
+            sc.session_id = 3001;
+            sc.G_prev = 128;
+            sc.G = 256;
+            std::memcpy(sc.key, "0123456789abcdef0123456789abcdef01234567", 40);
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &sc) == 1, "leader send segment save");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "segment save", err, sizeof(err)),
+                  "leader segment save ack: %s", err);
+            sc.last = 1;
+            sc.digest = 0x1122334455667788ull;
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_LOAD, &sc) == 1, "leader send segment load");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "segment load", err, sizeof(err)),
+                  "leader segment load ack: %s", err);
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_DROP, &sc) == 1, "leader send segment drop");
+            const char keys[] = "0123456789abcdef0123456789abcdef01234567"
+                                "fedcba9876543210fedcba9876543210fedcba98";
+            CHECK(pulsar_tp_send_segment_reconcile(tp, keys, 2) == 1, "leader send segment reconcile");
+            sc.key[3] = 'G';
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_DROP, &sc) == 0,
+                  "a segment frame with a malformed key must not ship");
+        }
+
         const int drafts[3] = { 7, 8, 9 };
         CHECK(pulsar_tp_send_verify(tp, sid, drafts, 3) == 1,
               "leader send_verify");
@@ -313,6 +339,26 @@ static void frames_phase(pulsar_tp *tp, int rank) {
             pulsar_tp_command_free(&cmd);
             CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker note_prefilled ack");
         }
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment save: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_SAVE && cmd.session_id == 3001 && cmd.segment.G_prev == 128 &&
+              cmd.segment.G == 256 && !std::memcmp(cmd.segment.key, "0123456789abcdef0123456789abcdef01234567", 40),
+              "worker segment save payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker segment save ack");
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment load: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_LOAD && cmd.segment.G == 256 && cmd.segment.last == 1 &&
+              cmd.segment.digest == 0x1122334455667788ull, "worker segment load payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker segment load ack");
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment drop: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_DROP, "worker segment drop type %d", (int)cmd.type);
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment reconcile: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_RECONCILE && cmd.n_keys == 2 && cmd.keys &&
+              !std::memcmp(cmd.keys + 40, "fedcba9876543210fedcba9876543210fedcba98", 40),
+              "worker segment reconcile payload");
+        pulsar_tp_command_free(&cmd);
 
         CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
               "worker recv verify: %s", err);

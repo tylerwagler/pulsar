@@ -140,6 +140,11 @@ typedef struct {
      *  frame so each rank can report the whole group's builds.  NULL = not
      *  stamped (the CLI); the transport sends it empty. */
     const char *build_id;
+    /** L264 S4e: a WORKER rank's own copies of the disk KV cache's segments
+     *  (<tp_kv_dir>/<key>.tpseg; KV is replicated per rank, so each rank keeps
+     *  its own).  NULL on a rank serving no disk cache: the segment frames are
+     *  then refused there as misses. */
+    const char *tp_kv_dir;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
@@ -1056,9 +1061,23 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 #define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(1)
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
-int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, char *err, size_t errlen);
+/** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
+ *  it is unused (NULL is fine); on one it names every worker's own copy, and
+ *  save and load are mirrored verdicts whose disagreement is a miss on every
+ *  rank (L264 S4e).  Refused inside a mirrored sync. */
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, const char *key,
+                                char *err, size_t errlen);
 int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
-                                int *G_out, char *err, size_t errlen);
+                                int *G_out, const char *key, char *err, size_t errlen);
+/** A store removed segment `key`: the workers delete their copies (void; a
+ *  no-op off a TP leader). */
+void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key);
+/** Bring-up: the leader's whole key set (n_keys x 40 hex); each worker removes
+ *  the copies it does not name.  0 when sent or nothing to do. */
+int pulsar_engine_segment_reconcile(pulsar_engine *e, const char *keys, int n_keys);
+/** True while a TP leader runs a mirrored sync (no other mirrored operation may
+ *  ship -- e.g. a disk store from the prefill's progress callback). */
+bool pulsar_session_in_mirrored_sync(const pulsar_session *s);
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen);
 void pulsar_session_snapshot_free(pulsar_session_snapshot *snap);
 

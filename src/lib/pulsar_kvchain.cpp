@@ -10,12 +10,13 @@ namespace {
 struct seg_ctx {
     pulsar_session *s;
     int G_prev, G;
+    char key[41];       ///< the key the store will name it by (the same rule, pulsar_segstore_child_key)
     const char *text;
     const pulsar_kvchain_trailer *trailer;
 };
 int write_payload(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
-    return pulsar_session_save_segment(c->s, fp, c->G_prev, c->G, err, errlen);
+    return pulsar_session_save_segment(c->s, fp, c->G_prev, c->G, c->key, err, errlen);
 }
 int write_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
@@ -72,7 +73,14 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
         uint64_t tbytes = 0;
         if (!text || (trailer && !trailer->size(trailer->ud, text, &tbytes))) tbytes = 0;
-        seg_ctx ctx = { s, prev, G, text, trailer };
+        seg_ctx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.s = s;
+        ctx.G_prev = prev;
+        ctx.G = G;
+        ctx.text = text;
+        ctx.trailer = trailer;
+        if (text) pulsar_segstore_child_key(parent, text, text_len, ctx.key);
         const uint64_t payload = pulsar_session_segment_bytes(s, prev, G);
         char key[41];
         const bool ok = text && pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text, text_len, payload,
@@ -107,7 +115,7 @@ int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
         char lerr[256] = "segment file unreadable";
         int G = 0;
-        const int rc = fp ? pulsar_session_load_segment(s, fp, pb, i == n - 1, &G, lerr, sizeof(lerr)) : 1;
+        const int rc = fp ? pulsar_session_load_segment(s, fp, pb, i == n - 1, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
         if (fp) fclose(fp);
         if (rc != 0) {
             if (err && errlen)

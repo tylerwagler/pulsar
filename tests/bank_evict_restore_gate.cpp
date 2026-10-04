@@ -146,7 +146,7 @@ static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, 
         Gs[i] = desc[n - 1 - i];
         fp[i] = tmpfile();
         bytes[i] = pulsar_session_segment_bytes(s, prev, Gs[i]);
-        if (!fp[i] || pulsar_session_save_segment(s, fp[i], prev, Gs[i], err, errlen) != 0) {
+        if (!fp[i] || pulsar_session_save_segment(s, fp[i], prev, Gs[i], NULL, err, errlen) != 0) {
             for (int k = 0; k <= i; k++) if (fp[k]) fclose(fp[k]);
             return 0;
         }
@@ -242,7 +242,7 @@ int GATE_ENTRY(int argc, char **argv) {
       CHECK(pulsar_session_bank_state_restore(s, 0), "repoint to bank 0 failed");
       for (int i = 0; i < n_chain; i++) {
           int G = 0;
-          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, err, sizeof err) == 0,
+          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, NULL, err, sizeof err) == 0,
                 "segment %d load: %s", i, err);
           CHECK(G == chain_G[i], "segment %d loaded G=%d, saved %d", i, G, chain_G[i]);
       }
@@ -319,7 +319,7 @@ int GATE_ENTRY(int argc, char **argv) {
           }
           rewind(fp);
           int G = 0;
-          const int lrc = pulsar_session_load_segment(s, fp, nb, true, &G, err, sizeof err);
+          const int lrc = pulsar_session_load_segment(s, fp, nb, true, &G, NULL, err, sizeof err);
           fclose(fp);
           const char *what = leg == 0 ? "(a) truncated" : "(b) flipped byte";
           CHECK(lrc != 0, "finding3%s: load ACCEPTED it", what);

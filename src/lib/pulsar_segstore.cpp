@@ -47,6 +47,8 @@ struct pulsar_segstore {
     uint32_t model_id = 0;
     pulsar_segstore_log_fn log = nullptr;
     void *log_ud = nullptr;
+    pulsar_segstore_removed_fn removed = nullptr;
+    void *removed_ud = nullptr;
     std::unordered_map<std::string, pulsar_segstore_seg> segs;
     std::unordered_map<std::string, std::vector<std::string>> children;   ///< parent key ("" = roots) -> child keys
     uint64_t used = 0;
@@ -91,6 +93,7 @@ struct pulsar_segstore {
     void unlink_index(const std::string &key) {
         auto it = segs.find(key);
         if (it == segs.end()) return;
+        if (removed) removed(removed_ud, key.c_str());
         used -= it->second.file_bytes;
         auto &sib = children[it->second.parent];
         for (size_t i = 0; i < sib.size(); i++)
@@ -409,6 +412,12 @@ void pulsar_segstore_drop(pulsar_segstore *st, const char key[41]) {
         ::unlink(st->path(k.c_str()).c_str());
         st->unlink_index(k);
     }
+}
+
+void pulsar_segstore_set_removed_hook(pulsar_segstore *st, pulsar_segstore_removed_fn fn, void *ud) {
+    if (!st) return;
+    st->removed = fn;
+    st->removed_ud = ud;
 }
 
 uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const char *stop) {

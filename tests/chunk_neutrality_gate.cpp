@@ -108,7 +108,7 @@ static char *read_file(const char *path, size_t *len_out) {
 struct segment_writer { pulsar_session *s; int G_prev, G; };
 static int segment_write(FILE *fp, void *ud, char *err, size_t errlen) {
     const segment_writer *w = (const segment_writer *)ud;
-    return pulsar_session_save_segment(w->s, fp, w->G_prev, w->G, err, errlen);
+    return pulsar_session_save_segment(w->s, fp, w->G_prev, w->G, NULL, err, errlen);
 }
 static char *render_span(pulsar_engine *e, const pulsar_tokens *t, int from, int to, size_t *len) {
     size_t cap = 4096, n = 0;
@@ -181,7 +181,7 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
             uint64_t pb = 0;
             FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
             int G = 0;
-            const int lrc = fp ? pulsar_session_load_segment(*sp, fp, pb, i == m - 1, &G, err, errlen) : 1;
+            const int lrc = fp ? pulsar_session_load_segment(*sp, fp, pb, i == m - 1, &G, chain[i].key, err, errlen) : 1;
             if (fp) fclose(fp);
             if (lrc != 0) { if (!fp) snprintf(err, errlen, "segment %d unreadable", i); goto out; }
         }

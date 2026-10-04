@@ -372,6 +372,11 @@ int server::kv_cache_persist(session_slot *sl, const char *reason) {
     auto *s = this;
     (void)sl;   /* the caller installed the slot's bank */
     if (!s->kv.enabled) return 0;
+    /* A "continued" store fires from the prefill's progress callback; on a TP
+     * group that is inside the mirrored sync, where the workers read only
+     * chunk verdicts.  The prompt-end store after it persists the same
+     * checkpoints. */
+    if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
     const double t0 = server_now_sec();
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     pulsar_kvchain_persist_result r;

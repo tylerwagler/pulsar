@@ -1758,6 +1758,7 @@ struct pulsar_engine {
      * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
+    char *tp_kv_dir;            ///< a worker's segment copies (pulsar_engine_options.tp_kv_dir), owned, or NULL
     uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
@@ -2283,6 +2284,10 @@ struct pulsar_session {
      *  no new rows re-evaluates the last one while it is set.  Fails safe: a
      *  writer that forgets to clear it costs one row, never a wrong sample. */
     bool logits_stale;
+    /** L264 S4e: the leader is inside a mirrored sync -- the workers read only
+     *  chunk verdicts until it returns, so no other mirrored frame may ship
+     *  (a disk KV store from the prefill's progress callback). */
+    bool tp_in_sync;
     /** Identity of the images whose sentinel blocks are inside `checkpoint`
      * (0 = none), and the exclusive end of the last of those blocks.  The
      * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never

@@ -521,6 +521,11 @@ static server_config parse_options(int argc, char **argv) {
 
 #ifndef PULSAR_SERVER_TEST
 
+/* L264 S4e: the segment store's removal hook on a TP leader. */
+static void kv_segment_removed(void *ud, const char key[41]) {
+    pulsar_engine_segment_dropped((pulsar_engine *)ud, key);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
@@ -532,6 +537,11 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
     server_resolve_kv_disk_dir(&cfg);
+    /* L264 S4e: a TP worker keeps its own copy of every disk KV segment the
+     * leader's store names, under its own KV directory. */
+    char *tp_kv_dir = cfg.kv_disk_dir ? (char *)xmalloc(strlen(cfg.kv_disk_dir) + 8) : NULL;
+    if (tp_kv_dir) sprintf(tp_kv_dir, "%s/tp-seg", cfg.kv_disk_dir);
+    cfg.engine.tp_kv_dir = tp_kv_dir;
     /* Every rank tells the group its build (the NODE frame), so the leader's
      * /health can show a mixed-build pair for what it is.  Stamped here, not in
      * the transport: this TU is rebuilt whenever HEAD moves (Makefile), and a
@@ -1003,15 +1013,7 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
-    /* L264 S4: the disk KV cache is the segment store.  Its segments are not
-     * mirrored across a tensor-parallel group yet (each rank would need its own
-     * copy of every segment, the L250 shape), so a TP engine serves without
-     * disk restore until they are -- said once, here. */
-    if (cfg.kv_disk_dir && pulsar_engine_is_tp(engine)) {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: disk KV cache off on a tensor-parallel group: segments are not "
-                   "mirrored across ranks yet (L264 S4)");
-    } else if (cfg.kv_disk_dir &&
+    if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                        pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(engine),
                                                 (uint32_t)pulsar_engine_routed_quant_bits(engine)),
@@ -1024,6 +1026,23 @@ int main(int argc, char **argv) {
                    "pulsar-server: disk KV cache disabled (directory %s unusable); "
                    "serving without disk restore",
                    cfg.kv_disk_dir);
+    }
+    /* L264 S4e: on a tensor-parallel group every worker keeps its own copy of
+     * each segment the store names (the engine mirrors save and load).  Every
+     * key the store removes from here on is dropped on the workers too, and the
+     * keys it holds now reconcile them -- copies left by a crash, or by orphans
+     * the open just pruned, go. */
+    if (s.kv.enabled && pulsar_engine_is_tp(engine)) {
+        pulsar_segstore_set_removed_hook(s.kv.st, kv_segment_removed, engine);
+        char *keys = NULL;
+        const int n_keys = pulsar_segstore_keys(s.kv.st, &keys);
+        if (pulsar_engine_segment_reconcile(engine, keys, n_keys) != 0)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: tp: the disk KV segment reconcile could not be sent; "
+                                           "orphan worker copies stay until the next bring-up");
+        else
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: disk KV segments mirrored across the TP group "
+                                           "(%d held, workers reconciled)", n_keys);
+        free(keys);
     }
     /* L264: a guard spill persists the bank's history to the disk KV cache; with
      * no cache there is nowhere to put it, and freeing the bank would lose the
@@ -1180,6 +1199,7 @@ int main(int argc, char **argv) {
         }
     }
     s.close_resources();
+    free(tp_kv_dir);
     return 0;
 }
 

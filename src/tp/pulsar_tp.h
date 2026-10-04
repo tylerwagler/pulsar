@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 22u           /* v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 23u           /* v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -696,7 +696,36 @@ typedef enum {
     /* v19 (L260 fusion): pulsar_session_note_prefilled -- the chunk's tokens,
      * the headed run's index in `value` (-1 none).  Verdict: 0 ok, 1 refused. */
     PULSAR_TP_FRAME_NOTE_PREFILLED = 51,
+    /* v23 (L264 S4e): the disk KV cache's segment chains.  KV is replicated
+     * per rank, so each rank keeps its own copy of every segment the leader's
+     * store names, as <tp_kv_dir>/<key>.tpseg.  The payload is a
+     * pulsar_tp_segment_command.  SAVE: verdict (0 stored, 1 a miss -- the
+     * leader skips the segment on every rank).  LOAD: verdict (0 the same
+     * state, 1 a miss); the leader loads first and states the result (G and
+     * the history digest).  DROP: void.  RECONCILE: void, the leader's whole
+     * key set at bring-up (n_keys x 40 hex after a u32 count); a worker
+     * removes the copies it does not name. */
+    PULSAR_TP_FRAME_SEGMENT_SAVE = 52,
+    PULSAR_TP_FRAME_SEGMENT_LOAD = 53,
+    PULSAR_TP_FRAME_SEGMENT_DROP = 54,
+    PULSAR_TP_FRAME_SEGMENT_RECONCILE = 55,
 } pulsar_tp_frame_type;
+
+/** One segment operation (L264 S4e). */
+typedef struct {
+    uint64_t session_id;
+    int32_t G_prev, G;    ///< the span (SAVE), the span loaded (LOAD)
+    uint64_t digest;      ///< LOAD: pulsar_session_checkpoint_digest after the leader's load
+    int32_t last;         ///< LOAD: the chain's last segment (restores its checkpoint)
+    uint32_t reserved;
+    char key[40];         ///< the segment's store key, 40 lowercase hex
+} pulsar_tp_segment_command;
+
+/** A segment store key: exactly 40 lowercase hex characters. */
+bool pulsar_tp_segment_key_ok(const char *key);
+int pulsar_tp_send_segment(pulsar_tp *tp, pulsar_tp_frame_type type, const pulsar_tp_segment_command *cmd);
+/** `keys`: n_keys x 40 hex, back to back. */
+int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys);
 
 
 typedef struct {
@@ -726,6 +755,11 @@ typedef struct {
     pulsar_image_ref *images;
     uint32_t n_images;
     uint8_t *image_bytes;
+    /* SEGMENT_SAVE / LOAD / DROP. */
+    pulsar_tp_segment_command segment;
+    /* SEGMENT_RECONCILE: n_keys x 40 hex (malloc'd). */
+    char *keys;
+    uint32_t n_keys;
 } pulsar_tp_command;
 
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,

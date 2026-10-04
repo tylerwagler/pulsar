@@ -638,7 +638,9 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
         ? pulsar_tp_send_sync_mm(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len, images, (uint32_t)n_images)
         : pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len);
     if (!tp_mirror_sent(tp, n_images > 0 ? "sync with images" : "sync", sent, err, errlen)) return 1;
+    s->tp_in_sync = true;
     const int body_rc = s->sync(prompt, images, n_images, err, errlen);
+    s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
@@ -1374,17 +1376,126 @@ int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_by
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G) {
     return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G) : 0;
 }
-int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, char *err, size_t errlen) {
-    if (!s || G_prev < 0 || G <= G_prev) { snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev, G); return 1; }
-    return s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+/* L264 S4e: on a TP group every rank keeps its own copy of each segment (KV is
+ * replicated per rank), named by the leader's store key.  Both operations are
+ * mirrored VERDICTS whose disagreement is a MISS on every rank, never a
+ * divergence: the pair stays up and the conversation prefills.  Neither may run
+ * inside a mirrored prefill -- the workers read only chunk verdicts there. */
+static int tp_segment_refused(pulsar_session *s, pulsar_tp *tp, const char *operation, const char *key,
+                              char *err, size_t errlen) {
+    if (tp_mirror_worker_drives_nothing(tp, operation, err, errlen) || tp_mirror_dead(tp, err, errlen)) return 1;
+    if (s->tp_in_sync) {
+        snprintf(err, errlen, "tp: %s inside a mirrored prefill is not mirrored (the workers are inside the "
+                              "prefill)", operation);
+        return 1;
+    }
+    if (!pulsar_tp_segment_key_ok(key)) {
+        snprintf(err, errlen, "tp: %s: '%.40s' is not a segment key", operation, key ? key : "(null)");
+        return 1;
+    }
+    return 0;
 }
-int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
-                                int *G_out, char *err, size_t errlen) {
+static pulsar_tp_segment_command tp_segment_command(const pulsar_session *s, const char *key) {
+    pulsar_tp_segment_command c;
+    memset(&c, 0, sizeof(c));
+    c.session_id = s->tp_session_id;
+    memcpy(c.key, key, 40);
+    return c;
+}
+void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key) {
+    if (!e || !e->tp || pulsar_tp_rank(e->tp) != 0 || pulsar_tp_failed(e->tp) || !pulsar_tp_segment_key_ok(key)) return;
+    pulsar_tp_segment_command c;
+    memset(&c, 0, sizeof(c));
+    memcpy(c.key, key, 40);
+    /* void: a lost drop leaves an orphan copy no leader key names -- never
+     * loaded, reclaimed by the next bring-up's reconcile. */
+    if (!pulsar_tp_send_segment(e->tp, PULSAR_TP_FRAME_SEGMENT_DROP, &c))
+        pulsar_tp_mirror_fail_void(e->tp, "kv segment drop", "the frame could not be shipped");
+}
+int pulsar_engine_segment_reconcile(pulsar_engine *e, const char *keys, int n_keys) {
+    if (!e || !e->tp || pulsar_tp_rank(e->tp) != 0 || pulsar_tp_failed(e->tp)) return 0;
+    if (n_keys < 0 || (n_keys > 0 && !keys)) return 1;
+    for (int i = 0; i < n_keys; i++)
+        if (!pulsar_tp_segment_key_ok(keys + (size_t)i * 40u)) return 1;
+    return pulsar_tp_send_segment_reconcile(e->tp, keys, (uint32_t)n_keys) ? 0 : 1;
+}
+bool pulsar_session_in_mirrored_sync(const pulsar_session *s) { return s && s->tp_in_sync; }
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, const char *key,
+                                char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s || G_prev < 0 || G <= G_prev) { snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev, G); return 1; }
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (!tp) return s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+    if (tp_segment_refused(s, tp, "kv segment save", key, err, errlen)) return 1;
+    /* Ship first, write second: each rank writes its own copy of the SAME state
+     * (nothing else moves on the control plane until the verdict is in), so the
+     * writes overlap instead of running back to back. */
+    pulsar_tp_segment_command c = tp_segment_command(s, key);
+    c.G_prev = G_prev;
+    c.G = G;
+    if (!tp_mirror_sent(tp, "kv segment save", pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &c),
+                        err, errlen)) return 1;
+    const int own = s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+    int peers = 0;
+    char perr[256];
+    perr[0] = '\0';
+    if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment save", &peers, perr, sizeof(perr))) {
+        pulsar_tp_mirror_fail_void(tp, "kv segment save", perr);
+        snprintf(err, errlen, "tp: kv segment save: the workers' verdict could not be collected: %s", perr);
+        return 1;
+    }
+    if (own != 0) {
+        if (peers == 0) pulsar_engine_segment_dropped(s->engine, key);   /* they stored, this rank did not */
+        return 1;                                                         /* err: this rank's own reason */
+    }
+    if (peers != 0) {
+        snprintf(err, errlen, "tp: a worker could not store its copy of segment %.40s (its log names the "
+                              "reason); the segment is skipped on every rank", key);
+        return 1;
+    }
+    return 0;
+}
+int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last, int *G_out,
+                                const char *key, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (G_out) *G_out = 0;
     if (!s) { snprintf(err, errlen, "load segment: no session"); return 1; }
+    pulsar_tp *tp = tp_mirror_target(s);
+    if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return 1;
     uint32_t G = 0;
-    const int rc = s->load_segment(fp, bytes, last, &G, err, errlen);
+    /* Load HERE first: the workers must reach the state this rank actually
+     * ended in, so the frame carries the result, not the intent.  A local
+     * failure never ships it -- the caller's mirrored invalidate brings every
+     * rank to the same empty state. */
+    const int own = s->load_segment(fp, bytes, last, &G, err, errlen);
+    if (own != 0 || !tp) {
+        if (G_out) *G_out = (int)G;
+        return own;
+    }
+    pulsar_tp_segment_command c = tp_segment_command(s, key);
+    c.G = (int32_t)G;
+    c.last = last ? 1 : 0;
+    c.digest = pulsar_session_checkpoint_digest(s);
+    if (!tp_mirror_sent(tp, "kv segment load", pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_LOAD, &c),
+                        err, errlen)) return 1;
+    int peers = 0;
+    char perr[256];
+    perr[0] = '\0';
+    if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment load", &peers, perr, sizeof(perr))) {
+        pulsar_tp_mirror_fail_void(tp, "kv segment load", perr);
+        snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
+        return 1;
+    }
+    if (peers != 0) {
+        /* A MISS: the copy is missing or reached another state.  Nothing is
+         * computed on it -- the caller invalidates every rank and drops the
+         * chain. */
+        snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
+                              "a miss on every rank", key);
+        return 1;
+    }
     if (G_out) *G_out = (int)G;
-    return rc;
+    return 0;
 }
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) { return s ? s->save_snapshot(snap, err, errlen) : 1; }
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) { return s ? s->load_snapshot(snap, err, errlen) : 1; }

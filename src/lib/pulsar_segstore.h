@@ -89,6 +89,11 @@ FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint
 FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint64_t *trailer_bytes);
 /** Record a use of every segment of a chain (hit count + last_used). */
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
+/** Called with every key the store removes (drop, release, eviction, an orphan
+ *  pruned at open) -- the TP leader tells its workers to delete their copies.
+ *  Set it before anything can be removed; NULL to clear. */
+typedef void (*pulsar_segstore_removed_fn)(void *ud, const char key[41]);
+void pulsar_segstore_set_removed_hook(pulsar_segstore *st, pulsar_segstore_removed_fn fn, void *ud);
 /** Remove a segment and every segment below it (a payload that would not load). */
 void pulsar_segstore_drop(pulsar_segstore *st, const char key[41]);
 /** Release the stretch of a chain only `tip` uses: walk up from a LEAF tip while

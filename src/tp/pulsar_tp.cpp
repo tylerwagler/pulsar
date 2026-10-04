@@ -3901,6 +3901,35 @@ int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_t
     return ok;
 }
 
+bool pulsar_tp_segment_key_ok(const char *key) {
+    if (!key) return false;
+    for (int i = 0; i < 40; i++) {
+        const char c = key[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+int pulsar_tp_send_segment(pulsar_tp *tp, pulsar_tp_frame_type type, const pulsar_tp_segment_command *cmd) {
+    if (!cmd || !pulsar_tp_segment_key_ok(cmd->key) ||
+        (type != PULSAR_TP_FRAME_SEGMENT_SAVE && type != PULSAR_TP_FRAME_SEGMENT_LOAD &&
+         type != PULSAR_TP_FRAME_SEGMENT_DROP)) return 0;
+    return tp_send_frame_to_peers(tp, (uint32_t)type, cmd, sizeof(*cmd));
+}
+
+int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys) {
+    if (n_keys > 0 && !keys) return 0;
+    const uint64_t bytes = sizeof(uint32_t) + (uint64_t)n_keys * 40u;
+    if (bytes > UINT32_MAX) return 0;
+    uint8_t *payload = static_cast<uint8_t *>(malloc((size_t)bytes));
+    if (!payload) return 0;
+    memcpy(payload, &n_keys, sizeof(n_keys));
+    if (n_keys) memcpy(payload + sizeof(n_keys), keys, (size_t)n_keys * 40u);
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SEGMENT_RECONCILE, payload, (uint32_t)bytes);
+    free(payload);
+    return ok;
+}
+
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
     return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
 }
@@ -4186,6 +4215,9 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     command->images = NULL;
     command->image_bytes = NULL;
     command->n_images = 0;
+    free(command->keys);
+    command->keys = NULL;
+    command->n_keys = 0;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -4368,6 +4400,26 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->value = msg.value;
         /* SESSION_CREATE's bank-pool size (v12); the other value frames send 0. */
         command->seq = msg.reserved;
+        break;
+    }
+    case PULSAR_TP_FRAME_SEGMENT_SAVE:
+    case PULSAR_TP_FRAME_SEGMENT_LOAD:
+    case PULSAR_TP_FRAME_SEGMENT_DROP:
+        if (bytes != sizeof(command->segment)) { ok = 0; break; }
+        memcpy(&command->segment, payload, sizeof(command->segment));
+        if (!pulsar_tp_segment_key_ok(command->segment.key)) { ok = 0; break; }
+        command->session_id = command->segment.session_id;
+        break;
+    case PULSAR_TP_FRAME_SEGMENT_RECONCILE: {
+        uint32_t n = 0;
+        if (bytes < sizeof(n)) { ok = 0; break; }
+        memcpy(&n, payload, sizeof(n));
+        if ((uint64_t)bytes != sizeof(n) + (uint64_t)n * 40u) { ok = 0; break; }
+        command->keys = static_cast<char *>(malloc((size_t)n * 40u + 1u));
+        if (!command->keys) { ok = -1; break; }
+        if (n) memcpy(command->keys, payload + sizeof(n), (size_t)n * 40u);
+        command->keys[(size_t)n * 40u] = '\0';
+        command->n_keys = n;
         break;
     }
     case PULSAR_TP_FRAME_SESSION_DESTROY:

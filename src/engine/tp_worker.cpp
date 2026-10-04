@@ -1,5 +1,11 @@
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
+#include "pulsar_writeback.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ---------------------------------------------------------------------------
  * Slice 4e, the WORKER RECEIVE LOOP (L238).
@@ -163,6 +169,107 @@ static int worker_ack_logits(pulsar_engine *e, uint64_t sid, int rc, const float
     if (pulsar_tp_send_command_ack_digest(e->tp, sid, 0, digest) != 0) return 1;
     snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
     return -1;
+}
+
+/* L264 S4e: this rank's copy of a disk KV segment the leader's store names. */
+static bool worker_segment_path(pulsar_engine *e, const char *key, char *out, size_t outlen) {
+    if (!e->tp_kv_dir || !pulsar_tp_segment_key_ok(key)) return false;
+    const int w = snprintf(out, outlen, "%s/%.40s.tpseg", e->tp_kv_dir, key);
+    return w > 0 && (size_t)w < outlen;
+}
+
+static bool worker_mkdir_p(const char *path) {
+    if (!path || !path[0]) return false;
+    char buf[4096];
+    const size_t n = strlen(path);
+    if (n >= sizeof(buf)) return false;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i <= n; i++) {
+        if (buf[i] == '/' || buf[i] == '\0') {
+            const char saved = buf[i];
+            buf[i] = '\0';
+            if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+            buf[i] = saved;
+        }
+    }
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* The installed bank's segment [G_prev, G), durably: tmp + fsync + rename, and
+ * out of the page cache (L261). */
+static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev, int G, char *err, size_t errlen) {
+    char tmp[4700];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        snprintf(err, errlen, "cannot create %.400s: %s", tmp, strerror(errno));
+        return false;
+    }
+    err[0] = '\0';
+    bool ok = s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen) == 0 &&
+              fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    if (ok) pulsar_writeback_drop_file(fp);
+    const int saved_errno = errno;
+    if (fclose(fp) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) {
+        remove(tmp);
+        if (!err[0]) snprintf(err, errlen, "writing %.400s failed: %s", path, strerror(saved_errno ? saved_errno : errno));
+    }
+    return ok;
+}
+
+/* Load this rank's copy and reach the state the leader states: the same span
+ * end and the same history digest. */
+static bool worker_segment_load(pulsar_session *s, const char *path, const pulsar_tp_segment_command *cmd,
+                                char *err, size_t errlen) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, errlen, "no copy %.400s: %s", path, strerror(errno));
+        return false;
+    }
+    struct stat st;
+    uint32_t G = 0;
+    err[0] = '\0';
+    bool ok = fstat(fileno(fp), &st) == 0 &&
+              s->load_segment(fp, (uint64_t)st.st_size, cmd->last != 0, &G, err, errlen) == 0;
+    fclose(fp);
+    if (ok && ((int)G != cmd->G || pulsar_session_checkpoint_digest(s) != cmd->digest)) {
+        snprintf(err, errlen, "the copy loaded to %u (digest %016llx); the leader stands at %d (digest %016llx)",
+                 G, (unsigned long long)pulsar_session_checkpoint_digest(s), cmd->G,
+                 (unsigned long long)cmd->digest);
+        ok = false;
+    }
+    if (!ok && !err[0]) snprintf(err, errlen, "loading %.400s failed", path);
+    return ok;
+}
+
+/* Bring-up: copies the leader's store does not name can never be loaded (the
+ * leader decides every load) -- reclaim them, and any abandoned temp file. */
+static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_t n_keys) {
+    if (!e->tp_kv_dir) return;
+    DIR *d = opendir(e->tp_kv_dir);
+    if (!d) return;
+    int kept = 0, removed = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        const size_t len = strlen(name);
+        bool keep = false;
+        if (len == 46 && !strcmp(name + 40, ".tpseg")) {
+            for (uint32_t i = 0; i < n_keys && !keep; i++) keep = !memcmp(keys + (size_t)i * 40u, name, 40);
+        } else if (!strstr(name, ".tpseg.tmp.")) {
+            continue;   /* not ours */
+        }
+        if (keep) { kept++; continue; }
+        char path[4600];
+        snprintf(path, sizeof(path), "%s/%s", e->tp_kv_dir, name);
+        if (unlink(path) == 0) removed++;
+    }
+    closedir(d);
+    fprintf(stderr, "pulsar: tp worker: kv segments reconciled: %d kept, %d removed (the leader holds %u)\n",
+            kept, removed, n_keys);
 }
 
 static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
@@ -647,6 +754,51 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         return worker_ack(e, c->session_id, status, err, errlen);
     }
+    /* ---- L264 S4e: the disk KV cache's segment chains, one copy per rank ---- */
+    case PULSAR_TP_FRAME_SEGMENT_SAVE: {
+        /* A failed store is a MISS, never a divergence: the leader skips the
+         * segment on every rank and the pair stays up. */
+        int status = 1;
+        char path[4600];
+        if (worker_refused(e, c, "kv segment save", &slot, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment save refused: %s\n", ferr);
+        } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment save refused: no segment directory on this rank "
+                            "(pulsar_engine_options.tp_kv_dir)\n");
+        } else if (!worker_segment_save(slot->s, path, c->segment.G_prev, c->segment.G, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment save failed: %s\n", ferr);
+        } else {
+            status = 0;
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SEGMENT_LOAD: {
+        /* The leader loaded first and states the result; a copy that cannot
+         * reach it is a MISS -- the leader invalidates every rank and drops the
+         * chain. */
+        int status = 1;
+        char path[4600];
+        if (worker_refused(e, c, "kv segment load", &slot, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment load refused: %s\n", ferr);
+        } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment load refused: no segment directory on this rank\n");
+        } else if (!worker_segment_load(slot->s, path, &c->segment, ferr, sizeof(ferr))) {
+            fprintf(stderr, "pulsar: tp worker: kv segment load miss (%.40s): %s\n", c->segment.key, ferr);
+        } else {
+            status = 0;
+        }
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
+    case PULSAR_TP_FRAME_SEGMENT_DROP: {
+        /* void: a copy the leader's store no longer names. */
+        char path[4600];
+        if (worker_segment_path(e, c->segment.key, path, sizeof(path))) (void)unlink(path);
+        return 1;
+    }
+    case PULSAR_TP_FRAME_SEGMENT_RECONCILE:
+        worker_segment_reconcile(e, c->keys ? c->keys : "", c->n_keys);
+        return 1;
+
     default:
         snprintf(err, errlen, "tp: the leader sent frame type %d, which a worker does not apply", (int)c->type);
         pulsar_tp_mark_failed(tp);
@@ -662,6 +814,10 @@ int pulsar_tp_worker_run(pulsar_engine *e, char *err, size_t errlen) {
     }
     fprintf(stderr, "pulsar: TP worker rank %d/%u: driving sessions from the leader's frames\n",
             pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
+    if (e->tp_kv_dir && !worker_mkdir_p(e->tp_kv_dir)) {
+        fprintf(stderr, "pulsar: TP worker: cannot create the segment directory %s (%s); mirrored "
+                        "disk KV segments will be misses on this rank\n", e->tp_kv_dir, strerror(errno));
+    }
     int rc = 0;
     for (;;) {
         pulsar_tp_command c;

@@ -215,6 +215,19 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank alloc physical", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session alloc physical must come back as a refusal: %s", err);
+        /* L264 S4e: a segment save for a session the worker never created is
+         * a refusal too (the leader then skips the segment on every rank). */
+        pulsar_tp_segment_command seg;
+        std::memset(&seg, 0, sizeof(seg));
+        seg.session_id = SID;
+        seg.G_prev = 0;
+        seg.G = 128;
+        std::memcpy(seg.key, "0123456789abcdef0123456789abcdef01234567", 40);
+        CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &seg) != 0, "send_segment must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "kv segment save", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session segment save must come back as a refusal: %s", err);
     }
 
     /* B. A void frame for an unknown session marks the worker's pair failed
