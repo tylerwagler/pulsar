@@ -2118,6 +2118,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 if (kk > (int)(cont_rows - pf_rows)) kk = (int)(cont_rows - pf_rows);
                 kk = (p0 + kk) / PULSAR_SERVER_FUSED_CHUNK_ALIGN * PULSAR_SERVER_FUSED_CHUNK_ALIGN - p0;
                 if (kk <= 0) continue;
+            } else {
+                /* L264: the final chunk stops at the last grid point inside it,
+                 * which the bank keeps as a checkpoint (note_prefilled); the
+                 * tail rides the next round -- the classic chunk loop's split. */
+                const int grid_end = (p0 + kk) / PULSAR_RESUME_GRID * PULSAR_RESUME_GRID;
+                if (grid_end > p0 && grid_end < p0 + kk) kk = grid_end - p0;
             }
             fr[n_fr].sl = c;
             fr[n_fr].p0 = p0;
@@ -2691,6 +2697,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     int pf_done = 0;
     bool reached_end = false;                     /* prefill reached len this quantum */
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
+    bool pf_at_grid = false;                       /* prefill reached a grid point: commit there (L264) */
 
     const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
     pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
@@ -2726,9 +2733,17 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
          * prefill output stays byte-identical to a cold prefill). */
         const int pos_now = P0 + pf_done;
         int kthis = 0;
-        if (!pf_giveup && pos_now < len) {
+        if (!pf_giveup && !pf_at_grid && pos_now < len) {
             kthis = kstep;
             if (pos_now + kthis > len) kthis = len - pos_now;
+            /* L264: never step over a grid point -- stop there for this quantum,
+             * so the commit below lands on it and the bank keeps a checkpoint
+             * (note_prefilled); the decode banks run on. */
+            const int next_grid = (pos_now / PULSAR_RESUME_GRID + 1) * PULSAR_RESUME_GRID;
+            if (pos_now + kthis >= next_grid && next_grid < len) {
+                kthis = next_grid - pos_now;
+                pf_at_grid = true;
+            }
         }
         for (int j = 0; j < kthis; j++) {
             reqs[m + j].bank = pf->bank;
@@ -2818,8 +2833,11 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
      * checkpoint by exactly the committed prefill tokens, so its next chunk resumes
      * correctly and any store sees the true frontier. */
     if (pf_done > 0 && pg->phase == GEN_PREFILL_MAIN) {
-        if (pulsar_session_bank_state_restore(pool, pf->bank)) {
-            pulsar_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
+        /* note_prefilled, not note_committed: these are PREFILL rows, so the
+         * bank's prefill frontier moves with them (a resume computes its grid
+         * point from it) and a commit that ends on the grid is a checkpoint. */
+        if (pulsar_session_bank_state_restore(pool, pf->bank) &&
+            pulsar_session_note_prefilled(pool, &pp->v[P0], pf_done, -1) == 0) {
             pf->committed_pos = P0 + pf_done;
             s->live_bank = (int)pf->bank;
             if (reached_end) {

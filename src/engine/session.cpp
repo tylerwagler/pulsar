@@ -2199,6 +2199,14 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
      * committed ("frontier not position-true ... n_comp 61 want 0"). */
     s->checkpoint_valid = true;
     s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
+    /* L264: a fused chunk that ends on the grid leaves the bank exactly where
+     * a prefill to that point leaves it -- a checkpoint, as the chunk loop takes
+     * one at every grid chunk end, so the fused lane's prompts resume like the
+     * classic sync's.  (The server's fused planners end chunks on grid points.) */
+    const uint32_t G = (uint32_t)s->checkpoint.len;
+    if (G % PULSAR_RESUME_GRID == 0u && G >= s->graph.raw_window &&
+        !s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)])
+        (void)gpu_graph_ckpt_capture(&s->graph, G);
     if (head >= 0)
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
                (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
