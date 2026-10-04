@@ -32,9 +32,10 @@
  * derived from ctx_size at CREATE, so it is 4096 for every depth here, not a
  * function of the prompt.  pulsar_session_sync then tests `prefill_cap <
  * prompt->len` (session.c:2063):
- *   - 512/2048/4096  -> FALSE (4096 included, at the boundary): the NON-chunked
- *     one-shot gpu_graph_prefill_raw_swa path.  Depth D is a single routed-MoE
- *     call at n_tokens == D.
+ *   - 512/2048/4096  -> FALSE (4096 included, at the boundary): ONE chunk.
+ *     Since L264 every cold prompt runs the chunk loop (the one-shot raw_swa
+ *     path is gone); a grid-multiple prompt inside one chunk is not split, so
+ *     depth D is still a single routed-MoE call at n_tokens == D.
  *   - 4102/6144      -> TRUE: gpu_graph_prefill_chunked, i.e. SEVERAL routed-MoE
  *     calls whose batch shapes are set by the chunk loop rather than by D.
  * The 6144 row is why the chunked path is not a blind spot: production chunks

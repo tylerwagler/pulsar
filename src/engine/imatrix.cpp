@@ -664,42 +664,6 @@ static bool gpu_graph_prefill_layer_major_inner(
 
 
 
-bool gpu_graph_prefill_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        int                    n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled) {
-    if (n_tokens <= 0 || n_tokens > prompt->len) return false;
-    if ((uint32_t)n_tokens > g->prefill_cap) return false;
-    /* The layer-major fallback below may submit the whole short prefill as one
-     * GPU command buffer.  Once that command is in flight there is no useful
-     * safe prefix to expose: by the time cancellation can be observed again,
-     * the prompt has already been fully read and the KV is valid.  Let the
-     * caller observe the pending interrupt at generation time instead. */
-    (void)cancel;
-    (void)cancel_ud;
-    (void)cancelled;
-    return gpu_graph_prefill_layer_major(g,
-                                           model,
-                                           weights,
-                                           prompt,
-                                           0,
-                                           (uint32_t)n_tokens,
-                                           logits,
-                                           show_progress,
-                                           NULL,
-                                           display_progress,
-                                           display_progress_ud);
-}
-
 /* Prefill a contiguous token range in fixed-size chunks.
  *
  * The common case starts at token zero, but server sessions also use this to

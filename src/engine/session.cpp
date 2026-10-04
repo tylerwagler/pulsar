@@ -1756,7 +1756,12 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
      * reached while dirty — decode_multiseq clears checkpoint_valid, which
      * that path gates on.) */
     s->mseq_dirty = false;
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    /* L264: every cold prompt goes through the chunk loop, short ones included:
+     * it is what splits the final chunk at the last grid point and captures the
+     * checkpoint there, so the next turn resumes instead of re-prefilling.  A
+     * prompt inside one chunk is the same computation either way (chunk
+     * neutrality). */
+    {
         bool cancelled = false;
         pulsar_sync_progress progress = {
             .session = s,
@@ -1775,19 +1780,6 @@ int pulsar_session::sync_impl(const pulsar_tokens *prompt, const pulsar_image_re
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             s->checkpoint_valid = s->checkpoint.len > 0;
-            return PULSAR_SESSION_SYNC_INTERRUPTED;
-        }
-    } else {
-        bool cancelled = false;
-        ok = gpu_graph_prefill_raw_swa(&s->graph, &e->model, &e->weights,
-                                         prompt, prompt->len, s->logits, false,
-                                         s->display_progress,
-                                         s->display_progress_ud,
-                                         pulsar_session_cancelled_cb,
-                                         s,
-                                         &cancelled);
-        if (cancelled) {
-            snprintf(err, errlen, "interrupted");
             return PULSAR_SESSION_SYNC_INTERRUPTED;
         }
     }
