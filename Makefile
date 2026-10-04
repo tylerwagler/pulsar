@@ -150,7 +150,7 @@ MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
 ifneq ($(strip $(MMQ_SRCS)),)
 MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
 endif
-LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h src/lib/pulsar_ctxmem.h src/lib/pulsar_json.h
+LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_segstore.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h src/lib/pulsar_ctxmem.h src/lib/pulsar_json.h
 # pulsar_json.o rides in CORE_OBJS rather than being listed per target like the
 # other src/lib objects: the ENGINE objects reference it (the safetensors reader
 # scans shard headers and __metadata__ as JSON), so every target that links
@@ -245,7 +245,7 @@ help:
 cuda-spark:
 	$(MAKE) -B pulsar-server CUDA_ARCH=sm_120f
 
-pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_segstore.o src/lib/pulsar_dsml.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
 # Development tools, not part of the shipped release. The release is just
@@ -2128,8 +2128,8 @@ tests/prefill_chunk_census_probe.o: tests/prefill_chunk_census_probe.cpp src/eng
 tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
+pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_segstore.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_segstore.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)

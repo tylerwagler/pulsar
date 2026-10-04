@@ -9,6 +9,7 @@
  * for the pulsar-server link. */
 #include "pulsar_server_internal.h"
 #include "lib/pulsar_writeback.h"
+#include "lib/pulsar_segstore.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -4752,6 +4753,156 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
 
 
 
+/* ===== L264 S4: the segment store ====================================== */
+typedef struct { uint64_t n; uint8_t fill; } test_seg_payload;
+static int test_seg_write(FILE *fp, void *ud, char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    const test_seg_payload *p = (const test_seg_payload *)ud;
+    for (uint64_t i = 0; i < p->n; i++) if (fputc(p->fill, fp) == EOF) return 1;
+    return 0;
+}
+static int test_seg_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
+    (void)ud; (void)err; (void)errlen;
+    return fwrite("TRAIL", 1, 5, fp) == 5 ? 0 : 1;
+}
+static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, uint32_t b, const char *text,
+                         uint64_t n, uint8_t fill, char key[41]) {
+    test_seg_payload p = { n, fill };
+    char err[256];
+    return pulsar_segstore_put(st, parent, a, b, text, strlen(text), n, test_seg_write, 0, NULL, &p, key,
+                               err, sizeof err);
+}
+
+static void test_l264_segstore_chain_lookup(void) {
+    char tmpl[] = "/tmp/pulsar-seg-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(st != NULL);
+    char root[41], a1[41], a2[41], b1[41];
+    /* two conversations sharing a system-prompt root */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root));
+    TEST_ASSERT(test_seg_put(st, root, 128, 256, "user A asks", 200, 0x22, a1));
+    TEST_ASSERT(test_seg_put(st, a1, 256, 384, " and follows up", 300, 0x33, a2));
+    TEST_ASSERT(test_seg_put(st, root, 128, 256, "user B asks", 200, 0x44, b1));
+    /* the key rule: a key names the whole text from 0 */
+    char k[41];
+    pulsar_segstore_child_key(root, "user A asks", 11, k);
+    TEST_ASSERT(!strcmp(k, a1));
+    /* the same text under the same parent is the same segment */
+    char again[41];
+    TEST_ASSERT(test_seg_put(st, root, 128, 256, "user A asks", 200, 0x99, again) && !strcmp(again, a1));
+    TEST_ASSERT(pulsar_segstore_count(st) == 4);
+
+    pulsar_segstore_seg chain[8];
+    const char *req = "SYSTEM:user A asks and follows up -- and the new turn";
+    int n = pulsar_segstore_lookup(st, req, strlen(req), chain, 8);
+    TEST_ASSERT(n == 3);
+    TEST_ASSERT(n == 3 && !strcmp(chain[0].key, root) && !strcmp(chain[2].key, a2) && chain[2].G == 384);
+    TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
+    /* a request that diverges inside a segment stops at the one before it */
+    const char *edited = "SYSTEM:user A asks and FOLLOWS up";
+    n = pulsar_segstore_lookup(st, edited, strlen(edited), chain, 8);
+    TEST_ASSERT(n == 2 && !strcmp(chain[1].key, a1));
+    /* the other conversation shares only the root */
+    const char *other = "SYSTEM:user B asks something else";
+    n = pulsar_segstore_lookup(st, other, strlen(other), chain, 8);
+    TEST_ASSERT(n == 2 && !strcmp(chain[1].key, b1));
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", 3, chain, 8) == 0);
+
+    /* the payload round-trips */
+    uint64_t pb = 0;
+    FILE *fp = pulsar_segstore_open_payload(st, a2, &pb);
+    TEST_ASSERT(fp != NULL && pb == 300);
+    if (fp) { TEST_ASSERT(fgetc(fp) == 0x33); fclose(fp); }
+
+    /* reopen: the index and the chain lengths come back from the files */
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    n = pulsar_segstore_lookup(st, req, strlen(req), chain, 8);
+    TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
+    /* another model's store sees none of it */
+    pulsar_segstore *other_model = pulsar_segstore_open(dir, 0, 8, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_count(other_model) == 0);
+    pulsar_segstore_close(other_model);
+
+    /* dropping a segment takes the chain below it */
+    pulsar_segstore_drop(st, a1);
+    TEST_ASSERT(!pulsar_segstore_contains(st, a1) && !pulsar_segstore_contains(st, a2));
+    TEST_ASSERT(pulsar_segstore_contains(st, root) && pulsar_segstore_contains(st, b1));
+    /* a child of a missing parent is refused, and so is a root not at 0 */
+    char bad[41];
+    char err[256];
+    test_seg_payload p = { 10, 0 };
+    TEST_ASSERT(!pulsar_segstore_put(st, a1, 256, 384, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_put(st, "", 128, 256, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
+    pulsar_segstore_close(st);
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
+static void test_l264_segstore_eviction_and_hygiene(void) {
+    char tmpl[] = "/tmp/pulsar-seg-evict.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    /* each segment costs 152 header + text + 1000 payload */
+    pulsar_segstore *st = pulsar_segstore_open(dir, 3 * 1200, 1, NULL, NULL);
+    char r[41], c1[41], c2[41], d[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "root", 1000, 1, r));
+    TEST_ASSERT(test_seg_put(st, r, 128, 256, "one", 1000, 2, c1));
+    TEST_ASSERT(test_seg_put(st, c1, 256, 384, "two", 1000, 3, c2));
+    TEST_ASSERT(pulsar_segstore_count(st) == 3);
+    /* a fourth must evict a LEAF, never the chain it extends: extending c2
+     * leaves no other leaf, so the store refuses rather than eat its own chain */
+    TEST_ASSERT(!test_seg_put(st, c2, 384, 512, "three", 1000, 4, d));
+    TEST_ASSERT(pulsar_segstore_contains(st, c2));
+    /* a sibling branch under the root evicts the old leaf c2 */
+    TEST_ASSERT(test_seg_put(st, r, 128, 256, "branch", 1000, 5, d));
+    TEST_ASSERT(!pulsar_segstore_contains(st, c2) && pulsar_segstore_contains(st, c1) &&
+                pulsar_segstore_contains(st, d));
+    TEST_ASSERT(pulsar_segstore_used_bytes(st) <= 3 * 1200);
+
+    /* a trailer is reachable through the walk, with its segment's text */
+    char t[41];
+    test_seg_payload p = { 10, 9 };
+    char err[256];
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_put(st, d, 256, 384, "tool turn", 9, 10, test_seg_write, 5, test_seg_trailer, &p, t,
+                                    err, sizeof err));
+    struct seen_t { int n; bool text_ok; bool bytes_ok; } seen = { 0, false, false };
+    pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, size_t len, void *ud) {
+        seen_t *sn = (seen_t *)ud;
+        sn->n++;
+        sn->text_ok = len == 9 && !memcmp(text, "tool turn", 9);
+        char b[5];
+        sn->bytes_ok = bytes == 5 && fread(b, 1, 5, fp) == 5 && !memcmp(b, "TRAIL", 5);
+        return true;
+    }, &seen);
+    TEST_ASSERT(seen.n == 1 && seen.text_ok && seen.bytes_ok);
+    pulsar_segstore_close(st);
+
+    /* a crashed write's tmp file and an orphan (parent gone) are cleaned at open */
+    char path[600];
+    snprintf(path, sizeof path, "%s/%.40s.seg.tmp.12345", dir, r);
+    FILE *f = fopen(path, "wb");
+    TEST_ASSERT(f != NULL);
+    if (f) fclose(f);
+    snprintf(path, sizeof path, "%s/%.40s.seg", dir, r);
+    TEST_ASSERT(unlink(path) == 0);   /* the root is gone: everything below is unreachable */
+    st = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_count(st) == 0);
+    snprintf(path, sizeof path, "%s/%.40s.seg.tmp.12345", dir, r);
+    TEST_ASSERT(access(path, F_OK) != 0);
+    pulsar_segstore_close(st);
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -8107,6 +8258,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_l264_segstore_chain_lookup();
+    test_l264_segstore_eviction_and_hygiene();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
