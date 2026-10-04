@@ -190,12 +190,12 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
 void pulsar_segstore_close(pulsar_segstore *st) { delete st; }
 
 void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]) {
-    Sha1 h;
+    pulsar::Sha1 h;
     if (parent && parent[0]) h.update(parent, 40);
     h.update(text, len);
     uint8_t d[20];
     h.final(d);
-    Sha1::hex20(d, out);
+    pulsar::Sha1::hex20(d, out);
 }
 
 int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, size_t len,
