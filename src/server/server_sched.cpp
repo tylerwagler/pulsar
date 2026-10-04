@@ -928,9 +928,6 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * server_bank_switch above restored a spilled victim (physical present, flag
      * cleared); belt-and-suspenders in case that restore failed. */
     if (s->pool_banks > 0 && sl->spilled) {
-        char spath[600];
-        snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv", s->spill_dir, (unsigned)sl->bank);
-        remove(spath);
         (void)pulsar_session_bank_alloc_physical(s->sess, sl->bank); /* empty physical for reuse */
         sl->spilled = false;
     }
@@ -1429,107 +1426,64 @@ static int server_pick_decode_lane(int pool_banks, bool has_dspark, session_slot
 bool server::bank_restore_spilled(int bank) {
     auto *s = this;
     pulsar_session *pool = s->sess;
-    char path[600];
-    snprintf(path, sizeof path, "%s/spill-bank-%d.kv", s->spill_dir, bank);
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: restore open %s failed: %s",
-                   path, strerror(errno));
-        s->count_metric(&s->m_restore_failures);
-        return false;
-    }
-    char err[128];
     const double t0 = server_now_sec();
-    const int rc = pulsar_session_bank_kv_load(pool, (uint32_t)bank, fp, err, sizeof err);
-    fclose(fp);
-    if (rc != 0) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_load bank %d failed: %s", bank, err);
+    /* L264 S4: a spill persisted the bank's history as segments; bring it back
+     * by loading the deepest stored chain that history reproduces.  The bank is
+     * re-backed and installed first (segments load onto the installed bank),
+     * and its carry is saved after, so the caller's install sees exactly what
+     * was loaded. */
+    if (!pulsar_session_bank_alloc_physical(pool, (uint32_t)bank) ||
+        !pulsar_session_bank_state_restore(pool, (uint32_t)bank)) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %d could not be re-backed", bank);
         s->count_metric(&s->m_restore_failures);
         return false;
     }
+    s->live_bank = bank;
+    int restored = 0;
+    const pulsar_tokens *hist = pulsar_session_tokens(pool);
+    if (hist && hist->len > 0) {
+        size_t len = 0;
+        char *text = render_tokens_text(s->engine, hist, &len);
+        restored = s->kv_cache_try_load_text(&s->slots[bank], text, NULL, 0, NULL, NULL, false);
+        free(text);
+    }
+    if (restored == 0) pulsar_session_invalidate(pool);   /* nothing stored: the conversation resumes cold */
+    pulsar_session_bank_state_save(pool, (uint32_t)bank);
     s->slots[bank].spilled = false;
-    remove(path);
     s->count_metric(&s->m_restores);
     server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
-               bank, (server_now_sec() - t0) * 1e3);
+               "pulsar-server: guard RESTORED bank %d from its segment chain to %d (%.1f ms reload stall)",
+               bank, restored, (server_now_sec() - t0) * 1e3);
     return true;
 }
 
-/* Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
- * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical. */
+/* Spill one idle bank: install it, persist its history as segments (only what
+ * the store lacks), save its host carry, repoint AWAY (free_physical refuses the
+ * cur bank), then cudaFree its physical. */
 bool server::spill_bank(session_slot *victim) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     const uint32_t vb = victim->bank;
     /* The victim is never spilled (the pick excludes spilled banks), so this
-     * never reloads from disk, but the installing state restore can refuse.
-     * Then live_bank still names another bank and the kv_save below would
-     * snapshot THAT bank's rings under the victim's file name (L190 A4).
-     * Abort the spill; the caller stops spilling this quantum. */
+     * never reloads, but the installing state restore can refuse; then the
+     * persist below would write ANOTHER bank's history (L190 A4).  Abort. */
     if (!s->bank_switch((int)vb)) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: guard: bank %u install failed (state restore refused); "
                    "spill aborted", vb);
         return false;
     }
-    char path[600];
-    snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
-    /* Durability: free_physical below drops the bank's only other copy, so this
-     * file must be COMPLETE on disk before we get there.  Plain fopen+fclose
-     * does not guarantee that — a crash or power loss can leave a truncated or
-     * zero-length spill sitting under the final name, and the restore path then
-     * refuses it, so that conversation 500s permanently.  Use the same
-     * write-tmp / fsync / rename contract the disk-KV store already uses
-     * (pulsar_kvstore.cpp): this path never inherited it. */
-    char tmp[672];
-    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
-    FILE *fp = fopen(tmp, "wb");
-    if (!fp) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: spill open %s failed: %s",
-                   tmp, strerror(errno));
-        return false;
-    }
-    char err[128];
     const double t0 = server_now_sec();
-    const int rc = pulsar_session_bank_kv_save(pool, vb, fp, err, sizeof err);
-    /* fsync BEFORE the rename, or the rename can become visible while the
-     * contents are still only in page cache. */
-    const bool synced = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
-    const int fc = fclose(fp);
-    if (rc != 0 || !synced || fc != 0) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_save bank %u failed: %s",
-                   vb, rc ? err : (synced ? "close" : "fsync"));
-        remove(tmp);
-        return false;
-    }
-    if (rename(tmp, path) != 0) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: spill rename %s failed: %s",
-                   path, strerror(errno));
-        remove(tmp);
-        return false;
-    }
-    /* Persist the rename itself so the entry survives a crash.  Best-effort:
-     * some filesystems reject a directory fsync, and the contents are already
-     * durable above. */
-    {
-        int dfd = ::open(s->spill_dir, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) {
-            (void)fsync(dfd);
-            ::close(dfd);
-        }
-    }
+    s->kv_cache_persist(victim, "spill");
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
-    if (!pulsar_session_bank_state_restore(pool, 0)) { remove(path); return false; }
+    if (!pulsar_session_bank_state_restore(pool, 0)) return false;
     s->live_bank = 0;
     /* Finding 4: free_physical returns false ONLY on a precondition refusal (nothing
-     * freed, bank still live) — abort the spill and drop the unused disk snapshot.
-     * A true return means the bank IS evicted (slabs freed), so mark it spilled
-     * unconditionally — no half-evicted state (spilled=false over freed slabs). */
+     * freed, bank still live).  A true return means the bank IS evicted (slabs
+     * freed), so mark it spilled unconditionally -- no half-evicted state. */
     if (!pulsar_session_bank_free_physical(pool, vb)) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
-        remove(path);
         return false;
     }
     victim->spilled = true;
@@ -1537,7 +1491,7 @@ bool server::spill_bank(session_slot *victim) {
     s->guard_evictions++;
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: guard EVICTED bank %u -> disk (%.1f ms save, physical freed); "
+               "pulsar-server: guard EVICTED bank %u -> segments (%.1f ms persist, physical freed); "
                "touched %.2f GiB / budget %.2f GiB, evictions %llu",
                vb, (server_now_sec() - t0) * 1e3,
                (double)pulsar_session_touched_kv_bytes(pool) / gib,

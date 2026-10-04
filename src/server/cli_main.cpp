@@ -274,19 +274,6 @@ void server::close_resources() {
     s->spec_lane_logits = NULL;
     free(s->lane_logits);
     s->lane_logits = NULL;
-    /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
-     * generate.cpp writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
-     * still spilled when the server exits would otherwise leave a stale
-     * multi-GiB file behind forever, so sweep every provisioned slot's bank
-     * on the way out.  Best-effort: a missing file is the normal case. */
-    if (s->spill_dir[0]) {
-        for (int i = 0; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
-            char spath[600];
-            snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv",
-                     s->spill_dir, (unsigned)s->slots[i].bank);
-            (void)remove(spath);
-        }
-    }
     pulsar_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -960,40 +947,14 @@ int main(int argc, char **argv) {
         s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
         s.guard_touched_budget = budget > s.guard_eager_bytes
                                ? budget - s.guard_eager_bytes : 0;
-        snprintf(s.spill_dir, sizeof s.spill_dir, "%s", "./ds4-spill");
-        (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */
-        /* Reclaim orphaned spill temporaries.  spill_bank writes
-         * "spill-bank-<n>.kv.tmp.<pid>" and renames it into place, so a tmp file
-         * surviving here is from a process that died mid-spill — precisely the
-         * crash the atomic write exists to contain.  The exit sweep cannot do
-         * this (a crash never reaches it), and these are multi-GiB, so they must
-         * be collected at startup: no spill can be in flight in a fresh process,
-         * which makes every match here an orphan by construction. */
-        if (DIR *sdp = opendir(s.spill_dir)) {
-            while (const struct dirent *de = readdir(sdp)) {
-                if (strncmp(de->d_name, "spill-bank-", 11) != 0) continue;
-                if (!strstr(de->d_name, ".kv.tmp.")) continue;
-                /* spill_dir is 512 and d_name up to 255, so 600 can truncate
-                 * (sparky's gcc warns; the dev box's does not). */
-                char opath[sizeof(s.spill_dir) + 264];
-                snprintf(opath, sizeof opath, "%s/%s", s.spill_dir, de->d_name);
-                if (remove(opath) == 0) {
-                    server_log(PULSAR_LOG_WARNING,
-                               "pulsar-server: guard: reclaimed orphaned spill temp %s",
-                               opath);
-                }
-            }
-            closedir(sdp);
-        }
         s.guard_enabled = (s.guard_touched_budget > 0);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 2b guard %s: touched budget %.2f GiB "
-                   "(kv budget %.2f − eager %.2f), spill dir %s",
+                   "(kv budget %.2f − eager %.2f); spills persist to the disk KV cache",
                    s.guard_enabled ? "ENABLED" : "DISABLED (no touched headroom)",
                    (double)s.guard_touched_budget / (1024.0*1024.0*1024.0),
                    (double)budget / (1024.0*1024.0*1024.0),
-                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0),
-                   s.spill_dir);
+                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0));
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
@@ -1063,6 +1024,14 @@ int main(int argc, char **argv) {
                    "pulsar-server: disk KV cache disabled (directory %s unusable); "
                    "serving without disk restore",
                    cfg.kv_disk_dir);
+    }
+    /* L264: a guard spill persists the bank's history to the disk KV cache; with
+     * no cache there is nowhere to put it, and freeing the bank would lose the
+     * conversation outright. */
+    if (s.guard_enabled && !s.kv.enabled) {
+        s.guard_enabled = false;
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: Tier-2 2b guard DISABLED: it spills to the disk KV cache, which is off");
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);

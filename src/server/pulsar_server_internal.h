@@ -1274,10 +1274,11 @@ typedef struct {
     int          prefill_counted;
     uint64_t     last_serviced_us;  ///< last quantum wall-clock (scheduler)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
-     * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
-     * \<spill_dir\>/spill-bank-\<bank\>.kv) while its conversation stays bound here; it
-     * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
-     * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
+     * bank's comp/index PHYSICAL was cudaFree'd, its history persisted as a
+     * segment chain in the disk KV cache (L264), while its conversation stays
+     * bound here; it is restored (alloc_physical + the chain's load) before this
+     * slot next decodes. Distinct from SLOT_EVICTED (which frees the bank for a
+     * DIFFERENT conversation). */
     bool         spilled;
     /** Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
@@ -1396,17 +1397,15 @@ struct server {
     uint64_t     kv_bank_bytes;
     uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
-     * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
-     * exists). `guard_touched_budget` is the resident-KV ceiling the guard keeps
+     * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
+     * KV cache is open: a spill persists to it, L264). `guard_touched_budget` is the resident-KV ceiling the guard keeps
      * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
      * physical is bounded); `guard_eager_bytes` the eager floor already resident.
-     * `guard_evictions` counts spills for metrics. `spill_dir` is a LOCAL fast-disk
-     * scratch (NOT the NAS; NOT tmpfs — either would defeat physical reclaim). */
+     * `guard_evictions` counts spills for metrics. */
     bool         guard_enabled;          ///< the proactive-eviction guard is active
     uint64_t     guard_touched_budget;   ///< resident-KV ceiling the guard keeps touched_kv under
     uint64_t     guard_eager_bytes;      ///< eager floor already resident
     uint64_t     guard_evictions;        ///< spills performed, for metrics
-    char         spill_dir[512];         ///< LOCAL fast-disk scratch for spills (never NAS, never tmpfs)
     warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
     /** Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
