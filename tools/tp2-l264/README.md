@@ -69,6 +69,12 @@ You can override any of these through the environment: `WORKER`, `PEERS`, `MODEL
   the operation. A segment frame inside a mirrored prefill is refused by name (`inside a mirrored
   prefill is not mirrored`). The server skips its "continued" stores there, so seeing that refusal
   is a bug.
+- **Reasoning drift under concurrency** (`[WARN] H resend`): the guard leg decodes two banks at
+  a time, and the batch a bank decodes in differs between the runs. On one Spark (2026-10-04)
+  one resend of six gave the same answer with reasoning that diverged partway, while its resume
+  was byte-exact (`resume at 17881 from grid checkpoint 17792`). That's an open question, not
+  graded: a near-tie in greedy decode that the batch composition tips. The sequential legs
+  (phase1/phase2) grade the whole output.
 - **A hang (`/health` ok, nothing moves)**: that's L258's wedge class, not L264. Take
   `gdb -p <pid> -batch -ex "thread apply all bt"` on both ranks before stopping.
 

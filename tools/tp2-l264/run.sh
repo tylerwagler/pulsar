@@ -16,7 +16,7 @@ MODEL=${MODEL:-$HOME/models/DeepSeek-v4-Flash}
 RDMA_DEV=${RDMA_DEV:-mlx5_3}
 RDMA_DEV2=${RDMA_DEV2:-mlx5_1}
 KV=${KV:-$HOME/l264-tp2-kv}                               # a fresh disk KV dir on BOTH nodes
-GUARD_BUDGET=${GUARD_BUDGET:-}   # bytes; default: the server's eager floor + 0.3 GiB (step 5 must spill)
+GUARD_BUDGET=${GUARD_BUDGET:-}   # bytes; default: the server's eager floor + 0.1 GiB (step 5 must spill)
 OUT=${OUT:-$HOME/l264-tp2-$(date +%m%d-%H%M)}
 UNIT=pulsar-tp-exp
 mkdir -p "$OUT"
@@ -127,12 +127,12 @@ FAILED=$(cat "$OUT/head-run2.log" "$OUT/worker-run2.log" | grep -c -i -E "marked
 [ "$FAILED" = 0 ] && verdict "alarms run2" PASS || verdict "alarms run2" "FAIL ($FAILED lines)"
 
 # ---- 5. the eviction guard spills to the segment chain and restores --------
-# The guard keeps touched KV under (budget - eager floor); six ~18k-token banks
-# touch ~0.75 GiB, so a budget 0.3 GiB above the floor must spill.
+# The guard keeps touched KV under (budget - eager floor); an ~18k-token bank
+# touches ~60 MiB, so 0.1 GiB above the floor holds two and the rest spill.
 if [ -z "$GUARD_BUDGET" ]; then
     EAGER=$(grep -o "eager [0-9.]*" "$OUT/head-run1.log" | head -1 | awk '{print $2}')
-    GUARD_BUDGET=$(python3 -c "print(int((float('${EAGER:-6.0}') + 0.3) * 2**30))")
-    note "guard budget: eager ${EAGER:-?} GiB + 0.3 GiB = $GUARD_BUDGET bytes"
+    GUARD_BUDGET=$(python3 -c "print(int((float('${EAGER:-6.0}') + 0.1) * 2**30))")
+    note "guard budget: eager ${EAGER:-?} GiB + 0.1 GiB = $GUARD_BUDGET bytes"
 fi
 reclaim
 T=$(start_pair "--setenv=PULSAR_SERVER_KV_BUDGET_OVERRIDE=$GUARD_BUDGET") || { journals "$T" boot3; verdict bring-up3 FAIL; exit 1; }
