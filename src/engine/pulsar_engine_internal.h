@@ -3706,20 +3706,7 @@ bool gpu_graph_verify_suffix_tops(
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
 
-/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
- *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
- *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
- *  are the decode kernels' and can never equal a cold prefill's, so a resume
- *  recomputes the tokens generated since): rewind the bank to G, then prefill
- *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
- *  up: at any even position the ratio-2 compressors hold no pending group and
- *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
- *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
- *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
- *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
- *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
- *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
-#define PULSAR_RESUME_GRID 128u
+/* PULSAR_RESUME_GRID: pulsar.h (the server plans its fused chunks on it). */
 static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ratio-2 group");
 
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,

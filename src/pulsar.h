@@ -884,6 +884,21 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
  * present, else 0. */
 int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled);
+/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
+ *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
+ *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
+ *  are the decode kernels' and can never equal a cold prefill's, so a resume
+ *  recomputes the tokens generated since): rewind the bank to G, then prefill
+ *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
+ *  up: at any even position the ratio-2 compressors hold no pending group and
+ *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
+ *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
+ *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
+ *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
+ *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
+ *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
+#define PULSAR_RESUME_GRID 128u
+
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live
