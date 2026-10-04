@@ -203,18 +203,48 @@ static bool layer_has_index_pool(uint32_t il) {
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
  * the maximum context size used to allocate the graph. */
-static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g) {
+/* The frontier's recurrent lanes, in the one order save and load walk them:
+ * per layer the attention compressor's (kv, score) and the V4 indexer
+ * compressor's (kv, score), each at the size its ALLOCATION holds -- a span
+ * shorter than the lane round-trips its own accounting and leaves the lane's
+ * tail primed (v11: a 0731 ratio-4 lane is 32768 B and the payload carried
+ * 8192). */
+static void payload_frontier_lanes(pulsar_gpu_graph *g, uint32_t il, pulsar_gpu_tensor *out[4]) {
+    out[0] = g->layer_attn_state_kv[il];
+    out[1] = g->layer_attn_state_score[il];
+    out[2] = g->layer_index_state_kv[il];
+    out[3] = g->layer_index_state_score[il];
+}
+
+/* The raw window a payload carries: the last raw_window positions before the
+ * frontier, in logical order (the reader re-scatters them into its own ring). */
+static uint32_t payload_raw_rows(const pulsar_gpu_graph *g, uint32_t tokens) {
+    return tokens < g->raw_window ? tokens : g->raw_window;
+}
+
+static uint64_t session_payload_live_tensor_bytes(pulsar_gpu_graph *g, uint32_t tokens, bool has_ckpt) {
     /* Comp rows are sized in the format the pools hold them in (MAIN rows; v4
-     * had sized them at the f32 stride, over-reserving the disk cache 3.5x),
-     * then the one checkpoint slot. */
-    uint64_t bytes = g->ckpt_slot_bytes;
+     * had sized them at the f32 stride, over-reserving the disk cache 3.5x). */
+    uint64_t bytes = has_ckpt ? g->ckpt_slot_bytes : 0u;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        bytes += (uint64_t)payload_raw_rows(g, tokens) * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
         bytes += rows * pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
         if (layer_has_index_pool(il)) bytes += rows * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+        pulsar_gpu_tensor *lanes[4];
+        payload_frontier_lanes(g, il, lanes);
+        for (int k = 0; k < 4; k++) if (lanes[k]) bytes += pulsar_gpu_tensor_bytes(lanes[k]);
     }
     return bytes;
+}
+
+/* The resume checkpoint a payload carries: the deepest at or below the prefill
+ * frontier's grid point -- what a sync that does not extend the frontier
+ * exactly would restore.  0 when the session holds none (a short one). */
+static uint32_t payload_resume_checkpoint(pulsar_session *s) {
+    const uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
+    return gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID);
 }
 
 
@@ -353,9 +383,11 @@ static int payload_read_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint
 uint64_t pulsar_session::payload_bytes() {
     auto *s = this;
     if (!s || !s->checkpoint_valid) return 0;
-    const pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    bytes += (uint64_t)PULSAR_N_VOCAB * sizeof(float);   /* the frontier's logits */
+    bytes += sizeof(uint32_t);                            /* the prefill frontier */
     /* ONE per-layer row-count array.  There were two while the index-K pool had
      * its own counter; the second line outlived it, so every advertised size was
      * PULSAR_N_LAYER * 4 (172 B on 0731) larger than what save_payload wrote.
@@ -366,7 +398,7 @@ uint64_t pulsar_session::payload_bytes() {
      * file size) did not.  The gate's written == payload_bytes() check is the
      * guard; keep them one fact. */
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
-    bytes += session_payload_live_tensor_bytes(g);
+    bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len, payload_resume_checkpoint(s) != 0u);
     /* v10: the trailing digest, appended raw after the data. */
     bytes += sizeof(uint64_t);
     return bytes;
@@ -486,6 +518,16 @@ int pulsar_session::stage_payload(pulsar_session_payload_file *out,
 
 
 
+/* Raw-ring row spans, one WINDOW row (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING))
+ * at the row's physical slot. */
+static int payload_raw_row(payload_io *io, pulsar_gpu_graph *g, uint32_t il, uint32_t pos, bool write,
+                           uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t rb = pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
+    const uint64_t off = (uint64_t)(pos % g->raw_cap) * rb;
+    return write ? payload_write_tensor_span(io, g->layer_raw_cache[il], off, rb, buf, cap, err, errlen)
+                 : payload_read_tensor_span(io, g->layer_raw_cache[il], off, rb, buf, cap, remaining, err, errlen);
+}
+
 int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     auto *s = this;
     if (!s || !fp || !s->checkpoint_valid) {
@@ -497,16 +539,18 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         return 1;
     }
     pulsar_gpu_graph *g = &s->graph;
-    /* L264: the state a restored bank resumes from is a grid checkpoint -- the
-     * deepest at or below the prefill frontier's grid point, which a sync would
-     * restore on this very bank.  Without one there is nothing exact to resume
-     * from, so there is nothing worth persisting. */
-    const uint32_t pf = (uint32_t)s->prefill_frontier;
-    const uint32_t G = gpu_graph_ckpt_best(g, gpu_graph_cur_bank(g), (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID);
+    if (g->ms_comp_state_stale[gpu_graph_cur_bank(g)]) {
+        payload_set_err(err, errlen, "session's state is stale (rewound off its grid checkpoints); sync it first");
+        return 1;
+    }
+    /* L264: the resume checkpoint, carried beside the frontier state so a
+     * restored session that is then synced to a prompt it does not extend
+     * resumes exactly where this one would. */
+    const uint32_t G = payload_resume_checkpoint(s);
     pulsar_gpu_tensor *slab = NULL;
     uint64_t slot_off = 0;
-    if (G == 0u || !gpu_graph_ckpt_locate(g, G, &slab, &slot_off)) {
-        payload_set_err(err, errlen, "session holds no grid checkpoint below its prefill frontier to persist");
+    if (G != 0u && !gpu_graph_ckpt_locate(g, G, &slab, &slot_off)) {
+        payload_set_err(err, errlen, "session's resume checkpoint vanished while saving");
         return 1;
     }
     if (pulsar_gpu_synchronize() == 0) {
@@ -524,7 +568,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 checkpoint slot bytes,
      *   13 main (comp pool) row bytes, 14 indexer fp4 row bytes,
-     *   15 the checkpoint's grid point (the restored bank's prefill frontier),
+     *   15 the resume checkpoint's grid point (0 = none),
      *   16 window (raw ring) row bytes.
      *
      * 13/14/16 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
@@ -559,22 +603,36 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
+    if (payload_write_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+    if (payload_write_u32(&io, (uint32_t)s->prefill_frontier, err, errlen) != 0) return 1;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_write_u32(&io, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
     }
 
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
-    int rc = payload_write_tensor_span(&io, slab, slot_off, g->ckpt_slot_bytes,
+    int rc = 0;
+    if (G != 0u)
+        rc = payload_write_tensor_span(&io, slab, slot_off, g->ckpt_slot_bytes,
                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    const uint32_t ck = (uint32_t)s->checkpoint.len;
+    const uint32_t raw_live = payload_raw_rows(g, ck);
     for (uint32_t il = 0; rc == 0 && il < PULSAR_N_LAYER; il++) {
-        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        /* The frontier's raw window, in logical position order. */
+        for (uint32_t r = 0; rc == 0 && r < raw_live; r++)
+            rc = payload_raw_row(&io, g, il, ck - raw_live + r, true, buf, PULSAR_SESSION_IO_CHUNK, NULL, err, errlen);
+        if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous; the index-K rows the same emits wrote follow where an
-         * indexer runs. */
+         * indexer runs.  Then the frontier's recurrent lanes. */
         const uint32_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
         rc = payload_write_attn_comp_pack(&io, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         if (rc == 0 && layer_has_index_pool(il))
             rc = payload_write_index_comp(&io, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        pulsar_gpu_tensor *lanes[4];
+        payload_frontier_lanes(g, il, lanes);
+        for (int k = 0; rc == 0 && k < 4; k++)
+            if (lanes[k]) rc = payload_write_tensor_span(&io, lanes[k], 0, pulsar_gpu_tensor_bytes(lanes[k]),
+                                                         buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     }
     free(buf);
     if (rc == 0) {
@@ -654,15 +712,15 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return 1;
     }
     /* prefill_cap is scratch scheduling capacity, not durable KV layout, and
-     * raw_cap only says where a window row lives in a ring -- the checkpoint
-     * carries the window by position, so neither has to match. */
+     * raw_cap only says where a window row lives in a ring -- the rows travel
+     * by position, so neither has to match. */
     (void)saved_prefill_cap;
     if (saved_raw_window != g->raw_window || saved_slot_bytes != (uint32_t)g->ckpt_slot_bytes) {
-        payload_set_err(err, errlen, "KV checkpoint's grid-checkpoint layout does not match this runtime");
+        payload_set_err(err, errlen, "KV checkpoint's window or grid-checkpoint layout does not match this runtime");
         return 1;
     }
-    if (saved_grid == 0u || saved_grid % PULSAR_RESUME_GRID != 0u || saved_grid > saved_tokens) {
-        payload_set_err(err, errlen, "KV checkpoint's grid point is not a grid point inside its token count");
+    if (saved_grid % PULSAR_RESUME_GRID != 0u || saved_grid > saved_tokens) {
+        payload_set_err(err, errlen, "KV checkpoint's resume grid point is not a grid point inside its token count");
         return 1;
     }
     if (saved_comp_cap > g->comp_cap) {
@@ -679,17 +737,33 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
         token_vec_push(&new_checkpoint, (int)tok);
     }
+    if (payload_read_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float),
+                           &remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    uint32_t saved_pf = 0;
+    if (payload_read_u32(&io, &saved_pf, &remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (saved_pf > saved_tokens || saved_grid > saved_pf) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "KV checkpoint's prefill frontier is inconsistent with its tokens and grid point");
+        return 1;
+    }
     uint32_t n_comp[PULSAR_MAX_LAYER];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_read_u32(&io, &n_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
         }
-        /* The checkpoint references rows [0, G/ratio): a file that holds fewer
-         * would resume onto rows it never carried. */
+        /* The frontier's rows, and the resume checkpoint references rows
+         * [0, G/ratio): a file that holds fewer would resume onto rows it never
+         * carried. */
         const bool source = gpu_graph_layer_is_kv_source(il);
         if (n_comp[il] > saved_comp_cap || n_comp[il] > g->layer_comp_cap[il] ||
-            (source && n_comp[il] < saved_grid / pulsar_layer_compress_ratio(il))) {
+            (source && n_comp[il] != saved_tokens / pulsar_layer_compress_ratio(il))) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
             return 1;
@@ -703,22 +777,36 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     s->checkpoint_valid = false;
 
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    uint32_t slot = 0;
-    if (!gpu_graph_ckpt_claim(g, saved_grid, &slab, &slot_off, &slot)) {
-        token_vec_free(&new_checkpoint);
-        payload_set_err(err, errlen, "no grid-checkpoint slot for the restored bank");
-        return 1;
-    }
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
-    int rc = payload_read_tensor_span(&io, slab, slot_off, g->ckpt_slot_bytes,
-                                      buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+    int rc = 0;
+    uint32_t slot = PULSAR_CKPT_SLOTS;
+    if (saved_grid != 0u) {
+        pulsar_gpu_tensor *slab = NULL;
+        uint64_t slot_off = 0;
+        if (!gpu_graph_ckpt_claim(g, saved_grid, &slab, &slot_off, &slot)) {
+            payload_set_err(err, errlen, "no grid-checkpoint slot for the restored bank");
+            rc = 1;
+        } else {
+            rc = payload_read_tensor_span(&io, slab, slot_off, g->ckpt_slot_bytes,
+                                          buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
+    }
+    const uint32_t raw_live = payload_raw_rows(g, saved_tokens);
     for (uint32_t il = 0; rc == 0 && il < PULSAR_N_LAYER; il++) {
-        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        /* Re-scatter the window into the current ring: the file holds rows by
+         * position, not by the writer's ring layout. */
+        for (uint32_t r = 0; rc == 0 && r < raw_live; r++)
+            rc = payload_raw_row(&io, g, il, saved_tokens - raw_live + r, false, buf, PULSAR_SESSION_IO_CHUNK,
+                                 &remaining, err, errlen);
+        if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
         rc = payload_read_attn_comp_pack(&io, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         if (rc == 0 && layer_has_index_pool(il))
             rc = payload_read_index_comp(&io, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        pulsar_gpu_tensor *lanes[4];
+        payload_frontier_lanes(g, il, lanes);
+        for (int k = 0; rc == 0 && k < 4; k++)
+            if (lanes[k]) rc = payload_read_tensor_span(&io, lanes[k], 0, pulsar_gpu_tensor_bytes(lanes[k]),
+                                                        buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
     }
     free(buf);
     if (rc != 0) {
@@ -757,12 +845,12 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         gpu_graph_set_n_comp(g, bank, il, n_comp[il]);
     }
     /* The frontier is installed first: a commit before it could be dropped by a
-     * frontier write.  The bank now holds the whole history and its state AT
-     * the grid point; its lanes and window describe nothing, so it is stale
-     * until the next sync restores the checkpoint (L264). */
-    gpu_graph_ckpt_commit(g, slot, saved_grid);
-    g->ms_comp_state_stale[bank] = true;
-    s->prefill_frontier = (int)saved_grid;   /* L195: the next sync resumes from here */
+     * frontier write.  The bank now stands at its frontier with that frontier's
+     * window, lanes and logits -- live, decodable as is -- and holds the resume
+     * checkpoint a non-extending sync restores. */
+    if (slot != PULSAR_CKPT_SLOTS) gpu_graph_ckpt_commit(g, slot, saved_grid);
+    g->ms_comp_state_stale[bank] = false;
+    s->prefill_frontier = (int)saved_pf;   /* L195: the next sync resumes from the grid point below it */
     s->checkpoint_valid = true;
     /* a restored state invalidates any in-flight speculative lookahead: the
      * carry token, pre-drafted pendings, AND the drafter's context-KV ring

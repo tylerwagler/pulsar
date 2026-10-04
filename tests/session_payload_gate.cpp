@@ -15,11 +15,10 @@
  *
  * WHAT IT PROVES, in the order that localises a failure:
  *   1. THE BYTES (v13, L264): FNV-1a over each kv source's attn comp rows and
- *      index-K rows to the frontier, and over the ONE grid checkpoint the
- *      payload carries (the raw window and the overlapping compressors' lanes
- *      at the prefill frontier's grid point) folded at the slot's full size: a
- *      payload that dropped the tail of a lane balances its own accounting, so
- *      only a fold at the allocation's size can see it.
+ *      index-K rows to the frontier, every recurrent lane, and the ONE grid
+ *      checkpoint the payload carries, each folded at its allocation's full
+ *      size: a payload that dropped the tail of a lane balances its own
+ *      accounting, so only a fold at the allocation's size can see it.
  *   2. THE RESUME, functionally.  Both sessions take the SAME next token through
  *      a sync, which resumes each from that grid checkpoint (A from its live
  *      copy, B from the restored one), and their full-vocab logits must match
@@ -109,6 +108,17 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
             if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il], 0, buf, n) == 0) { ok = false; break; }
             for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             idx_rows += ncomp;
+        }
+    }
+    /* The frontier's recurrent lanes, each at its allocation's size. */
+    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+        pulsar_gpu_tensor *lanes[4] = { g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                                        g->layer_index_state_kv[il], g->layer_index_state_score[il] };
+        for (int k = 0; k < 4 && ok; k++) {
+            if (!lanes[k]) continue;
+            const uint64_t n = pulsar_gpu_tensor_bytes(lanes[k]);
+            ok = n <= cap && pulsar_gpu_tensor_read(lanes[k], 0, buf, n) != 0;
+            if (ok) for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
     }
     /* The checkpoint the payload carries: the deepest at or below the prefill

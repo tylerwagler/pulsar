@@ -1054,16 +1054,17 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * committed-projection ring an OVERLAPPING compressor replays to rebuild its
  * carry, plus that ring's covered span once in the counter region.  Earlier
  * files are refused: the per-layer layout differs at the same strides. */
-/* v13 (L264, 2026-10-04): a payload is the bank's compressed and index-K rows
- * plus ONE grid checkpoint -- the deepest at or below the prefill frontier, as
- * opaque slot bytes (checkpoint.cpp) -- instead of the raw rows, the frontier's
- * compressor lanes, the logits and v12's projection ring.  A restored bank holds
- * the full token history and resumes from that checkpoint, which is what v12's
- * ring replay did, exact by construction instead of by coverage.  Field 12 is
- * now the checkpoint slot size, field 15 the checkpoint's grid point (the
- * prefill frontier the restored bank resumes from).  Earlier files are refused. */
+/* v13 (L264, 2026-10-04): v12 without the projection ring, plus the resume
+ * checkpoint.  A payload is the frontier state exactly -- tokens, logits, the
+ * prefill frontier, the raw window [ck - raw_window, ck), every compressed and
+ * index-K row, every recurrent lane -- so a restored session decodes on as the
+ * saved one would; and ONE grid checkpoint, the deepest at or below the prefill
+ * frontier (opaque slot bytes, checkpoint.cpp), which a sync that does not
+ * extend the frontier restores, exact by construction where v12's ring replay
+ * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
+ * the checkpoint's grid point (0 = none).  Earlier files are refused. */
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(13)
-/** 13 shape/counters + 2 row strides (main, indexer fp4) + the checkpoint grid point + the window row stride. */
+/** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
