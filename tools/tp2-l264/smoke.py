@@ -57,7 +57,7 @@ def filler(seed, n_lines):
     return "\n".join(out)
 
 
-def chat(messages, max_tokens=96):
+def chat(messages, max_tokens=768):
     body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": max_tokens,
                        "temperature": 0, "stream": False}).encode()
     req = urllib.request.Request(BASE + "/v1/chat/completions", body, {"Content-Type": "application/json"})
@@ -70,7 +70,11 @@ def chat(messages, max_tokens=96):
                 "secs": time.time() - t0}
     msg = data["choices"][0]["message"]
     usage = data.get("usage", {})
-    return {"status": status, "text": msg.get("content") or "",
+    # The whole output: thinking mode puts most of a short budget in the
+    # reasoning, and a greedy reply is compared on everything it generated.
+    out = (msg.get("reasoning_content") or "") + "\n--\n" + (msg.get("content") or "")
+    return {"status": status, "text": out if out.strip("\n-") else "",
+            "answer": msg.get("content") or "",
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
             "secs": time.time() - t0}
@@ -78,7 +82,7 @@ def chat(messages, max_tokens=96):
 
 def show(tag, r):
     print(f"    {tag}: http {r['status']} prompt={r.get('prompt_tokens')} cached={r.get('cached')} "
-          f"{r['secs']:.1f}s reply={r['text'][:60]!r}", flush=True)
+          f"{r['secs']:.1f}s answer={r.get('answer', '')[:60]!r}", flush=True)
 
 
 def conversation(seed, n_lines):
@@ -91,7 +95,7 @@ def phase1(st):
     msgs = conversation(1, 560)                     # ~6.5k tokens: several grid points, two prefill chunks
     a = chat(msgs); show("A cold", a)
     leg("A cold turn answers", a["status"] == 200 and a["text"] != "")
-    msgs += [{"role": "assistant", "content": a["text"]},     # the client echoes the visible reply only
+    msgs += [{"role": "assistant", "content": a["answer"]},   # the client echoes the visible reply only
              {"role": "user", "content": "Now name the word in line 1.7, in one sentence."}]
     b = chat(msgs); show("B next turn", b)
     leg("B resumes from a grid checkpoint (cached >= 90% of A's prompt)",
@@ -100,7 +104,7 @@ def phase1(st):
     c = chat(msgs); show("C exact resend", c)
     leg("C exact resend: same reply", c["status"] == 200 and c["text"] == b["text"])
     leg("C exact resend: cache hit", c.get("cached", 0) >= 0.9 * b.get("prompt_tokens", 1))
-    msgs += [{"role": "assistant", "content": b["text"]},
+    msgs += [{"role": "assistant", "content": b["answer"]},
              {"role": "user", "content": "And line 1.11? One sentence."}]
     d = chat(msgs); show("D turn 3", d)
     leg("D turn 3 answers", d["status"] == 200 and d["text"] != "")
