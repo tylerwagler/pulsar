@@ -75,6 +75,9 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
 
 /** Open a segment's payload for reading, positioned at its first byte. */
 FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint64_t *payload_bytes);
+/** Open a segment's trailer for reading, positioned at its first byte; NULL when
+ * the segment carries none. */
+FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint64_t *trailer_bytes);
 /** Record a use of every segment of a chain (hit count + last_used). */
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** Remove a segment and every segment below it (a payload that would not load). */

@@ -357,6 +357,18 @@ FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint
     return fp;
 }
 
+FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint64_t *trailer_bytes) {
+    if (!st) return nullptr;
+    auto it = st->segs.find(std::string(key, 40));
+    if (it == st->segs.end() || !it->second.trailer_bytes) return nullptr;
+    FILE *fp = fopen(st->path(it->first.c_str()).c_str(), "rb");
+    if (!fp) return nullptr;
+    const pulsar_segstore_seg &e = it->second;
+    if (fseek(fp, (long)(HDR + e.text_len + e.payload_bytes), SEEK_SET) != 0) { fclose(fp); return nullptr; }
+    if (trailer_bytes) *trailer_bytes = e.trailer_bytes;
+    return fp;
+}
+
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n) {
     if (!st) return;
     const uint64_t now = (uint64_t)time(nullptr);

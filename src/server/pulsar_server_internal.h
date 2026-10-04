@@ -184,10 +184,8 @@
  * persist only mappings whose DSML block appears in the saved cache text.
  */
 
-#define KV_CACHE_FIXED_HEADER PULSAR_KVSTORE_FIXED_HEADER
 #define KV_CACHE_HIT_HALF_LIFE_SECONDS PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS
 #define KV_EXT_TOOL_MAP PULSAR_KVSTORE_EXT_TOOL_MAP
-#define KV_EXT_RESPONSES_VISIBLE PULSAR_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -895,11 +893,25 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
 bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);
 
-typedef pulsar_kvstore_entry kv_entry;
+/** L264 S4: the disk KV cache's placement policy. */
+typedef struct {
+    int min_tokens;          ///< a conversation shorter than this is not persisted, nor restored
+    int sys_prefix_align;    ///< the sys-prefix cut lands on a multiple of this (a resume-grid multiple)
+    int sys_prefix_margin;   ///< and this far below the chat anchor, clear of preamble jitter
+} kv_cache_options;
 
-typedef pulsar_kvstore_options kv_cache_options;
+typedef struct pulsar_segstore pulsar_segstore;
+/** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
+typedef struct {
+    pulsar_segstore *st;     ///< NULL while disabled
+    char *dir;
+    bool enabled;
+    kv_cache_options opt;
+} kv_disk_cache;
 
-typedef pulsar_kvstore kv_disk_cache;
+/** Longest chain a lookup or a store walks: a 1M-token conversation persisted
+ * at prompt ends of ~2k tokens stays well under it. */
+#define PULSAR_KV_CHAIN_MAX 512
 
 /** Where a remembered tool entry came from. */
 typedef enum {
@@ -1261,10 +1273,6 @@ typedef struct {
      * not re-tick (position-progress semantics, not GPU-work accounting). */
     int          prefill_counted;
     uint64_t     last_serviced_us;  ///< last quantum wall-clock (scheduler)
-    /** Per-conversation continued-store frontier (see kv_cache_tracker_bind):
-     * the shared pulsar_kvstore keeps one continued_last_store_tokens field, but
-     * the schedule it tracks belongs to this slot's conversation. */
-    int          continued_last_store_tokens;
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
      * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
      * \<spill_dir\>/spill-bank-\<bank\>.kv) while its conversation stays bound here; it
@@ -1619,58 +1627,21 @@ struct server {
     /** Re-populate tool memory with the calls and results `msgs` refers to, so
      * a replayed conversation can be matched against the live prefix. */
     void kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs);
-    /** Build the trailer read/write callbacks the KV store uses for a file,
-     * bound to the tool ids in `wanted`. */
-    pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(const stop_list *wanted);
-    /** Store the first `store_len` tokens of the live session as a checkpoint,
-     * with explicit control over the text the entry is KEYED by.
-     * @param sl                   slot holding the live session
-     * @param tokens               the token history being checkpointed
-     * @param store_len            how many of them the entry covers
-     * @param reason               logged, and classifies the write in metrics
-     * @param cache_text_override  key text to use instead of the rendered
-     *                             prefix -- how a truncated preamble is stored
-     *                             under the bytes a future request will present
-     * @param cache_text_ext       ext_flags to record on the entry
-     * @param cache_text_key       explicit key text, when it differs again
-     * @return true when an entry was written. */
-    bool kv_cache_store_live_prefix_text(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason, const char *cache_text_override, uint8_t cache_text_ext, const char *cache_text_key);
-    /** kv_cache_store_live_prefix_text() keyed by the rendered prefix itself. */
-    bool kv_cache_store_live_prefix(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason);
-    /** Store the slot's full current prefix.
-     * @param sl      the slot whose session is checkpointed
-     * @param reason  logged, and classifies the write in metrics
-     * @return true when an entry was written. */
-    bool kv_cache_store_current(session_slot *sl, const char *reason);
-    /** Unlink a disk entry whose file is unusable, so a later load does not keep
-     * retrying a broken path.  Only a failure that implicates the file may call it
-     * (L261: a client disconnect used to unlink the snapshot it had just loaded). */
-    void kv_cache_discard_failed_disk_entry(const char *path);
-    /** Point the continued-store tracker at `sl` before an engine call that may
-     * cross a store threshold. */
-    void kv_cache_tracker_bind(session_slot *sl);
-    /** Release the tracker after such a call, performing any store it scheduled. */
-    void kv_cache_tracker_flush(session_slot *sl);
-    /** Write a "continued" cache entry if the slot has advanced far enough past
-     * the last one. Cheap no-op when it has not. */
-    void kv_cache_maybe_store_continued(session_slot *sl);
-    /* L260: whether kv_cache_maybe_store_continued would store for this slot's
-     * bank, read from the bank's saved frontier (no bank switch). */
-    bool kv_cache_continued_store_due(session_slot *sl);
-    /** kv_cache_try_load() keyed on raw prompt TEXT rather than a request.
-     * The cache is keyed by rendered bytes, so this is the primitive and the
-     * request form is the wrapper. @return prefix tokens loaded, 0 for a miss. */
+    /** L264 S4: persist the INSTALLED bank's history as segments -- the chain the
+     * store already holds for this text, extended to the bank's deepest grid
+     * checkpoint.  @return segments written (0: nothing new, or disabled). */
+    int kv_cache_persist(session_slot *sl, const char *reason);
+    /** Load the deepest stored chain whose text is a byte prefix of
+     * `prompt_text` into the installed bank (live at the chain's end), and build
+     * the prompt to sync: the exact stored tokens + the rest of the text.
+     * @return tokens restored, 0 for a miss. */
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
-                               pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
-    /** Try to satisfy `req`'s prompt from the disk cache.
-     * @param sl                    slot whose session receives the payload
-     * @param req                   the request whose prompt is being resolved
-     * @param effective_prompt      rewritten to the prompt that should now be synced
-     * @param loaded_path_out       the file used, owned by the caller
-     * @param loaded_ext_flags_out  which trailers that file carried
-     * @return prefix tokens loaded, 0 for a miss. */
-    int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out);
+                               pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
+    /** kv_cache_try_load_text() for a request's prompt. */
+    int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_key_out);
+    /** A chain whose restore the prefill then failed on: drop its last segment. */
+    void kv_cache_discard_failed_chain(const char *key);
     /** Tool-output-only Responses continuation.
      * Some clients send just the new tool outputs after a tool call.  There is no
      * long visible prefix to match in that shape; the call_id itself is the
@@ -2175,23 +2146,6 @@ struct job {
     provision_refusal refusal_counted;
 };
 
-/** Server-side names for the KV-store write reasons.
- *
- * Each is defined AS the corresponding ::pulsar_kvstore_reason value rather
- * than as an independent number, so the two enums cannot drift apart: the
- * values are the store's, only the spelling is local.
- *
- * The TYPE NAME has no user -- every reference is to a member -- so a sweep for
- * unused types will keep proposing this for deletion.  It is not unused; the
- * members below are the interface, and removing the typedef removes them. */
-typedef enum {
-    KV_REASON_UNKNOWN   = PULSAR_KVSTORE_REASON_UNKNOWN,     ///< unspecified
-    KV_REASON_COLD      = PULSAR_KVSTORE_REASON_COLD,        ///< a fresh prefix checkpoint
-    KV_REASON_CONTINUED = PULSAR_KVSTORE_REASON_CONTINUED,   ///< an extension of an existing one
-    KV_REASON_EVICT     = PULSAR_KVSTORE_REASON_EVICT,       ///< written because the slot is being evicted
-    KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,    ///< written on server shutdown
-    KV_REASON_SYS_PREFIX = PULSAR_KVSTORE_REASON_SYS_PREFIX, ///< the shared preamble cut (system prompt + tools)
-} kv_cache_reason;
 
 /** A window of token ids around the point where a replayed prompt stopped
  * matching the live session.
@@ -2858,19 +2812,8 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
-void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint8_t ext_flags,
-                           uint32_t tokens, uint32_t hits, uint32_t ctx_size,
-                           uint64_t created_at, uint64_t last_used,
-                           uint64_t payload_bytes);
-double kv_entry_eviction_score(const kv_entry *e, const pulsar_tokens *live,
-                                      uint64_t now,
-                                      const pulsar_kvstore_eviction_context *incoming);
-void kv_cache_evict(kv_disk_cache *kc, const pulsar_tokens *live,
-                           uint64_t extra_bytes,
-                           const pulsar_kvstore_eviction_context *incoming);
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
-                          bool reject_different_quant, kv_cache_options opt);
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t model_id,
+                   kv_cache_options opt);
 void kv_cache_close(kv_disk_cache *kc);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
@@ -2886,30 +2829,6 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const pulsar_tokens *prompt,
                                     int user_token_id,
                                     int assistant_token_id);
-int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens);
-bool kv_cache_file_size_fits(const kv_disk_cache *kc,
-                                    uint64_t text_bytes,
-                                    uint64_t payload_bytes,
-                                    uint64_t tool_map_bytes,
-                                    uint64_t *file_bytes_out,
-                                    uint64_t *required_bytes_out);
-/* Returns whether a checkpoint file was actually written — eviction uses this
- * for failure honesty (evict-without-snapshot falls back to client re-prefill;
- * older callers ignore the result as before). */
-/* The continued-store frontier (lib field kc->continued_last_store_tokens) is
- * per-conversation state on a kvstore shared by every slot. Every
- * tracker-touching operation brackets itself with these on the single worker
- * thread: bind loads the acting slot's frontier into the shared struct, flush
- * writes it back (2026-07-14 review: without this, slot A's high-water mark
- * suppressed slot B's continued checkpoints, and a cold request on B reset
- * A's schedule). */
-void kv_cache_note_store(kv_disk_cache *kc, int tokens);
-int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens);
-void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
-                                                  int old_tokens,
-                                                  int suppressed_tokens);
-int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
-                                     int quant_bits, int ctx_size);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
