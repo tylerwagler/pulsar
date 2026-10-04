@@ -19,9 +19,9 @@ chunk-neutrality law the single-Spark gates prove, here through the pair).
           at once -- every one 200 (mirrored stores under concurrency)
   miss    (after a worker copy was corrupted) G turn 3 resent -- still the same
           reply (the miss falls back to prefill on every rank)
-  guard   (relaunched with a small KV budget) H six conversations of ~10k
-          tokens, then each resent -- same replies (banks spilled to the
-          segment chain and restored)
+  guard   (relaunched with a small KV budget) H six conversations of ~18k
+          tokens two at a time, then each resent -- same replies (banks
+          spilled to the segment chain and restored)
 
 Exit status: 0 = every leg passed; 1 = a leg failed (named on stdout).
 """
@@ -134,14 +134,20 @@ def phase_miss(st):
 
 
 def phase_guard(st):
+    # The guard checks from the BATCHED decode step (two or more banks decoding
+    # at once), so the conversations run two at a time: the banks idle while a
+    # pair decodes are its spill victims, and the resends restore them.
     seeds = list(range(21, 27))
-    first = {}
+    with ThreadPoolExecutor(2) as ex:
+        first = dict(zip(seeds, ex.map(lambda s: chat(conversation(s, 850)), seeds)))
     for s in seeds:
-        r = chat(conversation(s, 850)); show(f"H conversation {s}", r)
-        first[s] = r
+        show(f"H conversation {s}", first[s])
     leg("H every conversation answers", all(r["status"] == 200 and r["text"] for r in first.values()))
+    with ThreadPoolExecutor(2) as ex:
+        again = dict(zip(seeds, ex.map(lambda s: chat(conversation(s, 850)), seeds)))
     for s in seeds:
-        r = chat(conversation(s, 850)); show(f"H resend {s}", r)
+        r = again[s]
+        show(f"H resend {s}", r)
         leg(f"H resend {s}: same reply after the guard's spill/restore", r["status"] == 200 and
             r["text"] == first[s]["text"])
 
