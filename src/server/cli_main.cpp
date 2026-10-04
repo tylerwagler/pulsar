@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "lib/pulsar_segstore.h"
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"
 #include "pulsar_ctxmem.h"
@@ -531,9 +532,6 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
     server_resolve_kv_disk_dir(&cfg);
-    /* A TP worker spills bank KV to ITS OWN disk under the same directory
-     * policy the leader uses (slice 4e increment 6). */
-    cfg.engine.tp_spill_dir = cfg.kv_disk_dir;
     /* Every rank tells the group its build (the NODE frame), so the leader's
      * /health can show a mixed-build pair for what it is.  Stamped here, not in
      * the transport: this TU is rebuilt whenever HEAD moves (Makefile), and a
@@ -1015,7 +1013,9 @@ int main(int argc, char **argv) {
                    "mirrored across ranks yet (L264 S4)");
     } else if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                       (uint32_t)pulsar_engine_model_id(engine), cfg.kv_cache))
+                       pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(engine),
+                                                (uint32_t)pulsar_engine_routed_quant_bits(engine)),
+                       cfg.kv_cache))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in
          * kv_cache_open; state the consequence once and serve without disk

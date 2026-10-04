@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 20u           /* v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 21u           /* v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -488,11 +488,9 @@ int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec
 #define PULSAR_TP_SPEC_STEPS_MAX 64u
 int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
                               const pulsar_tp_spec_command *steps);
-/* Increment 6.  free/alloc physical ride the value payload; save/load carry
- * the snapshot key. */
+/* Increment 6.  free/alloc physical ride the value payload. */
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
-int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_t bank, const char *key);
 /* Increment 7: sync with images (n_images > 0; use pulsar_tp_send_sync otherwise). */
 int pulsar_tp_send_sync_mm(pulsar_tp *tp, uint64_t session_id, const int *tokens, uint32_t n_tokens,
                            const pulsar_image_ref *images, uint32_t n_images);
@@ -662,15 +660,13 @@ typedef enum {
     PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH = 33,    /* verdict: 0 ok, 1 failed */
     PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT = 34,   /* void */
     PULSAR_TP_FRAME_GENERATE_SPECULATIVE = 35,  /* verdict: tokens generated + 1 */
-    /* Increment 6: the eviction guard's spill path.  KV is replicated per
-     * rank, so each rank spills its own bank to its own disk; the frames name
-     * the snapshot by the KEY of the file the leader wrote (its basename with
-     * any ".tmp.<pid>" stripped) and the worker mirrors it under its own spill
-     * directory.  All four are verdicts (0 ok, 1 failed). */
+    /* Increment 6: the eviction guard's physical-bank pair.  KV is replicated
+     * per rank, so each rank frees / re-backs its own bank.  Verdicts (0 ok,
+     * 1 failed). */
     PULSAR_TP_FRAME_BANK_FREE_PHYSICAL = 36,
     PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL = 37,
-    PULSAR_TP_FRAME_BANK_KV_SAVE = 38,
-    PULSAR_TP_FRAME_BANK_KV_LOAD = 39,
+    /* 38, 39 were BANK_KV_SAVE / BANK_KV_LOAD, retired with the bank KV
+     * snapshot (L264, v21). */
     /* Increment 7: a sync that carries IMAGES -- the tokens (with the vision
      * sentinel blocks already expanded by the leader), then a per-image table
      * of {start_pos, len}, then the concatenated image bytes.  Every rank's
@@ -690,27 +686,8 @@ typedef enum {
      * instead of deadlocking inside the prefill's exchanges -- the failure
      * mode of an unmirrored state change (L250: the disk KV restore). */
     PULSAR_TP_FRAME_SYNC_CHECK = 42,
-    /* v16 (L250): the disk KV cache, mirrored.  KV is replicated per rank, so
-     * every rank keeps its OWN copy of an entry, named by the leader's store
-     * key (the 40-hex sha of the entry's text) under its spill directory.
-     * Same wire shape as BANK_KV_SAVE/LOAD (key header + key bytes).
-     *   KVSTORE_SAVE: verdict (0 stored, 1 not) -- the leader keeps its entry
-     *                 only when every rank stored its copy.
-     *   KVSTORE_LOAD: verdict (phase 2), own header: the leader has loaded
-     *                 its entry and states the RESULT -- token count
-     *                 (`value`) and checkpoint digest (`seq`); a worker loads
-     *                 its copy and must reach the same state, or answers 1.
-     *   KVSTORE_DROP: void, fire-and-forget -- the leader's entry is gone (its
-     *                 own store failed, or eviction), so the copies go too. */
-    PULSAR_TP_FRAME_KVSTORE_SAVE = 43,
-    PULSAR_TP_FRAME_KVSTORE_LOAD = 44,
-    PULSAR_TP_FRAME_KVSTORE_DROP = 45,
-    /* v16 (L250 phase 3): void.  At bring-up the leader ships the key of
-     * every entry its disk KV cache holds; each worker deletes its copies
-     * that no key names (a lost DROP, a crash between the worker's store and
-     * the leader's commit, copies from another build), plus crash-abandoned
-     * temp files.  Keys ride `spill_key` as n x 40 hex chars, n in `value`. */
-    PULSAR_TP_FRAME_KVSTORE_RECONCILE = 46,
+    /* 43..46 were KVSTORE_SAVE / LOAD / DROP / RECONCILE, the mirrored disk KV
+     * cache, retired with it (L264, v21). */
     /* v17 (L260): the batched spec lane's per-bank bookkeeping, one frame per
      * phase carrying every bank (pulsar_tp_send_spec_steps).  Verdict: the
      * phase's outcome fingerprint (pulsar_spec_steps_verdict). */
@@ -725,30 +702,6 @@ typedef enum {
      * the headed run's index in `value` (-1 none).  Verdict: 0 ok, 1 refused. */
     PULSAR_TP_FRAME_NOTE_PREFILLED = 51,
 } pulsar_tp_frame_type;
-
-/** v16 (L250): a KVSTORE_SAVE / KVSTORE_DROP frame naming the entry by `key`;
- *  `value` rides the header (0 today).  KVSTORE_LOAD has its own sender. */
-int pulsar_tp_send_kvstore(pulsar_tp *tp, pulsar_tp_frame_type type, uint64_t session_id,
-                           const char *key, int32_t value);
-/** v16 (L250 phase 2): KVSTORE_LOAD -- the leader's state after loading entry
- *  `key`: its checkpoint length and pulsar_session_checkpoint_digest.  The
- *  worker receives them as `value` and `seq`. */
-int pulsar_tp_send_kvstore_load(pulsar_tp *tp, uint64_t session_id, const char *key,
-                                int n_tokens, uint64_t digest);
-/** v16 (L250 phase 3): KVSTORE_RECONCILE -- `keys` is n_keys x 40 hex chars,
- *  back to back (no separators, no terminator required). */
-int pulsar_tp_send_kvstore_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys);
-
-/** L250: a worker's disk-KV copy is named "tp-kv-<40 lowercase hex>.payload".
- *  Returns true and the key when `name` is exactly that. */
-bool pulsar_tp_kv_blob_name(const char *name, char key[41]);
-/** L250 phase 3: in `dir`, delete every copy "tp-kv-<key>.payload" whose key is
- *  not among `keys` (n_keys x 40 hex, back to back), and every abandoned
- *  "tp-kv-<key>.payload.tmp.<pid>" whose writer is gone.  Nothing else in the
- *  directory is touched (the spill's "tp-<key>" snapshots share it).  Counts
- *  what it kept and removed.  false only when the directory cannot be read. */
-bool pulsar_tp_kv_reconcile_dir(const char *dir, const char *keys, uint32_t n_keys,
-                                int *kept, int *removed, char *err, size_t errlen);
 
 
 typedef struct {
@@ -778,9 +731,6 @@ typedef struct {
     uint64_t *spec_rngs;
     /* SPEC_*_BATCH: the per-bank records (malloc'd, spec.count). */
     pulsar_tp_spec_command *spec_steps;
-    /* BANK_KV_SAVE / BANK_KV_LOAD and KVSTORE_SAVE / LOAD / DROP: the key
-     * (malloc'd, NUL-terminated); the bank (spill) or 0 rides `value`. */
-    char *spill_key;
     /* SYNC_MM: the images (malloc'd table whose `bytes` point into
      * `image_bytes`, one malloc'd block). */
     pulsar_image_ref *images;

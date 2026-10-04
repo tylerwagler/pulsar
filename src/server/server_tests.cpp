@@ -4903,17 +4903,6 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
 
 
 
-/* L261: every stored reason names itself, so a hit can report which trigger
- * earned it ("stored=<reason>" on the hit line). */
-static void test_kv_cache_reason_names_round_trip(void) {
-    static const char *const names[] = {"cold", "continued", "evict", "shutdown",
-                                        "agent-system", "agent-session", "sys-prefix"};
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-        TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(pulsar_kvstore_reason_code(names[i])), names[i]));
-    TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(PULSAR_KVSTORE_REASON_UNKNOWN), "unknown"));
-    TEST_ASSERT(!strcmp(pulsar_kvstore_reason_name(200), "unknown"));
-}
-
 /* L261: streaming writeback drops written pages from the cache but never the
  * bytes -- a file written through step/finish/drop reads back identical, across
  * more than one PULSAR_WRITEBACK_STEP. */
@@ -7546,7 +7535,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
-    test_kv_cache_reason_names_round_trip();
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();

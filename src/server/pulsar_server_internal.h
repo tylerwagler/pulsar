@@ -147,45 +147,29 @@
  * KV Cache.
  * =========================================================================
  *
- * The server has one live GPU session.  We persist reusable DS4 session
- * snapshots when a cold prompt reaches a useful prefix, when a long continued
- * conversation has grown far enough, and when a request evicts the live session.
- * The cache key is the SHA1 of the rendered byte prefix.  The payload still
- * stores exact token IDs and graph state; the filename only selects a checkpoint
- * whose decoded transcript bytes are a prefix of the next rendered request.
+ * L264: the disk KV cache is a content-addressed SEGMENT store
+ * (src/lib/pulsar_segstore.h, src/server/kv_cache.cpp).  A segment is one grid
+ * span of a conversation -- tokens [G_prev, G), their comp/index-K rows and the
+ * grid checkpoint at G (pulsar_session_save_segment) -- plus the rendered text
+ * of those tokens; its key is sha1(parent_key || text), so a chain's last key
+ * names the whole text from position 0 and conversations sharing a prefix share
+ * its segments.  A lookup returns the deepest chain whose text is a byte prefix
+ * of the rendered request; loading it leaves the bank live at the chain's end.
  *
- * Files are loaded with plain read/write I/O into the existing graph tensors;
- * mmap is deliberately avoided here so cache restore cannot add more VM
- * mappings to a process that already maps a very large GGUF.
+ * kv_cache_persist extends a bank's stored chain by the segments past its last
+ * one (a write costs the new tokens, never the history), at prompt end, on
+ * progress, at the system-prefix cut, on evict and on a Tier-2 spill -- always
+ * from checkpoints the live bank already holds; the session is never rolled
+ * back to build an entry.  The store is keyed by pulsar_segstore_identity
+ * (model + routed-expert format), evicts least-recently-used LEAVES first, and
+ * writes durably without leaving page cache (L261).
  *
- * Stores are created only when the live graph is already at the checkpoint we
- * want to persist.  For long cold prompts this means prefill reaches the stable
- * boundary first, writes that prefix, and then continues with the suffix.  We
- * never roll the session backward just to build a disk cache entry: that would
- * turn cache population into a second hidden prefill.
- *
- * File layout:
- *
- *   "KVC" version
- *   quant bits, save reason, token count, hit count, context size
- *   creation time, last-used time, payload byte count
- *   rendered text byte count + rendered text for human inspection
- *   DS4 engine payload written by pulsar_session_save_payload()
- *   optional tool-id map section
- *
- * The filename is SHA1(cache text bytes), not SHA1(token ids).  For ordinary
- * checkpoints the cache text is the rendered token prefix.  For live hidden
- * state it can instead be the client-visible transcript: the payload still
- * contains sampled reasoning KV, but the lookup key must be what the client can
- * replay after a process restart or session switch.
- *
- * The optional tool-id map is not part of model state, but it is needed to
- * render future client JSON back to the exact DSML sampled by the model.  We
- * persist only mappings whose DSML block appears in the saved cache text.
+ * The optional tool-id map rides as a segment TRAILER.  It is not model state,
+ * but it is needed to render future client JSON back to the exact DSML the
+ * model sampled; only mappings whose DSML block appears in the segment's text
+ * are kept.
  */
 
-#define KV_CACHE_HIT_HALF_LIFE_SECONDS PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS
-#define KV_EXT_TOOL_MAP PULSAR_KVSTORE_EXT_TOOL_MAP
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'

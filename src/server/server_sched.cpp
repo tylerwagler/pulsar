@@ -636,7 +636,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
  * transcript bytes, or by the visible protocol transcript when a live
  * responses/thinking binding covers the frontier. A returning client binds to
  * any free slot and restores from disk there; no extra routing metadata is
- * needed because the kvstore's text-prefix index IS the metadata. Live
+ * needed because the segment store's text-prefix lookup IS the metadata. Live
  * tool-state continuations of an evicted slot get the protocol's honest 409
  * (their sampled frontier is gone), exactly like a server restart.
  *

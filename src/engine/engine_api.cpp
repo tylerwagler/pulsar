@@ -315,26 +315,6 @@ bool pulsar_session_is_mirrored(const pulsar_session *s) {
     return s && s->engine && s->engine->tp && s->tp_session_id != 0;
 }
 
-bool pulsar_tp_kv_key_ok(const char *key) {
-    if (!key) return false;
-    int n = 0;
-    for (; key[n]; n++) {
-        const char c = key[n];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-        if (n >= 40) return false;
-    }
-    return n == 40;
-}
-
-uint64_t pulsar_build_digest(const char *build_id) {
-    uint64_t h = 1469598103934665603ull;
-    for (const char *p = build_id ? build_id : ""; *p; p++) {
-        h ^= (uint8_t)*p;
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
 uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s) {
     uint64_t h = 1469598103934665603ull;
     if (!s) return h;
@@ -659,9 +639,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
         ? pulsar_tp_send_sync_mm(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len, images, (uint32_t)n_images)
         : pulsar_tp_send_sync(tp, s->tp_session_id, prompt->v, (uint32_t)prompt->len);
     if (!tp_mirror_sent(tp, n_images > 0 ? "sync with images" : "sync", sent, err, errlen)) return 1;
-    s->tp_in_sync = true;
     const int body_rc = s->sync(prompt, images, n_images, err, errlen);
-    s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
@@ -1031,38 +1009,8 @@ int pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst, cons
     PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_fork(s, src, dst, tokens, n_tokens, n_cached) : 1;
 }
-/* ---- The eviction guard's spill path (increment 6).  KV is replicated per
- * rank, so a spill is per rank to its own disk.  The snapshot's identity is
- * the KEY of the file the leader was handed: its basename with the server's
- * ".tmp.<pid>" suffix stripped, read back from the descriptor, because the
- * public API takes a FILE* and the server renames the temp into place after
- * the save.  The worker mirrors the snapshot under its own spill directory
- * by that key, so a later load names the same snapshot on every rank. */
-static int tp_spill_key(FILE *fp, char *out, size_t outlen) {
-    if (!fp) return 0;
-    char link[64], target[4096];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", fileno(fp));
-    const ssize_t n = readlink(link, target, sizeof(target) - 1u);
-    if (n <= 0) return 0;
-    target[n] = '\0';
-    const char *base = strrchr(target, '/');
-    base = base ? base + 1 : target;
-    if (!base[0]) return 0;
-    /* strip a trailing ".tmp.<digits>" */
-    size_t len = strlen(base);
-    const char *t = strstr(base, ".tmp.");
-    while (t) {
-        const char *d = t + 5;
-        size_t k = 0;
-        while (d[k] >= '0' && d[k] <= '9') k++;
-        if (k > 0 && d[k] == '\0') { len = (size_t)(t - base); break; }
-        t = strstr(t + 1, ".tmp.");
-    }
-    if (len == 0 || len >= outlen) return 0;
-    memcpy(out, base, len);
-    out[len] = '\0';
-    return 1;
-}
+/* ---- The eviction guard's physical-bank pair (increment 6): verdicts, each
+ * rank frees or allocates its own replicated bank. */
 static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t bank) {
     const char *operation = freeing ? "bank free physical" : "bank alloc physical";
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1086,30 +1034,6 @@ bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
-}
-static int tp_mirror_bank_kv(pulsar_session *s, int load, uint32_t bank, FILE *fp, char *err, size_t errlen) {
-    const char *operation = load ? "bank kv load" : "bank kv save";
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return load ? s->bank_kv_load(bank, fp, err, errlen) : s->bank_kv_save(bank, fp, err, errlen);
-    if (tp_mirror_worker_drives_nothing(tp, operation, err, errlen) ||
-        tp_mirror_dead(tp, err, errlen)) return 1;
-    char key[256];
-    if (!tp_spill_key(fp, key, sizeof(key))) {
-        if (err) snprintf(err, errlen, "tp: %s: the snapshot file has no usable key (not a named file?)", operation);
-        return 1;
-    }
-    if (!tp_mirror_sent(tp, operation, pulsar_tp_send_bank_kv(tp, load, s->tp_session_id, bank, key),
-                        err, errlen)) return 1;
-    const int own = (load ? s->bank_kv_load(bank, fp, err, errlen) : s->bank_kv_save(bank, fp, err, errlen)) == 0 ? 0 : 1;
-    return tp_mirror_bank_verdict(s, tp, operation, own, 1);
-}
-int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    return s ? tp_mirror_bank_kv(s, 0, bank, fp, err, errlen) : 1;
-}
-int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    return s ? tp_mirror_bank_kv(s, 1, bank, fp, err, errlen) : 1;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
@@ -1469,127 +1393,6 @@ int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { return s ? s->prefill_quantum_min_suffix() : 0; }
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->tokens() : NULL; }
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { return s ? s->payload_bytes() : 0; }
-int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_keys) {
-    if (!e || !e->tp || pulsar_tp_rank(e->tp) != 0 || pulsar_tp_failed(e->tp)) return 0;
-    if (n_keys < 0 || (n_keys > 0 && !keys)) return 1;
-    for (int i = 0; i < n_keys; i++) {
-        char k[41];
-        memcpy(k, keys + (size_t)i * 40u, 40u);
-        k[40] = '\0';
-        if (!pulsar_tp_kv_key_ok(k)) return 1;
-    }
-    return pulsar_tp_send_kvstore_reconcile(e->tp, keys, (uint32_t)n_keys) ? 0 : 1;
-}
-void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key) {
-    PULSAR_NVTX_FN();
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp || pulsar_tp_rank(tp) != 0 || pulsar_tp_failed(tp) || !pulsar_tp_kv_key_ok(key)) return;
-    /* Inside a mirrored prefill the workers read only chunk verdicts; the
-     * orphan this leaves is reclaimed by the next bring-up reconcile. */
-    if (s->tp_in_sync) return;
-    /* void: the worker deletes its copy and acks nothing.  A lost drop leaves
-     * an orphan copy that no leader entry names -- never loaded (the leader
-     * decides every load), reclaimed by the bring-up reconciliation (phase 3). */
-    (void)pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_KVSTORE_DROP, s->tp_session_id, key, 0);
-}
-int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payload_file *out,
-                                          const char *stage_dir, const char *key,
-                                          char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    if (!s) return 1;
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return s->stage_payload(out, stage_dir, err, errlen);
-    if (tp_mirror_worker_drives_nothing(tp, "kv cache store", err, errlen) ||
-        tp_mirror_dead(tp, err, errlen)) return 1;
-    if (s->tp_in_sync) {
-        /* A mid-prefill checkpoint ("continued" at a chunk boundary): the
-         * workers are inside the same prefill, reading only chunk verdicts, so
-         * a store frame now would desync them (2026-09-25: the worker read
-         * frame 43 where it expected 41 and the pair died).  Skipped; the next
-         * checkpoint outside the prefill (decode, cold, evict, shutdown) lands. */
-        if (err) snprintf(err, errlen, "tp: a mid-prefill checkpoint is not mirrored (the workers are "
-                                       "inside the prefill); skipped");
-        return 1;
-    }
-    if (!pulsar_tp_kv_key_ok(key)) {
-        if (err) snprintf(err, errlen, "tp: kv cache store: '%s' is not a store key", key ? key : "(null)");
-        return 1;
-    }
-    /* Ship first, stage second: each rank writes its own copy of the SAME state
-     * (nothing else moves on the control plane until the verdict is in), and
-     * the multi-hundred-MB writes overlap instead of running back to back. */
-    if (!tp_mirror_sent(tp, "kv cache store",
-                        pulsar_tp_send_kvstore(tp, PULSAR_TP_FRAME_KVSTORE_SAVE, s->tp_session_id, key, 0),
-                        err, errlen)) return 1;
-    const int own = s->stage_payload(out, stage_dir, err, errlen);
-    int peers = 0;
-    char perr[256];
-    perr[0] = '\0';
-    if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv cache store", &peers,
-                                       perr, sizeof(perr))) {
-        pulsar_tp_mirror_fail_void(tp, "kv cache store", perr);
-        if (own == 0) pulsar_session_payload_file_free(out);
-        if (err) snprintf(err, errlen, "tp: kv cache store: the workers' verdict could not be collected: %s", perr);
-        return 1;
-    }
-    if (own != 0) {
-        if (peers == 0) pulsar_session_kv_mirror_drop(s, key);   /* they stored, this rank did not */
-        return 1;                                                  /* err: this rank's own reason */
-    }
-    if (peers != 0) {
-        pulsar_session_payload_file_free(out);
-        if (err) snprintf(err, errlen, "tp: a worker could not store its copy of this kv cache entry "
-                                       "(its log names the reason); the entry is skipped on every rank");
-        return 1;
-    }
-    return 0;
-}
-int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t payload_bytes,
-                                         const char *key, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    if (!s) return 1;
-    pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return s->load_payload(fp, payload_bytes, err, errlen);
-    if (tp_mirror_worker_drives_nothing(tp, "kv cache load", err, errlen) ||
-        tp_mirror_dead(tp, err, errlen)) return 1;
-    if (s->tp_in_sync) {
-        if (err) snprintf(err, errlen, "tp: kv cache load refused inside a mirrored prefill");
-        return 1;
-    }
-    if (!pulsar_tp_kv_key_ok(key)) {
-        if (err) snprintf(err, errlen, "tp: kv cache load: '%s' is not a store key", key ? key : "(null)");
-        return 1;
-    }
-    /* Load HERE first: the workers must reach the state this rank actually
-     * ended in, so the frame carries the result, not the intent.  A local
-     * failure never ships the frame -- the workers are untouched, and the
-     * caller's mirrored invalidate brings every rank to the same empty state. */
-    const int own = s->load_payload(fp, payload_bytes, err, errlen);
-    if (own != 0) return own;
-    const int n = s->checkpoint.len;
-    const uint64_t digest = pulsar_session_checkpoint_digest(s);
-    if (!tp_mirror_sent(tp, "kv cache load",
-                        pulsar_tp_send_kvstore_load(tp, s->tp_session_id, key, n, digest),
-                        err, errlen)) return 1;
-    int peers = 0;
-    char perr[256];
-    perr[0] = '\0';
-    if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv cache load", &peers,
-                                       perr, sizeof(perr))) {
-        pulsar_tp_mirror_fail_void(tp, "kv cache load", perr);
-        if (err) snprintf(err, errlen, "tp: kv cache load: the workers' verdict could not be collected: %s", perr);
-        return 1;
-    }
-    if (peers != 0) {
-        /* A MISS, not a divergence: the copy is missing, stale (another build),
-         * or restored different state.  Nothing is computed on this state --
-         * the caller invalidates every rank before the next sync. */
-        if (err) snprintf(err, errlen, "tp: a worker has no matching copy of this kv cache entry "
-                                       "(its log names why) -- treated as a miss on every rank");
-        return 1;
-    }
-    return 0;
-}
 int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out, const char *stage_dir, char *err, size_t errlen) { return s ? s->stage_payload(out, stage_dir, err, errlen) : 1; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }

@@ -1892,7 +1892,7 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
-tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/engine/pulsar_engine_internal.h src/pulsar.h
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/engine/pulsar_engine_internal.h src/pulsar.h src/lib/pulsar_segstore.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2042,7 +2042,7 @@ cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
 tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/comp_state_gate: tests/comp_state_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

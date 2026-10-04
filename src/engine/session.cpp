@@ -12,15 +12,15 @@ int pulsar_engine::routed_quant_bits() {
      * IQ2 + MXFP4/type-40 build as pure 2-bit). Any 4-bit routed format
      * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
      * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
-     * routed experts. The kvstore snapshot-compat guards accept {2,4} and
-     * pulsar_engine_model_id() is a compile-time constant, so this is the only
-     * model-variant discriminator in the disk-KV key — a value change
-     * invalidates old snapshots (one-time re-prefill; fine in dev). */
+     * routed experts. pulsar_engine_model_id() is a compile-time constant, so
+     * this is the model-variant discriminator in the agent's session-file
+     * header (the agent refuses a file whose value differs) — a value change
+     * invalidates old session payloads (one-time re-prefill; fine in dev). */
     /* EXL3 (L245) is its own value space -- 20 + the rate in half-bit units
      * (24 = K2, 25 = K2.5, 26 = K3; the highest rate present wins) -- so an
-     * EXL3 artifact never shares a KV key with the IQ2 (2) or MXFP4 (4) tier
-     * of the same model id.  pulsar_kvstore_quant_bits_valid() enumerates the
-     * accepted set; the kvstore refuses to store or match anything else. */
+     * EXL3 artifact never shares a session file with the IQ2 (2) or MXFP4 (4)
+     * tier of the same model id.  pulsar_kvstore_quant_bits_valid() enumerates
+     * the accepted set; the header reader refuses anything else. */
     int bits = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_tensor *proj[3] = {
@@ -749,8 +749,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (opt->tp_spill_dir && opt->tp_spill_dir[0]) e->tp_spill_dir = pulsar_strdup(opt->tp_spill_dir);
-        e->tp_build_digest = pulsar_build_digest(opt->build_id);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
         /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
          * GPU-direct through a buffer of out | in[0] | in[1], each one prefill
@@ -1090,8 +1088,6 @@ void pulsar_engine::destroy() {
         pulsar_tp_free(e->tp);
         e->tp = NULL;
     }
-    free(e->tp_spill_dir);
-    e->tp_spill_dir = NULL;
     if (e->tp_slab_base) {
         pulsar_gpu_tp_err_word_set(NULL);
         pulsar_tp_gpu_slab_free_hostpin(e->tp_slab_base);

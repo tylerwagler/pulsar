@@ -47,10 +47,19 @@ typedef void (*pulsar_segstore_log_fn)(void *ud, const char *msg);
 /** Writes exactly the bytes promised into fp; 0 on success. */
 typedef int (*pulsar_segstore_write_fn)(FILE *fp, void *ud, char *err, size_t errlen);
 
+/** What a store's segments were computed by: the model AND its routed-expert
+ * format (pulsar_engine_routed_quant_bits -- the IQ2, MXFP4 and EXL3 builds of
+ * one model share a model id and a KV row layout, so a segment's shape cannot
+ * tell them apart, but their KV differs).  The one rule both writers and
+ * readers key with. */
+static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t routed_quant_bits) {
+    return model_id << 8 | (routed_quant_bits & 0xffu);
+}
+
 /** Open (create) the store and index its segments.  budget_bytes 0 = unbounded.
- * Segments of another model, of another format, or unreadable are skipped (and
- * left alone: a store dir is per model already). */
-pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t model_id,
+ * Segments of another identity (pulsar_segstore_identity), of another format,
+ * or unreadable are skipped and left alone. */
+pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t identity,
                                       pulsar_segstore_log_fn log, void *log_ud);
 void pulsar_segstore_close(pulsar_segstore *st);
 

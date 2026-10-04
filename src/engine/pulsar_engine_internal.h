@@ -1763,8 +1763,6 @@ struct pulsar_engine {
      * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
-    char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
-    uint64_t tp_build_digest;   ///< L250: FNV-1a of the build id, stamped into disk-KV copies
     uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
@@ -2188,32 +2186,6 @@ bool pulsar_session_is_mirrored(const pulsar_session *s);
  *  SYNC_CHECK; a worker compares its own.  O(checkpoint) per sync. */
 uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s);
 
-/** L250: a worker's own copy of a disk KV cache entry, at
- *  "<tp_spill_dir>/tp-kv-<key>.payload": this header, then the rank's own
- *  pulsar_session::save_payload bytes.  Everything a copy must match before a
- *  rank may load it is here: the rank and group size (a rank-0 or single-box
- *  file never loads as rank 1), the transport protocol and the build (state
- *  from a different build is never resumed), and the state it restores. */
-#define PULSAR_TP_KV_BLOB_MAGIC   UINT32_C(0x564B5450)   /* "PTKV" little-endian */
-#define PULSAR_TP_KV_BLOB_VERSION 1u
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t rank;
-    uint32_t n_ranks;
-    uint32_t protocol;
-    uint32_t n_tokens;        ///< checkpoint length the payload restores
-    uint64_t build_digest;    ///< pulsar_engine::tp_build_digest of the writer
-    uint64_t state_digest;    ///< pulsar_session_checkpoint_digest at save
-    uint64_t payload_bytes;   ///< bytes of save_payload output after this header
-} pulsar_tp_kv_blob_header;
-
-/** L250: a disk KV store key is exactly 40 lowercase hex characters (the
- *  store's sha of the entry text); anything else is refused before it can
- *  name a path. */
-bool pulsar_tp_kv_key_ok(const char *key);
-uint64_t pulsar_build_digest(const char *build_id);
-
 /** Slice 4e (L238 increment 4): the speculative round family's LOCAL
  * implementations (session_spec.cpp).  The public pulsar_session_spec_*
  * entry points (engine_api.cpp) mirror onto the pair and call these; the
@@ -2273,11 +2245,6 @@ struct pulsar_session {
      * mirrored frame carries it; see tp_session_seq above for why it is the
      * create ordinal and why a mismatch is refused. */
     uint64_t tp_session_id;
-    /** L250: true on the LEADER while a mirrored sync runs.  The workers are then
-     *  inside the same prefill, reading only chunk verdicts on the control
-     *  channel, so any other frame (a disk-KV store/drop from a mid-prefill
-     *  "continued" checkpoint) would desync them -- those ops refuse instead. */
-    bool tp_in_sync;
     /** L260: the batched round end's deferred drafter seed.  While `active`
      *  (pulsar_session_spec_round_end_batch_local), each bank's round end records
      *  its committed capture rows here instead of seeding them one GEMV row at a
@@ -2420,11 +2387,6 @@ struct pulsar_session {
     bool bank_is_evicted(uint32_t bank) const;
     /** touched_kv_bytes() for an arbitrary bank, live or idle. */
     uint64_t bank_touched_kv_bytes(uint32_t bank);
-    /** Write one bank's KV to `fp` bit-identically (the spill half of the
-     * eviction guard). @return 0 on success. */
-    int bank_kv_save(uint32_t bank, FILE *fp, char *err, size_t errlen);
-    /** Reload a spilled bank's KV from `fp`, byte-for-byte. @return 0 on success. */
-    int bank_kv_load(uint32_t bank, FILE *fp, char *err, size_t errlen);
     /** Extra bytes ONE bank would demand-page in if the context grew to quantum
      * `q` -- the admission question "can this session take another step" priced
      * before committing to it. */
@@ -3276,7 +3238,7 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank);
 /** Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
  * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
  * touch) and rebuild its base-table entries to the new pointers. The caller then
- * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * reloads the bank's KV into these (the server from its segment chain). Idempotent: a
  * slab already present is left untouched. Returns false on OOM.
  */
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);

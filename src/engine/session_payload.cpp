@@ -465,12 +465,10 @@ int pulsar_session::stage_payload(pulsar_session_payload_file *out,
         return 1;
     }
     int fd = mkstemp(tmpl);
-    /* Rename onto the house "<name>.tmp.<pid>" convention so the kvstore's
-     * boot-scan orphan GC reclaims a crash-abandoned staged file (it lives in
-     * the store dir now); the live-pid check keeps in-flight saves safe when
-     * two servers share a cache dir. Best-effort: on rename failure keep the
-     * mkstemp name (worst case a crash leaks one skipped file, /tmp-era
-     * behavior). */
+    /* Rename onto the house "<name>.tmp.<pid>" convention, which names the
+     * writer of a crash-abandoned staged file.  (The retired server kvstore's
+     * boot scan reclaimed these; the agent, the one stager now, has no such
+     * scan.)  Best-effort: on rename failure keep the mkstemp name. */
     char named[1056];
     if (fd >= 0) {
         snprintf(named, sizeof named, "%s.tmp.%ld", tmpl, (long)getpid());

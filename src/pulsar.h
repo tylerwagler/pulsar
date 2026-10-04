@@ -140,13 +140,6 @@ typedef struct {
      *  frame so each rank can report the whole group's builds.  NULL = not
      *  stamped (the CLI); the transport sends it empty. */
     const char *build_id;
-    /** Slice 4e increment 6 (L238): where a WORKER rank keeps its own bank
-     * KV disk snapshots.  KV is replicated per rank, so a spill is per rank
-     * to its own disk; the leader's frames name the snapshot by the key of
-     * the file the leader wrote and the worker mirrors it under this
-     * directory.  NULL (the CLI, or a server without a KV disk cache) refuses
-     * the spill frames on a worker. */
-    const char *tp_spill_dir;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
@@ -339,22 +332,18 @@ void     pulsar_engine_set_bank_pool(uint32_t n_banks);
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
 /** Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
  * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
- * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
- * first (host RAM reclaims nothing on unified memory) and repointed away from it.
+ * (reclaims physical on GB10); caller must have persisted the bank's KV to DISK
+ * first (host RAM reclaims nothing on unified memory; the server writes the bank's
+ * history as segments) and repointed away from it.
  * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
- * the base-pointer table; caller then reloads KV H2D from the disk snapshot.
+ * the base-pointer table; the caller then reloads its KV (the server from its
+ * segment chain).
  * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
  * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank);
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
-/** Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
- * mechanism; the D2H staging is transient — freed before free_physical). save:
- * precondition bank is installed (cur). load: reallocs physical + rebuilds the
- * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
-int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
-int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
 /** Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
@@ -1076,36 +1065,6 @@ int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file 
 int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void pulsar_session_payload_file_free(pulsar_session_payload_file *payload);
-/** L250: pulsar_session_stage_payload for the disk KV cache on a TP group.  KV
- * is replicated per rank, so every worker also writes its OWN copy of this
- * state under its spill directory, named by `key` (the store's 40-hex sha);
- * the leader stages in parallel.  Returns 0 only when every rank succeeded --
- * otherwise nothing is left staged here and no worker keeps a copy, so the
- * store is skipped (the pair is NOT failed: a full disk on one rank is a miss,
- * not a divergence).  Without a TP group it is exactly
- * pulsar_session_stage_payload and `key` is unused. */
-int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payload_file *out,
-                                          const char *stage_dir, const char *key,
-                                          char *err, size_t errlen);
-/** L250: the leader's entry `key` is gone (its own write failed after the
- * workers stored, or eviction): drop every worker's copy.  Fire-and-forget; a
- * no-op without a TP group. */
-void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key);
-/** L250 phase 2: pulsar_session_load_payload for the disk KV cache on a TP
- * group.  This rank loads first; then every worker loads ITS copy of entry
- * `key` and must reach the same state (checkpoint length + digest).  Returns 0
- * only when every rank did.  On any failure the ranks may hold different
- * state, so the caller MUST pulsar_session_invalidate (mirrored: every rank
- * ends empty and identical), remove its entry and pulsar_session_kv_mirror_drop
- * it -- exactly what it already does for a payload that will not load.
- * Without a TP group it is exactly pulsar_session_load_payload. */
-int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t payload_bytes,
-                                         const char *key, char *err, size_t errlen);
-/** L250 phase 3: at bring-up, hand the workers the key of every entry this
- * leader's disk KV cache holds (`keys`: n_keys x 40 hex, back to back); each
- * worker deletes the copies no key names.  Fire-and-forget.  0 when sent, 1
- * when it could not be; a no-op (0) off a TP group or on a worker. */
-int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_keys);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);

@@ -560,8 +560,8 @@ static bool bank_bases_set(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
  * Nulls the slab pointers and their base-table entries, and ZEROES this bank's
  * frontier counters (ms_n_comp) so touched_kv_bytes stops counting
  * a freed bank — else the guard's projected never drops after a spill and it
- * cascades, evicting every idle bank on one breach (review finding 2). The disk
- * snapshot preserves the real counts for restore. MUST NOT be the installed (cur)
+ * cascades, evicting every idle bank on one breach (review finding 2). The
+ * restore rebuilds the counts from what it loads. MUST NOT be the installed (cur)
  * bank — the caller repoints away first. The eager raw ring + state lanes
  * (contiguous, bounded floor) are NOT freed and survive the cycle in place.
  *
@@ -588,11 +588,12 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = 0;
         g->ms_comp_hw[bank][il] = 0;
     }
-    /* L264: the bank's grid checkpoints are KEPT.  Their slab is eager, the
-     * rows they reference come back bit-identical through bank_kv_load (which
-     * drops them on any failure), and a bank reused for another conversation
-     * goes through rewind(0), which drops them -- so the frontier zeroed above
-     * is the one write that must not count as "rows below G changed". */
+    /* L264: the bank's grid checkpoints are left in place: their slab is
+     * eager, nothing reads them while the bank is evicted, and every way back
+     * -- the server's segment-chain restore (whose root segment invalidates),
+     * a restore that finds nothing (invalidate), a bank reused for another
+     * conversation -- goes through rewind(0), which drops them.  So the
+     * frontier zeroed above is not a "rows below G changed" write. */
     if (!table_ok) {
         fprintf(stderr,
                 "pulsar: WARNING free_physical bank %u: base-table NULL device-write "
@@ -604,7 +605,7 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
 /* Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
  * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
  * touch) and rebuild its base-table entries to the new pointers. The caller then
- * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * reloads the bank's KV into these (the server from its segment chain). Idempotent: a
  * slab already present is left untouched. Returns false on OOM. */
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;

@@ -30,8 +30,10 @@
  *                                reasoning-stripping turn resumed the L264 way
  *   N  sync(N), restore the checkpoint at 8576 -- the split the prefill makes at
  *                                the last grid point below the prompt's end
- *   O  sync(N), persist the session as a chain of disk SEGMENTS (L264 S4), load the
- *                                chain into a fresh session, sync(N): resumes at 8576
+ *   O  sync(N), persist the session as a chain of disk SEGMENTS in a segment
+ *                                store (L264 S4), restart (store reopened, session
+ *                                fresh), find the chain by text, load it, sync(N):
+ *                                resumes at 8576 -- the disk cache end to end
  *   P  M's history persisted as a segment chain to 3968 and resumed from it --
  *                                the reasoning-stripping turn coming back from disk
  * The resume grid is 128 (PULSAR_RESUME_GRID, L195): a resume rewinds to the grid
@@ -63,6 +65,10 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
+#include "pulsar_segstore.h"
+
+#include <dirent.h>
+#include <unistd.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -91,35 +97,106 @@ static char *read_file(const char *path, size_t *len_out) {
 }
 
 /* L264 S4: persist the session's grid checkpoints up to `limit` as a chain of
- * segments, throw the session away, and load the chain into a fresh one.  Says
+ * segments in a real segment STORE -- keyed by the rendered text of their
+ * tokens, the way the server's disk KV cache keys them -- close the store and
+ * throw the session away (the restart), reopen the store, find the chain by a
+ * text lookup of the whole prompt alone, and load it into a fresh session.  Says
  * the chain it moved, so the log shows the segment path ran. */
-static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, int limit, char *err, size_t errlen) {
+struct segment_writer { pulsar_session *s; int G_prev, G; };
+static int segment_write(FILE *fp, void *ud, char *err, size_t errlen) {
+    const segment_writer *w = (const segment_writer *)ud;
+    return pulsar_session_save_segment(w->s, fp, w->G_prev, w->G, err, errlen);
+}
+static char *render_span(pulsar_engine *e, const pulsar_tokens *t, int from, int to, size_t *len) {
+    size_t cap = 4096, n = 0;
+    char *out = (char *)malloc(cap);
+    for (int i = from; out && i < to; i++) {
+        size_t pl = 0;
+        char *piece = pulsar_token_text(e, t->v[i], &pl);
+        if (n + pl + 1 > cap) { while (n + pl + 1 > cap) cap *= 2; out = (char *)realloc(out, cap); }
+        if (out) { memcpy(out + n, piece, pl); n += pl; }
+        free(piece);
+    }
+    if (out) out[n] = 0;
+    *len = n;
+    return out;
+}
+static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsar_tokens *prompt, int limit,
+                              char *err, size_t errlen) {
     int Gs[64];
     int n = 0;
     for (int G = pulsar_session_checkpoint_best(*sp, limit); G > 0 && n < 64;
          G = pulsar_session_checkpoint_best(*sp, G - 1)) Gs[n++] = G;
     if (n == 0) { snprintf(err, errlen, "no grid checkpoint at or below %d to persist", limit); return 1; }
-    FILE *fp[64];
-    uint64_t bytes[64];
+    const char *tmp = getenv("TMPDIR");
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/chunk_neutrality_segs.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    if (!mkdtemp(dir)) { snprintf(err, errlen, "mkdtemp %s failed", dir); return 1; }
+    const uint32_t model = pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e),
+                                                   (uint32_t)pulsar_engine_routed_quant_bits(e));
+    int rc = 1;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, model, NULL, NULL);
+    if (!st) { snprintf(err, errlen, "segment store open failed"); goto out; }
     printf("  [segments]");
-    for (int k = n - 1, prev = 0; k >= 0; prev = Gs[k], k--) {
-        const int i = n - 1 - k;
-        fp[i] = tmpfile();
-        bytes[i] = pulsar_session_segment_bytes(*sp, prev, Gs[k]);
-        if (!fp[i] || pulsar_session_save_segment(*sp, fp[i], prev, Gs[k], err, errlen) != 0) return 1;
-        printf(" [%d,%d)", prev, Gs[k]);
-        rewind(fp[i]);
+    {
+        char parent[41] = "";
+        const pulsar_tokens *hist = pulsar_session_tokens(*sp);
+        for (int k = n - 1, prev = 0; k >= 0; prev = Gs[k], k--) {
+            size_t tl = 0;
+            char *text = render_span(e, hist, prev, Gs[k], &tl);
+            segment_writer w = { *sp, prev, Gs[k] };
+            char key[41];
+            const bool ok = text && pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)Gs[k], text, tl,
+                                                        pulsar_session_segment_bytes(*sp, prev, Gs[k]), segment_write,
+                                                        0, NULL, &w, key, err, errlen);
+            free(text);
+            if (!ok) goto out;
+            memcpy(parent, key, sizeof key);
+            printf(" [%d,%d)", prev, Gs[k]);
+        }
     }
     printf("\n");
+    pulsar_segstore_close(st);
+    st = NULL;
     pulsar_session_free(*sp);
     *sp = NULL;
-    if (pulsar_session_create(sp, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); return 1; }
-    int rc = 0;
-    for (int i = 0; i < n && rc == 0; i++) {
-        int G = 0;
-        rc = pulsar_session_load_segment(*sp, fp[i], bytes[i], i == n - 1, &G, err, errlen);
+    /* the restart: nothing carries over but the directory */
+    if (!(st = pulsar_segstore_open(dir, 0, model, NULL, NULL))) { snprintf(err, errlen, "segment store reopen failed"); goto out; }
+    if (pulsar_session_create(sp, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); goto out; }
+    {
+        size_t tl = 0;
+        char *text = render_span(e, prompt, 0, prompt->len, &tl);
+        pulsar_segstore_seg chain[64];
+        const int m = text ? pulsar_segstore_lookup(st, text, tl, chain, 64) : 0;
+        free(text);
+        if (m != n || (int)chain[m - 1].G != Gs[0]) {
+            snprintf(err, errlen, "text lookup found a chain of %d to %d, persisted %d to %d", m,
+                     m ? (int)chain[m - 1].G : 0, n, Gs[0]);
+            goto out;
+        }
+        for (int i = 0; i < m; i++) {
+            uint64_t pb = 0;
+            FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
+            int G = 0;
+            const int lrc = fp ? pulsar_session_load_segment(*sp, fp, pb, i == m - 1, &G, err, errlen) : 1;
+            if (fp) fclose(fp);
+            if (lrc != 0) { if (!fp) snprintf(err, errlen, "segment %d unreadable", i); goto out; }
+        }
     }
-    for (int i = 0; i < n; i++) fclose(fp[i]);
+    rc = 0;
+out:
+    if (st) pulsar_segstore_close(st);
+    {   /* the store is scratch: remove its files and the directory */
+        DIR *d = opendir(dir);
+        for (struct dirent *de; d && (de = readdir(d));) {
+            if (de->d_name[0] == '.') continue;
+            char path[1024];
+            snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+            unlink(path);
+        }
+        if (d) closedir(d);
+        rmdir(dir);
+    }
     return rc;
 }
 
@@ -162,7 +239,7 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
         }
         if (pulsar_session_restore_checkpoint(s, restore, err, errlen) != 0) goto done;
     }
-    if (segments > 0 && segment_round_trip(e, &s, segments, err, errlen) != 0) goto done;
+    if (segments > 0 && segment_round_trip(e, &s, toks, segments, err, errlen) != 0) goto done;
     if (via_snapshot) {
         /* the disk-cache path: serialise, throw the session away, restore into
          * a fresh one */
