@@ -16,6 +16,12 @@
  *                                decode rows are the decode kernels' and a cold prefill's
  *                                are not (L195)
  *   G  sync(4000), eval x200, sync(N) -> same from 3968
+ *   K  sync(4000), eval x4600, cut to 4100, sync(N) -> the reasoning-stripping
+ *                                client (L264): decode runs past the raw ring's
+ *                                reach (raw_cap 4352), so the raw slots the
+ *                                resume's window needs were overwritten by
+ *                                decode rows the cut then removed; the resume
+ *                                must still equal the cold prefill
  * The resume grid is 128 (PULSAR_RESUME_GRID, L195): a resume rewinds to the grid
  * point below the PREFILL frontier, warms the compressor state up over the 32 tokens
  * before it, and redoes < 128 tokens plus whatever was generated since.  Nothing is
@@ -53,8 +59,9 @@
 
 #define GATE_N 8600
 #define GATE_CTX 8704
-#define GATE_SCHEDULES 10
+#define GATE_SCHEDULES 11
 #define GATE_EVALS 200   /* decode steps that carry schedules F and G across a grid boundary */
+#define GATE_EVALS_PAST_RING 4600   /* schedule K: more than raw_cap (4352) decode rows past the prefill */
 
 static char *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
@@ -189,6 +196,11 @@ int GATE_ENTRY(int argc, char **argv) {
             /* the cut: prefilled to 4500, rewound to 4300 (a partial fork, an edited
              * tail); the resume starts at 4224, the grid point below the cut */
             {"J: sync 4500, cut to 4300, resume from 4224", 4500, 0, 4224, false, 4300},
+            /* L264: a turn whose generation ran past the raw ring's reach, echoed
+             * back without it (the client stripped its reasoning): every raw slot
+             * of [3840, 3968) was rewritten by decode rows 8192.. that the cut
+             * removes.  The prefill's grid point 3968 is the exact resume. */
+            {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 4100},
         };
         char err[256];
         printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",
