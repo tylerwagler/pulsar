@@ -2,10 +2,22 @@
 
 
 
-static const char *anthropic_stop_reason(const char *finish) {
+/* A matched client stop sequence is reported as such, with the sequence; tool
+ * calls and the length cap take precedence, as in the Messages API. */
+static const char *anthropic_stop_reason(const char *finish, const char *stop_sequence) {
     if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
     if (finish && !strcmp(finish, "length")) return "max_tokens";
+    if (stop_sequence) return "stop_sequence";
     return "end_turn";
+}
+
+static void append_anthropic_stop(buf *b, const char *finish, const char *stop_sequence) {
+    const char *reason = anthropic_stop_reason(finish, stop_sequence);
+    buf_puts(b, "\"stop_reason\":");
+    json_escape(b, reason);
+    buf_puts(b, ",\"stop_sequence\":");
+    if (!strcmp(reason, "stop_sequence")) json_escape(b, stop_sequence);
+    else buf_puts(b, "null");
 }
 
 
@@ -86,15 +98,16 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 bool anthropic_final_response(int fd,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
+                                     const char *stop_sequence,
                                      int prompt_tokens, int completion_tokens) {
     buf b = {0};
     buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"content\":");
     append_anthropic_content(&b, text, reasoning, calls, id);
-    buf_puts(&b, ",\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    buf_putc(&b, ',');
+    append_anthropic_stop(&b, finish, stop_sequence);
+    buf_puts(&b, ",\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, 200, "application/json", b.ptr);
@@ -564,12 +577,12 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
 
 
 
-static bool anthropic_sse_stop_live(int fd, const char *finish,
+static bool anthropic_sse_stop_live(int fd, const char *finish, const char *stop_sequence,
                                     int completion_tokens) {
     buf b = {0};
-    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{");
+    append_anthropic_stop(&b, finish, stop_sequence);
+    buf_puts(&b, "},\"usage\":{\"output_tokens\":");
     buf_printf(&b, "%d}}", completion_tokens);
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
@@ -582,7 +595,8 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
 bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
-                                      const char *finish, int completion_tokens) {
+                                      const char *finish, const char *stop_sequence,
+                                      int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
@@ -591,7 +605,7 @@ bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+    return anthropic_sse_stop_live(fd, finish, stop_sequence, completion_tokens);
 }
 
 

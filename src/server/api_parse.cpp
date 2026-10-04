@@ -447,7 +447,17 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+            char *tools_raw = NULL;
+            if (!json_raw_value(&p, &tools_raw) ||
+                !anthropic_tools_supported(tools_raw, err, errlen)) {
+                free(tools_raw);
+                free(key);
+                goto bad;
+            }
+            const char *tp = tools_raw;
+            const bool tools_ok = parse_tools_value(&tp, &tool_schemas, &r->tool_orders);
+            free(tools_raw);
+            if (!tools_ok) {
                 free(key);
                 goto bad;
             }

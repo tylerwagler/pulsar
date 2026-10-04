@@ -2444,6 +2444,7 @@ struct gen_state {
      * it, and this is that backed-up position. */
     size_t stop_scan_from;
     const char *finish;       ///< finish reason once known ("stop", "length", ...); NULL while running
+    char *stop_sequence;      ///< the client stop sequence that ended generation, when one did; owned
     int completion;           ///< tokens generated this attempt
     int max_tokens;           ///< cap for this attempt
     bool saw_tool_start;      ///< a tool-call opening marker has appeared
@@ -2619,6 +2620,7 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
                                    size_t limit, bool final);
 bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
+bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
@@ -2899,6 +2901,7 @@ void append_anthropic_content(buf *b, const char *text, const char *reasoning,
 bool anthropic_final_response(int fd,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
+                                     const char *stop_sequence,
                                      int prompt_tokens, int completion_tokens);
 bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st);
@@ -2913,7 +2916,8 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
 bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
-                                      const char *finish, int completion_tokens);
+                                      const char *finish, const char *stop_sequence,
+                                      int completion_tokens);
 double server_now_sec(void);
 void server_log(pulsar_log_type type, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));

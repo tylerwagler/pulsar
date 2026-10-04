@@ -1561,7 +1561,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
 
     if (hit_stop) {
-        (void)stop_len;
+        free(g->stop_sequence);
+        g->stop_sequence = xstrndup(g->text.ptr + stop_pos, stop_len);
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
@@ -1959,7 +1960,7 @@ void server::gen_step_finish(session_slot *sl) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
                                                     g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    &parsed_calls, final_finish,
+                                                    &parsed_calls, final_finish, g->stop_sequence,
                                                     g->completion_total + g->completion);
         } else if (g->openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, g->id, &g->openai_live,
@@ -2005,7 +2006,7 @@ void server::gen_step_finish(session_slot *sl) {
         anthropic_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
-                                 &parsed_calls, final_finish,
+                                 &parsed_calls, final_finish, g->stop_sequence,
                                  g->prompt_tokens,
                                  g->completion_total + g->completion);
     } else if (j->req.api == API_RESPONSES) {
@@ -2111,6 +2112,7 @@ void server::gen_state_free(session_slot *sl) {
     pulsar_tokens_free(&g->cold_prefix);
     pulsar_tokens_free(&g->batch_pending);
     free(g->disk_cache_path);
+    free(g->stop_sequence);
     slot_writer_free(&g->writer);
     free(g);
     sl->gen = NULL;

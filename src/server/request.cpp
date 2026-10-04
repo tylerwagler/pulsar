@@ -1,5 +1,7 @@
 #include "pulsar_server_internal.h"
 
+#include <atomic>
+
 
 
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes) {
@@ -1331,12 +1333,13 @@ done:
  * not execute Anthropic server tools -- the router upstream owns web search
  * and injects results into the prompt -- so the entry is recognised only to
  * be dropped.  Only the "type" member is inspected. */
-static bool anthropic_server_tool_entry(const char *raw_tool_json) {
+/* The "type" member of one JSON object (a tool entry or a content block),
+ * malloc'd, or NULL when it has none. */
+static char *anthropic_type_member(const char *raw_tool_json) {
     const char *p = raw_tool_json ? raw_tool_json : "";
     json_ws(&p);
-    if (*p != '{') return false;
+    if (*p != '{') return NULL;
     p++;
-    bool is_server_tool = false;
     json_ws(&p);
     while (*p && *p != '}') {
         char *key = NULL;
@@ -1348,17 +1351,55 @@ static bool anthropic_server_tool_entry(const char *raw_tool_json) {
         free(key);
         if (is_type) {
             char *type = NULL;
-            if (!json_string(&p, &type)) break;
-            is_server_tool = !strncmp(type, "web_search", strlen("web_search"));
-            free(type);
-            break;
+            if (!json_string(&p, &type)) return NULL;
+            return type;
         }
         if (!json_skip_value(&p)) break;
         json_ws(&p);
         if (*p == ',') p++;
         json_ws(&p);
     }
+    return NULL;
+}
+
+static bool anthropic_server_tool_entry(const char *raw_tool_json) {
+    char *type = anthropic_type_member(raw_tool_json);
+    bool is_server_tool = type && !strncmp(type, "web_search", strlen("web_search"));
+    free(type);
     return is_server_tool;
+}
+
+/* An Anthropic tools array may name only client tools (no "type", or
+ * "custom") and web search.  Any other typed entry -- the advisor tool
+ * (advisor_20260301), code execution, memory -- is a server tool nothing here
+ * runs.  It is refused with the Messages API's own wording, "Input tag '<type>'",
+ * which is what Claude Code matches to retry once without that tool and leave
+ * it out for the session; passing it on would let the model call a tool
+ * nobody can execute. */
+bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen) {
+    const char *p = tools_json ? tools_json : "";
+    json_ws(&p);
+    if (*p != '[') return true;   /* not an array: parse_tools_value refuses it */
+    p++;
+    for (int i = 0;; i++) {
+        json_ws(&p);
+        if (*p == ']' || !*p) return true;
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return true;
+        char *type = anthropic_type_member(raw);
+        free(raw);
+        bool ok = !type || !strcmp(type, "custom") ||
+                  !strncmp(type, "web_search", strlen("web_search"));
+        if (!ok) {
+            snprintf(err, errlen,
+                     "tools.%d: Input tag '%s' found using 'type' does not match any of "
+                     "the expected tags", i, type);
+        }
+        free(type);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') p++;
+    }
 }
 
 /* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
@@ -1790,9 +1831,66 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
  * image block's inline base64 into an attached encoded image file with
  * PULSAR_IMAGE_PLACEHOLDER written into the content at the block's position --
  * the same contract, and the same refusal wording, as the OpenAI image_url
- * reader.  A block type this parser does not know is refused: silently
- * dropping one is how an image request used to answer as if no image were
- * sent. */
+ * reader.  Three more types are handled: a document is inlined when it is
+ * text and otherwise shown as a notice, a tool_reference names the tool, and
+ * redacted_thinking is dropped.  A block type this parser does
+ * not know is refused: silently dropping one is how an image request used to
+ * answer as if no image were sent. */
+static bool parse_anthropic_content_block(const char **p, const char *role,
+                                          chat_msg *msg, char *err, size_t errlen);
+
+/* A tool_result's content: a string, or an array of blocks.  Each block is read
+ * by the same parser as a message's blocks, so a document, tool_reference or
+ * unknown type is handled identically wherever it appears.  An image cannot be
+ * placed inside a tool result here, so it becomes a visible notice instead of
+ * vanishing (Claude Code's Read tool returns images and PDFs this way). */
+static bool anthropic_tool_result_text(const char *content_raw, char **out,
+                                       char *err, size_t errlen) {
+    const char *p = content_raw;
+    json_ws(&p);
+    if (*p != '[') return json_content(&p, out);
+    p++;
+    buf b = {0};
+    for (;;) {
+        json_ws(&p);
+        if (*p == ']') break;
+        if (*p == '"') {
+            char *s = NULL;
+            if (!json_string(&p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else {
+            char *raw = NULL;
+            if (!json_raw_value(&p, &raw)) goto fail;
+            char *type = anthropic_type_member(raw);
+            const bool image = type && !strcmp(type, "image");
+            free(type);
+            if (image) {
+                buf_puts(&b, "[image omitted: images inside tool results are not supported "
+                             "by this server]");
+            } else {
+                chat_msg part = {0};
+                const char *rp = raw;
+                const bool ok = parse_anthropic_content_block(&rp, "user", &part, err, errlen);
+                if (ok && part.content) buf_puts(&b, part.content);
+                chat_msg_free(&part);
+                if (!ok) {
+                    free(raw);
+                    goto fail;
+                }
+            }
+            free(raw);
+        }
+        json_ws(&p);
+        if (*p == ',') p++;
+    }
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
 static bool parse_anthropic_content_block(const char **p, const char *role,
                                           chat_msg *msg, char *err, size_t errlen) {
     (void)role;
@@ -1809,6 +1907,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
     char *media_type = NULL;
     char *data = NULL;
     char *url = NULL;
+    char *tool_name = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1847,6 +1946,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
         } else if (!strcmp(key, "name")) {
             free(name);
             if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_name")) {
+            free(tool_name);
+            if (!json_string(p, &tool_name)) {
                 free(key);
                 goto bad;
             }
@@ -1958,8 +2063,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
         char *tool_result = NULL;
-        const char *cp = content_raw ? content_raw : "";
-        if (content_raw && !json_content(&cp, &tool_result)) {
+        if (content_raw && !anthropic_tool_result_text(content_raw, &tool_result, err, errlen)) {
             free(tool_result);
             goto bad;
         }
@@ -2032,10 +2136,44 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
             free(msg->reasoning);
             msg->reasoning = buf_take(&b);
         }
+    } else if (type && !strcmp(type, "document")) {
+        /* A text document is read like text.  Anything else (base64 PDF, a
+         * URL, nested content) cannot be read here; a notice keeps the
+         * conversation going and tells the model something was attached,
+         * where a refusal would fail every later turn that resends it. */
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        if (source_type && !strcmp(source_type, "text") && data) {
+            append_anthropic_block_content(&b, data);
+        } else {
+            buf_printf(&b, "[document omitted: %s is not supported by this server]",
+                       media_type ? media_type : source_type ? source_type : "this document");
+        }
+        free(msg->content);
+        msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "tool_reference")) {
+        /* MCP tool search loaded this tool.  This server always offers every
+         * tool, so only the fact is rendered. */
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        buf_printf(&b, "[tool available: %s]", tool_name ? tool_name : "(unnamed)");
+        free(msg->content);
+        msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "redacted_thinking")) {
+        /* Encrypted reasoning only Anthropic's API can read.  It arrives only
+         * in history produced there (a resumed session); nothing here can use
+         * it, and refusing would fail every later turn of that session. */
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: dropping redacted_thinking blocks: encrypted Anthropic "
+                       "reasoning this server cannot read (logged once per process)");
+        }
     } else {
         snprintf(err, errlen,
                  "unsupported content block type \"%s\"; this server accepts text, thinking, "
-                 "tool_use, tool_result and image blocks",
+                 "redacted_thinking, tool_use, tool_result, tool_reference, document and "
+                 "image blocks",
                  type ? type : "(missing)");
         goto bad;
     }
@@ -2051,6 +2189,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
     free(media_type);
     free(data);
     free(url);
+    free(tool_name);
     return true;
 bad:
     free(type);
@@ -2064,6 +2203,7 @@ bad:
     free(media_type);
     free(data);
     free(url);
+    free(tool_name);
     return false;
 }
 

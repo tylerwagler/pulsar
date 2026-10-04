@@ -538,6 +538,68 @@ static void test_error_envelope_shape_per_protocol(void) {
 
 
 
+/* L252: server tools nothing here runs are refused with the Messages API's
+ * "Input tag" wording, which Claude Code matches to retry without them. */
+static void test_anthropic_unsupported_tool_types_are_refused(void) {
+    char err[160] = {0};
+    TEST_ASSERT(anthropic_tools_supported(
+        "[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}},"
+        "{\"type\":\"custom\",\"name\":\"x\",\"input_schema\":{}},"
+        "{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]",
+        err, sizeof err));
+    TEST_ASSERT(!anthropic_tools_supported(
+        "[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}},"
+        "{\"type\":\"advisor_20260301\",\"name\":\"advisor\"}]",
+        err, sizeof err));
+    TEST_ASSERT(strstr(err, "tools.1: Input tag 'advisor_20260301'") != NULL);
+}
+
+/* L252: a matched client stop sequence is reported as stop_sequence with the
+ * sequence itself, buffered and streamed; tool calls still win. */
+static void test_anthropic_stop_sequence_is_reported(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    struct { const char *finish; const char *seq; const char *want; } cases[] = {
+        {"stop", "END", "\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"END\""},
+        {"stop", NULL, "\"stop_reason\":\"end_turn\",\"stop_sequence\":null"},
+        {"tool_calls", "END", "\"stop_reason\":\"tool_use\",\"stop_sequence\":null"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) continue;
+        TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_stop", "OK", NULL, NULL,
+                                             cases[i].finish, cases[i].seq, 10, 2));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, cases[i].want) != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    r.stream = true;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        anthropic_stream st;
+        TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_stop", 10, &st));
+        TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_stop", &st,
+                                              "OK", 2, NULL, "stop", "END", 3));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"delta\":{\"stop_reason\":\"stop_sequence\","
+                                "\"stop_sequence\":\"END\"}") != NULL);
+        free(out);
+        anthropic_stream_free(&st);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&r);
+}
+
+
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -566,7 +628,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
                                           raw, strlen(raw), &calls,
-                                          "tool_calls", 8));
+                                          "tool_calls", NULL, 8));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -644,7 +706,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
                                           raw_complete, strlen(raw_complete),
-                                          &calls, "tool_calls", 5));
+                                          &calls, "tool_calls", NULL, 5));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -700,7 +762,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", NULL, 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -4079,6 +4141,94 @@ static void test_anthropic_image_content_blocks(void) {
     }
 }
 
+
+
+/* L252 P1: Claude Code sends document, tool_reference and redacted_thinking
+ * blocks.  Each has one fixed rendering, so a session that carries one keeps
+ * working; a type nobody named is still refused. */
+static void test_anthropic_document_reference_redacted_blocks(void) {
+    const char *json =
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"document\",\"source\":{\"type\":\"text\",\"media_type\":\"text/plain\","
+        "\"data\":\"plain doc\"}},"
+        "{\"type\":\"document\",\"source\":{\"type\":\"base64\","
+        "\"media_type\":\"application/pdf\",\"data\":\"JVBERi0=\"}},"
+        "{\"type\":\"tool_reference\",\"tool_name\":\"mcp__docs__search\"}]},"
+        "{\"role\":\"assistant\",\"content\":["
+        "{\"type\":\"redacted_thinking\",\"data\":\"opaque\"},"
+        "{\"type\":\"text\",\"text\":\"answer\"}]}]";
+    chat_msgs msgs = {0};
+    char err[256] = {0};
+    const char *p = json;
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, err, sizeof err));
+    TEST_ASSERT(msgs.len == 2);
+    if (msgs.len == 2) {
+        const char *user = msgs.v[0].content;
+        TEST_ASSERT(user && strstr(user, "plain doc") != NULL);
+        TEST_ASSERT(user && strstr(user, "[document omitted: application/pdf "
+                                         "is not supported by this server]") != NULL);
+        TEST_ASSERT(user && strstr(user, "JVBERi0=") == NULL);
+        TEST_ASSERT(user && strstr(user, "[tool available: mcp__docs__search]") != NULL);
+        TEST_ASSERT(msgs.v[1].content && !strcmp(msgs.v[1].content, "answer"));
+        TEST_ASSERT(!msgs.v[1].reasoning || !strstr(msgs.v[1].reasoning, "opaque"));
+    }
+    chat_msgs_free(&msgs);
+
+    const char *unknown =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"search_result\",\"title\":\"t\"}]}]";
+    chat_msgs bad = {0};
+    p = unknown; err[0] = 0;
+    TEST_ASSERT(!parse_anthropic_messages(&p, &bad, err, sizeof err));
+    TEST_ASSERT(strstr(err, "content block type \"search_result\"") != NULL);
+    chat_msgs_free(&bad);
+}
+
+
+/* L252: blocks inside a tool_result are read by the same parser as a
+ * message's blocks.  Text renders as before; a document, a tool_reference and
+ * an image no longer vanish (Claude Code's Read tool returns PDFs and images
+ * this way). */
+static void test_anthropic_tool_result_nested_blocks(void) {
+    struct { const char *content; const char *want[5]; } cases[] = {
+        {"\"plain ok\"", {"<tool_result>plain ok</tool_result>"}},
+        {"[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"text\",\"text\":\"b\"}]",
+         {"<tool_result>ab</tool_result>"}},
+        {"[{\"type\":\"text\",\"text\":\"head \"},"
+         "{\"type\":\"document\",\"source\":{\"type\":\"text\",\"media_type\":\"text/plain\","
+         "\"data\":\"doc body\"}},"
+         "{\"type\":\"document\",\"source\":{\"type\":\"base64\","
+         "\"media_type\":\"application/pdf\",\"data\":\"JVBERi0=\"}},"
+         "{\"type\":\"tool_reference\",\"tool_name\":\"mcp__x__y\"},"
+         "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\","
+         "\"data\":\"aGVsbG8=\"}}]",
+         {"head doc body",
+          "[document omitted: application/pdf is not supported by this server]",
+          "[tool available: mcp__x__y]",
+          "[image omitted: images inside tool results are not supported by this server]"}},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf json = {0};
+        buf_puts(&json, "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+                        "\"tool_use_id\":\"toolu_1\",\"content\":");
+        buf_puts(&json, cases[i].content);
+        buf_puts(&json, "}]}]");
+        chat_msgs msgs = {0};
+        char err[256] = {0};
+        const char *p = json.ptr;
+        TEST_ASSERT(parse_anthropic_messages(&p, &msgs, err, sizeof err));
+        if (msgs.len == 1) {
+            const char *c = msgs.v[0].content;
+            for (int k = 0; k < 5 && cases[i].want[k]; k++)
+                TEST_ASSERT(c && strstr(c, cases[i].want[k]) != NULL);
+            TEST_ASSERT(msgs.v[0].images_len == 0);
+            TEST_ASSERT(c && strstr(c, "JVBERi0=") == NULL);
+        } else {
+            TEST_ASSERT(msgs.len == 1);
+        }
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
 
 
 static void append_tool_heavy_schema(buf *b, int idx) {
@@ -8075,6 +8225,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
     test_error_envelope_shape_per_protocol();
+    test_anthropic_unsupported_tool_types_are_refused();
+    test_anthropic_stop_sequence_is_reported();
     test_logprob_stream_ready_watermark();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
@@ -8137,6 +8289,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_multi_image_blocks_and_offsets();
     test_responses_request_keeps_image_refusal_message();
     test_anthropic_image_content_blocks();
+    test_anthropic_document_reference_redacted_blocks();
+    test_anthropic_tool_result_nested_blocks();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
     test_json_parser_handles_tool_heavy_requests();
