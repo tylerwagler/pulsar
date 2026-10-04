@@ -308,6 +308,11 @@ char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, siz
     return pulsar_kvstore_render_tokens_text(engine, tokens, out_len);
 }
 
+static bool byte_prefix_match(const char *text, size_t text_len,
+                              const char *prefix, size_t prefix_len) {
+    return pulsar_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
+}
+
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
     pulsar_kvstore_tokens_copy_prefix(dst, src, n);
 }

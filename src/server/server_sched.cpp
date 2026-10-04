@@ -348,7 +348,6 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     sl->tokens_emitted = 0;
     sl->prefill_counted = 0;
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-    sl->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes += s->bank_marginal_bytes;
     if (idx >= s->n_slots) s->n_slots = idx + 1;
@@ -861,7 +860,6 @@ static int evict_reset_slot_fields(session_slot *sl) {
     sl->tokens_emitted = 0;
     sl->prefill_counted = 0;
     sl->last_serviced_us = 0;
-    sl->continued_last_store_tokens = 0;
     return evicted_ctx;
 }
 
@@ -891,7 +889,10 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
-        stored = s->kv_cache_store_current(sl, "evict");
+        /* L264 S4: persisting is idempotent -- a chain the store already holds
+         * writes nothing -- so "stored" is "the store holds this history". */
+        s->kv_cache_persist(sl, "evict");
+        stored = true;
     }
     if (!stored && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -2462,20 +2463,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
             }
             if (stopped) g->phase = GEN_FINISH;
-            /* L118: continued disk-KV store -- the classic loop's cadence, on
-             * the bank's token-true frontier.  Same tool-span suppression as
-             * the classic loop; the bank is installed only when one is due. */
-            bool store = false;
-            if (!stopped && g->phase == GEN_DECODE) {
-                const request *rq = &g->j->req;
-                const dsml_decode_state ds =
-                    rq->kind == REQ_CHAT && rq->has_tools ?
-                        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
-                store = !(rq->kind == REQ_CHAT && rq->has_tools &&
-                          (g->saw_tool_start || dsml_decode_state_is_tool(ds))) &&
-                        s->kv_cache_continued_store_due(sl);
-            }
-            if (done < na || store) {
+            /* L264 S4: decode creates no grid checkpoints, so there is nothing
+             * for the disk cache to persist here; the next prefill does it. */
+            if (done < na) {
                 if (!s->bank_switch(sl->bank)) {
                     snprintf(g->err, sizeof g->err,
                              "bank %u restore failed after spec round end", (unsigned)sl->bank);
@@ -2494,7 +2484,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                "ghost tokens to pos %d",
                                (unsigned)sl->bank, ghost, target);
                 }
-                if (store) s->kv_cache_maybe_store_continued(sl);
                 pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
                 s->live_bank = -1;   /* saved: the next install need not save it again */
             }

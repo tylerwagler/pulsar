@@ -1044,15 +1044,17 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
-    /* L250: on a tensor-parallel group the disk KV cache is MIRRORED -- every
-     * store, load and removal runs on every rank against its own copy
-     * (pulsar_session_stage_payload_mirrored / load_payload_mirrored /
-     * kv_mirror_drop), and SYNC_CHECK refuses a sync whose ranks disagree
-     * instead of deadlocking.  kv_disk_dir is also the engine's tp_spill_dir
-     * (above), where each worker keeps its copies. */
-    if (cfg.kv_disk_dir &&
+    /* L264 S4: the disk KV cache is the segment store.  Its segments are not
+     * mirrored across a tensor-parallel group yet (each rank would need its own
+     * copy of every segment, the L250 shape), so a TP engine serves without
+     * disk restore until they are -- said once, here. */
+    if (cfg.kv_disk_dir && pulsar_engine_is_tp(engine)) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: disk KV cache off on a tensor-parallel group: segments are not "
+                   "mirrored across ranks yet (L264 S4)");
+    } else if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                       false /* accept cross-quant restores */, cfg.kv_cache))
+                       (uint32_t)pulsar_engine_model_id(engine), cfg.kv_cache))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in
          * kv_cache_open; state the consequence once and serve without disk
@@ -1061,25 +1063,6 @@ int main(int argc, char **argv) {
                    "pulsar-server: disk KV cache disabled (directory %s unusable); "
                    "serving without disk restore",
                    cfg.kv_disk_dir);
-    }
-    /* L250 phase 3: the workers keep a copy of every entry.  A lost DROP, a
-     * crash between a worker's store and this rank's commit, or copies from
-     * another build leave copies no entry names -- never loaded (this rank
-     * decides every load), but taking disk.  Hand the workers this index once,
-     * now, before any session exists to race with. */
-    if (s.kv.enabled && pulsar_engine_is_tp(engine)) {
-        char *keys = NULL;
-        const int n = pulsar_kvstore_keys(&s.kv, &keys);
-        if (n >= 0 && pulsar_engine_kv_mirror_reconcile(engine, keys, n) == 0) {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: disk KV mirror: the workers reconcile their copies "
-                       "against %d entr%s", n, n == 1 ? "y" : "ies");
-        } else {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: disk KV mirror: could not hand the workers the index; "
-                       "orphan copies stay until the next start");
-        }
-        free(keys);
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
@@ -1224,7 +1207,7 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
                        i, tokens->len);
-            s.kv_cache_store_current(sl, "shutdown");
+            s.kv_cache_persist(sl, "shutdown");
         }
     }
     s.close_resources();

@@ -148,7 +148,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && !p->image_request && current > p->cached_tokens) {
-            p->srv->kv_cache_maybe_store_continued(p->slot);
+            p->srv->kv_cache_persist(p->slot, "continued");
         }
         return;
     }
@@ -204,7 +204,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && !p->image_request && current > p->cached_tokens) {
-        p->srv->kv_cache_maybe_store_continued(p->slot);
+        p->srv->kv_cache_persist(p->slot, "continued");
     }
 }
 
@@ -318,7 +318,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         pulsar_tokens effective = {0};
         int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
                                             rendered.spans, rendered.n_spans,
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, false);
         if (loaded == 0) pulsar_session_invalidate(s->sess);
 
         char sync_err[160] = {0};
@@ -549,17 +549,12 @@ void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_tracker_bind(sl);
-    kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                          g->cold_store_len);
-    s->kv_cache_tracker_flush(sl);
     if (discard_loaded_entry) {
-        s->kv_cache_discard_failed_disk_entry(g->disk_cache_path);
+        s->kv_cache_discard_failed_chain(g->disk_cache_path);
     } else if (g->disk_cache_path) {
-        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept file=%s (prefill ended: %s)",
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept segment=%s (prefill ended: %s)",
                    g->disk_cache_path, g->err);
     }
-    sl->continued_last_store_tokens = 0;
     /* pulsar_session_invalidate acts on the LIVE bank.  A fused round abandons a
      * rider while another conversation's bank is live (L261 2026-10-02: a client
      * that disconnected during a fused prefill wiped a decoding bank's KV, its next
@@ -638,12 +633,7 @@ void server::gen_begin(session_slot *sl) {
     int cached = 0;
     const char *cache_source = "none";
     int disk_cached = 0;
-    uint8_t disk_cache_ext_flags = 0;
     if (image_request) {
-        /* No continued checkpoint exists for a cold image prompt; clear the
-         * slot watermark so a later request cannot resume from the previous
-         * conversation's frontier. */
-        sl->continued_last_store_tokens = 0;
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: image request (%d image%s): disk/prefix resolver and cold store "
                    "bypassed; the engine reuses the live prefix when the images are already in it",
@@ -744,17 +734,15 @@ void server::gen_begin(session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) sl->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live GPU session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        s->kv_cache_store_current(sl, "evict");
+        /* Loading a chain replaces the live bank.  Persist its history first
+         * (only the segments the store lacks), so the newer conversation state
+         * outlives the restore. */
+        s->kv_cache_persist(sl, "evict");
     }
     if (cached == 0) {
         disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
-                                        &g->disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &g->disk_cache_path);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
@@ -764,10 +752,8 @@ void server::gen_begin(session_slot *sl) {
     }  /* !image_request */
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
-         (!strcmp(cache_source, "disk-text") &&
-          (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
+        (!strcmp(cache_source, "responses-visible") ||
+         !strcmp(cache_source, "responses-tool-output"));
     const bool responses_visible_replay_without_reasoning =
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
@@ -869,20 +855,6 @@ void server::gen_begin(session_slot *sl) {
         cold_store_len = kv_cache_sys_prefix_cut(&s->kv, anchor);
     }
     g->cold_store_len = cold_store_len;
-    g->suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
-        /* A cold checkpoint can land exactly on the continued-checkpoint
-         * frontier.  The prefill progress callback would then write the same
-         * prefix as "continued" while we are intentionally stopping there to
-         * write it as "cold".  Mark the frontier as already handled before the
-         * sync reaches it; if the cold write fails, restore the old schedule so
-         * a later continued write can still try. */
-        s->kv_cache_tracker_bind(sl);
-        g->suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
-        s->kv_cache_tracker_flush(sl);
-    }
-
     /* Transfer prompt ownership into the slot state; the prefill phases run in
      * later quanta. */
     g->effective_prompt = effective_prompt;
@@ -968,16 +940,9 @@ void server::gen_step_prefill(session_slot *sl) {
     }
 
     if (cold) {
-        s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "sys-prefix")) {
-            kv_cache_note_store(&s->kv, g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                                  g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        }
-        s->kv_cache_tracker_flush(sl);
+        /* The cold prefill ended on the sys-prefix cut, a grid point, so the
+         * shared preamble is a checkpoint now: persist it as its own chain. */
+        s->kv_cache_persist(sl, "sys-prefix");
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
@@ -1004,7 +969,7 @@ void server::gen_stream_begin(session_slot *sl) {
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
     /* An image prompt's KV is never checkpointed: its sentinel ids cannot be
      * re-entered by a plain sync, so a stored prefix could never be reused. */
-    if (j->req.n_images == 0) s->kv_cache_maybe_store_continued(sl);
+    if (j->req.n_images == 0) s->kv_cache_persist(sl, "prompt");
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -1975,7 +1940,6 @@ void server::generate_job_begin(session_slot *sl, job *j) {
     g->j = j;
     g->prompt_for_sync = &j->req.prompt;
     g->finish = "length";
-    g->suppressed_continued_last = -1;
     sl->gen = g;
     sl->active_job = j;
     sl->state = SLOT_PREFILLING;

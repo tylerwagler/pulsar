@@ -2266,12 +2266,6 @@ struct gen_state {
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata
     int cold_store_len;  ///< the shared-preamble cut (chat_anchor_pos, system prompt + tools before the task message) written as a "sys-prefix" entry after its own prefill phase; always < the prompt; 0 = no cold write
-    /** Saved continued-store schedule, suppressed while a cold write is
-     * pending. The prefill callback would otherwise write the same prefix as
-     * "continued" at the very frontier where we are deliberately stopping to
-     * write it as "cold". If the cold write fails, this value is restored so a
-     * later continued write can still happen. -1 = nothing suppressed. */
-    int suppressed_continued_last;
     pulsar_tokens cold_prefix;  ///< the token prefix the cold write covers
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
