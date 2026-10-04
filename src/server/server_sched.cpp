@@ -2122,7 +2122,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 /* L264: the final chunk stops at the last grid point inside it,
                  * which the bank keeps as a checkpoint (note_prefilled); the
                  * tail rides the next round -- the classic chunk loop's split. */
-                const int grid_end = (p0 + kk) / (int)PULSAR_RESUME_GRID * (int)PULSAR_RESUME_GRID;
+                const int grid = (int)pulsar_session_resume_grid(pool);
+                const int grid_end = (p0 + kk) / grid * grid;
                 if (grid_end > p0 && grid_end < p0 + kk) kk = grid_end - p0;
             }
             fr[n_fr].sl = c;
@@ -2739,7 +2740,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             /* L264: never step over a grid point -- stop there for this quantum,
              * so the commit below lands on it and the bank keeps a checkpoint
              * (note_prefilled); the decode banks run on. */
-            const int next_grid = (pos_now / (int)PULSAR_RESUME_GRID + 1) * (int)PULSAR_RESUME_GRID;
+            const int grid = (int)pulsar_session_resume_grid(pool);
+            const int next_grid = (pos_now / grid + 1) * grid;
             if (pos_now + kthis >= next_grid && next_grid < len) {
                 kthis = next_grid - pos_now;
                 pf_at_grid = true;

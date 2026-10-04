@@ -943,13 +943,9 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
 
-/** L264: grid checkpoints kept per bank (pulsar_gpu_graph::ckpt_pos).  The
- * newest PULSAR_CKPT_RECENT are always kept -- the prompt ends of the turns a
- * client is most likely to continue -- and the older ones thin out by merging
- * the smallest gap, which leaves a ladder that reaches back into the history a
- * client rewrites (L261: tool results 12-20k tokens back). */
-#define PULSAR_CKPT_SLOTS 16u
-#define PULSAR_CKPT_RECENT 8u
+/* L264/L265: the KV state model's model-neutral half; DeepSeek V4's answer is kv_state_ds4.cpp. */
+#include "kv_state.h"
+uint32_t pulsar_layer_compress_ratio(uint32_t il);   /* the frontier hook below needs it */
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
@@ -1477,20 +1473,11 @@ typedef struct {
     uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
     uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
 
-    /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
-     * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
-     * NOT already hold: the raw window [G - raw_window, G) of every layer and the
-     * overlapping (coff 2) sources' recurrent lanes, attention and indexer.  The
-     * compressed and index-K rows below G/ratio are append-only, so a checkpoint
-     * references them through the frontier instead of copying them; a coff-1
-     * (ratio-128) lane is canonical-empty at a 128 boundary and is reset, not
-     * stored.  ckpt_pos[bank][slot] is the slot's G, 0 = empty.  A checkpoint is
-     * valid while its bank still holds rows [0, G/ratio) unmodified: lowering the
-     * frontier below that drops it (gpu_graph_set_n_comp), and replacing a bank's
-     * rows wholesale drops all of its checkpoints (gpu_graph_ckpt_drop_bank). */
-    pulsar_gpu_tensor *ckpt_slab[PULSAR_MSEQ_MAX];  ///< per bank, PULSAR_CKPT_SLOTS slots of ckpt_slot_bytes; [0] only without a pool
-    uint64_t ckpt_slot_bytes;                       ///< one checkpoint: raw window rows + coff-2 lanes
-    uint32_t ckpt_pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS];  ///< the grid point each slot holds; 0 = empty
+    /** L264 GRID CHECKPOINTS (kv_state.h, checkpoint.cpp; what a slot holds:
+     * kv_state_ds4.cpp).  A checkpoint at G is valid while the bank's compressed
+     * frontier reaches G: gpu_graph_set_n_comp lowers it with the frontier, and
+     * replacing a bank's rows wholesale drops all of its checkpoints. */
+    pulsar_ckpt_store ckpt;
 
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
@@ -1608,12 +1595,12 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
  * frontier past rows the accounting has not counted. */
-void gpu_graph_ckpt_frontier_lowered(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows);
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
      * rewind, cut and invalidate already passes. */
-    if (rows < g->ms_n_comp[bank][il]) gpu_graph_ckpt_frontier_lowered(g, bank, il, rows);
+    if (rows < g->ms_n_comp[bank][il])
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * pulsar_layer_compress_ratio(il));
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }
@@ -2537,7 +2524,7 @@ struct pulsar_session {
      * rows from the projection ring -- only when the ring covers the rewound
      * span, which on the served (multiseq) path it does not. */
     void rewind(int pos);
-    /** L264: put the installed bank at its grid checkpoint G (gpu_graph_ckpt_restore)
+    /** L264: put the installed bank at its grid checkpoint G (pulsar_ckpt_restore)
      * and trim the host history to match.  The next sync evaluates from G, which
      * is a prefill grid point, so the result is the cold prefill's byte for byte.
      * False -- and nothing changed -- when the bank holds no checkpoint at G or the
@@ -3231,32 +3218,6 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
  */
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
 
-/** L264 grid checkpoints (checkpoint.cpp; layout at pulsar_gpu_graph::ckpt_slab).
- * Allocated with the graph -- one slab per bank, priced by the dry run like
- * every other session tensor -- and released with it. */
-bool gpu_graph_ckpt_alloc(pulsar_gpu_graph *g, uint32_t n_banks);
-void gpu_graph_ckpt_release(pulsar_gpu_graph *g);
-/** Capture the INSTALLED bank's state at grid point G.  Precondition: the bank's
- * frontier is exactly G (every kv source holds G/ratio rows) -- a prefill chunk
- * just ended there.  False on any violation; the caller fails the prefill. */
-bool gpu_graph_ckpt_capture(pulsar_gpu_graph *g, uint32_t G);
-/** Restore the INSTALLED bank to its checkpoint at G: the raw window and the
- * coff-2 lanes are copied back, every other lane is reset to the canonical
- * boundary state, every kv source's frontier is set to G/ratio, the bank's
- * rewind aids (projection ring span, boundary stash, stale flag) are cleared,
- * and the checkpoints above G are dropped.  False when no checkpoint at G. */
-bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
-/** The deepest checkpoint G <= limit the bank holds; 0 when none. */
-uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
-/** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
-void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
-/** The session payload carries one checkpoint as opaque slot bytes (layout:
- * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
- * claim: a slot for an incoming G, emptied until commit marks it filled. */
-bool gpu_graph_ckpt_locate(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off);
-bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
-                          uint32_t *slot);
-void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G);
 /** Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
@@ -3706,8 +3667,6 @@ bool gpu_graph_verify_suffix_tops(
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
 
-/* PULSAR_RESUME_GRID: pulsar.h (the server plans its fused chunks on it). */
-static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ratio-2 group");
 
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,
  *  score -INF): their state at any even position. */

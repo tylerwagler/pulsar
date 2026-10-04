@@ -1482,14 +1482,14 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * Otherwise the cold rebuild runs, which is the common answer early in a
          * conversation, when the images are near the frontier. */
         resume_floor = image_barrier > 0
-            ? (((uint32_t)image_barrier + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
+            ? pulsar_ckpt_grid_floor(&s->graph.ckpt, (uint32_t)image_barrier + s->graph.ckpt.ops->resume_grid - 1u)
             : 0u;
         uint32_t pf_grid = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
         if (pf_grid > (uint32_t)s->checkpoint.len) pf_grid = (uint32_t)s->checkpoint.len;
-        pf_grid = (pf_grid / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
+        pf_grid = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf_grid);
         const bool grid_reachable =
             resume_floor > 0 &&
-            gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), pf_grid) >= resume_floor;
+            pulsar_ckpt_best(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), pf_grid) >= resume_floor;
         const bool images_all_live =
             s->checkpoint_valid &&
             grid_reachable &&
@@ -1575,7 +1575,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * prefill chunk's bytes depend on the chunk's row count and on a row's
          * offset within the call (L183), so a suffix evaluated from an off-grid
          * position is a different computation from the cold prefill of the same
-         * tokens.  The rule: G = the last multiple of PULSAR_RESUME_GRID at or
+         * tokens.  The rule: G = the last multiple of the resume grid (kv_state.h) at or
          * below the PREFILL frontier (decode rows are the decode kernels'; the
          * tokens generated since are recomputed); restore the deepest grid
          * checkpoint at or below G, which the prefill that reached G captured
@@ -1588,8 +1588,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             const uint32_t ck = (uint32_t)s->checkpoint.len;
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
-            const uint32_t G = (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
-            uint32_t B = gpu_graph_ckpt_best(&s->graph, bank, G);
+            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
+            uint32_t B = pulsar_ckpt_best(&s->graph.ckpt, bank, G);
             /* L226: an image request's reuse may not RE-EVALUATE a row inside an
              * image block -- the licence above proved a checkpoint at or above
              * the barrier's grid point exists. */
@@ -1601,7 +1601,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
                         ck, B, bank, ck - B);
             } else {
-                if (ck >= PULSAR_RESUME_GRID)
+                if (ck >= s->graph.ckpt.ops->resume_grid)
                     fprintf(stderr, "pulsar: resume at %u on bank %u: no grid checkpoint at or below %u -- "
                                     "prefilling the prompt from 0\n", ck, bank, G);
                 s->rewind(0);
@@ -2204,9 +2204,9 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
      * one at every grid chunk end, so the fused lane's prompts resume like the
      * classic sync's.  (The server's fused planners end chunks on grid points.) */
     const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % PULSAR_RESUME_GRID == 0u && G >= s->graph.raw_window &&
+    if (G % s->graph.ckpt.ops->resume_grid == 0u && G >= s->graph.ckpt.ops->min_checkpoint(s->graph.ckpt.state) &&
         !s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)])
-        (void)gpu_graph_ckpt_capture(&s->graph, G);
+        (void)pulsar_ckpt_capture(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), G);
     if (head >= 0)
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
                (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
@@ -2281,11 +2281,11 @@ void pulsar_session::rewind(int pos) {
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
-        gpu_graph_ckpt_drop_bank(&s->graph, rw_bank);
+        pulsar_ckpt_drop_bank(&s->graph.ckpt, rw_bank);
         ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
     }
-    else if (gpu_graph_ckpt_best(&s->graph, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = gpu_graph_ckpt_restore(&s->graph, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph.ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
+        ok = pulsar_ckpt_restore(&s->graph.ckpt, rw_bank, (uint32_t)pos);
     else {
         s->graph.ms_comp_state_stale[rw_bank] = true;
         return;
@@ -2324,8 +2324,8 @@ bool pulsar_session::restore_checkpoint(uint32_t G) {
     auto *s = this;
     const uint32_t bank = gpu_graph_cur_bank(&s->graph);
     if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        gpu_graph_ckpt_best(&s->graph, bank, G) != G) return false;
-    if (!gpu_graph_ckpt_restore(&s->graph, G)) {
+        pulsar_ckpt_best(&s->graph.ckpt, bank, G) != G) return false;
+    if (!pulsar_ckpt_restore(&s->graph.ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;

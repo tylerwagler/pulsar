@@ -208,7 +208,7 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     {
         const uint32_t b = gpu_graph_cur_bank(g);
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
-        gpu_graph_ckpt_drop_bank(g, b);   /* L264: the zeroing bypasses the frontier writer */
+        pulsar_ckpt_drop_bank(&g->ckpt, b);   /* L264: the zeroing bypasses the frontier writer */
     }
     if (!gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g))) return false;
     g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;   /* position 0: the canonical state, re-established */
@@ -793,7 +793,7 @@ bool gpu_graph_prefill_chunked_range(
          * prefill's computation (L195), so the split moves no byte -- the
          * chunk-neutrality gate's resumes are this same cut. */
         if (pos0 + chunk == end) {
-            const uint32_t grid_end = (end / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
+            const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
             if (grid_end > pos0 && grid_end < end && grid_end >= (uint32_t)vision_span_end)
                 chunk = grid_end - pos0;
         }
@@ -824,8 +824,8 @@ bool gpu_graph_prefill_chunked_range(
          * and the final split above makes the last grid point one too -- is a
          * checkpoint.  Never inside an image span: a resume may not re-evaluate
          * a row of an image block (L226). */
-        if (chunk_end % PULSAR_RESUME_GRID == 0u && chunk_end >= (uint32_t)vision_span_end &&
-            !gpu_graph_ckpt_capture(g, chunk_end)) return false;
+        if (chunk_end % g->ckpt.ops->resume_grid == 0u && chunk_end >= (uint32_t)vision_span_end &&
+            !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }

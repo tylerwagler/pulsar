@@ -884,20 +884,9 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
  * present, else 0. */
 int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled);
-/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
- *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
- *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
- *  are the decode kernels' and can never equal a cold prefill's, so a resume
- *  recomputes the tokens generated since): rewind the bank to G, then prefill
- *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
- *  up: at any even position the ratio-2 compressors hold no pending group and
- *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
- *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
- *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
- *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
- *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
- *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
-#define PULSAR_RESUME_GRID 128u
+/** L264/L265: the resume grid of the loaded model (tokens): a resume starts at a multiple of it
+ *  and a prefill leaves its checkpoints on it -- the server plans its fused chunks on it. */
+uint32_t pulsar_session_resume_grid(const pulsar_session *s);
 
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
@@ -918,7 +907,7 @@ int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
  * verify saves and the projection ring do not cover (on the pair: a 1-token ghost
  * rewind from a ratio-128 group boundary).  Such a bank can only be extended from
  * a group boundary, so a continuation must take the classic sync, whose resume
- * starts at a PULSAR_RESUME_GRID point, not a fused round at the bank's frontier.
+ * starts at a resume-grid point (pulsar_session_resume_grid), not a fused round at the bank's frontier.
  * Pure host read; false for an out-of-range bank. */
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank);
 /** Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
@@ -1077,7 +1066,9 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
  *         Every segment's checkpoint is kept; `last` restores the final one, so
  *         the bank stands LIVE at G and the next sync evaluates from there. */
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(1)
+/* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
+ * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(2)
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and

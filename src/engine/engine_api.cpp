@@ -1014,6 +1014,7 @@ bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
+uint32_t pulsar_session_resume_grid(const pulsar_session *s) { return s && s->graph.ckpt.ops ? s->graph.ckpt.ops->resume_grid : 0u; }
 int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) { return s ? s->bank_prefill_frontier(bank) : 0; }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
@@ -1335,11 +1336,11 @@ void pulsar_session_invalidate(pulsar_session *s) {
 }
 int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
     if (!s || limit <= 0) return 0;
-    return (int)gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), (uint32_t)limit);
+    return (int)pulsar_ckpt_best(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), (uint32_t)limit);
 }
 int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit) {
     if (!s || limit <= 0 || bank >= PULSAR_MSEQ_MAX) return 0;
-    return (int)gpu_graph_ckpt_best(&s->graph, bank, (uint32_t)limit);
+    return (int)pulsar_ckpt_best(&s->graph.ckpt, bank, (uint32_t)limit);
 }
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();

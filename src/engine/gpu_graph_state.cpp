@@ -16,7 +16,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
  * that never ran has baked no segment graph, and a pricing run must not reset
  * the live session's. */
 void gpu_graph_release(pulsar_gpu_graph *g) {
-    gpu_graph_ckpt_release(g);
+    pulsar_ckpt_release(&g->ckpt);
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);
