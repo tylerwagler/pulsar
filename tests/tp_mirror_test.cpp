@@ -186,9 +186,9 @@ static int run_leader(pulsar_tp *tp) {
               std::strstr(err, "refused") != NULL,
               "an unknown-session restore must come back as a refusal, not a verdict: %s", err);
         const int t3[3] = { 1, 2, 3 };
-        CHECK(pulsar_tp_send_bank_fork(tp, 1, SID, 0u, 1u, t3, 3u, 2) != 0, "send_bank_fork must report success");
+        CHECK(pulsar_tp_send_bank_fork(tp, SID, 0u, 1u, t3, 3u, 2) != 0, "send_bank_fork must report success");
         err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_status(tp, SID, "partial bank fork", &status, err, sizeof(err)) &&
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank fork", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session fork must come back as a refusal: %s", err);
         CHECK(pulsar_tp_send_rewrite_from_common(tp, SID, t3, 3u, 1) != 0, "send_rewrite must report success");

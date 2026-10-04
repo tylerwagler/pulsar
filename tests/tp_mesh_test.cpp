@@ -713,9 +713,9 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                   status == 0,
                   "rank 0 restore verdict: want agreed 0, got rc/status %d (%s)", status, cerr);
             const int toks[6] = { 5, 6, 7, 8, 9, 10 };
-            CHECK(pulsar_tp_send_bank_fork(tp, 1, sid, 3u, 4u, toks, 6u, 5) != 0, "rank 0 fork send failed");
+            CHECK(pulsar_tp_send_bank_fork(tp, sid, 3u, 4u, toks, 6u, 5) != 0, "rank 0 fork send failed");
             status = -99;
-            CHECK(pulsar_tp_wait_command_status(tp, sid, "partial bank fork", &status, cerr, sizeof(cerr)) &&
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "bank fork", &status, cerr, sizeof(cerr)) &&
                   status == 3,
                   "rank 0 fork verdict: want agreed 3, got %d (%s)", status, cerr);
             /* split verdict (n>=3 only: with one worker there is nobody to disagree) */
@@ -759,10 +759,10 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                 CHECK(pulsar_tp_send_command_ack(tp, sid, 0), "rank %d restore ack failed", rank);
                 pulsar_tp_command_free(&cmd);
             }
-            /* partial fork: fields + tokens survive the wire; verdict 3 */
+            /* fork: fields + tokens survive the wire; verdict 3 */
             if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d fork recv: %s", rank, cerr);
             else {
-                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_FORK_PARTIAL && cmd.session_id == sid &&
+                CHECK(cmd.type == PULSAR_TP_FRAME_BANK_FORK && cmd.session_id == sid &&
                       cmd.bank_src == 3 && cmd.bank_dst == 4 && cmd.n_cached == 5 && cmd.n_tokens == 6 &&
                       cmd.tokens && cmd.tokens[0] == 5 && cmd.tokens[5] == 10,
                       "rank %d fork frame fields: src %d dst %d n_cached %d n_tokens %u",
