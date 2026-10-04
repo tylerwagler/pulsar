@@ -2802,6 +2802,13 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
                                          const tool_schema_orders *orders);
 bool http_response(int fd, int code, const char *type, const char *body);
 bool http_error(int fd, int code, const char *msg);
+/* Retry-After for a retryable 503, by cause: the box is going away
+ * (shutting down, draining), or it is briefly full (connections, metric
+ * streams).  The one authority for these values. */
+enum { HTTP_RETRY_GOING_AWAY_S = 10, HTTP_RETRY_BUSY_S = 1 };
+bool http_response_retry(int fd, int code, const char *type, const char *body,
+                         int retry_after_s);
+bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
 void request_forced_tool_seed(const request *r, buf *out);
 void request_apply_forced_tool_prefill(request *r);

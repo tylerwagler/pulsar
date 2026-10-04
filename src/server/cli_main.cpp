@@ -1179,7 +1179,7 @@ int main(int argc, char **argv) {
         if (!at_cap) s.clients++;
         pthread_mutex_unlock(&s.mu);
         if (at_cap) {
-            http_error(fd, 503, "too many connections");
+            http_error_retry(fd, 503, "too many connections", HTTP_RETRY_BUSY_S);
             close(fd);
             continue;
         }

@@ -321,8 +321,9 @@ bool server::send_health(int fd) {
         buf_putc(&b, '}');
     }
     buf_puts(&b, "]}}\n");
-    bool ok = http_response(fd, draining ? 503 : 200,
-                            "application/json", b.ptr);
+    bool ok = draining
+        ? http_response_retry(fd, 503, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
+        : http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -872,7 +873,7 @@ bool server::send_metrics_stream(int fd) {
         /* Refused rather than queued: a scraper that cannot stream should fall
          * back to polling, which this server still serves. Blocking here would
          * just move the queueing somewhere less visible. */
-        http_error(fd, 503, "too many metric streams");
+        http_error_retry(fd, 503, "too many metric streams", HTTP_RETRY_BUSY_S);
         return false;
     }
 
@@ -1086,7 +1087,7 @@ void *client_main(void *arg) {
             }
         }
     }
-    if (!enqueued) http_error(fd, 503, "server shutting down");
+    if (!enqueued) http_error_retry(fd, 503, "server shutting down", HTTP_RETRY_GOING_AWAY_S);
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);

@@ -2,7 +2,10 @@
 
 
 
-bool http_response(int fd, int code, const char *type, const char *body) {
+/* Writes one complete response.  `extra` is NULL or pre-formatted
+ * "Name: value\r\n" lines, placed before Connection. */
+static bool http_write(int fd, int code, const char *type, const char *body,
+                       const char *extra) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
@@ -20,6 +23,7 @@ bool http_response(int fd, int code, const char *type, const char *body) {
         buf_puts(&h, type);
         buf_puts(&h, "\r\n");
     }
+    if (extra) buf_puts(&h, extra);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
@@ -27,14 +31,40 @@ bool http_response(int fd, int code, const char *type, const char *body) {
     return ok;
 }
 
+bool http_response(int fd, int code, const char *type, const char *body) {
+    return http_write(fd, code, type, body, NULL);
+}
 
+/* A retryable failure tells the client when to come back: Retry-After in
+ * whole seconds (never an HTTP date; Claude Code reads integers and stops
+ * retrying above 60) and X-Should-Retry: true.  Permanent failures carry
+ * neither, so a client never backs off to retry something that cannot work. */
+bool http_response_retry(int fd, int code, const char *type, const char *body,
+                         int retry_after_s) {
+    char extra[96];
+    snprintf(extra, sizeof extra, "Retry-After: %d\r\nX-Should-Retry: true\r\n",
+             retry_after_s);
+    return http_write(fd, code, type, body, extra);
+}
+
+static void openai_error_body(buf *b, const char *msg) {
+    buf_puts(b, "{\"error\":{\"message\":");
+    json_escape(b, msg);
+    buf_puts(b, ",\"type\":\"invalid_request_error\"}}\n");
+}
 
 bool http_error(int fd, int code, const char *msg) {
     buf b = {0};
-    buf_puts(&b, "{\"error\":{\"message\":");
-    json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    openai_error_body(&b, msg);
     bool ok = http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+bool http_error_retry(int fd, int code, const char *msg, int retry_after_s) {
+    buf b = {0};
+    openai_error_body(&b, msg);
+    bool ok = http_response_retry(fd, code, "application/json", b.ptr, retry_after_s);
     buf_free(&b);
     return ok;
 }

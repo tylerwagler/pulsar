@@ -600,6 +600,52 @@ static void test_anthropic_stop_sequence_is_reported(void) {
 }
 
 
+/* L253: a retryable 503 says when to come back; a permanent failure says
+ * nothing; a response with no hint is byte-identical to before. */
+static void test_retry_hints_on_retryable_failures(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_retry(sv[0], 503, "server shutting down",
+                                     HTTP_RETRY_GOING_AWAY_S));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+        TEST_ASSERT(strstr(out, "\r\nRetry-After: 10\r\nX-Should-Retry: true\r\n"
+                                "Connection: close\r\n\r\n") != NULL);
+        TEST_ASSERT(strstr(out, "\"message\":\"server shutting down\"") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error(sv[0], 400, "bad field"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "Retry-After") == NULL);
+        TEST_ASSERT(strstr(out, "X-Should-Retry") == NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_response(sv[0], 200, "text/plain", "ok"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(!strcmp(out, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                                 "Content-Type: text/plain\r\nConnection: close\r\n\r\nok"));
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+
+
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -8227,6 +8273,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_error_envelope_shape_per_protocol();
     test_anthropic_unsupported_tool_types_are_refused();
     test_anthropic_stop_sequence_is_reported();
+    test_retry_hints_on_retryable_failures();
     test_logprob_stream_ready_watermark();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
