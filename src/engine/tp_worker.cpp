@@ -761,6 +761,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = 1;
         char path[4600];
         if (worker_refused(e, c, "kv segment save", &slot, ferr, sizeof(ferr))) {
+            status = -1;   /* a refusal (the ranks diverged), not a miss */
             fprintf(stderr, "pulsar: tp worker: kv segment save refused: %s\n", ferr);
         } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
             fprintf(stderr, "pulsar: tp worker: kv segment save refused: no segment directory on this rank "
@@ -779,6 +780,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = 1;
         char path[4600];
         if (worker_refused(e, c, "kv segment load", &slot, ferr, sizeof(ferr))) {
+            status = -1;   /* a refusal (the ranks diverged), not a miss */
             fprintf(stderr, "pulsar: tp worker: kv segment load refused: %s\n", ferr);
         } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
             fprintf(stderr, "pulsar: tp worker: kv segment load refused: no segment directory on this rank\n");
