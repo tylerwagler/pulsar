@@ -666,8 +666,8 @@ void server::gen_begin(session_slot *sl) {
     int disk_cached = 0;
     if (image_request) {
         server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: image request (%d image%s): live resolvers apply, disk resolver and "
-                   "cold store bypassed", j->req.n_images, j->req.n_images == 1 ? "" : "s");
+                   "pulsar-server: image request (%d image%s): live resolvers apply, disk resolver "
+                   "bypassed, cold phase covers the sys-prefix only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
     }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
@@ -902,6 +902,29 @@ void server::gen_begin(session_slot *sl) {
                                                     pulsar_token_assistant(s->engine));
         cold_store_len = kv_cache_sys_prefix_cut(&s->kv, anchor);
     }
+    /* An image request's cold phase covers the shared preamble only, and the
+     * cut sits a margin below the first user turn, so no image block begins
+     * inside it: that phase is the PLAIN text sync (gen_step_prefill), and the
+     * main sync then merges every image on top of the checkpoint it leaves --
+     * L261 reuse with 0 held images and all of them new, the text-turn-then-
+     * image-turn shape.  A block that does begin inside the cut would be split
+     * from its merge, so such a cut is dropped and the main pass merges from
+     * token 0.  (l264t, 2026-10-05: with the !image_request gate gone, the cut
+     * itself was handed to sync_mm with every start_pos past its end -> HTTP
+     * 400 "image 0 at N is not a sentinel block" for any prompt whose first
+     * user turn sat past ~4k tokens, i.e. every Claude Code request.) */
+    if (image_request && cold_store_len > 0) {
+        for (int i = 0; i < j->req.n_images; i++) {
+            if (j->req.images[i].start_pos < cold_store_len) {
+                server_log(PULSAR_LOG_PREFILL,
+                           "pulsar-server: image request: image %d at %d begins inside the "
+                           "sys-prefix cut %d -- no cold phase, the main pass merges it",
+                           i, j->req.images[i].start_pos, cold_store_len);
+                cold_store_len = 0;
+                break;
+            }
+        }
+    }
     g->cold_store_len = cold_store_len;
     /* Transfer prompt ownership into the slot state; the prefill phases run in
      * later quanta. */
@@ -955,7 +978,11 @@ void server::gen_step_prefill(session_slot *sl) {
      * sync whose checkpoint already carries sentinel ids (refused). So no cancel
      * callback is armed and the mm call runs to completion; a client that has
      * gone away is noticed at the next quantum boundary. */
-    const int n_images = g->j->req.n_images;
+    /* The cold phase's target is the shared preamble, which carries no image
+     * block (gen_begin drops a cut that any block begins inside), so it is the
+     * plain text sync -- interruptible like any text prefill -- and the
+     * checkpoint it leaves is one the main image sync extends. */
+    const int n_images = cold ? 0 : g->j->req.n_images;
     gen_arm_prefill_callbacks(s->sess, g, n_images == 0);
 
     g->prefill_chunks_done = 0;
