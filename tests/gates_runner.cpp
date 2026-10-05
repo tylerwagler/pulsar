@@ -59,7 +59,6 @@ int gate_bank_spec_gate_main(int, char **);
 int gate_dspark_batch_gate_main(int, char **);
 int gate_accounting_gate_main(int, char **);
 int gate_bank_evict_restore_gate_main(int, char **);
-int gate_bank_fork_gate_main(int, char **);
 int gate_algo_stability_gate_main(int, char **);
 int gate_mixed_prefill_gate_main(int, char **);
 int gate_mixed_neutrality_gate_main(int, char **);
@@ -364,7 +363,6 @@ int main(int argc, char **argv) {
         {"cuda-dspark-batch-gate",    gate_dspark_batch_gate_main,      3, NULL, NULL, {"8", "0", NULL}},
         {"cuda-accounting-gate",      gate_accounting_gate_main,        2, NULL, NULL, {NULL}},
         {"cuda-evict-restore-gate",   gate_bank_evict_restore_gate_main, 2, NULL, NULL, {NULL}},
-        {"cuda-fork-gate",            gate_bank_fork_gate_main,         3, NULL, NULL, {NULL}},
         {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}},
         /* L175: the same 1..16 width sweep with bank 0 at ~2200 tokens, so the
          * indexed lane is engaged while the row-count-keyed dispatches vary. */

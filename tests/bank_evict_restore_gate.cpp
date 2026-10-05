@@ -1,37 +1,40 @@
 /* Tier-2 BANK EVICT/RESTORE gate (task #55 increment 2b, the memory-safety core).
  *
  * Proves the per-bank physical evict/restore cycle the proactive-eviction guard
- * relies on is (a) a real physical reclaim and (b) KV-BIT-IDENTICAL on return —
+ * relies on is (a) a real physical reclaim and (b) KV-BIT-IDENTICAL on return --
  * WITHOUT the box-lock risk of the full-server smoke (single session, controlled,
  * fills modest, never approaches OOM).
  *
- * Flow (mirrors the server guard's evict/restore, minus the disk I/O — the
- * snapshot lives in host RAM here; on the server it is the disk KV cache):
+ * Flow (L264: the server's spill IS the disk KV cache's segment chain, so the
+ * gate drives the same engine calls -- spill_bank / bank_restore_spilled):
  *   1. prefill bank 0 to L tokens; capture its frontier; CHECKSUM its comp/index
  *      rows (raw D2H fold).
- *   2. save_snapshot(bank 0)   — the D2H KV snapshot (server: kv_cache "evict").
- *   3. repoint to bank 1       — bank 0 is now idle (free_physical refuses cur).
- *   4. free_physical(bank 0)   — DIRECT cudaFree of bank 0's split comp/index;
+ *   2. save bank 0 as a chain of SEGMENTS, one per grid checkpoint it holds
+ *      (server: kv_cache_persist "spill").
+ *   3. repoint to bank 1       -- bank 0 is now idle (free_physical refuses cur).
+ *   4. free_physical(bank 0)   -- DIRECT cudaFree of bank 0's split comp/index;
  *      assert is_evicted==true.  The cudaMemGetInfo delta is PRINTED, not
  *      asserted: cuda-accounting-gate owns the physical-reclaim assertion.
- *   5. alloc_physical(bank 0)  — fresh cudaMallocManaged + base-table rebuild;
+ *   5. alloc_physical(bank 0)  -- fresh cudaMallocManaged + base-table rebuild;
  *      assert the rebuilt comp_bases[0] entry == the new comp[il][0] ptr.
- *   6. repoint to bank 0; load_snapshot — H2D reload (server: kv_cache_try_load).
- *   7. CHECKSUM bank 0's comp/index again; assert == step 1 (bit-identical).
+ *   6. repoint to bank 0; load the chain (server: kv_cache_try_load_text).
+ *   7. CHECKSUM bank 0's comp/index again; assert == step 1 (bit-identical), and
+ *      the bank stands at the chain's end.
  *
  * MODEL-DEPENDENT, GPU-resident; run manually under the memory discipline (hold
  * temp/gpu.lock, drop_caches, no foreign ds4 process). NOT part of `make test`.
  *
  * usage: PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate MODEL [L]
  *
- * L (default 8192, was 24576 until L220).  The invariant under test is
- * format/pointer identity -- the saved row bytes come back bit-identical and
- * the rebuilt base table points at the fresh allocation -- so the length buys
- * coverage of the cache KINDS, not strength: 8192 is the shortest L that still
- * populates every class the save/load loops handle (ratio-4 comp rows and the
- * MXFP4 index rows at L/4 = 2048, ratio-128 comp rows at L/128 = 64, so
- * several ratio-128 boundaries are crossed).  That coverage is asserted below
- * (frontier_coverage), not assumed.
+ * L (default 8192, was 24576 until L220; a multiple of the 128 resume grid, so
+ * the chain ends exactly at the frontier and the checksum covers every row).
+ * The invariant under test is format/pointer identity -- the saved row bytes
+ * come back bit-identical and the rebuilt base table points at the fresh
+ * allocation -- so the length buys coverage of the cache KINDS, not strength:
+ * 8192 is the shortest L that still populates every class the segment rows
+ * carry (ratio-4 comp rows and the MXFP4 index rows at L/4 = 2048, ratio-128
+ * comp rows at L/128 = 64, so several ratio-128 boundaries are crossed).  That
+ * coverage is asserted below (frontier_coverage), not assumed.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -52,18 +55,6 @@ static double now_ms(void) {
 static const double GIB = 1024.0 * 1024.0 * 1024.0;
 static int g_fail;
 
-/* Scratch dir for the KV snapshot files. These paths used to be hardcoded into
- * one developer's home, which made the gate unrunnable as anyone else: the
- * fopen failed, every later stage cascaded off the never-written snapshot (bank
- * 0 stayed evicted, so the bit-identical and no-cascade findings both reported
- * bogus FAILs), and finding-3's unchecked fwrite on the NULL FILE* finished the
- * job with SIGSEGV. Derive it instead; override only for odd setups. */
-static const char *gate_tmpdir(void) {
-    const char *d = getenv("PULSAR_GATE_TMPDIR");
-    if (!d || !*d) d = getenv("TMPDIR");
-    if (!d || !*d) d = "/tmp";
-    return d;
-}
 #define CHECK(cond, ...) do { if(!(cond)){ fprintf(stderr,"EVICT-RESTORE FAIL: " __VA_ARGS__); fprintf(stderr,"\n"); g_fail=1; } } while(0)
 
 static char *read_file(const char *path, size_t *len_out) {
@@ -108,7 +99,7 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
 }
 
 /* NON-VACUITY: the frontier the gate captures and folds must hold rows in
- * EVERY cache class pulsar_session::bank_kv_save/load handle -- ratio-4 comp
+ * EVERY cache class a segment carries -- ratio-4 comp
  * rows, ratio-128 comp rows, and the MXFP4 index rows (ratio-4 layers only).
  * A length that left a class empty would make the bit-identity assertion
  * vacuous for it while still printing PASS, which is the failure mode this
@@ -139,6 +130,29 @@ static void frontier_coverage(const pulsar_gpu_graph *g, uint32_t bank, int L) {
                     "ratio-128 %u layers/%llu rows, index %u layers/%llu rows\n",
             L, bank, l4, (unsigned long long)r4, l128, (unsigned long long)r128,
             lidx, (unsigned long long)ridx);
+}
+
+/* Bank `cur`'s grid checkpoints as a segment chain, root first, each in its own
+ * tmpfile rewound for reading -- what kv_cache_persist writes for a spill.
+ * Returns the chain length; 0 on failure (err says why). */
+#define GATE_CHAIN_MAX 64
+static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, int *Gs, char *err, size_t errlen) {
+    int desc[GATE_CHAIN_MAX];
+    int n = 0;
+    for (int G = pulsar_session_checkpoint_best(s, limit); G > 0 && n < GATE_CHAIN_MAX;
+         G = pulsar_session_checkpoint_best(s, G - 1)) desc[n++] = G;
+    if (n == 0) { snprintf(err, errlen, "no grid checkpoint at or below %d", limit); return 0; }
+    for (int i = 0, prev = 0; i < n; prev = Gs[i], i++) {
+        Gs[i] = desc[n - 1 - i];
+        fp[i] = tmpfile();
+        bytes[i] = pulsar_session_segment_bytes(s, prev, Gs[i]);
+        if (!fp[i] || pulsar_session_save_segment(s, fp[i], prev, Gs[i], NULL, err, errlen) != 0) {
+            for (int k = 0; k <= i; k++) if (fp[k]) fclose(fp[k]);
+            return 0;
+        }
+        rewind(fp[i]);
+    }
+    return n;
 }
 
 int GATE_ENTRY(int argc, char **argv) {
@@ -181,19 +195,22 @@ int GATE_ENTRY(int argc, char **argv) {
     fprintf(stderr, "evict_restore_gate: bank0 prefilled pos=%d touched=%.3f GiB checksum=%016" PRIx64 "\n",
             pulsar_session_pos(s), (double)touched0 / GIB, sum_before);
 
-    /* 2. Save bank 0's comp/index KV to a DISK file (the real server mechanism;
-     * bank 0 is cur). Measure disk-snapshot latency (an eviction stalls the
-     * evicted session's next turn by save+reload time). */
+    /* 2. Save bank 0 (cur) as its segment chain.  Measure the write: an eviction
+     * stalls the evicted session's next turn by save+reload time. */
     pulsar_gpu_graph *g = &s->graph;
-    char snap_buf[512];
-    snprintf(snap_buf, sizeof snap_buf, "%s/pulsar_gate_bank0.kvsnap", gate_tmpdir());
-    const char *snap_path = snap_buf;
+    FILE *chain_fp[GATE_CHAIN_MAX] = {0};
+    uint64_t chain_bytes[GATE_CHAIN_MAX];
+    int chain_G[GATE_CHAIN_MAX];
+    int n_chain = 0;
     { double t0 = now_ms();
-      FILE *fp = fopen(snap_path, "wb");
-      CHECK(fp != NULL, "open snap for write");
-      if (fp) { CHECK(pulsar_session_bank_kv_save(s, 0, fp, err, sizeof err) == 0, "kv_save: %s", err); fclose(fp); }
-      double t1 = now_ms();
-      fprintf(stderr, "evict_restore_gate: kv_save %.1f ms\n", (t1 - t0)); }
+      n_chain = save_chain(s, L, chain_fp, chain_bytes, chain_G, err, sizeof err);
+      CHECK(n_chain > 0, "segment save: %s", err);
+      if (n_chain == 0) goto done;
+      CHECK(chain_G[n_chain - 1] == L, "chain ends at %d, not the frontier %d", chain_G[n_chain - 1], L);
+      uint64_t total = 0;
+      for (int i = 0; i < n_chain; i++) total += chain_bytes[i];
+      fprintf(stderr, "evict_restore_gate: segment save %d segments %.1f MiB %.1f ms\n", n_chain,
+              (double)total / (1024.0 * 1024.0), now_ms() - t0); }
 
     uint64_t f_prefill = 0, tt = 0; (void)pulsar_gpu_synchronize(); pulsar_gpu_mem_info(&f_prefill, &tt);
 
@@ -218,14 +235,19 @@ int GATE_ENTRY(int argc, char **argv) {
      * the reclaim against touched with a tolerance.  The guard itself decides
      * on the deterministic touched accounting, never this gauge. */
 
-    /* 5-6. Restore bank 0 from disk: alloc_physical + base-table rebuild + counter
-     * reinstall + H2D reload, all inside kv_load (leaves bank 0 installed). */
+    /* 5-6. Restore bank 0 the way bank_restore_spilled does: fresh physical,
+     * repoint, load the chain root first (a root resets the bank). */
     { double t0 = now_ms();
-      FILE *fp = fopen(snap_path, "rb");
-      CHECK(fp != NULL, "open snap for read");
-      if (fp) { CHECK(pulsar_session_bank_kv_load(s, 0, fp, err, sizeof err) == 0, "kv_load: %s", err); fclose(fp); }
-      double t1 = now_ms();
-      fprintf(stderr, "evict_restore_gate: kv_load %.1f ms\n", (t1 - t0)); }
+      CHECK(pulsar_session_bank_alloc_physical(s, 0), "alloc_physical(bank 0) failed");
+      CHECK(pulsar_session_bank_state_restore(s, 0), "repoint to bank 0 failed");
+      for (int i = 0; i < n_chain; i++) {
+          int G = 0;
+          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, NULL, err, sizeof err) == 0,
+                "segment %d load: %s", i, err);
+          CHECK(G == chain_G[i], "segment %d loaded G=%d, saved %d", i, G, chain_G[i]);
+      }
+      fprintf(stderr, "evict_restore_gate: segment load %.1f ms\n", now_ms() - t0); }
+    CHECK(pulsar_session_pos(s) == L, "restored bank stands at %d, not %d", pulsar_session_pos(s), L);
     CHECK(!pulsar_session_bank_is_evicted(s, 0), "bank 0 still evicted after restore");
     /* base-table entry must point at the fresh comp[il][0]. */
     { int checked = 0;
@@ -275,52 +297,40 @@ int GATE_ENTRY(int argc, char **argv) {
             "(bank0=%.3f) : %s\n", (double)t_both/GIB, (double)t_after/GIB, (double)t_b0/GIB,
             t_after == t_b0 ? "OK" : "FAIL");
 
-    /* ===== Review finding 3 — a corrupt/short snapshot must fail kv_load SAFELY:
-     * validate counts <= cap, don't install rows over unwritten KV. Bank 1 is now
-     * freed (frontier 0). ===== */
-    char corrupt_buf[512];
-    snprintf(corrupt_buf, sizeof corrupt_buf, "%s/pulsar_gate_corrupt.kvsnap", gate_tmpdir());
-    const char *cpath = corrupt_buf;
-    /* (a) count > cap. */
-    { FILE *fp = fopen(cpath, "wb");
-      CHECK(fp != NULL, "finding3(a): open corrupt snap for write");
-      if (!fp) goto finding3_done;
-      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
-      fwrite(hdr, sizeof hdr, 1, fp);
-      for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) { uint32_t c[2] = { 0xFFFFFFFFu, 0u }; fwrite(c, sizeof c, 1, fp); }
-      fclose(fp);
-      fp = fopen(cpath, "rb");
-      CHECK(fp != NULL, "finding3(a): reopen corrupt snap for read");
-      if (!fp) goto finding3_done;
-      const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
-      fclose(fp);
-      CHECK(rc != 0, "finding3(a): kv_load ACCEPTED a count > cap");
-      CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(a): bank1 advertises rows after failed load");
-      fprintf(stderr, "evict_restore_gate: finding-3(a) count>cap rejected: rc=%d touched(1)=%.3f : %s\n",
-              rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
-    /* (b) truncated: valid small counts but the row bytes are missing (short read). */
-    { FILE *fp = fopen(cpath, "wb");
-      CHECK(fp != NULL, "finding3(b): open corrupt snap for write");
-      if (!fp) goto finding3_done;
-      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
-      fwrite(hdr, sizeof hdr, 1, fp);
-      for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) {
-          uint32_t c[2] = { pulsar_layer_compress_ratio(il) ? 4u : 0u, 0u }; fwrite(c, sizeof c, 1, fp); }
-      /* no row data written -> fread of rows fails */
-      fclose(fp);
-      fp = fopen(cpath, "rb");
-      CHECK(fp != NULL, "finding3(b): reopen corrupt snap for read");
-      if (!fp) goto finding3_done;
-      const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
-      fclose(fp);
-      CHECK(rc != 0, "finding3(b): kv_load ACCEPTED a truncated file");
-      CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(b): bank1 advertises rows after truncated load");
-      fprintf(stderr, "evict_restore_gate: finding-3(b) truncated rejected: rc=%d touched(1)=%.3f : %s\n",
-              rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
-finding3_done:
-    remove(cpath);
+    /* ===== Review finding 3 -- a corrupt/short segment must fail its load
+     * SAFELY: refused, and the bank advertises no rows.  Bank 1 is freed by now;
+     * give it physical back and make it cur, as a restore would.  (a) truncated:
+     * the stream ends early; (b) one flipped byte: the digest catches it AFTER
+     * the device writes, so the load must also take back what it wrote. ===== */
+    CHECK(pulsar_session_bank_alloc_physical(s, 1), "finding3: alloc_physical(bank 1)");
+    CHECK(pulsar_session_bank_state_restore(s, 1), "finding3: repoint to bank 1");
+    { const uint64_t nb = chain_bytes[0];
+      uint8_t *seg = (uint8_t *)malloc(nb);
+      CHECK(seg && fseek(chain_fp[0], 0, SEEK_SET) == 0 && fread(seg, 1, nb, chain_fp[0]) == nb,
+            "finding3: re-read segment 0");
+      for (int leg = 0; seg && leg < 2; leg++) {
+          FILE *fp = tmpfile();
+          CHECK(fp != NULL, "finding3: tmpfile");
+          if (!fp) break;
+          if (leg == 0) fwrite(seg, 1, nb / 2, fp);
+          else {
+              seg[nb - sizeof(uint64_t) - 1] ^= 0x40u;   /* the last row byte before the digest */
+              fwrite(seg, 1, nb, fp);
+          }
+          rewind(fp);
+          int G = 0;
+          const int lrc = pulsar_session_load_segment(s, fp, nb, true, &G, NULL, err, sizeof err);
+          fclose(fp);
+          const char *what = leg == 0 ? "(a) truncated" : "(b) flipped byte";
+          CHECK(lrc != 0, "finding3%s: load ACCEPTED it", what);
+          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0 && pulsar_session_pos(s) == 0,
+                "finding3%s: bank1 advertises rows after the failed load", what);
+          fprintf(stderr, "evict_restore_gate: finding-3%s rejected: rc=%d (%s) touched(1)=%.3f : %s\n", what, lrc,
+                  err, (double)pulsar_session_bank_touched_kv_bytes(s, 1) / GIB, lrc != 0 ? "OK" : "FAIL");
+      }
+      free(seg); }
+    for (int i = 0; i < n_chain; i++) fclose(chain_fp[i]);
 
-    remove(snap_path);
     fprintf(stderr, "EVICT-RESTORE GATE: %s\n", g_fail ? "FAIL" : "PASS");
     rc = g_fail ? 1 : 0;
     }

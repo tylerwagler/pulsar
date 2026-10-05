@@ -343,7 +343,7 @@ __global__ static void rope_tail_kernel(
  *
  * THE RULE: never re-encode.  MOVE PACKED BYTES.  Every KV path in the engine
  * does -- prefill's ring scatter (winkv_scatter_kernel), session save/load and
- * bank snapshots (payload / KVB2 versions), fork and evict/restore, the
+ * disk segments (payload / segment versions), evict/restore, the
  * drafter seed.  There is no exact-re-encode safety net and no conversion
  * loader; if a future restore path genuinely cannot move bytes, it needs a
  * design, not a call into the quantisers above.

@@ -942,18 +942,14 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
               "boundary in pulsar_cuda_moe.cu, then raise "
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
-/** L120 value half: depth of the committed-projection ring an OVERLAPPING
- * compressor (coff 2 -- 0731's ratio 4, and only that) uses to rebuild its state
- * on a rewind.  A group's row is pooled from that group's tokens AND the group
- * before them, so a replay that starts at the cut needs the previous group's
- * projection rows, which nothing else retains.  The worst replay span is
- * `ratio - 1 + 1` positions and a ghost overshoot is bounded by the draft depth,
- * so 32 keeps every slot a replay reads collision-free; the ring's [lo, hi) span
- * check is the structural half of the same guarantee.  coff-1 sources deposit
- * nothing -- their state at a boundary is canonically empty and is rebuilt
- * outright, which is what the CSA2 rewrite relied on when it deleted the ring
- * (correct for V4.1, a V4 regression). */
-#define PULSAR_REWIND_RING_DEPTH 288u
+
+/** L264: grid checkpoints kept per bank (pulsar_gpu_graph::ckpt_pos).  The
+ * newest PULSAR_CKPT_RECENT are always kept -- the prompt ends of the turns a
+ * client is most likely to continue -- and the older ones thin out by merging
+ * the smallest gap, which leaves a ladder that reaches back into the history a
+ * client rewrites (L261: tool results 12-20k tokens back). */
+#define PULSAR_CKPT_SLOTS 16u
+#define PULSAR_CKPT_RECENT 8u
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
@@ -1034,17 +1030,6 @@ typedef struct {
     pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];  ///< compressor state lane, score half
     pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, KV half
     pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];  ///< V4 only: indexer compressor state lane, score half
-    /** L120 value half: per-bank lanes for the committed-projection ring an
-     * OVERLAPPING compressor replays (see PULSAR_REWIND_RING_DEPTH).  One bank's
-     * lane is PULSAR_REWIND_RING_DEPTH rows of `pulsar_comp_row_width(ratio,
-     * head_dim)` f32, kv and score plane separate; index_proj_* exists only where
-     * the source owns an index-K pool AND its indexer compresses its own key. */
-    uint64_t attn_proj_bank_bytes[PULSAR_MAX_LAYER];   ///< one bank's attention projection ring, f32 bytes; 0 where the compressor does not overlap
-    uint64_t index_proj_bank_bytes[PULSAR_MAX_LAYER];  ///< one bank's indexer projection ring; 0 without one
-    pulsar_gpu_tensor *attn_proj_kv[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, KV plane
-    pulsar_gpu_tensor *attn_proj_sc[PULSAR_MAX_LAYER];   ///< bank-major attention projection ring, score plane
-    pulsar_gpu_tensor *index_proj_kv[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, KV plane
-    pulsar_gpu_tensor *index_proj_sc[PULSAR_MAX_LAYER];  ///< bank-major indexer projection ring, score plane
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -1150,44 +1135,6 @@ typedef struct {
      * V4.1 artifact: nothing would ever write it. */
     pulsar_gpu_tensor *layer_index_state_kv[PULSAR_MAX_LAYER];    ///< indexer compressor accumulator, KV half
     pulsar_gpu_tensor *layer_index_state_score[PULSAR_MAX_LAYER]; ///< indexer compressor accumulator, score half
-
-    /** L120 value half: rolling COMMITTED-projection rings for the overlapping
-     * compressor (coff 2, ratio 4 -- 0731 only), PULSAR_REWIND_RING_DEPTH slots
-     * at `pos % PULSAR_REWIND_RING_DEPTH` of one `pulsar_comp_row_width(ratio,
-     * head_dim)` f32 row each, kv and score plane separate, attention and
-     * indexer compressors.  A rewind replays store + shift over
-     * [ratio*(pos/ratio - 1), pos) from these to rebuild the carry half the
-     * overlap needs; nothing else retains the previous group's projection rows.
-     * Deposits happen at COMMIT points only -- the CSA2 produce path, never a
-     * speculative candidate row -- and never under a multiseq step, so the
-     * [lo, hi) span below is what tells a rewind whether the range it needs is
-     * still covered.  Banked mode: views into the slab's per-bank lanes,
-     * repointed with the state views. */
-    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];   ///< projection ring view, attention KV; NULL where the compressor does not overlap
-    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];   ///< projection ring view, attention score
-    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];  ///< projection ring view, indexer KV; NULL without one
-    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];  ///< projection ring view, indexer score
-    /** Contiguously-deposited span [lo, hi) of the projection ring, in absolute
-     * positions.  A rewind replays only when the span COVERS the range it needs;
-     * an uncovered span skips the value restore and degrades to the counter clamp
-     * (the pre-ring behaviour).  A gap forward restarts the span and a run wholly
-     * behind it replaces it, so slots claimed under a stale hi -- a ghost
-     * position's deposit -- can never be read back; a run INSIDE the span leaves
-     * it alone, because that is a re-deposit of rows the ring still holds and
-     * shrinking there would discard live coverage.  `proj_ring_span_cover`
-     * (gpu_diag.cpp) is the one authority for the rule; a ghost rewind narrows
-     * the span with its own explicit clamp. */
-    uint32_t proj_ring_lo;   ///< first position the ring still covers
-    uint32_t proj_ring_hi;   ///< one past the newest; lo == hi means empty
-    /** L226 DIAGNOSTIC: per-bank rows deposited into the ring and the newest
-     * position deposited.  A rewind refusal prints these so a reader can tell
-     * "the ring never saw the generated region" from "the ring is empty on this
-     * bank" from "the span is right but the stash is missing" without a
-     * rebuild-and-diff.  Counters, not state: nothing reads them but the
-     * message. */
-    uint64_t ring_dep_rows[PULSAR_MSEQ_MAX];
-    uint64_t ring_dep_last[PULSAR_MSEQ_MAX];
-    uint32_t ring_dep_hi[PULSAR_MSEQ_MAX];   ///< the span's hi as the last deposit left it
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
@@ -1519,50 +1466,31 @@ typedef struct {
      * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
      * window under N=2 spec-time-slice — the whole point of Option F. */
     uint32_t ms_dspark_n_raw[PULSAR_MSEQ_MAX][3];   ///< per-bank raw-ring fill for each of the drafter's 3 rings
-    /** L218: the last verify round's compressor-projection save span, per
-     * bank -- positions [pos0, pos0 + rows) sit at save rows [row0, row0 + rows)
-     * of spec_comp_kv/sc_save.  A rewind to an odd position inside the round
-     * rebuilds the ratio-2 pending slot from them (pulsar_session::rewind);
-     * rows == 0 means no round has saved for this bank. */
-    uint32_t ms_spec_save_pos0[PULSAR_MSEQ_MAX];
-    uint32_t ms_spec_save_row0[PULSAR_MSEQ_MAX];
-    uint32_t ms_spec_save_rows[PULSAR_MSEQ_MAX];
-    /** L218: the bank's ratio-2 pending groups do not describe its position
-     * (a rewind landed on an odd position outside the saved span).  Only a
-     * store at a group boundary makes the state consistent again; a store at
-     * any other position on a stale bank refuses (gpu_graph_csa2_produce). */
+    /** L264: the bank's recurrent compressor lanes and raw window do not
+     * describe its frontier -- a rewind landed somewhere other than 0 or a grid
+     * checkpoint.  Set only by pulsar_session::rewind; cleared only where the
+     * state at the frontier is re-established whole (a checkpoint restore, a
+     * reset to position 0).  Every compressor store on a stale bank refuses
+     * (gpu_graph_csa2_produce), eval refuses up front, and the server keeps a
+     * stale bank out of fused rounds until a sync restores it. */
     bool ms_comp_state_stale[PULSAR_MSEQ_MAX];
     uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
     uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
-    /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33). fork_pin[bank] is a
-     * transient eviction pin so the guard's victim picker cannot free_physical
-     * a source bank mid-clone (plan-33 anti-corruption guarantee).  Zero-
-     * initialised with the graph. */
-    uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
-    /** L120 value half: the projection ring's covered span is per bank, captured
-     * and installed with the frontiers (a bank's deposits say nothing about
-     * another bank's positions).  `lo == hi` means the bank's ring is empty; both
-     * are zeroed on fork, on eviction and on install of a fresh bank. */
-    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];  ///< oldest position the bank's projection ring still covers
-    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];  ///< one past the newest
-    /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment C).
-     * ms_emit_keep[bank] is the boundary-row restore threshold: 0 = inactive (a
-     * full-prefix fork clears it; the partial cut sets R/ratio + 1 and the emit
-     * hook overwrites the recomputed boundary row with the packed stash while
-     * row0 < it).  An overlapping compressor (coff 2, 0731's ratio 4) pools a
-     * group's row from tokens on BOTH sides of the group, so the row at the cut
-     * is not reproducible from the replay's own rows; a coff-1 compressor's
-     * boundary row is, and its threshold is never armed. */
-    uint32_t ms_emit_keep[PULSAR_MSEQ_MAX];  ///< boundary-row restore threshold; 0 = inactive
-    /** Boundary-row stash (increment C): one PACKED row per (bank, layer) -- the
-     * overlapping compressor's comp row R/ratio and (where the source has one)
-     * its index-K row, copied byte-for-byte at fork_copy_cut and byte-REPLACED
-     * over the replay's recomputed row by gpu_graph_emit_keep_restore (never
-     * re-encoded: bit-exact for the MXFP8 pack AND the non-idempotent MXFP4 QAT
-     * alike).  Sized n_banks * PULSAR_N_LAYER * row_bytes at slab alloc; NULL
-     * when the pool is disabled. */
-    pulsar_gpu_tensor *emit_stash_comp;   ///< stashed packed comp row per (bank, layer)
-    pulsar_gpu_tensor *emit_stash_index;  ///< stashed packed index row per (bank, layer)
+
+    /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
+     * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
+     * NOT already hold: the raw window [G - raw_window, G) of every layer and the
+     * overlapping (coff 2) sources' recurrent lanes, attention and indexer.  The
+     * compressed and index-K rows below G/ratio are append-only, so a checkpoint
+     * references them through the frontier instead of copying them; a coff-1
+     * (ratio-128) lane is canonical-empty at a 128 boundary and is reset, not
+     * stored.  ckpt_pos[bank][slot] is the slot's G, 0 = empty.  A checkpoint is
+     * valid while its bank still holds rows [0, G/ratio) unmodified: lowering the
+     * frontier below that drops it (gpu_graph_set_n_comp), and replacing a bank's
+     * rows wholesale drops all of its checkpoints (gpu_graph_ckpt_drop_bank). */
+    pulsar_gpu_tensor *ckpt_slab[PULSAR_MSEQ_MAX];  ///< per bank, PULSAR_CKPT_SLOTS slots of ckpt_slot_bytes; [0] only without a pool
+    uint64_t ckpt_slot_bytes;                       ///< one checkpoint: raw window rows + coff-2 lanes
+    uint32_t ckpt_pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS];  ///< the grid point each slot holds; 0 = empty
 
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
@@ -1680,7 +1608,12 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
  * frontier past rows the accounting has not counted. */
+void gpu_graph_ckpt_frontier_lowered(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows);
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
+    /* L264: rows below a checkpoint's frontier may be rewritten once the counter
+     * drops under them, so the checkpoint goes with them -- here, where every
+     * rewind, cut and invalidate already passes. */
+    if (rows < g->ms_n_comp[bank][il]) gpu_graph_ckpt_frontier_lowered(g, bank, il, rows);
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }
@@ -1825,8 +1758,7 @@ struct pulsar_engine {
      * GPU-visible registered block pulsar_tp_gpu_slab_alloc_hostpin hands to
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
-    char *tp_spill_dir;         ///< a worker's own bank-KV spill directory (inc 6), or NULL
-    uint64_t tp_build_digest;   ///< L250: FNV-1a of the build id, stamped into disk-KV copies
+    char *tp_kv_dir;            ///< a worker's segment copies (pulsar_engine_options.tp_kv_dir), owned, or NULL
     uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
@@ -2208,10 +2140,11 @@ typedef struct pulsar_bank_carry {
     uint32_t  dspark_pending_qrows_cap;  ///< floats allocated in dspark_pending_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
+    bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
     int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
     /** L226: mirror of pulsar_session::live_image_fp / _barrier -- the image
      * identity travels with the bank, exactly like the checkpoint it describes,
-     * so a fork or a bank switch can never pair one conversation's barrier with
+     * so a bank switch can never pair one conversation's barrier with
      * another's KV. */
     uint64_t  live_image_fp;
     int       live_image_barrier;
@@ -2222,7 +2155,6 @@ typedef struct pulsar_bank_carry {
      * gpu_graph_bank_counters_install and then clears it unconditionally.  The
      * old mirror field was write-only (saved, never read) and has been dropped. */
     pulsar_spec_carry_state spec;
-    void copy(const pulsar_bank_carry *sc);  ///< was bank_carry_copy
     void free_one();  ///< was bank_carry_free_one
 } pulsar_bank_carry;
 
@@ -2249,32 +2181,6 @@ bool pulsar_session_is_mirrored(const pulsar_session *s);
  *  it -- FNV-1a over the checkpoint length and tokens.  The leader ships it on
  *  SYNC_CHECK; a worker compares its own.  O(checkpoint) per sync. */
 uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s);
-
-/** L250: a worker's own copy of a disk KV cache entry, at
- *  "<tp_spill_dir>/tp-kv-<key>.payload": this header, then the rank's own
- *  pulsar_session::save_payload bytes.  Everything a copy must match before a
- *  rank may load it is here: the rank and group size (a rank-0 or single-box
- *  file never loads as rank 1), the transport protocol and the build (state
- *  from a different build is never resumed), and the state it restores. */
-#define PULSAR_TP_KV_BLOB_MAGIC   UINT32_C(0x564B5450)   /* "PTKV" little-endian */
-#define PULSAR_TP_KV_BLOB_VERSION 1u
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t rank;
-    uint32_t n_ranks;
-    uint32_t protocol;
-    uint32_t n_tokens;        ///< checkpoint length the payload restores
-    uint64_t build_digest;    ///< pulsar_engine::tp_build_digest of the writer
-    uint64_t state_digest;    ///< pulsar_session_checkpoint_digest at save
-    uint64_t payload_bytes;   ///< bytes of save_payload output after this header
-} pulsar_tp_kv_blob_header;
-
-/** L250: a disk KV store key is exactly 40 lowercase hex characters (the
- *  store's sha of the entry text); anything else is refused before it can
- *  name a path. */
-bool pulsar_tp_kv_key_ok(const char *key);
-uint64_t pulsar_build_digest(const char *build_id);
 
 /** Slice 4e (L238 increment 4): the speculative round family's LOCAL
  * implementations (session_spec.cpp).  The public pulsar_session_spec_*
@@ -2335,11 +2241,6 @@ struct pulsar_session {
      * mirrored frame carries it; see tp_session_seq above for why it is the
      * create ordinal and why a mismatch is refused. */
     uint64_t tp_session_id;
-    /** L250: true on the LEADER while a mirrored sync runs.  The workers are then
-     *  inside the same prefill, reading only chunk verdicts on the control
-     *  channel, so any other frame (a disk-KV store/drop from a mid-prefill
-     *  "continued" checkpoint) would desync them -- those ops refuse instead. */
-    bool tp_in_sync;
     /** L260: the batched round end's deferred drafter seed.  While `active`
      *  (pulsar_session_spec_round_end_batch_local), each bank's round end records
      *  its committed capture rows here instead of seeding them one GEMV row at a
@@ -2376,13 +2277,17 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
-    /** L226: a rewind whose compressor state could not be re-established was
-     * SALVAGED to the last prefill frontier (rounded to PULSAR_RESUME_GRID)
-     * rather than invalidating the whole checkpoint.  The tokens below that floor
-     * are still correct and the next sync re-prefills from it, but a DECODE in
-     * between would run against KV the rollback dropped -- so eval refuses until
-     * a sync has re-established the session (the same shape as mseq_dirty). */
-    bool kv_salvaged;
+    /** L264: s->logits do NOT describe the next token after `checkpoint` -- the
+     *  bank was cut (rewind) or put at a grid checkpoint (restore, a segment
+     *  chain's load), which moves the KV but not the logits.  Set by every cut,
+     *  cleared by a prefill or eval that writes them; a sync whose prompt needs
+     *  no new rows re-evaluates the last one while it is set.  Fails safe: a
+     *  writer that forgets to clear it costs one row, never a wrong sample. */
+    bool logits_stale;
+    /** L264 S4e: the leader is inside a mirrored sync -- the workers read only
+     *  chunk verdicts until it returns, so no other mirrored frame may ship
+     *  (a disk KV store from the prefill's progress callback). */
+    bool tp_in_sync;
     /** Identity of the images whose sentinel blocks are inside `checkpoint`
      * (0 = none), and the exclusive end of the last of those blocks.  The
      * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never
@@ -2457,8 +2362,8 @@ struct pulsar_session {
      * constructors/destructors.
      * NOTE: pulsar_session_prefill_cap and pulsar_session_resident_bytes stay
      * free functions — members would collide with the same-named data members.
-     * pulsar_session_rewrite_requires_rebuild / _write_staged_payload /
-     * _payload_file_free / _snapshot_free do not take a session and stay free. */
+     * pulsar_session_rewrite_requires_rebuild / _snapshot_free do not take a
+     * session and stay free. */
     static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
     /** Tear down the session and release its GPU allocations. Behind pulsar_session_free(). */
     void destroy();
@@ -2475,7 +2380,7 @@ struct pulsar_session {
      * figure, which is below the reserved capacity on a short session. */
     uint64_t touched_kv_bytes() const;
 
-    /* ---- Tier-2 bank pool: physical residency, spill, fork ---------------- */
+    /* ---- Tier-2 bank pool: physical residency, spill --------------------- */
 
     /** Release one idle bank's ctx-scaled physical pages (cudaFree on its managed
      * comp/index allocations). The only reclaim primitive that actually returns
@@ -2489,51 +2394,14 @@ struct pulsar_session {
     bool bank_is_evicted(uint32_t bank) const;
     /** touched_kv_bytes() for an arbitrary bank, live or idle. */
     uint64_t bank_touched_kv_bytes(uint32_t bank);
-    /** Write one bank's KV to `fp` bit-identically (the spill half of the
-     * eviction guard). @return 0 on success. */
-    int bank_kv_save(uint32_t bank, FILE *fp, char *err, size_t errlen);
-    /** Reload a spilled bank's KV from `fp`, byte-for-byte. @return 0 on success. */
-    int bank_kv_load(uint32_t bank, FILE *fp, char *err, size_t errlen);
     /** Extra bytes ONE bank would demand-page in if the context grew to quantum
      * `q` -- the admission question "can this session take another step" priced
      * before committing to it. */
     uint64_t quantum_growth_bytes_per_bank(uint32_t q);
-    /** FULL-prefix fork: clone `src`'s committed KV into `dst` and continue
-     * there, leaving the trunk intact for other siblings. This is what makes a
-     * branching conversation cheap -- the shared history is copied, not
-     * recomputed.
-     * @param src       bank to clone FROM; left intact
-     * @param dst       bank to clone INTO
-     * @param tokens    the full prompt the forked bank should hold
-     * @param n_tokens  its length
-     * @param n_cached  how many of `tokens` are already committed in src
-     * @return tokens reused, negative on failure. */
-    int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
-    /** Is `bank` pinned against eviction because a fork is cloning from it?
-     * The guard's victim picker must not free physical pages mid-clone. */
-    bool bank_fork_pinned(uint32_t bank) const;
-    /** PARTIAL-prefix fork: clone only the shared prefix, cut at a ratio-4
-     * boundary, and replay the rest.
-     * @param src       bank to clone FROM
-     * @param dst       bank to clone INTO
-     * @param tokens    the full prompt the forked bank should hold
-     * @param n_tokens  its length
-     * @param n_cached  shared prefix length to cut at
-     * @return tokens reused, negative on failure. */
-    int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
-    /** Would a partial fork from `src` at `n_cached` reuse enough to be worth
-     * it? @return the reusable token count, 0 when a cold prefill is better. */
-    int bank_fork_partial_feasible(uint32_t src, int n_cached);
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
              char *err, size_t errlen);
-    /** sync's body.  `logits_owed`: the caller has just CUT this bank (a rewind
-     * leaves s->logits describing the old frontier), so if the prompt turns out
-     * to need no new rows the last one is re-evaluated anyway -- else the
-     * request samples from a finished conversation's distribution. */
-    int sync_impl(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
-                  bool logits_owed, char *err, size_t errlen);
     /** Rewrite the session to `prompt` given an already-computed `common`
      * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
@@ -2612,6 +2480,7 @@ struct pulsar_session {
     bool bank_state_restore(uint32_t bank);
     /** Committed token count for `bank`, live or idle. */
     int bank_pos(uint32_t bank);
+    int bank_prefill_frontier(uint32_t bank);
     /** Adaptive draft depth for `bank`, read from the live state or its carry. */
     int bank_spec_depth(uint32_t bank);
     /** Borrowed view of `bank`'s committed token history. Do not free. */
@@ -2668,6 +2537,15 @@ struct pulsar_session {
      * rows from the projection ring -- only when the ring covers the rewound
      * span, which on the served (multiseq) path it does not. */
     void rewind(int pos);
+    /** L264: put the installed bank at its grid checkpoint G (gpu_graph_ckpt_restore)
+     * and trim the host history to match.  The next sync evaluates from G, which
+     * is a prefill grid point, so the result is the cold prefill's byte for byte.
+     * False -- and nothing changed -- when the bank holds no checkpoint at G or the
+     * history is shorter than G. */
+    bool restore_checkpoint(uint32_t G);
+    /** The host half shared by rewind and restore_checkpoint: the history ends at
+     * pos, so everything that described positions above it goes. */
+    void trim_history(int pos);
     /** Committed token count for the current bank. */
     int pos();
     /** Allocated context length, in tokens. */
@@ -2679,15 +2557,15 @@ struct pulsar_session {
     const pulsar_tokens *tokens();
     /** Serialized size of this session's payload, in bytes. */
     uint64_t payload_bytes();
-    /** Write the payload to a fresh file under `stage_dir` and report where it
-     * landed -- the disk-KV store's write path. @return 0 on success. */
-    int stage_payload(pulsar_session_payload_file *out, const char *stage_dir,
-                      char *err, size_t errlen);
     /** Write the payload to an open stream. @return 0 on success. */
     int save_payload(FILE *fp, char *err, size_t errlen);
     /** Read a payload back, replacing this session's state. Refuses a payload
      * whose version or shape does not match this build. @return 0 on success. */
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+    /** L264 S4 disk segments (pulsar.h, pulsar_session_save_segment). */
+    uint64_t segment_bytes(uint32_t G_prev, uint32_t G);
+    int save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen);
+    int load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */
     int save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen);
     /** Restore the session from a snapshot taken by save_snapshot().
@@ -2893,7 +2771,7 @@ static inline bool gpu_graph_layer_has_comp_state(uint32_t il) {
  * indexer.  0731's ratio-128 HCA layers are kv sources that run none, so they
  * publish no index pool, own no index base table and store no index rows -- the
  * single authority every index-pool consumer asks (the allocator, the sizing
- * estimate, the bank snapshot, the fork's checksum). */
+ * estimate, the bank snapshot). */
 static inline bool gpu_graph_layer_has_index_pool(uint32_t il) {
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     return pulsar_attn_owns_kv(a->mode) && pulsar_attn_runs_indexer(a->mode);
@@ -3344,7 +3222,7 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank);
 /** Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
  * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
  * touch) and rebuild its base-table entries to the new pointers. The caller then
- * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * reloads the bank's KV into these (the server from its segment chain). Idempotent: a
  * slab already present is left untouched. Returns false on OOM.
  */
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
@@ -3352,13 +3230,33 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
  * server checks this before restoring on a returning request.
  */
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
-/** Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
- * KV into dst + mirror frontier counters. Caller validates + pins src first. */
-bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
-/** plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.cpp). */
-uint32_t pulsar_partial_fork_base_align(void);
-bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t dst,
-                                  uint32_t R, uint32_t src_len);
+
+/** L264 grid checkpoints (checkpoint.cpp; layout at pulsar_gpu_graph::ckpt_slab).
+ * Allocated with the graph -- one slab per bank, priced by the dry run like
+ * every other session tensor -- and released with it. */
+bool gpu_graph_ckpt_alloc(pulsar_gpu_graph *g, uint32_t n_banks);
+void gpu_graph_ckpt_release(pulsar_gpu_graph *g);
+/** Capture the INSTALLED bank's state at grid point G.  Precondition: the bank's
+ * frontier is exactly G (every kv source holds G/ratio rows) -- a prefill chunk
+ * just ended there.  False on any violation; the caller fails the prefill. */
+bool gpu_graph_ckpt_capture(pulsar_gpu_graph *g, uint32_t G);
+/** Restore the INSTALLED bank to its checkpoint at G: the raw window and the
+ * coff-2 lanes are copied back, every other lane is reset to the canonical
+ * boundary state, every kv source's frontier is set to G/ratio, the bank's
+ * rewind aids (projection ring span, boundary stash, stale flag) are cleared,
+ * and the checkpoints above G are dropped.  False when no checkpoint at G. */
+bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
+/** The deepest checkpoint G <= limit the bank holds; 0 when none. */
+uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
+/** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
+void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
+/** The session payload carries one checkpoint as opaque slot bytes (layout:
+ * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
+ * claim: a slot for an incoming G, emptied until commit marks it filled. */
+bool gpu_graph_ckpt_locate(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off);
+bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
+                          uint32_t *slot);
+void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G);
 /** Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
@@ -3376,26 +3274,6 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t 
  * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il);
-/** plan-33 inc C: after an emit wrote rows [row0, row0+rows) for kv source `il`
- * on `bank`, byte-replace the overlapping compressor's boundary row with the
- * stash a partial cut left.  `indexer` selects the index-K lane.  A no-op for a
- * coff-1 compressor, an unarmed bank, or an emit past the threshold. */
-bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
-                                 uint32_t row0, uint32_t rows, bool indexer);
-/** L120 value half: deposit the staged projection rows [row0, row0+n_rows) of
- * kv source `il` -- whose absolute positions are [pos0, pos0+n_rows) -- into the
- * installed bank's ring, and advance its covered span.  A no-op on a coff-1
- * source (no ring lane), under a multiseq step (those rows belong to other
- * banks' positions and the span is per bank), and on a layer with no ring.
- *
- * RANGE, not per token: a contiguous source run maps to contiguous ring slots
- * modulo the depth, so this is at most two ranged copies per lane.  The
- * per-token shape cost 17% of prefill -- 4 copies x 21 overlapping layers x 4096
- * tokens is ~344k small D2D launches per chunk, against ~52 MB of bytes.
- * Copies are ASYNC on the current stream, ordered after whatever produced the
- * rows and before any later rewind could read them. */
-bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos0,
-                                 uint32_t row0, uint32_t n_rows);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
@@ -3785,19 +3663,6 @@ bool gpu_graph_prefill_layer_major(
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud);
-bool gpu_graph_prefill_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        int                    n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled);
 bool gpu_graph_prefill_chunked_range(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -3841,41 +3706,12 @@ bool gpu_graph_verify_suffix_tops(
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
 
-/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
- *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
- *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
- *  are the decode kernels' and can never equal a cold prefill's, so a resume
- *  recomputes the tokens generated since): rewind the bank to G, then prefill
- *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
- *  up: at any even position the ratio-2 compressors hold no pending group and
- *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
- *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
- *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
- *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
- *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
- *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
-#define PULSAR_RESUME_GRID 128u
+/* PULSAR_RESUME_GRID: pulsar.h (the server plans its fused chunks on it). */
 static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ratio-2 group");
 
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,
  *  score -INF): their state at any even position. */
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank);
-/** L218: make a bank's compressor state describe position `pos` after a
- *  rewind FROM `prev_pos` (the length the session held before it; the caller
- *  has already clamped the frontier counters).  At a group boundary that is the
- *  empty group.  Inside a group the pending slots are rebuilt from the
- *  PROJECTION RING -- a coff-2 (overlapping) source replays the previous group
- *  plus the straddled rows -- falling back to the last verify round's saved
- *  projections when the ring misses the span; a coff-1 source has no ring, so a
- *  rewind that stays inside the group its lane is already FILLING keeps that
- *  group's committed slots and clears only the rest (`prev_pos` is what says
- *  so), and one that crosses a group boundary needs the saves.  Only when a
- *  needed rebuild has no source is the state reset and the bank marked stale
- *  (see ms_comp_state_stale).  Returns false on a device failure, and for an
- *  overlapping boundary that has neither ring coverage nor an armed boundary
- *  stash. */
-bool gpu_graph_compressor_state_rewind(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos,
-                                       uint32_t prev_pos);
 /** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
  * spec_logits rows [row0, row0+n_rows) and read the compact block into
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to

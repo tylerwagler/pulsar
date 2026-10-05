@@ -16,6 +16,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
  * that never ran has baked no segment graph, and a pricing run must not reset
  * the live session's. */
 void gpu_graph_release(pulsar_gpu_graph *g) {
+    gpu_graph_ckpt_release(g);
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);
@@ -163,11 +164,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
         pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
         pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
-        /* L120 value half: the per-bank projection rings. */
-        pulsar_gpu_tensor_free(g->banks.attn_proj_kv[il]);
-        pulsar_gpu_tensor_free(g->banks.attn_proj_sc[il]);
-        pulsar_gpu_tensor_free(g->banks.index_proj_kv[il]);
-        pulsar_gpu_tensor_free(g->banks.index_proj_sc[il]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
@@ -177,10 +173,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     }
     /* plan-33 inc C boundary-row stash (one pair for the whole pool, so outside
      * the per-layer loop above). */
-    pulsar_gpu_tensor_free(g->emit_stash_comp);
-    pulsar_gpu_tensor_free(g->emit_stash_index);
-    g->emit_stash_comp = NULL;
-    g->emit_stash_index = NULL;
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     pulsar_gpu_batched_copy_free(g->spec_snap_copies);

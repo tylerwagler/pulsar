@@ -8,7 +8,7 @@
  * the same bytes but hands every PULSAR_WRITEBACK_STEP of them to the disk and
  * drops them from the cache as it goes, so a store's footprint stays bounded.
  *
- * Header-only; the engine's payload writer and the kvstore share it. */
+ * Header-only; the engine's payload writer and the segment store share it. */
 #pragma once
 
 #include <fcntl.h>

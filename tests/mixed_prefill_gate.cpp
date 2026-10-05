@@ -8,7 +8,7 @@
  *
  * ORACLE = output-token coherence (NOT byte-identity): the mixed prefill resumes
  * with the accepted last-ulp warm-continuation KV delta, so greedy tokens are
- * compared, not logit bytes (same class as fork-gate P5).
+ * compared, not logit bytes.
  *
  * Shape: classic-prefill a small FIRST chunk [0,c0) to lift the bank frontier off
  * 0 (step_begin rejects pos-0), then feed [c0,c0+K) as ONE K-row mixed run; then

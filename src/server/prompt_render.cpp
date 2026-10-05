@@ -485,39 +485,6 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
 }
 
 
-/* Does this client REPLAY prior reasoning on the next turn?  This governs the
- * thinking checkpoint (should_remember_thinking_checkpoint): a reasoning-
- * preserving client (opencode et al.) echoes reasoning_content so its replay
- * byte-matches the live KV directly and no stripped checkpoint is wanted; a
- * reasoning-stripping client (openwebui) drops it, so the durable key must be
- * the reasoning-STRIPPED transcript.
- *
- * The old code keyed this off chat_history_uses_tool_context — i.e. "tools are
- * advertised" — on the assumption that tool-advertising clients are agentic and
- * preserve reasoning.  openwebui breaks that: it advertises a tool list AND
- * strips reasoning, so every thinking turn was stored token-text-with-reasoning
- * and its stripped replay cold-re-prefilled the whole conversation.
- *
- * The ground truth is observable: if any prior assistant turn carries non-empty
- * reasoning the client preserves; if we have seen assistant turns and NONE do,
- * it strips.  Only with no assistant history yet can we not tell — there we fall
- * back to the tool-context heuristic (unchanged first-turn behavior; the signal
- * self-corrects from the second turn on, where the deep re-prefills hurt). */
-bool chat_history_preserves_reasoning(const chat_msgs *msgs,
-                                             const char *tool_schemas) {
-    bool saw_assistant = false;
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (strcmp(m->role, "assistant")) continue;
-        saw_assistant = true;
-        if (m->reasoning && m->reasoning[0]) return true;
-    }
-    if (saw_assistant) return false;
-    return chat_history_uses_tool_context(msgs, tool_schemas);
-}
-
-
-
 void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
                       pulsar_think_mode think_mode, bool v41) {
     memset(r, 0, sizeof *r);

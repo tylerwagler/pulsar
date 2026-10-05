@@ -140,13 +140,10 @@ mirrored operation -- the hook fires at prefill chunk boundaries, and a leader
 stopping after k chunks would leave its workers at a big gate it never joins,
 so under TP cancellation is between operations only (the driver issues no
 further frame); (6) LANDED with (1): the eviction guard's spill path --
-`bank_free_physical`, `bank_alloc_physical`, `bank_kv_save`, `bank_kv_load`.
-KV is replicated per rank, so each rank spills its own bank to its own disk:
-the leader names the snapshot by the KEY of the file it was handed (basename,
-the server's `.tmp.<pid>` stripped, read back from the descriptor), and the
-worker mirrors it as `<tp_spill_dir>/tp-<key>`, the server handing the engine
-its KV-disk directory as `pulsar_engine_options.tp_spill_dir`.  A worker with
-no spill directory answers a split verdict, never a quiet success.  With this
+`bank_free_physical`, `bank_alloc_physical`.  (L264, 2026-10-04: the bank KV
+snapshot and its `BANK_KV_SAVE`/`LOAD` frames are retired -- a spill is now the
+disk KV cache's segment chain, and the server disables both the disk cache and
+the guard under TP until segments are mirrored.)  With this
 the server's whole mutating session surface is mirrored; (7) LANDED with (1):
 images ride the sync frame (`SYNC_MM`: the expanded tokens, a per-image table
 of start position and length, the concatenated bytes), and every rank's own
@@ -357,8 +354,8 @@ worker "blocks in the wrapper", read "the loop applies the frame".
   slice deviates from its objective on safety grounds rather than preference.
 - **Banks are a LIVENESS gap, not a safety gap (round 10).**  Bank *selection*
   for decodes is already mirrored: the rows carry bank ids, and the worker
-  decodes into the leader's banks.  Bank *contents* are not -- `bank_fork`,
-  `bank_fork_partial`, `bank_state_save`/`_restore` and eviction are the server
+  decodes into the leader's banks.  Bank *contents* are not --
+  `bank_state_save`/`_restore` and eviction are the server
   scheduler's own decisions (`server_sched.cpp`), made against LOCAL memory
   state, so a pair whose schedulers diverge would decode a leader-chosen bank
   whose KV does not match on the worker.

@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "lib/pulsar_segstore.h"
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"
 #include "pulsar_ctxmem.h"
@@ -266,7 +267,6 @@ void server::close_resources() {
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
-        visible_live_free(&s->slots[i].thinking_live);
         s->slots[i].provisioned = false;
     }
     if (s->sess) pulsar_session_free(s->sess);
@@ -275,19 +275,6 @@ void server::close_resources() {
     s->spec_lane_logits = NULL;
     free(s->lane_logits);
     s->lane_logits = NULL;
-    /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
-     * generate.cpp writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
-     * still spilled when the server exits would otherwise leave a stale
-     * multi-GiB file behind forever, so sweep every provisioned slot's bank
-     * on the way out.  Best-effort: a missing file is the normal case. */
-    if (s->spill_dir[0]) {
-        for (int i = 0; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
-            char spath[600];
-            snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv",
-                     s->spill_dir, (unsigned)s->slots[i].bank);
-            (void)remove(spath);
-        }
-    }
     pulsar_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -534,6 +521,11 @@ static server_config parse_options(int argc, char **argv) {
 
 #ifndef PULSAR_SERVER_TEST
 
+/* L264 S4e: the segment store's removal hook on a TP leader. */
+static void kv_segment_removed(void *ud, const char key[41]) {
+    pulsar_engine_segment_dropped((pulsar_engine *)ud, key);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
@@ -545,9 +537,11 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
     server_resolve_kv_disk_dir(&cfg);
-    /* A TP worker spills bank KV to ITS OWN disk under the same directory
-     * policy the leader uses (slice 4e increment 6). */
-    cfg.engine.tp_spill_dir = cfg.kv_disk_dir;
+    /* L264 S4e: a TP worker keeps its own copy of every disk KV segment the
+     * leader's store names, under its own KV directory. */
+    char *tp_kv_dir = cfg.kv_disk_dir ? (char *)malloc(strlen(cfg.kv_disk_dir) + 8) : NULL;
+    if (tp_kv_dir) sprintf(tp_kv_dir, "%s/tp-seg", cfg.kv_disk_dir);
+    cfg.engine.tp_kv_dir = tp_kv_dir;
     /* Every rank tells the group its build (the NODE frame), so the leader's
      * /health can show a mixed-build pair for what it is.  Stamped here, not in
      * the transport: this TU is rebuilt whenever HEAD moves (Makefile), and a
@@ -918,25 +912,6 @@ int main(int argc, char **argv) {
                    s.mixed_chunk_tokens,
                    s.mixed_deep_guard_rows);
     }
-    /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
-     * pool mode; PULSAR_WARM_FORK=0 restores today's in-place-continuation routing
-     * exactly. One startup read — never on a hot path. */
-    {
-        const char *wf = getenv("PULSAR_WARM_FORK");
-        s.warm_fork_enabled = s.pool_banks > 0 &&
-                              !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
-        /* inc D: partial-cut floor. Default 256 tokens (2 ratio-4 groups of
-         * reuse); floor to 128 so a cut always aligns to >= one group of R. */
-        s.warm_partial_min = 256;
-        const char *wpm = getenv("PULSAR_WARM_PARTIAL_MIN");
-        if (wpm && *wpm) {
-            int v = atoi(wpm);
-            if (v < 128) v = 128;
-            s.warm_partial_min = v;
-        }
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm routing %s (in-place advance at the aligned cut; partial-min %d)",
-                   s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
-    }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = (uint32_t)i;
@@ -977,43 +952,29 @@ int main(int argc, char **argv) {
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
         uint64_t budget = kv_budget_final;
+        /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
+         * tools/tp2-l264 -- the spill/restore through the segment chain has no
+         * other way to fire at a test's fills). */
+        const char *ov = getenv("PULSAR_SERVER_KV_BUDGET_OVERRIDE");
+        if (ov && ov[0]) {
+            const unsigned long long b = strtoull(ov, NULL, 10);
+            if (b > 0) {
+                budget = (uint64_t)b;
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test hook)",
+                           (double)budget / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
         s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
         s.guard_touched_budget = budget > s.guard_eager_bytes
                                ? budget - s.guard_eager_bytes : 0;
-        snprintf(s.spill_dir, sizeof s.spill_dir, "%s", "./ds4-spill");
-        (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */
-        /* Reclaim orphaned spill temporaries.  spill_bank writes
-         * "spill-bank-<n>.kv.tmp.<pid>" and renames it into place, so a tmp file
-         * surviving here is from a process that died mid-spill — precisely the
-         * crash the atomic write exists to contain.  The exit sweep cannot do
-         * this (a crash never reaches it), and these are multi-GiB, so they must
-         * be collected at startup: no spill can be in flight in a fresh process,
-         * which makes every match here an orphan by construction. */
-        if (DIR *sdp = opendir(s.spill_dir)) {
-            while (const struct dirent *de = readdir(sdp)) {
-                if (strncmp(de->d_name, "spill-bank-", 11) != 0) continue;
-                if (!strstr(de->d_name, ".kv.tmp.")) continue;
-                /* spill_dir is 512 and d_name up to 255, so 600 can truncate
-                 * (sparky's gcc warns; the dev box's does not). */
-                char opath[sizeof(s.spill_dir) + 264];
-                snprintf(opath, sizeof opath, "%s/%s", s.spill_dir, de->d_name);
-                if (remove(opath) == 0) {
-                    server_log(PULSAR_LOG_WARNING,
-                               "pulsar-server: guard: reclaimed orphaned spill temp %s",
-                               opath);
-                }
-            }
-            closedir(sdp);
-        }
         s.guard_enabled = (s.guard_touched_budget > 0);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 2b guard %s: touched budget %.2f GiB "
-                   "(kv budget %.2f − eager %.2f), spill dir %s",
+                   "(kv budget %.2f − eager %.2f); spills persist to the disk KV cache",
                    s.guard_enabled ? "ENABLED" : "DISABLED (no touched headroom)",
                    (double)s.guard_touched_budget / (1024.0*1024.0*1024.0),
                    (double)budget / (1024.0*1024.0*1024.0),
-                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0),
-                   s.spill_dir);
+                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0));
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
@@ -1064,15 +1025,11 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
-    /* L250: on a tensor-parallel group the disk KV cache is MIRRORED -- every
-     * store, load and removal runs on every rank against its own copy
-     * (pulsar_session_stage_payload_mirrored / load_payload_mirrored /
-     * kv_mirror_drop), and SYNC_CHECK refuses a sync whose ranks disagree
-     * instead of deadlocking.  kv_disk_dir is also the engine's tp_spill_dir
-     * (above), where each worker keeps its copies. */
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                       false /* accept cross-quant restores */, cfg.kv_cache))
+                       pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(engine),
+                                                (uint32_t)pulsar_engine_routed_quant_bits(engine)),
+                       cfg.kv_cache))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in
          * kv_cache_open; state the consequence once and serve without disk
@@ -1082,24 +1039,30 @@ int main(int argc, char **argv) {
                    "serving without disk restore",
                    cfg.kv_disk_dir);
     }
-    /* L250 phase 3: the workers keep a copy of every entry.  A lost DROP, a
-     * crash between a worker's store and this rank's commit, or copies from
-     * another build leave copies no entry names -- never loaded (this rank
-     * decides every load), but taking disk.  Hand the workers this index once,
-     * now, before any session exists to race with. */
+    /* L264 S4e: on a tensor-parallel group every worker keeps its own copy of
+     * each segment the store names (the engine mirrors save and load).  Every
+     * key the store removes from here on is dropped on the workers too, and the
+     * keys it holds now reconcile them -- copies left by a crash, or by orphans
+     * the open just pruned, go. */
     if (s.kv.enabled && pulsar_engine_is_tp(engine)) {
+        pulsar_segstore_set_removed_hook(s.kv.st, kv_segment_removed, engine);
         char *keys = NULL;
-        const int n = pulsar_kvstore_keys(&s.kv, &keys);
-        if (n >= 0 && pulsar_engine_kv_mirror_reconcile(engine, keys, n) == 0) {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: disk KV mirror: the workers reconcile their copies "
-                       "against %d entr%s", n, n == 1 ? "y" : "ies");
-        } else {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: disk KV mirror: could not hand the workers the index; "
-                       "orphan copies stay until the next start");
-        }
+        const int n_keys = pulsar_segstore_keys(s.kv.st, &keys);
+        if (pulsar_engine_segment_reconcile(engine, keys, n_keys) != 0)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: tp: the disk KV segment reconcile could not be sent; "
+                                           "orphan worker copies stay until the next bring-up");
+        else
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: disk KV segments mirrored across the TP group "
+                                           "(%d held, workers reconciled)", n_keys);
         free(keys);
+    }
+    /* L264: a guard spill persists the bank's history to the disk KV cache; with
+     * no cache there is nowhere to put it, and freeing the bank would lose the
+     * conversation outright. */
+    if (s.guard_enabled && !s.kv.enabled) {
+        s.guard_enabled = false;
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: Tier-2 2b guard DISABLED: it spills to the disk KV cache, which is off");
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
@@ -1244,10 +1207,11 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
                        i, tokens->len);
-            s.kv_cache_store_current(sl, "shutdown");
+            s.kv_cache_persist(sl, "shutdown");
         }
     }
     s.close_resources();
+    free(tp_kv_dir);
     return 0;
 }
 

@@ -2052,18 +2052,11 @@ int generate_gpu_graph_raw_swa(
     float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
 
     const double t_prefill0 = now_sec();
-    if (prefill_cap < (uint32_t)prompt->len) {
-        ok = gpu_graph_prefill_chunked(&g, model, weights, prompt,
-                                         prompt->len, logits, false,
-                                         progress, progress_ud,
-                                         progress, progress_ud,
-                                         NULL, NULL, NULL);
-    } else {
-        ok = gpu_graph_prefill_raw_swa(&g, model, weights, prompt,
-                                         prompt->len, logits, true,
-                                         progress, progress_ud,
-                                         NULL, NULL, NULL);
-    }
+    ok = gpu_graph_prefill_chunked(&g, model, weights, prompt,
+                                     prompt->len, logits, false,
+                                     progress, progress_ud,
+                                     progress, progress_ud,
+                                     NULL, NULL, NULL);
     const double t_prefill1 = now_sec();
 
     if (!ok) {

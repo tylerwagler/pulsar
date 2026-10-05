@@ -65,7 +65,6 @@ __pycache__/
 # --- working files (see CLAUDE.md: all temp/scratch files live here) ---
 /temp/
 /tests/bank_evict_restore_gate
-/tests/bank_fork_gate
 /tests/session_payload_gate
 /tests/kv4_pack_gate
 /tests/rewind_frontier_gate

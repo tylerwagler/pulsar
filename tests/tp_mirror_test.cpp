@@ -22,7 +22,7 @@
  *
  *   A. sync / eval / batched decode / mixed / fused step for an unknown session
  *      -> refused by name, and the refusal ACKED so the leader reads it at once;
- *      the verdict frames (bank restore, fork) answer a NEGATIVE status that
+ *      the verdict frames (bank restore, rewrite, ...) answer a NEGATIVE status that
  *      the verdict collector reads as a refusal, never as a result
  *   B. a void frame (rewind) for an unknown session -> the worker marks the
  *      pair failed with NO ack; the NEXT acked frame carries the refusal back
@@ -186,11 +186,6 @@ static int run_leader(pulsar_tp *tp) {
               std::strstr(err, "refused") != NULL,
               "an unknown-session restore must come back as a refusal, not a verdict: %s", err);
         const int t3[3] = { 1, 2, 3 };
-        CHECK(pulsar_tp_send_bank_fork(tp, 1, SID, 0u, 1u, t3, 3u, 2) != 0, "send_bank_fork must report success");
-        err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_status(tp, SID, "partial bank fork", &status, err, sizeof(err)) &&
-              std::strstr(err, "refused") != NULL,
-              "an unknown-session fork must come back as a refusal: %s", err);
         CHECK(pulsar_tp_send_rewrite_from_common(tp, SID, t3, 3u, 1) != 0, "send_rewrite must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "rewrite from common", &status, err, sizeof(err)) &&
@@ -215,11 +210,24 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "spec_next_base", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session spec_next_base must come back as a refusal: %s", err);
-        CHECK(pulsar_tp_send_bank_kv(tp, 1, SID, 2u, "kv-none.bin") != 0, "send_bank_kv must report success");
+        CHECK(pulsar_tp_send_bank_alloc_physical(tp, SID, 2u) != 0, "send_bank_alloc_physical must report success");
         err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank kv load", &status, err, sizeof(err)) &&
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank alloc physical", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
-              "an unknown-session kv load must come back as a refusal: %s", err);
+              "an unknown-session alloc physical must come back as a refusal: %s", err);
+        /* L264 S4e: a segment save for a session the worker never created is
+         * a refusal too (the leader then skips the segment on every rank). */
+        pulsar_tp_segment_command seg;
+        std::memset(&seg, 0, sizeof(seg));
+        seg.session_id = SID;
+        seg.G_prev = 0;
+        seg.G = 128;
+        std::memcpy(seg.key, "0123456789abcdef0123456789abcdef01234567", 40);
+        CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &seg) != 0, "send_segment must report success");
+        err[0] = 0;
+        CHECK(!pulsar_tp_wait_command_status(tp, SID, "kv segment save", &status, err, sizeof(err)) &&
+              std::strstr(err, "refused") != NULL,
+              "an unknown-session segment save must come back as a refusal: %s", err);
     }
 
     /* B. A void frame for an unknown session marks the worker's pair failed

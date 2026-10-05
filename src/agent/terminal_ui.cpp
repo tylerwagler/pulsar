@@ -1143,7 +1143,7 @@ void runtime_help(void) {
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
-    puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
+    puts("  /strip SHA   Release cached KV only this session uses; /switch prefills it back.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
@@ -1219,7 +1219,7 @@ int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg)
                 w->cache_dir, strerror(errno));
         return -1;
     }
-    w->sysprompt_path = pulsar_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    (void)agent_kv_open(w);
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -1243,9 +1243,8 @@ void agent_worker_free(agent_worker *w) {
     pulsar_session_free(w->session);
     pulsar_tokens_free(&w->transcript);
     free(w->cache_dir);
-    free(w->sysprompt_path);
+    pulsar_segstore_close(w->kv);
     free(w->session_title);
-    free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);

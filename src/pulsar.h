@@ -140,13 +140,11 @@ typedef struct {
      *  frame so each rank can report the whole group's builds.  NULL = not
      *  stamped (the CLI); the transport sends it empty. */
     const char *build_id;
-    /** Slice 4e increment 6 (L238): where a WORKER rank keeps its own bank
-     * KV disk snapshots.  KV is replicated per rank, so a spill is per rank
-     * to its own disk; the leader's frames name the snapshot by the key of
-     * the file the leader wrote and the worker mirrors it under this
-     * directory.  NULL (the CLI, or a server without a KV disk cache) refuses
-     * the spill frames on a worker. */
-    const char *tp_spill_dir;
+    /** L264 S4e: a WORKER rank's own copies of the disk KV cache's segments
+     *  (<tp_kv_dir>/<key>.tpseg; KV is replicated per rank, so each rank keeps
+     *  its own).  NULL on a rank serving no disk cache: the segment frames are
+     *  then refused there as misses. */
+    const char *tp_kv_dir;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
@@ -178,12 +176,6 @@ typedef struct {
     uint64_t len;   ///< bytes actually used
     uint64_t cap;   ///< allocated capacity in bytes
 } pulsar_session_snapshot;
-
-/** An on-disk session payload: where it landed and how large it is. */
-typedef struct {
-    char *path;      ///< owned path string; free with the payload API
-    uint64_t bytes;  ///< file size in bytes
-} pulsar_session_payload_file;
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
 /** Tensor parallelism (slice 4e, L238): is this engine a WORKER rank of a TP
@@ -339,66 +331,21 @@ void     pulsar_engine_set_bank_pool(uint32_t n_banks);
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
 /** Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
  * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
- * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
- * first (host RAM reclaims nothing on unified memory) and repointed away from it.
+ * (reclaims physical on GB10); caller must have persisted the bank's KV to DISK
+ * first (host RAM reclaims nothing on unified memory; the server writes the bank's
+ * history as segments) and repointed away from it.
  * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
- * the base-pointer table; caller then reloads KV H2D from the disk snapshot.
+ * the base-pointer table; the caller then reloads its KV (the server from its
+ * segment chain).
  * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
  * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank);
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
-/** Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
- * mechanism; the D2H staging is transient — freed before free_physical). save:
- * precondition bank is installed (cur). load: reallocs physical + rebuilds the
- * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
-int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
-int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
 /** Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
-/** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
- * Clone bank `src`'s committed KV + host carry into bank `dst` (dst continues src's
- * conversation; the caller re-prefills only the divergent suffix). VALIDATES the
- * request tokens[0..n_cached) against src's committed history BEFORE any device
- * write (mismatch/short history -> refuse, non-zero return -> caller cold-prefills);
- * n_cached must equal src's committed length (full-prefix). Pins src against the
- * eviction guard for the clone. Returns 0 on success. fork_pinned: whether a bank
- * is currently mid-fork (the guard's victim picker must skip it). */
-int  pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
-                           const int *tokens, int n_tokens, int n_cached);
-bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank);
-/** plan-33 increment C — PARTIAL-prefix fork: the request shares only
- * tokens[0..n_cached) with src's history. Cuts at R = ((n_cached-4)/128)*128,
- * validates tokens[0..R+4) vs src BEFORE any device write, clones [0,R) (+ the
- * byte-stashed ratio-4 boundary row, emit-restored during the replay), and makes
- * dst's committed history tokens[0..R) — the caller then re-prefills [R, ...).
- * src==dst = in-place truncate-reuse. 0 on success; non-zero -> cold prefill,
- * with the refusal reason coded (all callers checking !=0 stay correct):    */
-enum {
-    PULSAR_FORK_OK            = 0,
-    PULSAR_FORK_EINVAL        = 1, /* bad args / bank out of range / cut beyond history */
-    PULSAR_FORK_SHALLOW       = 2, /* R < align: cut too close to the origin */
-    PULSAR_FORK_NOHIST        = 3, /* src has no valid committed-history carry */
-    PULSAR_FORK_MISMATCH      = 4, /* src history not a BYTE-prefix of tokens (L115) */
-    PULSAR_FORK_EVICTED       = 5, /* src bank has no physical KV */
-    PULSAR_FORK_RING_SCROLLED = 6, /* raw ring wrapped past the cut: the replay's
-                                    * attention window [R-raw_window, R) is gone.
-                                    * PERMANENT for this (bank, cut) — the ring
-                                    * only scrolls forward (see _partial_feasible) */
-    PULSAR_FORK_COPY_FAIL     = 7, /* device clone-with-cut failed */
-};
-int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
-                                   const int *tokens, int n_tokens, int n_cached);
-/** Host-only feasibility probe for the partial fork: every check above EXCEPT the
- * token compare (the caller already knows its common prefix) and the device copy.
- * Lets a scheduler route an infeasible cut (typically PULSAR_FORK_RING_SCROLLED
- * after a client compacts history) straight to a cold path instead of retrying a
- * fork that can never succeed. Returns PULSAR_FORK_OK when a fork with this
- * n_cached could proceed. Pure host reads; safe at routing time. */
-int  pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src,
-                                            int n_cached);
 /** GPU bytes the session's create allocated (allocator delta measured across
  * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the
  * same context and pool size -- the server asserts it after each create. */
@@ -559,8 +506,7 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
 
 /** L115 — THE prefix-reuse authority.  Every "can this state serve this
  * prompt, and from which cut?" decision (routing, the worker's cache
- * resolver, session sync, and the bank fork validators) asks this and
- * nothing else.
+ * resolver, session sync) asks this and nothing else.
  *
  * The comparison is over BYTES, not token ids: generated text freezes the
  * boundaries the model SAMPLED into the live history, while the client's
@@ -938,6 +884,21 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
  * present, else 0. */
 int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled);
+/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
+ *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
+ *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
+ *  are the decode kernels' and can never equal a cold prefill's, so a resume
+ *  recomputes the tokens generated since): rewind the bank to G, then prefill
+ *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
+ *  up: at any even position the ratio-2 compressors hold no pending group and
+ *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
+ *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
+ *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
+ *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
+ *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
+ *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
+#define PULSAR_RESUME_GRID 128u
+
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live
@@ -947,6 +908,9 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
  * must keep idle banks' carries current (bank_state_save at job end). Return
  * 0 / NULL for an out-of-range or never-populated bank. */
 int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
+/** L264: the end of the last prompt the bank PREFILLED (its generated tokens lie
+ *  past it).  A request that carries all of it is that conversation's next turn. */
+int  pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);
@@ -991,6 +955,20 @@ void pulsar_session_invalidate(pulsar_session *s);
  * dropping trailing tokens the client never saw (mid-block speculative stop);
  * rewound rows are overwritten by the next prefill/eval. */
 void pulsar_session_rewind(pulsar_session *s, int pos);
+/** L264 grid checkpoints.  A prefill captures the installed bank's state at each
+ * grid point it ends a chunk on (every multiple of 128 a chunk boundary lands on,
+ * and the last one below the prompt's end); restoring one puts the bank back at
+ * that position so the next sync evaluates only the tokens after it -- the cold
+ * prefill's computation, byte for byte.  best: the deepest checkpoint <= limit
+ * the installed bank holds, 0 when none.  restore: 0 on success; 1 when the bank
+ * holds none at G (nothing changed), or on a tensor-parallel engine, which does
+ * not mirror the restore. */
+int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
+/** The same question for any bank of the pool, installed or not -- a host scan,
+ * no device work.  The router's score for a bank (L264 S3): a request whose bytes
+ * match the bank's history to `limit` tokens resumes there from this position. */
+int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
+int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);
@@ -1070,52 +1048,54 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * committed-projection ring an OVERLAPPING compressor replays to rebuild its
  * carry, plus that ring's covered span once in the counter region.  Earlier
  * files are refused: the per-layer layout differs at the same strides. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(12)
-/** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
+/* v13 (L264, 2026-10-04): v12 without the projection ring, plus the resume
+ * checkpoint.  A payload is the frontier state exactly -- tokens, logits, the
+ * prefill frontier, the raw window [ck - raw_window, ck), every compressed and
+ * index-K row, every recurrent lane -- so a restored session decodes on as the
+ * saved one would; and ONE grid checkpoint, the deepest at or below the prefill
+ * frontier (opaque slot bytes, checkpoint.cpp), which a sync that does not
+ * extend the frontier restores, exact by construction where v12's ring replay
+ * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
+ * the checkpoint's grid point (0 = none).  Earlier files are refused. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(13)
+/** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
-/** stage_dir: directory for the transient staged file (the caller's disk
- * dir). NULL/"" falls back to /tmp -- avoid on tmpfs boxes, where staged
- * bytes are RAM (L110 F5). */
-int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
-                              const char *stage_dir, char *err, size_t errlen);
-int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
-                                     FILE *fp, char *err, size_t errlen);
-void pulsar_session_payload_file_free(pulsar_session_payload_file *payload);
-/** L250: pulsar_session_stage_payload for the disk KV cache on a TP group.  KV
- * is replicated per rank, so every worker also writes its OWN copy of this
- * state under its spill directory, named by `key` (the store's 40-hex sha);
- * the leader stages in parallel.  Returns 0 only when every rank succeeded --
- * otherwise nothing is left staged here and no worker keeps a copy, so the
- * store is skipped (the pair is NOT failed: a full disk on one rank is a miss,
- * not a divergence).  Without a TP group it is exactly
- * pulsar_session_stage_payload and `key` is unused. */
-int pulsar_session_stage_payload_mirrored(pulsar_session *s, pulsar_session_payload_file *out,
-                                          const char *stage_dir, const char *key,
-                                          char *err, size_t errlen);
-/** L250: the leader's entry `key` is gone (its own write failed after the
- * workers stored, or eviction): drop every worker's copy.  Fire-and-forget; a
- * no-op without a TP group. */
-void pulsar_session_kv_mirror_drop(pulsar_session *s, const char *key);
-/** L250 phase 2: pulsar_session_load_payload for the disk KV cache on a TP
- * group.  This rank loads first; then every worker loads ITS copy of entry
- * `key` and must reach the same state (checkpoint length + digest).  Returns 0
- * only when every rank did.  On any failure the ranks may hold different
- * state, so the caller MUST pulsar_session_invalidate (mirrored: every rank
- * ends empty and identical), remove its entry and pulsar_session_kv_mirror_drop
- * it -- exactly what it already does for a payload that will not load.
- * Without a TP group it is exactly pulsar_session_load_payload. */
-int pulsar_session_load_payload_mirrored(pulsar_session *s, FILE *fp, uint64_t payload_bytes,
-                                         const char *key, char *err, size_t errlen);
-/** L250 phase 3: at bring-up, hand the workers the key of every entry this
- * leader's disk KV cache holds (`keys`: n_keys x 40 hex, back to back); each
- * worker deletes the copies no key names.  Fire-and-forget.  0 when sent, 1
- * when it could not be; a no-op (0) off a TP group or on a worker. */
-int pulsar_engine_kv_mirror_reconcile(pulsar_engine *e, const char *keys, int n_keys);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);
+
+/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G), every kv source's
+ * compressed and index-K rows for those positions, and the grid checkpoint at G
+ * (G_prev and G are grid points; G_prev may be 0).  A chain of segments from
+ * position 0 rebuilds a bank exactly at its last G, which is how the server's
+ * disk cache persists a conversation: each new prefill adds the segments past the
+ * chain's last one, so a write costs the new tokens, not the whole history.
+ *   save: the installed bank must hold the history to G and its checkpoint at G.
+ *   load: the installed bank must stand at G_prev (a root, G_prev 0, resets it).
+ *         Every segment's checkpoint is kept; `last` restores the final one, so
+ *         the bank stands LIVE at G and the next sync evaluates from there. */
+#define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(1)
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
+/** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
+ *  it is unused (NULL is fine); on one it names every worker's own copy, and
+ *  save and load are mirrored verdicts whose disagreement is a miss on every
+ *  rank (L264 S4e).  Refused inside a mirrored sync. */
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, const char *key,
+                                char *err, size_t errlen);
+int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
+                                int *G_out, const char *key, char *err, size_t errlen);
+/** A store removed segment `key`: the workers delete their copies (void; a
+ *  no-op off a TP leader). */
+void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key);
+/** Bring-up: the leader's whole key set (n_keys x 40 hex); each worker removes
+ *  the copies it does not name.  0 when sent or nothing to do. */
+int pulsar_engine_segment_reconcile(pulsar_engine *e, const char *keys, int n_keys);
+/** True while a TP leader runs a mirrored sync (no other mirrored operation may
+ *  ship -- e.g. a disk store from the prefill's progress callback). */
+bool pulsar_session_in_mirrored_sync(const pulsar_session *s);
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen);
 void pulsar_session_snapshot_free(pulsar_session_snapshot *snap);
 

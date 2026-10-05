@@ -184,26 +184,22 @@ queue when someone is waiting on the number; the battery runs behind it.
 
 ## Named exceptions to rule 1
 
-Three places let the same input take two paths on purpose.  Each is listed
+Two places let the same input take two paths on purpose.  Each is listed
 with the instrument that grades it; an exception without an instrument is a
 fallback and goes back under rule 1.  Adding to this list is a decision Tyler
 makes.
 
-1. **Warm fork / in-place continuation vs cold prefill.**  A request whose
-   token prefix matches a warm bank's frontier continues from that bank's KV
-   -- forked (`src/engine/session_banks.cpp:99-172`) or in place
-   (`src/engine/session.cpp:820-847`), routed in
-   `src/server/server_jobs.cpp:747` onward, kill switch `PULSAR_WARM_FORK` --
-   instead of re-prefilling it.  Off chunk-aligned cuts the KV bytes differ
-   from a cold prefill's: the continuation's chunks have different widths,
-   so its GEMMs take different shapes.  *Instruments:*
-   `tests/warm_fork_3way.sh` (lines 16-17 state the exception; the gate is
-   OUTPUT-TEXT identity of the branch replies across the cold, in-place and
-   forked routings) and `cuda-fork-gate` (`Makefile:475`,
-   `tests/bank_fork_gate`) for the chunk-aligned case, where the KV bytes
-   must match.
+*Retired 2026-10-04 (L264):* **warm fork / in-place continuation vs cold
+prefill** was exception 1 -- a continuation off a chunk-aligned cut took
+different GEMM shapes than the cold prefill, kill switch `PULSAR_WARM_FORK`.
+Every warm resume is now a restore of a grid checkpoint the prefill captured
+followed by a prefill from that grid point, which IS the cold prefill's
+computation, so the exception has no remaining case; the switch, the 3-way
+scripts and the router's fork paths are deleted.  The instrument that says so
+is `cuda-chunk-neutrality-gate` (schedules L, M, N: restored resumes
+byte-identical to cold).
 
-2. **`PULSAR_CUDA_PREFILL_CHUNK`** (`src/engine/layers.cpp:22-29`): a test
+1. **`PULSAR_CUDA_PREFILL_CHUNK`** (`src/engine/layers.cpp:22-29`): a test
    knob for the prefill chunk width.  Chunk width changes GEMM shapes and so
    cuBLASLt's algorithm choice; a prompt prefilled at chunk 1024 and at chunk
    4096 does not produce the same KV bytes.  *Instrument:* the prefill byte
@@ -211,7 +207,7 @@ makes.
    its depths -- 512, 2048, 4096, 4102, 6144 -- at the default chunk of
    4096; a run with the knob set is not a byte-gate run and says so.
 
-3. **`PULSAR_DSPARK_CONF_SCHED`** (`src/engine/session_spec.cpp:17-29`,
+2. **`PULSAR_DSPARK_CONF_SCHED`** (`src/engine/session_spec.cpp:17-29`,
    read at `:860`, `:954`, `:1981`; set by `tools/confhead/bench.sh:33`,
    `collect.sh:45`, `smoke.sh:26`): a draft-schedule knob.  The confidence
    head trims the verify batch to the drafts above tau, which changes WHICH

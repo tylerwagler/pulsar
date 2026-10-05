@@ -136,11 +136,11 @@ char *agent_default_cache_dir(void) {
 
 
 
-char *agent_kv_path_for_sha(const char *dir, const char sha[41]) {
-    char name[44];
+char *agent_session_path_for_sha(const char *dir, const char sha[41]) {
+    char name[49];
     memcpy(name, sha, 40);
-    memcpy(name + 40, ".kv", 4);
-    return pulsar_kvstore_path_join(dir, name);
+    memcpy(name + 40, ".session", 9);
+    return pulsar_kvtext_path_join(dir, name);
 }
 
 
@@ -162,7 +162,7 @@ void agent_session_identity_sha(const char *title, uint64_t created_at,
     uint8_t ts[8];
     agent_le_put64(ts, created_at);
     agent_buf_append(&b, (const char *)ts, sizeof(ts));
-    pulsar_kvstore_sha1_bytes_hex(b.ptr ? b.ptr : "", b.len, sha_out);
+    pulsar_kvtext_sha1_bytes_hex(b.ptr ? b.ptr : "", b.len, sha_out);
     free(b.ptr);
 }
 
@@ -173,14 +173,8 @@ void agent_worker_clear_session_identity(agent_worker *w) {
     free(w->session_title);
     w->session_title = NULL;
     w->session_created_at = 0;
-    free(w->legacy_session_path_to_delete);
-    w->legacy_session_path_to_delete = NULL;
 }
 
 
 
-void agent_kv_session_meta_free(agent_kv_session_meta *m) {
-    free(m->title);
-    memset(m, 0, sizeof(*m));
-}
 

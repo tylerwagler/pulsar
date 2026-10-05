@@ -82,10 +82,7 @@ model.  Record pass/fail against the release commit:
   (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the
   shipped artifact and the gate cannot certify the release.  Rebuild the blob
   with `make cuda-prefill-gate-baseline` after bumping the ref.
-- `make cuda-evict-restore-gate` and `make cuda-fork-gate` — bank evict/restore
-  bit-identity and fork==cold oracle (covers warm-fork routing).  Since L115
-  the fork validators compare BYTES, not token ids, so this gate also covers
-  forking a conversation onto its own history across token-boundary seams.
+- `make cuda-evict-restore-gate` — bank evict/restore bit-identity.
 - `make cuda-rewind-gate` — compressor frontier position-truth across ghost
   rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
   ratio-128 boundary, plus the value leg (a ghost rewind must not contaminate
@@ -100,8 +97,6 @@ model.  Record pass/fail against the release commit:
   Discovers a seam pair from the model's own vocabulary, then pins the byte
   walk, the sync rescue, the shorter-echo shape, and a fork across seams.
   Needs `PULSAR_MSEQ_BANKS>=2` for its fork leg (the target sets it).
-- `warm_fork_3way` / `warm_partial_fork_3way` (`make warm-fork-3way
-  warm-partial-fork-3way`) — server-level warm-fork determinism.
 - `make cuda-frontier-gate`, `make cuda-multiseq-gate`,
   `make cuda-multiseq-gate-nodspark` — multiseq isolation and throughput.
 - `make cuda-bank-spec-gate`, `make cuda-accounting-gate`,

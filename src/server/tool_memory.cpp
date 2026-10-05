@@ -292,28 +292,6 @@ void visible_live_free(visible_live_state *st) {
 
 
 
-void server::thinking_live_clear(session_slot *sl) {
-    auto *s = this;
-    if (!s || !sl) return;
-    pulsar::ScopedLock lk(&s->tool_mu);
-    visible_live_clear_locked(&sl->thinking_live);
-}
-
-
-
-void server::thinking_live_remember(session_slot *sl, const char *visible_text) {
-    auto *s = this;
-    if (!s || !sl || !visible_text || !visible_text[0]) return;
-    pulsar::ScopedLock lk(&s->tool_mu);
-    visible_live_clear_locked(&sl->thinking_live);
-    sl->thinking_live.visible_text = xstrdup(visible_text);
-    sl->thinking_live.visible_len = strlen(visible_text);
-    sl->thinking_live.live_tokens = s->slot_frontier_pos(sl);
-    sl->thinking_live.valid = true;
-}
-
-
-
 void server::responses_live_remember(session_slot *sl, const char *visible_text,
                                     const tool_calls *calls) {
     auto *s = this;

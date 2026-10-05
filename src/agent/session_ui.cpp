@@ -98,30 +98,6 @@ static char *agent_session_title_clip(const char *title, size_t max_bytes) {
 
 
 
-static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return xstrdup("(unreadable session)");
-    pulsar_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    char *text = NULL;
-    char *trailer_title = NULL;
-    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
-    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
-    fclose(fp);
-    char *title = ok ?
-        (trailer_title ?
-            agent_session_title_clip(trailer_title, max_bytes) :
-            agent_session_title_from_text(text, text_bytes, max_bytes)) :
-        xstrdup("(unreadable session)");
-    free(trailer_title);
-    free(text);
-    return title;
-}
-
-
-
 static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
                                     agent_history_mark mark) {
     if (p->len == p->cap) {
@@ -582,7 +558,7 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
         return false;
     }
     size_t text_len = 0;
-    char *text = pulsar_kvstore_render_tokens_text(w->engine, &w->transcript,
+    char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript,
                                                 &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
@@ -598,81 +574,85 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
 static int agent_session_list_cmp_recent(const void *a, const void *b) {
     const agent_session_list_item *sa = (const agent_session_list_item *)a;
     const agent_session_list_item *sb = (const agent_session_list_item *)b;
-    uint64_t ta = sa->entry.last_used ? sa->entry.last_used : sa->entry.created_at;
-    uint64_t tb = sb->entry.last_used ? sb->entry.last_used : sb->entry.created_at;
+    uint64_t ta = sa->f.last_used ? sa->f.last_used : sa->f.created_at;
+    uint64_t tb = sb->f.last_used ? sb->f.last_used : sb->f.created_at;
     if (ta < tb) return 1;
     if (ta > tb) return -1;
-    return strcmp(sa->entry.sha, sb->entry.sha);
+    return strcmp(sa->sha, sb->sha);
+}
+
+
+
+/* <40 hex>.session -> the sha. */
+static bool agent_session_name_sha(const char *name, char sha[41]) {
+    if (strlen(name) != 48 || strcmp(name + 40, ".session") != 0) return false;
+    for (int i = 0; i < 40; i++)
+        if (!isxdigit((unsigned char)name[i])) return false;
+    memcpy(sha, name, 40);
+    sha[40] = '\0';
+    return true;
+}
+
+
+
+/* Every saved session of this model whose sha starts with `prefix` ("" for
+ * all), read and verified; the caller frees with agent_session_list_free. */
+static int agent_session_scan(agent_worker *w, const char *prefix, agent_session_list_item **out) {
+    *out = NULL;
+    DIR *d = opendir(w->cache_dir);
+    if (!d) return 0;
+    const size_t plen = strlen(prefix);
+    const uint32_t model_id = (uint32_t)pulsar_engine_model_id(w->engine);
+    int len = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!agent_session_name_sha(de->d_name, sha)) continue;
+        if (plen && strncasecmp(sha, prefix, plen) != 0) continue;
+        char *path = pulsar_kvtext_path_join(w->cache_dir, de->d_name);
+        agent_session_file f;
+        char err[96];
+        const bool ok = agent_session_file_read(path, &f, err, sizeof(err));
+        free(path);
+        if (!ok) continue;
+        if (f.model_id != model_id) {
+            agent_session_file_free(&f);
+            continue;
+        }
+        if (len == cap) {
+            cap = cap ? cap * 2 : 16;
+            *out = (agent_session_list_item *)agent_xrealloc(*out, (size_t)cap * sizeof((*out)[0]));
+        }
+        memcpy((*out)[len].sha, sha, 41);
+        (*out)[len].f = f;
+        len++;
+    }
+    closedir(d);
+    return len;
 }
 
 
 
 static void agent_session_list_free(agent_session_list_item *v, int n) {
-    for (int i = 0; i < n; i++) {
-        pulsar_kvstore_entry_free(&v[i].entry);
-        free(v[i].title);
-    }
+    for (int i = 0; i < n; i++) agent_session_file_free(&v[i].f);
     free(v);
 }
 
 
 
-static void agent_session_list_push(agent_session_list_item **v, int *len,
-                                    int *cap, pulsar_kvstore_entry entry,
-                                    char *title) {
-    if (*len == *cap) {
-        *cap = *cap ? *cap * 2 : 16;
-        *v = (agent_session_list_item *)agent_xrealloc(*v, (size_t)*cap * sizeof((*v)[0]));
-    }
-    (*v)[(*len)++] = (agent_session_list_item){
-        .entry = entry,
-        .title = title,
-    };
-}
-
-
-
-/* Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
- * ignored because it is an implementation cache, not a user session. */
+/* Print resumable sessions from <cache>/<sha>.session. */
 void agent_worker_list_sessions(agent_worker *w) {
-    DIR *d = opendir(w->cache_dir);
-    if (!d) {
-        printf("no sessions: %s\n", strerror(errno));
-        return;
-    }
-
     int cols = renderer_terminal_cols();
     size_t title_budget = cols > 16 ? (size_t)(cols - 12) : 20;
     if (title_budget > 160) title_budget = 160;
 
     agent_session_list_item *sessions = NULL;
-    int sessions_len = 0, sessions_cap = 0;
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) {
-                char *title = agent_session_title_from_file(path, title_budget);
-                agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
-                                        e, title);
-            } else {
-                pulsar_kvstore_entry_free(&e);
-            }
-        }
-        free(path);
-    }
-    closedir(d);
+    const int sessions_len = agent_session_scan(w, "", &sessions);
     if (!sessions_len) {
         printf("no saved sessions\n");
         return;
     }
-
-    qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]),
-          agent_session_list_cmp_recent);
+    qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]), agent_session_list_cmp_recent);
 
     bool color = isatty(STDOUT_FILENO) != 0;
     const char *sha_on = color ? "\x1b[1;96m" : "";
@@ -682,47 +662,20 @@ void agent_worker_list_sessions(agent_worker *w) {
     const char *reset = color ? "\x1b[0m" : "";
 
     for (int i = 0; i < sessions_len; i++) {
-        pulsar_kvstore_entry *e = &sessions[i].entry;
+        const agent_session_file *f = &sessions[i].f;
         char age[32];
-        agent_format_age(e->last_used ? e->last_used : e->created_at,
-                         age, sizeof(age));
+        agent_format_age(f->last_used ? f->last_used : f->created_at, age, sizeof(age));
+        char *title = agent_session_title_clip(f->title, title_budget);
         printf("%s%.8s%s %s>%s %s%s%s\n",
-               sha_on, e->sha, reset, dim, reset,
-               title_on, sessions[i].title, reset);
-        printf("         %s> %s, %u tokens, %.2f MB%s%s\n\n",
-               dim, age, e->tokens,
-               (double)e->file_size / (1024.0 * 1024.0),
-               e->payload_bytes == 0 ? ", stripped" : "",
-               reset);
+               sha_on, sessions[i].sha, reset, dim, reset,
+               title_on, title, reset);
+        printf("         %s> %s, %d tokens%s\n\n", dim, age, f->tokens.len, reset);
+        free(title);
     }
     printf("%sUse /switch <id> to select a session, /del <id> to remove, "
-           "/strip <id> to strip KV cache.%s\n",
+           "/strip <id> to release its cached KV.%s\n",
            help_on, reset);
     agent_session_list_free(sessions, sessions_len);
-}
-
-
-
-static void agent_completion_sessions_push(agent_completion_sessions *s,
-                                           const char sha[41],
-                                           uint64_t last_used) {
-    if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 16;
-        s->v = (agent_completion_session *)agent_xrealloc(s->v, (size_t)s->cap * sizeof(s->v[0]));
-    }
-    memcpy(s->v[s->len].sha, sha, 41);
-    s->v[s->len].last_used = last_used;
-    s->len++;
-}
-
-
-
-static int agent_completion_session_cmp(const void *a, const void *b) {
-    const agent_completion_session *sa = (const agent_completion_session *)a;
-    const agent_completion_session *sb = (const agent_completion_session *)b;
-    if (sa->last_used < sb->last_used) return 1;
-    if (sa->last_used > sb->last_used) return -1;
-    return strcmp(sa->sha, sb->sha);
 }
 
 
@@ -747,50 +700,23 @@ void agent_switch_completion_callback(const char *buf,
     }
     if (prefix_len > 40) return;
 
-    DIR *d = opendir(w->cache_dir);
-    if (!d) return;
-
-    agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        if (prefix_len && strncasecmp(sha, prefix, prefix_len) != 0) continue;
-
-        uint64_t last_used = 0;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) last_used = e.last_used;
-            else last_used = UINT64_MAX;
-            pulsar_kvstore_entry_free(&e);
-        } else {
-            last_used = UINT64_MAX;
-        }
-        free(path);
-        if (last_used == UINT64_MAX) continue;
-        agent_completion_sessions_push(&sessions, sha, last_used);
-    }
-    closedir(d);
-
-    qsort(sessions.v, (size_t)sessions.len, sizeof(sessions.v[0]),
-          agent_completion_session_cmp);
-    for (int i = 0; i < sessions.len; i++) {
+    agent_session_list_item *sessions = NULL;
+    const int n = agent_session_scan(w, prefix, &sessions);
+    qsort(sessions, (size_t)n, sizeof(sessions[0]), agent_session_list_cmp_recent);
+    for (int i = 0; i < n; i++) {
         char line[64];
         int sha_chars = prefix_len > 8 ? 40 : 8;
-        snprintf(line, sizeof(line), "/switch %.*s",
-                 sha_chars, sessions.v[i].sha);
+        snprintf(line, sizeof(line), "/switch %.*s", sha_chars, sessions[i].sha);
         linenoiseAddCompletion(lc, line);
     }
-    free(sessions.v);
+    agent_session_list_free(sessions, n);
 }
 
 
 
-/* Resolve a user-provided SHA prefix to exactly one saved session file. */
+/* Resolve a user-provided SHA prefix to exactly one saved session. */
 static bool agent_worker_find_session(agent_worker *w, const char *prefix,
-                                      char sha_out[41], char **path_out,
+                                      char sha_out[41], agent_session_file *f_out,
                                       char *err, size_t err_len) {
     size_t plen = strlen(prefix);
     if (plen == 0 || plen > 40) {
@@ -803,51 +729,37 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
             return false;
         }
     }
-
-    DIR *d = opendir(w->cache_dir);
-    if (!d) {
-        snprintf(err, err_len, "%s", strerror(errno));
+    agent_session_list_item *sessions = NULL;
+    const int n = agent_session_scan(w, prefix, &sessions);
+    if (n != 1) {
+        if (n == 0) snprintf(err, err_len, "no saved session matches %.40s", prefix);
+        else snprintf(err, err_len, "session prefix %.40s is ambiguous", prefix);
+        agent_session_list_free(sessions, n);
         return false;
     }
-    int matches = 0;
-    char match_sha[41] = {0};
-    char *match_path = NULL;
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        if (strncasecmp(sha, prefix, plen) != 0) continue;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        bool same_model = pulsar_kvstore_read_entry_file(path, sha, &e) &&
-                          e.model_id == model_id;
-        pulsar_kvstore_entry_free(&e);
-        if (!same_model) {
-            free(path);
-            continue;
-        }
-        matches++;
-        if (matches == 1) {
-            memcpy(match_sha, sha, sizeof(match_sha));
-            match_path = path;
-        } else {
-            free(path);
-        }
-    }
-    closedir(d);
-    if (matches == 0) {
-        snprintf(err, err_len, "no saved session matches %.40s", prefix);
-        return false;
-    }
-    if (matches > 1) {
-        snprintf(err, err_len, "session prefix %.40s is ambiguous", prefix);
-        free(match_path);
-        return false;
-    }
-    memcpy(sha_out, match_sha, 41);
-    *path_out = match_path;
+    memcpy(sha_out, sessions[0].sha, 41);
+    *f_out = sessions[0].f;
+    memset(&sessions[0].f, 0, sizeof(sessions[0].f));
+    agent_session_list_free(sessions, n);
     return true;
+}
+
+
+
+/* Release the KV only this session's chain holds: the segments past the last
+ * one any other chain shares, never the system prompt's.  The session keeps its
+ * exact ids, so switching to it later prefills what was released. */
+static uint64_t agent_session_release_kv(agent_worker *w, const agent_session_file *f) {
+    if (!w->kv || f->tokens.len <= 0) return 0;
+    size_t text_len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(w->engine, &f->tokens, &text_len);
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, chain, PULSAR_KVCHAIN_MAX) : 0;
+    free(text);
+    if (n == 0) return 0;
+    char sys_tip[41];
+    agent_kv_system_tip(w, sys_tip);
+    return pulsar_segstore_release(w->kv, chain[n - 1].key, sys_tip[0] ? sys_tip : NULL);
 }
 
 
@@ -855,162 +767,51 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
 bool agent_worker_delete_session(agent_worker *w, const char *prefix,
                                         char sha_out[41],
                                         char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
     char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
-        return false;
-    if (unlink(path) != 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(path);
-        return false;
-    }
-    if (sha_out) memcpy(sha_out, sha, 41);
-    free(path);
-    return true;
-}
-
-
-
-/* Strip the heavy backend payload from a saved session while preserving its
- * rendered transcript. Loading such a file later tokenizes the text and
- * rebuilds the live KV with a full prefill. */
-bool agent_worker_strip_session(agent_worker *w, const char *prefix,
-                                       char sha_out[41],
-                                       uint32_t *tokens_out,
-                                       char *err, size_t err_len) {
-    if (err && err_len) err[0] = '\0';
-    char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
-        return false;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(path);
-        return false;
-    }
-
-    pulsar_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    char *text = NULL;
-    char *title = NULL;
-    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, err, err_len);
-    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
-    /* The exact ids, when the file carries them: a stripped file must stay
-     * restorable WITHOUT re-tokenising its text (L223 -- the text cannot tell a
-     * control token from its literal spelling).  Read while the file is OPEN; a
-     * legacy file has no trailer and then the rendered text is the only count
-     * available, which is also what the loader rebuilds from. */
-    pulsar_tokens trailer = {0};
-    bool have_trailer = ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_AGENT_TOKENS) &&
-                        agent_kv_read_token_trailer(fp, &hdr, &trailer, err, err_len);
-    fclose(fp);
-    if (!ok) {
-        if (!err[0]) snprintf(err, err_len, "failed to read session");
-        free(title);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    char actual_sha[41];
-    agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
-    if (strcmp(actual_sha, sha)) {
-        snprintf(err, err_len, "cached session identity does not match file name");
-        free(title);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    uint32_t stripped_token_count = 0;
-    if (have_trailer) {
-        stripped_token_count = (uint32_t)trailer.len;
-    } else {
-        pulsar_tokens rebuilt = {0};
-        pulsar_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        stripped_token_count = (uint32_t)rebuilt.len;
-        pulsar_tokens_free(&rebuilt);
-    }
-
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(tmp);
-        pulsar_tokens_free(&trailer);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    fp = fdopen(fd, "wb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        close(fd);
-        unlink(tmp);
-        free(tmp);
-        pulsar_tokens_free(&trailer);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
-    uint64_t now = (uint64_t)time(NULL);
-    const uint8_t ext_flags =
-        have_trailer ? (uint8_t)(hdr.ext_flags | PULSAR_KVSTORE_EXT_AGENT_TOKENS)
-                     : (uint8_t)(hdr.ext_flags & ~PULSAR_KVSTORE_EXT_AGENT_TOKENS);
-    pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
-    uint8_t tb[4];
-    pulsar_kvstore_le_put32(tb, text_bytes);
-
-    errno = 0;
-    ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-         fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-         fwrite(text, 1, text_bytes, fp) == text_bytes &&
-         (!(hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) ||
-          agent_kv_write_title_trailer(fp, title, err, err_len)) &&
-         (!have_trailer || agent_kv_write_token_trailer(fp, &trailer, err, err_len)) &&
-         fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
-    }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) : "failed to write stripped session");
-        unlink(tmp);
-    } else {
-        if (sha_out) memcpy(sha_out, sha, 41);
-        if (tokens_out) *tokens_out = stripped_token_count;
-    }
-
-    free(tmp);
-    free(title);
-    pulsar_tokens_free(&trailer);
-    free(text);
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    char *path = agent_session_path_for_sha(w->cache_dir, sha);
+    const bool ok = unlink(path) == 0;
+    if (!ok) snprintf(err, err_len, "%s", strerror(errno));
+    else (void)agent_session_release_kv(w, &f);
+    if (ok && sha_out) memcpy(sha_out, sha, 41);
+    agent_session_file_free(&f);
     free(path);
     return ok;
 }
 
 
 
-/* Load a saved session KV into the live transcript and optionally replay recent
- * history for the human. */
+/* Release a saved session's cached KV while keeping the session (L264: its KV
+ * lives in the shared segment store; only the stretch no other chain uses
+ * goes).  *bytes_out: what was freed. */
+bool agent_worker_strip_session(agent_worker *w, const char *prefix,
+                                       char sha_out[41],
+                                       uint64_t *bytes_out,
+                                       char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+    char sha[41];
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    const uint64_t freed = agent_session_release_kv(w, &f);
+    if (sha_out) memcpy(sha_out, sha, 41);
+    if (bytes_out) *bytes_out = freed;
+    agent_session_file_free(&f);
+    return true;
+}
+
+
+
+/* Load a saved session into the live transcript -- the deepest chain the store
+ * holds for it, then the rest by prefill from its exact ids -- and optionally
+ * replay recent history for the human. */
 bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,
                                         char *err, size_t err_len) {
@@ -1019,36 +820,28 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         return false;
     }
     char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    if (f.tokens.len <= 0) {
+        snprintf(err, err_len, "saved session %.8s holds no tokens", sha);
+        agent_session_file_free(&f);
         return false;
-
-    bool stripped = false;
-    pulsar_kvstore_entry entry = {0};
-    if (pulsar_kvstore_read_entry_file(path, sha, &entry)) {
-        stripped = entry.payload_bytes == 0;
-        pulsar_kvstore_entry_free(&entry);
     }
-    if (stripped) {
-        printf("rebuilding stripped session %.8s from rendered text...\n", sha);
+    const int cached = agent_kv_load(w, &f.tokens);
+    if (cached < f.tokens.len) {
+        printf("restoring session %.8s: %d of %d tokens cached, prefilling the rest...\n",
+               sha, cached, f.tokens.len);
         fflush(stdout);
     }
-
-    pulsar_tokens loaded = {0};
-    agent_kv_session_meta meta = {0};
-    /* rebuild_from_text=true: a stripped session's only content is its rendered
-     * text (see the loader's note on why that rebuild is lossy). */
-    bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
-                                 true, err, err_len);
+    const bool ok = agent_worker_sync_tokens(w, &f.tokens, true, err, err_len) == 0;
     if (ok) {
         pulsar_tokens_free(&w->transcript);
-        w->transcript = loaded;
+        w->transcript = f.tokens;
+        memset(&f.tokens, 0, sizeof(f.tokens));
         free(w->session_title);
-        w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
-        w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
+        w->session_title = f.title && f.title[0] ? xstrdup(f.title) : xstrdup("(no user prompt)");
+        w->session_created_at = f.created_at ? f.created_at : (uint64_t)time(NULL);
         memcpy(w->session_sha, sha, sizeof(w->session_sha));
-        free(w->legacy_session_path_to_delete);
-        w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
         w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
@@ -1062,15 +855,10 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->status.error[0] = '\0';
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
-        printf("switched to session %.8s (%d tokens%s)\n",
-               sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+        printf("switched to session %.8s (%d tokens)\n", sha, w->transcript.len);
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
-    } else {
-        pulsar_tokens_free(&loaded);
     }
-    agent_kv_session_meta_free(&meta);
-    free(path);
+    agent_session_file_free(&f);
     return ok;
 }
-

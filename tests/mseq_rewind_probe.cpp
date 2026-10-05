@@ -62,11 +62,10 @@ static void show(pulsar_session *s, const char *when, int pos) {
 int GATE_ENTRY(int argc, char **argv) {
     g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
-    /* Leg 2 needs a bank pool: the boundary stash is allocated with it
-     * (n_banks * N_LAYER rows), so an unpooled run cannot reach the escape.
-     * Set BEFORE anything opens an engine or reads the pool size -- that read
-     * is cached on first use, and the engine-open path gets there first.
-     * overwrite=0, so an explicit caller value still wins. */
+    /* The served shape is a bank pool.  Set BEFORE anything opens an engine or
+     * reads the pool size -- that read is cached on first use, and the
+     * engine-open path gets there first.  overwrite=0, so an explicit caller
+     * value still wins. */
     setenv("PULSAR_MSEQ_BANKS", "4", 0);
     pulsar_engine *e = NULL;
     pulsar_engine_options opt;
@@ -139,7 +138,10 @@ int GATE_ENTRY(int argc, char **argv) {
     }
 
     /* round 2 on the SAME bank with no intervening switch-away -- the shape
-     * that has no publisher for the clamp. Does step_begin reject? */
+     * that has no publisher for the clamp.  Since L264 the rewind leaves the
+     * bank STALE (its lanes and window describe position 606, not 603), so the
+     * step must REFUSE rather than pool a wrong row: before L264 it was
+     * accepted against a lane the projection ring may or may not have rebuilt. */
     pulsar_multiseq_req req2;
     req2.bank = 0u; req2.pos = (int32_t)pulsar_session_pos(s); req2.token = toks[700];
     uint32_t got2 = 0;
@@ -147,58 +149,34 @@ int GATE_ENTRY(int argc, char **argv) {
                                                 (int)PULSAR_N_VOCAB, &got2, 0u,
                                                 err, sizeof err);
     printf("\nround 2 on same bank after rewind: rc=%d%s\n", rc2,
-           rc2 == 0 ? "  (ACCEPTED)" : "  <-- REJECTED, L120's shape");
-    CHECK(rc2 == 0, "step on a rewound bank rejected (L120's production shape): %s",
-          rc2 != 0 ? err : "");
+           rc2 != 0 ? "  (REFUSED: the bank is stale)" : "  <-- ACCEPTED on a stale bank");
+    CHECK(rc2 != 0, "a multiseq step on a bank rewound off its grid checkpoints was accepted");
 
-    /* LEG 2 -- an out-of-reach BOUNDARY.  The carry for the group ENDING at G
-     * needs [G-ratio, G), and the ring's span starts at 318 here, so a boundary
-     * below it cannot be replayed.  This is the shape production hits: a SHORT
-     * prefill that starts on the resume grid point sets the span's lo to that
-     * point, so the boundary at G wants exactly the group that is missing and the
-     * resume fell back to prefilling the prompt from 0 (2026-09-19 23:24:11:
-     * "resume at 62329 ... compressor state at grid point 62208 could not be
-     * re-established -- prefilling the prompt from 0").
-     *
-     * The assertion is deliberately NOT "the next step is accepted".  An empty
-     * lane survives a boundary store and pools a WRONG row silently -- that is how
-     * this gate's old green was a false pass at 603.  What has teeth is what the
-     * NEXT SYNC does: an unrepaired state makes it set resume_origin = 0 and
-     * PREFILL THE WHOLE PROMPT, which is the full-conversation rebuild the
-     * objective is about. */
+    /* The sync that follows a rewind in production restores the grid checkpoint
+     * the prefill left at 512 (its last grid point below 600) and re-prefills to
+     * the frontier; the same step is then accepted.  As in the server, the bank
+     * is re-established first (server::bank_switch -> bank_state_restore): a
+     * multiseq step invalidates the session's single-bank bookkeeping, and a
+     * sync without it rebuilds from 0 by contract. */
+    CHECK(pulsar_session_bank_state_restore(s, 0u), "bank_state_restore(0) before the restoring sync failed");
     {
-        const uint32_t ratio2 = pulsar_layer_compress_ratio(2);
-        const int G = 256;
-        pulsar_gpu_graph *g = &s->graph;
-        const uint32_t rbank = g->banks.n_banks ? g->banks.cur_bank : 0u;
-        /* The boundary stash is allocated WITH the bank pool, so an unpooled run
-         * cannot exercise this leg at all.  The battery runs every runner gate in
-         * ONE process and that process reads the pool size (cached) before this
-         * gate's GATE_ENTRY runs, so the setenv above cannot win there -- hence a
-         * printed SKIP here and the real vehicle is the STANDALONE target, whose
-         * recipe sets PULSAR_MSEQ_BANKS before the process starts.  A printed
-         * SKIP, never a silent pass (the L080 precedent). */
-        if (g->banks.n_banks == 0) {
-            printf("leg 2 SKIPPED: no bank pool in this process (the boundarystash is "
-                   "allocated with it).  Vehicle: make cuda-mseq-rewind-gate, which "
-                   "sets PULSAR_MSEQ_BANKS in its recipe.\n");
-        } else {
-        printf("\nleg 2: compressor rewind to boundary %d (layer 2 ratio %u, ring span starts "
-               "above it)\n", G, ratio2);
-        CHECK(ratio2 != 0u && (uint32_t)G % ratio2 == 0u, "G must be a ratio-%u boundary", ratio2);
-        /* ASSERT ON THE GRAPH CALL'S RETURN, not on session state: this harness's
-         * checkpoint_valid is false from the start, and an empty lane survives a
-         * boundary store either way, so neither separates repair from refusal.
-         * false here IS the refusal that makes the caller rebuild the conversation. */
-        CHECK(gpu_graph_compressor_state_rewind(g, rbank, (uint32_t)G,
-                                                (uint32_t)pulsar_session_pos(s)),
-              "compressor rewind to boundary %d REFUSED: the carry group [%d, %d) is out of "
-              "ring coverage and the boundary stash escape did not arm",
-              G, G - (int)ratio2, G);
-        pulsar_session_rewind(s, G);
-        CHECK(pulsar_session_pos(s) == G, "rewind did not land on %d (pos %d)", G,
-              pulsar_session_pos(s));
-        }
+        pulsar_tokens q;
+        memset(&q, 0, sizeof(q));
+        q.v = toks; q.len = q.cap = target + 1;
+        const int src = pulsar_session_sync(s, &q, err, sizeof err);
+        CHECK(src == 0, "the restoring sync failed: %s", src != 0 ? err : "");
+        CHECK(pulsar_session_resume_origin(s) == 512,
+              "the restoring sync resumed from %d, want the grid checkpoint 512",
+              pulsar_session_resume_origin(s));
+        show(s, "after the restoring sync", pulsar_session_pos(s));
+        pulsar_session_bank_state_save(s, 0u);
+        pulsar_multiseq_req req3;
+        req3.bank = 0u; req3.pos = (int32_t)pulsar_session_pos(s); req3.token = toks[701];
+        uint32_t got3 = 0;
+        const int rc3 = pulsar_session_decode_mixed(s, &req3, 1u, logits,
+                                                    (int)PULSAR_N_VOCAB, &got3, 0u,
+                                                    err, sizeof err);
+        CHECK(rc3 == 0, "a step after the restoring sync was rejected: %s", rc3 != 0 ? err : "");
     }
 
     free(logits);

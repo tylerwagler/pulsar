@@ -38,11 +38,6 @@
 
 #include <atomic>
 #include <dlfcn.h>
-#include <dirent.h>
-#include <signal.h>
-#include <algorithm>
-#include <string>
-#include <vector>
 #include <new>
 #include <pthread.h>
 
@@ -3732,32 +3727,6 @@ int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t ban
     return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, bank);
 }
 
-typedef struct {
-    uint64_t session_id;
-    int32_t src;
-    int32_t dst;
-    int32_t n_cached;
-    uint32_t count;      /* request tokens following the header */
-} pulsar_tp_fork_command_header;
-
-int pulsar_tp_send_bank_fork(pulsar_tp *tp, int partial, uint64_t session_id,
-                             uint32_t src, uint32_t dst,
-                             const int *tokens, uint32_t n_tokens, int n_cached) {
-    const uint64_t bytes64 = sizeof(pulsar_tp_fork_command_header) + (uint64_t)n_tokens * sizeof(int32_t);
-    if (!tp || (n_tokens && !tokens) || bytes64 > UINT32_MAX) return 0;
-    const uint32_t bytes = (uint32_t)bytes64;
-    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
-    if (!payload) return 0;
-    pulsar_tp_fork_command_header h = { session_id, (int32_t)src, (int32_t)dst, (int32_t)n_cached, n_tokens };
-    memcpy(payload, &h, sizeof(h));
-    int32_t *wire = reinterpret_cast<int32_t *>(payload + sizeof(h));
-    for (uint32_t i = 0; i < n_tokens; i++) wire[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame_to_peers(tp,
-            partial ? PULSAR_TP_FRAME_BANK_FORK_PARTIAL : PULSAR_TP_FRAME_BANK_FORK, payload, bytes);
-    free(payload);
-    return ok;
-}
-
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
  * and pulsar_tp_wait_command_status_digest (want_digest 1). */
 static int tp_settle_deferred(pulsar_tp *tp, char *err, size_t errlen);
@@ -3932,154 +3901,40 @@ int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_t
     return ok;
 }
 
-int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
-}
-int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, bank);
-}
-
-typedef struct {
-    uint64_t session_id;
-    int32_t bank;
-    uint32_t key_len;    /* bytes of key following, without a terminator */
-} pulsar_tp_spill_command_header;
-
-static int tp_send_keyed(pulsar_tp *tp, uint32_t type, uint64_t session_id, int32_t value,
-                         const char *key) {
-    if (!tp || !key || !key[0]) return 0;
-    const size_t kl = strlen(key);
-    if (kl > 4096) return 0;
-    const uint32_t bytes = (uint32_t)(sizeof(pulsar_tp_spill_command_header) + kl);
-    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
-    if (!payload) return 0;
-    pulsar_tp_spill_command_header h = { session_id, value, (uint32_t)kl };
-    memcpy(payload, &h, sizeof(h));
-    memcpy(payload + sizeof(h), key, kl);
-    const int ok = tp_send_frame_to_peers(tp, type, payload, bytes);
-    free(payload);
-    return ok;
-}
-
-int pulsar_tp_send_bank_kv(pulsar_tp *tp, int load, uint64_t session_id, uint32_t bank, const char *key) {
-    return tp_send_keyed(tp, load ? PULSAR_TP_FRAME_BANK_KV_LOAD : PULSAR_TP_FRAME_BANK_KV_SAVE,
-                         session_id, (int32_t)bank, key);
-}
-
-int pulsar_tp_send_kvstore(pulsar_tp *tp, pulsar_tp_frame_type type, uint64_t session_id,
-                           const char *key, int32_t value) {
-    if (type != PULSAR_TP_FRAME_KVSTORE_SAVE && type != PULSAR_TP_FRAME_KVSTORE_DROP) return 0;
-    return tp_send_keyed(tp, (uint32_t)type, session_id, value, key);
-}
-
-typedef struct {
-    uint64_t session_id;
-    int32_t n_tokens;
-    uint32_t key_len;    /* bytes of key following, without a terminator */
-    uint64_t digest;
-} pulsar_tp_kvload_command_header;
-
-typedef struct {
-    uint64_t session_id;   /* 0: not a session operation */
-    uint32_t n_keys;
-    uint32_t reserved;
-} pulsar_tp_kvreconcile_command_header;
-
-int pulsar_tp_send_kvstore_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys) {
-    if (!tp || (n_keys > 0 && !keys) || n_keys > (1u << 20)) return 0;
-    const uint64_t bytes64 = sizeof(pulsar_tp_kvreconcile_command_header) + (uint64_t)n_keys * 40u;
-    uint8_t *payload = static_cast<uint8_t *>(malloc((size_t)bytes64));
-    if (!payload) return 0;
-    pulsar_tp_kvreconcile_command_header h = { 0u, n_keys, 0u };
-    memcpy(payload, &h, sizeof(h));
-    if (n_keys) memcpy(payload + sizeof(h), keys, (size_t)n_keys * 40u);
-    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_KVSTORE_RECONCILE, payload, (uint32_t)bytes64);
-    free(payload);
-    return ok;
-}
-
-static bool tp_kv_hex40(const char *p) {
+bool pulsar_tp_segment_key_ok(const char *key) {
+    if (!key) return false;
     for (int i = 0; i < 40; i++) {
-        const char c = p[i];
+        const char c = key[i];
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     }
     return true;
 }
 
-bool pulsar_tp_kv_blob_name(const char *name, char key[41]) {
-    static const char pre[] = "tp-kv-", suf[] = ".payload";
-    const size_t lp = sizeof(pre) - 1u, ls = sizeof(suf) - 1u;
-    if (!name || strlen(name) != lp + 40u + ls || strncmp(name, pre, lp) != 0 ||
-        strcmp(name + lp + 40u, suf) != 0 || !tp_kv_hex40(name + lp)) return false;
-    if (key) { memcpy(key, name + lp, 40u); key[40] = '\0'; }
-    return true;
+int pulsar_tp_send_segment(pulsar_tp *tp, pulsar_tp_frame_type type, const pulsar_tp_segment_command *cmd) {
+    if (!cmd || !pulsar_tp_segment_key_ok(cmd->key) ||
+        (type != PULSAR_TP_FRAME_SEGMENT_SAVE && type != PULSAR_TP_FRAME_SEGMENT_LOAD &&
+         type != PULSAR_TP_FRAME_SEGMENT_DROP)) return 0;
+    return tp_send_frame_to_peers(tp, (uint32_t)type, cmd, sizeof(*cmd));
 }
 
-/* "tp-kv-<key>.payload.tmp.<pid>" whose writer is gone (the worker's own
- * tmp + rename recipe, interrupted). */
-static bool tp_kv_abandoned_tmp(const char *name) {
-    const char *t = strstr(name, ".payload.tmp.");
-    if (!t) return false;
-    char base[128];
-    const size_t n = (size_t)(t - name) + strlen(".payload");
-    if (n >= sizeof(base)) return false;
-    memcpy(base, name, n);
-    base[n] = '\0';
-    if (!pulsar_tp_kv_blob_name(base, NULL)) return false;
-    char *end = NULL;
-    const long pid = strtol(t + strlen(".payload.tmp."), &end, 10);
-    if (!end || *end != '\0' || pid <= 0) return false;
-    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
-}
-
-bool pulsar_tp_kv_reconcile_dir(const char *dir, const char *keys, uint32_t n_keys,
-                                int *kept, int *removed, char *err, size_t errlen) {
-    if (kept) *kept = 0;
-    if (removed) *removed = 0;
-    DIR *d = dir ? opendir(dir) : NULL;
-    if (!d) {
-        tp_set_err(err, errlen, "cannot read %s: %s", dir ? dir : "(null)", strerror(errno));
-        return false;
-    }
-    std::vector<std::string> live;
-    live.reserve(n_keys);
-    for (uint32_t i = 0; i < n_keys; i++) live.emplace_back(keys + (size_t)i * 40u, 40u);
-    std::sort(live.begin(), live.end());
-    std::vector<std::string> doomed;
-    while (struct dirent *de = readdir(d)) {
-        char key[41];
-        if (pulsar_tp_kv_blob_name(de->d_name, key)) {
-            if (std::binary_search(live.begin(), live.end(), std::string(key, 40u))) {
-                if (kept) (*kept)++;
-            } else {
-                doomed.emplace_back(de->d_name);
-            }
-        } else if (tp_kv_abandoned_tmp(de->d_name)) {
-            doomed.emplace_back(de->d_name);
-        }
-    }
-    closedir(d);
-    for (const std::string &name : doomed) {
-        const std::string path = std::string(dir) + "/" + name;
-        if (unlink(path.c_str()) == 0 && removed) (*removed)++;
-    }
-    return true;
-}
-
-int pulsar_tp_send_kvstore_load(pulsar_tp *tp, uint64_t session_id, const char *key,
-                                int n_tokens, uint64_t digest) {
-    if (!tp || !key || !key[0]) return 0;
-    const size_t kl = strlen(key);
-    if (kl > 4096) return 0;
-    const uint32_t bytes = (uint32_t)(sizeof(pulsar_tp_kvload_command_header) + kl);
-    uint8_t *payload = static_cast<uint8_t *>(malloc(bytes));
+int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys) {
+    if (n_keys > 0 && !keys) return 0;
+    const uint64_t bytes = sizeof(uint32_t) + (uint64_t)n_keys * 40u;
+    if (bytes > UINT32_MAX) return 0;
+    uint8_t *payload = static_cast<uint8_t *>(malloc((size_t)bytes));
     if (!payload) return 0;
-    pulsar_tp_kvload_command_header h = { session_id, (int32_t)n_tokens, (uint32_t)kl, digest };
-    memcpy(payload, &h, sizeof(h));
-    memcpy(payload + sizeof(h), key, kl);
-    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_KVSTORE_LOAD, payload, bytes);
+    memcpy(payload, &n_keys, sizeof(n_keys));
+    if (n_keys) memcpy(payload + sizeof(n_keys), keys, (size_t)n_keys * 40u);
+    const int ok = tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_SEGMENT_RECONCILE, payload, (uint32_t)bytes);
     free(payload);
     return ok;
+}
+
+int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
+}
+int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, bank);
 }
 
 typedef struct {
@@ -4355,13 +4210,14 @@ void pulsar_tp_command_free(pulsar_tp_command *command) {
     command->spec_rngs = NULL;
     free(command->spec_steps);
     command->spec_steps = NULL;
-    free(command->spill_key);
-    command->spill_key = NULL;
     free(command->images);
     free(command->image_bytes);
     command->images = NULL;
     command->image_bytes = NULL;
     command->n_images = 0;
+    free(command->keys);
+    command->keys = NULL;
+    command->n_keys = 0;
 }
 
 static int tp_command_decode_tokens(pulsar_tp_command *command,
@@ -4490,26 +4346,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->session_id = h.session_id;
         break;
     }
-    case PULSAR_TP_FRAME_BANK_FORK:
-    case PULSAR_TP_FRAME_BANK_FORK_PARTIAL: {
-        pulsar_tp_fork_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        const uint64_t want = sizeof(h) + (uint64_t)h.count * sizeof(int32_t);
-        if (want != bytes) { ok = 0; break; }
-        command->session_id = h.session_id;
-        command->bank_src = h.src;
-        command->bank_dst = h.dst;
-        command->n_cached = h.n_cached;
-        if (h.count) {
-            command->tokens = static_cast<int *>(malloc((size_t)h.count * sizeof(int)));
-            if (!command->tokens) { ok = -1; break; }
-            const int32_t *wire = reinterpret_cast<const int32_t *>(payload + sizeof(h));
-            for (uint32_t i = 0; i < h.count; i++) command->tokens[i] = wire[i];
-        }
-        command->n_tokens = h.count;
-        break;
-    }
     case PULSAR_TP_FRAME_SYNC_MM: {
         pulsar_tp_sync_mm_header h;
         if (bytes < sizeof(h)) { ok = 0; break; }
@@ -4550,49 +4386,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->seq = msg.digest;     /* the leader's cached-prefix digest */
         break;
     }
-    case PULSAR_TP_FRAME_KVSTORE_RECONCILE: {
-        pulsar_tp_kvreconcile_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        if (h.n_keys > (1u << 20) || sizeof(h) + (uint64_t)h.n_keys * 40u != bytes) { ok = 0; break; }
-        command->spill_key = static_cast<char *>(malloc((size_t)h.n_keys * 40u + 1u));
-        if (!command->spill_key) { ok = -1; break; }
-        memcpy(command->spill_key, payload + sizeof(h), (size_t)h.n_keys * 40u);
-        command->spill_key[(size_t)h.n_keys * 40u] = '\0';
-        command->session_id = h.session_id;
-        command->value = (int)h.n_keys;
-        break;
-    }
-    case PULSAR_TP_FRAME_KVSTORE_LOAD: {
-        pulsar_tp_kvload_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        if (h.key_len == 0 || h.key_len > 4096 || sizeof(h) + h.key_len != bytes) { ok = 0; break; }
-        command->spill_key = static_cast<char *>(malloc((size_t)h.key_len + 1u));
-        if (!command->spill_key) { ok = -1; break; }
-        memcpy(command->spill_key, payload + sizeof(h), h.key_len);
-        command->spill_key[h.key_len] = '\0';
-        command->session_id = h.session_id;
-        command->value = h.n_tokens;   /* the leader's checkpoint length after its load */
-        command->seq = h.digest;       /* ...and its checkpoint digest */
-        break;
-    }
-    case PULSAR_TP_FRAME_BANK_KV_SAVE:
-    case PULSAR_TP_FRAME_BANK_KV_LOAD:
-    case PULSAR_TP_FRAME_KVSTORE_SAVE:
-    case PULSAR_TP_FRAME_KVSTORE_DROP: {
-        pulsar_tp_spill_command_header h;
-        if (bytes < sizeof(h)) { ok = 0; break; }
-        memcpy(&h, payload, sizeof(h));
-        if (h.key_len == 0 || h.key_len > 4096 || sizeof(h) + h.key_len != bytes) { ok = 0; break; }
-        command->spill_key = static_cast<char *>(malloc((size_t)h.key_len + 1u));
-        if (!command->spill_key) { ok = -1; break; }
-        memcpy(command->spill_key, payload + sizeof(h), h.key_len);
-        command->spill_key[h.key_len] = '\0';
-        command->session_id = h.session_id;
-        command->value = h.bank;
-        break;
-    }
     case PULSAR_TP_FRAME_BANK_FREE_PHYSICAL:
     case PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL:
     case PULSAR_TP_FRAME_BANK_STATE_SAVE:
@@ -4607,6 +4400,26 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
         command->value = msg.value;
         /* SESSION_CREATE's bank-pool size (v12); the other value frames send 0. */
         command->seq = msg.reserved;
+        break;
+    }
+    case PULSAR_TP_FRAME_SEGMENT_SAVE:
+    case PULSAR_TP_FRAME_SEGMENT_LOAD:
+    case PULSAR_TP_FRAME_SEGMENT_DROP:
+        if (bytes != sizeof(command->segment)) { ok = 0; break; }
+        memcpy(&command->segment, payload, sizeof(command->segment));
+        if (!pulsar_tp_segment_key_ok(command->segment.key)) { ok = 0; break; }
+        command->session_id = command->segment.session_id;
+        break;
+    case PULSAR_TP_FRAME_SEGMENT_RECONCILE: {
+        uint32_t n = 0;
+        if (bytes < sizeof(n)) { ok = 0; break; }
+        memcpy(&n, payload, sizeof(n));
+        if ((uint64_t)bytes != sizeof(n) + (uint64_t)n * 40u) { ok = 0; break; }
+        command->keys = static_cast<char *>(malloc((size_t)n * 40u + 1u));
+        if (!command->keys) { ok = -1; break; }
+        if (n) memcpy(command->keys, payload + sizeof(n), (size_t)n * 40u);
+        command->keys[(size_t)n * 40u] = '\0';
+        command->n_keys = n;
         break;
     }
     case PULSAR_TP_FRAME_SESSION_DESTROY:

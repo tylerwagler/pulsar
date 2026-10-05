@@ -1,24 +1,32 @@
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
+#include "lib/pulsar_segstore.h"
+#include "lib/pulsar_kvchain.h"
+
+#include <string>
 
 
 
 
 kv_cache_options kv_cache_default_options(void) {
-    return pulsar_kvstore_default_options();
+    kv_cache_options o = {};
+    o.min_tokens = 512;
+    o.sys_prefix_align = 2048;
+    o.sys_prefix_margin = 2048;
+    return o;
 }
 
 
 
 void le_put32(uint8_t *p, uint32_t v) {
-    pulsar_kvstore_le_put32(p, v);
+    pulsar_kvtext_le_put32(p, v);
 }
 
 
 
 
 static uint32_t le_get32(const uint8_t *p) {
-    return pulsar_kvstore_le_get32(p);
+    return pulsar_kvtext_le_get32(p);
 }
 
 
@@ -27,7 +35,7 @@ static uint32_t le_get32(const uint8_t *p) {
 #ifdef PULSAR_SERVER_TEST
 
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
-    pulsar_kvstore_sha1_bytes_hex(ptr, len, out);
+    pulsar_kvtext_sha1_bytes_hex(ptr, len, out);
 }
 
 
@@ -75,14 +83,8 @@ void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
 
 
 
-static bool sha_hex_name(const char *name, char sha[41]) {
-    return pulsar_kvstore_sha_hex_name(name, sha);
-}
-
-
-
 char *path_join(const char *dir, const char *name) {
-    return pulsar_kvstore_path_join(dir, name);
+    return pulsar_kvtext_path_join(dir, name);
 }
 
 
@@ -273,168 +275,48 @@ int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
 
 
 
-#ifdef PULSAR_SERVER_TEST
+/* ===== L264 S4: the disk KV cache is the segment store ====================
+ * A conversation persists as a chain of segments, one per grid checkpoint its
+ * bank holds (pulsar_segstore.h): each new prefill adds only the segments past
+ * the chain's last stored one, so a write costs the new tokens, and the chain's
+ * earlier segments stay -- a client that rewrites history further back finds
+ * the stretch it still shares.  A restore loads the deepest chain the request's
+ * bytes reproduce, ending live at its last checkpoint. */
 
-void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint8_t ext_flags,
-                           uint32_t tokens, uint32_t hits, uint32_t ctx_size,
-                           uint64_t created_at, uint64_t last_used,
-                           uint64_t payload_bytes) {
-    pulsar_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes);
-}
-
-
-#endif
-
-
-static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
-    return pulsar_kvstore_read_header(fp, e, text_bytes);
-}
-
-
-
-
-
-
-void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {
-    auto *s = this;
-    if (!s || !s->kv.enabled || !msgs) return;
-    stop_list wanted = {0};
-    collect_tool_call_ids(msgs, &wanted);
-    if (wanted.len == 0) return;
-    /* Only ids MISSING from the in-memory tool map justify touching disk: a
-     * live conversation's ids were remembered at generation time, so the
-     * common case skips the directory scan entirely (it used to open and
-     * parse every .kv file on every request that mentioned a tool call). */
-    {
-        int keep = 0;
-        for (int i = 0; i < wanted.len; i++) {
-            if (!s->tool_memory_has_id(wanted.v[i])) {
-                wanted.v[keep++] = wanted.v[i];
-            } else {
-                free(wanted.v[i]);
-            }
-        }
-        wanted.len = keep;
-    }
-    if (wanted.len == 0) {
-        id_list_free(&wanted);
-        return;
-    }
-    /* Tool replay payloads are stored next to KV checkpoints; keep them model
-     * scoped too, since token positions and graph state are not portable across
-     * Flash/Pro shapes even when the rendered chat text is identical. */
-    uint8_t model_id = s->engine ? (uint8_t)pulsar_engine_model_id(s->engine) : 0;
-
-    DIR *d = opendir(s->kv.dir);
-    if (!d) {
-        id_list_free(&wanted);
-        return;
-    }
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!sha_hex_name(de->d_name, sha)) continue;
-        (void)sha;
-        char *path = path_join(s->kv.dir, de->d_name);
-        FILE *fp = fopen(path, "rb");
-        free(path);
-        if (!fp) continue;
-
-        kv_entry hdr = {0};
-        uint32_t text_bytes = 0;
-        bool ok = kv_read_header(fp, &hdr, &text_bytes);
-        uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
-        if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
-            skip <= (uint64_t)INT64_MAX &&
-            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
-        {
-            s->kv_tool_map_load_from_pos(fp, &wanted);
-        }
-        fclose(fp);
-        /* Cold restore satisfied: stop scanning once every missing id is in
-         * memory instead of walking the rest of the cache directory. */
-        bool all_found = true;
-        for (int i = 0; i < wanted.len; i++) {
-            if (!s->tool_memory_has_id(wanted.v[i])) { all_found = false; break; }
-        }
-        if (all_found) break;
-    }
-    closedir(d);
-    id_list_free(&wanted);
-}
-
-
-
-#ifdef PULSAR_SERVER_TEST
-
-double kv_entry_eviction_score(const kv_entry *e, const pulsar_tokens *live,
-                                      uint64_t now,
-                                      const pulsar_kvstore_eviction_context *incoming) {
-    return pulsar_kvstore_entry_eviction_score(e, live, now, incoming);
-}
-
-
-#endif
-
-
-#ifdef PULSAR_SERVER_TEST
-
-void kv_cache_evict(kv_disk_cache *kc, const pulsar_tokens *live,
-                           uint64_t extra_bytes,
-                           const pulsar_kvstore_eviction_context *incoming) {
-    pulsar_kvstore_evict(kc, live, extra_bytes, incoming);
-}
-
-
-#endif
-
-
-static void kv_cache_log_cb(void *ud, pulsar_kvstore_log_type type, const char *msg) {
+static void kv_seg_log(void *ud, const char *msg) {
     (void)ud;
-    pulsar_log_type stype = PULSAR_LOG_KVCACHE;
-    if (type == PULSAR_KVSTORE_LOG_DEFAULT) stype = PULSAR_LOG_DEFAULT;
-    else if (type == PULSAR_KVSTORE_LOG_WARNING) stype = PULSAR_LOG_WARNING;
-    server_log(stype, "%s", msg);
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache %s", msg);
 }
 
-
-
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
-                          bool reject_different_quant, kv_cache_options opt) {
-    return pulsar_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
-                            "pulsar-server", kv_cache_log_cb, NULL);
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t model_id,
+                   kv_cache_options opt) {
+    memset(kc, 0, sizeof(*kc));
+    kc->opt = opt;
+    kc->st = pulsar_segstore_open(dir, budget_mb << 20, model_id, kv_seg_log, NULL);
+    if (!kc->st) return false;
+    kc->dir = xstrdup(dir);
+    kc->enabled = true;
+    return true;
 }
-
-
 
 void kv_cache_close(kv_disk_cache *kc) {
-    pulsar_kvstore_close(kc);
+    pulsar_segstore_close(kc->st);
+    free(kc->dir);
+    memset(kc, 0, sizeof(*kc));
 }
-
-
 
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len) {
-    return pulsar_kvstore_render_tokens_text(engine, tokens, out_len);
+    return pulsar_kvtext_render_tokens_text(engine, tokens, out_len);
 }
-
-
 
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
-    return pulsar_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
+    return pulsar_kvtext_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
-
-
-
 
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
-    pulsar_kvstore_tokens_copy_prefix(dst, src, n);
+    pulsar_kvtext_tokens_copy_prefix(dst, src, n);
 }
-
-
-
 
 void build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
@@ -444,358 +326,162 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out)
 {
-    pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+    pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, spans, n_spans, out);
 }
 
-
-
+/* The stable rendered chat prefix is everything before the user message that
+ * asks this specific task.  Some clients put stable user-role scaffolding
+ * first, so the anchor is the last user marker before the first assistant. */
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const pulsar_tokens *prompt,
                                     int user_token_id,
                                     int assistant_token_id) {
-    return pulsar_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+    if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
+    int last_user = -1;
+    for (int i = 0; i < prompt->len; i++) {
+        if (prompt->v[i] == assistant_token_id) break;
+        if (prompt->v[i] == user_token_id) last_user = i;
+    }
+    return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
+/* Back the anchor cut off below harness-injected preamble jitter and land it on
+ * an alignment boundary (a multiple of the resume grid, so the cold prefill that
+ * ends there leaves a grid checkpoint).  0 when nothing useful survives. */
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
-    return pulsar_kvstore_sys_prefix_cut(kc, anchor);
+    if (anchor < kc->opt.min_tokens) return 0;
+    int cut = anchor - kc->opt.sys_prefix_margin;
+    if (kc->opt.sys_prefix_align > 0) cut -= cut % kc->opt.sys_prefix_align;
+    return cut >= kc->opt.min_tokens ? cut : 0;
 }
 
-
-
-
-int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
-    return pulsar_kvstore_continued_store_target(kc, live_tokens);
+namespace {
+bool seg_trailer_size(void *ud, const char *text, uint64_t *bytes) {
+    return ((server *)ud)->kv_tool_map_serialized_size(text, bytes);
 }
-
-
-
-/* A same-text-prefix file can be reused by a larger context, but not by a
- * smaller one: the payload was validated against the context capacity recorded
- * in the file.  If the existing file cannot be used by this server, replace it
- * so this context can still populate its own cache. */
-
-
-
-#ifdef PULSAR_SERVER_TEST
-
-bool kv_cache_file_size_fits(const kv_disk_cache *kc,
-                                    uint64_t text_bytes,
-                                    uint64_t payload_bytes,
-                                    uint64_t tool_map_bytes,
-                                    uint64_t *file_bytes_out,
-                                    uint64_t *required_bytes_out) {
-    return pulsar_kvstore_file_size_fits(kc, text_bytes, payload_bytes,
-                                      tool_map_bytes, file_bytes_out,
-                                      required_bytes_out);
+int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t errlen) {
+    uint64_t written = 0;
+    if (((server *)ud)->kv_tool_map_write(fp, text, &written)) return 0;
+    snprintf(err, errlen, "tool map write failed");
+    return 1;
 }
+}  // namespace
 
-
-#endif
-
-
-
-
-static bool kv_cache_tool_map_size_cb(void *ud, const char *text,
-                                      uint64_t *bytes_out) {
-    return ((server *)ud)->kv_tool_map_serialized_size(text, bytes_out);
-}
-
-
-
-static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
-                                       uint64_t *written_bytes) {
-    return ((server *)ud)->kv_tool_map_write(fp, text, written_bytes);
-}
-
-
-
-static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
-    return ((server *)ud)->kv_tool_map_load_from_pos(fp, (const stop_list *)wanted);
-}
-
-
-
-pulsar_kvstore_trailer_hooks server::kv_cache_tool_map_hooks(const stop_list *wanted) {
+int server::kv_cache_persist(session_slot *sl, const char *reason) {
     auto *s = this;
-    return (pulsar_kvstore_trailer_hooks){
-        .ud = s,
-        .ext_flag = KV_EXT_TOOL_MAP,
-        .serialized_size = kv_cache_tool_map_size_cb,
-        .write = kv_cache_tool_map_write_cb,
-        .load = kv_cache_tool_map_load_cb,
-        .load_wanted = wanted,
-    };
-}
-
-
-
-bool server::kv_cache_store_live_prefix_text(session_slot *sl,
-                                            const pulsar_tokens *tokens,
-                                            int store_len, const char *reason,
-                                            const char *cache_text_override,
-                                            uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
-    auto *s = this;
-    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
-    char err[160] = {0};
-    pulsar_kvstore_trailer_hooks hooks = s->kv_cache_tool_map_hooks(NULL);
-    return pulsar_kvstore_store_live_prefix_text(&s->kv, s->engine, s->sess,
-                                              tokens, store_len, reason,
-                                              cache_text_override,
-                                              cache_text_ext,
-                                              cache_text_key,
-                                              &hooks, err, sizeof(err));
-}
-
-
-
-bool server::kv_cache_store_live_prefix(session_slot *sl,
-                                       const pulsar_tokens *tokens,
-                                       int store_len, const char *reason) {
-    auto *s = this;
-    return s->kv_cache_store_live_prefix_text(sl, tokens, store_len, reason,
-                                           NULL, 0, NULL);
-}
-
-
-
-bool server::kv_cache_store_current(session_slot *sl, const char *reason) {
-    auto *s = this;
-    const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
-    if (!tokens) return false;
-
-    char *visible_text = NULL;
-    uint8_t visible_ext = 0;
-    const char *visible_key = NULL;
-    pthread_mutex_lock(&s->tool_mu);
-    if (sl->responses_live.valid &&
-        sl->responses_live.live_tokens == tokens->len &&
-        sl->responses_live.visible_text &&
-        sl->responses_live.visible_text[0])
-    {
-        visible_text = xstrdup(sl->responses_live.visible_text);
-        visible_ext = KV_EXT_RESPONSES_VISIBLE;
-        visible_key = "responses-visible";
-    } else if (sl->thinking_live.valid &&
-               sl->thinking_live.live_tokens == tokens->len &&
-               sl->thinking_live.visible_text &&
-               sl->thinking_live.visible_text[0])
-    {
-        visible_text = xstrdup(sl->thinking_live.visible_text);
-        visible_ext = KV_EXT_THINKING_VISIBLE;
-        visible_key = "thinking-visible";
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-
-    if (visible_text &&
-        !pulsar_kvstore_text_ends_with_live(s->engine, visible_text, strlen(visible_text), tokens))
-    {
-        /* L196: the file's text would name bytes the payload does not hold (or
-         * hold bytes the text does not name); a load would then tokenise the
-         * suffix from the wrong byte and drop or double the EOS in the bank. */
-        server_log(PULSAR_LOG_ERROR,
-                   "pulsar-server: kv cache %s key REFUSED (live=%d): the key's EOS "
-                   "disagrees with the last live token -- checkpoint not stored",
-                   visible_key, tokens->len);
-        free(visible_text);
-        return false;
-    }
-
-    /* A visible live checkpoint can contain hidden reasoning that the client
-     * intentionally does not replay.  For disk recovery after a session switch,
-     * key that payload by the visible protocol transcript, not by rendering the
-     * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
-     * tokenizes only the visible suffix that follows this key. */
-    bool stored;
-    if (visible_text) {
-        stored = s->kv_cache_store_live_prefix_text(sl, tokens, tokens->len,
-                                                 reason, visible_text,
-                                                 visible_ext, visible_key);
-        free(visible_text);
-    } else {
-        stored = s->kv_cache_store_live_prefix(sl, tokens, tokens->len, reason);
-    }
-    return stored;
-}
-
-
-
-void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
-    pulsar_kvstore_note_store(kc, tokens);
-}
-
-
-
-int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
-    return pulsar_kvstore_suppress_continued_store(kc, tokens);
-}
-
-
-
-void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
-                                                  int old_tokens,
-                                                  int suppressed_tokens) {
-    pulsar_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
-}
-
-
-
-void server::kv_cache_discard_failed_disk_entry(const char *path) {
-    if (!path) return;
-    if (unlink(path) == 0) {
+    (void)sl;   /* the caller installed the slot's bank */
+    if (!s->kv.enabled) return 0;
+    /* A "continued" store fires from the prefill's progress callback; on a TP
+     * group that is inside the mirrored sync, where the workers read only
+     * chunk verdicts.  The prompt-end store after it persists the same
+     * checkpoints. */
+    if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
+    const double t0 = server_now_sec();
+    const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
+    pulsar_kvchain_persist_result r;
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, &tool_maps, &r);
+    if (r.err[0])
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
+    if (r.written)
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: kv cache discarded reason=prefill-failed file=%s",
-                   path);
-    } else if (errno != ENOENT) {
-        server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: kv cache failed to discard prefill-failed file=%s: %s",
-                   path, strerror(errno));
-    }
+                   "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) %.1f ms",
+                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
+    return r.written;
 }
-
-
-
-void server::kv_cache_tracker_bind(session_slot *sl) {
-    auto *s = this;
-    s->kv.continued_last_store_tokens = sl->continued_last_store_tokens;
-}
-
-
-
-void server::kv_cache_tracker_flush(session_slot *sl) {
-    auto *s = this;
-    sl->continued_last_store_tokens = s->kv.continued_last_store_tokens;
-}
-
-
-
-void server::kv_cache_maybe_store_continued(session_slot *sl) {
-    auto *s = this;
-    kv_disk_cache *kc = &s->kv;
-    const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
-    if (!tokens) return;
-    s->kv_cache_tracker_bind(sl);
-    const int target = kv_cache_continued_store_target(kc, tokens->len);
-    /* The frontier is the ONLY prefix a live session can serialise: the raw
-     * window and the compressor state exist there and nowhere below it (the
-     * lib refuses a shorter prefix by name).  A boundary the frontier crossed
-     * inside a prefill chunk or a multi-token round is therefore stored AT the
-     * frontier that noticed it, not at the aligned target -- the first cut
-     * asked the lib for the target, was refused, and asked again on every
-     * decode step (561 identical log lines in one generation, dogfood
-     * 2026-09-05) while the checkpoint was never written at all. */
-    if (target != 0 &&
-        s->kv_cache_store_live_prefix(sl, tokens, tokens->len, "continued")) {
-        kv_cache_note_store(kc, tokens->len);
-    }
-    s->kv_cache_tracker_flush(sl);
-}
-
-
-
-bool server::kv_cache_continued_store_due(session_slot *sl) {
-    auto *s = this;
-    s->kv_cache_tracker_bind(sl);
-    const int target = kv_cache_continued_store_target(&s->kv,
-                                                       pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank));
-    s->kv_cache_tracker_flush(sl);
-    return target != 0;
-}
-
-
-
-#ifdef PULSAR_SERVER_TEST
-
-int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
-                                     int quant_bits, int ctx_size) {
-    return pulsar_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
-}
-
-
-#endif
-
 
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   const pulsar_text_span *prompt_spans,
                                   uint32_t prompt_n_spans,
                                   pulsar_tokens *effective_prompt,
-                                  char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out,
+                                  char **loaded_key_out,
                                   bool responses_protocol) {
     auto *s = this;
-    if (loaded_path_out) *loaded_path_out = NULL;
-    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
-    pulsar_kvstore_load_result lr = {0};
-    pulsar_kvstore_trailer_hooks hooks = s->kv_cache_tool_map_hooks(NULL);
-    /* A successful load advances the continued-store frontier (the lib sets
-     * kc->continued_last_store_tokens = loaded) — bracket it per slot. */
-    s->kv_cache_tracker_bind(sl);
-    int loaded = pulsar_kvstore_try_load_text(&s->kv, s->engine, s->sess,
-                                           prompt_text, prompt_spans, prompt_n_spans,
-                                           effective_prompt, &lr,
-                                           &hooks, responses_protocol);
-    s->kv_cache_tracker_flush(sl);
-    if (loaded > 0) {
-        if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
-        if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+    (void)sl;   /* the caller installed the slot's bank */
+    if (loaded_key_out) *loaded_key_out = NULL;
+    if (!s->kv.enabled || !prompt_text) return 0;
+    const size_t prompt_bytes = strlen(prompt_text);
+    const double t0 = server_now_sec();
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    int n = 0;
+    char err[384];
+    const int G = pulsar_kvchain_restore(s->kv.st, s->engine, s->sess, prompt_text, prompt_bytes,
+                                         s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
+    if (G == 0) {
+        if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+        return 0;
     }
-    pulsar_kvstore_load_result_free(&lr);
-    return loaded;
+    const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
+    const uint64_t text_end = chain[n - 1].text_end;
+    /* The chain's tool maps: the exact DSML of every tool call inside it. */
+    for (int i = 0; i < n; i++) {
+        FILE *fp = pulsar_segstore_open_trailer(s->kv.st, chain[i].key, NULL);
+        if (!fp) continue;
+        s->kv_tool_map_load_from_pos(fp, NULL);
+        fclose(fp);
+    }
+    if (effective_prompt) {
+        /* The lookup was by bytes; the graph holds the exact token history.
+         * Build the prompt from that history and tokenize only the text after
+         * it -- carrying the client-data ranges into the suffix's coordinates
+         * so client bytes stay plain text there too (L223). */
+        uint32_t tail_n = 0;
+        pulsar_text_span *tail = pulsar_text_spans_slice(prompt_spans, prompt_n_spans, (uint32_t)text_end,
+                                                         (uint32_t)(prompt_bytes - text_end), &tail_n);
+        build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, prompt_text + text_end,
+                                                       tail, tail_n, effective_prompt);
+        free(tail);
+    }
+    if (loaded_key_out) *loaded_key_out = xstrdup(chain[n - 1].key);
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms",
+               responses_protocol ? " [responses]" : "", n, chain[n - 1].G,
+               (unsigned long long)text_end, prompt_bytes, (server_now_sec() - t0) * 1000.0);
+    return (int)chain[n - 1].G;
 }
-
-
 
 int server::kv_cache_try_load(session_slot *sl, const request *req,
                              pulsar_tokens *effective_prompt,
-                             char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             char **loaded_key_out) {
     auto *s = this;
     return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
                                   req ? req->prompt_spans : NULL,
                                   req ? req->prompt_n_spans : 0,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
+                                  effective_prompt, loaded_key_out,
                                   req && req->api == API_RESPONSES);
 }
 
-
-
-int server::live_text_prefix_prompt(session_slot *sl, const request *req,
-                                   pulsar_tokens *effective_prompt) {
+void server::kv_cache_discard_failed_chain(const char *key) {
     auto *s = this;
-    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
-    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
-    if (!live_tokens || live_tokens->len <= 0) return 0;
+    if (!key || !s->kv.enabled) return;
+    pulsar_segstore_drop(s->kv.st, key);
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache discarded reason=prefill-failed segment=%s", key);
+}
 
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
-    const size_t prompt_text_len = strlen(req->prompt_text);
-    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                           live_text, live_text_len))
-    {
-        free(live_text);
-        return 0;
+void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {
+    auto *s = this;
+    if (!s || !s->kv.enabled || !msgs) return;
+    stop_list wanted = {0};
+    collect_tool_call_ids(msgs, &wanted);
+    /* Only ids MISSING from the in-memory tool map justify touching disk: a
+     * live conversation's ids were remembered at generation time. */
+    int keep = 0;
+    for (int i = 0; i < wanted.len; i++) {
+        if (!s->tool_memory_has_id(wanted.v[i])) wanted.v[keep++] = wanted.v[i];
+        else free(wanted.v[i]);
     }
-
-    /* This is the core text-prefix case.  The live graph is authoritative, so
-     * keep its sampled tokenization and tokenize only the request bytes that
-     * come after it.  Reusing req->prompt's token suffix would be wrong: full
-     * prompt BPE may have merged across this byte boundary. */
-    /* The appended tail is a slice of the rendered prompt, so its client-data
-     * ranges are the request's, rebased (L223). */
-    uint32_t tail_n = 0;
-    pulsar_text_span *tail_spans =
-        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, live_text_len,
-                                prompt_text_len - live_text_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        tail_spans, tail_n, effective_prompt);
-    free(tail_spans);
-    free(live_text);
-    return live_tokens->len;
+    wanted.len = keep;
+    if (wanted.len > 0) {
+        struct walk { server *s; stop_list *wanted; } w = { s, &wanted };
+        pulsar_segstore_foreach_trailer(s->kv.st, [](FILE *fp, uint64_t, const char *, size_t, void *ud) {
+            walk *wk = (walk *)ud;
+            wk->s->kv_tool_map_load_from_pos(fp, wk->wanted);
+            for (int i = 0; i < wk->wanted->len; i++)
+                if (!wk->s->tool_memory_has_id(wk->wanted->v[i])) return true;
+            return false;   /* every missing id is back */
+        }, &w);
+    }
+    id_list_free(&wanted);
 }
 
 
@@ -899,7 +585,7 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
-    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
+    if (!pulsar_kvtext_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
         server_log(PULSAR_LOG_ERROR,
                    "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
                    "with the last live token (L196)", live_pos);
@@ -918,96 +604,4 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
 }
 
 
-
-/* Tool-less thinking continuation.
- *
- * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
- *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
-int server::thinking_live_visible_prefix_prompt(session_slot *sl,
-                                               const request *req,
-                                               int live_pos,
-                                               pulsar_tokens *effective_prompt) {
-    auto *s = this;
-    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = sl->thinking_live.valid &&
-              sl->thinking_live.live_tokens == live_pos &&
-              sl->thinking_live.visible_text &&
-              sl->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                sl->thinking_live.visible_text,
-                                sl->thinking_live.visible_len);
-    if (ok) visible_len = sl->thinking_live.visible_len;
-    pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
-        server_log(PULSAR_LOG_ERROR,
-                   "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
-                   "with the last live token (L196)", live_pos);
-        return 0;
-    }
-
-    uint32_t tail_n = 0;
-    pulsar_text_span *tail_spans =
-        pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
-                                prompt_len - visible_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        tail_spans, tail_n, effective_prompt);
-    free(tail_spans);
-    return live_tokens->len;
-}
-
-
-
-/* Routing probe (choose_slot_for_job): does this slot's live thinking
- * binding mark it as the warm continuation of req's visible transcript?
- * Same guards as thinking_live_visible_prefix_prompt above, but byte-prefix
- * check only — no tokenization, no effective-prompt build (gen_begin redoes
- * the full resolution on the chosen slot). The router needs this because
- * the token common prefix UNDERSTATES relatedness for thinking chats: the
- * client replays visible content while the slot's sampled frontier holds
- * the hidden reasoning too, so a short token match can still be the same
- * conversation. Returns the matched visible-key length (>0) so the caller
- * can prefer the most recent frontier if several slots hold bindings for
- * prefixes of one conversation, or 0 for no match. Never dereferences
- * s->sess (the caller passes the slot's live position). */
-size_t server::thinking_live_binds_prompt(session_slot *sl,
-                                  const request *req, int live_pos) {
-    auto *s = this;
-    if (!s || !sl || !req || !req->prompt_text) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    if (sl->thinking_live.valid &&
-        sl->thinking_live.live_tokens == live_pos &&
-        sl->thinking_live.visible_text &&
-        sl->thinking_live.visible_len < prompt_len &&
-        byte_prefix_match(req->prompt_text, prompt_len,
-                          sl->thinking_live.visible_text,
-                          sl->thinking_live.visible_len))
-    {
-        visible_len = sl->thinking_live.visible_len;
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    return visible_len;
-}
 

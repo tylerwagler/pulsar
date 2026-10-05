@@ -14,19 +14,16 @@
  * than a thing we assume.
  *
  * WHAT IT PROVES, in the order that localises a failure:
- *   1. THE LINEAR LANES, byte for byte.  FNV-1a over each kv source's attn comp
- *      rows, its index-K rows, and both compressor state lanes, folded to the
- *      size the ALLOCATION holds rather than the size the payload believes it
- *      should carry.  That distinction is the point: a payload that silently
- *      drops the tail of a lane balances its own accounting and round-trips its
- *      own header, so only a fold at the allocation's size can see it.  (v11: a
- *      0731 ratio-4 state lane is 32768 B and the payload carried 8192.)
- *   2. THE RAW RING, functionally.  Byte-comparing a ring is awkward (rows sit
- *      at pos % cap and the tail is legitimately stale), so instead both
- *      sessions evaluate the SAME next token and their full-vocab logits must
- *      match bit for bit.  That runs the restored raw window, comp rows and
- *      indexer selection through attention, which is the property a session
- *      restore actually owes its caller.
+ *   1. THE BYTES (v13, L264): FNV-1a over each kv source's attn comp rows and
+ *      index-K rows to the frontier, every recurrent lane, and the ONE grid
+ *      checkpoint the payload carries, each folded at its allocation's full
+ *      size: a payload that dropped the tail of a lane balances its own
+ *      accounting, so only a fold at the allocation's size can see it.
+ *   2. THE RESUME, functionally.  Both sessions take the SAME next token through
+ *      a sync, which resumes each from that grid checkpoint (A from its live
+ *      copy, B from the restored one), and their full-vocab logits must match
+ *      bit for bit.  That runs the restored window, lanes, comp rows and indexer
+ *      selection through attention, which is what a restore owes its caller.
  *
  * A byte copy round trip should be EXACT -- v5 re-encodes nothing -- so this
  * gate compares for equality, not tolerance.  If it ever needs a tolerance,
@@ -83,31 +80,6 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* FNV-1a over every linear-from-row-0 lane the payload carries: each kv
- * source's comp rows, its index-K rows where an indexer runs, and both
- * compressor state lanes.  (The raw ring is the one lane that is NOT linear --
- * rows sit at pos % cap -- so it is checked functionally, by the logits below.)
- *
- * The fold runs to pulsar_gpu_tensor_bytes(), i.e. over exactly what the
- * ALLOCATION holds, not over what session_payload.cpp believes it should hold.
- * That distinction is the whole point: a payload that carries fewer bytes than
- * the lane holds still balances its own accounting and still round-trips its own
- * header, so only a fold at the allocation's size can see the missing tail.  The
- * v11 fix exists because a V4 ratio-4 state lane is 32768 B and the payload
- * carried a quarter of it. */
-static bool fold_tensor(uint64_t *h, pulsar_gpu_tensor *t, uint8_t *buf, size_t cap,
-                        uint64_t *bytes_io) {
-    /* A lane the allocation never made (V4.1's indexer compressor, a ratio-1
-     * source's pending group) contributes nothing and is not an error. */
-    if (!t) return true;
-    const uint64_t n = pulsar_gpu_tensor_bytes(t);
-    if (n == 0) return true;
-    if (n > cap) return false;
-    if (pulsar_gpu_tensor_read(t, 0, buf, n) == 0) return false;
-    for (uint64_t i = 0; i < n; i++) { *h ^= buf[i]; *h *= 1099511628211ull; }
-    *bytes_io += n;
-    return true;
-}
 
 static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
     pulsar_gpu_graph *g = &s->graph;
@@ -116,7 +88,7 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
     const size_t cap = 64u * 1024u * 1024u;
     bool ok = true;
     uint64_t h = 1469598103934665603ull;
-    uint64_t attn_rows = 0, idx_rows = 0, attn_state = 0, idx_state = 0, attn_proj = 0, idx_proj = 0;
+    uint64_t attn_rows = 0, idx_rows = 0;
     uint8_t *buf = (uint8_t *)malloc(cap);
     if (!buf) return 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
@@ -137,35 +109,39 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
             for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             idx_rows += ncomp;
         }
-        /* L120 value half (v12): the projection ring an OVERLAPPING compressor
-         * replays, and the span that says which of its slots are readable.  The
-         * span is a host value, so it enters the fold as two words: a payload
-         * that carried the ring but not its span would restore rows nothing may
-         * read. */
-        ok = fold_tensor(&h, g->layer_attn_state_kv[il], buf, cap, &attn_state) &&
-             fold_tensor(&h, g->layer_attn_state_score[il], buf, cap, &attn_state) &&
-             fold_tensor(&h, g->layer_index_state_kv[il], buf, cap, &idx_state) &&
-             fold_tensor(&h, g->layer_index_state_score[il], buf, cap, &idx_state) &&
-             fold_tensor(&h, g->layer_attn_proj_kv[il], buf, cap, &attn_proj) &&
-             fold_tensor(&h, g->layer_attn_proj_sc[il], buf, cap, &attn_proj) &&
-             fold_tensor(&h, g->layer_index_proj_kv[il], buf, cap, &idx_proj) &&
-             fold_tensor(&h, g->layer_index_proj_sc[il], buf, cap, &idx_proj);
     }
-    for (int w = 0; w < 2; w++) {
-        const uint32_t v = w ? g->proj_ring_hi : g->proj_ring_lo;
-        for (int b = 0; b < 4; b++) { const uint8_t byte = (uint8_t)(v >> (8 * b)); h ^= byte; h *= 1099511628211ull; }
+    /* The frontier's recurrent lanes, each at its allocation's size. */
+    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+        pulsar_gpu_tensor *lanes[4] = { g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                                        g->layer_index_state_kv[il], g->layer_index_state_score[il] };
+        for (int k = 0; k < 4 && ok; k++) {
+            if (!lanes[k]) continue;
+            const uint64_t n = pulsar_gpu_tensor_bytes(lanes[k]);
+            ok = n <= cap && pulsar_gpu_tensor_read(lanes[k], 0, buf, n) != 0;
+            if (ok) for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+        }
+    }
+    /* The checkpoint the payload carries: the deepest at or below the prefill
+     * frontier's grid point, whole slot. */
+    uint32_t G = 0;
+    if (ok) {
+        int pf = pulsar_session_pos(s);
+        if (pf > s->prefill_frontier) pf = s->prefill_frontier;
+        G = gpu_graph_ckpt_best(g, gpu_graph_cur_bank(g), (uint32_t)(pf / 128) * 128u);
+        pulsar_gpu_tensor *slab = NULL;
+        uint64_t off = 0;
+        ok = G != 0u && gpu_graph_ckpt_locate(g, G, &slab, &off) &&
+             g->ckpt_slot_bytes <= cap &&
+             pulsar_gpu_tensor_read(slab, off, buf, g->ckpt_slot_bytes) != 0;
+        if (ok) for (uint64_t i = 0; i < g->ckpt_slot_bytes; i++) { h ^= buf[i]; h *= 1099511628211ull; }
     }
     free(buf);
     if (!ok) return 0;
     fprintf(stderr, "  %-8s attn_comp_rows=%llu (%llu B/row)  idx_comp_rows=%llu (%llu B/row)  "
-                    "attn_state=%llu B  idx_state=%llu B  attn_proj=%llu B  idx_proj=%llu B  "
-                    "span=[%u,%u)  fnv=%016llx\n",
+                    "checkpoint G=%u (%llu B)  fnv=%016llx\n",
             tag, (unsigned long long)attn_rows, (unsigned long long)attn_row,
             (unsigned long long)idx_rows, (unsigned long long)idx_row,
-            (unsigned long long)attn_state, (unsigned long long)idx_state,
-            (unsigned long long)attn_proj, (unsigned long long)idx_proj,
-            g->proj_ring_lo, g->proj_ring_hi,
-            (unsigned long long)h);
+            G, (unsigned long long)g->ckpt_slot_bytes, (unsigned long long)h);
     return h;
 }
 
@@ -218,8 +194,15 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK((uint64_t)written == pbytes,
           "payload_bytes() said %llu but save wrote %ld", (unsigned long long)pbytes, written);
 
-    /* A evaluates the probe token from its LIVE state -- the reference. */
-    CHECK(pulsar_session_eval(a, probe_tok, err, sizeof err) == 0, "A eval: %s", err);
+    /* A takes the probe token through a sync from its LIVE state -- the
+     * reference.  A sync, not an eval: the restored session can only resume from
+     * its grid checkpoint, and an eval is a decode row, a different computation
+     * from the prefill row a resume evaluates. */
+    (void)probe_tok;
+    pulsar_tokens pn; memset(&pn, 0, sizeof pn);
+    pn.v = base.v; pn.len = pn.cap = L + 1;
+    CHECK(pulsar_session_sync(a, &pn, err, sizeof err) == 0, "A sync L+1: %s", err);
+    const int origin_a = pulsar_session_resume_origin(a);
     float *ref = (float *)malloc((size_t)width * sizeof(float));
     CHECK(ref != NULL, "alloc ref");
     CHECK(pulsar_session_copy_logits(a, ref, width) == width, "A copy_logits");
@@ -239,7 +222,12 @@ int GATE_ENTRY(int argc, char **argv) {
           "-- a comp pool, an index-K pool or a compressor state lane did not survive as bytes",
           (unsigned long long)fnv_a, (unsigned long long)fnv_b);
 
-    CHECK(pulsar_session_eval(b, probe_tok, err, sizeof err) == 0, "B eval: %s", err);
+    CHECK(pulsar_session_sync(b, &pn, err, sizeof err) == 0, "B sync L+1: %s", err);
+    const int origin_b = pulsar_session_resume_origin(b);
+    fprintf(stderr, "  resume origins: live %d, restored %d\n", origin_a, origin_b);
+    CHECK(origin_a == origin_b && origin_b > 0,
+          "the restored session resumed from %d, the live one from %d: not the same computation",
+          origin_b, origin_a);
     float *got = (float *)malloc((size_t)width * sizeof(float));
     CHECK(got != NULL, "alloc got");
     CHECK(pulsar_session_copy_logits(b, got, width) == width, "B copy_logits");
@@ -257,7 +245,7 @@ int GATE_ENTRY(int argc, char **argv) {
             probe_tok, ndiff, width, (double)worst, first);
     CHECK(ndiff == 0,
           "restored session decodes differently: %d/%d logits differ, worst %.6g. "
-          "The lanes above matched byte for byte, so this is the RAW RING",
+          "The bytes above matched, so this is the resume's restore path",
           ndiff, width, (double)worst);
 
     /* ---- corruption case: the v10 digest must refuse a one-byte flip ----
