@@ -1442,65 +1442,106 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
             return 1;
         }
-        for (int i = 0; i < n_images; i++) {
-            if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
-                snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
-                return 1;
-            }
-            int span_len = 0;
-            if (!vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB,
-                                    images[i].start_pos, &span_len) ||
-                span_len <= 0) {
-                snprintf(err, errlen, "image %d at %d is not a sentinel block in this prompt",
-                         i, images[i].start_pos);
-                return 1;
-            }
-            if (images[i].start_pos + span_len > image_barrier)
-                image_barrier = images[i].start_pos + span_len;
-        }
-        /* L226: an image ALREADY inside the live KV is not a reason to redo the
-         * prompt.  Reuse is licensed when this session's checkpoint holds those
-         * blocks AND holds THESE IMAGES: the fingerprint is what makes that true,
-         * since block ids are geometry (see image_set_fingerprint).  Licensing it
-         * is all that is needed -- the carry path below and the L115 seam rescue
-         * then do the work, and `image_barrier` (see the resume) keeps either one
-         * from re-evaluating a merged row.  Anything else -- a new image, a
-         * different image of the same size, a block the checkpoint does not cover
-         * -- clears checkpoint_valid exactly as before, so the cold rebuild (the
-         * one pass that merges) runs.
+        /* Before any state moves: a block that cannot sit whole in one chunk is
+         * refused here (and by the TP leader before it mirrors anything). */
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+                              &image_barrier, err, errlen))
+            return 1;
+        /* L226 + L261: reuse the live KV across an image request.  The images the
+         * checkpoint already holds must be exactly the live set -- the fingerprint
+         * is the pixels, since block ids are only geometry (image_set_fingerprint)
+         * -- and every other image must begin at or after the checkpoint, so the
+         * resumed prefill merges it in the chunk that owns it (the planner never
+         * splits a block).  The checkpoint must be a token prefix of this prompt:
+         * the seam rescue rewinds to an arbitrary common prefix and could land
+         * inside a merged block.  Anything else -- a different image, a block that
+         * straddles the checkpoint, an edited history -- clears checkpoint_valid and
+         * the cold pass merges every image from token 0.
          *
          * No sentinel id can reach a cache surface this way.  The server never
          * plans a cold store for an image request (server_jobs.cpp gates the
          * whole disk/prefix resolver on !image_request), and a LATER prompt whose
          * sentinel ids outlive their images is still refused by the scan below. */
-        const uint64_t request_fp = image_set_fingerprint(images, n_images);
-        /* The resume must start at a grid checkpoint (L264): that is what makes a
-         * resumed prefill reproduce the cold one byte for byte, and it must start
-         * at or above the barrier so no merged row is re-evaluated.  So reuse is
-         * legal only when the bank holds a checkpoint between the barrier's grid
-         * point and the prefill frontier's -- the one the resume below restores.
-         * Otherwise the cold rebuild runs, which is the common answer early in a
-         * conversation, when the images are near the frontier. */
-        resume_floor = image_barrier > 0
-            ? (((uint32_t)image_barrier + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
+        /* The live history this prompt can keep: its common token prefix with the
+         * checkpoint (an echo that stops short of the live tail -- stripped
+         * reasoning, a rollback -- shares a prefix without extending it). */
+        const uint32_t live_len = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+        uint32_t common = 0;
+        {
+            const uint32_t lim = live_len < (uint32_t)prompt->len ? live_len : (uint32_t)prompt->len;
+            while (common < lim && s->checkpoint.v[common] == prompt->v[common]) common++;
+        }
+        const uint32_t ck = common;
+        enum { LIVE_IMAGES_MAX = 64 };
+        pulsar_image_ref held[LIVE_IMAGES_MAX];
+        int n_held = 0, n_new = 0, held_end = 0;
+        bool straddles = n_images > LIVE_IMAGES_MAX;
+        for (int i = 0; i < n_images && !straddles; i++) {
+            int len = 0;
+            (void)vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB, images[i].start_pos, &len);
+            const uint32_t bs = (uint32_t)images[i].start_pos, be = bs + (uint32_t)len;
+            if (be <= ck) {
+                held[n_held++] = images[i];
+                if ((int)be > held_end) held_end = (int)be;
+            } else if (bs >= ck) {
+                n_new++;
+            } else {
+                straddles = true;
+            }
+        }
+        const uint64_t held_fp = n_held > 0 ? image_set_fingerprint(held, n_held) : 0;
+        /* A bank whose compressor state is STALE (a mid-group rewind with no state
+         * coverage) can only be joined at a group boundary: the per-row producer
+         * refuses the store anywhere else, so extending it fails the request
+         * outright (measured: "store at 170 would extend a stale pending group --
+         * refusing" -> HTTP 400 on the third turn of an image conversation).  The
+         * cold rebuild is the pass that rebuilds that state from scratch, so a
+         * stale bank declines reuse. */
+        const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+        const bool bank_extendable = !s->graph.ms_comp_state_stale[bank];
+        /* A resume restores the deepest grid checkpoint at or below the cut
+         * (L264): the cut is the live tail when the prompt extends it, else the
+         * grid point at or below the common prefix.  The checkpoint restored must
+         * be at or above the end of the last HELD block, so no merged row is
+         * re-evaluated; with no held images any checkpoint at or below the cut
+         * serves. */
+        resume_floor = held_end > 0
+            ? (((uint32_t)held_end + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
             : 0u;
-        uint32_t pf_grid = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
-        if (pf_grid > (uint32_t)s->checkpoint.len) pf_grid = (uint32_t)s->checkpoint.len;
-        pf_grid = (pf_grid / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
-        const bool grid_reachable =
-            resume_floor > 0 &&
-            gpu_graph_ckpt_best(&s->graph, gpu_graph_cur_bank(&s->graph), pf_grid) >= resume_floor;
-        const bool images_all_live =
+        const uint32_t keep = ck < live_len ? (ck / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID : ck;
+        uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
+        if (pf > keep) pf = keep;
+        const uint32_t G = (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
+        const uint32_t B = s->checkpoint_valid ? gpu_graph_ckpt_best(&s->graph, bank, G) : 0u;
+        const bool floor_ok =
+            keep > 0 &&
+            (resume_floor == 0 || (resume_floor <= keep && B >= resume_floor)) &&
+            (keep == live_len || B > 0);
+        bool reuse =
             s->checkpoint_valid &&
-            grid_reachable &&
-            s->live_image_fp == request_fp &&
-            s->live_image_barrier == image_barrier;
-        if (!images_all_live) {
+            !straddles &&
+            bank_extendable &&
+            floor_ok &&
+            s->live_image_fp == held_fp &&
+            s->live_image_barrier == held_end;
+        if (reuse && keep < live_len) {
+            /* short of the live tail: stand the bank at the checkpoint the resume
+             * would restore, so the carry path below sees a prefix it extends */
+            if (!s->restore_checkpoint(B)) {
+                fprintf(stderr, "pulsar: image request: the grid checkpoint %u below the common prefix %u "
+                                "could not be restored -- rebuilding cold\n", B, ck);
+                reuse = false;
+            }
+        }
+        if (!reuse) {
             s->checkpoint_valid = false;
+            if (!bank_extendable)
+                fprintf(stderr, "pulsar: image request: this bank's compressor state is stale -- "
+                                "rebuilding cold\n");
         } else {
-            fprintf(stderr, "pulsar: image request: %d image(s) already live (prefix %d tokens, "
-                            "blocks end at %d) -- reuse licensed\n",
-                    n_images, s->checkpoint.len, image_barrier);
+            fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
+                            "(merged where their blocks fall) -- reuse licensed\n",
+                    n_held, (uint32_t)s->checkpoint.len, n_new);
         }
     } else {
         /* A prompt carrying sentinel ids with no image to fill them would prefill
@@ -1520,6 +1561,29 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
     }
 
+    /* The images are BORROWED for exactly this sync's prefill -- the resume
+     * below as well as the cold rebuild: a licensed resume merges the NEW images
+     * in the chunks that own their blocks (L261; before, only the cold path set
+     * the borrow and a resumed image prefilled its sentinels zero-masked).  The
+     * driver reads them off the graph so that four prefill signatures do not
+     * grow a parameter that only this caller can ever fill; the scope clears the
+     * borrow on every exit, including the interrupted ones and the seam rescue's
+     * re-entry, so no later decode can see it. */
+    struct vision_scope {
+        pulsar_gpu_graph *g;
+        const pulsar_vision_request *prev;
+        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
+            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
+        ~vision_scope() { g->vision_req = prev; }
+    };
+    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
+    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
+
+    /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
+     * carry path re-prefills from a grid point at or above the salvage floor and
+     * the rebuild path prefills from 0 -- so a decode is legal again once it
+     * returns.  Cleared here rather than in either arm because BOTH make the
+     * session decodable again (and the carry path returns early). */
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
      * (position stamping alone misses a same-length full rebuild.) */
@@ -1719,20 +1783,6 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             return rc;
         }
     }
-
-    /* The images are BORROWED for exactly this prefill.  The driver reads them
-     * off the graph so that four prefill signatures do not grow a parameter that
-     * only this caller can ever fill; the scope clears the borrow on every exit,
-     * including the interrupted ones, so no later decode can see it. */
-    struct vision_scope {
-        pulsar_gpu_graph *g;
-        const pulsar_vision_request *prev;
-        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
-            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
-        ~vision_scope() { g->vision_req = prev; }
-    };
-    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
-    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
 
     bool ok;
     s->checkpoint_valid = false;

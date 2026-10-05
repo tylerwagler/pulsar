@@ -2162,9 +2162,6 @@ typedef struct server_prefill_progress {
     const char *phase;   ///< current phase name, for log lines
     bool has_tools;      ///< the request declared tools
     bool responses_protocol;  ///< the request is on /responses
-    /** An image request is a COLD prefill whose sentinel blocks must not be
-     * checkpointed: the progress callback skips the continued KV store. */
-    bool image_request;  ///< the request carries images
     double t0;           ///< wall-clock at prefill start
     double last_t;       ///< wall-clock of the last progress event, for interval rates
     int last_current;    ///< `current` at that event

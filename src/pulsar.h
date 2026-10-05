@@ -493,6 +493,12 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen);
+/** The image BLOCKS already present in tokens [0, len): writes each block's
+ *  first slot (the start_pos an expanded image carries) to `starts`, in order, up
+ *  to `cap`.  Returns how many blocks there are (which may exceed `cap`), or -1
+ *  when a sentinel id there belongs to no well-formed block.  The server uses it
+ *  to place a live continuation's held images (L261). */
+int pulsar_image_block_starts(const pulsar_tokens *tokens, int len, int *starts, int cap);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, -1 when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a

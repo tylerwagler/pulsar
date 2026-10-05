@@ -31,17 +31,32 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
 }
 }  // namespace
 
+int pulsar_kvchain_persist_end(const pulsar_tokens *toks) {
+    if (!toks) return 0;
+    int first = 0;
+    const int n_blocks = pulsar_image_block_starts(toks, toks->len, &first, 1);
+    if (n_blocks < 0) return -1;
+    return n_blocks > 0 ? first : toks->len;
+}
+
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof(r));
     const pulsar_tokens *toks = st ? pulsar_session_tokens(s) : NULL;
-    /* The bank's grid checkpoints, deepest first: where new segments can end. */
+    /* The bank's grid checkpoints at or before the chain's end, deepest first:
+     * where new segments can end.  No checkpoint is captured inside an image
+     * block, so the end is never inside one either. */
+    const int end = pulsar_kvchain_persist_end(toks);
+    if (end < 0) {
+        snprintf(r.err, sizeof(r.err), "the history's image blocks are malformed; nothing persisted");
+        if (out) *out = r;
+        return 0;
+    }
     int Gs[PULSAR_KVCHAIN_MAX];
     int n = 0;
-    if (toks)
-        for (int G = pulsar_session_checkpoint_best(s, toks->len); G > 0 && n < PULSAR_KVCHAIN_MAX;
-             G = pulsar_session_checkpoint_best(s, G - 1)) Gs[n++] = G;
+    for (int G = pulsar_session_checkpoint_best(s, end); G > 0 && n < PULSAR_KVCHAIN_MAX;
+         G = pulsar_session_checkpoint_best(s, G - 1)) Gs[n++] = G;
     if (n == 0 || Gs[0] < min_tokens) {
         if (out) *out = r;
         return 0;

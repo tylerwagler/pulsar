@@ -42,8 +42,18 @@ typedef struct {
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
 
-/** Persist the installed bank's history (see above).  Nothing is written when
- *  its deepest grid checkpoint is below `min_tokens`.  Returns `written`. */
+/** How far a chain may extend over `toks`: the first image block's start, or
+ *  the history's length when it holds none.  A sentinel id renders as no text,
+ *  so a chain over a block would be found by a prompt that never carried the
+ *  image and restore rows that prompt cannot describe (L261): the chain ends at
+ *  the deepest checkpoint at or before this position, wherever persist was
+ *  called from.  -1 when the history's blocks are malformed (nothing may be
+ *  persisted from it). */
+int pulsar_kvchain_persist_end(const pulsar_tokens *toks);
+
+/** Persist the installed bank's history (see above), never past
+ *  pulsar_kvchain_persist_end.  Nothing is written when its deepest grid
+ *  checkpoint is below `min_tokens`.  Returns `written`. */
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out);
 

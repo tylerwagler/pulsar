@@ -335,6 +335,40 @@ int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, in
     return 0;   /* no START, or a START with no END: not a block we will merge */
 }
 
+/* Where an image request's blocks may sit -- the ONE statement of the rule (the
+ * session's sync, the TP leader's preflight and the prefill itself all call it):
+ * every image has bytes and names a sentinel block the prompt carries, and every
+ * block fits inside ONE prefill chunk (`chunk_cap`), wherever it sits.  The merge
+ * and the block's bidirectional visibility are per chunk, so a block the chunk
+ * planner keeps whole is merged in the chunk that owns it (L261 2026-10-02: an
+ * agent's screenshot deep in a conversation must be served, not refused).
+ * `*end_out` receives the exclusive end of the last block.  Returns 0 with `err`
+ * naming the problem. */
+int vision_spans_fit(const int32_t *ids, int n, const pulsar_image_ref *images, int n_images,
+                     uint32_t chunk_cap, int *end_out, char *err, size_t errlen) {
+    int end = 0;
+    for (int i = 0; i < n_images; i++) {
+        if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
+            snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
+            return 0;
+        }
+        int len = 0;
+        if (!vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, images[i].start_pos, &len) || len <= 0) {
+            snprintf(err, errlen, "image %d at %d is not a sentinel block in this prompt",
+                     i, images[i].start_pos);
+            return 0;
+        }
+        if (len > (int)chunk_cap) {
+            snprintf(err, errlen, "image %d's block is %d tokens but one prefill chunk holds only %u "
+                                  "(send a smaller image)", i, len, chunk_cap);
+            return 0;
+        }
+        if (images[i].start_pos + len > end) end = images[i].start_pos + len;
+    }
+    if (end_out) *end_out = end;
+    return 1;
+}
+
 /* The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
  * image span needs `max_image_tokens` columns beyond the sliding window. */
 int vision_visible_width(int n, int window_size, int max_image_tokens) {

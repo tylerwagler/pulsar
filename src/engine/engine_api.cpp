@@ -593,6 +593,18 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
         if (err) snprintf(err, errlen, "tp: an image request with no images; refusing");
         return 1;
     }
+    /* An image the prefill cannot serve is refused HERE, before anything is
+     * mirrored: the worker would refuse the same sync inside it, and a refused
+     * mirrored sync fails the pair (2026-10-02: an image at ~205k tokens took
+     * the pair down instead of failing its request). */
+    if (n_images > 0) {
+        char verr[384];
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+                              NULL, verr, sizeof(verr))) {
+            if (err) snprintf(err, errlen, "%s", verr);
+            return 1;
+        }
+    }
     /* L250: agree on the starting state BEFORE anything runs.  The sync below
      * is ship-first-run-second: the leader starts computing at once and its
      * exchanges wait on the workers, so a worker that refused INSIDE the sync
@@ -643,6 +655,20 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
+int pulsar_image_block_starts(const pulsar_tokens *tokens, int len, int *starts, int cap) {
+    if (!tokens || len < 0 || len > tokens->len) return -1;
+    int n = 0;
+    for (int i = 0; i < len; ) {
+        if (tokens->v[i] < (int)PULSAR_N_VOCAB) { i++; continue; }
+        int blk = 0;
+        if (!vision_span_extent(tokens->v, len, (int)PULSAR_N_VOCAB, i, &blk) || blk <= 0) return -1;
+        if (n < cap && starts) starts[n] = i;
+        n++;
+        i += blk;
+    }
+    return n;
+}
+
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen) {

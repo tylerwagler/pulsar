@@ -4233,6 +4233,31 @@ static void test_spec_cost_fit(void) {
     TEST_ASSERT(f.valid && f.flat_us > 29000 && f.flat_us < 31500 && f.row_us > 4800 && f.row_us < 5200);
 }
 
+/* L261: a chain never holds an image row.  The rule has ONE statement,
+ * pulsar_kvchain_persist_end: the first block's start, the history's length
+ * without one, -1 for a malformed block (nothing persisted). */
+static void test_lib_kvchain_persist_end(void) {
+    const int V = (int)PULSAR_N_VOCAB;
+    const int PAD = V + PULSAR_VISION_ROLE_IMAGE_PAD, START = V + PULSAR_VISION_ROLE_IMAGE_START,
+                  END = V + PULSAR_VISION_ROLE_IMAGE_END;
+    int text_only[] = {5, 6, 7, 8};
+    pulsar_tokens t = {text_only, 4, 4};
+    TEST_ASSERT(pulsar_kvchain_persist_end(&t) == 4);
+    int one_block[] = {5, 6, 7, PAD, START, 9, 9, END, 10, 11};
+    pulsar_tokens b = {one_block, 10, 10};
+    TEST_ASSERT(pulsar_kvchain_persist_end(&b) == 3);
+    int two_blocks[] = {5, START, 9, END, 10, PAD, START, 9, END};
+    pulsar_tokens b2 = {two_blocks, 9, 9};
+    TEST_ASSERT(pulsar_kvchain_persist_end(&b2) == 1);
+    int leading[] = {START, 9, END, 10};
+    pulsar_tokens b3 = {leading, 4, 4};
+    TEST_ASSERT(pulsar_kvchain_persist_end(&b3) == 0);
+    int unterminated[] = {5, 6, START, 9, 9};
+    pulsar_tokens m = {unterminated, 5, 5};
+    TEST_ASSERT(pulsar_kvchain_persist_end(&m) == -1);
+    TEST_ASSERT(pulsar_kvchain_persist_end(NULL) == 0);
+}
+
 static void test_context_memory_shape(void) {
     install_profile_attn_layout();
     const int ctx = 32768;
@@ -4304,6 +4329,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--spec-cost", "spec-cost", "spec cost fit: a round's measured cost to its terms, or no price at all (L263)", test_spec_cost_fit},
+    {"--lib-kvchain", "lib-kvchain", "shared chain rule: a chain ends before the first image block, one statement (L261)", test_lib_kvchain_persist_end},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},
