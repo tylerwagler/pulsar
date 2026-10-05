@@ -150,17 +150,7 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
     memset(st, 0, sizeof(*st));
     st->active = ok;
-    st->mode = pulsar_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
-    st->guard_second_reasoning =
-        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
-}
-
-
-
-void anthropic_stream_free(anthropic_stream *st) {
-    if (!st) return;
-    dsml_tool_stream_free(&st->tool);
 }
 
 
@@ -296,37 +286,30 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
 
 
 
-/* The Anthropic side of the shared DSML tool-stream projection (genmsg.cpp
- * dsml_tool_stream_update): a tool_use content block per invocation, its
- * arguments as input_json_delta, stopped when the invocation closes.  The
- * block/stop lifecycle stays here, in the protocol; the DSML walk is shared. */
-typedef struct {
-    int fd;
-    server *s;
-    const char *id;
-    anthropic_stream *st;
-} anthropic_tool_ctx;
-
+/* The Anthropic side of the DSML tool-call events (deepseek_stream_update): a
+ * tool_use content block per invocation, its arguments as input_json_delta,
+ * stopped when the invocation closes.  ctx is the sink. */
 static bool anthropic_tool_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
-    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
+    chat_sink *k = (chat_sink *)vctx;
     /* This id is already visible to the client.  After final parsing,
-     * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
-     * before tool_memory_remember(), so the next tool_result can continue from
-     * the live KV state instead of re-rendering canonical JSON. */
-    const char *tool_id = dsml_tool_stream_id(c->s, ts, ts->index, API_ANTHROPIC);
-    return anthropic_sse_open_tool_block(c->fd, c->st, tool_id, name);
+     * apply_stream_tool_ids() copies it into the parsed tool_call before
+     * tool_memory_remember(), so the next tool_result can continue from the
+     * live KV state instead of re-rendering canonical JSON. */
+    const char *tool_id = dsml_tool_stream_id(k->s, ts, ts->index, API_ANTHROPIC);
+    return anthropic_sse_open_tool_block(k->fd, (anthropic_stream *)k->st, tool_id, name);
 }
 
-static bool anthropic_tool_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
-    (void)ts;
-    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
-    return anthropic_sse_tool_delta_live(c->fd, c->st, text, len);
+static bool anthropic_tool_args_fragment(void *vctx, dsml_tool_stream *, const char *text, size_t len) {
+    chat_sink *k = (chat_sink *)vctx;
+    return anthropic_sse_tool_delta_live(k->fd, (anthropic_stream *)k->st, text, len);
 }
 
-static bool anthropic_tool_end_invoke(void *vctx, dsml_tool_stream *ts) {
-    (void)ts;
-    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
-    return anthropic_sse_close_block_live(c->fd, c->id, c->st);
+static bool anthropic_tool_end_invoke(void *vctx, dsml_tool_stream *) {
+    chat_sink *k = (chat_sink *)vctx;
+    anthropic_stream *st = (anthropic_stream *)k->st;
+    if (!anthropic_sse_close_block_live(k->fd, k->id, st)) return false;
+    st->tools_streamed++;
+    return true;
 }
 
 static const dsml_tool_stream_ops anthropic_tool_ops = {
@@ -378,155 +361,6 @@ size_t text_stream_safe_limit(const char *raw, size_t start,
 
 
 
-bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
-                                        anthropic_stream *st,
-                                        const char *raw, size_t raw_len,
-                                        bool final) {
-    if (!st->active || !raw) return true;
-
-    if (st->mode == ANTH_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
-        /* Unclosed-reasoning recovery (upstream ds4 51a1c14): see the OpenAI
-         * stream twin. */
-        const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
-        const bool tool_before_close = tool && (!close || tool < close);
-        /* The END must also land before </think> (upstream ds4 0ead8a8): see
-         * the OpenAI stream twin. */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
-        const bool complete_tool = tool_end && (!close || tool_end < close);
-        size_t limit;
-        if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else if (close) {
-            /* An incomplete marker that remains inside a closed think block is
-             * reasoning text, not an executable call. */
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
-            limit = raw_len;
-        } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
-        }
-
-        if (limit > st->emit_pos) {
-            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
-            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                          raw + st->emit_pos,
-                                          limit - st->emit_pos)) return false;
-            st->sent_thinking = true;
-            st->emit_pos = limit;
-        }
-
-        if (complete_tool) {
-            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = ANTH_STREAM_SUPPRESS;
-            return true;
-        }
-
-        if (close || final) {
-            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-            if (close) {
-                st->emit_pos = (size_t)(close - raw) + strlen("</think>");
-                st->mode = ANTH_STREAM_TEXT;
-            } else {
-                st->mode = ANTH_STREAM_SUPPRESS;
-                return true;
-            }
-        } else {
-            return true;
-        }
-    }
-
-    if (st->mode == ANTH_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            /* Second </think> before any tool marker: the held text was
-             * another reasoning pass — emit it as a thinking block. */
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool2 || close < tool2)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos) {
-                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
-                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                                  raw + st->emit_pos,
-                                                  limit - st->emit_pos)) return false;
-                    st->sent_thinking = true;
-                }
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool2 && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
-
-        if (limit > st->emit_pos) {
-            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
-            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
-                                          raw + st->emit_pos,
-                                          limit - st->emit_pos)) return false;
-            st->sent_text = true;
-            st->emit_pos = limit;
-        }
-
-        if (tool) {
-            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-            st->emit_pos = (size_t)(tool - raw);
-            /* On normal token-by-token updates, switch from hidden text to a
-             * live tool_use projection as soon as the DSML block starts.  On
-             * final catch-up from plain text, leave the block for the existing
-             * final emitter so old non-incremental behavior stays unchanged. */
-            if (!final &&
-                dsml_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
-                st->mode = ANTH_STREAM_TOOL;
-            } else {
-                st->mode = ANTH_STREAM_SUPPRESS;
-            }
-        } else if (final) {
-            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-            st->mode = ANTH_STREAM_SUPPRESS;
-        }
-    }
-
-    if (st->mode == ANTH_STREAM_TOOL) {
-        anthropic_tool_ctx ctx = {fd, s, id, st};
-        if (!dsml_tool_stream_update(&st->tool, &anthropic_tool_ops, &ctx, raw, raw_len)) return false;
-        if (final && st->tool.active &&
-            !dsml_tool_stream_finalize(&st->tool, &anthropic_tool_ops, &ctx, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
-    }
-    return true;
-}
-
-
-
 static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
                                            anthropic_stream *st,
                                            const tool_calls *calls) {
@@ -534,11 +368,11 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     if (!calls) return true;
 
     buf b = {0};
-    /* Tool calls completed by anthropic_tool_stream_update() have already
-     * produced start/delta/stop events.  Only emit the tail calls that were not
-     * seen by the live projection, for example if the first DSML bytes only
-     * become available during final flush. */
-    int already_streamed = st->tool.emitted_any ? st->tool.index : 0;
+    /* Tool calls the live DSML projection completed have already produced
+     * start/delta/stop events.  Only emit the tail calls that were not seen by
+     * it, for example if the first DSML bytes only become available during the
+     * final flush (or the family hands calls over whole). */
+    int already_streamed = st->tools_streamed;
     if (already_streamed > calls->len) already_streamed = calls->len;
     for (int i = already_streamed; i < calls->len; i++, st->next_index++) {
         const tool_call *tc = &calls->v[i];
@@ -592,13 +426,12 @@ static bool anthropic_sse_stop_live(int fd, const char *finish, const char *stop
 
 
 
-bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                      anthropic_stream *st, const char *raw,
-                                      size_t raw_len, const tool_calls *calls,
-                                      const char *finish, const char *stop_sequence,
-                                      int completion_tokens) {
-    if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
-
+/* The end of a streamed message, every block closed: an empty text block when
+ * only thinking was sent (a message must end with content), the tool_use blocks
+ * not yet streamed, then message_delta + message_stop. */
+static bool anthropic_sse_finish_tail(int fd, const request *r, const char *id, anthropic_stream *st,
+                                      const tool_calls *calls, const char *finish,
+                                      const char *stop_sequence, int completion_tokens) {
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
         if (!anthropic_sse_close_block_live(fd, id, st)) return false;
@@ -608,5 +441,37 @@ bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *
     return anthropic_sse_stop_live(fd, finish, stop_sequence, completion_tokens);
 }
 
+/* ---- L267: the Anthropic sink (chat_sink) ------------------------------------ */
 
+/* Reasoning into a thinking block, content into a text block: the open block
+ * closes when the other kind arrives (DeepSeek's walk closes it at the section
+ * end first). */
+static bool anthropic_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
+    anthropic_stream *st = (anthropic_stream *)k->st;
+    if (!st->active || len == 0) return true;
+    const anthropic_block_type type = reasoning ? ANTH_BLOCK_THINKING : ANTH_BLOCK_TEXT;
+    if (st->open_block != type && !anthropic_sse_close_block_live(k->fd, k->id, st)) return false;
+    if (!anthropic_sse_open_block(k->fd, st, type)) return false;
+    if (!anthropic_sse_delta_live(k->fd, st, type, text, len)) return false;
+    if (reasoning) st->sent_thinking = true;
+    else st->sent_text = true;
+    return true;
+}
 
+static bool anthropic_sink_end_cb(chat_sink *k, bool) {
+    return anthropic_sse_close_block_live(k->fd, k->id, (anthropic_stream *)k->st);
+}
+
+void anthropic_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
+                         anthropic_stream *st) {
+    /* a block first seen in the final flush goes out with the finish */
+    *k = {fd, s, r, id, st, anthropic_sink_text_cb, anthropic_sink_end_cb, &anthropic_tool_ops, false};
+}
+
+/* The end of the message: the open block closed, then the tail. */
+bool anthropic_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish,
+                          const char *stop_sequence, int completion_tokens) {
+    anthropic_stream *st = (anthropic_stream *)k->st;
+    if (!anthropic_sse_close_block_live(k->fd, k->id, st)) return false;
+    return anthropic_sse_finish_tail(k->fd, k->r, k->id, st, calls, finish, stop_sequence, completion_tokens);
+}

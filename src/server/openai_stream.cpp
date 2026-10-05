@@ -421,61 +421,13 @@ bool sse_done(int fd, const request *r, const char *id,
 
 
 
-bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
-                            const char *reasoning, const tool_calls *calls, const char *finish,
-                            int prompt_tokens, int completion_tokens) {
-    if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
-
-    buf b = {0};
-    long now = (long)time(NULL);
-    if (reasoning && reasoning[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
-        json_escape(&b, reasoning);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    if (content && content[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
-        json_escape(&b, content);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    if (calls && calls->len) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-    json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
-    json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
-
-    bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
-    return ok;
-}
 
 
 
 void openai_stream_start(const request *r, openai_stream *st) {
+    (void)r;
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->mode = pulsar_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning =
-        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
-}
-
-
-
-void openai_stream_free(openai_stream *st) {
-    if (!st) return;
-    dsml_tool_stream_free(&st->tool);
 }
 
 
@@ -987,175 +939,58 @@ size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
 /* The OpenAI side of the shared DSML tool-stream projection (genmsg.cpp
  * dsml_tool_stream_update): tool_call deltas keyed by the invocation index;
  * nothing to send when an invocation closes. */
-typedef struct {
-    int fd;
-    server *s;
-    const request *r;
-    const char *id;
-} openai_tool_ctx;
+/* ---- L267: the OpenAI sink (chat_sink) --------------------------------------- */
 
+static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto) {
+    openai_stream *st = (openai_stream *)k->st;
+    if (!st->active) return true;
+    if (!sse_chat_delta_n(k->fd, k->r, k->id, reasoning ? "reasoning_content" : "content", text, len, st->lp,
+                          release_upto)) return false;
+    if (reasoning) st->sent_reasoning = true;
+    return true;
+}
+
+static bool openai_sink_end_cb(chat_sink *, bool) { return true; }
+
+/* A DSML invocation as it decodes: the tool_call start delta (id + name), then
+ * its argument object's JSON in fragments. */
 static bool openai_tool_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
-    openai_tool_ctx *c = (openai_tool_ctx *)vctx;
-    const char *tool_id = dsml_tool_stream_id(c->s, ts, ts->index, API_OPENAI);
-    return sse_chat_tool_call_start_delta(c->fd, c->r, c->id, ts->index, tool_id, name);
+    chat_sink *k = (chat_sink *)vctx;
+    const char *tool_id = dsml_tool_stream_id(k->s, ts, ts->index, API_OPENAI);
+    ((openai_stream *)k->st)->tools_streamed++;
+    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, ts->index, tool_id, name);
 }
 
 static bool openai_tool_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
-    openai_tool_ctx *c = (openai_tool_ctx *)vctx;
-    return sse_chat_tool_call_args_delta_n(c->fd, c->r, c->id, ts->index, text, len);
+    chat_sink *k = (chat_sink *)vctx;
+    return sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, ts->index, text, len);
 }
 
-static bool openai_tool_end_invoke(void *vctx, dsml_tool_stream *ts) {
-    (void)vctx;
-    (void)ts;
-    return true;
-}
+static bool openai_tool_end_invoke(void *, dsml_tool_stream *) { return true; }
 
 static const dsml_tool_stream_ops openai_tool_ops = {
     openai_tool_begin_invoke, openai_tool_args_fragment, openai_tool_end_invoke,
 };
 
+void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st) {
+    *k = {fd, s, r, id, st, openai_sink_text_cb, openai_sink_end_cb, &openai_tool_ops, true};
+}
 
-
-bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
-                                     openai_stream *st,
-                                     const char *raw, size_t raw_len,
-                                     bool final) {
-    if (!st->active || !raw) return true;
-
-    if (st->mode == OPENAI_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
-        /* A tool call starting before any </think> is the unclosed-reasoning
-         * recovery case (upstream ds4 51a1c14): stream only the prose before
-         * the marker as reasoning, hold until the block completes, and keep
-         * the protocol bytes off every channel. */
-        const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
-        const bool tool_before_close = tool && (!close || tool < close);
-        /* The END must also land before </think>: a block whose end falls past
-         * the close straddles the reasoning boundary and is NOT an executable
-         * call (upstream ds4 0ead8a8). */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
-        const bool complete_tool = tool_end && (!close || tool_end < close);
-        size_t limit;
-        if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else if (close) {
-            /* An incomplete marker that remains inside a closed think block is
-             * reasoning text, not an executable call. */
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
-            limit = raw_len;
-        } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
-        }
-
-        if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos, st->lp, limit)) return false;
-            st->sent_reasoning = true;
-            st->emit_pos = limit;
-        }
-
-        if (complete_tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = OPENAI_STREAM_SUPPRESS;
-            return true;
-        }
-
-        if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
-            st->mode = OPENAI_STREAM_TEXT;
-        } else if (final) {
-            st->mode = OPENAI_STREAM_SUPPRESS;
-            return true;
-        } else {
-            return true;
-        }
-    }
-
-    if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            /* A second </think> before any tool marker means the held text
-             * was another reasoning pass — reroute it. A tool marker or the
-             * final flush releases the hold as genuine answer text. */
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool2 || close < tool2)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos, st->lp, limit)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool2 && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
-
-        if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos, st->lp, limit)) return false;
-            st->emit_pos = limit;
-        }
-
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            if (dsml_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
-                st->mode = OPENAI_STREAM_TOOL;
-            } else {
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
-        } else if (final) {
-            st->mode = OPENAI_STREAM_SUPPRESS;
-        }
-    }
-
-    if (st->mode == OPENAI_STREAM_TOOL) {
-        openai_tool_ctx ctx = {fd, s, r, id};
-        if (!dsml_tool_stream_update(&st->tool, &openai_tool_ops, &ctx, raw, raw_len)) return false;
-        if (final && st->tool.active &&
-            !dsml_tool_stream_finalize(&st->tool, &openai_tool_ops, &ctx, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
-    }
-    return true;
+/* A call handed over whole (Qwen): the start delta (index, id, name, empty
+ * arguments) and one arguments delta carrying the whole JSON object -- the
+ * OpenAI streaming shape, so a client that concatenates argument fragments gets
+ * the object. */
+bool openai_sink_tool_call(chat_sink *k, int index, const tool_call *tc) {
+    const char *args = tc->arguments ? tc->arguments : "";
+    ((openai_stream *)k->st)->tools_streamed++;
+    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, index, tc->id, tc->name) &&
+           sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, index, args, strlen(args));
 }
 
 
 
 /* Append the closing chat chunk (empty delta, the remaining logprob entries,
- * finish_reason) to `b`, send `b`, then the usage chunk and [DONE]; frees `b`.
- * Shared by the DeepSeek projection and the Qwen one (L251). */
+ * finish_reason) to `b`, send `b`, then the usage chunk and [DONE]; frees `b`. */
 static bool openai_sse_send_final(int fd, const request *r, const char *id, long now, buf *b,
                                   logprob_ledger *lp, const char *finish,
                                   int prompt_tokens, int completion_tokens) {
@@ -1179,55 +1014,21 @@ static bool openai_sse_send_final(int fd, const request *r, const char *id, long
 
 
 
-bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                   openai_stream *st, const char *raw,
-                                   size_t raw_len, const tool_calls *calls,
-                                   const char *finish, int prompt_tokens,
-                                   int completion_tokens) {
-    if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
-
+/* The end of the stream: the calls no delta carried yet (a block the final
+ * parse recovered), then the closing chunk, usage and [DONE]. */
+bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish, int prompt_tokens,
+                       int completion_tokens) {
+    const openai_stream *st = (const openai_stream *)k->st;
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
+    if (calls && calls->len && !st->tools_streamed) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", k->id, now);
+        json_escape(&b, k->r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, k->id, &k->r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
-    return openai_sse_send_final(fd, r, id, now, &b, st->lp, finish,
-                                 prompt_tokens, completion_tokens);
-}
-
-
-
-/* ---- L251: the Qwen family's chat deltas (qwen_gen_feed drives them) ---- */
-
-bool openai_sse_qwen_text(int fd, const request *r, const char *id, bool reasoning,
-                          const std::string &text, logprob_ledger *lp, size_t release_upto) {
-    return sse_chat_delta_n(fd, r, id, reasoning ? "reasoning_content" : "content",
-                            text.data(), text.size(), lp, release_upto);
-}
-
-
-
-/* A complete call: the start delta (index, id, name, empty arguments) and one
- * arguments delta carrying the whole JSON object -- the OpenAI streaming shape,
- * so a client that concatenates argument fragments gets the object. */
-bool openai_sse_qwen_tool_call(int fd, const request *r, const char *id, int index,
-                               const tool_call *tc) {
-    const char *args = tc->arguments ? tc->arguments : "";
-    return sse_chat_tool_call_start_delta(fd, r, id, index, tc->id, tc->name) &&
-           sse_chat_tool_call_args_delta_n(fd, r, id, index, args, strlen(args));
-}
-
-
-
-bool openai_sse_qwen_finish(int fd, const request *r, const char *id, logprob_ledger *lp,
-                            const char *finish, int prompt_tokens, int completion_tokens) {
-    buf b = {0};
-    return openai_sse_send_final(fd, r, id, (long)time(NULL), &b, lp, finish,
-                                 prompt_tokens, completion_tokens);
+    return openai_sse_send_final(k->fd, k->r, k->id, now, &b, st->lp, finish, prompt_tokens, completion_tokens);
 }
 
 

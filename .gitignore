@@ -153,3 +153,5 @@ tests/dspark_batch_gate
 /tests/qsa_layer_replay
 /tests/qsa_attn_bench
 /tests/qwen_chat_gate
+tests/api-golden/out.txt
+tests/sse-golden/out.txt

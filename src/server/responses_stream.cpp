@@ -9,10 +9,8 @@
 
 
 void responses_stream_init(const request *r, responses_stream *st) {
+    (void)r;
     memset(st, 0, sizeof(*st));
-    st->mode = pulsar_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
-    st->guard_second_reasoning =
-        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
     random_prefixed_id(st->response_id, sizeof(st->response_id), "resp_", 12);
     random_prefixed_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_", 12);
     random_prefixed_id(st->message_id, sizeof(st->message_id), "msg_", 12);
@@ -549,187 +547,73 @@ bool responses_sse_completed(int fd, const request *r,
  * consumes: <think>...</think> is reasoning, anything before the tool-call
  * marker is output text. Tool-call argument deltas are not surfaced because
  * Codex' SSE parser only ingests function_call items via output_item.done. */
-bool responses_sse_stream_update(int fd, const request *r,
-                                        responses_stream *st,
-                                        const char *raw, size_t raw_len,
-                                        bool final) {
-    if (!st->active || !raw) return true;
-
-    /* The client only sees reasoning if it explicitly opted in via
-     * reasoning.summary. Otherwise we still need to walk past <think>...</think>
-     * to find the user-visible text, but we suppress the per-chunk emission. */
-    const bool emit_reasoning = r->reasoning_summary_emit;
-
-    if (st->mode == RESP_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            /* The chat template ends the prompt with the literal `<think>` (or
-             * `</think>` when thinking is off), so generation usually starts
-             * mid-reasoning rather than with the open tag. If the model does
-             * happen to repeat `<think>` we skip it; otherwise start from
-             * position 0. The earlier "no-think-prefix => switch to TEXT"
-             * shortcut here was incorrect: it leaked reasoning to clients as
-             * regular output_text because the model was already inside the
-             * think block when it produced its first token. The actual
-             * mode change to TEXT happens only when `</think>` is observed. */
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
-        /* Unclosed-reasoning recovery (upstream ds4 51a1c14): see the OpenAI
-         * stream twin. */
-        const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
-        const bool tool_before_close = tool && (!close || tool < close);
-        /* The END must also land before </think> (upstream ds4 0ead8a8): see
-         * the OpenAI stream twin. */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
-        const bool complete_tool = tool_end && (!close || tool_end < close);
-        size_t limit;
-        if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else if (close) {
-            /* An incomplete marker that remains inside a closed think block is
-             * reasoning text, not an executable call. */
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
-            limit = raw_len;
-        } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
-        }
-
-        if (limit > st->emit_pos) {
-            if (emit_reasoning) {
-                if (!st->reasoning_item_opened) {
-                    st->reasoning_index = st->next_output_index++;
-                    if (!responses_sse_reasoning_added(fd, st)) return false;
-                    st->reasoning_item_opened = true;
-                }
-                if (!st->reasoning_summary_started) {
-                    if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
-                    st->reasoning_summary_started = true;
-                }
-                if (!responses_sse_reasoning_delta(fd, st,
-                                                   raw + st->emit_pos,
-                                                   limit - st->emit_pos)) return false;
-                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
-                st->reasoning_emitted_any = true;
-            }
-            st->emit_pos = limit;
-        }
-
-        if (complete_tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
-            return true;
-        }
-
-        if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
-            st->mode = RESP_STREAM_TEXT;
-            st->reasoning_closed_naturally = true;
-        } else if (final) {
-            st->mode = RESP_STREAM_SUPPRESS;
-            return true;
-        } else {
-            return true;
-        }
+/* One reasoning delta into the reasoning item (opened, with its summary part, on
+ * the first) and one output_text delta into the message item: the two shapes
+ * every producer streams -- DeepSeek's text projection below and a family's
+ * output parser (responses_sink_text). */
+static bool responses_emit_reasoning(int fd, responses_stream *st, const char *text, size_t len) {
+    if (!st->reasoning_item_opened) {
+        st->reasoning_index = st->next_output_index++;
+        if (!responses_sse_reasoning_added(fd, st)) return false;
+        st->reasoning_item_opened = true;
     }
-
-    if (st->mode == RESP_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            /* Second </think> before any tool marker: the held text was
-             * another reasoning pass — reroute (or drop, when reasoning
-             * summaries are off) instead of leaking it into output_text. */
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool2 || close < tool2)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos && r->reasoning_summary_emit) {
-                    if (!st->reasoning_item_opened) {
-                        st->reasoning_index = st->next_output_index++;
-                        if (!responses_sse_reasoning_added(fd, st)) return false;
-                        st->reasoning_item_opened = true;
-                    }
-                    if (!st->reasoning_summary_started) {
-                        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
-                        st->reasoning_summary_started = true;
-                    }
-                    if (!responses_sse_reasoning_delta(fd, st,
-                                                       raw + st->emit_pos,
-                                                       limit - st->emit_pos)) return false;
-                    buf_append(&st->reasoning_text, raw + st->emit_pos,
-                               limit - st->emit_pos);
-                    st->reasoning_emitted_any = true;
-                }
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool2 && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
-
-        if (limit > st->emit_pos) {
-            if (!st->message_item_opened) {
-                st->message_index = st->next_output_index++;
-                if (!responses_sse_message_added(fd, st)) return false;
-                st->message_item_opened = true;
-            }
-            if (!st->message_text_part_open) {
-                if (!responses_sse_message_text_part_added(fd, st)) return false;
-                st->message_text_part_open = true;
-            }
-            if (!responses_sse_output_text_delta(fd, st,
-                                                 raw + st->emit_pos,
-                                                 limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
-            st->message_emitted_any = true;
-            st->emit_pos = limit;
-        }
-
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
-        } else if (final) {
-            st->mode = RESP_STREAM_SUPPRESS;
-        }
+    if (!st->reasoning_summary_started) {
+        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+        st->reasoning_summary_started = true;
     }
+    if (!responses_sse_reasoning_delta(fd, st, text, len)) return false;
+    buf_append(&st->reasoning_text, text, len);
+    st->reasoning_emitted_any = true;
+    return true;
+}
+
+static bool responses_emit_text(int fd, responses_stream *st, const char *text, size_t len) {
+    if (!st->message_item_opened) {
+        st->message_index = st->next_output_index++;
+        if (!responses_sse_message_added(fd, st)) return false;
+        st->message_item_opened = true;
+    }
+    if (!st->message_text_part_open) {
+        if (!responses_sse_message_text_part_added(fd, st)) return false;
+        st->message_text_part_open = true;
+    }
+    if (!responses_sse_output_text_delta(fd, st, text, len)) return false;
+    buf_append(&st->message_text, text, len);
+    st->message_emitted_any = true;
     return true;
 }
 
 
 
-bool responses_sse_finish_live(int fd, const request *r,
-                                      responses_stream *st,
-                                      const char *raw, size_t raw_len,
-                                      const char *recovered_content,
-                                      const tool_calls *calls,
-                                      const char *finish,
-                                      int prompt_tokens, int completion_tokens,
-                                      long created_at) {
-    if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+/* ---- L267: the Responses sink (chat_sink) ------------------------------------ */
 
+/* Reasoning reaches the client only when it opted into a summary
+ * (reasoning.summary); tool calls go out with the response's completion
+ * (responses_sse_finish), not as they decode. */
+static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
+    responses_stream *st = (responses_stream *)k->st;
+    if (!st->active || len == 0) return true;
+    if (reasoning) return !k->r->reasoning_summary_emit || responses_emit_reasoning(k->fd, st, text, len);
+    return responses_emit_text(k->fd, st, text, len);
+}
+
+/* A reasoning section that ended at the model's own </think> is a complete
+ * reasoning item (not one a stop or an error cut short). */
+static bool responses_sink_end_cb(chat_sink *k, bool think_closed) {
+    if (think_closed) ((responses_stream *)k->st)->reasoning_closed_naturally = true;
+    return true;
+}
+
+void responses_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
+                         responses_stream *st) {
+    *k = {fd, s, r, id, st, responses_sink_text_cb, responses_sink_end_cb, NULL, false};
+}
+
+
+
+bool responses_sse_finish(int fd, const request *r, responses_stream *st, const char *recovered_tail,
+                          size_t tail_len, const tool_calls *calls, const char *finish, int prompt_tokens,
+                          int completion_tokens, long created_at) {
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
     if (st->reasoning_item_opened && !st->reasoning_item_closed) {
@@ -737,30 +621,11 @@ bool responses_sse_finish_live(int fd, const request *r,
         st->reasoning_item_closed = true;
     }
     /* Recovery path: when DSML tool parsing fails the worker promotes the entire
-     * generation to assistant text. Streaming had already entered suppress mode
-     * at the tool marker, so anything in raw[st->emit_pos..raw_len] never made
-     * it to the client. Emit those bytes as additional output_text deltas so
-     * what the client accumulates matches output_item.done and the terminal
-     * response. We use the stream cursor instead of comparing against
-     * recovered_content because the raw text can begin with `<think>...</think>`
-     * which the streaming side consumed as reasoning, not message text. */
-    if (recovered_content && raw && st->emit_pos < raw_len) {
-        const char *tail = raw + st->emit_pos;
-        size_t tail_len = raw_len - st->emit_pos;
-        if (!st->message_item_opened) {
-            st->message_index = st->next_output_index++;
-            if (!responses_sse_message_added(fd, st)) return false;
-            st->message_item_opened = true;
-        }
-        if (!st->message_text_part_open) {
-            if (!responses_sse_message_text_part_added(fd, st)) return false;
-            st->message_text_part_open = true;
-        }
-        if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
-        st->message_emitted_any = true;
-        st->emit_pos = raw_len;
-    }
+     * generation to assistant text.  Streaming had already stopped at the tool
+     * marker, so the bytes after the walk's position never made it to the
+     * client: they go out as additional output_text deltas so what the client
+     * accumulates matches output_item.done and the terminal response. */
+    if (recovered_tail && tail_len && !responses_emit_text(fd, st, recovered_tail, tail_len)) return false;
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
         st->message_item_closed = true;

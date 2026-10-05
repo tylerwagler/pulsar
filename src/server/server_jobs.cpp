@@ -1063,10 +1063,7 @@ void server::gen_stream_begin(session_slot *sl) {
     random_prefixed_id(g->id, sizeof(g->id), j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-", 12);
 
     g->structured_stream = request_uses_structured_stream(&j->req);
-    /* L251: a Qwen stream is projected from its output parser's events
-     * (qwen_gen_feed), never by the DeepSeek think/DSML projection; it is still
-     * a structured stream, so no raw text goes out either. */
-    g->openai_live_chat = request_uses_openai_live_stream(&j->req) && !j->req.chat_qwen;
+    g->openai_live_chat = request_uses_openai_live_stream(&j->req);
     g->responses_live_chat = request_uses_responses_live_stream(&j->req);
     g->responses_created_at = (long)time(NULL);
     if (j->req.stream) {
@@ -1126,6 +1123,16 @@ void server::gen_stream_begin(session_slot *sl) {
                 return;
             }
         }
+        /* L267: the protocol sink this response streams into; a Qwen turn is
+         * driven by its output parser (qwen_gen_feed), a DeepSeek turn by the
+         * walk over its raw text (gen_emit_token). */
+        if (j->req.api == API_ANTHROPIC)
+            anthropic_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->anthropic_live);
+        else if (g->openai_live_chat)
+            openai_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->openai_live);
+        else if (g->responses_live_chat)
+            responses_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->responses_live);
+        if (g->sink.text && !j->req.chat_qwen) deepseek_stream_walk_init(&g->ds_walk, &j->req);
     }
 
     g->dsml_recovery_attempted = false;
@@ -1292,10 +1299,11 @@ qwen_gen::~qwen_gen() { tool_calls_free(&calls); }
 /* L251: feed the Qwen output parser g->text[fed, upto) -- the bytes the
  * stop-string scan has released -- and, when `final`, end the turn; then turn
  * its events into the response.  Reasoning and content go out as deltas when
- * streaming (the parser keeps both for the final message either way); a
- * completed call is given its id and kept, and streamed whole.  A malformed
- * call is the model's output, not a server fault: logged, and dropped by the
- * parser.  false = a client write failed. */
+ * streaming, into the request's protocol sink (L267; the parser keeps both for
+ * the final message either way); a completed call is given its id and kept,
+ * and on OpenAI streamed whole (Anthropic and Responses send calls with the
+ * finish).  A malformed call is the model's output, not a server fault: logged,
+ * and dropped by the parser.  false = a client write failed. */
 static bool qwen_gen_feed(server *s, gen_state *g, size_t upto, bool final) {
     job *j = g->j;
     qwen_gen *q = g->qwen;
@@ -1310,9 +1318,9 @@ static bool qwen_gen_feed(server *s, gen_state *g, size_t upto, bool final) {
         switch (e.kind) {
         case qwen_out_event::REASONING:
         case qwen_out_event::CONTENT:
-            if (stream && !openai_sse_qwen_text(j->fd, &j->req, g->id,
-                                                e.kind == qwen_out_event::REASONING,
-                                                e.text, &g->logprobs, q->fed)) return false;
+            if (stream && g->sink.text &&
+                !g->sink.text(&g->sink, e.kind == qwen_out_event::REASONING, e.text.data(), e.text.size(), q->fed))
+                return false;
             break;
         case qwen_out_event::TOOL_BEGIN:
             break;   /* a call goes out whole, at TOOL_END (see qwen_gen) */
@@ -1322,8 +1330,9 @@ static bool qwen_gen_feed(server *s, gen_state *g, size_t upto, bool final) {
             tc.arguments = xstrdup(e.arguments.c_str());
             tool_calls_push(&q->calls, tc);
             s->assign_tool_call_ids(&q->calls, j->req.api);
-            if (stream && !openai_sse_qwen_tool_call(j->fd, &j->req, g->id, q->calls.len - 1,
-                                                     &q->calls.v[q->calls.len - 1])) return false;
+            if (stream && g->openai_live_chat &&
+                !openai_sink_tool_call(&g->sink, q->calls.len - 1, &q->calls.v[q->calls.len - 1]))
+                return false;
             break;
         }
         case qwen_out_event::ERROR:
@@ -1431,28 +1440,10 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         free(piece);
         return true;
     }
-    if (j->req.stream && j->req.api == API_ANTHROPIC &&
-        !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
-                                     &g->anthropic_live, g->text.ptr, stream_len,
-                                     false)) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
-        return true;
-    }
-    if (g->openai_live_chat &&
-        !openai_sse_stream_update(j->fd, s, &j->req, g->id,
-                                  &g->openai_live, g->text.ptr, stream_len,
-                                  false)) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
-        return true;
-    }
-    if (g->responses_live_chat &&
-        !responses_sse_stream_update(j->fd, &j->req,
-                                     &g->responses_live, g->text.ptr, stream_len,
-                                     false)) {
+    /* DeepSeek's one walk over its raw text (L267); a Qwen turn is projected by
+     * its output parser (qwen_gen_feed above) */
+    if (g->sink.text && !j->req.chat_qwen &&
+        !deepseek_stream_update(&g->ds_walk, &g->sink, g->text.ptr, stream_len, false)) {
         g->finish = "error";
         snprintf(g->err, sizeof(g->err), "client stream write failed");
         free(piece);
@@ -1822,9 +1813,7 @@ void server::gen_step_finish(session_slot *sl) {
             }
         }
         if (parsed_calls.len) {
-            if (g->openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &g->openai_live);
-            if (j->req.api == API_ANTHROPIC && j->req.stream)
-                apply_anthropic_stream_tool_ids(&parsed_calls, &g->anthropic_live);
+            if (g->sink.text) apply_stream_tool_ids(&parsed_calls, &g->ds_walk.tool);
             s->assign_tool_call_ids(&parsed_calls, j->req.api);
             s->tool_memory_remember(&parsed_calls);
             /* L077: a length-capped, tag-repaired call reports "length" -- the
@@ -1871,7 +1860,9 @@ void server::gen_step_finish(session_slot *sl) {
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        /* L267: the visible suffix is DeepSeek's render, and the Qwen family keeps
+         * no live tool state (its renderer refuses a request that needs it) */
+        if (!j->req.chat_qwen && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -1952,43 +1943,29 @@ void server::gen_step_finish(session_slot *sl) {
         }
     } else if (j->req.stream) {
         bool response_ok = true;
-        if (j->req.chat_qwen) {
-            response_ok = qwen_stream_ok &&
-                          openai_sse_qwen_finish(j->fd, &j->req, g->id, &g->logprobs, final_finish,
-                                                 g->prompt_tokens,
-                                                 g->completion_total + g->completion);
-        } else if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
-                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    &parsed_calls, final_finish, g->stop_sequence,
-                                                    g->completion_total + g->completion);
-        } else if (g->openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, g->id, &g->openai_live,
-                                                 g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                 &parsed_calls, final_finish,
-                                                 g->prompt_tokens,
-                                                 g->completion_total + g->completion);
-        } else if (g->responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &g->responses_live,
-                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    g->prompt_tokens,
-                                                    g->completion_total + g->completion,
-                                                    g->responses_created_at);
-        } else if (g->structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, g->id,
-                                          parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          g->prompt_tokens,
-                                          g->completion_total + g->completion);
+        if (g->sink.text) {
+            /* L267: the family's last text into the sink -- DeepSeek's walk
+             * flushes what it held back; a Qwen turn's parser already did -- then
+             * the protocol's finish, which sends any calls not yet streamed. */
+            const int completion = g->completion_total + g->completion;
+            const char *raw = g->text.ptr ? g->text.ptr : "";
+            response_ok = j->req.chat_qwen ? qwen_stream_ok
+                                           : deepseek_stream_update(&g->ds_walk, &g->sink, raw, g->text.len, true);
+            if (response_ok && j->req.api == API_ANTHROPIC) {
+                response_ok = anthropic_sse_finish(&g->sink, &parsed_calls, final_finish, g->stop_sequence, completion);
+            } else if (response_ok && j->req.api == API_RESPONSES) {
+                /* A malformed tool call the final parse turned back into text:
+                 * the walk stopped at its marker, so the rest goes out now. */
+                const bool recover = recovered_tool_parse_failure && !j->req.chat_qwen &&
+                                     g->ds_walk.emit_pos < g->text.len;
+                response_ok = responses_sse_finish(j->fd, &j->req, &g->responses_live,
+                                                   recover ? raw + g->ds_walk.emit_pos : NULL,
+                                                   recover ? g->text.len - g->ds_walk.emit_pos : 0, &parsed_calls,
+                                                   final_finish, g->prompt_tokens, completion,
+                                                   g->responses_created_at);
+            } else if (response_ok) {
+                response_ok = openai_sse_finish(&g->sink, &parsed_calls, final_finish, g->prompt_tokens, completion);
+            }
         } else {
             response_ok = sse_chunk(j->fd, &j->req, g->id, NULL, final_finish) &&
                           sse_done(j->fd, &j->req, g->id, g->prompt_tokens,
@@ -2103,8 +2080,7 @@ void server::gen_state_free(session_slot *sl) {
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    anthropic_stream_free(&g->anthropic_live);
-    openai_stream_free(&g->openai_live);
+    deepseek_stream_walk_free(&g->ds_walk);
     responses_stream_free(&g->responses_live);
     delete g->qwen;
     buf_free(&g->text);

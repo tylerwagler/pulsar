@@ -944,10 +944,80 @@ void responses_prepare_live_continuation(request *r,
 
 
 
+/* An Anthropic tool result: a "tool" part as read (chat_msg::anthropic_continues), or after
+ * anthropic_fold_tool_results the user turn it was folded into. */
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
-    return m && !strcmp(m->role, "user") &&
+    return m && (!strcmp(m->role, "user") || !strcmp(m->role, "tool")) &&
            ((m->tool_call_id && m->tool_call_id[0]) ||
             m->tool_call_ids_len > 0);
+}
+
+
+
+/* DeepSeek's template keeps an Anthropic message's tool results inside the user turn they arrived in:
+ * each one is <tool_result>escaped text</tool_result> at its block's position among the message's own
+ * text, an image placeholder unescaped where its block was, and the turn answers every result's id.
+ * The parser reads the message into parts (chat_msg::anthropic_continues); this folds each message's
+ * parts back into that one turn, in place. */
+void anthropic_fold_tool_results(chat_msgs *msgs) {
+    chat_msgs out = {0};
+    for (int i = 0; i < msgs->len;) {
+        int end = i + 1;
+        while (end < msgs->len && msgs->v[end].anthropic_continues) end++;
+        if (end == i + 1 && strcmp(msgs->v[i].role, "tool")) {
+            chat_msgs_push(&out, msgs->v[i]);
+            memset(&msgs->v[i], 0, sizeof(msgs->v[i]));
+            i = end;
+            continue;
+        }
+        chat_msg f = {0};
+        buf content = {0};
+        for (int k = i; k < end; k++) {
+            chat_msg *m = &msgs->v[k];
+            const bool result = !strcmp(m->role, "tool");
+            if (!f.role && !result) f.role = xstrdup(m->role);
+            const char *c = m->content ? m->content : "";
+            if (result) {
+                chat_msg_add_tool_call_id(&f, m->tool_call_id);
+                buf_puts(&content, "<tool_result>");
+            }
+            /* the part's text, escaped when it is a result's, around its images' placeholders */
+            size_t at = 0;
+            for (int im = 0; im <= m->images_len; im++) {
+                const size_t ph = im < m->images_len ? m->image_ph_off[im] : strlen(c);
+                char *run = xstrndup(c + at, ph - at);
+                if (result) append_tool_result_text(&content, run);
+                else buf_puts(&content, run);
+                free(run);
+                if (im == m->images_len) break;
+                chat_msg_add_image(&f, m->images[im].bytes, m->images[im].len, content.len);
+                m->images[im].bytes = NULL;
+                buf_puts(&content, PULSAR_IMAGE_PLACEHOLDER);
+                at = ph + strlen(PULSAR_IMAGE_PLACEHOLDER);
+            }
+            if (result) buf_puts(&content, "</tool_result>");
+            for (int t = 0; t < m->calls.len; t++) {
+                tool_call tc = m->calls.v[t];
+                tool_calls_push(&f.calls, tc);
+            }
+            free(m->calls.v);
+            memset(&m->calls, 0, sizeof(m->calls));
+            if (m->reasoning) {
+                buf r = {0};
+                buf_puts(&r, f.reasoning ? f.reasoning : "");
+                buf_puts(&r, m->reasoning);
+                free(f.reasoning);
+                f.reasoning = buf_take(&r);
+            }
+        }
+        if (!f.role) f.role = xstrdup("user");
+        f.content = buf_take(&content);
+        if (!f.content) f.content = xstrdup("");
+        chat_msgs_push(&out, f);
+        i = end;
+    }
+    chat_msgs_free(msgs);
+    *msgs = out;
 }
 
 

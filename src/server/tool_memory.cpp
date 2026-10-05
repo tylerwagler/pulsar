@@ -609,29 +609,16 @@ void server::assign_tool_call_ids(tool_calls *calls, api_style api) {
 
 
 
-void apply_openai_stream_tool_ids(tool_calls *calls,
-                                         const openai_stream *st) {
-    if (!calls || !st) return;
-    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
-    for (int i = 0; i < n; i++) {
-        if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
-    }
-}
-
-
-
-void apply_anthropic_stream_tool_ids(tool_calls *calls,
-                                            const anthropic_stream *st) {
-    if (!calls || !st) return;
+void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts) {
+    if (!calls || !ts) return;
     /* The SSE stream may have exposed tool ids before final DSML parsing.  The
      * parsed calls must inherit those ids before assign_tool_call_ids() and
      * tool_memory_remember(), otherwise the client returns a tool_result for an
      * id that the continuation fast path does not know. */
-    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
+    int n = calls->len < ts->ids_cap ? calls->len : ts->ids_cap;
     for (int i = 0; i < n; i++) {
         if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
+        if (ts->ids[i] && ts->ids[i][0]) calls->v[i].id = xstrdup(ts->ids[i]);
     }
 }
 

@@ -354,6 +354,12 @@ typedef struct {
      * MESSAGES follow the leading-run rule instead (L113) — position in the
      * array cannot distinguish the two, so this flag is the one authority. */
     bool system_field;
+    /** L267: this entry continues the previous one's Anthropic message.  An Anthropic message is
+     * read into parts in block order -- its text (role as sent) and each tool_result (role "tool",
+     * tool_call_id, the result's own text and images) -- because a family template places tool
+     * results itself; DeepSeek's folds them back into the one user turn they arrived in
+     * (anthropic_fold_tool_results). */
+    bool anthropic_continues;
 } chat_msg;
 
 /** A parsed conversation. */
@@ -635,12 +641,6 @@ typedef struct {
     int cap;      ///< pairs allocated
 } json_args;
 
-typedef enum {
-    OPENAI_STREAM_THINKING,
-    OPENAI_STREAM_TEXT,
-    OPENAI_STREAM_TOOL,
-    OPENAI_STREAM_SUPPRESS,
-} openai_stream_mode;
 
 typedef enum {
     DSML_TOOL_BETWEEN_INVOKES,
@@ -698,23 +698,58 @@ typedef struct {
     bool (*end_invoke)(void *ctx, dsml_tool_stream *ts);
 } dsml_tool_stream_ops;
 
-/** OpenAI chat-completions SSE projection for one response. */
+/** L267: where DeepSeek's raw generated text is, for its one stream projection (deepseek_stream.cpp):
+ * every protocol's live response is fed by the same walk over <think>, the answer and DSML blocks. */
+typedef enum {
+    DS_WALK_THINKING,   ///< inside the reasoning block
+    DS_WALK_TEXT,       ///< the answer
+    DS_WALK_TOOL,       ///< a DSML block, decoded into tool-call events as it arrives
+    DS_WALK_SUPPRESS,   ///< nothing more goes out live (a block the finish sends, or the end)
+} deepseek_walk_mode;
+
 typedef struct {
-    openai_stream_mode mode;     ///< which OpenAI shape is being emitted
-    size_t emit_pos;             ///< bytes of generated text already turned into deltas
-    bool active;                 ///< the stream has started
+    deepseek_walk_mode mode;
+    size_t emit_pos;             ///< bytes of generated text already turned into events
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
     /** Thinking+tools: hold tentative answer text after the first \</think\>
      * until a tool marker, stream end, or a SECOND close proves whether it
      * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
+    dsml_tool_stream tool;       ///< the DSML block being decoded (DS_WALK_TOOL)
+} deepseek_stream_walk;
+
+/** L267: one protocol's live response, as a family's output parser drives it: text as it is released,
+ * the end of a reasoning or answer section, and -- on protocols that stream calls as they decode --
+ * DSML tool-call events.  The protocol owns the wire shape; the family owns where the text is.  Built by
+ * openai_sink_init / anthropic_sink_init / responses_sink_init. */
+typedef struct chat_sink chat_sink;
+struct chat_sink {
+    int fd;
+    server *s;
+    const request *r;
+    const char *id;
+    void *st;              ///< the protocol's stream state
+    /** Reasoning or answer text; `release_upto` is the byte offset in the generation the text ends at
+     * (OpenAI's logprob entries ride with the delta that releases their bytes). */
+    bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
+    /** The current section ended; `think_closed`: at the model's own </think>. */
+    bool (*end)(chat_sink *k, bool think_closed);
+    /** DSML tool-call events (ctx = this sink); NULL: calls go out with the finish. */
+    const dsml_tool_stream_ops *tool_ops;
+    /** Also start streaming a block that first appears in the final flush (else the finish sends it). */
+    bool tools_on_final;
+};
+
+/** OpenAI chat-completions SSE projection for one response. */
+typedef struct {
+    bool active;          ///< the stream has started
     bool sent_reasoning;  ///< a reasoning delta has been emitted
+    int tools_streamed;   ///< tool calls whose start delta has gone out
     /** Borrowed (never owned): the request's logprob ledger, so the delta
      * emitters can attach the entries whose bytes the delta releases.  NULL
      * whenever the client did not ask for logprobs — openai_stream_start
      * zeroes it and only the job binds it. */
     logprob_ledger *lp;
-    dsml_tool_stream tool;  ///< tool-call projection nested in this stream
 } openai_stream;
 
 typedef enum {
@@ -749,12 +784,6 @@ typedef struct {
     bool json_escaped;         ///< previous byte was a backslash, so this one is literal
 } dsml_decode_tracker;
 
-typedef enum {
-    RESP_STREAM_THINKING,
-    RESP_STREAM_TEXT,
-    RESP_STREAM_SUPPRESS,
-} responses_stream_mode;
-
 /** /v1/responses SSE projection for one response.
  *
  * The Responses protocol is ITEM-structured rather than delta-structured: a
@@ -764,13 +793,7 @@ typedef enum {
  * generation is interrupted, recovered, or resumed on a later quantum.
  */
 typedef struct {
-    responses_stream_mode mode;  ///< which item the projection is currently filling
-    size_t emit_pos;             ///< bytes of generated text already emitted
     bool active;                 ///< the stream has started
-    bool checked_think_prefix;   ///< the leading `<think>` check has been done once
-    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0;
-     * upstream left Responses out, but our leak is identical). */
-    bool guard_second_reasoning;
     bool reasoning_item_opened;   ///< the reasoning item's added event has gone out
     bool reasoning_item_closed;   ///< its done event has gone out
     bool reasoning_summary_started;  ///< a reasoning_summary part has been opened
@@ -804,14 +827,6 @@ typedef struct {
     int output_index;   ///< the item's position in the output array
 } responses_tool_item;
 
-/** What an Anthropic stream is currently emitting. */
-typedef enum {
-    ANTH_STREAM_THINKING,  ///< filling a thinking block
-    ANTH_STREAM_TEXT,      ///< filling a text block
-    ANTH_STREAM_TOOL,      ///< filling a tool_use block
-    ANTH_STREAM_SUPPRESS,  ///< output withheld pending a decision about what it is
-} anthropic_stream_mode;
-
 /** Which content block is currently open on the Anthropic wire. */
 typedef enum {
     ANTH_BLOCK_NONE,      ///< no block open
@@ -826,17 +841,12 @@ typedef enum {
  * SSE events, and never rewrites the model-visible transcript or cache key. */
 /** Anthropic messages SSE projection for one response. */
 typedef struct {
-    anthropic_stream_mode mode;         ///< what is being emitted
     anthropic_block_type open_block;    ///< which content block is open
     int next_index;              ///< content-block index for the next block opened
-    size_t emit_pos;             ///< bytes of generated text already emitted
     bool active;                 ///< the stream has started
-    bool checked_think_prefix;   ///< the leading `<think>` check has been done once
-    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0). */
-    bool guard_second_reasoning;
     bool sent_thinking;  ///< a thinking delta has been emitted
     bool sent_text;      ///< a text delta has been emitted
-    dsml_tool_stream tool;  ///< tool-call projection nested in this stream
+    int tools_streamed;  ///< tool_use blocks streamed and stopped
 } anthropic_stream;
 
 typedef struct job job;
@@ -2306,6 +2316,10 @@ struct gen_state {
     responses_stream responses_live;   ///< /responses SSE projection state
     bool openai_live_chat;             ///< the OpenAI projection is in chat (not completion) shape
     bool responses_live_chat;          ///< the /responses projection is in chat shape
+    /** L267: the request's protocol sink, which ever family's output drives it (set for a streamed
+     * chat on any protocol: sink.text != NULL), and DeepSeek's walk over its raw text into it. */
+    chat_sink sink;
+    deepseek_stream_walk ds_walk;
     long responses_created_at;         ///< `created` timestamp, fixed at first emit so it is stable across quanta
     bool dsml_recovery_attempted;      ///< a malformed tool block already triggered one recovery; do not loop
     /** Request-lifetime token count: accumulates across decode attempts (the
@@ -2474,6 +2488,10 @@ void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nby
 void tool_calls_free(tool_calls *calls);
 void tool_calls_push(tool_calls *calls, tool_call tc);
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
+/** Attach an encoded image file (`bytes` taken) whose placeholder sits at `placeholder_off` in content. */
+void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+/** Fold each Anthropic message's parts back into the one user turn DeepSeek's template renders. */
+void anthropic_fold_tool_results(chat_msgs *msgs);
 void chat_msgs_free(chat_msgs *msgs);
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg);
 void tool_schema_orders_free(tool_schema_orders *orders);
@@ -2605,6 +2623,57 @@ void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
+/** L267: the tool_choice a chat request asked for, whatever its protocol spelled it as. */
+typedef enum {
+    CHAT_TOOL_CHOICE_AUTO,    ///< the model decides (also: absent, null)
+    CHAT_TOOL_CHOICE_NONE,    ///< render without the tools
+    CHAT_TOOL_CHOICE_ANY,     ///< a call is required, any tool (OpenAI "required", Anthropic "any")
+    CHAT_TOOL_CHOICE_NAMED,   ///< a call to request::forced_tool_name is required
+} chat_tool_choice;
+
+/** L267: one thinking / effort control as the client sent it: the request key and its raw JSON value.
+ * The family reads the list in arrival order, each family by its own rules (chat_family.cpp). */
+typedef struct {
+    const char *key;   ///< "thinking", "think", "enable_thinking", "reasoning_effort", "output_config",
+                       ///< "reasoning.effort" (Responses) or "chat_template_kwargs"; static
+    char *raw;         ///< the value's JSON text, owned
+} chat_control;
+
+/** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
+ * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's
+ * renderer (render_chat_conversation) makes the prompt from it.  The protocol-only parts of the request
+ * (sampling, stream, stops, the API style, forced_tool_name, ...) are already in the request. */
+typedef struct {
+    chat_msgs msgs;                 ///< the conversation, system / instructions first when sent
+    char *tools_raw;                ///< the tools array as sent; NULL when absent or null
+    char *tool_schemas;             ///< the same tools, one function schema a line (parse_tools_value)
+    buf loaded_tool_schemas;        ///< Responses: schemas carried by input items (tool_search output)
+    chat_tool_choice tool_choice;   ///< what the client asked of the tools
+    char *tool_choice_wire;         ///< the choice as the client spelled it (for a refusal); NULL = named
+    chat_control *controls;         ///< thinking / effort controls in arrival order, owned
+    int n_controls;                 ///< entries in controls
+} chat_conversation;
+
+void chat_conversation_free(chat_conversation *c);
+/** The raw JSON text of member `key` of object `obj` (malloc'd), or NULL when absent. */
+char *json_object_member_raw(const char *obj, const char *key);
+/** An Anthropic SERVER tool entry (web_search_*): recognised only to be dropped. */
+bool anthropic_server_tool_entry(const char *raw_tool_json);
+/** Append one control (`key` static, `raw` taken). */
+void chat_conversation_control(chat_conversation *c, const char *key, char *raw);
+/** The loaded family's half of a chat request: thinking resolved from the controls, the protocol's
+ * tool-result checks, then the prompt -- text, client spans, and with an engine its tokens and images.
+ * `fmt` is the loaded model's (pulsar_engine_chat_format); `e` and `s` may be NULL (the
+ * parse-without-engine test shape).  false = refused, with `err` naming why ("" = a malformed value). */
+bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *s, chat_conversation *c,
+                              request *r, char *err, size_t errlen);
+/** The protocol halves: each reads its wire format into `c` and the request's protocol fields.  The
+ * request is initialised by the caller.  false = refused (`err` set, or "" for malformed JSON). */
+bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err, size_t errlen);
+bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
+                                       size_t errlen);
+bool parse_chat_conversation_responses(const char *body, chat_conversation *c, request *r, char *err,
+                                       size_t errlen);
 /** parse_chat_request up to and including the rendered prompt TEXT, plus --
  * when `e` is non-NULL -- the tokenisation and the image-span resolution.  The
  * engine is optional so the renderer gate can render request bodies with no
@@ -2716,11 +2785,7 @@ void append_openai_usage_json(buf *b, const request *r,
 void append_openai_timings_json(buf *b, const request *r);
 bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens);
-bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
-                            const char *reasoning, const tool_calls *calls, const char *finish,
-                            int prompt_tokens, int completion_tokens);
 void openai_stream_start(const request *r, openai_stream *st);
-void openai_stream_free(openai_stream *st);
 bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit);
 bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
                             const char *a, const char *b);
@@ -2734,24 +2799,30 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                size_t raw_len, const char *param_end,
                                                bool is_string);
-bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
-                                     openai_stream *st,
-                                     const char *raw, size_t raw_len,
-                                     bool final);
-bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                   openai_stream *st, const char *raw,
-                                   size_t raw_len, const tool_calls *calls,
-                                   const char *finish, int prompt_tokens,
-                                   int completion_tokens);
-/* L251: the Qwen family's OpenAI chat deltas (see qwen_gen).  A reasoning or
- * content delta carries the logprob entries released up to `release_upto`; a
- * tool call goes out whole (start delta with id and name, then its arguments). */
-bool openai_sse_qwen_text(int fd, const request *r, const char *id, bool reasoning,
-                          const std::string &text, logprob_ledger *lp, size_t release_upto);
-bool openai_sse_qwen_tool_call(int fd, const request *r, const char *id, int index,
-                               const tool_call *tc);
-bool openai_sse_qwen_finish(int fd, const request *r, const char *id, logprob_ledger *lp,
-                            const char *finish, int prompt_tokens, int completion_tokens);
+/* L267: the protocol-out SINKS (chat_sink): every family's output parser drives the request's
+ * protocol through one.  DeepSeek's walk (deepseek_stream_update) streams its DSML calls as they
+ * decode on OpenAI and Anthropic; Qwen's parser hands a call over whole -- on OpenAI it goes out
+ * then (openai_sink_tool_call); Anthropic and Responses send the calls the stream has not with the
+ * finish.  The finish is the protocol's, after the family's last text. */
+void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st);
+bool openai_sink_tool_call(chat_sink *k, int index, const tool_call *tc);
+bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish, int prompt_tokens,
+                       int completion_tokens);
+void anthropic_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
+                         anthropic_stream *st);
+bool anthropic_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish,
+                          const char *stop_sequence, int completion_tokens);
+void responses_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
+                         responses_stream *st);
+/** DeepSeek's one projection: walk the generated text [0, raw_len) from where it stopped and drive
+ * the sink; `final` flushes what was held back. */
+void deepseek_stream_walk_init(deepseek_stream_walk *w, const request *r);
+void deepseek_stream_walk_free(deepseek_stream_walk *w);
+bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *raw, size_t raw_len,
+                            bool final);
+/** The tool-call ids a stream already showed the client, into the parsed calls that have none (they
+ * must answer the client's tool_result / tool output ids). */
+void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts);
 bool request_uses_openai_live_stream(const request *r);
 bool request_uses_responses_live_stream(const request *r);
 bool request_uses_structured_stream(const request *r);
@@ -2771,18 +2842,12 @@ bool responses_sse_completed(int fd, const request *r,
                                     const char *finish,
                                     int prompt_tokens, int completion_tokens,
                                     long created_at);
-bool responses_sse_stream_update(int fd, const request *r,
-                                        responses_stream *st,
-                                        const char *raw, size_t raw_len,
-                                        bool final);
-bool responses_sse_finish_live(int fd, const request *r,
-                                      responses_stream *st,
-                                      const char *raw, size_t raw_len,
-                                      const char *recovered_content,
-                                      const tool_calls *calls,
-                                      const char *finish,
-                                      int prompt_tokens, int completion_tokens,
-                                      long created_at);
+/** The end of a Responses stream: the reasoning item closed; `recovered_tail` (a tool block the final
+ * parse turned back into text, never streamed) as output_text; the message item closed; the
+ * function_call items; response.completed. */
+bool responses_sse_finish(int fd, const request *r, responses_stream *st, const char *recovered_tail,
+                          size_t tail_len, const tool_calls *calls, const char *finish, int prompt_tokens,
+                          int completion_tokens, long created_at);
 bool responses_final_response(int fd,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
@@ -2802,19 +2867,9 @@ bool anthropic_final_response(int fd,
                                      int prompt_tokens, int completion_tokens);
 bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st);
-void anthropic_stream_free(anthropic_stream *st);
 size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
-bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
-                                        anthropic_stream *st,
-                                        const char *raw, size_t raw_len,
-                                        bool final);
-bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                      anthropic_stream *st, const char *raw,
-                                      size_t raw_len, const tool_calls *calls,
-                                      const char *finish, const char *stop_sequence,
-                                      int completion_tokens);
 double server_now_sec(void);
 void server_log(pulsar_log_type type, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -2830,10 +2885,6 @@ void visible_live_free(visible_live_state *st);
  * runs before the job is bound to a slot. */
 /* Slots whose live binding contains all of the request's continuation ids
  * (worker thread; used to route a continuation to the session that owns it). */
-void apply_openai_stream_tool_ids(tool_calls *calls,
-                                         const openai_stream *st);
-void apply_anthropic_stream_tool_ids(tool_calls *calls,
-                                            const anthropic_stream *st);
 kv_cache_options kv_cache_default_options(void);
 void le_put32(uint8_t *p, uint32_t v);
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]);

@@ -399,6 +399,42 @@ static tool_schema_orders make_bash_order(void) {
 
 
 
+/* L267: a DeepSeek stream as the server drives it -- the protocol's sink, DeepSeek's walk into it
+ * (gen_emit_token), and at the end the walk's final flush then the protocol's finish. */
+static bool t_openai_update(int fd, request *r, const char *id, openai_stream *st, deepseek_stream_walk *w,
+                            const char *raw, size_t len, bool final) {
+    chat_sink k;
+    openai_sink_init(&k, fd, NULL, r, id, st);
+    return deepseek_stream_update(w, &k, raw, len, final);
+}
+
+static bool t_openai_finish(int fd, request *r, const char *id, openai_stream *st, deepseek_stream_walk *w,
+                            const char *raw, size_t len, const tool_calls *calls, const char *finish,
+                            int prompt_tokens, int completion_tokens) {
+    chat_sink k;
+    openai_sink_init(&k, fd, NULL, r, id, st);
+    return deepseek_stream_update(w, &k, raw, len, true) &&
+           openai_sse_finish(&k, calls, finish, prompt_tokens, completion_tokens);
+}
+
+static bool t_anthropic_update(int fd, request *r, const char *id, anthropic_stream *st, deepseek_stream_walk *w,
+                               const char *raw, size_t len, bool final) {
+    chat_sink k;
+    anthropic_sink_init(&k, fd, NULL, r, id, st);
+    return deepseek_stream_update(w, &k, raw, len, final);
+}
+
+static bool t_anthropic_finish(int fd, request *r, const char *id, anthropic_stream *st, deepseek_stream_walk *w,
+                               const char *raw, size_t len, const tool_calls *calls, const char *finish,
+                               const char *stop_sequence, int completion_tokens) {
+    chat_sink k;
+    anthropic_sink_init(&k, fd, NULL, r, id, st);
+    return deepseek_stream_update(w, &k, raw, len, true) &&
+           anthropic_sse_finish(&k, calls, finish, stop_sequence, completion_tokens);
+}
+
+
+
 static char *read_socket_text(int fd) {
     buf b = {0};
     char tmp[1024];
@@ -586,14 +622,16 @@ static void test_anthropic_stop_sequence_is_reported(void) {
     if (sv[0] >= 0 && sv[1] >= 0) {
         anthropic_stream st;
         TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_stop", 10, &st));
-        TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_stop", &st,
+        deepseek_stream_walk w;
+        deepseek_stream_walk_init(&w, &r);
+        TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_stop", &st, &w,
                                               "OK", 2, NULL, "stop", "END", 3));
         shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "\"delta\":{\"stop_reason\":\"stop_sequence\","
                                 "\"stop_sequence\":\"END\"}") != NULL);
         free(out);
-        anthropic_stream_free(&st);
+        deepseek_stream_walk_free(&w);
         close(sv[0]);
         close(sv[1]);
     }
@@ -662,18 +700,20 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
 
     anthropic_stream st;
     TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_test", 10, &st));
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw1 = "need a tool</think>Hello.\n\n";
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
+    TEST_ASSERT(t_anthropic_update(sv[0], &r, "msg_test", &st, &w,
                                             raw1, strlen(raw1), false));
 
     const char *raw =
         "need a tool</think>Hello.\n\n"
         PULSAR_TOOL_CALLS_START "\n";
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
+    TEST_ASSERT(t_anthropic_update(sv[0], &r, "msg_test", &st, &w,
                                             raw, strlen(raw), false));
 
     tool_calls calls = make_swapped_bash_call();
-    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_test", &st, &w,
                                           raw, strlen(raw), &calls,
                                           "tool_calls", NULL, 8));
     shutdown(sv[0], SHUT_WR);
@@ -700,7 +740,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
 
     free(out);
     tool_calls_free(&calls);
-    anthropic_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -723,13 +763,15 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
 
     anthropic_stream st;
     TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_tool", 7, &st));
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
 
     const char *raw =
         "Before.\n\n"
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"bash\">\n"
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo partial";
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tool", &st,
+    TEST_ASSERT(t_anthropic_update(sv[0], &r, "msg_tool", &st, &w,
                                             raw, strlen(raw), false));
 
     const char *raw_complete =
@@ -739,7 +781,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo partial done" PULSAR_PARAM_END "\n"
         PULSAR_INVOKE_END "\n"
         PULSAR_TOOL_CALLS_END;
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tool", &st,
+    TEST_ASSERT(t_anthropic_update(sv[0], &r, "msg_tool", &st, &w,
                                             raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -748,10 +790,10 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content,
                                            &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
-    apply_anthropic_stream_tool_ids(&calls, &st);
+    apply_stream_tool_ids(&calls, &w.tool);
     TEST_ASSERT(calls.v[0].id != NULL);
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
-    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_tool", &st, &w,
                                           raw_complete, strlen(raw_complete),
                                           &calls, "tool_calls", NULL, 5));
     shutdown(sv[0], SHUT_WR);
@@ -787,7 +829,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
-    anthropic_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -864,18 +906,20 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw1 = "<think>need a tool</think>Hello.\n\n";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_test", &st, &w,
                                          raw1, strlen(raw1), false));
 
     const char *raw =
         "<think>need a tool</think>Hello.\n\n"
         PULSAR_TOOL_CALLS_START "\n";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_test", &st, &w,
                                          raw, strlen(raw), false));
 
     tool_calls calls = make_swapped_bash_call();
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
+    TEST_ASSERT(t_openai_finish(sv[0], &r, "chatcmpl_test", &st, &w,
                                        raw, strlen(raw), &calls,
                                        "tool_calls", 10, 8));
     shutdown(sv[0], SHUT_WR);
@@ -950,14 +994,16 @@ static void test_openai_tool_stream_truncated_call_closes_args(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     buf raw = {0};
     buf_puts(&raw, "<think>go</think>Running.\n\n" PULSAR_TOOL_CALLS_START "\n");
     buf_puts(&raw, PULSAR_INVOKE_START " name=\"bash\">\n");
     buf_puts(&raw, PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la /tmp/prof");
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_test", &st, &w,
                                          raw.ptr, raw.len, false));
     /* generation ends here: no </parameter>, no </invoke>, no closing tag */
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
+    TEST_ASSERT(t_openai_finish(sv[0], &r, "chatcmpl_test", &st, &w,
                                        raw.ptr, raw.len, NULL,
                                        "length", 10, 8));
     shutdown(sv[0], SHUT_WR);
@@ -1095,13 +1141,15 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw1 = "We need to generate a title";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_title", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_title", &st, &w,
                                          raw1, strlen(raw1), false));
 
     const char *raw2 =
         "We need to generate a title</think>Free disk space check";
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
+    TEST_ASSERT(t_openai_finish(sv[0], &r, "chatcmpl_title", &st, &w,
                                        raw2, strlen(raw2), NULL,
                                        "stop", 12, 8));
     shutdown(sv[0], SHUT_WR);
@@ -1125,7 +1173,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     TEST_ASSERT(strstr(out, "</think>") == NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1150,12 +1198,14 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw =
         "Before.\n\n"
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"bash\">\n"
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo partial";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_partial_tool", &st, &w,
                                          raw, strlen(raw), false));
 
     const char *raw_complete =
@@ -1165,7 +1215,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo partial done" PULSAR_PARAM_END "\n"
         PULSAR_INVOKE_END "\n"
         PULSAR_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_partial_tool", &st, &w,
                                          raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -1173,10 +1223,10 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
-    apply_openai_stream_tool_ids(&calls, &st);
+    apply_stream_tool_ids(&calls, &w.tool);
     TEST_ASSERT(calls.v[0].id != NULL);
     TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
+    TEST_ASSERT(t_openai_finish(sv[0], &r, "chatcmpl_partial_tool", &st, &w,
                                        raw_complete, strlen(raw_complete), &calls,
                                        "tool_calls", 10, 4));
 
@@ -1207,7 +1257,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1236,19 +1286,21 @@ static void test_openai_stream_keeps_text_when_tool_straddles_think_close(void) 
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw =
         "<think>consider " PULSAR_TOOL_CALLS_START "</think>Answer."
         PULSAR_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_straddle", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_straddle", &st, &w,
                                          raw, strlen(raw), false));
     /* The regression discriminator: the straddling block used to be classified
      * as a complete call, latching the stream into SUPPRESS from the marker
      * onward.  It must instead close reasoning at </think> and continue. */
-    TEST_ASSERT(st.mode != OPENAI_STREAM_SUPPRESS);
-    TEST_ASSERT(st.mode == OPENAI_STREAM_TEXT);
+    TEST_ASSERT(w.mode != DS_WALK_SUPPRESS);
+    TEST_ASSERT(w.mode == DS_WALK_TEXT);
 
     /* Flush: TEXT mode holds the tail back until final. */
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_straddle", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_straddle", &st, &w,
                                          raw, strlen(raw), true));
 
     shutdown(sv[0], SHUT_WR);
@@ -1257,7 +1309,7 @@ static void test_openai_stream_keeps_text_when_tool_straddles_think_close(void) 
     TEST_ASSERT(strstr(out, "Answer.") != NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1344,20 +1396,22 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw_invoke = PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_incomplete_tool", &st, &w,
                                          raw_invoke, strlen(raw_invoke), false));
-    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
-    TEST_ASSERT(st.tool.state == DSML_TOOL_BETWEEN_INVOKES);
+    TEST_ASSERT(w.mode == DS_WALK_TOOL);
+    TEST_ASSERT(w.tool.state == DSML_TOOL_BETWEEN_INVOKES);
 
     const char *raw_param =
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"bash\">\n"
         PULSAR_PARAM_START;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_incomplete_tool", &st, &w,
                                          raw_param, strlen(raw_param), false));
-    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
-    TEST_ASSERT(st.tool.state == DSML_TOOL_BETWEEN_PARAMS);
+    TEST_ASSERT(w.mode == DS_WALK_TOOL);
+    TEST_ASSERT(w.tool.state == DSML_TOOL_BETWEEN_PARAMS);
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -1365,7 +1419,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     TEST_ASSERT(strstr(out, PULSAR_PARAM_START) == NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1387,11 +1441,13 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw =
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"edit\">\n"
         PULSAR_PARAM_START " name=\"edits\" string=\"false\">[1,2,3";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_raw_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_raw_tool", &st, &w,
                                          raw, strlen(raw), false));
 
     shutdown(sv[0], SHUT_WR);
@@ -1403,7 +1459,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     TEST_ASSERT(strstr(out, PULSAR_TOOL_CALLS_START) == NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1425,11 +1481,13 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw_partial =
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"bash\">\n"
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo &amp";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_entity_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_entity_tool", &st, &w,
                                          raw_partial, strlen(raw_partial), false));
 
     const char *raw_complete =
@@ -1438,7 +1496,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">echo &amp; done" PULSAR_PARAM_END "\n"
         PULSAR_INVOKE_END "\n"
         PULSAR_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_entity_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_entity_tool", &st, &w,
                                          raw_complete, strlen(raw_complete), false));
 
     shutdown(sv[0], SHUT_WR);
@@ -1449,7 +1507,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
     TEST_ASSERT(strstr(out, "&amp") == NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1471,6 +1529,8 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char prefix[] =
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"write\">\n"
@@ -1486,14 +1546,14 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     buf_append(&partial, prefix, strlen(prefix));
     buf_putc(&partial, (char)0xf0);
     buf_putc(&partial, (char)0x9f);
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_utf8_tool", &st, &w,
                                          partial.ptr, partial.len, false));
 
     buf complete = {0};
     buf_append(&complete, prefix, strlen(prefix));
     buf_append(&complete, flag_utf8, 4);
     buf_append(&complete, suffix, strlen(suffix));
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_utf8_tool", &st, &w,
                                          complete.ptr, complete.len, false));
 
     shutdown(sv[0], SHUT_WR);
@@ -1506,7 +1566,7 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     free(out);
     buf_free(&partial);
     buf_free(&complete);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1528,6 +1588,8 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
     const char *raw =
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"read\">\n"
@@ -1537,7 +1599,7 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">wc -l a.c" PULSAR_PARAM_END "\n"
         PULSAR_INVOKE_END "\n"
         PULSAR_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_multi_tool", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_multi_tool", &st, &w,
                                          raw, strlen(raw), false));
 
     shutdown(sv[0], SHUT_WR);
@@ -1552,7 +1614,7 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -1599,9 +1661,11 @@ static void test_streaming_holds_partial_utf8(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8", &st,
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_utf8", &st, &w,
                                          partial, strlen(partial), false));
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8", &st,
+    TEST_ASSERT(t_openai_update(sv[0], &r, "chatcmpl_utf8", &st, &w,
                                          complete, strlen(complete), false));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -1611,7 +1675,7 @@ static void test_streaming_holds_partial_utf8(void) {
     TEST_ASSERT(strstr(out, replacement) == NULL);
 
     free(out);
-    openai_stream_free(&st);
+    deepseek_stream_walk_free(&w);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -4123,7 +4187,10 @@ static void test_responses_request_keeps_image_refusal_message(void) {
  * attached, with its placeholder inside the tool_result tags between the text
  * pieces; json_content alone kept only the text and the image vanished.  A
  * text-only tool_result renders exactly as before, and an unknown block type
- * inside one is refused, not dropped. */
+ * inside one is refused, not dropped.  L267: the parser reads the result into a
+ * part of its own (role "tool", its id, the client's text); DeepSeek's template
+ * folds it back into the user turn (anthropic_fold_tool_results), which is the
+ * turn these assertions read. */
 static void test_anthropic_tool_result_image(void) {
     static const char png_b64[] =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -4138,6 +4205,7 @@ static void test_anthropic_tool_result_image(void) {
     char err[200] = {0};
     const bool parsed = parse_anthropic_messages(&p, &msgs, err, sizeof err);
     TEST_ASSERT(parsed);
+    if (parsed) anthropic_fold_tool_results(&msgs);
     if (parsed && msgs.len == 1) {
         const char *c = msgs.v[0].content;
         const char *open = strstr(c, "<tool_result>");
@@ -4160,7 +4228,12 @@ static void test_anthropic_tool_result_image(void) {
     chat_msgs tmsgs = {0};
     p = text_only; err[0] = 0;
     TEST_ASSERT(parse_anthropic_messages(&p, &tmsgs, err, sizeof err));
+    /* as read: one "tool" part answering toolu_2 with the client's own text */
+    TEST_ASSERT(tmsgs.len == 1 && !strcmp(tmsgs.v[0].role, "tool") && tmsgs.v[0].tool_call_id &&
+                !strcmp(tmsgs.v[0].tool_call_id, "toolu_2") && !strcmp(tmsgs.v[0].content, "a<bc"));
+    anthropic_fold_tool_results(&tmsgs);
     if (tmsgs.len == 1) {
+        TEST_ASSERT(!strcmp(tmsgs.v[0].role, "user"));
         buf want = {0};
         buf_puts(&want, "<tool_result>");
         append_tool_result_text(&want, "a<bc");
@@ -4331,6 +4404,7 @@ static void test_anthropic_tool_result_nested_blocks(void) {
         char err[256] = {0};
         const char *p = json.ptr;
         TEST_ASSERT(parse_anthropic_messages(&p, &msgs, err, sizeof err));
+        anthropic_fold_tool_results(&msgs);   /* DeepSeek's turn (L267) */
         if (msgs.len == 1) {
             const char *c = msgs.v[0].content;
             for (int k = 0; k < 5 && cases[i].want[k]; k++)

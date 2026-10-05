@@ -2347,6 +2347,31 @@ tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pul
 pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
+# L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
+# api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
+tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/api_golden.cpp
+
+tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: api-golden-gate
+api-golden-gate: tests/api_golden
+	./tests/api_golden tests/api-golden/corpus.jsonl > tests/api-golden/out.txt
+	diff -u tests/api-golden/golden.txt tests/api-golden/out.txt && echo "API-GOLDEN GATE PASS"
+
+# L267: the DeepSeek stream projections' bytes per protocol (host-only; see tests/sse_golden.cpp).
+tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/sse_golden.cpp
+
+tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: sse-golden-gate
+sse-golden-gate: tests/sse_golden
+	./tests/sse_golden > tests/sse-golden/out.txt
+	diff -u tests/sse-golden/golden.txt tests/sse-golden/out.txt && echo "SSE-GOLDEN GATE PASS"
+
 pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
