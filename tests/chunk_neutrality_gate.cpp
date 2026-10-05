@@ -39,7 +39,7 @@
  * And one leg outside the table, X: a segment chain to 8576 restored, then
  * sync(8576) EXACTLY -- no new rows, so the sync must re-evaluate the last one
  * (the load moved the KV, not the logits) and match the cold prefill of 8576.
- * The resume grid is 128 (PULSAR_RESUME_GRID, L195): a resume rewinds to the grid
+ * The resume grid is 128 (DeepSeek V4's, kv_state_ds4.cpp; L195): a resume rewinds to the grid
  * point below the PREFILL frontier, warms the compressor state up over the 32 tokens
  * before it, and redoes < 128 tokens plus whatever was generated since.  Nothing is
  * saved, so a resume below a cut works the same.

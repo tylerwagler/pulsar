@@ -17,8 +17,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** True when `k2` is a rate the arm instantiates (2, 2.5, 3). */
-bool ds4_exl3_gemv_rate_supported(int k2);
+#include "engine/exl3_trellis.h"   /* EXL3_ARM_*: the kinds and their rates */
+
+/** The GEMV kinds are exl3_trellis.h's arms: EXL3_ARM_DOWN (one projection
+ *  whose input the fold already rotated), EXL3_ARM_PAIR (gate and up from two
+ *  slices -- DeepSeek's split stacks -- each rotating the input by its own suh),
+ *  EXL3_ARM_GATE_UP_FUSED (one [in -> 2 mid] slice whose output rows are
+ *  gate | up -- Qwen3.8-Flash-Next, L251 -- rotating the input by its suh).
+ *  True when the kind instantiates rate `k2` (exl3_arm_has_rate, the one table). */
+bool ds4_exl3_gemv_rate_supported(int kind, int k2);
 
 /** gate/up: out_gate / out_up [n_assign][M] f32 = the UNROTATED z of each
  *  assignment (the fold applies svh and the output Hadamard).  The input
@@ -52,6 +59,76 @@ int ds4_exl3_moe_gemv_pair_launch_rows(
     const int32_t * expert_bounds,
     float         * out_gate,
     float         * out_up,
+    int             M,
+    int             K,
+    int64_t         n_assign,
+    int             n_experts,
+    int             rows_per_block,
+    cudaStream_t    stream);
+
+/** fused gate_up: out [n_assign][M] f32 = the UNROTATED z of the one [K -> M]
+ *  slice (M = 2 mid: gate rows then up rows), the input rotated in-kernel by
+ *  the slice's suh.  Same contract as the pair launch otherwise. */
+/* L251 / ac69748f: the same fused gate_up arm over a BF16 activation.  The Qwen family has no E4M3
+ * activation slot, so its routed experts read row-major bf16. */
+int ds4_exl3_moe_gemv_fused_bf16_launch(
+        const void *table, int k2, const void *act,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out, int M, int K, int64_t n_assign,
+        int n_experts, cudaStream_t stream);
+
+/* The split gate / up arm over the same bf16 activation (the MTP layer's routed experts: two slices,
+ * each rotating the input by its own suh). */
+int ds4_exl3_moe_gemv_pair_bf16_launch(
+        const void *gate_table, const void *up_table, int k2, const void *act,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out_gate, float *out_up, int M, int K, int64_t n_assign,
+        int n_experts, cudaStream_t stream);
+
+/* The down arm over the same bf16 activation (its input is the fold's output). */
+int ds4_exl3_moe_gemv_single_bf16_launch(
+        const void *table, int k2, const void *act,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out, int M, int K, int64_t n_assign,
+        int n_experts, cudaStream_t stream);
+
+/* L251: the Qwen routed arm for PROMPT CHUNKS (qwen_exl3_moe_prefill.cu) -- a grouped tensor-core GEMM
+ * over the same expert-sorted schedule, writing the same unrotated z as the two bf16 GEMVs above.
+ * rotate_input: the fused gate_up (x * suh, H128); false: the down (input rotated by the fold).
+ * Rates k2 = 8, 10; M % 64, K % 128.  Agrees with the GEMV to rounding, not to the bit. */
+/* L251: the dense arm's prompt chunks through the same GEMM (one weight, identity rows): w is the
+ * dense layout (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh
+ * applied).  ds4_exl3_dense_launch calls it for M > 16. */
+int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+                                   uint64_t trellis_bytes, cudaStream_t stream);
+constexpr int64_t QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN = 161;   /* more than 16 tokens x 10 slots */
+int qwen_exl3_moe_prefill_launch(
+        const void *table, int k2, bool rotate_input, const void *x_bf16,
+        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+        float *out, int M, int K, int64_t n_assign, int n_experts, cudaStream_t stream);
+
+int ds4_exl3_moe_gemv_fused_launch(
+    const void    * table,
+    int             k2,
+    const void    * act,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    float         * out,
+    int             M,
+    int             K,
+    int64_t         n_assign,
+    int             n_experts,
+    cudaStream_t    stream);
+
+/** The fused launch with the row block pinned (1, 4 or 16); the gate uses it
+ *  to prove every row block bit-identical, the arm never calls it. */
+int ds4_exl3_moe_gemv_fused_launch_rows(
+    const void    * table,
+    int             k2,
+    const void    * act,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    float         * out,
     int             M,
     int             K,
     int64_t         n_assign,
@@ -95,7 +172,28 @@ int ds4_exl3_moe_fold_launch(
     void          * mid_q,
     void          * mid_sf,
     int             mid_kbp,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    void          * mid_bf16 = nullptr);
+
+/** The fold over a FUSED gate_up: gate_up_z [pairs][2 mid] (gate columns
+ *  0..mid-1, up columns mid..2 mid-1), svh of the one gate_up slice (gate's at
+ *  suh + in_dim, up's at suh + in_dim + mid); otherwise the same arithmetic and
+ *  the same E4M3 mid as ds4_exl3_moe_fold_launch. */
+int ds4_exl3_moe_fold_fused_launch(
+    const float   * gate_up_z,
+    const int32_t * selected,
+    const float   * weights,
+    const void    * gate_up_table,
+    const void    * down_table,
+    int             in_dim,
+    int             mid_dim,
+    int64_t         pairs,
+    float           clamp,
+    void          * mid_q,
+    void          * mid_sf,
+    int             mid_kbp,
+    cudaStream_t    stream,
+    void          * mid_bf16 = nullptr);
 
 /** The EXL3 sum: out[tok][o] = sum over slots (in slot order) of
  *  svh_d * H(z_d[pair]) -- the down projection's output rotation folded into

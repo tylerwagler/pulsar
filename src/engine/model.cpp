@@ -25,6 +25,10 @@ static const struct { const char *name; uint32_t id; } pulsar_layout_names[] = {
     {"exl3m_k2",       PULSAR_TENSOR_EXL3M_K2},
     {"exl3m_k2h",      PULSAR_TENSOR_EXL3M_K2H},
     {"exl3m_k3",       PULSAR_TENSOR_EXL3M_K3},
+    {"exl3m_k4",       PULSAR_TENSOR_EXL3M_K4},
+    {"exl3m_k5",       PULSAR_TENSOR_EXL3M_K5},
+    {"exl3m_k6",       PULSAR_TENSOR_EXL3M_K6},
+    {"exl3m_k8",       PULSAR_TENSOR_EXL3M_K8},
 };
 
 
@@ -92,7 +96,7 @@ static pulsar_kv *model_find_kv(const pulsar_model *m, const char *key) {
 
 
 
-static bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out) {
+bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out) {
     pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != PULSAR_META_STRING) return false;
     pulsar_cursor c = cursor_at(m, kv->value_pos);
@@ -231,6 +235,7 @@ void model_close(pulsar_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->tp_unstaged);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -443,7 +448,9 @@ static bool model_tensor_is_expert_stack(const pulsar_tensor *t) {
  * mapping (pulsar_gpu_register_mxfp4_expert_half); the stacks as stored are
  * never staged or read on the device.  One box stages every tensor. */
 static bool model_tensor_unstaged(const pulsar_model *m, const pulsar_tensor *t) {
-    return m->tp_n_ranks > 1 && model_tensor_is_expert_stack(t);
+    if (m->tp_n_ranks <= 1) return false;
+    if (m->tp_unstaged) return m->tp_unstaged[t - m->tensors] != 0;   /* the family's rule (L266) */
+    return model_tensor_is_expert_stack(t);
 }
 
 uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
@@ -608,7 +615,11 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     if (!m || m->size == 0) return false;
     if (m->n_shards == 0 && !m->map) return false;
     /* Announce the residency lane (rule 5) with the bytes it withholds. */
-    if (m->tp_n_ranks > 1) {
+    if (m->tp_n_ranks > 1 && m->tp_unstaged) {
+        fprintf(stderr, "pulsar: TP residency: rank %d/%u leaves %.2f GiB unstaged -- the other ranks' experts and the "
+                        "stored tensors whose rank slices the family builds at open\n",
+                m->tp_rank, m->tp_n_ranks, (double)pulsar_model_unstaged_expert_bytes(m) / 1073741824.0);
+    } else if (m->tp_n_ranks > 1) {
         fprintf(stderr, "pulsar: TP residency: rank %d/%u stages no routed-expert stack whole; "
                         "its half of every expert (%.2f GiB of stored stacks) is built at open\n",
                 m->tp_rank, m->tp_n_ranks,

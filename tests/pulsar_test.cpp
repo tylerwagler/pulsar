@@ -946,7 +946,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
     pulsar_tokens turn1_raw = {0};
     /* The image sits early and a longer text tail follows, which is the shape in
      * which reuse is licensed at all: the start of a resumed prefill must be a
-     * PULSAR_RESUME_GRID multiple at or above the image block (so no merged row is
+     * resume-grid multiple at or above the image block (so no merged row is
      * re-evaluated) and inside the checkpoint.  With the images near the frontier
      * there is no such grid point and the engine correctly rebuilds cold -- the
      * served test's boundary. */

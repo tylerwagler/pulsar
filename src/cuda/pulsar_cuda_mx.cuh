@@ -74,7 +74,20 @@ __host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, 
  * every one of them. */
 __device__ __forceinline__ static int pulsar_mx_shared_exp(float amax) {
     int se = -127;
-    if (amax > 0.f) { int e = (int)floorf(log2f(amax)); se = e - 7; }
+    if (amax > 0.f) {
+        /* frexpf gives floor(log2(amax)) EXACTLY: amax = m * 2^e with m in [0.5,1), so the
+         * floor is e - 1.  This used to be `(int)floorf(log2f(amax))`, and --use_fast_math
+         * turns log2f into the approximate lg2.approx.f32, which returns one binade TOO HIGH
+         * when amax is a float just below a power of two -- measured on this GPU: 10 of 63
+         * such values disagree with the exact floor, and frexpf-1 disagrees on 0 of 63.  One
+         * binade is a 2x block scale, and it is exactly what held the MoE K4 dev-vs-emu gate
+         * at 7.08e-05 while every all-K5 configuration sat at 1.40e-07 (the reference emu
+         * derives the exponent in fp64, correctly, so the DEVICE was the outlier).  It also
+         * restores the bit-exactness with the standalone quantiser claimed above. */
+        int e = 0;
+        frexpf(amax, &e);
+        se = (e - 1) - 7;
+    }
     if (se < -127) se = -127;
     if (se >  127) se =  127;
     return se;

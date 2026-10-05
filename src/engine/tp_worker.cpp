@@ -13,7 +13,7 @@
  * A rank above 0 drives nothing of its own: it never opens a listener and
  * never reads a prompt.  It runs this one loop -- receive a frame from the
  * leader, look the session up in a registry keyed by the CREATE ORDINAL,
- * apply the operation through the session member, ack -- until the leader
+ * apply the operation through the family's operation (the leader's own dispatch, L266), ack -- until the leader
  * sends STOP or the transport dies.  "Only the leader's arguments are
  * authoritative" is therefore literally true: a worker has no arguments.
  *
@@ -345,7 +345,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             borrowed.v = c->tokens;
             borrowed.len = (int)c->n_tokens;
             borrowed.cap = (int)c->n_tokens;
-            rc = slot->s->sync(&borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr, sizeof(ferr));
+            rc = e->family->session->sync(slot->s, &borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr,
+                                         sizeof(ferr));
         }
         /* INTERRUPTED is the leader's chunk verdict (v15), taken at the same
          * boundary on both ranks: an outcome, not a refusal. */
@@ -389,7 +390,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
-                rc = slot->s->eval(c->value, ferr, sizeof(ferr));
+                rc = e->family->session->eval(slot->s, c->value, ferr, sizeof(ferr));
             }
         }
         if (rc != 0) {
@@ -413,10 +414,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             int cap = 0;
             logits = worker_logits(e, slot, c->n_items, &cap);
             if (mixed) {
-                rc = slot->s->decode_mixed(rows, c->n_items, logits, cap, &out_rows,
-                                           (uint32_t)c->value, ferr, sizeof(ferr));
+                rc = e->family->session->decode_mixed(slot->s, rows, c->n_items, logits, cap, &out_rows,
+                                                      (uint32_t)c->value, ferr, sizeof(ferr));
             } else {
-                rc = slot->s->decode_multiseq(rows, c->n_items, logits, cap, ferr, sizeof(ferr));
+                rc = e->family->session->decode_multiseq(slot->s, rows, c->n_items, logits, cap, ferr, sizeof(ferr));
                 out_rows = c->n_items;
             }
             free(rows);
@@ -474,7 +475,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             return 1;
         }
         if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->rewind(c->value);
-        else                                   slot->s->invalidate();
+        else                                   e->family->session->invalidate(slot->s);
         return 1;
     }
 
@@ -483,7 +484,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "bank state save", ferr);
             return 1;
         }
-        slot->s->bank_state_save((uint32_t)c->value);
+        if (FAMILY_BANKS(slot->s)) FAMILY_BANKS(slot->s)->save(slot->s, (uint32_t)c->value);
+        else                       slot->s->bank_state_save((uint32_t)c->value);
         return 1;
 
     case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
@@ -495,7 +497,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         const char *op = restore ? "bank state restore" : "bank repoint";
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
-            status = restore ? (slot->s->bank_state_restore((uint32_t)c->value) ? 0 : 1)
+            const bool restored = restore && (FAMILY_BANKS(slot->s) ? FAMILY_BANKS(slot->s)->restore(slot->s, (uint32_t)c->value)
+                                                                    : slot->s->bank_state_restore((uint32_t)c->value));
+            status = restore ? (restored ? 0 : 1)
                              : slot->s->bank_repoint((uint32_t)c->value);
             if (status < 0) status = 1;
         } else {
@@ -528,7 +532,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
             return 1;
         }
-        slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
+        if (FAMILY_BANKS(slot->s)) FAMILY_BANKS(slot->s)->note_committed(slot->s, c->tokens, (int)c->n_tokens);
+        else                       slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
         return 1;
 
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {
@@ -720,8 +725,12 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (!worker_refused(e, c, "generate_speculative", &slot, ferr, sizeof(ferr))) {
             uint64_t rng = c->spec.rng;
             int *acc = worker_accepted(slot, c->spec.i2);
-            const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
-                                                        &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
+            const pulsar_family_session_ops *fs = e->family->session;
+            const int n = fs->generate_speculative
+                ? fs->generate_speculative(slot->s, c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
+                                           &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr))
+                : slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
+                                                &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;
             if (status < 0) status = 0;
             if (n < 0) {

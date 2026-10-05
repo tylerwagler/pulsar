@@ -206,7 +206,7 @@ typedef struct {
     pulsar_session *session;    ///< KV session backing the transcript
     pulsar_tokens transcript;   ///< the conversation as tokens; source of truth for context use
 
-    char *cache_dir;            ///< directory holding saved sessions (<sha>.session) and segments/
+    char *cache_dir;            ///< directory holding saved sessions (`<sha>.session`) and `segments/`
     pulsar_segstore *kv;        ///< the KV segment store under cache_dir; NULL when unusable
     char session_sha[41];       ///< session identity: 40 hex chars + NUL
     char *session_title;        ///< human-readable session name for the picker
@@ -576,7 +576,7 @@ typedef struct {
     bool truncated;  ///< the cap was hit; content is incomplete
 } agent_buf;
 
-/** A saved session as its <sha>.session file holds it (kvstore_session.cpp):
+/** A saved session as its `<sha>.session` file holds it (kvstore_session.cpp):
  *  the KV is not in it -- it lives in the segment store, found by the rendered
  *  text of `tokens`. */
 typedef struct {
@@ -920,7 +920,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
 /** Reads and verifies (size, digest) a session file; false with `err` when it
  *  is not one. */
 bool agent_session_file_read(const char *path, agent_session_file *f, char *err, size_t err_len);
-/** Opens w->kv at <cache_dir>/segments, keyed by model and routed format;
+/** Opens w->kv at `<cache_dir>/segments`, keyed by model and routed format;
  *  false (said once) leaves sessions saving without cached KV. */
 bool agent_kv_open(agent_worker *w);
 /** Loads the deepest stored chain for `tokens`' rendered text into the live

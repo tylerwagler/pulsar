@@ -156,7 +156,10 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # scans shard headers and __metadata__ as JSON), so every target that links
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(TP_OBJS)
+# The Qwen tokenizer (L251 S5) rides here too: the Qwen family loads it at open and the engine's
+# tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
+QWEN_TOK_OBJS = src/lib/qwen_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(QWEN_TOK_OBJS) $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
@@ -262,11 +265,15 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
+                 tests/exl3_dense_gate \
+                 tests/gdn_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
 	./tests/exl3_gemv_gate
+	./tests/exl3_dense_gate
+	./tests/gdn_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -465,7 +472,7 @@ tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
 # -- graded against the host authority (exl3_trellis.h + double arithmetic)
 # on random tiles at the V4.1 expert shape, plus the arm's GB/s.  Model-free;
 # needs a device.  Includes the kernel TU directly, as the table gate does.
-tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
+tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu tests/exl3_gemv_gate_qwen.inc Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
                       src/cuda/mmq/ds4_exl3_gemv.cuh src/cuda/mmq/ds4_act_block.cuh \
                       src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -Isrc/cuda/mmq -o $@ $<
@@ -473,6 +480,101 @@ tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu Makefile src/cuda/mmq/ds4_exl3_gem
 .PHONY: exl3-gemv-gate
 exl3-gemv-gate: tests/exl3_gemv_gate
 	./tests/exl3_gemv_gate
+
+# L251: the EXL3 dense-Linear arm -- the complete Linear (input rotation,
+# split-K trellis GEMV, output Hadamard + svh) at the Qwen dense shapes and a
+# DeepSeek one, K = 2..5, M = 1..16 and a 40-row prefill, graded against the
+# host authority in double; M-neutrality bit-exact; mutations; refusals.
+# Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
+# the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
+tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+                       src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+
+.PHONY: exl3-dense-gate
+exl3-dense-gate: tests/exl3_dense_gate
+	./tests/exl3_dense_gate
+
+# L251: the dense arm on a REAL exllamav3-quantized weight, driven by
+# pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
+# exllamav3's own forward on the same activations).  Not a gate.
+tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+                         src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+
+# L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
+# decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
+# and a streaming-read roofline, DRAM-cold, M = 1..16.  Not a gate.
+tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+# L251 S4: Qwen3.8-Flash-Next's router, MoE block (EXL3 routed + shared), Gated
+# Residual and PLE injection -- the production objects vs the double references in
+# tests/qwen_ref.h, model-free: decisions, ties, NaN routing, M-neutrality, the
+# PLE conv state carried (batch == single-token steps), mutations.  Pass the served
+# arch: make qwen-s4-gate CUDA_ARCH=sm_120f.
+QWEN_S4_HDRS = tests/qwen_ref.h tests/exl3_dense_ref.h src/cuda/pulsar_cuda_qwen.h src/cuda/pulsar_cuda_mx.cuh \
+               src/engine/exl3_trellis.h
+tests/qwen_s4_gate: tests/qwen_s4_gate.cu $(QWEN_S4_HDRS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qwen_s4_gate.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+.PHONY: qwen-s4-gate
+qwen-s4-gate: tests/qwen_s4_gate
+	./tests/qwen_s4_gate
+
+# L251: the Gated DeltaNet kernels (Qwen3.8-Flash-Next) -- conv + gates + the
+# delta-rule recurrence + gated RMSNorm between the block's projections.  Vs the
+# double host authority; decode == prefill, chunk and batch neutrality
+# bit-exact; the A8 slot vs the canonical encoder; mutations; refusals.  Links
+# the PRODUCTION object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
+src/cuda/pulsar_cuda_gdn.o: src/cuda/pulsar_cuda_gdn.h
+tests/gdn_gate: tests/gdn_gate.cu tests/gdn_ref.h src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_cuda_gdn.h \
+                src/cuda/pulsar_cuda_mx.cuh Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gdn_gate.cu src/cuda/pulsar_cuda_gdn.o
+
+.PHONY: gdn-gate
+gdn-gate: tests/gdn_gate
+	./tests/gdn_gate
+
+# L251: the GDN microbenchmark -- decode steps at 1/4/8/16 sequences, DRAM-cold
+# (state slots rotated past L2), prefill throughput, and a streaming-copy
+# roofline measured in the same process.  Not a gate.
+tests/gdn_bench: tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_cuda_gdn.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o
+
+# L251: the same TU as a shared object for the real-weight harness in
+# pulsar-notes research/l251/gdn/ (ctypes from torch, against transformers'
+# own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
+tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
+# L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
+# double host reference -- cache encode, top-512 selection incl. exact ties,
+# output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
+# needs a device.  Links the PRODUCTION objects.
+tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                     $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_gate.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: qsa-attn-gate
+qsa-attn-gate: tests/qsa_attn_gate
+	./tests/qsa_attn_gate
+
+# L251 S3: replay one real attention layer's captured projections through the
+# same entry point, for the offline grade against transformers (see the tool's
+# header).  Not a gate by itself: the grade lives with the capture script.
+tests/qsa_layer_replay: tests/qsa_layer_replay.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_layer_replay.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+# L251 S3: the layer's decode (M = 1/4/8 at 8K/64K/256K, DRAM-cold) and prefill
+# chunk timings on GB10.  Not a gate.
+tests/qsa_attn_bench: tests/qsa_attn_bench.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
+                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_bench.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # The restored 0731 unified NVFP4 row CODEC ORACLE -- HOST ONLY, no device, so
 # it runs anywhere the tree builds.  tests/attn_pack_fixture.h mirrors the row
@@ -546,6 +648,36 @@ tests/exl3_dequant_gate: tests/exl3_dequant_gate.cpp src/engine/exl3_trellis.h \
 exl3-dequant-gate: tests/exl3_dequant_gate
 	./tests/exl3_dequant_gate tests/test-vectors/exl3
 
+# L251 S1: the Qwen4-exp family skeleton -- load, layer plan, weight bind,
+# session-state sizing at the 1.5-2M-token target, and the by-name refusal of
+# every step -- over ZERO-WEIGHT containers made from the HF checkpoint's own
+# headers and config (tests/qwen_family_container.py: sparse files, no weight
+# byte is read), plus four mutants the loader must refuse by name.
+# qwen-family-gate-device adds a real session on the GPU (the battery's entry).
+QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
+QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
+# The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
+.PHONY: spec-depth-gate
+tests/spec_depth_gate: tests/spec_depth_gate.cpp src/engine/spec_depth.h Makefile
+	$(CXX) $(CXXFLAGS) -o $@ tests/spec_depth_gate.cpp
+spec-depth-gate: tests/spec_depth_gate
+	./tests/spec_depth_gate
+
+.PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
+qwen-family-containers:
+	@test -f $(QWEN_HF_DIR)/model.safetensors.index.json || { \
+	  echo "REFUSING: QWEN_HF_DIR=$(QWEN_HF_DIR) is not the Qwen3.8-Flash-Next HF checkpoint (headers + config are read)"; exit 1; }
+	@mkdir -p $(QWEN_GATE_DIR) && \
+	cp $(QWEN_HF_DIR)/tokenizer.json $(QWEN_HF_DIR)/generation_config.json $(QWEN_GATE_DIR)/ && \
+	python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/good.safetensors && \
+	for m in arch shape tensor layer-type s4-format ple-rows; do \
+	  python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/$$m.safetensors --mutate $$m || exit 1; \
+	done
+qwen-family-gate: tests/qwen_family_gate qwen-family-containers
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
+qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
+	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
+
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
 # a gather of the fixture's ids from the row file must return the fixture's bytes.
@@ -558,6 +690,43 @@ tests/engram_table_test: tests/engram_table_test.cpp src/engine/engram.cpp src/e
 engram-table-check: tests/engram_table_test
 	./tests/engram_table_test tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
 	./tests/engram_table_test tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
+
+# L251 S4: Qwen3.8-Flash-Next's PLE n-gram ids vs transformers' own module, bit-exact,
+# whole-sequence and chunked (decode steps), plus the row gather over the checkpoint's
+# 128 shard tensors through the Engram pool -- HOST ONLY.  Vectors from
+# tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
+# sparky; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
+QWEN_NGRAM_VECTORS ?= /srv/models/qwen-s4/ngram-corpus.vec
+# the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
+# checkpoint's shard parts named in the vectors instead
+QWEN_NGRAM_ROWFILE ?=
+tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/engine/qwen_ngram.h \
+                       src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
+                       src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp \
+		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
+.PHONY: qwen-ngram-test
+qwen-ngram-test: tests/qwen_ngram_test
+	./tests/qwen_ngram_test tests/test-vectors/qwen-ngram-small.vec --no-rows
+	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS) $(if $(QWEN_NGRAM_ROWFILE),--rowfile $(QWEN_NGRAM_ROWFILE),)
+
+# L251 S5: the Qwen3.8-Flash-Next tokenizer, chat renderer, client-span map and
+# output parser, graded against HF (goldens from tests/qwen/gen_qwen_goldens.py
+# -- transformers' apply_chat_template + tokenizers).  Model-free; the inputs are
+# the checkpoint's tokenizer.json + generation_config.json, the L216 corpus case
+# files and the 466-row calibration corpus HF rendered from them.
+QWEN_TOK_DIR ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
+QWEN_RENDER_CASES ?= /mnt/models/reap-corpus/cases
+QWEN_CALIB ?= /mnt/models/qwen38-calib/calib-qwen38-v1.jsonl
+QWEN_CHAT_SRCS = src/lib/qwen_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp
+tests/qwen_chat_gate: tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS) src/lib/qwen_tokenizer.h \
+                      src/lib/qwen_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/pulsar_utf8.h \
+                      src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
+.PHONY: qwen-chat-gate
+qwen-chat-gate: tests/qwen_chat_gate
+	./tests/qwen_chat_gate --tok $(QWEN_TOK_DIR) --vectors tests/test-vectors/qwen38 \
+	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
@@ -617,7 +786,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/vision_hc_gate
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -919,13 +1088,15 @@ cuda-reap-router-audit:
 # The artifact builder's module suites (tools/container, L247), no GPU, minutes:
 # names/policy against every declaration of the served Vision-Exp artifact
 # (shard, gguf_name, layout, dims_ne), kv entry-for-entry, every producer
-# byte-identical to the served bytes.  The oracle paths live in the tests and
+# byte-identical to the served bytes; the qwen4_exp family (L251) end to end on a
+# synthetic miniature checkpoint (recipe refusals, emit twice byte-identical,
+# verify --roundtrip, the PLE row file).  The oracle paths live in the tests and
 # refuse when the checkpoints are not mounted; the codecs need numpy, so pass
 # the interpreter that has it (CONTAINER_PY=.../.venv/bin/python).
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_names.py test_kv.py test_producers.py; do \
+	cd tools/container && for t in test_names.py test_kv.py test_producers.py test_qwen.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -1540,7 +1711,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 \
+	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1721,7 +1892,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -1736,7 +1907,9 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
+	        src/engine/family*|tests/qwen_family*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
+	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -1752,6 +1925,7 @@ gates-dev:
 	        engine) for g in $(GATES_DEV_ENGINE); do add $$g; done ;; \
 	        vision) for g in $(GATES_DEV_VISION); do add $$g; done ;; \
 	        exl3) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
+	        gdn) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
@@ -1763,6 +1937,7 @@ gates-dev:
 	if [ -z "$$sel" ]; then printf '  runner sub-gates: (none -- all coverage for this path set is in the targets below)\n'; \
 	else printf '  runner sub-gates: %s\n' "$$(echo $$sel | tr ' ' ',')"; fi; \
 	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
+	if [ $$family -eq 1 ]; then printf '  qwen-family-gate-device: selected (the family interface)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -1783,8 +1958,15 @@ gates-dev:
 	    $(MAKE) --no-print-directory $$h CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	  done; \
 	fi; \
+	if [ $$gdn -eq 1 ]; then \
+	  $(MAKE) --no-print-directory gdn-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$family -eq 1 ]; then \
+	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
@@ -1910,6 +2092,9 @@ tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_intern
 
 tests/vision_visible_gate.o: tests/vision_visible_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_visible_gate.cpp
+
+tests/qwen_family_gate.o: tests/qwen_family_gate.cpp src/engine/pulsar_engine_internal.h src/engine/family.h src/engine/family_qwen.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/qwen_family_gate.cpp
 
 tests/vision_layout_gate.o: tests/vision_layout_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_layout_gate.cpp
@@ -2059,6 +2244,48 @@ tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 
 tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
+# BF16 streamed reference.  Needs a real container and the anchors on disk:
+#   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
+QWEN_REF_MODEL ?= $(HOME)/qwen-container
+QWEN_REF_DIR   ?= $(HOME)/ref-qwen38fn
+tests/qwen_ref_gate.o: tests/qwen_ref_gate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_ref_gate: tests/qwen_ref_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: qwen-ref-gate
+qwen-ref-gate: tests/qwen_ref_gate
+	@./tests/qwen_ref_gate $(QWEN_REF_MODEL) $(QWEN_REF_DIR)
+
+# L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out (the family has
+# no tokenizer or renderer yet, S5, so the CLI's text path refuses by design).  Decode the emitted
+# ids with qwen_generate_decode.py.  Needs a real container and a prompt's tokens.bin on disk.
+QWEN_GEN_MODEL  ?= $(HOME)/qwen-container
+QWEN_GEN_TOKENS ?= $(HOME)/ref-qwen38fn/code.tokens.bin
+QWEN_GEN_N      ?= 32
+tests/qwen_generate.o: tests/qwen_generate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/qwen_banks_gate.o: tests/qwen_banks_gate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_banks_gate: tests/qwen_banks_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/qwen_chunk_neutrality_gate.o: tests/qwen_chunk_neutrality_gate.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_chunk_neutrality_gate: tests/qwen_chunk_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: qwen-generate
+qwen-generate: tests/qwen_generate
+	@./tests/qwen_generate $(QWEN_GEN_MODEL) $(QWEN_GEN_TOKENS) $(QWEN_GEN_N) /tmp/qwen-gen-ids.bin
 
 tests/vision_layout_gate: tests/vision_layout_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -2281,7 +2508,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

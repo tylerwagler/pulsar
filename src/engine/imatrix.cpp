@@ -208,7 +208,7 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     {
         const uint32_t b = gpu_graph_cur_bank(g);
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
-        gpu_graph_ckpt_drop_bank(g, b);   /* L264: the zeroing bypasses the frontier writer */
+        pulsar_ckpt_drop_bank(&g->ckpt, b);   /* L264: the zeroing bypasses the frontier writer */
     }
     if (!gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g))) return false;
     g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;   /* position 0: the canonical state, re-established */
@@ -810,7 +810,7 @@ bool gpu_graph_prefill_chunked_range(
          * chunk-neutrality gate's resumes are this same cut.  Not when that grid
          * point falls inside an image block (the block stays whole). */
         if (pos0 + chunk == end) {
-            const uint32_t grid_end = (end / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
+            const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
             bool inside = false;
             for (int b = 0; b < n_blk; b++)
                 if ((uint32_t)blk_s[b] < grid_end && grid_end < (uint32_t)blk_e[b]) inside = true;
@@ -846,8 +846,8 @@ bool gpu_graph_prefill_chunked_range(
         bool in_block = false;
         for (int b = 0; b < n_blk; b++)
             if ((uint32_t)blk_s[b] < chunk_end && chunk_end < (uint32_t)blk_e[b]) in_block = true;
-        if (chunk_end % PULSAR_RESUME_GRID == 0u && !in_block &&
-            !gpu_graph_ckpt_capture(g, chunk_end)) return false;
+        if (chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block &&
+            !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }

@@ -133,6 +133,246 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
 
 
 
+/* L251: POST /v1/chat/completions for the Qwen family (Qwen3.8-Flash-Next).
+ *
+ * The same request surface as the DeepSeek arm below -- messages, tools,
+ * sampling, logprobs, stream, stop -- rendered by the family's ONE renderer
+ * (qwen_chat_render: HF's apply_chat_template byte for byte, with the L223
+ * client-span map) and tokenised through the engine's tokenizer entry, which
+ * dispatches to the Qwen tokenizer.  The effort comes from reasoning_effort and
+ * the thinking switch (enable_thinking / think / thinking, or the same names in
+ * chat_template_kwargs), resolved by qwen_effort_resolve: a name the template
+ * does not know ("high", "max", a number) is refused, never mapped.
+ *
+ * Refused by name, because the template cannot express them: image content,
+ * tool_choice "required" or a named function, and any chat_template_kwargs key
+ * other than enable_thinking / reasoning_effort.  Everything the renderer
+ * refuses (system_not_first, unexpected_role -- which covers "developer" --,
+ * no_user_query, tool_arguments_not_json, ...) comes back with its key.
+ * tool_choice "none" renders the conversation without the tools, as the
+ * DeepSeek arm does.  No DeepSeek tool memory or forced prefill runs here: a
+ * replayed assistant call renders from the client's own name + arguments. */
+static bool parse_chat_request_qwen(pulsar_engine *e, const char *body, request *r,
+                                    char *err, size_t errlen) {
+    r->chat_qwen = true;
+    if (err && errlen) err[0] = '\0';
+    const char *p = body;
+    bool got_messages = false;
+    bool got_top_logprobs = false;
+    bool tool_choice_none = false;
+    int thinking = -1;       /* qwen_effort_resolve's switch: -1 not sent, 0 off, 1 on */
+    char *effort = NULL;     /* reasoning_effort as sent; NULL = not sent */
+    char *tools = NULL;      /* the tools array as the client wrote it; NULL = absent or null */
+    int skr = 0;
+    chat_msgs msgs = {0};
+    qwen_effort qe = QWEN_EFFORT_NONE;
+    qwen_render_out out;
+    std::vector<qwen_msg_in> qm;
+    std::vector<std::vector<qwen_tool_call_in>> qc;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        bool ok = true;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            ok = parse_messages(&p, &msgs, err, errlen);
+            got_messages = true;
+        } else if (!strcmp(key, "tools")) {
+            free(tools);
+            tools = NULL;
+            json_ws(&p);
+            if (!json_lit(&p, "null")) ok = json_raw_value(&p, &tools);
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                ok = json_string(&p, &choice);
+                if (ok && strcmp(choice, "auto") && strcmp(choice, "none")) {
+                    snprintf(err, errlen, "tool_choice: \"%.40s\" is not served for the Qwen family "
+                                          "(its chat template cannot force a call); use \"auto\" or \"none\"",
+                             choice);
+                    ok = false;
+                }
+                if (ok) tool_choice_none = !strcmp(choice, "none");
+                free(choice);
+            } else if (!json_lit(&p, "null")) {
+                snprintf(err, errlen, "tool_choice: a named function is not served for the Qwen family "
+                                      "(its chat template cannot force a call); use \"auto\" or \"none\"");
+                ok = false;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            ok = json_string(&p, &r->model);
+            r->model_from_request = true;
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            ok = json_int(&p, &r->max_tokens);
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            ok = skr > 0;
+        } else if (!strcmp(key, "logprobs")) {
+            json_ws(&p);
+            ok = json_lit(&p, "null") || json_bool(&p, &r->logprobs);
+        } else if (!strcmp(key, "top_logprobs")) {
+            /* the same contract as the DeepSeek arm: range-checked after the loop */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                double v = 0.0;
+                ok = json_number(&p, &v);
+                r->top_logprobs = (v >= 0 && v <= PULSAR_SERVER_MAX_TOP_LOGPROBS
+                                   && v == (double)(int)v) ? (int)v : -1;
+                got_top_logprobs = true;
+            }
+        } else if (!strcmp(key, "stream")) {
+            ok = json_bool(&p, &r->stream);
+        } else if (!strcmp(key, "stream_options")) {
+            ok = parse_stream_options(&p, &r->stream_include_usage);
+        } else if (!strcmp(key, "thinking")) {
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                bool on = true;
+                ok = parse_thinking_control_value(&p, &on);
+                thinking = on ? 1 : 0;
+            }
+        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
+            bool on = true;
+            ok = json_bool(&p, &on);
+            thinking = on ? 1 : 0;
+        } else if (!strcmp(key, "reasoning_effort")) {
+            json_ws(&p);
+            free(effort);
+            effort = NULL;
+            if (!json_lit(&p, "null")) {
+                ok = *p == '"' && json_string(&p, &effort);
+                if (!ok) snprintf(err, errlen, "reasoning_effort: this model (Qwen3.8-Flash-Next) takes a name -- "
+                                               "low, medium, xhigh or none");
+            }
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            /* vLLM's spelling of the template variables.  Only the two this
+             * renderer takes are accepted; any other would be silently unrendered. */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                ok = *p == '{';
+                if (ok) p++;
+                json_ws(&p);
+                while (ok && *p && *p != '}') {
+                    char *k = NULL;
+                    ok = json_string(&p, &k);
+                    json_ws(&p);
+                    ok = ok && *p == ':';
+                    if (ok) p++;
+                    if (ok && !strcmp(k, "enable_thinking")) {
+                        bool on = true;
+                        ok = json_bool(&p, &on);
+                        thinking = on ? 1 : 0;
+                    } else if (ok && !strcmp(k, "reasoning_effort")) {
+                        json_ws(&p);
+                        free(effort);
+                        effort = NULL;
+                        if (!json_lit(&p, "null")) ok = *p == '"' && json_string(&p, &effort);
+                    } else if (ok) {
+                        snprintf(err, errlen, "chat_template_kwargs.%.40s is not a template variable this server "
+                                              "renders for the Qwen family (enable_thinking, reasoning_effort)", k);
+                        ok = false;
+                    }
+                    free(k);
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                    json_ws(&p);
+                }
+                ok = ok && *p == '}';
+                if (ok) p++;
+            }
+        } else if (!strcmp(key, "stop")) {
+            ok = parse_stop(&p, &r->stops);
+        } else {
+            ok = json_skip_value(&p);
+        }
+        free(key);
+        if (!ok) goto bad;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        goto bad;
+    }
+    if (got_top_logprobs && !r->logprobs) {
+        snprintf(err, errlen, "top_logprobs requires logprobs to be true");
+        goto bad;
+    }
+    if (r->top_logprobs < 0 || r->top_logprobs > PULSAR_SERVER_MAX_TOP_LOGPROBS) {
+        snprintf(err, errlen, "top_logprobs must be an integer between 0 and %d",
+                 PULSAR_SERVER_MAX_TOP_LOGPROBS);
+        goto bad;
+    }
+    if (!r->logprobs) r->top_logprobs = 0;
+    if (!qwen_effort_resolve(effort, thinking, &qe, err, errlen)) goto bad;
+
+    /* chat_msgs -> the renderer's messages.  The pointers borrow `msgs`, which
+     * outlives the render. */
+    qm.resize((size_t)msgs.len);
+    qc.resize((size_t)msgs.len);
+    for (int i = 0; i < msgs.len; i++) {
+        const chat_msg *m = &msgs.v[i];
+        if (m->images_len > 0) {
+            snprintf(err, errlen, "message %d: image content is not served for the Qwen family", i);
+            goto bad;
+        }
+        for (int c = 0; c < m->calls.len; c++)
+            qc[(size_t)i].push_back({m->calls.v[c].name, m->calls.v[c].arguments});
+        qm[(size_t)i] = {m->role, m->content, m->reasoning,
+                         qc[(size_t)i].empty() ? NULL : qc[(size_t)i].data(), m->calls.len};
+    }
+    {
+        const qwen_render_in in = {qm.data(), msgs.len, tool_choice_none ? NULL : tools, qe, true};
+        if (!qwen_chat_render(in, &out, err, errlen)) goto bad;
+    }
+    r->prompt_text = xstrndup(out.text.data(), out.text.size());
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = (uint32_t)out.spans.size();
+    if (r->prompt_n_spans) {
+        r->prompt_spans = (pulsar_text_span *)server_xmalloc(out.spans.size() * sizeof(pulsar_text_span));
+        memcpy(r->prompt_spans, out.spans.data(), out.spans.size() * sizeof(pulsar_text_span));
+    }
+    /* Downstream reads only whether a think block is open: the generation
+     * prompt opened "<think>\n" unless thinking is off (the effort itself is in
+     * the rendered text).  PULSAR_THINK_DEFAULT is the enabled marker, not a
+     * DeepSeek effort. */
+    r->think_mode = qe == QWEN_EFFORT_NONE ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT;
+    if (!tool_choice_none && tools) {
+        r->has_tools = true;
+        r->qwen_tools_json = tools;
+        tools = NULL;
+    }
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+    chat_msgs_free(&msgs);
+    free(tools);
+    free(effort);
+    return true;
+bad:
+    chat_msgs_free(&msgs);
+    free(tools);
+    free(effort);
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -140,6 +380,8 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
 bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    /* L251: the Qwen family renders with its own template, never this one. */
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) return parse_chat_request_qwen(e, body, r, err, errlen);
     /* The chat template family follows the LOADED model (L218 s123): the
      * renderer, the forced-prefill and the KV-key suffix builders all read it
      * from the request, so a 0731 artifact cannot be primed with V4.1's
@@ -398,6 +640,13 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: the Qwen chat renderer (src/lib/qwen_chat) is not wired into this endpoint yet, and the
+         * DeepSeek template must never render a Qwen conversation -- refuse by name */
+        if (err && errlen) snprintf(err, errlen, "this endpoint does not serve the Qwen family yet; "
+                                                 "/v1/completions takes raw text");
+        return false;
+    }
     r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_ANTHROPIC;
     if (err && errlen) err[0] = '\0';
@@ -1512,6 +1761,13 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: the Qwen chat renderer (src/lib/qwen_chat) is not wired into this endpoint yet, and the
+         * DeepSeek template must never render a Qwen conversation -- refuse by name */
+        if (err && errlen) snprintf(err, errlen, "this endpoint does not serve the Qwen family yet; "
+                                                 "/v1/completions takes raw text");
+        return false;
+    }
     r->chat_v41 = pulsar_engine_chat_v41(e);   /* the loaded model's template family */
     r->api = API_RESPONSES;
     const char *p = body;
@@ -1961,6 +2217,26 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         snprintf(err, errlen, "missing prompt");
         request_free(r);
         return false;
+    }
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        /* L251: a Qwen completion is a RAW continuation (vLLM's /v1/completions): no template and
+         * no thinking block; the whole prompt is client text, so no added token matches in it */
+        r->think_mode = think_mode_from_enabled(false, reasoning_effort);
+        free(r->prompt_spans);
+        r->prompt_n_spans = 0;
+        r->prompt_spans = NULL;
+        r->prompt_text = prompt;
+        prompt = NULL;
+        const size_t plen = strlen(r->prompt_text);
+        if (plen) {
+            r->prompt_spans = (pulsar_text_span *)malloc(sizeof(pulsar_text_span));
+            if (!r->prompt_spans) { if (err && errlen) snprintf(err, errlen, "out of memory"); return false; }
+            r->prompt_spans[0].lo = 0;
+            r->prompt_spans[0].hi = (uint32_t)plen;
+            r->prompt_n_spans = 1;
+        }
+        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        return true;
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;

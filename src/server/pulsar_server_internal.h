@@ -17,6 +17,8 @@
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
+/* L251: the Qwen family's chat renderer, effort authority and output parser. */
+#include "qwen_chat.h"
 
 #include <new>
 #include <string>
@@ -600,6 +602,16 @@ typedef struct {
      * unless a parser says otherwise, so hand-built requests keep the default
      * profile's bytes. */
     bool chat_v41;
+    /** L251: a /v1/chat/completions request for the Qwen family.  Rendered by
+     * qwen_chat_render (src/lib/qwen_chat), and its generated text is read by
+     * ONE qwen_output_parser per generation (gen_state::qwen) instead of the
+     * DeepSeek think/DSML machinery: every DeepSeek continuation, forced-prefill,
+     * tool-memory and checkpoint-suffix builder is skipped for it, because each
+     * of them writes DeepSeek markup.  False for every other request. */
+    bool chat_qwen;
+    /** L251: the request's tools array as the client sent it (JSON text), for
+     * the Qwen output parser's argument typing; owned, NULL = no tools. */
+    char *qwen_tools_json;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -1343,6 +1355,16 @@ struct server {
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
+    /** L251: the loaded family decodes speculatively through its OWN
+     * pulsar_session_generate_speculative (Qwen's MTP; not the DSpark round
+     * API, which stays DeepSeek-only) and --no-dspark did not turn it off.
+     * Arms decode lane 4 (worker_family_spec_quantum). Set once at startup
+     * from pulsar_engine_family; the engine exposes no query for "this
+     * family has its own speculative generate AND its drafter is loaded", so
+     * an artifact without the MTP sidecar fails its greedy solo decodes by
+     * the engine's own name ("needs the MTP layer") -- start such a model
+     * with --no-dspark. */
+    bool         family_spec;
     /** Deep-concurrent guard for the fused lane: when the aggregate committed
      * depth (sum of committed_pos) of the active decode set exceeds this many
      * rows, worker_find_fuse_prefill refuses to fuse — the decode step is
@@ -1466,7 +1488,8 @@ struct server {
      * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
      * sequentially in one worker. */
     float   *lane_logits;
-    /** Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
+    /** Which decode lane the scheduler is on: 0 idle, 1 spec (retired), 2
+     * batched, 3 spec-batched, 4 family-spec (server_pick_decode_lane). The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
      * this" from "no speculative decoding ran at all". */
@@ -1997,6 +2020,15 @@ struct server {
      * fresh conversation's bank at 0 (invalidate), and refuse (no_fuse) a prompt
      * that does not extend the bank's history; leaves no bank live. */
     bool fuse_prepare(session_slot *sl);
+    /** L251 lane 4: ONE greedy decoder on a family with its own speculative
+     * generate (family_spec).  Makes the slot's bank live, runs
+     * pulsar_session_generate_speculative for up to a quantum of tokens (the
+     * engine commits them into the bank's checkpoint and leaves its logits
+     * fresh), and emits each through gen_emit_token.  Tokens committed but
+     * not emitted (a stop string, a failed client write) cannot be rewound
+     * on a recurrent state: the bank's view is invalidated instead, so the
+     * next sync prefills it cold. */
+    void worker_family_spec_quantum(session_slot *sl);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
      * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
      * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
@@ -2204,6 +2236,21 @@ typedef enum {
     GEN_DONE,
 } gen_phase;
 
+/** L251: one Qwen generation's output side.  The ONE qwen_output_parser of the
+ * generation is fed g->text's bytes as the stop-string scan releases them, and
+ * its events become the response: reasoning and content deltas, and each
+ * completed tool call, which is given its id here and kept in `calls` for the
+ * final message.  A call reaches the client only when complete (TOOL_END): a
+ * call the parser later rejects (ERROR) was never announced, so a stream never
+ * carries a call the final message lacks. */
+struct qwen_gen {
+    qwen_output_parser parser;
+    std::vector<qwen_out_event> ev;  ///< scratch, reused per feed
+    size_t fed = 0;                  ///< bytes of g->text fed to the parser
+    tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
+    ~qwen_gen();                     ///< frees `calls` (server_jobs.cpp)
+};
+
 /** Everything one in-flight generation needs, for the whole life of the
  * request.
  *
@@ -2334,6 +2381,10 @@ struct gen_state {
      * conversation).  A prompt that is not an extension of its bank's history is
      * marked no_fuse instead and prefills classically. */
     bool fuse_ready;
+
+    /** L251: the Qwen output state for a request with chat_qwen set, owned
+     * (heap-held: gen_state is a memset C struct); NULL for every other request. */
+    qwen_gen *qwen;
 
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker
@@ -2692,6 +2743,15 @@ bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens);
+/* L251: the Qwen family's OpenAI chat deltas (see qwen_gen).  A reasoning or
+ * content delta carries the logprob entries released up to `release_upto`; a
+ * tool call goes out whole (start delta with id and name, then its arguments). */
+bool openai_sse_qwen_text(int fd, const request *r, const char *id, bool reasoning,
+                          const std::string &text, logprob_ledger *lp, size_t release_upto);
+bool openai_sse_qwen_tool_call(int fd, const request *r, const char *id, int index,
+                               const tool_call *tc);
+bool openai_sse_qwen_finish(int fd, const request *r, const char *id, logprob_ledger *lp,
+                            const char *finish, int prompt_tokens, int completion_tokens);
 bool request_uses_openai_live_stream(const request *r);
 bool request_uses_responses_live_stream(const request *r);
 bool request_uses_structured_stream(const request *r);

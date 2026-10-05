@@ -549,20 +549,21 @@ __device__ __forceinline__ static void mma_store2(__half *p, float a, float b) {
 }
 template <int MT, int R, int S, typename OT>
 __global__ static void __launch_bounds__(R * S * 32) fp8mx_mma_kernel(
-        OT *out,
-        const __nv_fp8_e4m3 *wdata,
-        const unsigned char *wscale,
-        int KBp,
-        const __nv_fp8_e4m3 *xdata,
-        const unsigned char *xscale,
-        int xKBp,
+        OT *out,                  ///< [token][n_groups * rank] rows, written from token tok0
+        const __nv_fp8_e4m3 *wdata,   ///< E4M3 weight rows, K bytes each, operand-permuted
+        const unsigned char *wscale,  ///< the weights' E8M0 block scales, swizzled (pulsar_mx_sfoff)
+        int KBp,                  ///< the weight scale layout's padded blocks per row
+        const __nv_fp8_e4m3 *xdata,   ///< E4M3 activation rows, K bytes each, operand-permuted
+        const unsigned char *xscale,  ///< the activations' E8M0 block scales, swizzled
+        int xKBp,                 ///< the activation scale layout's padded blocks per row
         uint64_t x_group_bytes,   ///< activation offset between groups (0: one group)
         uint64_t scale_slab,      ///< activation scale offset between groups
-        int K,
+        int K,                    ///< the reduction length, a multiple of 32 * PULSAR_MMA_U
         int rank,                 ///< weight rows per group
-        int n_groups,
-        int tok0,
-        int n_tok) {
+        int n_groups,             ///< groups; output rows are n_groups * rank
+        int tok0,                 ///< the first token this launch computes
+        int n_tok                 ///< tokens this launch computes, at most PULSAR_MMA_TOK
+        ) {
     __shared__ float red[R][S][MT * PULSAR_MMA_NT * 4][32];
     const int lane = threadIdx.x & 31, grp = lane >> 2, q = lane & 3;
     const int ks = (int)(threadIdx.x >> 5) % S, rt = (int)(threadIdx.x >> 5) / S;

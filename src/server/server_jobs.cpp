@@ -756,6 +756,13 @@ void server::gen_begin(session_slot *sl) {
                                          s->slot_trivial_common_tokens);
         cached = (pm.prompt_cut > 0 && !trivial) ? pm.prompt_cut : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
+        /* L266: a bank-pool family (Qwen) cannot rewind to a byte match -- it serves an extension or a
+         * grid checkpoint, so the count is where its sync actually starts */
+        const int resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        if (resume >= 0) {
+            cached = trivial ? 0 : resume;
+            cache_source = cached <= 0 ? "none" : cached == common ? "memory-token" : "memory-checkpoint";
+        }
     }
     if (cached == 0 && old_pos > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -1056,7 +1063,10 @@ void server::gen_stream_begin(session_slot *sl) {
     random_prefixed_id(g->id, sizeof(g->id), j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-", 12);
 
     g->structured_stream = request_uses_structured_stream(&j->req);
-    g->openai_live_chat = request_uses_openai_live_stream(&j->req);
+    /* L251: a Qwen stream is projected from its output parser's events
+     * (qwen_gen_feed), never by the DeepSeek think/DSML projection; it is still
+     * a structured stream, so no raw text goes out either. */
+    g->openai_live_chat = request_uses_openai_live_stream(&j->req) && !j->req.chat_qwen;
     g->responses_live_chat = request_uses_responses_live_stream(&j->req);
     g->responses_created_at = (long)time(NULL);
     if (j->req.stream) {
@@ -1205,6 +1215,22 @@ void server::gen_decode_init(session_slot *sl) {
         g->tool_scan_from = g->text.len;
         g->plain_stream_pos = g->text.len;
     }
+    /* L251: ONE Qwen output parser per generation.  Its tools are the ones the
+     * prompt rendered (they type the arguments); it starts in reasoning exactly
+     * when the generation prompt opened "<think>\n".  A Qwen request never
+     * loops back here (no DSML recovery runs for it), so this is the only init. */
+    if (j->req.chat_qwen) {
+        delete g->qwen;
+        g->qwen = new qwen_gen();
+        char perr[200];
+        if (!g->qwen->parser.init(pulsar_think_mode_enabled(j->req.think_mode),
+                                  j->req.qwen_tools_json, perr, sizeof perr)) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "qwen output parser: %s", perr);
+            g->phase = GEN_FINISH;
+            return;
+        }
+    }
     g->phase = GEN_DECODE;
 }
 
@@ -1261,6 +1287,57 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
 
 
 
+qwen_gen::~qwen_gen() { tool_calls_free(&calls); }
+
+/* L251: feed the Qwen output parser g->text[fed, upto) -- the bytes the
+ * stop-string scan has released -- and, when `final`, end the turn; then turn
+ * its events into the response.  Reasoning and content go out as deltas when
+ * streaming (the parser keeps both for the final message either way); a
+ * completed call is given its id and kept, and streamed whole.  A malformed
+ * call is the model's output, not a server fault: logged, and dropped by the
+ * parser.  false = a client write failed. */
+static bool qwen_gen_feed(server *s, gen_state *g, size_t upto, bool final) {
+    job *j = g->j;
+    qwen_gen *q = g->qwen;
+    q->ev.clear();
+    if (upto > q->fed) {
+        q->parser.feed(g->text.ptr + q->fed, upto - q->fed, &q->ev);
+        q->fed = upto;
+    }
+    if (final) q->parser.finish(&q->ev);
+    const bool stream = j->req.stream;
+    for (const qwen_out_event &e : q->ev) {
+        switch (e.kind) {
+        case qwen_out_event::REASONING:
+        case qwen_out_event::CONTENT:
+            if (stream && !openai_sse_qwen_text(j->fd, &j->req, g->id,
+                                                e.kind == qwen_out_event::REASONING,
+                                                e.text, &g->logprobs, q->fed)) return false;
+            break;
+        case qwen_out_event::TOOL_BEGIN:
+            break;   /* a call goes out whole, at TOOL_END (see qwen_gen) */
+        case qwen_out_event::TOOL_END: {
+            tool_call tc = {0};
+            tc.name = xstrdup(e.name.c_str());
+            tc.arguments = xstrdup(e.arguments.c_str());
+            tool_calls_push(&q->calls, tc);
+            s->assign_tool_call_ids(&q->calls, j->req.api);
+            if (stream && !openai_sse_qwen_tool_call(j->fd, &j->req, g->id, q->calls.len - 1,
+                                                     &q->calls.v[q->calls.len - 1])) return false;
+            break;
+        }
+        case qwen_out_event::ERROR:
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s qwen output: %s",
+                       g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, e.text.c_str());
+            s->trace_event(g->trace_id, "qwen output: %s", e.text.c_str());
+            break;
+        }
+    }
+    return true;
+}
+
+
+
 /* Emit one already-decoded token into the response stream: append it to the
  * accumulated text, feed the thinking/DSML trackers, run stop-string and
  * tool-marker detection, and drive every active protocol stream projection
@@ -1282,7 +1359,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    if (token == pulsar_token_eos(s->engine)) {
+    if (pulsar_token_is_stop(s->engine, token)) {
         g->finish = "stop";
         return true;
     }
@@ -1317,7 +1394,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         const size_t close_base = g->text.len - piece_len;
         if (g->stop_scan_from < close_base) g->stop_scan_from = close_base;
     }
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen) {
         dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
     }
 
@@ -1348,6 +1425,12 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         }
         g->plain_stream_pos = stream_len;
     }
+    if (g->qwen && !qwen_gen_feed(s, g, stream_len, false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
     if (j->req.stream && j->req.api == API_ANTHROPIC &&
         !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
                                      &g->anthropic_live, g->text.ptr, stream_len,
@@ -1377,7 +1460,10 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
     free(piece);
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+    /* DeepSeek DSML markers only: a Qwen turn's tool calls are read by its
+     * output parser, and it ends at the family's stop token, so saw_tool_* stay
+     * false for it and the tool_calls stop below never fires. */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen) {
         if (g->thinking_gates_tool_markers && g->thinking.inside) {
             /* A DSML block inside reasoning is not executable, and an opening
              * marker alone can be quoted protocol text. A COMPLETE block is
@@ -1509,7 +1595,7 @@ void server::gen_step_finish(session_slot *sl) {
      * that the turn was cut (openai_stream.cpp's finalize comment already
      * states this contract; the unconditional "tool_calls" relabel broke it). */
     bool truncated_tool_repair = false;
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen &&
         g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
@@ -1612,7 +1698,25 @@ void server::gen_step_finish(session_slot *sl) {
     char *parsed_reasoning = NULL;
     const char *final_finish = g->finish;
     bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
+    bool qwen_stream_ok = true;
+    if (j->req.chat_qwen) {
+        /* L251: the rest of the text (a stop string's held tail never reaches
+         * it: g->text was cut at the match) and the end of the turn.  The parser
+         * already holds reasoning, content and the completed calls in the
+         * template's normal form; a malformed call was logged and dropped.  No
+         * parser exists when the request failed before decoding (a bank restore
+         * refused during prefill): that finish is an error with nothing to read. */
+        if (g->qwen) {
+            if (strcmp(g->finish, "error") != 0)
+                qwen_stream_ok = qwen_gen_feed(s, g, g->text.len, true);
+            parsed_content = xstrdup(g->qwen->parser.content().c_str());
+            parsed_reasoning = g->qwen->parser.reasoning().empty()
+                                   ? NULL : xstrdup(g->qwen->parser.reasoning().c_str());
+            parsed_calls = g->qwen->calls;
+            memset(&g->qwen->calls, 0, sizeof(g->qwen->calls));
+        }
+        if (parsed_calls.len && strcmp(final_finish, "error") != 0) final_finish = "tool_calls";
+    } else if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response(
             g->text.ptr ? g->text.ptr : "",
             j->req.has_tools,
@@ -1798,7 +1902,13 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    if (j->req.chat_qwen) {
+        /* L251: the canonical rewrite below is built by a DeepSeek suffix
+         * builder (append_assistant_turn_sampled / _close); a Qwen turn has no
+         * Qwen form of it, so the next request resolves by exact token /
+         * rendered-text prefix only (L264 retired the binding there was to
+         * clear). */
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         pulsar_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
@@ -1842,7 +1952,12 @@ void server::gen_step_finish(session_slot *sl) {
         }
     } else if (j->req.stream) {
         bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
+        if (j->req.chat_qwen) {
+            response_ok = qwen_stream_ok &&
+                          openai_sse_qwen_finish(j->fd, &j->req, g->id, &g->logprobs, final_finish,
+                                                 g->prompt_tokens,
+                                                 g->completion_total + g->completion);
+        } else if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
                                                     g->text.ptr ? g->text.ptr : "", g->text.len,
                                                     &parsed_calls, final_finish, g->stop_sequence,
@@ -1991,6 +2106,7 @@ void server::gen_state_free(session_slot *sl) {
     anthropic_stream_free(&g->anthropic_live);
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
+    delete g->qwen;
     buf_free(&g->text);
     logprob_ledger_free(&g->logprobs);
     pulsar_tokens_free(&g->effective_prompt);

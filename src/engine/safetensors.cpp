@@ -23,6 +23,7 @@
  * kernel read patterns and are mapped straight to their PULSAR_TENSOR_* ids.
  */
 #include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"   /* the EXL3 byte model for exl3m entries */
 
 #include "pulsar_json.h"
 
@@ -471,9 +472,19 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
         }
         return rows * cols + rows * (cols / 32);
     }
-    default:
+    default: {
+        /* EXL3 on a pulsar.tensors entry (L251): one [trellis | suh | svh] slice per
+         * [in, out] (ne order), and a 3-D [in, out, n] entry is n of them back to
+         * back -- exl3_expert_layout is the one byte model */
+        const int k2 = exl3_type_k2(type);
+        uint64_t trellis = 0, scales = 0, stride = 0;
+        if (k2 && (nd == 2 || nd == 3) && exl3_expert_layout(dim[0], dim[1], k2, &trellis, &scales, &stride))
+            return stride * (nd == 3 ? dim[2] : 1);
+        if (k2) st_die("safetensors: EXL3 dense tensor has a bad shape (%u dims, in %llu, out %llu)", nd,
+                       (unsigned long long)(nd > 0 ? dim[0] : 0), (unsigned long long)(nd > 1 ? dim[1] : 0));
         st_die("safetensors: no byte model for tensor type %u", type);
         return 0;
+    }
     }
 }
 
@@ -583,7 +594,7 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
     if (*p == ']') return;
     for (;;) {
         const char *q = p;
-        char *gguf_name = NULL, *part = NULL, *layout = NULL;
+        char *gguf_name = NULL, *part = NULL, *layout = NULL, *entry_name = NULL;
         uint64_t dim2[2];
         uint32_t nd2 = 0;
         double dn = 0.0, db = 0.0;
@@ -603,14 +614,28 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         uint64_t n_experts = (uint64_t)dn;
         uint64_t expert_bytes = (uint64_t)db;
 
+        /* The per-expert tensor name is either DECLARED (`entry_name`, the HF
+         * tensor name carrying an {e} placeholder -- what a Qwen4-exp container
+         * writes, because its entries are not blk.N-shaped) or derived from the
+         * family's gguf_name prefix (DeepSeek's blk.N -> layers, dspark.N ->
+         * mtp).  The container states which form it uses; neither is guessed. */
+        q = p;
+        if (st_obj_key(&q, "entry_name") && !json_string(&q, &entry_name)) {
+            st_die("safetensors: expert entry has a malformed entry_name");
+        }
+
         char ns[16];
         int layer = -1;
-        if (sscanf(gguf_name, "blk.%d.", &layer) == 1) {
-            memcpy(ns, "layers", 7);
-        } else if (sscanf(gguf_name, "dspark.%d.", &layer) == 1) {
-            memcpy(ns, "mtp", 4);
-        } else {
-            st_die("safetensors: expert family '%s' is neither blk.N nor dspark.N", gguf_name);
+        if (!entry_name) {
+            if (sscanf(gguf_name, "blk.%d.", &layer) == 1) {
+                memcpy(ns, "layers", 7);
+            } else if (sscanf(gguf_name, "dspark.%d.", &layer) == 1) {
+                memcpy(ns, "mtp", 4);
+            } else {
+                st_die("safetensors: expert family '%s' is neither blk.N nor dspark.N and declares no entry_name", gguf_name);
+            }
+        } else if (!strstr(entry_name, "{e}")) {
+            st_die("safetensors: expert family '%s': entry_name '%s' has no {e} placeholder -- refusing", gguf_name, entry_name);
         }
 
         /* The per-expert tensors must be contiguous in expert order: the
@@ -618,9 +643,15 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
          * a gap or a reordering here would silently read the wrong expert. */
         uint64_t first_off = 0;
         for (uint64_t e = 0; e < n_experts; e++) {
-            char tn[160];
-            snprintf(tn, sizeof(tn), "%s.%d.ffn.experts.%llu.%s.weight",
-                     ns, layer, (unsigned long long)e, part);
+            char tn[256];
+            if (entry_name) {
+                const char *ph = strstr(entry_name, "{e}");
+                snprintf(tn, sizeof(tn), "%.*s%llu%s", (int)(ph - entry_name), entry_name,
+                         (unsigned long long)e, ph + 3);
+            } else {
+                snprintf(tn, sizeof(tn), "%s.%d.ffn.experts.%llu.%s.weight",
+                         ns, layer, (unsigned long long)e, part);
+            }
             const st_tensor *ft = st_tensor_find(s, tn);
             if (!ft) st_die("safetensors: %s: missing %s", s->name, tn);
             if (ft->off1 - ft->off0 != expert_bytes) {
@@ -664,6 +695,7 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
                  s->buf_off + first_off, n_experts * expert_bytes);
         free(part);
         free(layout);
+        free(entry_name);
 
         if (!json_skip_value(&p)) st_die("safetensors: %s pulsar.experts entry bad", s->name);
         json_ws(&p);

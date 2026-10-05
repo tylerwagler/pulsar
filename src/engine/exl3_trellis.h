@@ -146,7 +146,7 @@ EXL3_HD static inline int exl3_stream_bits(int k2) {
  * even position ends K bits in, the odd one at the pair's end
  * (`dq8_half`: w6 = w7 >> (K+1), w5 = w6 >> K).
  */
-EXL3_HD static inline int exl3_state_end_bit(int k2, int p) {
+EXL3_HD static constexpr inline int exl3_state_end_bit(int k2, int p) {
     const int bits = k2 >> 1;
     if (!(k2 & 1)) return (p + 1) * bits;
     const int bits2 = 2 * bits + 1;
@@ -222,7 +222,39 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
     case PULSAR_TENSOR_EXL3M_K2:  return 4;
     case PULSAR_TENSOR_EXL3M_K2H: return 5;
     case PULSAR_TENSOR_EXL3M_K3:  return 6;
+    case PULSAR_TENSOR_EXL3M_K4:  return 8;
+    case PULSAR_TENSOR_EXL3M_K5:  return 10;
+    case PULSAR_TENSOR_EXL3M_K6:  return 12;
+    case PULSAR_TENSOR_EXL3M_K8:  return 16;
     default:                      return 0;
+    }
+}
+
+/**
+ * The EXL3 arms and the rates each reads -- the ONE table, used by the CUDA
+ * arms' dispatch (mmq/ds4_exl3_gemv.cu, which instantiates exactly these) and
+ * by the binders that admit a container's tensors (a rate no arm reads is
+ * refused at load, not at first use):
+ *   DOWN   a routed down on the fold's pre-rotated mid: 2, 2.5, 3 (DeepSeek /
+ *          V4.1) and 4, 5, 6 (Qwen3.8-Flash-Next)
+ *   PAIR   split gate / up stacks, each rotating its own input: 2, 2.5, 3 (DeepSeek; Qwen's MTP layer
+ *          K3) and 4, 6 (turboderp's Qwen trunk, which ships gate and up apart with their own suh)
+ *   GATE_UP_FUSED   one [in -> 2 mid] gate | up slice (our Qwen quant): 4, 5
+ *   DENSE  the dense-Linear arm (mmq/ds4_exl3_dense.cuh): 2, 3, 4, 5, 6, 8
+ *   MOE_PREFILL     the Qwen routed-expert prefill GEMM (mmq/qwen_exl3_moe_prefill.cu): 3, 4, 5, 6
+ * Qwen's rates are turboderp's packs (L266): 4.05 bpw = K4 experts, K6 dense and
+ * shared; 6.05 = K6 experts, K8 dense and shared; the MTP layer's experts K3.
+ */
+enum { EXL3_ARM_DOWN = 0, EXL3_ARM_PAIR = 1, EXL3_ARM_GATE_UP_FUSED = 2, EXL3_ARM_DENSE = 3,
+       EXL3_ARM_MOE_PREFILL = 4 };
+EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
+    switch (arm) {
+    case EXL3_ARM_DOWN:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
+    case EXL3_ARM_PAIR:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 12;
+    case EXL3_ARM_GATE_UP_FUSED: return k2 == 8 || k2 == 10;
+    case EXL3_ARM_DENSE:         return k2 == 4 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12 || k2 == 16;
+    case EXL3_ARM_MOE_PREFILL:   return k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
+    default:                     return false;
     }
 }
 

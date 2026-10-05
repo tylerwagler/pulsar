@@ -1782,7 +1782,7 @@ bool gpu_graph_alloc_raw_cap(
      * named flags are the aggregates the per-tensor checks fold into. */
     /* L264: the grid-checkpoint slabs size themselves from the layer views just
      * installed, so they come last. */
-    const bool ckpt_ok = ok && gpu_graph_ckpt_alloc(g, banked ? g->banks.n_banks : 1u);
+    const bool ckpt_ok = ok && pulsar_ckpt_alloc(&g->ckpt, &PULSAR_KV_STATE_DS4, g, banked ? g->banks.n_banks : 1u);
     if (!ok || !ckpt_ok) {
         fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s, checkpoints %s -- refusing\n",
                 state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED", ckpt_ok ? "ok" : "FAILED");

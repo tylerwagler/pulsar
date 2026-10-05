@@ -94,6 +94,7 @@ static pulsar_engine *fabricate_engine(pulsar_tp *tp) {
         std::exit(1);
     }
     e->tp = tp;
+    e->family = &PULSAR_FAMILY_DEEPSEEK4;   /* the TP-capable family; the C API reads it (L251) */
     return e;
 }
 

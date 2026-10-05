@@ -97,6 +97,32 @@ typedef struct {
 
 typedef struct pulsar_engine pulsar_engine;
 typedef struct pulsar_session pulsar_session;
+typedef struct pulsar_family pulsar_family;
+
+/** The model family the loaded artifact belongs to (L251): chosen once at
+ * pulsar_engine_open from the artifact's `general.architecture`, never
+ * switched.  Values are stable. */
+typedef enum {
+    PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
+    PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
+} pulsar_family_id;
+
+/** The conversation format a front end must render for the loaded model: the
+ * chat template, the reasoning-effort spelling, and the tool-call syntax all
+ * follow it.  One fact with one authority (the family); a renderer that has
+ * no arm for a format refuses it. */
+typedef enum {
+    PULSAR_CHAT_DS4_V4  = 0,  ///< DeepSeek V4 (0731) template
+    PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
+    PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
+} pulsar_chat_format;
+
+/** The speculative drafter a family's artifacts carry. */
+typedef enum {
+    PULSAR_DRAFTER_NONE   = 0,
+    PULSAR_DRAFTER_DSPARK = 1,  ///< DeepSeek's DSpark (merged `dspark.*` tensors)
+    PULSAR_DRAFTER_MTP    = 2,  ///< Qwen's multi-token-prediction block (`mtp.*`)
+} pulsar_drafter_kind;
 
 typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*pulsar_session_cancel_fn)(void *ud);
@@ -141,7 +167,7 @@ typedef struct {
      *  stamped (the CLI); the transport sends it empty. */
     const char *build_id;
     /** L264 S4e: a WORKER rank's own copies of the disk KV cache's segments
-     *  (<tp_kv_dir>/<key>.tpseg; KV is replicated per rank, so each rank keeps
+     *  (`<tp_kv_dir>/<key>.tpseg`; KV is replicated per rank, so each rank keeps
      *  its own).  NULL on a rank serving no disk cache: the segment frames are
      *  then refused there as misses. */
     const char *tp_kv_dir;
@@ -218,6 +244,17 @@ const char *pulsar_engine_model_name(pulsar_engine *e);
  * Follows the loaded profile (pulsar_shape::variant); an engine-less caller
  * reads as V4.1, the compile-time default profile. */
 bool pulsar_engine_chat_v41(const pulsar_engine *e);
+/** The loaded model's family (L251).  An engine-less caller reads DeepSeek. */
+pulsar_family_id pulsar_engine_family(const pulsar_engine *e);
+/** The loaded model's conversation format (the family's answer; for DeepSeek
+ * it follows the shape profile exactly like pulsar_engine_chat_v41). */
+pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e);
+/** Printable family name ("DeepSeek V4", "Qwen4-exp"). */
+const char *pulsar_engine_family_name(const pulsar_engine *e);
+/** Does the loaded family carry a tokenizer and chat renderer in this build?
+ * A front end that takes text refuses an engine without one at startup; the
+ * tokenizer entries themselves end the process by name if reached anyway. */
+bool pulsar_engine_has_tokenizer(const pulsar_engine *e);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open.
@@ -278,7 +315,7 @@ const char *pulsar_think_effort_prefix_family(pulsar_think_mode mode, bool v41);
 bool pulsar_think_effort_v4_valid(pulsar_think_mode mode);
 /** The loaded model's DEFAULT thinking effort: V4.1's reference default is high
  * (PULSAR_THINK_DEFAULT); the V4 (0731) encoder's is low, which renders no
- * effort line.  Every front end that did not receive an explicit effort
+ * effort line; Qwen's is thinking on at the template's default effort.  Every front end that did not receive an explicit effort
  * resolves it here, after the engine is open (L239). */
 pulsar_think_mode pulsar_engine_think_default(const pulsar_engine *e);
 /** If `s` starts with SOME effort line, the length of that line (so a caller
@@ -416,6 +453,11 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 size_t pulsar_tool_result_escape(const char *s,
                                  void (*emit)(void *ud, const char *bytes, size_t n),
                                  void *ud);
+/** DeepSeek's chat template, built from marker ids: pulsar_chat_begin, _append_lead_in,
+ * _append_message and _append_assistant_prefix end the process on a Qwen engine (its chat is rendered
+ * whole).  pulsar_encode_chat_prompt serves both: a Qwen engine renders [system,] user through
+ * qwen_chat_render, as the server does; its think_mode is PULSAR_THINK_NONE or PULSAR_THINK_DEFAULT
+ * (the template's default effort) -- any other effort ends the process, never a neighbouring one. */
 void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,
@@ -432,6 +474,9 @@ void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
 int pulsar_token_eos(pulsar_engine *e);
+/** L251: whether `token` ends generation -- the family's whole stop set (Qwen: <|im_end|> and
+ * <|endoftext|>, generation_config.json); DeepSeek: its one eos id. */
+bool pulsar_token_is_stop(pulsar_engine *e, int token);
 int pulsar_token_user(pulsar_engine *e);
 int pulsar_token_assistant(pulsar_engine *e);
 
@@ -890,20 +935,9 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
  * present, else 0. */
 int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled);
-/** L195/L218: the RESUME GRID.  A continuation of a checkpoint is a cold
- *  prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
- *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
- *  are the decode kernels' and can never equal a cold prefill's, so a resume
- *  recomputes the tokens generated since): rewind the bank to G, then prefill
- *  [G, N) as the cold prefill would.  Nothing is saved and nothing is warmed
- *  up: at any even position the ratio-2 compressors hold no pending group and
- *  the ratio-1 compressor holds no state at all, so the state at G IS the cold
- *  prefill's (0731's ratio-4 two-group window needed a 32-token state-only
- *  warm-up here; V4.1 has no such window).  128 is a multiple of 32, the
- *  period of the one remaining chunk-mate mechanism, the HC-mix GEMM's
- *  dependence on a row's offset within the call (censuses 14/15, 2026-09-06,
- *  at n_embd 4096; RE-CENSUS at 5120 before moving this). */
-#define PULSAR_RESUME_GRID 128u
+/** L264/L265: the resume grid of the loaded model (tokens): a resume starts at a multiple of it
+ *  and a prefill leaves its checkpoints on it -- the server plans its fused chunks on it. */
+uint32_t pulsar_session_resume_grid(const pulsar_session *s);
 
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
@@ -924,7 +958,7 @@ int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
  * verify saves and the projection ring do not cover (on the pair: a 1-token ghost
  * rewind from a ratio-128 group boundary).  Such a bank can only be extended from
  * a group boundary, so a continuation must take the classic sync, whose resume
- * starts at a PULSAR_RESUME_GRID point, not a fused round at the bank's frontier.
+ * starts at a resume-grid point (pulsar_session_resume_grid), not a fused round at the bank's frontier.
  * Pure host read; false for an out-of-range bank. */
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank);
 /** Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
@@ -974,6 +1008,11 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
  * no device work.  The router's score for a bank (L264 S3): a request whose bytes
  * match the bank's history to `limit` tokens resumes there from this position. */
 int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
+/** L266: where a sync of `prompt` on `bank` starts its prefill -- the tokens the bank's state serves.  A
+ *  bank-pool family (Qwen) serves an exact extension of the bank's history, else its deepest grid
+ *  checkpoint within the shared prefix, the prefill-only history and prompt->len - 1, else nothing.
+ *  -1 = DeepSeek's graph pool, whose live KV serves any byte-matched prefix (pulsar_session_bank_prefix_match). */
+int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
@@ -988,6 +1027,13 @@ int pulsar_session_prefill_cap(pulsar_session *s);
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
 bool pulsar_engine_has_dspark(pulsar_engine *e);
+/** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
+ * front end without it runs greedy through the session lane (Qwen). */
+bool pulsar_engine_has_argmax(const pulsar_engine *e);
+/** The speculative drafter the OPENED engine actually carries: DSPARK when its dspark.* drafter loaded,
+ *  MTP when a Qwen artifact carries the mtp.* layer (the sidecar shard; served by the family's own
+ *  pulsar_session_generate_speculative, greedy), NONE otherwise. */
+pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
 /** L263: the spec lane's step cost, MEASURED -- the one authority the yield
  * quench and the server's overflow K-allocator price rows against.  The
@@ -1095,7 +1141,9 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
  *         Every segment's checkpoint is kept; `last` restores the final one, so
  *         the bank stands LIVE at G and the next sync evaluates from there. */
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(1)
+/* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
+ * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(2)
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and

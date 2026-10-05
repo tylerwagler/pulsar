@@ -127,13 +127,13 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
     if (ok) {
         int pf = pulsar_session_pos(s);
         if (pf > s->prefill_frontier) pf = s->prefill_frontier;
-        G = gpu_graph_ckpt_best(g, gpu_graph_cur_bank(g), (uint32_t)(pf / 128) * 128u);
+        G = pulsar_ckpt_best(&g->ckpt, gpu_graph_cur_bank(g), pulsar_ckpt_grid_floor(&g->ckpt, (uint32_t)pf));
         pulsar_gpu_tensor *slab = NULL;
         uint64_t off = 0;
-        ok = G != 0u && gpu_graph_ckpt_locate(g, G, &slab, &off) &&
-             g->ckpt_slot_bytes <= cap &&
-             pulsar_gpu_tensor_read(slab, off, buf, g->ckpt_slot_bytes) != 0;
-        if (ok) for (uint64_t i = 0; i < g->ckpt_slot_bytes; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+        ok = G != 0u && pulsar_ckpt_locate(&g->ckpt, gpu_graph_cur_bank(g), G, &slab, &off) &&
+             g->ckpt.slot_bytes <= cap &&
+             pulsar_gpu_tensor_read(slab, off, buf, g->ckpt.slot_bytes) != 0;
+        if (ok) for (uint64_t i = 0; i < g->ckpt.slot_bytes; i++) { h ^= buf[i]; h *= 1099511628211ull; }
     }
     free(buf);
     if (!ok) return 0;
@@ -141,7 +141,7 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
                     "checkpoint G=%u (%llu B)  fnv=%016llx\n",
             tag, (unsigned long long)attn_rows, (unsigned long long)attn_row,
             (unsigned long long)idx_rows, (unsigned long long)idx_row,
-            G, (unsigned long long)g->ckpt_slot_bytes, (unsigned long long)h);
+            G, (unsigned long long)g->ckpt.slot_bytes, (unsigned long long)h);
     return h;
 }
 

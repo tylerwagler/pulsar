@@ -20,7 +20,7 @@
 //     16 weights of a k-tile as FOUR runs of four consecutive positions
 //     (positions 32(c%8) + 8a + 4(c/8) + b, rows 2a + {0,1,8,9}); one run is
 //     two uint32 loads and one 64-bit funnel window (the four states span at
-//     most 3K+16 bits, <= 26 for the rates here) -- exllamav3's dq4 pattern.
+//     most 3K+16 bits, <= 31 for the rates here) -- exllamav3's dq4 pattern.
 //     A warp's two n-tiles are 192 contiguous bytes per k-tile at K=3.
 //   * the input rotation for gate/up: suh is per expert-projection and sits
 //     INSIDE the Hadamard, so it cannot be hoisted before routing; the kernel
@@ -32,12 +32,10 @@
 //     touch those elements.
 
 #include "ds4_exl3_gemv.cuh"
+#include "ds4_exl3_dev.cuh"
 #include "ds4_act_block.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
-
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 
 #include <cstdio>
 
@@ -46,75 +44,17 @@ namespace {
 constexpr int kRows   = 32;    ///< output rows per CTA = one warp's lanes = two n-tiles
 constexpr int kWarps  = 8;     ///< K split
 constexpr int kMaxK   = 5120;  ///< the activation row (V4.1 n_embd)
-constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k-tiles = 2 per warp
+constexpr int kChunk  = 256;   ///< k staged per pass: two Hadamard blocks, 16 k-tiles = 2 per warp;
+                               ///< the last pass of a K % 256 == 128 row (Qwen's expert down, 640)
+                               ///< is one block, 8 k-tiles = 1 per warp -- the same k order
 constexpr int kMaxR   = 16;    ///< the widest row block
-constexpr float kInvSqrt128 = 0.08838834764831845f;
 
-template <int K2> struct Exl3Rate {
-    static constexpr int words16 = 16 * (K2 >> 1) + ((K2 & 1) ? 8 : 0);
-    static constexpr int words32 = words16 / 2;
-    static_assert(words16 % 2 == 0, "a tile is whole uint32 words");
-    /* the four states of a run lie in one 64-bit window: their span is
-     * 3K + 16 (integer K) or 2(2K+1) + 16 (half-integer K) bits, <= 32 */
-    static_assert(3 * (K2 >> 1) + 16 + 2 <= 32, "rate too wide for the 64-bit run window");
-};
-
-/** exllamav3's mul1 codebook, the device form: x * 0x83DCD12D, a dp4a byte
- *  sum onto 0x6400 (= fp16 1024 + bytesum, exact), one hfma.  Bit-identical to
- *  the host exl3_mul1_decode (both graded against the extension's table). */
-__device__ __forceinline__ float exl3_dev_mul1(uint32_t x) {
-    x *= EXL3_MUL1_MULTIPLIER;
-    const uint32_t s = __dp4a(x, 0x01010101u, 0x6400u);
-    const __half h = __ushort_as_half((unsigned short)s);
-    return __half2float(__hfma(h, __ushort_as_half(0x1eee), __ushort_as_half(0xc931)));
-}
-
-/** The four states of positions p0..p0+3 (p0 % 4 == 0) of one tile.  `w` is
- *  the tile's words as uint32 (stream bit s in w[s/32] at bit 31 - s%32, the
- *  layout the header documents); the window is the 64 bits ending at
- *  end(p0+3), wrapping to the last word when it starts before the tile. */
-template <int K2>
-__device__ __forceinline__ void exl3_dev_run4(const uint32_t *__restrict__ w, int p0, uint32_t st[4]) {
-    constexpr int nw = Exl3Rate<K2>::words32;
-    const int e3 = exl3_state_end_bit(K2, p0 + 3);
-    const int hi = (e3 - 1) >> 5;
-    const int lo = (hi + nw - 1) % nw;
-    const int s  = ((hi + 1) << 5) - e3;
-    const uint64_t v = (((uint64_t)w[lo] << 32) | (uint64_t)w[hi]) >> s;
-    st[3] = (uint32_t)v & 0xffffu;
-    st[2] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0 + 2))) & 0xffffu;
-    st[1] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0 + 1))) & 0xffffu;
-    st[0] = (uint32_t)(v >> (e3 - exl3_state_end_bit(K2, p0))) & 0xffffu;
-}
-
-/** In-place natural-order Sylvester H128 / sqrt(128) over one 128-block held
- *  as four consecutive values per lane (lane l holds elements 4l..4l+3): two
- *  in-lane stages, then five xor-shuffle stages (the lane with the bit set
- *  takes a - b, the other a + b).  Full warp required. */
-__device__ __forceinline__ void exl3_dev_had128(float v[4]) {
-    float a, b;
-    a = v[0]; b = v[1]; v[0] = a + b; v[1] = a - b;
-    a = v[2]; b = v[3]; v[2] = a + b; v[3] = a - b;
-    a = v[0]; b = v[2]; v[0] = a + b; v[2] = a - b;
-    a = v[1]; b = v[3]; v[1] = a + b; v[3] = a - b;
-    const int lane = threadIdx.x & 31;
-#pragma unroll
-    for (int m = 1; m <= 16; m <<= 1) {
-        const bool upper = (lane & m) != 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float p = __shfl_xor_sync(0xffffffffu, v[j], m);
-            v[j] = upper ? (p - v[j]) : (v[j] + p);
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= kInvSqrt128;
-}
-
-__device__ __forceinline__ float exl3_dev_e4m3_to_f32(uint8_t bits) {
-    return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
-}
-
+/* What an instance computes (DS4_EXL3_* in the header): DOWN = one projection
+ * of an input the fold already rotated; PAIR = gate and up from two slices,
+ * each rotating the input by its own suh (DeepSeek's split stacks); FUSED = one
+ * projection that rotates the input by its suh (Qwen's fused gate_up, whose
+ * output rows are gate | up). */
+constexpr int kDown = EXL3_ARM_DOWN, kPair = EXL3_ARM_PAIR, kFused = EXL3_ARM_GATE_UP_FUSED;
 /* ---------------------------------------------------------------------- */
 /* the GEMV                                                                */
 
@@ -123,19 +63,32 @@ __device__ __forceinline__ float exl3_dev_e4m3_to_f32(uint8_t bits) {
  * the chunked multi-row body pays 68.  Bit-identical to the multi-row form
  * (the gate proves R = 1 / 4 / 16 equal), kept because a decode step is one
  * assignment per CTA and the barriers are its whole difference. */
-template <bool PAIR, int K2>
+template <int MODE, int K2, bool A8 = true>
 __global__ void __launch_bounds__(kRows * kWarps)
 exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
                      const block_mx_act_mmq *__restrict__ act,
                      const int32_t *__restrict__ ids_dst,
+                     const int32_t *__restrict__ ids_src,   /* !A8: the SOURCE token row per assignment */
                      const int32_t *__restrict__ expert_bounds,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
-    constexpr int W32 = Exl3Rate<K2>::words32;
-    __shared__ float s_x[PAIR ? 2 : 1][kMaxK];
-    __shared__ float s_red[kWarps][kRows][2];   /* 42 KB with s_x: the whole-vector staging */
+    constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
+    constexpr int W32 = exl3dev::Rate<K2>::words32;
+    /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
+     * argument reinterpreted, so the pointer cost no new argument -- but the ROW did.  ids_src[col] is
+     * the SOURCE token (mm_ids_helper: ids_src1 = it*sis1, sis1 = 1); ids_dst[col] is the flat
+     * (token*n_slots + slot) OUTPUT row the scatter below writes to.  Confusing the two reads the wrong
+     * token for every slot past the first and yields plausible garbage, so the bf16 path takes the
+     * source map explicitly.  With it the token's row is addressed directly, and the E4M3 gather/encode
+     * that builds the A8 blocks is not needed at all on this path. */
+    const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
+    /* the whole-vector staging, sized by the launch to (PAIR ? 2 : 1) x K floats (L251: a static kMaxK
+     * buffer held the kernel to 4 CTAs per SM at Qwen's K = 2560 / 640) */
+    extern __shared__ __align__(16) float s_dyn[];
+    float *s_x[2] = {s_dyn, s_dyn + (PAIR ? K : 0)};
+    __shared__ float s_red[kWarps][kRows][2];
     __shared__ int   s_expert;
 
     const int col  = blockIdx.y;                 /* assignment (expert-sorted) */
@@ -168,18 +121,52 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
      * projection.  block i holds k in [128 i, 128 i + 128) as 4 groups of 32
      * E4M3 under one ue8m0 byte each. */
     const int n_k128 = K >> 7;
-    for (int i = tid; i < n_k128 * 4; i += kRows * kWarps) {
+    if constexpr (!A8) {
+        /* bf16 (the Qwen family): every thread stages runs of 8 with 16-byte loads of x and of the suh
+         * rows -- the per-group form below had a third of the threads doing 32 serial 2-byte loads each,
+         * with stores 32 floats apart (one bank per warp).  Each element is the same v * suh product. */
+        const __nv_bfloat16 *xr = xb + (size_t)ids_src[col] * (size_t)K;
+        for (int i = tid; i < (K >> 3); i += kRows * kWarps) {
+            const int k0 = i * 8;
+            const uint4 xw = *reinterpret_cast<const uint4 *>(xr + k0);
+            const __nv_bfloat16 *xv = reinterpret_cast<const __nv_bfloat16 *>(&xw);
+            if constexpr (ROT) {
+                const uint4 gw = *reinterpret_cast<const uint4 *>(sg + k0);
+                const __half *gv = reinterpret_cast<const __half *>(&gw);
+                uint4 uw = gw;
+                if constexpr (PAIR) uw = *reinterpret_cast<const uint4 *>(su + k0);
+                const __half *uv = reinterpret_cast<const __half *>(&uw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = __bfloat162float(xv[j]);
+                    s_x[0][k0 + j] = v * __half2float(gv[j]);
+                    if constexpr (PAIR) s_x[1][k0 + j] = v * __half2float(uv[j]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) s_x[0][k0 + j] = __bfloat162float(xv[j]);
+            }
+        }
+    }
+    for (int i = tid; A8 && i < n_k128 * 4; i += kRows * kWarps) {
         const int blk = i >> 2, grp = i & 3;
-        const block_mx_act_mmq &b = act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)col];
-        const float sc = exp2f(b.d4[grp] - 127.0f);
-        const int8_t *q = b.qs + grp * 32;
         const int k0 = blk * 128 + grp * 32;
+        /* A8: the vendored MMQ block, whose per-32 ue8m0 byte folds in here (the DeepSeek lane).  bf16:
+         * this family's row-major activation, whose exponent is already in the value -- there is no E4M3
+         * activation slot in the Qwen family (L251 / ac69748f).  `bp` is never dereferenced when A8 is
+         * false, so nothing reads `act` as blocks on that path. */
+        const block_mx_act_mmq *bp = A8 ? &act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)col] : nullptr;
+        const float sc = A8 ? exp2f(bp->d4[grp] - 127.0f) : 0.0f;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
-            const float v = exl3_dev_e4m3_to_f32((uint8_t)q[j]) * sc;
+            const float v = A8 ? (exl3dev::e4m3_to_f32((uint8_t)bp->qs[grp * 32 + j]) * sc)
+                               : __bfloat162float(xb[(size_t)ids_src[col] * (size_t)K
+                                                     + (size_t)k0 + (size_t)j]);
             if constexpr (PAIR) {
                 s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
                 s_x[1][k0 + j] = v * __half2float(su[k0 + j]);
+            } else if constexpr (ROT) {
+                s_x[0][k0 + j] = v * __half2float(sg[k0 + j]);
             } else {
                 s_x[0][k0 + j] = v;
             }
@@ -191,7 +178,16 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
         for (int t = warp; t < 2 * n_k128; t += kWarps) {
             float *v4 = s_x[t & 1] + (t >> 1) * 128 + lane * 4;
             float v[4] = {v4[0], v4[1], v4[2], v4[3]};
-            exl3_dev_had128(v);
+            exl3dev::had128(v);
+            v4[0] = v[0]; v4[1] = v[1]; v4[2] = v[2]; v4[3] = v[3];
+        }
+        __syncthreads();
+    } else if constexpr (ROT) {
+        /* H128 per 128-block of the one projection */
+        for (int t = warp; t < n_k128; t += kWarps) {
+            float *v4 = s_x[0] + t * 128 + lane * 4;
+            float v[4] = {v4[0], v4[1], v4[2], v4[3]};
+            exl3dev::had128(v);
             v4[0] = v[0]; v4[1] = v[1]; v4[2] = v[2]; v4[3] = v[3];
         }
         __syncthreads();
@@ -215,8 +211,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
 #pragma unroll
         for (int a = 0; a < 4; ++a) {
             const int p0 = 32 * (c & 7) + 8 * a + 4 * (c >> 3);
-            exl3_dev_run4<K2>(wg, p0, stg[a]);
-            if constexpr (PAIR) exl3_dev_run4<K2>(wu, p0, stu[a]);
+            exl3dev::run4<K2>(wg, p0, stg[a]);
+            if constexpr (PAIR) exl3dev::run4<K2>(wu, p0, stu[a]);
         }
 #pragma unroll
         for (int a = 0; a < 4; ++a) {
@@ -224,8 +220,8 @@ exl3_moe_gemv_kernel_r1(const void *__restrict__ gate_table,
             const int r[4] = {2 * a, 2 * a + 1, 2 * a + 8, 2 * a + 9};
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                acc_g = fmaf(exl3_dev_mul1(stg[a][b]), xg[r[b]], acc_g);
-                if constexpr (PAIR) acc_u = fmaf(exl3_dev_mul1(stu[a][b]), xu[r[b]], acc_u);
+                acc_g = fmaf(exl3dev::mul1(stg[a][b]), xg[r[b]], acc_g);
+                if constexpr (PAIR) acc_u = fmaf(exl3dev::mul1(stu[a][b]), xu[r[b]], acc_u);
             }
         }
     }
@@ -257,17 +253,27 @@ struct GemvSmem {
     static_assert(floats * 4 <= 40 * 1024, "the GEMV's shared buffer must stay under the static limit");
 };
 
-template <bool PAIR, int K2, int R>
+template <int MODE, int K2, int R, bool A8 = true>
 __global__ void __launch_bounds__(kRows * kWarps)
 exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
                      const block_mx_act_mmq *__restrict__ act,
                      const int32_t *__restrict__ ids_dst,
+                     const int32_t *__restrict__ ids_src,   /* !A8: the SOURCE token row per assignment */
                      const int32_t *__restrict__ expert_bounds,
                      float *__restrict__ out_gate,
                      float *__restrict__ out_up,
                      int M, int K, int n_assign, int E) {
-    constexpr int W32 = Exl3Rate<K2>::words32;
+    constexpr bool PAIR = MODE == kPair, ROT = MODE != kDown;
+    constexpr int W32 = exl3dev::Rate<K2>::words32;
+    /* !A8: the activation is the family's own row-major bf16, token-major.  The pointer is the SAME
+     * argument reinterpreted, so the pointer cost no new argument -- but the ROW did.  ids_src[col] is
+     * the SOURCE token (mm_ids_helper: ids_src1 = it*sis1, sis1 = 1); ids_dst[col] is the flat
+     * (token*n_slots + slot) OUTPUT row the scatter below writes to.  Confusing the two reads the wrong
+     * token for every slot past the first and yields plausible garbage, so the bf16 path takes the
+     * source map explicitly.  With it the token's row is addressed directly, and the E4M3 gather/encode
+     * that builds the A8 blocks is not needed at all on this path. */
+    const __nv_bfloat16 *__restrict__ xb = reinterpret_cast<const __nv_bfloat16 *>(act);
     constexpr int NV = PAIR ? 2 : 1;
     __shared__ __align__(16) float s_buf[GemvSmem<PAIR, R>::floats];
     __shared__ int s_expert[R];
@@ -294,7 +300,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 
     /* the reduction view of the shared buffer: [warp][lane][r][v] */
     float *s_red = s_buf;
-    const int n_chunk = K / kChunk;
+    const int n_chunk = (K + kChunk - 1) / kChunk;
     const int ntn = M >> 4;                              /* n-tiles per k-tile row */
     const int nt  = (blockIdx.x << 1) + (lane >> 4);
     const int c   = lane & 15;
@@ -322,6 +328,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 
         for (int kc = 0; kc < n_chunk; ++kc) {
             const int k0 = kc * kChunk;
+            const int nblk = min(2, (K - k0) >> 7);           /* Hadamard blocks in this pass: 2, or 1 at a 128 tail */
             /* stage this chunk of each row's activation as f32 -- for gate/up
              * already multiplied by each projection's suh.  block i of the row
              * holds k in [128 i, 128 i + 128) as 4 groups of 32 E4M3 under one
@@ -329,19 +336,27 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
             __syncthreads();                                   /* the previous pass's readers are done */
             for (int i = tid; i < nr * 8; i += kRows * kWarps) {
                 const int r = i >> 3, g8 = i & 7;
+                if ((g8 >> 2) >= nblk) continue;               /* past a 128 tail: nothing to stage */
                 const int blk = (k0 >> 7) + (g8 >> 2), grp = g8 & 3;
-                const block_mx_act_mmq &b = act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)(col0 + r0 + r)];
-                const float sc = exp2f(b.d4[grp] - 127.0f);
-                const int8_t *q = b.qs + grp * 32;
+                const int arow = col0 + r0 + r;
+                const block_mx_act_mmq *bp = A8 ? &act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)arow]
+                                                : nullptr;   /* as in kernel r1: not dereferenced if !A8 */
+                const float sc = A8 ? exp2f(bp->d4[grp] - 127.0f) : 0.0f;
+                const int8_t *q = A8 ? bp->qs + grp * 32 : nullptr;
                 const int kk = g8 * 32;                        /* offset inside the chunk */
                 float *xg = s_buf + (0 * R + r) * kChunk + kk;
                 float *xu = PAIR ? s_buf + (1 * R + r) * kChunk + kk : nullptr;
 #pragma unroll
                 for (int j = 0; j < 32; ++j) {
-                    const float v = exl3_dev_e4m3_to_f32((uint8_t)q[j]) * sc;
+                    const float v = A8
+                        ? (exl3dev::e4m3_to_f32((uint8_t)q[j]) * sc)
+                        : __bfloat162float(xb[(size_t)ids_src[arow] * (size_t)K
+                                             + (size_t)k0 + (size_t)kk + (size_t)j]);
                     if constexpr (PAIR) {
                         xg[j] = v * __half2float(sg[k0 + kk + j]);
                         xu[j] = v * __half2float(su[k0 + kk + j]);
+                    } else if constexpr (ROT) {
+                        xg[j] = v * __half2float(sg[k0 + kk + j]);
                     } else {
                         xg[j] = v;
                     }
@@ -352,9 +367,21 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 /* H128 per 128-block, per row, per projection: one warp per task */
                 for (int t = warp; t < nr * 2 * 2; t += kWarps) {
                     const int v = t & 1, blk = (t >> 1) & 1, r = t >> 2;
+                    if (blk >= nblk) continue;
                     float *v4 = s_buf + (v * R + r) * kChunk + blk * 128 + lane * 4;
                     float x[4] = {v4[0], v4[1], v4[2], v4[3]};
-                    exl3_dev_had128(x);
+                    exl3dev::had128(x);
+                    v4[0] = x[0]; v4[1] = x[1]; v4[2] = x[2]; v4[3] = x[3];
+                }
+                __syncthreads();
+            } else if constexpr (ROT) {
+                /* H128 per 128-block, per row, of the one projection */
+                for (int t = warp; t < nr * 2; t += kWarps) {
+                    const int blk = t & 1, r = t >> 1;
+                    if (blk >= nblk) continue;
+                    float *v4 = s_buf + r * kChunk + blk * 128 + lane * 4;
+                    float x[4] = {v4[0], v4[1], v4[2], v4[3]};
+                    exl3dev::had128(x);
                     v4[0] = x[0]; v4[1] = x[1]; v4[2] = x[2]; v4[3] = x[3];
                 }
                 __syncthreads();
@@ -363,6 +390,7 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
             /* this warp's two k-tiles of the chunk: the same k order a row alone takes */
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
+                if (half >= nblk) break;                       /* a 128 tail is one k-tile per warp */
                 const int kt = (k0 >> 4) + half * kWarps + warp;
                 const int kk = (half * kWarps + warp) * 16;    /* the tile's k inside the chunk */
                 const uint32_t *wg = tg + ((size_t)kt * (size_t)ntn + (size_t)nt) * W32;
@@ -371,8 +399,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 #pragma unroll
                 for (int a = 0; a < 4; ++a) {
                     const int p0 = 32 * (c & 7) + 8 * a + 4 * (c >> 3);
-                    exl3_dev_run4<K2>(wg, p0, stg[a]);
-                    if constexpr (PAIR) exl3_dev_run4<K2>(wu, p0, stu[a]);
+                    exl3dev::run4<K2>(wg, p0, stg[a]);
+                    if constexpr (PAIR) exl3dev::run4<K2>(wu, p0, stu[a]);
                 }
                 /* decode once, apply to every row of the run */
                 float wgv[16], wuv[16];
@@ -380,8 +408,8 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
                 for (int a = 0; a < 4; ++a)
 #pragma unroll
                     for (int b = 0; b < 4; ++b) {
-                        wgv[a * 4 + b] = exl3_dev_mul1(stg[a][b]);
-                        if constexpr (PAIR) wuv[a * 4 + b] = exl3_dev_mul1(stu[a][b]);
+                        wgv[a * 4 + b] = exl3dev::mul1(stg[a][b]);
+                        if constexpr (PAIR) wuv[a * 4 + b] = exl3dev::mul1(stu[a][b]);
                     }
                 for (int r = 0; r < nr; ++r) {
                     const float *xg = s_buf + (0 * R + r) * kChunk + kk;
@@ -434,14 +462,17 @@ exl3_moe_gemv_kernel(const void *__restrict__ gate_table,
 __global__ void __launch_bounds__(256)
 exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      const float *__restrict__ up_z,
+                     int z_stride,
                      const int32_t *__restrict__ selected,
                      const float *__restrict__ weights,
                      const void *__restrict__ gate_table,
                      const void *__restrict__ up_table,
+                     int up_svh_off,
                      const void *__restrict__ down_table,
                      int in_dim, int mid_dim, int64_t pairs, float clamp,
                      __nv_fp8_e4m3 *__restrict__ mid_q,
                      unsigned char *__restrict__ mid_sf,
+                     __nv_bfloat16 *__restrict__ mid_bf16,   /* the format the down arm reads */
                      int mid_kbp) {
     const int64_t task = ((int64_t)blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
     const int n_blk = mid_dim >> 7;
@@ -451,20 +482,21 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     const int blk = (int)(task - pair * n_blk);
     const int lane = threadIdx.x & 31;
     const int e = selected[pair];
+    if (e < 0) return;                                /* another rank's expert (L266 EP) or the router's NaN path */
     const void *const *pg = reinterpret_cast<const void *const *>(gate_table);
     const void *const *pu = reinterpret_cast<const void *const *>(up_table);
     const void *const *pd = reinterpret_cast<const void *const *>(down_table);
     /* gate/up scales: suh[in_dim] | svh[mid_dim]; down scales: suh[mid_dim] | svh[out] */
     const __half *svh_g = reinterpret_cast<const __half *>(pg[2 * (size_t)e + 1]) + in_dim;
-    const __half *svh_u = reinterpret_cast<const __half *>(pu[2 * (size_t)e + 1]) + in_dim;
+    const __half *svh_u = reinterpret_cast<const __half *>(pu[2 * (size_t)e + 1]) + up_svh_off;
     const __half *suh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]);
     const int col0 = blk * 128 + lane * 4;
     const float wv = weights[pair];
-    const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * mid_dim + col0);
-    const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * mid_dim + col0);
+    const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * z_stride + col0);
+    const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * z_stride + col0);
     float g[4] = {g4.x, g4.y, g4.z, g4.w}, u[4] = {u4.x, u4.y, u4.z, u4.w};
-    exl3_dev_had128(g);
-    exl3_dev_had128(u);
+    exl3dev::had128(g);
+    exl3dev::had128(u);
     float t[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -472,18 +504,29 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
         const float yu = u[j] * __half2float(svh_u[col0 + j]);
         t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
     }
-    exl3_dev_had128(t);
+    exl3dev::had128(t);
     float a = fmaxf(fmaxf(fabsf(t[0]), fabsf(t[1])), fmaxf(fabsf(t[2]), fabsf(t[3])));
 #pragma unroll
     for (int off = 4; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
     const int se = pulsar_mx_shared_exp(a);
-    __nv_fp8_e4m3 *dst = mid_q + (size_t)pair * mid_dim + col0;
-    dst[0] = pulsar_mx_encode(t[0], se);
-    dst[1] = pulsar_mx_encode(t[1], se);
-    dst[2] = pulsar_mx_encode(t[2], se);
-    dst[3] = pulsar_mx_encode(t[3], se);
-    if ((lane & 7) == 0)
-        mid_sf[pulsar_mx_sfoff((int)pair, col0 >> 5, mid_kbp)] = pulsar_mx_scale_byte(se);
+    if (mid_q) {
+        __nv_fp8_e4m3 *dst = mid_q + (size_t)pair * mid_dim + col0;
+        dst[0] = pulsar_mx_encode(t[0], se);
+        dst[1] = pulsar_mx_encode(t[1], se);
+        dst[2] = pulsar_mx_encode(t[2], se);
+        dst[3] = pulsar_mx_encode(t[3], se);
+        if ((lane & 7) == 0)
+            mid_sf[pulsar_mx_sfoff((int)pair, col0 >> 5, mid_kbp)] = pulsar_mx_scale_byte(se);
+    }
+    /* L251 / ac69748f: bf16 carries its own exponent, so there is no per-32 block and no scale byte.
+     * The fold's output is an op-internal Linear activation, so it follows the family's rule. */
+    if (mid_bf16) {
+        __nv_bfloat16 *d16 = mid_bf16 + (size_t)pair * mid_dim + col0;
+        d16[0] = __float2bfloat16(t[0]);
+        d16[1] = __float2bfloat16(t[1]);
+        d16[2] = __float2bfloat16(t[2]);
+        d16[3] = __float2bfloat16(t[3]);
+    }
 }
 
 /* One warp per (token, 128-block of out); slots summed in order. */
@@ -506,10 +549,11 @@ exl3_moe_sum_kernel(float *__restrict__ out,
     for (int s = 0; s < n_expert; ++s) {
         const int64_t pair = (int64_t)tok * n_expert + s;
         const int e = selected[pair];
+        if (e < 0) continue;                          /* another rank's expert (L266 EP): its partial is that rank's */
         const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]) + mid_dim;
         const float4 z4 = *reinterpret_cast<const float4 *>(down_z + pair * out_dim + col0);
         float z[4] = {z4.x, z4.y, z4.z, z4.w};
-        exl3_dev_had128(z);
+        exl3dev::had128(z);
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[j] += z[j] * __half2float(svh_d[col0 + j]);
     }
@@ -530,40 +574,76 @@ static int exl3_rows_per_block(int64_t n_assign) {
     return kMaxR;
 }
 
-template <bool PAIR, int K2, int R>
+template <int MODE, int K2, int R, bool A8 = true>
 static void exl3_gemv_kernel_launch(const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                     const void *gt, const void *ut, const block_mx_act_mmq *a,
-                                    const int32_t *ids_dst, const int32_t *expert_bounds,
+                                    const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                     float *og, float *ou, int M, int K, int n_assign, int E) {
-    exl3_moe_gemv_kernel<PAIR, K2, R><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E);
+    exl3_moe_gemv_kernel<MODE, K2, R, A8><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E);
 }
 
-template <bool PAIR, int K2>
+template <int MODE, int K2, bool A8 = true>
 static void exl3_gemv_dispatch_r(int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
                                  const void *gt, const void *ut, const block_mx_act_mmq *a,
-                                 const int32_t *ids_dst, const int32_t *expert_bounds,
+                                 const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                                  float *og, float *ou, int M, int K, int n_assign, int E) {
     switch (R) {
-    case 1:  exl3_moe_gemv_kernel_r1<PAIR, K2><<<grid, block, 0, stream>>>(gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    case 4:  exl3_gemv_kernel_launch<PAIR, K2, 4>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
-    default: exl3_gemv_kernel_launch<PAIR, K2, kMaxR>(grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, n_assign, E); break;
+    case 1: {
+        const size_t smem = (size_t)(MODE == kPair ? 2 : 1) * (size_t)K * sizeof(float);
+        static bool attr = false;                    /* per instance; idempotent */
+        if (!attr) {
+            cudaFuncSetAttribute(exl3_moe_gemv_kernel_r1<MODE, K2, A8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)((MODE == kPair ? 2 : 1) * kMaxK * sizeof(float)));
+            attr = true;
+        }
+        exl3_moe_gemv_kernel_r1<MODE, K2, A8><<<grid, block, smem, stream>>>(gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E);
+        break;
+    }
+    case 4:  exl3_gemv_kernel_launch<MODE, K2, 4, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
+    default: exl3_gemv_kernel_launch<MODE, K2, kMaxR, A8>(grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); break;
     }
 }
 
-template <bool PAIR>
+/* The rates each kind instantiates: exl3_arm_has_rate (exl3_trellis.h), the
+ * one table the binders read too. */
+constexpr bool kind_has_rate(int mode, int k2) { return exl3_arm_has_rate(mode, k2); }
+
+template <int MODE, bool A8 = true>
+static bool exl3_gemv_dispatch_k2(int k2, int R, const dim3 &grid, const dim3 &block, cudaStream_t stream,
+                                  const void *gt, const void *ut, const block_mx_act_mmq *a,
+                                  const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+                                  float *og, float *ou, int M, int K, int n_assign, int E) {
+    if constexpr (kind_has_rate(MODE, 4)) if (k2 == 4) { exl3_gemv_dispatch_r<MODE, 4, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 5)) if (k2 == 5) { exl3_gemv_dispatch_r<MODE, 5, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 6)) if (k2 == 6) { exl3_gemv_dispatch_r<MODE, 6, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 8)) if (k2 == 8) { exl3_gemv_dispatch_r<MODE, 8, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 10)) if (k2 == 10) { exl3_gemv_dispatch_r<MODE, 10, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    if constexpr (kind_has_rate(MODE, 12)) if (k2 == 12) { exl3_gemv_dispatch_r<MODE, 12, A8>(R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K, n_assign, E); return true; }
+    return false;
+}
+
+template <int MODE, bool A8 = true>
 int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
                      const int32_t *ids_dst, const int32_t *expert_bounds,
                      float *og, float *ou, int M, int K, int64_t n_assign, int E,
-                     int rows_per_block, cudaStream_t stream) {
-    const char *tag = PAIR ? "ds4_exl3_moe_gemv_pair_launch" : "ds4_exl3_moe_gemv_single_launch";
+                     int rows_per_block, cudaStream_t stream,
+                     const int32_t *ids_src = nullptr) {   /* only read when A8 == false */
+    constexpr bool PAIR = MODE == kPair;
+    const char *tag = MODE == kPair ? "ds4_exl3_moe_gemv_pair_launch"
+                    : MODE == kFused ? "ds4_exl3_moe_gemv_fused_launch" : "ds4_exl3_moe_gemv_single_launch";
     if (!gt || (PAIR && !ut) || !act || !ids_dst || !expert_bounds || !og || (PAIR && !ou) ||
         M <= 0 || K <= 0 || n_assign <= 0 || E <= 0) {
         fprintf(stderr, "%s: null pointer or bad shape\n", tag);
         return -1;
     }
-    if (M % kRows || K % kChunk || K > kMaxK || n_assign > INT32_MAX) {
+    if (!A8 && !ids_src) {
+        fprintf(stderr, "%s: the bf16 activation needs the SOURCE row map (ids_src) -- refusing, because "
+                        "ids_dst is the flat output row and would read the wrong token\n", tag);
+        return -1;
+    }
+    if (M % kRows || K % EXL3_HAD_BLOCK || K > kMaxK || n_assign > INT32_MAX) {
         fprintf(stderr, "%s: shape M=%d K=%d n_assign=%lld outside the arm's contract "
-                        "(M %% 32, K %% 256, K <= %d) -- refusing\n",
+                        "(M %% 32, K %% 128, K <= %d) -- refusing\n",
                 tag, M, K, (long long)n_assign, kMaxK);
         return -1;
     }
@@ -575,12 +655,10 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
     const dim3 grid((unsigned)(M / kRows), (unsigned)((n_assign + R - 1) / R), 1);
     const dim3 block(kRows, kWarps, 1);
     const block_mx_act_mmq *a = (const block_mx_act_mmq *)act;
-    switch (k2) {
-    case 4: exl3_gemv_dispatch_r<PAIR, 4>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 5: exl3_gemv_dispatch_r<PAIR, 5>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    case 6: exl3_gemv_dispatch_r<PAIR, 6>(R, grid, block, stream, gt, ut, a, ids_dst, expert_bounds, og, ou, M, K, (int)n_assign, E); break;
-    default:
-        fprintf(stderr, "%s: rate k2=%d has no instance (2, 2.5, 3) -- refusing\n", tag, k2);
+    if (!exl3_gemv_dispatch_k2<MODE, A8>(k2, R, grid, block, stream, gt, ut, a, ids_dst, ids_src, expert_bounds, og, ou, M, K,
+                                     (int)n_assign, E)) {
+        fprintf(stderr, "%s: rate k2=%d has no instance for this kind (split gate/up and DeepSeek's down: "
+                        "2, 2.5, 3; fused gate_up and Qwen's down: 4, 5) -- refusing\n", tag, k2);
         return -1;
     }
     const cudaError_t err = cudaGetLastError();
@@ -593,49 +671,124 @@ int exl3_gemv_launch(const void *gt, const void *ut, int k2, const void *act,
 
 } // namespace
 
-bool ds4_exl3_gemv_rate_supported(int k2) { return k2 == 4 || k2 == 5 || k2 == 6; }
+bool ds4_exl3_gemv_rate_supported(int kind, int k2) {
+    return (kind == kDown || kind == kPair || kind == kFused) && exl3_arm_has_rate(kind, k2);
+}
 
 int ds4_exl3_moe_gemv_pair_launch(const void *gate_table, const void *up_table, int k2, const void *act,
                                   const int32_t *ids_dst, const int32_t *expert_bounds,
                                   float *out_gate, float *out_up, int M, int K, int64_t n_assign,
                                   int n_experts, cudaStream_t stream) {
-    return exl3_gemv_launch<true>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
-                                  out_gate, out_up, M, K, n_assign, n_experts, 0, stream);
+    return exl3_gemv_launch<kPair>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
+                                   out_gate, out_up, M, K, n_assign, n_experts, 0, stream);
 }
 
 int ds4_exl3_moe_gemv_single_launch(const void *table, int k2, const void *act,
                                     const int32_t *ids_dst, const int32_t *expert_bounds,
                                     float *out, int M, int K, int64_t n_assign,
                                     int n_experts, cudaStream_t stream) {
-    return exl3_gemv_launch<false>(table, nullptr, k2, act, ids_dst, expert_bounds,
+    return exl3_gemv_launch<kDown>(table, nullptr, k2, act, ids_dst, expert_bounds,
                                    out, nullptr, M, K, n_assign, n_experts, 0, stream);
+}
+
+int ds4_exl3_moe_gemv_fused_launch(const void *table, int k2, const void *act,
+                                   const int32_t *ids_dst, const int32_t *expert_bounds,
+                                   float *out, int M, int K, int64_t n_assign,
+                                   int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kFused>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                    out, nullptr, M, K, n_assign, n_experts, 0, stream);
+}
+
+/* L251 / ac69748f -- the same arm over a BF16 activation.  The Qwen family has no E4M3 activation slot,
+ * so its routed experts read row-major bf16: one value per k, indexed by assignment (`ids_dst[col]`
+ * is the destination TOKEN, which the producer has already applied when it gathered the rows).  A
+ * separate entry point rather than a flag on the A8 one, which is upstream's own shape for this
+ * (exl3_gemv and exl3_gemv_int8 are two entry points, not one with a switch). */
+int ds4_exl3_moe_gemv_fused_bf16_launch(const void *table, int k2, const void *act,
+                                        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+                                        float *out, int M, int K, int64_t n_assign,
+                                        int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kFused, false>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                           out, nullptr, M, K, n_assign, n_experts, 0, stream, ids_src);
+}
+
+/* The split gate / up arm over the same bf16 activation: the MTP layer's routed experts, which carry
+ * gate and up as separate slices with their own suh (L251 MTP; the trunk's are fused). */
+int ds4_exl3_moe_gemv_pair_bf16_launch(const void *gate_table, const void *up_table, int k2, const void *act,
+                                       const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+                                       float *out_gate, float *out_up, int M, int K, int64_t n_assign,
+                                       int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kPair, false>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
+                                          out_gate, out_up, M, K, n_assign, n_experts, 0, stream, ids_src);
+}
+
+/* The down arm over the same bf16 activation.  Its input is the FOLD's output, which is an op-internal
+ * Linear activation and so follows the same rule -- bf16, not an E4M3 slot. */
+int ds4_exl3_moe_gemv_single_bf16_launch(const void *table, int k2, const void *act,
+                                         const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+                                         float *out, int M, int K, int64_t n_assign,
+                                         int n_experts, cudaStream_t stream) {
+    return exl3_gemv_launch<kDown, false>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                          out, nullptr, M, K, n_assign, n_experts, 0, stream, ids_src);
+}
+
+int ds4_exl3_moe_gemv_fused_launch_rows(const void *table, int k2, const void *act,
+                                        const int32_t *ids_dst, const int32_t *expert_bounds,
+                                        float *out, int M, int K, int64_t n_assign,
+                                        int n_experts, int rows_per_block, cudaStream_t stream) {
+    return exl3_gemv_launch<kFused>(table, nullptr, k2, act, ids_dst, expert_bounds,
+                                    out, nullptr, M, K, n_assign, n_experts, rows_per_block, stream);
 }
 
 int ds4_exl3_moe_gemv_pair_launch_rows(const void *gate_table, const void *up_table, int k2, const void *act,
                                        const int32_t *ids_dst, const int32_t *expert_bounds,
                                        float *out_gate, float *out_up, int M, int K, int64_t n_assign,
                                        int n_experts, int rows_per_block, cudaStream_t stream) {
-    return exl3_gemv_launch<true>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
-                                  out_gate, out_up, M, K, n_assign, n_experts, rows_per_block, stream);
+    return exl3_gemv_launch<kPair>(gate_table, up_table, k2, act, ids_dst, expert_bounds,
+                                   out_gate, out_up, M, K, n_assign, n_experts, rows_per_block, stream);
 }
 
 int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32_t *selected,
                              const float *weights, const void *gate_table, const void *up_table,
                              const void *down_table, int in_dim, int mid_dim, int64_t pairs,
-                             float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream) {
+                             float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream, void *mid_bf16) {
     if (!gate_z || !up_z || !selected || !weights || !gate_table || !up_table || !down_table ||
-        !mid_q || !mid_sf || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
+        (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: null pointer or bad shape (mid_dim %% 128)\n");
         return -1;
     }
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
-        gate_z, up_z, selected, weights, gate_table, up_table, down_table, in_dim, mid_dim, pairs,
-        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
+        gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
+        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: launch failed: %s\n", cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *selected, const float *weights,
+                                   const void *gate_up_table, const void *down_table, int in_dim, int mid_dim,
+                                   int64_t pairs, float clamp, void *mid_q, void *mid_sf, int mid_kbp,
+                                   cudaStream_t stream, void *mid_bf16) {
+    if (!gate_up_z || !selected || !weights || !gate_up_table || !down_table || (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 ||
+        in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK) {
+        fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: null pointer or bad shape (mid_dim %% 128)\n");
+        return -1;
+    }
+    /* gate = rows 0..mid-1 of the fused output, up = rows mid..2 mid-1; the scales
+     * plane is suh [in_dim] | svh [2 mid], so up's svh starts at in_dim + mid */
+    const int64_t tasks = pairs * (mid_dim >> 7);
+    const unsigned blocks = (unsigned)((tasks + 7) / 8);
+    exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
+        gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
+        down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: launch failed: %s\n", cudaGetErrorString(err));
         return -3;
     }
     return 0;

@@ -334,7 +334,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(session, cfg->gen.temperature, 0,
                                            cfg->gen.top_p, cfg->gen.min_p, &rng);
@@ -343,7 +343,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (token == pulsar_token_eos(engine)) break;
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -356,7 +356,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -596,7 +596,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
         }
         fputs("]}", fp);
 
-        if (token == pulsar_token_eos(engine)) break;
+        if (pulsar_token_is_stop(engine, token)) break;
         if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -1022,11 +1022,12 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
                     pulsar_backend_name(cfg->engine.backend));
         }
     } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_dspark(engine) ||
-               pulsar_engine_is_tp(engine)) {
-        /* Sampled, drafted, OR tensor-parallel: the session lane.  A TP engine
-         * cannot take the raw whole-graph path below (no transport; the engine
-         * refuses it by name), and the session lane at temperature 0 is the
-         * same greedy argmax, mirrored across the group frame by frame. */
+               pulsar_engine_is_tp(engine) || !pulsar_engine_has_argmax(engine)) {
+        /* Sampled, drafted, tensor-parallel, OR a family without the whole-graph
+         * path (Qwen): the session lane.  A TP engine cannot take the raw
+         * whole-graph path below (no transport; the engine refuses it by name),
+         * and the session lane at temperature 0 is the same greedy argmax,
+         * mirrored across the group frame by frame. */
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1259,7 +1260,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(chat->session,
                                            cfg->gen.temperature,
@@ -1271,7 +1272,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
                 return 1;
             }
-            if (token == pulsar_token_eos(engine)) break;
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -1283,7 +1284,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -1706,6 +1707,15 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         free(cfg.prompt_owned);
         return wrc;
+    }
+    /* Everything but --inspect takes text; a family whose tokenizer this build
+     * does not carry is refused here, by name (L251). */
+    if (!cfg.inspect && !pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar: the %s family has no tokenizer or chat renderer in this build; "
+                        "only --inspect runs -- refusing\n", pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return 1;
     }
     if (!cfg.inspect) {
         char ctxmem_line[256];

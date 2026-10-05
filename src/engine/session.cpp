@@ -2,6 +2,7 @@
 #include "exl3_trellis.h"
 #include "tp/pulsar_tp.h"
 #include "tp/pulsar_tp_gpu.h"
+#include "lib/qwen_tokenizer.h"
 
 
 int pulsar_engine::routed_quant_bits() {
@@ -417,6 +418,274 @@ static bool tp_register_shared_split(const void *kslice_key, const pulsar_model 
                                              kslice_key, pulsar_tp_kslice_key_offset(L->ffn_down_shexp));
 }
 
+/* The DeepSeek family's load (family.h pulsar_family::load): the tokenizer, the
+ * shape profile and its metadata validation, the expert overlay, and the
+ * target / drafter / vision weight binding -- the steps pulsar_engine::open ran
+ * inline until L251, moved here verbatim and in the same order.  Every refusal
+ * prints its reason; the caller tears the engine down. */
+bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
+    if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
+    config_validate_model(&e->model);
+    if (opt->expert_overlay && opt->expert_overlay[0]) {
+        const char *sep = strrchr(opt->expert_overlay, ':');
+        if (!sep || sep == opt->expert_overlay || !sep[1]) {
+            fprintf(stderr, "pulsar: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
+            return false;
+        }
+        char overlay_path[4096];
+        const size_t path_len = (size_t)(sep - opt->expert_overlay);
+        if (path_len >= sizeof(overlay_path)) {
+            fprintf(stderr, "pulsar: --expert-overlay path is too long\n");
+            return false;
+        }
+        memcpy(overlay_path, opt->expert_overlay, path_len);
+        overlay_path[path_len] = '\0';
+        model_open(&e->overlay_model, overlay_path, pulsar_backend_uses_graph(opt->backend));
+        e->overlay_ready = true;
+        /* PREFIX is a comma-separated list so several layers can be swapped
+         * in one run (e.g. compose "anchor + candidate" from a cheap base
+         * without materializing the combined model as a file). */
+        char prefixes[2048];
+        const size_t plist_len = strlen(sep + 1);
+        if (plist_len >= sizeof(prefixes)) {
+            fprintf(stderr, "pulsar: --expert-overlay prefix list is too long\n");
+            return false;
+        }
+        memcpy(prefixes, sep + 1, plist_len + 1);
+        uint32_t swapped = 0;
+        for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
+            const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
+            if (n == 0) {
+                fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
+                        p);
+                return false;
+            }
+            swapped += n;
+        }
+        fprintf(stderr, "pulsar: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
+                swapped, overlay_path, sep + 1);
+    }
+    weights_bind(&e->weights, &e->model);
+    /* the drafter binds before the inspect-only exit so --inspect proves the
+     * whole artifact binds, drafter included */
+    if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
+        /* Drafter merged into the main GGUF: bind from the main model and
+         * alias dspark_model to it by value (same map/fd; every dspark call
+         * site reads e->dspark_model, and close is guarded on dspark_external
+         * so the shared mapping is only torn down once). */
+        dspark_weights_bind(&e->dspark_weights, &e->model);
+        e->dspark_model = e->model;
+        e->dspark_external = false;
+        e->dspark_ready = true;
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
+                e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
+    }
+    /* Vision-Exp tower: bound and layout-validated here so a wrong or
+     * half-present vision stack refuses at load rather than at first image.
+     * Absent tower is normal for text-only artifacts and simply leaves
+     * vision_ready false; the image path is refused until it is true. */
+    if (vision_weights_bind(&e->vision_weights, &e->model)) {
+        e->vision_ready = true;
+        fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
+                "patch %u, aligner %ux%d -> %u)\n",
+                e->vision_weights.n_layers, (unsigned)PULSAR_VISION_DIM,
+                (unsigned)PULSAR_VISION_HEADS, (unsigned)PULSAR_VISION_INTER,
+                (unsigned)PULSAR_VISION_PATCH,
+                (unsigned)PULSAR_VISION_DOWNSAMPLE, (unsigned)PULSAR_VISION_DOWNSAMPLE,
+                (unsigned)PULSAR_N_EMBD);
+    }
+    /* The layer plan: one kind for every layer.  The per-layer attention mode
+     * (SWA / compressed / indexed) stays in pulsar_attn_layout, its authority. */
+    e->plan.n_layer = PULSAR_N_LAYER;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) e->plan.kind[il] = PULSAR_LAYER_DS4_BLOCK;
+    return true;
+}
+
+/* The DeepSeek family's device-side step of open (family.h after_gpu): the
+ * MoE tier announce and the attention / shared / routed-expert TP slices this
+ * rank owns.  Moved verbatim from pulsar_engine::open (L251); runs after the
+ * GPU and, on a TP group, the transport are up. */
+bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
+    /* One MoE-tier boot line so a silent slow tier is no longer silent:
+     * the resolved expert weight types per layer (grouped-CUTLASS type-40
+     * on both sides vs the per-expert MMQ/mixed path).  Reuses the
+     * bound-layer expert tensors; log-only, runs once at open on every GPU
+     * serve.  PULSAR_DUMP_MOE_TYPES=1 additionally prints every routed
+     * layer's gate/down type pair -- that census is what established the
+     * artifact is 40 and 43 only. */
+    {
+        /* Count the tier PER LAYER.  Reporting the first bound layer's type
+         * as "the" tier is actively misleading on a heterogeneous model:
+         * v5mx has only 5 uniform-MXFP4 layers, so the old line printed
+         * "per-expert-tiled" while a dozen layers were in fact running the
+         * grouped CUTLASS path (2026-07-21 profile).  This observability
+         * exists to catch a SILENT fall to a slow tier, so it has to be
+         * truthful about the mix or it defeats its own purpose. */
+        uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
+        const pulsar_layer_weights *ml = NULL;
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const pulsar_layer_weights *l = &e->weights.layer[il];
+            if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
+            if (!ml) ml = l;                    /* first routed layer, for the type sample */
+            n_routed++;
+            /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
+             * gate and down experts are type-40 (see the moe.cu batch
+             * predicate); any other mix takes the per-expert tiled path. */
+            if (l->ffn_gate_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4 &&
+                l->ffn_down_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4) n_grouped++;
+            else n_tiled++;
+        }
+        if (ml) {
+            const uint32_t gt = ml->ffn_gate_exps->type;
+            const uint32_t dt = ml->ffn_down_exps->type;
+            /* The "mxfp4 tile=NT%u" field is gone with the type-39 gate/up
+             * kernel it described: nothing reads that tile width now that
+             * every MXFP4 layer goes through CUTLASS. */
+            fprintf(stderr,
+                    "pulsar: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
+                    "(first routed layer gate=%s(%u) down=%s(%u))\n",
+                    n_grouped, n_routed, n_tiled, n_routed,
+                    tensor_type_name(gt), gt, tensor_type_name(dt), dt);
+        }
+    }
+
+    /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
+     * range authority every split shares.  The unit is the group (8 heads and
+     * one LoRA-down block each), never the head: a rank's heads are whole
+     * groups, so its attn_q_b rows and its attn_output_a rows are contiguous
+     * and 128-row aligned.  On a group each layer's two owned row slices are
+     * registered with the backend here, once; the attention block then
+     * addresses them by offset like any other weight.  One box: [0, n). */
+    const int tp_rk = e->tp ? pulsar_tp_rank(e->tp) : 0;
+    const uint32_t tp_nr = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
+    if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
+        e->tp_group_hi <= e->tp_group_lo) {
+        fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
+                        "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
+                tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
+        return false;
+    }
+    if (tp_nr > 1) {
+        const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
+        const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
+        const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
+        const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
+        const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
+        const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
+        const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
+        const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
+        uint32_t registered = 0;
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const pulsar_layer_weights *L = &e->weights.layer[il];
+            if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
+                fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
+                return false;
+            }
+            const uint64_t q_rank = L->attn_q_a->dim[1];
+            if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
+                                                      L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
+                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
+                                                      L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
+                /* 4g-2: stage 'b' row-parallel -- the K-half over the same
+                 * owned group columns [a_lo, a_hi) of its a_out_full input. */
+                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
+                                                   L->attn_output_b->abs_offset, a_out_full,
+                                                   L->attn_output_b->dim[1], a_lo, a_hi,
+                                                   e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
+                fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
+                                "registered -- refusing\n", il);
+                return false;
+            }
+            registered += 3;
+            /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
+             * compressor and indexer projections, each rank its floor row
+             * range, gathered in one row-lane exchange per layer
+             * (tp_attn_input_split).  Only the MXFP8_LT ones need their
+             * slice registered; a bf16/f32 slice is plain offset arithmetic. */
+            {
+                static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
+                                                        "attn_compressor_gate", "indexer_compressor_kv",
+                                                        "indexer_compressor_gate", "indexer_proj" };
+                const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
+                                               L->attn_compressor_gate, L->indexer_compressor_kv,
+                                               L->indexer_compressor_gate, L->indexer_proj };
+                for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
+                    const pulsar_tensor *w = ain[k];
+                    if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
+                    uint32_t lo = 0, hi = 0;
+                    if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
+                        !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, w), w->abs_offset,
+                                                              w->dim[0], w->dim[1], lo, hi)) {
+                        fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
+                                        "not be registered -- refusing\n", il, ain_name[k]);
+                        return false;
+                    }
+                }
+            }
+            if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
+                fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
+                                "registered -- refusing\n", il);
+                return false;
+            }
+            registered += 3;
+            if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
+                fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
+                                "not be built -- refusing\n", il);
+                return false;
+            }
+            registered += 3;
+        }
+        for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+            if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
+                                "could not be built -- refusing\n", dl);
+                return false;
+            }
+            if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+                fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
+                                "registered -- refusing\n", dl);
+                return false;
+            }
+            registered += 3;
+            /* 4g-1b: the drafter's attention head-split exactly like a
+             * target layer's -- attn_q_b rows and attn_output_a rows of the
+             * owned groups, attn_output_b's K-half -- over the drafter's own
+             * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
+            const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
+            if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
+                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_q_b),
+                                                      DL->attn_q_b->abs_offset, DL->attn_q_a->dim[1],
+                                                      q_out_full, q_lo, q_hi) ||
+                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_output_a),
+                                                      DL->attn_output_a->abs_offset, group_dim, a_out_full,
+                                                      a_lo, a_hi) ||
+                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->dspark_model, DL->attn_output_b),
+                                                   DL->attn_output_b->abs_offset, a_out_full,
+                                                   DL->attn_output_b->dim[1], a_lo, a_hi,
+                                                   e, pulsar_tp_kslice_key_offset(DL->attn_output_b))) {
+                fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
+                                "registered -- refusing\n", dl);
+                return false;
+            }
+            registered += 3;
+        }
+        const pulsar_layer_weights *L0 = &e->weights.layer[0];
+        uint32_t sx_lo = 0, sx_hi = 0;
+        (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
+        fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
+                        "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
+                        "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
+                        "%u layers + %u drafter blocks): %u slices registered\n",
+                tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
+                e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
+                (unsigned long long)q_lo, (unsigned long long)q_hi,
+                (unsigned long long)a_lo, (unsigned long long)a_hi,
+                sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
+                (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
+    }
+    return true;
+}
+
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -490,87 +759,29 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
      * merged drafter aliases e->model by value below and inherits it. */
     e->model.tp_rank = tp_rank_at_load;
     e->model.tp_n_ranks = tp_n_ranks_at_load;
-    if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
-    config_validate_model(&e->model);
-    if (opt->expert_overlay && opt->expert_overlay[0]) {
-        const char *sep = strrchr(opt->expert_overlay, ':');
-        if (!sep || sep == opt->expert_overlay || !sep[1]) {
-            fprintf(stderr, "pulsar: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
-            e->destroy();
-            *out = NULL;
-            return 1;
-        }
-        char overlay_path[4096];
-        const size_t path_len = (size_t)(sep - opt->expert_overlay);
-        if (path_len >= sizeof(overlay_path)) {
-            fprintf(stderr, "pulsar: --expert-overlay path is too long\n");
-            e->destroy();
-            *out = NULL;
-            return 1;
-        }
-        memcpy(overlay_path, opt->expert_overlay, path_len);
-        overlay_path[path_len] = '\0';
-        model_open(&e->overlay_model, overlay_path, graph_backend);
-        e->overlay_ready = true;
-        /* PREFIX is a comma-separated list so several layers can be swapped
-         * in one run (e.g. compose "anchor + candidate" from a cheap base
-         * without materializing the combined model as a file). */
-        char prefixes[2048];
-        const size_t plist_len = strlen(sep + 1);
-        if (plist_len >= sizeof(prefixes)) {
-            fprintf(stderr, "pulsar: --expert-overlay prefix list is too long\n");
-            e->destroy();
-            *out = NULL;
-            return 1;
-        }
-        memcpy(prefixes, sep + 1, plist_len + 1);
-        uint32_t swapped = 0;
-        for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
-            const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
-            if (n == 0) {
-                fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
-                        p);
-                e->destroy();
-                *out = NULL;
-                return 1;
-            }
-            swapped += n;
-        }
-        fprintf(stderr, "pulsar: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
-                swapped, overlay_path, sep + 1);
+    e->family = pulsar_family_for_model(&e->model);
+    if (!e->family) {
+        e->destroy();
+        *out = NULL;
+        return 1;
     }
-    weights_bind(&e->weights, &e->model);
-    /* the drafter binds before the inspect-only exit so --inspect proves the
-     * whole artifact binds, drafter included */
-    if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
-        /* Drafter merged into the main GGUF: bind from the main model and
-         * alias dspark_model to it by value (same map/fd; every dspark call
-         * site reads e->dspark_model, and close is guarded on dspark_external
-         * so the shared mapping is only torn down once). */
-        dspark_weights_bind(&e->dspark_weights, &e->model);
-        e->dspark_model = e->model;
-        e->dspark_external = false;
-        e->dspark_ready = true;
-        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
-                e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
+    /* A feature the family does not declare is refused before anything of it
+     * is built: TP here, an overlay in the family's own load. */
+    if (tp_n_ranks_at_load > 1 && !pulsar_family_require(e, PULSAR_FAMILY_CAP_TP, "tensor parallelism")) {
+        e->destroy();
+        *out = NULL;
+        return 1;
     }
-    /* Vision-Exp tower: bound and layout-validated here so a wrong or
-     * half-present vision stack refuses at load rather than at first image.
-     * Absent tower is normal for text-only artifacts and simply leaves
-     * vision_ready false; the image path is refused until it is true. */
-    if (vision_weights_bind(&e->vision_weights, &e->model)) {
-        e->vision_ready = true;
-        fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
-                "patch %u, aligner %ux%d -> %u)\n",
-                e->vision_weights.n_layers, (unsigned)PULSAR_VISION_DIM,
-                (unsigned)PULSAR_VISION_HEADS, (unsigned)PULSAR_VISION_INTER,
-                (unsigned)PULSAR_VISION_PATCH,
-                (unsigned)PULSAR_VISION_DOWNSAMPLE, (unsigned)PULSAR_VISION_DOWNSAMPLE,
-                (unsigned)PULSAR_N_EMBD);
+    if (!e->family->load(e, opt)) {
+        e->destroy();
+        *out = NULL;
+        return 1;
     }
+    fprintf(stderr, "pulsar: model family %s (%s): %u layers\n",
+            e->family->name, e->family->arch, e->plan.n_layer);
 
-    /* the vision tower binds before the inspect-only exit for the same reason
-     * the drafter does: --inspect proves the whole artifact binds */
+    /* the family's load binds everything (drafter and vision tower included)
+     * before the inspect-only exit: --inspect proves the whole artifact binds */
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -655,49 +866,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
         fprintf(stderr, "pulsar: %s backend initialized for graph diagnostics\n",
                 pulsar_backend_name(e->backend));
-
-        /* One MoE-tier boot line so a silent slow tier is no longer silent:
-         * the resolved expert weight types per layer (grouped-CUTLASS type-40
-         * on both sides vs the per-expert MMQ/mixed path).  Reuses the
-         * bound-layer expert tensors; log-only, runs once at open on every GPU
-         * serve.  PULSAR_DUMP_MOE_TYPES=1 additionally prints every routed
-         * layer's gate/down type pair -- that census is what established the
-         * artifact is 40 and 43 only. */
-        {
-            /* Count the tier PER LAYER.  Reporting the first bound layer's type
-             * as "the" tier is actively misleading on a heterogeneous model:
-             * v5mx has only 5 uniform-MXFP4 layers, so the old line printed
-             * "per-expert-tiled" while a dozen layers were in fact running the
-             * grouped CUTLASS path (2026-07-21 profile).  This observability
-             * exists to catch a SILENT fall to a slow tier, so it has to be
-             * truthful about the mix or it defeats its own purpose. */
-            uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
-            const pulsar_layer_weights *ml = NULL;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                const pulsar_layer_weights *l = &e->weights.layer[il];
-                if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
-                if (!ml) ml = l;                    /* first routed layer, for the type sample */
-                n_routed++;
-                /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
-                 * gate and down experts are type-40 (see the moe.cu batch
-                 * predicate); any other mix takes the per-expert tiled path. */
-                if (l->ffn_gate_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4 &&
-                    l->ffn_down_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4) n_grouped++;
-                else n_tiled++;
-            }
-            if (ml) {
-                const uint32_t gt = ml->ffn_gate_exps->type;
-                const uint32_t dt = ml->ffn_down_exps->type;
-                /* The "mxfp4 tile=NT%u" field is gone with the type-39 gate/up
-                 * kernel it described: nothing reads that tile width now that
-                 * every MXFP4 layer goes through CUTLASS. */
-                fprintf(stderr,
-                        "pulsar: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
-                        "(first routed layer gate=%s(%u) down=%s(%u))\n",
-                        n_grouped, n_routed, n_tiled, n_routed,
-                        tensor_type_name(gt), gt, tensor_type_name(dt), dt);
-            }
-        }
     }
 
     /* Two-rank TP (slice 4b, prefill big-gate arm).  Built here, after the
@@ -729,13 +897,15 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         tp_opt.rank = tp_rank_at_load;
         tp_opt.n_ranks = (int)tp_n_ranks_at_load;
         tp_opt.build = opt->build_id;
+        uint32_t tp_layers = 0, tp_embd = 0, tp_vocab = 0;
+        e->family->tp_shape(e, &tp_layers, &tp_embd, &tp_vocab);
         pulsar_tp_identity id;
         pulsar_tp_identity_init_defaults(&id,
                                          (uint64_t)e->model.size,
                                          (uint32_t)e->model_id(),
-                                         PULSAR_N_LAYER,
-                                         PULSAR_N_EMBD,
-                                         PULSAR_N_VOCAB,
+                                         tp_layers,
+                                         tp_embd,
+                                         tp_vocab,
                                          (uint32_t)e->routed_quant_bits(),
                                          0);
         int tp_ok = opt->tp_peers
@@ -749,14 +919,14 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         if (opt->tp_kv_dir && opt->tp_kv_dir[0]) e->tp_kv_dir = pulsar_strdup(opt->tp_kv_dir);
-        e->tp_slab_bytes = pulsar_tp_slab_bytes(PULSAR_N_LAYER, PULSAR_N_EMBD);
+        e->tp_slab_bytes = pulsar_tp_slab_bytes(tp_layers, tp_embd);
         /* The bulk lane (v14): a pair over RDMA moves its prefill exchanges
          * GPU-direct through a buffer of out | in[0] | in[1], each one prefill
          * chunk of f32 rows; attach registers it beside the slab.  A chunk
          * larger than that is cut by gpu_graph_tp_allreduce_rows. */
         if (pulsar_tp_is_rdma(e->tp) && pulsar_tp_n_ranks(e->tp) == 2) {
             const uint64_t rows = e->prefill_chunk ? e->prefill_chunk : PULSAR_PREFILL_CHUNK_DEFAULT;
-            e->tp_bulk_bytes = 3u * rows * (uint64_t)PULSAR_N_EMBD * sizeof(float);
+            e->tp_bulk_bytes = 3u * rows * (uint64_t)tp_embd * sizeof(float);
             if (!pulsar_tp_gpu_slab_alloc_hostpin(e->tp_bulk_bytes, &e->tp_bulk_base, tperr, sizeof(tperr)) ||
                 !(e->tp_bulk_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_bulk_base, tperr, sizeof(tperr)))) {
                 fprintf(stderr, "pulsar: tensor parallelism bulk buffer (%llu bytes) setup failed: %s\n",
@@ -796,165 +966,18 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, "
-                        "routed experts as per-rank halves (%.2f GiB of stored stacks)\n",
+        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, %s (%.2f GiB of stored "
+                        "tensors unstaged)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
+                e->model.tp_unstaged ? "the family's residency rule" : "routed experts as per-rank halves",
                 (double)pulsar_model_unstaged_expert_bytes(&e->model) / 1073741824.0);
     }
 
-    /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
-     * range authority every split shares.  The unit is the group (8 heads and
-     * one LoRA-down block each), never the head: a rank's heads are whole
-     * groups, so its attn_q_b rows and its attn_output_a rows are contiguous
-     * and 128-row aligned.  On a group each layer's two owned row slices are
-     * registered with the backend here, once; the attention block then
-     * addresses them by offset like any other weight.  One box: [0, n). */
-    if (graph_backend) {
-        const int tp_rk = e->tp ? pulsar_tp_rank(e->tp) : 0;
-        const uint32_t tp_nr = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
-        if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
-            e->tp_group_hi <= e->tp_group_lo) {
-            fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
-                            "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
-                    tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
-            e->destroy();
-            *out = NULL;
-            return 1;
-        }
-        if (tp_nr > 1) {
-            const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
-            const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
-            const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
-            const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
-            const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
-            const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
-            const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
-            const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
-            uint32_t registered = 0;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                const pulsar_layer_weights *L = &e->weights.layer[il];
-                if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
-                    fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                const uint64_t q_rank = L->attn_q_a->dim[1];
-                if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
-                                                          L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
-                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
-                                                          L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
-                    /* 4g-2: stage 'b' row-parallel -- the K-half over the same
-                     * owned group columns [a_lo, a_hi) of its a_out_full input. */
-                    !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
-                                                       L->attn_output_b->abs_offset, a_out_full,
-                                                       L->attn_output_b->dim[1], a_lo, a_hi,
-                                                       e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
-                    fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
-                                    "registered -- refusing\n", il);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                registered += 3;
-                /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
-                 * compressor and indexer projections, each rank its floor row
-                 * range, gathered in one row-lane exchange per layer
-                 * (tp_attn_input_split).  Only the MXFP8_LT ones need their
-                 * slice registered; a bf16/f32 slice is plain offset arithmetic. */
-                {
-                    static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
-                                                            "attn_compressor_gate", "indexer_compressor_kv",
-                                                            "indexer_compressor_gate", "indexer_proj" };
-                    const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
-                                                   L->attn_compressor_gate, L->indexer_compressor_kv,
-                                                   L->indexer_compressor_gate, L->indexer_proj };
-                    for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
-                        const pulsar_tensor *w = ain[k];
-                        if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
-                        uint32_t lo = 0, hi = 0;
-                        if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
-                            !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, w), w->abs_offset,
-                                                                  w->dim[0], w->dim[1], lo, hi)) {
-                            fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
-                                            "not be registered -- refusing\n", il, ain_name[k]);
-                            e->destroy();
-                            *out = NULL;
-                            return 1;
-                        }
-                    }
-                }
-                if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
-                    fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
-                                    "registered -- refusing\n", il);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                registered += 3;
-                if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
-                    fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
-                                    "not be built -- refusing\n", il);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                registered += 3;
-            }
-            for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
-                if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                    fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
-                                    "could not be built -- refusing\n", dl);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                    fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
-                                    "registered -- refusing\n", dl);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                registered += 3;
-                /* 4g-1b: the drafter's attention head-split exactly like a
-                 * target layer's -- attn_q_b rows and attn_output_a rows of the
-                 * owned groups, attn_output_b's K-half -- over the drafter's own
-                 * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
-                const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
-                if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
-                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_q_b),
-                                                          DL->attn_q_b->abs_offset, DL->attn_q_a->dim[1],
-                                                          q_out_full, q_lo, q_hi) ||
-                    !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_output_a),
-                                                          DL->attn_output_a->abs_offset, group_dim, a_out_full,
-                                                          a_lo, a_hi) ||
-                    !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->dspark_model, DL->attn_output_b),
-                                                       DL->attn_output_b->abs_offset, a_out_full,
-                                                       DL->attn_output_b->dim[1], a_lo, a_hi,
-                                                       e, pulsar_tp_kslice_key_offset(DL->attn_output_b))) {
-                    fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
-                                    "registered -- refusing\n", dl);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
-                }
-                registered += 3;
-            }
-            const pulsar_layer_weights *L0 = &e->weights.layer[0];
-            uint32_t sx_lo = 0, sx_hi = 0;
-            (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
-            fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                            "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
-                            "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
-                            "%u layers + %u drafter blocks): %u slices registered\n",
-                    tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
-                    e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
-                    (unsigned long long)q_lo, (unsigned long long)q_hi,
-                    (unsigned long long)a_lo, (unsigned long long)a_hi,
-                    sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
-                    (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
-        }
+    /* The family's own device-side registrations and announces. */
+    if (graph_backend && !e->family->after_gpu(e)) {
+        e->destroy();
+        *out = NULL;
+        return 1;
     }
 
     /* Every weight the device reads now lives in device memory (the staged spans,
@@ -1003,14 +1026,13 @@ int pulsar_engine::vocab_size() {
  * length is exactly the mismatch that produced an unbounded-logits write. */
 int pulsar_engine::logits_width() const {
     auto *e = this;
-    return e ? (int)PULSAR_N_VOCAB : 0;
+    return e ? (int)e->family->logits_width(e) : 0;
 }
 
 
 const char *pulsar_engine::model_name() {
     auto *e = this;
-    (void)e;
-    return PULSAR_MODEL_SHAPE_NAME;
+    return e->family->model_name(e);
 }
 
 void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
@@ -1063,8 +1085,7 @@ uint64_t pulsar_engine::weights_resident_bytes() {
 
 int pulsar_engine::model_id() {
     auto *e = this;
-    (void)e;
-    return (int)PULSAR_MODEL_VARIANT;
+    return e->family->model_id(e);
 }
 
 
@@ -1104,6 +1125,10 @@ void pulsar_engine::destroy() {
         e->tp_bulk_bytes = 0;
     }
     weights_free(&e->weights);
+    if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
+    if (e->qwen_tok) qwen_tokenizer_free(e->qwen_tok);
+    e->qwen_tok = NULL;
+    free(e->qwen_weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
@@ -1125,10 +1150,8 @@ void pulsar_engine::destroy() {
  * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
-    const uint64_t n_ranks = pulsar_tp_n_ranks(tp);
-    const uint64_t stride = ((uint64_t)PULSAR_N_VOCAB + n_ranks - 1u) / n_ranks;
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
-    const uint64_t bytes = ((uint64_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS * stride * sizeof(float) + vb - 1u) / vb * vb;
+    const uint64_t bytes = pulsar_tp_vocab_own_bytes(tp, (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS);
     g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
@@ -1151,7 +1174,22 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 
 
 
+/* Every session is created by its engine's family (family.h). */
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    if (!out || !e || ctx_size <= 0) return 1;
+    const int rc = e->family->session->create(out, e, ctx_size);
+    /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
+     * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
+     * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
+    if (rc == 0 && *out && e->tp) (*out)->tp_session_id = ++e->tp_session_seq;
+    return rc;
+}
+
+
+/* The DeepSeek family's session create: the pulsar_gpu_graph (SWA rings,
+ * compressed KV and frontiers, bank slabs), steering, the TP scratch and the
+ * drafter's buffers.  pulsar_session::create's body until L251. */
+int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
 
@@ -1200,10 +1238,6 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
         free(s);
         return 1;
     }
-    /* Slice 4e: the mirror id both ranks agree on by construction.  Assigned
-     * here, at the one place a session begins, from the engine's ordinal; a
-     * session created with no pair armed keeps 0 and stays out of the mirror. */
-    if (e->tp) s->tp_session_id = ++e->tp_session_seq;
     s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
@@ -1235,6 +1269,11 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
  * memory floor absorbs those. */
 uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
     auto *e = this;
+    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
+    return e->family->session->cost_bytes(e, ctx_size, n_banks);
+}
+
+uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
@@ -1281,6 +1320,11 @@ uint64_t pulsar_session::touched_kv_bytes() const {
 void pulsar_session::destroy() {
     auto *s = this;
     if (!s) return;
+    s->engine->family->session->destroy(s);
+}
+
+
+void pulsar_ds4_session_destroy(pulsar_session *s) {
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
@@ -1506,13 +1550,13 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * re-evaluated; with no held images any checkpoint at or below the cut
          * serves. */
         resume_floor = held_end > 0
-            ? (((uint32_t)held_end + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID
+            ? pulsar_ckpt_grid_floor(&s->graph.ckpt, (uint32_t)held_end + s->graph.ckpt.ops->resume_grid - 1u)
             : 0u;
-        const uint32_t keep = ck < live_len ? (ck / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID : ck;
+        const uint32_t keep = ck < live_len ? pulsar_ckpt_grid_floor(&s->graph.ckpt, ck) : ck;
         uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
         if (pf > keep) pf = keep;
-        const uint32_t G = (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
-        const uint32_t B = s->checkpoint_valid ? gpu_graph_ckpt_best(&s->graph, bank, G) : 0u;
+        const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
+        const uint32_t B = s->checkpoint_valid ? pulsar_ckpt_best(&s->graph.ckpt, bank, G) : 0u;
         const bool floor_ok =
             keep > 0 &&
             (resume_floor == 0 || (resume_floor <= keep && B >= resume_floor)) &&
@@ -1639,7 +1683,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * prefill chunk's bytes depend on the chunk's row count and on a row's
          * offset within the call (L183), so a suffix evaluated from an off-grid
          * position is a different computation from the cold prefill of the same
-         * tokens.  The rule: G = the last multiple of PULSAR_RESUME_GRID at or
+         * tokens.  The rule: G = the last multiple of the resume grid (kv_state.h) at or
          * below the PREFILL frontier (decode rows are the decode kernels'; the
          * tokens generated since are recomputed); restore the deepest grid
          * checkpoint at or below G, which the prefill that reached G captured
@@ -1652,8 +1696,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             const uint32_t ck = (uint32_t)s->checkpoint.len;
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
-            const uint32_t G = (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
-            uint32_t B = gpu_graph_ckpt_best(&s->graph, bank, G);
+            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
+            uint32_t B = pulsar_ckpt_best(&s->graph.ckpt, bank, G);
             /* L226: an image request's reuse may not RE-EVALUATE a row inside an
              * image block -- the licence above proved a checkpoint at or above
              * the barrier's grid point exists. */
@@ -1665,7 +1709,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
                         ck, B, bank, ck - B);
             } else {
-                if (ck >= PULSAR_RESUME_GRID)
+                if (ck >= s->graph.ckpt.ops->resume_grid)
                     fprintf(stderr, "pulsar: resume at %u on bank %u: no grid checkpoint at or below %u -- "
                                     "prefilling the prompt from 0\n", ck, bank, G);
                 s->rewind(0);
@@ -1992,7 +2036,7 @@ void pulsar_session::prefix_match(const pulsar_tokens *prompt,
 
 int pulsar_session::argmax() {
     auto *s = this;
-    return sample_argmax(s->logits, PULSAR_N_VOCAB);
+    return sample_argmax(s->logits, (uint32_t)s->engine->logits_width());
 }
 
 
@@ -2003,7 +2047,7 @@ int pulsar_session::argmax_excluding(int excluded_id) {
      * wins a tie, -1 when nothing is finite. */
     int best = -1;
     float best_logit = 0.0f;
-    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
+    for (uint32_t i = 0, nv = (uint32_t)s->engine->logits_width(); i < nv; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
@@ -2028,7 +2072,7 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     auto *s = this;
-    return sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k, top_p,
+    return sample_top_p_min_p(s->logits, (uint32_t)s->engine->logits_width(), temperature, top_k, top_p,
                               min_p, rng, &s->sample_scratch);
 }
 
@@ -2118,29 +2162,29 @@ int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
 int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
     auto *s = this;
     if (!s) return 0;
-    return pulsar_logits_top_logprobs(s->logits, (int)PULSAR_N_VOCAB, out, k);
+    return pulsar_logits_top_logprobs(s->logits, s->engine->logits_width(), out, k);
 }
 
 
 int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
     auto *s = this;
     if (!s) return 0;
-    return pulsar_logits_token_logprob(s->logits, (int)PULSAR_N_VOCAB, token, out);
+    return pulsar_logits_token_logprob(s->logits, s->engine->logits_width(), token, out);
 }
 
 
 int pulsar_session::copy_logits(float *out, int cap) {
     auto *s = this;
-    if (!s || !out || cap < (int)PULSAR_N_VOCAB) return 0;
-    memcpy(out, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(out[0]));
-    return (int)PULSAR_N_VOCAB;
+    if (!s || !out || cap < s->engine->logits_width()) return 0;
+    memcpy(out, s->logits, (size_t)s->engine->logits_width() * sizeof(out[0]));
+    return s->engine->logits_width();
 }
 
 
 int pulsar_session::set_logits(const float *logits, int n) {
     auto *s = this;
-    if (!s || !logits || n != (int)PULSAR_N_VOCAB) return 1;
-    memcpy(s->logits, logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
+    if (!s || !logits || n != s->engine->logits_width()) return 1;
+    memcpy(s->logits, logits, (size_t)s->engine->logits_width() * sizeof(s->logits[0]));
     return 0;
 }
 
@@ -2254,9 +2298,9 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
      * one at every grid chunk end, so the fused lane's prompts resume like the
      * classic sync's.  (The server's fused planners end chunks on grid points.) */
     const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % PULSAR_RESUME_GRID == 0u && G >= s->graph.raw_window &&
+    if (G % s->graph.ckpt.ops->resume_grid == 0u && G >= s->graph.ckpt.ops->min_checkpoint(s->graph.ckpt.state) &&
         !s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)])
-        (void)gpu_graph_ckpt_capture(&s->graph, G);
+        (void)pulsar_ckpt_capture(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), G);
     if (head >= 0)
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
                (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
@@ -2331,11 +2375,11 @@ void pulsar_session::rewind(int pos) {
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
-        gpu_graph_ckpt_drop_bank(&s->graph, rw_bank);
+        pulsar_ckpt_drop_bank(&s->graph.ckpt, rw_bank);
         ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
     }
-    else if (gpu_graph_ckpt_best(&s->graph, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = gpu_graph_ckpt_restore(&s->graph, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph.ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
+        ok = pulsar_ckpt_restore(&s->graph.ckpt, rw_bank, (uint32_t)pos);
     else {
         s->graph.ms_comp_state_stale[rw_bank] = true;
         return;
@@ -2374,8 +2418,8 @@ bool pulsar_session::restore_checkpoint(uint32_t G) {
     auto *s = this;
     const uint32_t bank = gpu_graph_cur_bank(&s->graph);
     if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        gpu_graph_ckpt_best(&s->graph, bank, G) != G) return false;
-    if (!gpu_graph_ckpt_restore(&s->graph, G)) {
+        pulsar_ckpt_best(&s->graph.ckpt, bank, G) != G) return false;
+    if (!pulsar_ckpt_restore(&s->graph.ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;

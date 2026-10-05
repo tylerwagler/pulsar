@@ -1148,6 +1148,23 @@ int pulsar_gpu_init(void) {
         fprintf(stderr, "pulsar: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
+        /* The dense path is cuBLASLt block-scaled MXFP8 (MATRIX_SCALE_VEC32_UE8M0) and the expert
+         * path is CUTLASS sm_120f; neither has a fallback (rule 1).  Refuse HERE, by name and
+         * once, instead of letting the descriptor's scale-mode attribute come back
+         * NOT_SUPPORTED and the matmul then run WITHOUT its block scales: matmul.cu does not
+         * check those return values, so the failure mode on an older device is silently wrong
+         * numbers rather than an error.  This is the dense half of the 2x A6000 port's work
+         * list; the GDN kernels' sm_90+ thread-block clusters (pulsar_cuda_gdn.cu) are the
+         * other half -- and note the existing arch trap cannot cover either, because a
+         * sm_86-only build matches a sm_86 device and passes cuda_tu_archs_ok. */
+        if (prop.major < 10) {
+            fprintf(stderr,
+                    "pulsar: the dense and expert paths need Blackwell tensor cores "
+                    "(block-scaled MXFP8 MATRIX_SCALE_VEC32_UE8M0 + CUTLASS sm_120f); this GPU "
+                    "(%s) is sm_%d%d, and there is no fallback path\n",
+                    prop.name, prop.major, prop.minor);
+            return 0;
+        }
     }
     /* No classic cuBLAS handle since L183: the last cublasGemmEx (the
      * plain-weight prefill arm) moved to cuBLASLt, which every GEMM now uses

@@ -33,6 +33,13 @@ __pycache__/
 /tests/tp_mesh_test
 /tests/tp_mirror_test
 /tests/mseq_short_ctx_probe
+/tests/qwen_ref_gate
+/tests/qwen_generate
+/tests/qwen_chat_smoke
+/tests/qwen_banks_gate
+/tests/qwen_chunk_neutrality_gate
+/tests/qwen_s4_gate
+/tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe
 /tests/nt_crossover_sweep
 /tests/tp_identity_test
@@ -45,6 +52,7 @@ __pycache__/
 /tests/tp_slab_gpu_probe
 /tests/tp_dmabuf_probe
 /tests/multiseq_frontier_gate
+/tests/qwen_family_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate
 /tests/accounting_gate
@@ -120,6 +128,17 @@ tests/dspark_batch_gate
 # gate binaries the battery builds in-tree (2026-09-23: a clean run left these untracked)
 /tests/expert_table_gate
 /tests/exl3_gemv_gate
+/tests/exl3_dense_gate
+/tests/exl3_dense_bench
+/tests/exl3_dense_xcheck
+/tests/engram_table_test
+/tests/qwen_ngram_test
+/tests/qwen_s4_gate
+/tests/qwen_gr_gate
+/tests/qwen_ple_gate
+/tests/gdn_gate
+/tests/gdn_bench
+/tests/libpulsar_gdn.so
 /tests/moe_route_bounds_gate
 /tests/vision_codec_gate
 /tests/vision_hc_gate
@@ -130,3 +149,7 @@ tests/dspark_batch_gate
 /tests/vision_span_gate
 /tests/vision_visible_gate
 /tests/bank_carry_identity
+/tests/qsa_attn_gate
+/tests/qsa_layer_replay
+/tests/qsa_attn_bench
+/tests/qwen_chat_gate

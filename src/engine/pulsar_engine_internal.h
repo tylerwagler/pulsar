@@ -42,6 +42,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <functional>
 
 #include "pulsar.h"
 
@@ -482,19 +483,35 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  * A pool of pread threads (the box has no liburing) serves gathers; a gather
  * is issued ahead of the layer that needs it and waited on there, which is the
  * whole point of hashing on the host.  Open asserts the header against the
- * layout's row count; a mismatch is a wrong table, refused. */
+ * layout's row count; a mismatch is a wrong table, refused.
+ *
+ * The same pool and table serve Qwen3.8-Flash-Next's PLE n-gram table (L251,
+ * src/engine/qwen_ngram.h): 320M rows of 160 bf16 held as 128 row-contiguous
+ * tensors spread over the checkpoint's shard files.  So a table is a list of
+ * PARTS -- (file, byte offset of the part's row 0) -- of `rows_per_part` rows
+ * each (the last may be shorter), with one record size; an Engram row file is
+ * the one-part case (offset 64, 264-byte records). */
 #define PULSAR_ENGRAM_ROW_BYTES 264u
 #define PULSAR_ENGRAM_HDR_BYTES 64u
 #define PULSAR_ENGRAM_IO_THREADS 16u
 
+/** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
+typedef struct {
+    int fd;                 ///< shared by the parts that live in one file
+    uint64_t base;          ///< byte offset of the part's first row
+} pulsar_engram_part;
+
 typedef struct pulsar_engram_table {
-    int fd;                 ///< the row file, or -1 when closed
-    uint32_t layer;         ///< the model layer this table serves
-    uint64_t n_rows;        ///< rows in the file, == layout num_embeddings[hash index]
-    char *path;             ///< owned copy, for messages
+    pulsar_engram_part *parts;  ///< n_parts ranges, owned; NULL when closed
+    uint32_t n_parts;
+    uint64_t rows_per_part;     ///< rows in every part but possibly the last
+    uint32_t row_bytes;         ///< bytes per row record (and per row of a gather's dst)
+    uint32_t layer;             ///< the model layer this table serves
+    uint64_t n_rows;            ///< rows in the table, == the layout's row count
+    char *path;                 ///< owned copy of the first file's path, for messages
 } pulsar_engram_table;
 
-/** A gather in flight: `rows` row ids -> `dst` (n_rows x 264 bytes, caller-owned,
+/** A gather in flight: `rows` row ids -> `dst` (n_rows x row_bytes, caller-owned,
  * must outlive the wait).  Completion is observed with pulsar_engram_gather_wait,
  * which returns 1 when every row landed and 0 with the failure printed. */
 typedef struct pulsar_engram_gather pulsar_engram_gather;
@@ -504,6 +521,13 @@ typedef struct pulsar_engram_io pulsar_engram_io;
 
 int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t layer,
                               uint64_t n_rows_expected);
+/** A table of `n_parts` row-contiguous parts in existing files (a part's file
+ * must hold `rows_per_part` rows -- fewer for the last -- of `row_bytes` at
+ * `bases[i]`; checked against the file size).  Paths may repeat: each distinct
+ * file is opened once.  1 = open. */
+int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
+                                    const char *const *paths, const uint64_t *bases,
+                                    uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows);
 void pulsar_engram_table_close(pulsar_engram_table *t);
 pulsar_engram_io *pulsar_engram_io_create(uint32_t n_threads);
 void pulsar_engram_io_destroy(pulsar_engram_io *io);
@@ -683,6 +707,10 @@ typedef struct {
      * the load, is asserted to come up as this same rank. */
     int tp_rank;
     uint32_t tp_n_ranks;
+    /** L266: a family's own residency rule under TP, set by its load -- tp_unstaged[i] marks tensor i as
+     *  never staged (Qwen: the other rank's experts, and the stored tensors whose rank slices the family
+     *  builds at open).  NULL = DeepSeek's rule alone (the routed stacks, model_tensor_unstaged). */
+    uint8_t *tp_unstaged;
 
     uint32_t version;       ///< GGUF format version
     uint64_t n_kv;          ///< metadata key/value pair count
@@ -712,6 +740,24 @@ typedef struct {
     const uint8_t *kv_base;         ///< metadata value buffer (NULL => map)
     uint64_t kv_size;               ///< length of that buffer
 } pulsar_model;
+
+/* The model-family interface (L251 S1): the family descriptor, the layer plan,
+ * and the Qwen4-exp family's shape/weights/state/op contract. */
+#include "family.h"
+#include "family_qwen.h"
+/** The session family's own bank pool ops (L251), NULL on DeepSeek's graph pool. */
+#define FAMILY_BANKS(s) ((s) && (s)->engine->family->banks ? (s)->engine->family->banks : nullptr)
+static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
+              "a layer plan must hold every layer a DeepSeek profile can have");
+
+/* The DeepSeek family's entries (family_deepseek.cpp points at them; bodies in
+ * session.cpp, where pulsar_engine::open and pulsar_session::create kept them
+ * until L251). */
+bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
+bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
+int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
+void pulsar_ds4_session_destroy(pulsar_session *s);
+uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
 
 /** A GGUF metadata array left UNPARSED: its type, length, and where its
  * elements start. Reading an array means walking the file from `data_pos`, and
@@ -943,13 +989,9 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
 
-/** L264: grid checkpoints kept per bank (pulsar_gpu_graph::ckpt_pos).  The
- * newest PULSAR_CKPT_RECENT are always kept -- the prompt ends of the turns a
- * client is most likely to continue -- and the older ones thin out by merging
- * the smallest gap, which leaves a ladder that reaches back into the history a
- * client rewrites (L261: tool results 12-20k tokens back). */
-#define PULSAR_CKPT_SLOTS 16u
-#define PULSAR_CKPT_RECENT 8u
+/* L264/L265: the KV state model's model-neutral half; DeepSeek V4's answer is kv_state_ds4.cpp. */
+#include "kv_state.h"
+uint32_t pulsar_layer_compress_ratio(uint32_t il);   /* the frontier hook below needs it */
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
@@ -1477,20 +1519,11 @@ typedef struct {
     uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
     uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
 
-    /** L264 GRID CHECKPOINTS (checkpoint.cpp).  The state of a bank at a prefill
-     * grid point G (a multiple of PULSAR_RESUME_GRID) that its compressed pools do
-     * NOT already hold: the raw window [G - raw_window, G) of every layer and the
-     * overlapping (coff 2) sources' recurrent lanes, attention and indexer.  The
-     * compressed and index-K rows below G/ratio are append-only, so a checkpoint
-     * references them through the frontier instead of copying them; a coff-1
-     * (ratio-128) lane is canonical-empty at a 128 boundary and is reset, not
-     * stored.  ckpt_pos[bank][slot] is the slot's G, 0 = empty.  A checkpoint is
-     * valid while its bank still holds rows [0, G/ratio) unmodified: lowering the
-     * frontier below that drops it (gpu_graph_set_n_comp), and replacing a bank's
-     * rows wholesale drops all of its checkpoints (gpu_graph_ckpt_drop_bank). */
-    pulsar_gpu_tensor *ckpt_slab[PULSAR_MSEQ_MAX];  ///< per bank, PULSAR_CKPT_SLOTS slots of ckpt_slot_bytes; [0] only without a pool
-    uint64_t ckpt_slot_bytes;                       ///< one checkpoint: raw window rows + coff-2 lanes
-    uint32_t ckpt_pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS];  ///< the grid point each slot holds; 0 = empty
+    /** L264 GRID CHECKPOINTS (kv_state.h, checkpoint.cpp; what a slot holds:
+     * kv_state_ds4.cpp).  A checkpoint at G is valid while the bank's compressed
+     * frontier reaches G: gpu_graph_set_n_comp lowers it with the frontier, and
+     * replacing a bank's rows wholesale drops all of its checkpoints. */
+    pulsar_ckpt_store ckpt;
 
     int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
     int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
@@ -1608,12 +1641,12 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
  * frontier past rows the accounting has not counted. */
-void gpu_graph_ckpt_frontier_lowered(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows);
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
      * rewind, cut and invalidate already passes. */
-    if (rows < g->ms_n_comp[bank][il]) gpu_graph_ckpt_frontier_lowered(g, bank, il, rows);
+    if (rows < g->ms_n_comp[bank][il])
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * pulsar_layer_compress_ratio(il));
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }
@@ -1753,6 +1786,19 @@ typedef struct {
 } pulsar_spec_cost_fit;
 
 struct pulsar_engine {
+    /** The model family, chosen once at open from `general.architecture`
+     * (pulsar_family_for_model) and never switched; generic code reaches the
+     * family's session operations through it (family.h). */
+    const pulsar_family *family;
+    /** The family's layer plan, built by family->load: THE authority for which
+     * op runs at layer il.  DeepSeek: n_layer x PULSAR_LAYER_DS4_BLOCK. */
+    pulsar_layer_plan plan;
+    /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
+    pulsar_qwen_weights *qwen_weights;
+    /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
+     * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
+     * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
+    struct qwen_tokenizer *qwen_tok;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids
@@ -2271,7 +2317,8 @@ struct pulsar_session {
         uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];
         uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
     } seed_defer;
-    pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
+    pulsar_gpu_graph graph;   ///< the DeepSeek family's device state (KV, scratch, bank views); untouched on a Qwen session
+    pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
     /** Reused working set for the sampled speculative acceptance walk's
@@ -2556,7 +2603,7 @@ struct pulsar_session {
      * rows from the projection ring -- only when the ring covers the rewound
      * span, which on the served (multiseq) path it does not. */
     void rewind(int pos);
-    /** L264: put the installed bank at its grid checkpoint G (gpu_graph_ckpt_restore)
+    /** L264: put the installed bank at its grid checkpoint G (pulsar_ckpt_restore)
      * and trim the host history to match.  The next sync evaluates from G, which
      * is a prefill grid point, so the result is the cold prefill's byte for byte.
      * False -- and nothing changed -- when the bank holds no checkpoint at G or the
@@ -2834,6 +2881,7 @@ void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
                                   uint64_t *stride);
 pulsar_cursor cursor_at(const pulsar_model *m, uint64_t pos);
 bool model_get_u32(const pulsar_model *m, const char *key, uint32_t *out);
+bool model_get_string(const pulsar_model *m, const char *key, pulsar_str *out);
 bool model_get_u64_compat(const pulsar_model *m, const char *key, uint64_t *out);
 bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out);
 bool model_get_bool(const pulsar_model *m, const char *key, bool *out);
@@ -3259,32 +3307,6 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
  */
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
 
-/** L264 grid checkpoints (checkpoint.cpp; layout at pulsar_gpu_graph::ckpt_slab).
- * Allocated with the graph -- one slab per bank, priced by the dry run like
- * every other session tensor -- and released with it. */
-bool gpu_graph_ckpt_alloc(pulsar_gpu_graph *g, uint32_t n_banks);
-void gpu_graph_ckpt_release(pulsar_gpu_graph *g);
-/** Capture the INSTALLED bank's state at grid point G.  Precondition: the bank's
- * frontier is exactly G (every kv source holds G/ratio rows) -- a prefill chunk
- * just ended there.  False on any violation; the caller fails the prefill. */
-bool gpu_graph_ckpt_capture(pulsar_gpu_graph *g, uint32_t G);
-/** Restore the INSTALLED bank to its checkpoint at G: the raw window and the
- * coff-2 lanes are copied back, every other lane is reset to the canonical
- * boundary state, every kv source's frontier is set to G/ratio, the bank's
- * rewind aids (projection ring span, boundary stash, stale flag) are cleared,
- * and the checkpoints above G are dropped.  False when no checkpoint at G. */
-bool gpu_graph_ckpt_restore(pulsar_gpu_graph *g, uint32_t G);
-/** The deepest checkpoint G <= limit the bank holds; 0 when none. */
-uint32_t gpu_graph_ckpt_best(const pulsar_gpu_graph *g, uint32_t bank, uint32_t limit);
-/** Drop every checkpoint of `bank`: its rows were replaced wholesale. */
-void gpu_graph_ckpt_drop_bank(pulsar_gpu_graph *g, uint32_t bank);
-/** The session payload carries one checkpoint as opaque slot bytes (layout:
- * checkpoint.cpp).  locate: the installed bank's slot holding G (save side).
- * claim: a slot for an incoming G, emptied until commit marks it filled. */
-bool gpu_graph_ckpt_locate(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off);
-bool gpu_graph_ckpt_claim(pulsar_gpu_graph *g, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
-                          uint32_t *slot);
-void gpu_graph_ckpt_commit(pulsar_gpu_graph *g, uint32_t slot, uint32_t G);
 /** Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
@@ -3553,6 +3575,42 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
  * the row lane at decode/verify width, the bulk lane above it, the host big gate
  * on transports without either.  `addend` (optional) is folded in first and
  * zeroed.  A no-op returning true when the graph has no pair. */
+/** What a row all-reduce borrows (tp_rows.cpp, L266): the transport, the registered slab's and bulk
+ *  buffer's device mappings, the stage ticket (one zeroed device u32), the exchange seq both ranks advance
+ *  in lockstep, the row width in floats. */
+typedef struct {
+    pulsar_tp *tp;
+    void *slab_dev;
+    void *bulk_dev;
+    pulsar_gpu_tensor *ticket;
+    uint64_t *seq;
+    uint32_t n_embd;
+} pulsar_tp_rows;
+/** Sum t [n_rows][n_embd] (plus `addend`, then zeroed, when given) across the group, in place; slot = the
+ *  exchange's slab layer.  No transport: a no-op. */
+bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *x, uint32_t slot, uint32_t n_rows, pulsar_gpu_tensor *t,
+                              pulsar_gpu_tensor *addend, const char *what);
+/** What a vocab gather borrows (tp_rows.cpp, L266): the transport, the slab's device mapping, the stage ticket,
+ *  the own-slice scratch (pulsar_tp_vocab_own_bytes; NULL off a row-lane pair), the gather's seq, the vocab
+ *  width and the most rows one gather carries. */
+typedef struct {
+    pulsar_tp *tp;
+    void *slab_dev;
+    pulsar_gpu_tensor *ticket;
+    pulsar_gpu_tensor *vocab_own;
+    uint64_t *seq;
+    uint32_t n_vocab;
+    uint32_t max_rows;
+} pulsar_tp_vocab;
+/** head(lo, width, dst): this rank's logits for vocab [lo, lo + width), row r at dst + r * width. */
+typedef std::function<bool(uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst)> pulsar_tp_head_fn;
+/** Bytes of the vocab gather's own-slice scratch for max_rows rows (0 off a row-lane pair); _for: the same
+ *  from the group size and the transport's vector width (a caller that sizes before the transport exists). */
+uint64_t pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows);
+uint64_t pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows);
+/** Every rank's vocab range gathered into out [n_rows][n_vocab] (rank order). */
+bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *x, uint32_t n_rows, const pulsar_tp_head_fn &head,
+                            pulsar_gpu_tensor *out);
 bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                                  pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                                  const char *what);
@@ -3734,8 +3792,6 @@ bool gpu_graph_verify_suffix_tops(
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
 
-/* PULSAR_RESUME_GRID: pulsar.h (the server plans its fused chunks on it). */
-static_assert(PULSAR_RESUME_GRID % 2u == 0u, "a grid point must be a complete ratio-2 group");
 
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,
  *  score -INF): their state at any even position. */

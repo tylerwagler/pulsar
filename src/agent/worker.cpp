@@ -218,7 +218,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 status_greedy_sampling = greedy_sampling;
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
-            if (token == pulsar_token_eos(w->engine)) break;
+            if (pulsar_token_is_stop(w->engine, token)) break;
 
             size_t text_len = 0;
             char *text = pulsar_token_text(w->engine, token, &text_len);

@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "pulsar_nvtx.h"
+#include "spec_depth.h"
 
 /* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
  * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
@@ -1303,47 +1304,18 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * full-accept signal alone then drives the climb. Counts-only decision,
      * deterministic for a fixed stream, same property as yield-quench. */
     if (K > 0) {
+        /* the rule is spec_depth.h's (shared with the Qwen MTP drafter since L251); DSpark's numbers:
+         * the v3 veto only at depth 5 with a >= 0.90 tail, the v4/v5 8-round cooldown after a down within
+         * 2 rounds of an up */
+        static const pulsar_spec_depth_policy k_dspark_depth = {SPEC_DEPTH_MIN, SPEC_DEPTH_MAX, SPEC_DEPTH_CONF_UP,
+                                                                5, 0.90f, 8u, 2u};
         const uint32_t depth = spec_cur_depth(s);
-        if (s->spec.spec_depth_climb_cooldown) s->spec.spec_depth_climb_cooldown--;
-        if (s->spec.spec_depth_rounds_since_up < 255u) s->spec.spec_depth_rounds_since_up++;
-        int next = (int)depth;
-        if (2u * (uint32_t)commit < depth) {
-            /* v2 down-veto: the A/B trajectory showed single bad rounds at
-             * depth 5 with tail conf ~0.98 knocking depth down and costing
-             * ~2 t/s until the climb back. When the calibrated head still
-             * believed in the chain (tail >= 0.90 -> measured 1.000-accept
-             * band), forgive ONE down-signal; a second consecutive one backs
-             * off regardless. Prose tails run ~0.5-0.7, so its immediate
-             * back-off is untouched. */
-            /* v3: the veto applies ONLY at depth 5 -- the measured
-             * structured optimum it exists to protect. Below 5 it is what
-             * regressed prose in the v2 A/B (prose has occasional >=0.90
-             * tails and each forgiven round pays a deep draft that converts
-             * nothing); at 6 it delays the return to 5, and 6 is never
-             * optimal (sweep: depth 6 lost on BOTH regimes). */
-            if (depth == 5u &&
-                pend_conf[K - 1] >= 0.90f && !s->spec.spec_depth_down_forgiven) {
-                s->spec.spec_depth_down_forgiven = true;
-            } else {
-                s->spec.spec_depth_down_forgiven = false;
-                /* v5: only a FAILED EXCURSION (down within 2 rounds of the
-                 * last up) triggers the cooldown. */
-                if (s->spec.spec_depth_rounds_since_up <= 2u)
-                    s->spec.spec_depth_climb_cooldown = 8u;
-                next--;
-            }
-        } else if ((uint32_t)commit == depth &&
-                   s->spec.spec_depth_climb_cooldown == 0u &&
-                   (pend_conf[depth - 1] >= SPEC_DEPTH_CONF_UP ||
-                    pend_conf[depth - 1] < 0.0f)) {
-            s->spec.spec_depth_down_forgiven = false;
-            s->spec.spec_depth_rounds_since_up = 0u;
-            next++;
-        } else {
-            s->spec.spec_depth_down_forgiven = false;
-        }
-        if (next < SPEC_DEPTH_MIN) next = SPEC_DEPTH_MIN;
-        if (next > SPEC_DEPTH_MAX) next = SPEC_DEPTH_MAX;
+        pulsar_spec_depth_state ds = {s->spec.spec_depth_down_forgiven, s->spec.spec_depth_rounds_since_up,
+                                      s->spec.spec_depth_climb_cooldown};
+        const int next = pulsar_spec_depth_next(&k_dspark_depth, &ds, depth, K, commit, pend_conf);
+        s->spec.spec_depth_down_forgiven = ds.down_forgiven;
+        s->spec.spec_depth_rounds_since_up = ds.rounds_since_up;
+        s->spec.spec_depth_climb_cooldown = ds.climb_cooldown;
         if (dspark_stats && (uint32_t)next != depth)
             fprintf(stderr, "pulsar: adaptive-k depth %u -> %d (commit=%d K=%u tail=%.2f)\n",
                     depth, next, commit, K, (double)pend_conf[K - 1]);

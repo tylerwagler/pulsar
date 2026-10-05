@@ -1,0 +1,117 @@
+/* The EXL3 dense-Linear host reference (L251), shared by tests/exl3_dense_gate.cu
+ * and tests/exl3_dense_xcheck.cu: built only from src/engine/exl3_trellis.h
+ * (the host dequant that tests/exl3_dequant_gate.cpp holds byte-exact to
+ * exllamav3) and double arithmetic,
+ *
+ *   y = svh * H128( W_hat^T H128(suh * x) )     per row, per 128-block.
+ */
+#pragma once
+
+#include "../src/engine/exl3_trellis.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+/** OCP E4M3 (1-4-3, bias 7, subnormals at exp 0) -> double; 0x7f/0xff (NaN) are
+ *  never produced by the fixtures. */
+static inline double exl3t_e4m3_to_f64(uint8_t b) {
+    const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    const double v = e == 0 ? (double)m / 8.0 * ldexp(1.0, -6) : (1.0 + (double)m / 8.0) * ldexp(1.0, e - 7);
+    return s ? -v : v;
+}
+
+/* round-to-nearest-even onto the finite E4M3 grid, saturating (the device's
+ * cvt.rn.satfinite): positive codes 0x00..0x7e are increasing in value, and a
+ * tie picks the even code, whose mantissa LSB is 0 */
+static inline uint8_t exl3t_f64_to_e4m3(double v) {
+    const uint8_t sign = v < 0 ? 0x80 : 0;
+    const double a = fabs(v);
+    int lo = 0, hi = 0x7e;
+    if (a >= exl3t_e4m3_to_f64(0x7e)) return sign | 0x7e;
+    while (hi - lo > 1) { const int mid = (lo + hi) / 2; if (exl3t_e4m3_to_f64((uint8_t)mid) <= a) lo = mid; else hi = mid; }
+    const double dl = a - exl3t_e4m3_to_f64((uint8_t)lo), dh = exl3t_e4m3_to_f64((uint8_t)hi) - a;
+    const int code = dl < dh ? lo : dh < dl ? hi : ((lo & 1) ? hi : lo);
+    return sign | (uint8_t)code;
+}
+
+/** The slice's layout, or exit: a fixture with a bad shape is a test bug. */
+static inline void exl3t_layout(int K, int N, int k2, uint64_t *trellis, uint64_t *stride) {
+    uint64_t scales = 0;
+    if (!exl3_expert_layout((uint64_t)K, (uint64_t)N, k2, trellis, &scales, stride)) {
+        fprintf(stderr, "exl3t: K=%d N=%d k2=%d is not an EXL3 layout\n", K, N, k2);
+        exit(2);
+    }
+}
+
+/** W_hat (K, N) row-major, double, from a [trellis | suh | svh] slice. */
+static inline void exl3t_dequant(const uint8_t *slice, int K, int N, int k2, std::vector<double> &out) {
+    const int words = exl3_words_per_tile(k2), ntn = N / 16;
+    out.assign((size_t)K * N, 0.0);
+    uint16_t tile[256];
+    const uint16_t *base = (const uint16_t *)slice;
+    for (int kt = 0; kt < K / 16; kt++)
+        for (int nt = 0; nt < ntn; nt++) {
+            exl3_tile_dequant(base + ((size_t)kt * ntn + nt) * words, k2, tile);
+            for (int r = 0; r < 16; r++)
+                for (int c = 0; c < 16; c++)
+                    out[(size_t)(kt * 16 + r) * N + nt * 16 + c] = exl3_f16_to_f32(tile[r * 16 + c]);
+        }
+}
+
+/** y [rows][N] for activation rows x [rows][K] (the slot's decoded values). */
+static inline void exl3t_reference(const uint8_t *slice, const std::vector<double> &what, int K, int N, int k2,
+                                   const double *x, int rows, std::vector<double> &y) {
+    uint64_t trellis = 0, stride = 0;
+    exl3t_layout(K, N, k2, &trellis, &stride);
+    const uint16_t *suh = (const uint16_t *)(slice + trellis), *svh = suh + K;
+    y.assign((size_t)rows * N, 0.0);
+    std::vector<double> xr(K), z(N);
+    for (int r = 0; r < rows; r++) {
+        for (int k = 0; k < K; k++) xr[k] = x[(size_t)r * K + k] * exl3_f16_to_f32(suh[k]);
+        for (int i = 0; i + 128 <= K; i += 128) exl3_had128(xr.data() + i);
+        std::fill(z.begin(), z.end(), 0.0);
+        for (int k = 0; k < K; k++) {
+            const double xk = xr[k];
+            const double *wr = what.data() + (size_t)k * N;
+            for (int n = 0; n < N; n++) z[n] += wr[n] * xk;
+        }
+        for (int i = 0; i + 128 <= N; i += 128) exl3_had128(z.data() + i);
+        for (int n = 0; n < N; n++) y[(size_t)r * N + n] = z[n] * exl3_f16_to_f32(svh[n]);
+    }
+}
+
+/* The prefill arm's error bound per output (L251): the GEMM reads the rotated activation x^ rounded to
+ * ONE fp16 plane after a power-of-two row prescale, so each operand element moves by at most 2^-12 of
+ * itself (plus a subnormal floor far below the f32 order).  Through z = W^T x^ that is at most
+ * 2^-12 sum_k |W_kj x^_k| per z_j, and through y = svh * H128(z) (the normalised Hadamard) at most
+ * |svh_n| / sqrt(128) times the block's sum of those.  bound[r * N + n] is that envelope, exactly. */
+static inline void exl3t_fp16_operand_bound(const uint8_t *slice, const std::vector<double> &what, int K, int N, int k2,
+                                            const double *x, int rows, std::vector<double> &bound) {
+    uint64_t trellis = 0, stride = 0;
+    exl3t_layout(K, N, k2, &trellis, &stride);
+    const uint16_t *suh = (const uint16_t *)(slice + trellis), *svh = suh + K;
+    bound.assign((size_t)rows * N, 0.0);
+    std::vector<double> xr(K), za(N);
+    for (int r = 0; r < rows; r++) {
+        double amax = 0;
+        for (int k = 0; k < K; k++) xr[k] = x[(size_t)r * K + k] * exl3_f16_to_f32(suh[k]);
+        for (int i = 0; i + 128 <= K; i += 128) exl3_had128(xr.data() + i);
+        for (int k = 0; k < K; k++) amax = fmax(amax, fabs(xr[k]));
+        std::fill(za.begin(), za.end(), 0.0);
+        for (int k = 0; k < K; k++) {
+            const double ek = ldexp(fabs(xr[k]), -12) + ldexp(amax, -40);
+            const double *wr = what.data() + (size_t)k * N;
+            for (int n = 0; n < N; n++) za[n] += fabs(wr[n]) * ek;
+        }
+        for (int b = 0; b + 128 <= N; b += 128) {
+            double sum = 0;
+            for (int j = b; j < b + 128; j++) sum += za[j];
+            for (int n = b; n < b + 128; n++)
+                bound[(size_t)r * N + n] = fabs(exl3_f16_to_f32(svh[n])) * sum / 11.313708498984761;
+        }
+    }
+}

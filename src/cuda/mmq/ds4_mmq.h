@@ -116,6 +116,58 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     const void    * act_sf,
     int             act_kbp);
 
+/* L251 / ac69748f: the same two arms over the Qwen family's row-major bf16 activation.  There is no
+ * E4M3 activation slot in that family, so nothing is gathered or encoded: the activation is
+ * [n_tokens, K] bf16 and each assignment's row is addressed through ids_src1, not ids_dst (which is
+ * the flat output row).  Separate entry points rather than a flag on the A8 ones -- upstream's own
+ * shape, where exl3_gemv and exl3_gemv_int8 are two entry points.  `prompt` (L266): a prompt chunk
+ * takes the grouped prefill GEMM at every assignment count, so a prompt cut anywhere is byte-identical
+ * to one prefilled whole; false: the GEMM from QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN up. */
+int ds4_exl3_moe_fused_bf16(
+    const void    * table,
+    int             k2,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_bf16,
+    bool            prompt);
+
+/* L251 MTP: the split gate / up arm (two slices, each with its own suh) over the same bf16 activation. */
+int ds4_exl3_moe_pair_bf16(
+    const void    * gate_table,
+    const void    * up_table,
+    int             k2,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_bf16,
+    bool            prompt);
+
+int ds4_exl3_moe_single_bf16(
+    const void    * table,
+    int             k2,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_bf16,
+    bool            prompt);
+
 /* pulsar (plan 41b): IQ2_XXS single-tensor MoE over the aligned-SoA artifact.
  * Upstream shipped a pair entry but no IQ2 SINGLE soa entry, which is what a
  * routed DOWN needs when the down tensor is IQ2 rather than Q2_K (our v5mx).
@@ -144,6 +196,25 @@ int ds4_exl3_moe_pair(
     int             act_kbp);
 
 int ds4_exl3_moe_single(
+    const void    * table,
+    int             k2,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
+
+/* L251: the fused gate_up twin (EXL3_ARM_GATE_UP_FUSED): one [trellis, scales]
+ * table whose slice is [K -> M = 2 mid], gate rows then up rows; the input is
+ * rotated in-kernel by the slice's suh.  out = the unrotated z per pair; the
+ * fused fold (ds4_exl3_moe_fold_fused_launch) takes it from there. */
+int ds4_exl3_moe_fused(
     const void    * table,
     int             k2,
     const int32_t * ids,

@@ -1209,100 +1209,10 @@ bool gpu_graph_encode_output_head_batch(
 template <class Head>
 static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
                            pulsar_gpu_tensor *out) {
-    const uint32_t n_vocab = (uint32_t)PULSAR_N_VOCAB;
-    const uint32_t n_ranks = pulsar_tp_n_ranks(g->tp);
-    const uint32_t stride = (n_vocab + n_ranks - 1u) / n_ranks;
-    const int rank = pulsar_tp_rank(g->tp);
-    uint32_t lo = 0, hi = 0;
-    if (!pulsar_tp_owned_range(rank, n_ranks, n_vocab, &lo, &hi)) {
-        fprintf(stderr, "pulsar: tp vocab range refused (rank=%d n_ranks=%u n_vocab=%u)\n",
-                rank, n_ranks, n_vocab);
-        return false;
-    }
-    if (pulsar_tp_row_lane(g->tp)) {
-        uint32_t plo = 0, phi = 0;
-        if (!pulsar_tp_owned_range(1 - rank, n_ranks, n_vocab, &plo, &phi) ||
-            n_rows == 0 || n_rows > PULSAR_SPEC_LOGITS_ALLOC_ROWS || !g->tp_vocab_own || !g->tp_slab_dev ||
-            !g->tp_stage_ticket) {
-            fprintf(stderr, "pulsar: tp vocab gather refused (%u rows, scratch %s) -- refusing\n",
-                    n_rows, g->tp_vocab_own ? "ok" : "MISSING");
-            return false;
-        }
-        pulsar_tp_row_lane_layout_t L;
-        pulsar_tp_row_lane_layout(g->tp, &L);
-        uint8_t *slab = (uint8_t *)g->tp_slab_dev;
-        const uint64_t vf = L.vec_bytes / sizeof(float);
-        const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
-        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->tp_vocab_own, 0,
-                                                        (uint64_t)n_rows * (hi - lo) * sizeof(float));
-        bool ok = own && head(lo, hi - lo, own) &&
-                  pulsar_gpu_tp_scatter_cols(out, own, n_rows, hi - lo, n_vocab, lo) != 0;
-        pulsar_gpu_tensor_free(own);
-        for (uint32_t m0 = 0; ok && m0 < msgs; m0 += PULSAR_TP_BATCH_MAX_ROWS) {
-            const uint32_t m = msgs - m0 < PULSAR_TP_BATCH_MAX_ROWS ? msgs - m0 : PULSAR_TP_BATCH_MAX_ROWS;
-            uint64_t first = 0, exch = 0;
-            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->tp_vocab_own, (uint64_t)m0 * L.vec_bytes,
-                                                              (uint64_t)m * L.vec_bytes);
-            ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
-                 pulsar_gpu_tp_stage_publish(chunk, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots, m,
-                                             slab + L.desc_off, exch, g->tp_stage_ticket) != 0 &&
-                 pulsar_gpu_tp_combine_scatter(out, slab, L.in_off, L.vec_bytes, first, L.n_slots, m,
-                                               (uint64_t)m0 * vf, n_rows, phi - plo, n_vocab, plo,
-                                               slab + L.done_off, exch, slab + L.err_off,
-                                               L.timeout_ns) != 0;
-            pulsar_gpu_tensor_free(chunk);
-        }
-        if (!ok) fprintf(stderr, "pulsar: tp vocab gather: row lane refused (%u rows, %u messages)\n",
-                         n_rows, msgs);
-        return ok;
-    }
-    const uint64_t slice_bytes = (uint64_t)n_rows * stride * sizeof(float);
-    const uint64_t full_bytes  = (uint64_t)n_rows * n_vocab * sizeof(float);
-    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, 0, slice_bytes);
-    if (!slice) {
-        fprintf(stderr, "pulsar: tp vocab slice view refused (rows=%u stride=%u)\n",
-                n_rows, stride);
-        return false;
-    }
-    float *own     = (float *)xmalloc(slice_bytes);
-    float *scratch = (float *)xmalloc(slice_bytes);
-    float *full    = (float *)xmalloc(full_bytes);
-    bool ok = own && scratch && full;
-    if (!ok) fprintf(stderr, "pulsar: tp vocab staging out of memory (%llu + %llu bytes)\n",
-                      (unsigned long long)slice_bytes, (unsigned long long)full_bytes);
-    /* This rank's range only.  slice 4d inc 1 made the range expressible: the
-     * head weight is [vocab, in_dim] row-major, so it is a contiguous row range. */
-    if (ok) ok = head(lo, hi - lo, slice);
-    /* The head wrote the slice PACKED: row r of the GEMM output starts at
-     * r * (hi - lo), because the GEMM's out_dim IS the range width.  The gather
-     * wants rows at the padded pitch `stride` (one byte count per exchange
-     * round), so the packed rows are read into scratch and RE-PITCHED here --
-     * reading them straight into a stride-pitched buffer mis-placed every row
-     * after the first on any rank whose range is shorter than the stride (every
-     * uneven split), and the tail zero-fill then overwrote the next row's head.
-     * n=2 over 129280 is even, which is why the pair never showed it. */
-    const uint64_t packed_bytes = (uint64_t)n_rows * (hi - lo) * sizeof(float);
-    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0;
-    if (ok) {
-        for (uint32_t r = 0; r < n_rows; r++) {
-            memcpy(own + (uint64_t)r * stride,
-                   scratch + (uint64_t)r * (hi - lo),
-                   (uint64_t)(hi - lo) * sizeof(float));
-            memset(own + (uint64_t)r * stride + (hi - lo), 0,
-                   (uint64_t)(stride - (hi - lo)) * sizeof(float));
-        }
-    }
-    if (ok) {
-        ok = pulsar_tp_allgather_rows(g->tp, PULSAR_TP_NON_LAYER_TAG,
-                                       ++g->tp_vocab_seq, full, own, scratch,
-                                       n_rows, n_vocab, 1u) != 0;
-    }
-    if (ok) ok = pulsar_gpu_tensor_write(out, 0, full, full_bytes) != 0;
-    pulsar_gpu_tensor_free(slice);
-    free(own);
-    free(scratch);
-    free(full);
-    return ok;
+    /* L266: the gather is the engine's (tp_rows.cpp); the graph lends its transport, slab, ticket, scratch and seq */
+    const pulsar_tp_vocab x = {g->tp, g->tp_slab_dev, g->tp_stage_ticket, g->tp_vocab_own, &g->tp_vocab_seq,
+                               (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS};
+    return pulsar_tp_vocab_gather(&x, n_rows, head, out);
 }
 
 bool gpu_graph_encode_output_head_row_tp(

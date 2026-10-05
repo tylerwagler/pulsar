@@ -83,10 +83,10 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                  * a rejected step (bad args / dirty multiseq state), not eos. */
                 if (n <= 0) { ok = false; break; }
                 emitted += n;
-                if (toks[n - 1] == pulsar_token_eos(engine)) break;
+                if (pulsar_token_is_stop(engine, toks[n - 1])) break;
             } else {
                 const int tok = pulsar_session_argmax(session);
-                if (tok == pulsar_token_eos(engine)) break;
+                if (pulsar_token_is_stop(engine, tok)) break;
                 if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) {
                     ok = false;
                     break;
@@ -559,14 +559,30 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return wrc;
     }
+    /* A family whose tokenizer and chat renderer this build does not carry
+     * cannot take a request: refused at startup, by name (L251). */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: the %s family has no tokenizer or chat "
+                   "renderer in this build -- refusing to serve", pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
      * into the main artifact), so the state is logged here, never at parse. */
+    /* L251: a family with its own speculative generate (Qwen's MTP) serves it
+     * on decode lane 4 -- one greedy decoder at a time; --no-dspark turns the
+     * lane off like the DSpark one. */
+    const bool family_spec = pulsar_engine_drafter(engine) == PULSAR_DRAFTER_MTP && !cfg.engine.dspark_disable;
     if (pulsar_engine_has_dspark(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
                    pulsar_engine_dspark_draft_tokens(engine));
+    } else if (family_spec) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: %s speculative decoding (MTP drafter) for a solo greedy decoder",
+                   pulsar_engine_family_name(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");
@@ -850,6 +866,7 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    s.family_spec = family_spec;
     /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
      * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
      * clamps kstep to 1 and the step exceeds the chunk cap on every quantum
@@ -901,7 +918,10 @@ int main(int argc, char **argv) {
          * PULSAR_MIXED_BATCH=0 still forces the lane fully off;
          * PULSAR_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
         const char *mb = getenv("PULSAR_MIXED_BATCH");
-        s.mixed_batch_enabled = s.pool_banks > 0 &&
+        /* L251: the fused lane and warm forks are DeepSeek graph-pool features; a family bank pool
+         * (Qwen) refuses fused prefill runs and forks, so the lanes are off there, not flag-dependent */
+        const bool graph_pool = pulsar_engine_family(engine) == PULSAR_FAMILY_ID_DEEPSEEK4;
+        s.mixed_batch_enabled = s.pool_banks > 0 && graph_pool &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
         s.mixed_deep_guard_rows = 16384;
