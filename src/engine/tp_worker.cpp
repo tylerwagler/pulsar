@@ -696,6 +696,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                                                          NULL, &rows);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, rows);
             } else if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH) {
+                /* v24: the leader's measured spec cost, the one every rank
+                 * prices this round's quench from (L263). */
+                pulsar_engine_spec_cost_set(e, c->spec.i1, c->spec.i2, c->spec.i3 != 0);
                 pulsar_session_spec_round_end_batch_local(slot->s, steps, n, c->spec.i0, slot->logits);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
             } else {

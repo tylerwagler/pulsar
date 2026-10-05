@@ -1740,6 +1740,18 @@ struct pulsar_vocab {
  * One engine owns the weights; MANY sessions share it. Everything here is
  * immutable after open() except the cumulative metrics counters -- which is
  * what makes concurrent sessions safe against a single engine. */
+/* L263: the spec lane's self-measured step cost (pulsar.h pulsar_spec_cost is
+ * the read-only view).  Exponentially weighted least squares of a round's wall
+ * time on the rows its forward carried: round_ms = flat + row * rows. */
+typedef struct {
+    double w, sx, sy, sxx, sxy;  ///< EW sums: weight, rows, ms, rows^2, rows*ms
+    uint32_t n;                  ///< rounds observed
+    int32_t flat_us, row_us;     ///< the fit, in microseconds, when `valid`
+    bool valid;                  ///< enough evidence (spec_cost_fit_observe says what)
+    int32_t ann_flat_us, ann_row_us;  ///< the last announced terms (0: never)
+    uint32_t ann_n;                   ///< `n` at that announcement
+} pulsar_spec_cost_fit;
+
 struct pulsar_engine {
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
@@ -1748,6 +1760,11 @@ struct pulsar_engine {
     pulsar_dspark_weights dspark_weights;  ///< resolved drafter tensors
     pulsar_backend backend;     ///< CPU or CUDA
     int dspark_draft_tokens;    ///< configured draft depth k
+    /** L263: the spec lane's measured step cost (pulsar_engine_spec_cost).
+     * Written by the leader's observations (the server's round loop, or the
+     * single lane off TP) or, on a TP worker, by the leader's values riding
+     * SPEC_ROUND_END_BATCH; read by the quench guard and the allocator. */
+    pulsar_spec_cost_fit spec_cost;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -2082,13 +2099,15 @@ typedef struct pulsar_spec_carry_state {
      * state, so xcalloc'd sessions start armed and spec_quench_reset is a
      * plain zeroing. Controller design after Entrpi ds4 v0.1.1 (MIT).
      *
-     * The controller reads only (commit, n_batch) — counts, never wall-clock —
-     * so the quench decision is deterministic run-to-run for a fixed stream.
-     * Multiseq note: this state belongs to the classic single-request flow;
+     * The guard prices the step from the engine's MEASURED cost (L263,
+     * pulsar_engine::spec_cost) -- the quench point moves with the machine,
+     * not with a fixed stream; both paths sample the exact target
+     * distribution, so only speed is at stake.  Multiseq note: this state belongs to the classic single-request flow;
      * the dormant multi-bank driver would need per-bank copies (not wired —
      * generate_speculative already refuses when mseq_dirty). */
     float spec_quench_debt;  ///< cumulative plain-token-equivalents lost
     float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
+    int spec_round_banks;       ///< banks sharing the round being ended (the flat cost's divisor); 1 in the single lane
     uint32_t spec_quench_steps; ///< fused spec steps taken by this request
     bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
     /** Per-SESSION mirror of the engine's cumulative DSpark counters. The engine
@@ -2792,6 +2811,10 @@ void *xmalloc(size_t size);
 char *pulsar_strdup(const char *s);
 void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
+
+void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms);
+/** A TP worker takes the leader's terms as they rode the wire. */
+void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
 bool read_f32_binary_file(const char *path, float *data, uint64_t n);
 bool cursor_read(pulsar_cursor *c, void *dst, uint64_t n);

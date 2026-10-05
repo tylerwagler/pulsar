@@ -4198,6 +4198,41 @@ static void test_attn_layout_table(void) {
  * the indexer_scores scratch.  The unit process has no model, so the loader
  * installs no layout and the comp/idx term would be 0 (a gate that measures
  * nothing); the test installs the profile's V4.1 layout first. */
+/* L263: the spec cost fit.  A linear round cost with spread row counts fits
+ * to its terms; too few rounds, one row count, or a non-positive term is not
+ * a price (valid stays false). */
+static void test_spec_cost_fit(void) {
+    pulsar_spec_cost_fit f;
+    memset(&f, 0, sizeof f);
+    /* rows 2..6 cycling, round = 40 + 7 * rows ms with +-0.4 ms of noise */
+    for (uint32_t i = 0; i < 64; i++) {
+        const uint32_t rows = 2u + i % 5u;
+        spec_cost_fit_observe(&f, rows, 40.0 + 7.0 * rows + ((i & 1u) ? 0.4 : -0.4));
+        if (i + 1 < 16) TEST_ASSERT(!f.valid);
+    }
+    TEST_ASSERT(f.valid && f.n == 64);
+    TEST_ASSERT(f.flat_us > 39000 && f.flat_us < 41000);
+    TEST_ASSERT(f.row_us > 6800 && f.row_us < 7200);
+    /* one row count only: no slope to measure */
+    memset(&f, 0, sizeof f);
+    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 3u, 61.0 + ((i & 1u) ? 0.4 : -0.4));
+    TEST_ASSERT(!f.valid && f.n == 64);
+    /* a falling cost in rows is noise, not a price */
+    memset(&f, 0, sizeof f);
+    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 80.0 - 3.0 * (double)(2u + i % 5u));
+    TEST_ASSERT(!f.valid);
+    /* a zero-row or non-positive observation is ignored */
+    memset(&f, 0, sizeof f);
+    spec_cost_fit_observe(&f, 0u, 50.0);
+    spec_cost_fit_observe(&f, 3u, 0.0);
+    TEST_ASSERT(f.n == 0);
+    /* the fit tracks a step change: the window forgets the old machine */
+    memset(&f, 0, sizeof f);
+    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 40.0 + 7.0 * (2u + i % 5u));
+    for (uint32_t i = 0; i < 1024; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 30.0 + 5.0 * (2u + i % 5u));
+    TEST_ASSERT(f.valid && f.flat_us > 29000 && f.flat_us < 31500 && f.row_us > 4800 && f.row_us < 5200);
+}
+
 static void test_context_memory_shape(void) {
     install_profile_attn_layout();
     const int ctx = 32768;
@@ -4268,6 +4303,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
+    {"--spec-cost", "spec-cost", "spec cost fit: a round's measured cost to its terms, or no price at all (L263)", test_spec_cost_fit},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},

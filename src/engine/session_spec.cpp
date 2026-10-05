@@ -143,135 +143,67 @@ int gpu_graph_spec_dump_active(void) {
  * conditions), small enough that a 400-token losing request recovers nearly
  * all of the loss.
  *
- * The controller reads only (commit, n_batch) — counts, never wall-clock —
- * so for a fixed token stream the quench point is deterministic. Constants
- * are compile-time (no hot-path env reads; project rule). */
-/* REFIT 2026-07-21 (FLAT 95.7 -> 57.0; ROW unchanged). The 2026-07-17 fit went
- * stale: the fused step got ~30-40 ms cheaper (41 commits + the mxfp8head ->
- * type-40/MXFP8_LT model swap) while plain decode did not, so the shipped line
- * OVER-priced the step at EVERY width -- +57% at n_batch=1, +29% at 3, +14-15%
- * at 6..8. Guard = step/plain, so over-pricing raises the break-even, which
- * biases TOWARD quenching: the exact false-quench the design comment says it
- * deliberately biased against. Measured live at 2.7k/n_batch=6, yield 2.964 sat
- * below the shipped guard 3.057 (quench) but above the true 2.732 (spec was
- * ~8% faster than plain).
- *
- * Basis: 7591 steady-state steps over six cells (greedy/T1.0 x prose/structured
- * x 2.7k/9.4k/38k), pooled resid rms 5.88 ms (original fit: 7.2). Per-cell fits
- * are excellent (rms 0.08-2.4 ms), so ONE line is still the right model.
- *
- * Why 57.0 and why ROW stays 18.37:
- *  - Residual structure is by ENGINE DRAFT DEPTH, not temperature or context.
- *    FLAT rises ~3.3 ms per configured draft position (drafting work, which is
- *    NOT in the verify batch) while ROW falls to compensate: draft-2 fits
- *    FLAT 53.3/ROW 20.95, draft-7 fits FLAT 81.0/ROW 16.97. Since
- *    dspark_draft_tokens is fixed per engine and only conf-sched trim moves
- *    n_batch, the WITHIN-engine line is the one the controller actually rides.
- *    57.0 targets the shipped --dspark-draft 3 engine (~56.6); deeper drafts are
- *    then UNDER-priced, which biases against quenching = the safe direction.
- *  - Pooled ROW (20.3) is inflated by smearing cross-engine drafting cost into
- *    the slope. Keeping the lower shipped 18.37 lands the line 3-6% BELOW
- *    measured at every width 2..8, restoring the intended underprice margin.
- *  - Greedy remains the MINIMUM cell (T1.0 costs +3.5..12.4 ms at equal width),
- *    so a greedy-derived FLAT stays the conservative choice, as originally
- *    intended.
- * Depth enters as a small additive FLAT term only (~0.17 ms/1k, +6 ms over 35k)
- * and ROW is depth-invariant, so nothing depth-aware belongs in the step term.
- * NOTE the old comment's premise "spec step cost is ~flat in depth while plain
- * slows" is NOT what was measured: the step's depth slope (0.17 ms/1k) is close
- * to plain's (0.20). The guard ratio still improves with depth, but because the
- * step is 2-3x larger, not because it is flat. */
-/* RE-FIT 2026-09-10 (L214, engine b536784 + the L214 gate/up dedupe): the pinned-width
- * census (n_batch = 2, 4, 6, 8 every step, one client, prose + structured + code at
- * production sampling, nsys-attached wall clock, steps counted from the type-40
- * gate/up launches) is LINEAR in rows to 1 ms: step = 45.0 + 7.17 x n_batch ms (re-fit on the a309ff8 kernels after the L214 row-cost cuts).  The
- * previous line (57.0 + 18.37, 2026-07) priced the row at twice its cost -- the row is
- * structurally the expert bytes (top-6 x 366 MB across 43 MoE layers = 10.1 ms at
- * 218 GB/s, less what the dedupe and L2 now save) -- so the guard sat at ~2.9 tokens
- * per step at K=3 where it belongs at ~1.5, and prose that ran 20% faster
- * speculative (23.8 vs 19.9 t/s) was being quenched to plain.  The plain table
- * below is re-measured on the same instrument; guard = step / plain, so both sides
- * carry the same ~3% profiler overhead and the ratio is clean. */
-#define PULSAR_QUENCH_FLAT_MS    45.0f
-/* The row term is the engine-wide authority (PULSAR_SPEC_ROW_MS, pulsar.h):
- * the server's overflow K-allocator prices the same row, so the number lives
- * in exactly one place. */
-#define PULSAR_QUENCH_ROW_MS     PULSAR_SPEC_ROW_MS
+ * The step side of the guard is MEASURED (L263): pulsar_engine::spec_cost is
+ * an exponentially weighted least-squares fit of a decode round's wall time
+ * on the rows its forward carried, round = flat + row * rows, fed by the
+ * server's round loop (the single lane off TP feeds its own steps).  Nothing
+ * about a deployment is compiled in -- the 2026-07/09 refits that lived here
+ * (FLAT 95.7 -> 57.0 -> 45.0, ROW 18.37 -> 7.17, a plain-by-depth table) went
+ * stale with every kernel landing and could only be right for one machine.
+ * The plain side needs no table: a bank that stops drafting still rides a
+ * round with ONE row, so plain costs the same round at n = 1, at whatever
+ * depth is being served.  A round shared by B banks shares its flat cost, so
+ * the guard for a bank with n rows is (flat/B + row*n) / (flat/B + row);
+ * B = 1 is the single lane's (flat + row*n) / (flat + row).  Until the fit
+ * is valid the controller does not price at all: no number, no quench.
+ * The decision therefore reads the machine's clock through the fit (the
+ * quench point is not fixed for a given token stream); both paths sample the
+ * exact target distribution, so only speed is at stake.  The remaining
+ * constants are the controller's own (EWMA weight, warm-up, minimum
+ * evidence, budget), not a deployment's. */
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
 #define PULSAR_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
-/* Served plain-decode ms/token vs request depth: piecewise-linear through the
- * measured depth table (re-measured 2026-07-21 — see the block below for the
- * data and for why the 2026-07-15 values were retired). The bottom clamp
- * over-estimates plain and biases AGAINST quenching (conservative for the
- * no-spurious-quench gates). Plain ms/token keeps rising ~linearly with KV
- * depth, so beyond the last anchor we project that segment's slope rather than
- * flat-lining — a flat clamp under-estimates plain, which inflates the guard
- * and biases TOWARD quenching exactly where spec advantage is already marginal.
- * The projection is bounded at ~256k (PULSAR_QUENCH_PLAIN_CAP_POS), well past the
- * measured range, rather than extrapolating without limit. Deterministic
- * (constants only) so the quench point stays reproducible for a fixed stream. */
-/* RE-MEASURED 2026-07-21 (medians of 3, run-to-run spread 0.01-0.11%), matching
- * the ORIGINAL instrument: the server's own `decoding ... avg=` line over a
- * 256-token greedy generation, `--no-dspark`, prose. Confirmed the shipped py
- * was exactly 1000/{16.74,14.85,14.55,13.43} from the 2026-07-15 prose table.
- *
- *   depth    old table   measured   ratio
- *     426      60.18       56.18    0.933
- *    2348      67.31       63.05    0.937
- *    9141      68.67       65.78    0.958
- *   38147      74.53       69.98    0.939
- *  100362      87.10*      80.24    0.921      (*extrapolated, now MEASURED)
- *
- * The table was uniformly ~6% HIGH — plain decode got ~6% faster since
- * 2026-07-15, alongside the fused spec step. The 100k anchor is new and real;
- * `-c` confound controlled (38k reads 70.12 at -c 131072 vs 70.00 at -c 40960,
- * +0.17%).
- *
- * A 2026-07-21 spot check that reported 85.89 ms at 38k (and an alarming
- * 0.675 ms/1k slope) was a MEASUREMENT ARTIFACT, reconstructed to 0.03 ms:
- * it used 128-vs-384 marginal differencing WITHOUT `--no-kv-disk`, so the two
- * legs took different disk-KV hits and prefilled 30011 vs 31163 tokens —
- * 70.20 true marginal + 12.55 unequal prefill + 3.17 client overhead = 85.92.
- * The real 9.1k->38k slope is 0.145 ms/1k, so the beyond-38k extrapolation was
- * if anything slightly too STEEP, never "3x too shallow". LESSON: when
- * differencing two runs to cancel prefill, DISABLE the disk KV cache or the
- * cancellation silently fails.
- *
- * DIRECTION (correcting the earlier note): the FLAT staleness and this table's
- * staleness did NOT compound — they partially CANCELLED. FLAT was over-priced
- * (guard too high) while plain was over-estimated (guard too low). Fixing FLAT
- * alone left the guard ~6-9% too LOW; this correction restores it (+7.0% @2.3k,
- * +6.4% @38k, +8.6% @100k, +11.9% @256k at n_batch=6).
- *
- * The measured curve is mildly convex (0.145 -> 0.165 ms/1k), so the linear
- * projection past 100k slightly UNDER-estimates plain, which inflates the guard
- * — the conservative direction this design already prefers, and now anchored on
- * a real 100k point instead of a 38k one. Past 100k is UNMEASURED: the 256k cap
- * (~105.9 ms) is a bounded guess. Also unmeasured: whether structured/tool
- * output shifts plain ms/token at depth (all five anchors are prose). */
-#define PULSAR_QUENCH_PLAIN_CAP_POS 256000.0f
-static float spec_quench_plain_ms(int pos) {
-    static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
-    /* 2026-09-10 (L214): all five anchors MEASURED (served plain, --no-dspark, 256-token prose): 0.3k = the census plain step, 2.3k/9.3k by the decode-span ratios, 38k/100k from the server's own decoding avg= line at 52k and 135k context (53.3 / 55.0 ms per token, scaled to the census method by 1.034).  Plain's depth slope is ~0.03 ms per 1k now; the July table's 70.0 / 80.2 predate split-K attention. */
-    static const float py[5] = { 51.7f, 52.8f, 54.3f, 54.7f, 56.1f };
-    const float p = (float)pos;
-    if (p <= px[0]) return py[0];
-    for (int i = 1; i < 5; i++)
-        if (p <= px[i])
-            return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
-                                   (px[i] - px[i - 1]);
-    /* pos > 100000: extend the last segment's slope, capped at the 256k value. */
-    const float slope = (py[4] - py[3]) / (px[4] - px[3]);
-    const float q = p < PULSAR_QUENCH_PLAIN_CAP_POS ? p : PULSAR_QUENCH_PLAIN_CAP_POS;
-    return py[4] + slope * (q - px[4]);
+/* The break-even yield for a bank with `n_batch` rows in a round shared by
+ * `banks` banks (see above).  Integer microseconds in, so every rank of a TP
+ * group computes the same value from the same wire terms. */
+static float spec_quench_guard(const pulsar_spec_cost_fit *c, int banks, uint32_t n_batch) {
+    const float share = (float)c->flat_us / (float)(banks > 0 ? banks : 1);
+    const float row = (float)c->row_us;
+    return (share + row * (float)n_batch) / (share + row);
 }
 
-static float spec_quench_guard(uint32_t n_batch, int pos) {
-    return (PULSAR_QUENCH_FLAT_MS + PULSAR_QUENCH_ROW_MS * (float)n_batch) /
-           spec_quench_plain_ms(pos);
+/* L263: one observation into the fit.  Decay 255/256 per round (a window of
+ * ~256 rounds, 15-25 s of decode: at c1 the rows spread only 2..6, so a
+ * 64-round window let the slope swing 1..6 ms/row between adjacent windows
+ * -- the pair, 2026-10-05); valid once 16 rounds are in, the row counts have
+ * spread (an EW variance of at least 1/4: adaptive depth and concurrency
+ * move them every few rounds) and both terms are positive -- anything else
+ * is noise, not a price. */
+#define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
+#define SPEC_COST_MIN_OBS 16u
+#define SPEC_COST_MIN_VAR 0.25
+void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
+    if (!f || rows == 0 || !(ms > 0.0)) return;
+    const double x = (double)rows, y = ms;
+    f->w   = f->w   * SPEC_COST_DECAY + 1.0;
+    f->sx  = f->sx  * SPEC_COST_DECAY + x;
+    f->sy  = f->sy  * SPEC_COST_DECAY + y;
+    f->sxx = f->sxx * SPEC_COST_DECAY + x * x;
+    f->sxy = f->sxy * SPEC_COST_DECAY + x * y;
+    f->n++;
+    f->valid = false;
+    const double mx = f->sx / f->w, my = f->sy / f->w;
+    const double vx = f->sxx / f->w - mx * mx;
+    const double cxy = f->sxy / f->w - mx * my;
+    if (f->n < SPEC_COST_MIN_OBS || vx < SPEC_COST_MIN_VAR) return;
+    const double row = cxy / vx, flat = my - row * mx;
+    if (!(row > 0.0) || !(flat > 0.0)) return;
+    f->flat_us = (int32_t)(flat * 1000.0 + 0.5);
+    f->row_us = (int32_t)(row * 1000.0 + 0.5);
+    f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
 /* Re-arm at request boundaries (the same sites that drop the carry and
@@ -1428,9 +1360,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (!s->spec.spec_quenched) {
         s->spec.spec_quench_steps++;
         bool fire = false;
-        if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
+        if (e->spec_cost.valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(n_batch, saved_len);
+                                 spec_quench_guard(&e->spec_cost, s->spec.spec_round_banks, n_batch);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
@@ -1643,9 +1575,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                                               char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
-    static int dspark_stats_env = -1;
-    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    const double t0 = dspark_stats ? now_sec() : 0.0;
+    const double t0 = now_sec();
 
     pulsar_spec_round r;
     {
@@ -1693,11 +1623,19 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         return -1;
     }
 
-    return spec_round_end(s, &r, first_token, eos_token,
-                          temperature, top_k, top_p, min_p, rng,
-                          spec_row_read_classic, g, 0u,
-                          g->spec_compact_rows >= r.n_batch ? g->spec_compact_host : NULL,
-                          false, t0, NULL, accepted, accepted_cap, err, errlen);
+    const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
+    s->spec.spec_round_banks = 1;
+    const int na = spec_round_end(s, &r, first_token, eos_token,
+                                  temperature, top_k, top_p, min_p, rng,
+                                  spec_row_read_classic, g, 0u,
+                                  g->spec_compact_rows >= r.n_batch ? g->spec_compact_host : NULL,
+                                  false, t0, NULL, accepted, accepted_cap, err, errlen);
+    /* L263: this lane's own cost observation -- the whole step, redraft
+     * included.  Off TP only: a group's ranks must hold the same fit, and this
+     * lane has no frame to carry one, so on a group neither rank observes
+     * here (the batched lane ships the leader's with every round's end). */
+    if (na >= 0 && !e->tp) pulsar_engine_spec_cost_observe(e, n_rows, (now_sec() - t0) * 1e3);
+    return na;
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -2449,6 +2387,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
     s->seed_defer.active = s->graph.banks.n_banks > 0;
     s->seed_defer.n = 0;
+    s->spec.spec_round_banks = n;   /* L263: the round's flat cost is shared n ways */
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);

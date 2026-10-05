@@ -1554,8 +1554,8 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
     /* The drafter's SHAPE is not in the artifact's metadata beyond embedding_length:
      * the shipped file carries NO expert_count, expert_used_count, block_size,
-     * noise_token_id or markov_rank key (checked directly in the GGUF, on both
-     * the serving and the -k variant).  This block used to require all five and
+     * noise_token_id or markov_rank key (checked directly in the artifact's
+     * header metadata, on both the serving and the -k variant).  This block used to require all five and
      * compare them against compiled constants -- so it made the artifact
      * unloadable while checking nothing the tensor validation does not already
      * check.  The facts are asserted where they actually live:

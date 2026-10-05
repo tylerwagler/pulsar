@@ -1223,7 +1223,7 @@ void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r)
  * divergence, refused. */
 static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame_type,
                                 const char *operation, const pulsar_spec_step *steps, int n,
-                                int eos_token, uint32_t row_budget) {
+                                int eos_token, int32_t h1, int32_t h2, int32_t h3) {
     if (n < 0 || (uint32_t)n > PULSAR_TP_SPEC_STEPS_MAX) {
         fprintf(stderr, "pulsar: tp: %s carries %d steps (at most %u)\n", operation, n,
                 (unsigned)PULSAR_TP_SPEC_STEPS_MAX);
@@ -1232,7 +1232,7 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
     pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
     c.count = (uint32_t)n;
     c.i0 = eos_token;
-    c.i1 = (int32_t)row_budget;
+    c.i1 = h1; c.i2 = h2; c.i3 = h3;   /* per frame: assemble's row budget; round_end's spec cost (v24) */
     pulsar_tp_spec_command recs[PULSAR_TP_SPEC_STEPS_MAX];
     for (int i = 0; i < n; i++) {
         const pulsar_spec_step *st = &steps[i];
@@ -1270,7 +1270,7 @@ int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *step
         return 0;
     }
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH, operation, steps, n,
-                              eos_token, row_budget)) return tp_spec_steps_fail(steps, n, operation);
+                              eos_token, (int32_t)row_budget, 0, 0)) return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_assemble_batch_local(s, steps, n, eos_token, row_budget, reqs, n_rows_out);
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, *n_rows_out);
     if (tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0) {
@@ -1293,9 +1293,14 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
         return 0;
     }
     /* The logits block is NOT shipped: every rank holds the same block from
-     * its own mirrored forward, so only each step's row0 crosses. */
+     * its own mirrored forward, so only each step's row0 crosses.  The
+     * leader's measured spec cost rides the header (v24): the guard every
+     * rank's round_end prices the quench with is computed from these same
+     * integers, so a quench latches on every rank or on none. */
+    const pulsar_spec_cost_fit *cost = &s->engine->spec_cost;
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH, operation, steps, n,
-                              eos_token, 0u)) return tp_spec_steps_fail(steps, n, operation);
+                              eos_token, cost->flat_us, cost->row_us, cost->valid ? 1 : 0))
+        return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_round_end_batch_local(s, steps, n, eos_token, rows);
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
@@ -1313,7 +1318,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
         return 0;
     }
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH, operation, steps, n,
-                              0, 0u)) return tp_spec_steps_fail(steps, n, operation);
+                              0, 0, 0, 0)) return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_redraft_commit_batch_local(s, steps, n);
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
@@ -1332,6 +1337,43 @@ void pulsar_session_invalidate(pulsar_session *s) {
     if (!tp_mirror_sent(tp, "invalidate",
                         pulsar_tp_send_invalidate(tp, s->tp_session_id), NULL, 0)) return;
     s->invalidate();
+}
+void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms) {
+    if (!e) return;
+    pulsar_spec_cost_fit *f = &e->spec_cost;
+    spec_cost_fit_observe(f, rows, ms);
+    if (!f->valid) return;
+    /* Rule 5: the fit announces itself when it first arms and, at most once a
+     * window, whenever a term has moved by half from what was last announced
+     * -- the number the quench prices with is in the log, not inferred. */
+    const bool first = f->ann_flat_us == 0;
+    const bool moved = !first && f->n - f->ann_n >= 256u &&
+                       (abs(f->flat_us - f->ann_flat_us) * 2 > f->ann_flat_us ||
+                        abs(f->row_us - f->ann_row_us) * 2 > f->ann_row_us);
+    if (first || moved) {
+        f->ann_flat_us = f->flat_us;
+        f->ann_row_us = f->row_us;
+        f->ann_n = f->n;
+        fprintf(stderr, "pulsar: spec cost measured: round = %.1f + %.2f x rows ms (%u rounds%s)\n",
+                (double)f->flat_us / 1000.0, (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
+    }
+}
+pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e) {
+    pulsar_spec_cost c;
+    memset(&c, 0, sizeof c);
+    if (!e) return c;
+    c.flat_us = e->spec_cost.flat_us;
+    c.row_us = e->spec_cost.row_us;
+    c.n = e->spec_cost.n;
+    c.valid = e->spec_cost.valid;
+    return c;
+}
+void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid) {
+    if (!e) return;
+    pulsar_spec_cost_fit *f = &e->spec_cost;
+    f->flat_us = flat_us;
+    f->row_us = row_us;
+    f->valid = valid && flat_us > 0 && row_us > 0;
 }
 int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
     if (!s || limit <= 0) return 0;

@@ -2016,6 +2016,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     int round_ix = 0;
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
+        const double round_t0 = server_now_sec();   /* L263: this round's cost observation */
         /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
          * At <=16 total rows the shared forward's marginal row cost is
          * near-flat, so the win is ALLOCATION under the cap, not budget
@@ -2051,34 +2052,24 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 npend[i] = np;
             }
             /* L117 (L049 inc 2): under overflow the ranked admission also
-             * consults the COST TABLE — stop admitting once the next
-             * candidate's survival is worth less than a marginal row
-             * costs (value denominator = live EMA of ms per emitted
-             * token).  Binds ONLY under overflow — when everything fits
-             * the old unconditional cap is byte-identical (isolation
-             * invariant, see spec_alloc_rows). vLLM #47808 is the same
-             * design upstream.
-             * L111/L121 established the cost is DEPTH-FLAT (the old
-             * 8.4→11 ramp was the naive score kernel's rows x depth
-             * term, not a property of the engine).  L136 set the price
-             * to 6.0 from L134's stage attribution; L214's pinned-width
-             * refit then measured 7.17 ms/row on the a309ff8 kernels,
-             * and the row price is ONE fact (PULSAR_SPEC_ROW_MS,
-             * pulsar.h) shared with the engine's yield quench -- this
-             * site's private 6.0f was the stale copy.  L219/B4 drove
-             * demand past the row budget and measured the correction's
-             * effect: the cut prices more rows (conc 8, mean/run:
-             * 41 -> 145 at 6.0 -> 7.17) while aggregate t/s is flat,
-             * and every price in [3, 9] ms sits on that plateau -- a
-             * 30 ms positive control costs 12-19%.  A stage decomposition
-             * (L134) puts ~83% of this in routed-MoE expert compute, so
-             * expect the number to move with MoE kernel work, not with
-             * KV/indexer work. */
-            const float marginal_ms = PULSAR_SPEC_ROW_MS;
-            const float ema = s->spec_ms_per_tok_ema > 1.0f ?
-                              s->spec_ms_per_tok_ema : 45.0f;
+             * consults the cost -- stop admitting once the next candidate's
+             * survival is worth less than a marginal row costs (value
+             * denominator = live EMA of ms per emitted token).  Binds ONLY
+             * under overflow -- when everything fits the old unconditional
+             * cap is byte-identical (isolation invariant, see
+             * spec_alloc_rows). vLLM #47808 is the same design upstream.
+             * L111/L121 established the cost is DEPTH-FLAT; the row price
+             * is ONE fact shared with the engine's yield quench, and since
+             * L263 it is MEASURED (pulsar_engine_spec_cost: the rounds this
+             * loop reports) -- L136's 6.0 and L214's 7.17 were refits that
+             * went stale with the kernels (L219/B4: every price in [3, 9] ms
+             * sits on one plateau; a 30 ms positive control costs 12-19%).
+             * No fit yet, or no EMA yet: no cut, the cap alone admits. */
+            const pulsar_spec_cost cost = pulsar_engine_spec_cost(s->engine);
+            const float thr = cost.valid && s->spec_ms_per_tok_ema > 1.0f ?
+                              (float)cost.row_us / (1000.0f * s->spec_ms_per_tok_ema) : 0.0f;
             int thr_cut_rows = 0;
-            k_overflow = spec_alloc_rows(surv, npend, n, n_live, marginal_ms / ema,
+            k_overflow = spec_alloc_rows(surv, npend, n, n_live, thr,
                                          k_alloc, &thr_cut_rows) != 0;
             if (k_overflow) s->w_spec_overflow_rounds++;
             s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
@@ -2502,6 +2493,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * scraper polling faster than the publish cadence sees its deltas
          * beat into 0 / 2x-rate flapping (the pulsar-tui square wave).
          * One mutex+copy per round (~0.35 s) is host noise. */
+        /* L263: the round's cost, measured -- the rows the forward carried
+         * against its wall time, redraft included (the next round's drafting
+         * is part of this one's step).  A round that carried prompt rows is
+         * not a decode round and is left out. */
+        if (n_fr == 0 && rows > 0)
+            pulsar_engine_spec_cost_observe(s->engine, rows, (server_now_sec() - round_t0) * 1e3);
         s->publish_metrics_snapshot();
         /* L260 fusion: a prompt finished this round -- end the quantum so its
          * first-token init runs at the top of the next pass and it joins the
