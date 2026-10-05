@@ -1169,8 +1169,15 @@ static bool gpu_graph_indexed_attention_span(
      * (fused_step_gate's LONG leg). */
     const int step_dec = pulsar_gpu_matmul_batch_decode_rows();
     const uint32_t span_dec = step_dec > (int)s0 ? ((uint32_t)step_dec - s0 < sn ? (uint32_t)step_dec - s0 : sn) : 0u;
+    /* The step's count already passed its own lane's cap (the batched lane
+     * declares up to PULSAR_SPEC_LOGITS_ROWS), so a span's share of it and the
+     * restore below are accepted values: they take the widest decode cap, as
+     * pulsar_decode_rows_scope's destructor does.  Through the 16-row setter
+     * the restore was refused for every step past 16 rows (c5+ on the pair,
+     * ~5 lines a round, 2026-10-05) and a multi-span fused step was left at
+     * the last span's 0 -- its verify rows on the prefill arms from there. */
     if (ok && span_dec != (uint32_t)(step_dec > 0 ? step_dec : 0) &&
-        !pulsar_gpu_matmul_set_batch_decode_rows((int)span_dec)) {
+        !pulsar_gpu_matmul_set_batch_decode_rows_capped((int)span_dec, (int)PULSAR_DSPARK_DRAFT_ROWS_MAX)) {
         fprintf(stderr, "pulsar: indexed span at layer %u: decode-row count %u refused -- refusing\n", il, span_dec);
         ok = false;
     }
@@ -1203,7 +1210,8 @@ static bool gpu_graph_indexed_attention_span(
                                           op->gact_data, op->gact_scale, op->gact_kbp, op->gact_slab,
                                           op->gact_n_groups, op->gact_n_nope, s0, op->gact_ntok) != 0;
     }
-    (void)pulsar_gpu_matmul_set_batch_decode_rows(step_dec > 0 ? step_dec : 0);   /* the step's own, back */
+    (void)pulsar_gpu_matmul_set_batch_decode_rows_capped(step_dec > 0 ? step_dec : 0,
+                                                         (int)PULSAR_DSPARK_DRAFT_ROWS_MAX);   /* the step's own, back */
     pulsar_gpu_tensor_free(sel_view);
     pulsar_gpu_tensor_free(vright_view);
     pulsar_gpu_tensor_free(vleft_view);
