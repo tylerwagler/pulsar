@@ -453,7 +453,7 @@ int GATE_ENTRY(int argc, char **argv) {
     opt.backend = PULSAR_BACKEND_CUDA;
     opt.dspark_draft_tokens = depth;
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (!pulsar_engine_has_dspark(g_e)) {
+    if (!pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "DSPARK-BATCH GATE: model has no drafter\n");
         gate_engine_close(g_e);
         return 1;

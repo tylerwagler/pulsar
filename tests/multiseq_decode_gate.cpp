@@ -394,7 +394,7 @@ int GATE_ENTRY(int argc, char **argv) {
                "work with no speculation machinery allocated\n");
     }
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
+    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "MULTISEQ GATE FAIL: PULSAR_GATE_NO_DSPARK set but the "
                         "engine still reports a drafter -- the no-dspark case "
                         "is not actually being exercised\n");

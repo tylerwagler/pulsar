@@ -9,6 +9,7 @@
  * is this family's session state. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
+#include "spec_internal.h"
 
 /* L272 B15: the drafter the opened artifact carries -- DSpark when its dspark.* tensors loaded. */
 static pulsar_drafter_kind ds4_drafter(pulsar_engine *e) {
@@ -122,5 +123,6 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .tp_shape     = */ ds4_tp_shape,
     /* .drafter      = */ ds4_drafter,
     /* .quant_bits   = */ ds4_quant_bits,
+    /* .spec         = */ &k_ds4_spec_target,
     /* .session      = */ &k_ds4_session_ops,
 };

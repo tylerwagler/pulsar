@@ -62,8 +62,8 @@ static int pending_q0(pulsar_session *s, uint32_t width, float temperature, int 
      * sweep reads between rounds, the live shadow is what round_begin will
      * consume.  Harvest first: the chain may still be in flight. */
     pulsar_session_spec_chain_harvest(s);
-    if (s->spec.dspark_n_pending == 0u) return 0;
-    const uint32_t qn = s->spec.dspark_pending_qn[0];
+    if (s->spec.n_pend == 0u) return 0;
+    const uint32_t qn = s->spec.pend_qn[0];
     memset(qd, 0, sizeof *qd);
     if (qn > 0) {
         qd->n = qn;
@@ -71,13 +71,13 @@ static int pending_q0(pulsar_session *s, uint32_t width, float temperature, int 
         qd->probs = (float *)malloc((size_t)qn * sizeof(float));
         if (!qd->ids || !qd->probs) return -1;
         for (uint32_t k = 0; k < qn; k++) {
-            qd->ids[k] = s->spec.dspark_pending_qids[0][k];
-            qd->probs[k] = s->spec.dspark_pending_qprobs[0][k];
+            qd->ids[k] = s->spec.pend_qids[0][k];
+            qd->probs[k] = s->spec.pend_qprobs[0][k];
         }
         *sparse = 1;
         return 1;
     }
-    const float *qrow = s->dspark_pending_qrows;
+    const float *qrow = s->pend_qrows;
     if (!qrow) return -1;
     if (!pulsar_sample_dist_build(qrow, width, temperature, top_k, top_p, min_p, scratch, qd)) return -1;
     *sparse = 0;
@@ -96,7 +96,7 @@ int GATE_ENTRY(int argc, char **argv) {
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
     pulsar_engine *e = NULL;
     if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (!pulsar_engine_has_dspark(e)) { fprintf(stderr, "no drafter in this artifact\n"); gate_engine_close(e); return 1; }
+    if (!pulsar_engine_has_spec_rounds(e)) { fprintf(stderr, "no drafter in this artifact\n"); gate_engine_close(e); return 1; }
 
     int rc = 1;
     pulsar_session *s = NULL;
@@ -156,7 +156,7 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_sample_dist qd; int sparse = 0;
             const int have_q = pending_q0(s, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &qd, &sparse);
             if (have_q < 0) { fprintf(stderr, "q read failed at pos %d\n", pos); goto done; }
-            const int draft0 = have_q ? (int)s->spec.dspark_pending[0] : -1;
+            const int draft0 = have_q ? (int)s->spec.pend[0] : -1;
             if (!have_q && n_rounds >= 3 && n_meas == 0) {
                 /* the first round has nothing pending by construction; from
                  * the second on a missing draft is a broken redraft, not data */

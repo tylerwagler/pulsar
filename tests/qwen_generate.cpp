@@ -240,9 +240,10 @@ int main(int argc, char **argv) {
                generated > 1 ? 1e3 * t_decode / (generated - 1) : 0.0);
 
     /* SPEC MODE (QWEN_SPEC set, a container with the MTP sidecar): re-sync the same prompt and generate
-     * the same count through pulsar_session_generate_speculative (greedy).  Its tokens must BE the
-     * greedy run's above -- the verify rows take the decode-width kernels -- and the speed is the
-     * point.  Timed like decode: every token after the first (which both runs read off the sync). */
+     * the same count through pulsar_session_generate_speculative (greedy), one round a call as the CLI
+     * loops it (L272 P1: the round API).  Its tokens must BE the greedy run's above -- the verify rows
+     * take the decode-width kernels -- and the speed is the point.  Timed like decode: every token after
+     * the first (which both runs read off the sync).  A short run is a failure, not a shorter compare. */
     const char *spec_env = getenv("QWEN_SPEC");
     if (spec_env && spec_env[0] && generated > 0) {
         char err[256] = "";
@@ -254,13 +255,21 @@ int main(int argc, char **argv) {
         int *out = (int *)malloc((size_t)n_predict * sizeof(int));
         uint64_t rng = 1;
         const double t0 = now_s();
-        const int n = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated, 248046, out,
-                                                          generated, err, sizeof(err));
-        const double dt = now_s() - t0;
-        if (n < 0) {
-            fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
-            return 1;
+        int n = 0, rounds = 0;
+        while (n < generated) {
+            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n, 248046,
+                                                              out + n, generated - n, err, sizeof(err));
+            if (k < 0) {
+                fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
+                return 1;
+            }
+            if (k == 0) break;
+            n += k;
+            rounds++;
+            if (out[n - 1] == 248046) break;
         }
+        const double dt = now_s() - t0;
+        printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);
         int same = 0;
         while (same < n && same < generated && out[same] == ids[n_tok + same]) same++;
         printf("qwen-generate: SPEC %d tokens in %.3f s = %.2f tok/s (%.1f ms/token after the first); identical to "
@@ -272,6 +281,10 @@ int main(int argc, char **argv) {
             return 3;
         }
         free(out);
+        if (n < generated) {
+            printf("qwen-generate: SPEC stopped at %d of %d tokens after %d rounds\n", n, generated, rounds);
+            return 3;
+        }
     }
 
     /* BATCH MODE (QWEN_BATCH set, L266): re-sync the same prompt and feed the greedy run's own tokens through

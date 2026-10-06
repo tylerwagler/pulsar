@@ -74,11 +74,11 @@ static uint64_t fnv(uint64_t h, int v) {
  * here, not taken from pulsar_spec_q_compact, because this instrument must also build against the tree from
  * BEFORE that helper existed (the "before" half of the identity check). */
 static uint32_t full_row_pendings(const pulsar_spec_carry_state &sp) {
-    if (!sp.dspark_pending_sampled) return 0;
-    const uint32_t n = sp.dspark_n_pending < 16u ? sp.dspark_n_pending : 16u;
+    if (!sp.pend_sampled) return 0;
+    const uint32_t n = sp.n_pend < 16u ? sp.n_pend : 16u;
     uint32_t k = 0;
     for (uint32_t j = 0; j < n; j++)
-        k += !(sp.dspark_pending_qn[j] > 0 && sp.dspark_pending_qn[j] <= PULSAR_DSPARK_QDIST_CAP);
+        k += !(sp.pend_qn[j] > 0 && sp.pend_qn[j] <= PULSAR_DSPARK_QDIST_CAP);
     return k;
 }
 
@@ -95,7 +95,7 @@ int GATE_ENTRY(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (gate_engine_open(&e, &opt) != 0 || !pulsar_engine_has_dspark(e)) {
+    if (gate_engine_open(&e, &opt) != 0 || !pulsar_engine_has_spec_rounds(e)) {
         fprintf(stderr, "engine open failed or no drafter\n");
         return 1;
     }
@@ -242,7 +242,7 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         ph_us[2] += now_us() - t0;
         for (int b = 0; b < NB; b++) {
-            drafted += s->bank_carry[b].spec.dspark_n_pending;
+            drafted += s->bank_carry[b].spec.n_pend;
             full_rows += full_row_pendings(s->bank_carry[b].spec);
         }
     }

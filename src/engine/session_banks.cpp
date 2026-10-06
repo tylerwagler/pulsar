@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "spec_internal.h"
 
 /* Tier-2 task #55 increment 2b — per-bank physical evict/restore.  The caller
  * (server guard) must have snapshotted the bank's KV to DISK before evict (host
@@ -48,7 +49,7 @@ void pulsar_bank_carry::free_one() {
     if (!c) return;
     token_vec_free(&c->checkpoint);
     free(c->logits);
-    free(c->dspark_pending_qrows);
+    free(c->pend_qrows);
     memset(c, 0, sizeof(*c));
 }
 
@@ -83,23 +84,6 @@ int pulsar_session::bank_repoint(uint32_t bank) {
     return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
 }
 
-/* L260: the full q rows a bank carries -- rows j < dspark_qrows_n (the positions whose rows may still be read,
- * which outlives the pendings: round_begin drops them before the in-flight round's walk reads the rows) of
- * sampled drafts whose q did not fit the compact form (pulsar_spec_q_compact) -- copied from src to dst.  The
- * rest of the n_draft x PULSAR_N_VOCAB capacity is never read, and copying it on every bank switch was ~2.6 MB
- * per save and per restore at depth 5 under sampling (the c10 host-bookkeeping cost). */
-static void copy_pending_qrows(float *dst, uint32_t dst_cap, const float *src, uint32_t src_cap,
-                               const pulsar_spec_carry_state &sp) {
-    if (!sp.dspark_pending_sampled) return;
-    const uint32_t n = sp.dspark_qrows_n < 16u ? sp.dspark_qrows_n : 16u;
-    for (uint32_t j = 0; j < n; j++) {
-        if (pulsar_spec_q_compact(sp.dspark_pending_qn[j])) continue;
-        const uint64_t end = (uint64_t)(j + 1u) * PULSAR_N_VOCAB;
-        if (end > dst_cap || end > src_cap) return;   /* no row was drafted there: nothing to carry */
-        memcpy(dst + (size_t)j * PULSAR_N_VOCAB, src + (size_t)j * PULSAR_N_VOCAB,
-               (size_t)PULSAR_N_VOCAB * sizeof(float));
-    }
-}
 
 void pulsar_session::bank_state_save(uint32_t bank) {
     auto *s = this;
@@ -114,11 +98,6 @@ void pulsar_session::bank_state_save(uint32_t bank) {
     pulsar_tokens_copy(&c->checkpoint, &s->checkpoint);
     if (!c->logits) c->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
     memcpy(c->logits, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    if (s->dspark_pending_qrows && c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
-        c->dspark_pending_qrows = (float *)xrealloc(c->dspark_pending_qrows,
-                                                    (size_t)s->dspark_pending_qrows_cap * sizeof(float));
-        c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
-    }
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
     c->logits_stale           = s->logits_stale;
@@ -132,11 +111,7 @@ void pulsar_session::bank_state_save(uint32_t bank) {
      * s->mseq_dirty is NOT saved: it describes the graph's scalar frontier
      * counters, not this bank's conversation, and _restore re-establishes
      * per-bank frontier truth and clears it unconditionally. */
-    pulsar_session_spec_chain_harvest(s);   /* L108 P2: never save an in-flight chain */
-    c->spec = s->spec;
-    /* the q rows the saved pendings can read (after the harvest, which only finishes greedy chains) */
-    copy_pending_qrows(c->dspark_pending_qrows, c->dspark_pending_qrows_cap, s->dspark_pending_qrows,
-                       s->dspark_pending_qrows_cap, c->spec);
+    pulsar_spec_shadow_save(s, &c->spec, &c->pend_qrows, &c->pend_qrows_cap);
     c->valid = true;
 }
 
@@ -160,20 +135,13 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     pulsar_bank_carry *c = &s->bank_carry[bank];
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
     memcpy(s->logits, c->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
-        s->dspark_pending_qrows = (float *)xrealloc(s->dspark_pending_qrows,
-                                                    (size_t)c->dspark_pending_qrows_cap * sizeof(float));
-        s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
-    }
-    copy_pending_qrows(s->dspark_pending_qrows, s->dspark_pending_qrows_cap, c->dspark_pending_qrows,
-                       c->dspark_pending_qrows_cap, c->spec);
     s->checkpoint_valid       = c->checkpoint_valid;
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
     s->live_image_fp          = c->live_image_fp;      /* L226 */
     s->live_image_barrier     = c->live_image_barrier;
-    /* Mirror of the save above: one assignment restores the whole shadow. */
-    s->spec = c->spec;
+    /* Mirror of the save above: the whole shadow and its q rows. */
+    pulsar_spec_shadow_restore(s, &c->spec, c->pend_qrows, c->pend_qrows_cap);
     /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
      * superset poison no longer applies to this bank. */
     s->mseq_dirty = false;
@@ -203,31 +171,6 @@ static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t ban
     return NULL;
 }
 
-/* L112 observability: the adaptive draft controller's CURRENT depth for a
- * bank -- live spec state for the live bank, the saved carry otherwise
- * (same live-vs-carry rule as bank_frontier_tokens above). In a bankless
- * session, bank 0 reads the live state. 0 = no drafter or nothing valid.
- * Pure host reads, worker-thread safe at publish time. */
-int pulsar_session::bank_spec_depth(uint32_t bank) {
-    auto *s = this;
-    if (!s->engine || !s->engine->has_dspark()) return 0;
-    const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
-    const pulsar_spec_carry_state *sp = NULL;
-    if (pool == 0) {
-        if (bank == 0) sp = &s->spec;
-    } else if (bank < pool) {
-        const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
-        if (bank == cur) sp = &s->spec;
-        else if (s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid)
-            sp = &s->bank_carry[bank].spec;
-    }
-    if (!sp) return 0;
-    int d = sp->spec_adaptive_depth;
-    if (d <= 0) d = s->engine->dspark_draft_tokens;
-    if (d < 1) d = 1;
-    if (d > 16) d = 16;
-    return d;
-}
 
 int pulsar_session::bank_pos(uint32_t bank) {
     auto *s = this;

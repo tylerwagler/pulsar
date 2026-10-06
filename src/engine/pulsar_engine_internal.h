@@ -1852,6 +1852,7 @@ struct pulsar_engine {
     uint32_t tp_worker_cap;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
+    const struct pulsar_drafter_ops *drafter_ops;   ///< L272 P1: the loaded drafter behind the round API (spec_ops.h), or NULL = none
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
     pulsar_vision_weights vision_weights;  ///< resolved ViT tower/aligner tensors (Vision-Exp artifacts)
     bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
@@ -1998,7 +1999,7 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
  * both paths pick them up for free.
  *
  * Deliberately EXCLUDED: heap-backed state (checkpoint, logits,
- * dspark_pending_qrows) — those need deep copies with per-side ownership, so
+ * pend_qrows) — those need deep copies with per-side ownership, so
  * they stay as explicit members of each struct. */
 /** L149: device min-p prefilter (pulsar_gpu_minp_prefilter_rows) output row:
  * i32 [0] candidate count, [1] max id, [2] max logit bits, then
@@ -2010,7 +2011,7 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
 /** L149: widest proposal distribution stored per pending draft position. */
 #define PULSAR_DSPARK_QDIST_CAP 256u
 /** L149/L260: a pending draft's proposal q is held in the compact form (qids/qprobs, qn entries) exactly when
- *  this holds; otherwise the verify walk rebuilds q from the draft's full row in dspark_pending_qrows.  The one
+ *  this holds; otherwise the verify walk rebuilds q from the draft's full row in pend_qrows.  The one
  *  test for both the walk and the bank carry's row copy. */
 static inline bool pulsar_spec_q_compact(uint32_t qn) { return qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP; }
 
@@ -2019,7 +2020,7 @@ typedef struct pulsar_spec_carry_state {
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
      * n=1 forward. Invalidated on rewind/invalidate. */
-    int32_t dspark_pending[16];
+    int32_t pend[16];
     /** L108 P2: a device-chained greedy draft was LAUNCHED but its ids/conf
      * have not been read back yet.  The read happens lazily ("harvest") at
      * the next consumer -- round assembly, the bank conf peek, or a bank
@@ -2030,23 +2031,23 @@ typedef struct pulsar_spec_carry_state {
     bool dspark_chain_unharvested;
     bool dspark_chain_conf;      ///< the confidence head ran for the in-flight chain
     uint32_t dspark_chain_n;     ///< drafted depth of the in-flight chain
-    uint32_t dspark_n_pending;   ///< drafts proposed and awaiting verification
-    /** L260: draft positions whose proposal q may still be read from the session's dspark_pending_qrows (the
+    uint32_t n_pend;   ///< drafts proposed and awaiting verification
+    /** L260: draft positions whose proposal q may still be read from the session's pend_qrows (the
      *  non-compact ones, pulsar_spec_q_compact).  Set where the rows are written (the drafting loop, redraft
      *  commit); NOT reset by pulsar_spec_drop_pendings, because round_begin drops the pendings before the
      *  in-flight round's walk reads their rows; cleared once that walk is done.  The bank carry copies these
      *  rows and no others. */
-    uint32_t dspark_qrows_n;
+    uint32_t qrows_n;
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
-    int32_t dspark_pending_base;
+    int32_t pend_base;
     /** checkpoint.len the drafts were produced at — an ACCEPTANCE guard, not an
      * exactness guard. The base-token check above is a VALUE check, not an
      * identity check: a plain pulsar_session_eval (tool injection, think-tag
      * recovery) advances the session and clears the carry but leaves the
      * pendings, so a later first_token that merely COLLIDES with
-     * dspark_pending_base would resurrect drafts conditioned on a different
+     * pend_base would resurrect drafts conditioned on a different
      * position.
      *
      * Do NOT read this as an exactness guard and do NOT delete it on the grounds
@@ -2059,7 +2060,7 @@ typedef struct pulsar_spec_carry_state {
      * stays true under p/q. The cost of staleness is throughput; we drop stale
      * pendings because a draft conditioned on the wrong position is a wasted
      * verify row. Mirrors spec_carry_pos. */
-    int32_t dspark_pending_pos;
+    int32_t pend_pos;
     /** Speculative-sampling carry: the next base token, already drawn from the
      * request's filtered distribution (bonus draw on full accept, residual
      * draw on rejection) but NOT yet forwarded through the target. The next
@@ -2080,7 +2081,7 @@ typedef struct pulsar_spec_carry_state {
     /** Confidence-head score per pending draft, carried draft->verify. Stored
      * UNCONDITIONALLY (-1 when the head didn't run): the L107 adaptive-depth
      * controller reads the verified chain's tail confidence in round_end. */
-    float   dspark_pending_conf[16];
+    float   pend_conf[16];
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first
@@ -2099,28 +2100,28 @@ typedef struct pulsar_spec_carry_state {
      * the residual (p-q)+ — which is not capped at p(mode) the way the
      * deterministic-proposal rule is.
      *
-     * `dspark_pending_sampled` records which rule the pendings were PROPOSED
+     * `pend_sampled` records which rule the pendings were PROPOSED
      * under, so verify applies the matching rule: false => argmax proposal =>
      * the deterministic rule (accept w.p. p(x), residual p-excluding). The two
      * rules are not interchangeable; applying p/q to an argmax proposal (or
      * vice versa) silently breaks exactness. */
-    bool dspark_pending_sampled;
+    bool pend_sampled;
     /** q(pend[i]) at draft time — the accept denominator. */
-    float dspark_pending_q[16];
+    float pend_q[16];
     /** L149: the proposal distribution q_i exactly as BUILT at draft time,
-     * kept for the residual draw. dspark_pending_qn[i] == 0 means "not
-     * stored": rebuild it from the full row in dspark_pending_qrows under the
+     * kept for the residual draw. pend_qn[i] == 0 means "not
+     * stored": rebuild it from the full row in pend_qrows under the
      * pending params, as before. When stored it IS that rebuild (same inputs,
      * same params, deterministic build), so the walk skips both the 517 KB
      * row read and the rebuild. Carried by value with the rest of the shadow. */
-    uint32_t dspark_pending_qn[16];
-    int32_t  dspark_pending_qids[16][PULSAR_DSPARK_QDIST_CAP];
-    float    dspark_pending_qprobs[16][PULSAR_DSPARK_QDIST_CAP];
+    uint32_t pend_qn[16];
+    int32_t  pend_qids[16][PULSAR_DSPARK_QDIST_CAP];
+    float    pend_qprobs[16][PULSAR_DSPARK_QDIST_CAP];
     /** The sampling params the pendings were sampled under. TWO consumers, and
      * they are different in kind:
      *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
-     *      position's q from dspark_pending_qrows using THESE params, so the
-     *      stored accept denominator dspark_pending_q[i] and the residual's q
+     *      position's q from pend_qrows using THESE params, so the
+     *      stored accept denominator pend_q[i] and the residual's q
      *      name the same proposal q_X by construction. This is why the rebuild
      *      must never be fed the live request params.
      *   2) THROUGHPUT (the guard in the verify path): drafts sampled under X and
@@ -2129,10 +2130,10 @@ typedef struct pulsar_spec_carry_state {
      *      for p_Y, so acceptance craters. The guard drops them to avoid wasting
      *      verify rows, not to avoid bias.
      * Mirrors the spec_carry_* params guard. Greedy never needed this. */
-    float dspark_pending_temp;   ///< temperature the pending drafts were proposed under
-    float dspark_pending_top_p;  ///< top-p the drafts were proposed under
-    float dspark_pending_min_p;  ///< min-p the drafts were proposed under
-    int   dspark_pending_top_k;  ///< top-k the drafts were proposed under; the verify guard drops mismatched drafts
+    float pend_temp;   ///< temperature the pending drafts were proposed under
+    float pend_top_p;  ///< top-p the drafts were proposed under
+    float pend_min_p;  ///< min-p the drafts were proposed under
+    int   pend_top_k;  ///< top-k the drafts were proposed under; the verify guard drops mismatched drafts
     /** --- Terminal yield-quench controller (spec-decode Item 4) ---
      * Per-request cumulative-regret gate: each fused spec step charges
      * debt += guard(n_batch) - tokens_committed (the breakeven yield minus the
@@ -2170,18 +2171,18 @@ typedef struct pulsar_spec_carry_state {
 } pulsar_spec_carry_state;
 
 /** Drop pendings AND any unharvested in-flight chain (L108 P2). The single
- * authority for every "pendings are stale" reset -- setting dspark_n_pending
+ * authority for every "pendings are stale" reset -- setting n_pend
  * to 0 by hand while a chain is in flight leaves a flag that would resurrect
  * the stale ids at the next harvest. */
 static inline void pulsar_spec_drop_pendings(pulsar_spec_carry_state *sp) {
-    sp->dspark_n_pending = 0;
+    sp->n_pend = 0;
     sp->dspark_chain_unharvested = false;
 }
 
 /** L108 P2: read back an in-flight device-chained draft (ids + conf), apply
  * the conf-sched trim, and populate the pendings. Idempotent; no-op when no
- * chain is in flight. Must run before anything consumes dspark_n_pending /
- * dspark_pending[], and before a bank save copies spec state (banks share
+ * chain is in flight. Must run before anything consumes n_pend /
+ * pend[], and before a bank save copies spec state (banks share
  * the session's graph tensors, so a saved unharvested flag would harvest
  * another bank's chain). Defined in session_spec.cpp. */
 void pulsar_session_spec_chain_harvest(pulsar_session *s);
@@ -2201,8 +2202,8 @@ typedef struct pulsar_bank_carry {
     /** heap-backed (owned): */
     token_vec checkpoint;  ///< deep copy of s->checkpoint
     float    *logits;  ///< PULSAR_N_VOCAB floats, owned
-    float    *dspark_pending_qrows;  ///< dspark_pending_qrows_cap floats, owned
-    uint32_t  dspark_pending_qrows_cap;  ///< floats allocated in dspark_pending_qrows
+    float    *pend_qrows;  ///< pend_qrows_cap floats, owned
+    uint32_t  pend_qrows_cap;  ///< floats allocated in pend_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
     bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
@@ -2316,6 +2317,7 @@ struct pulsar_session {
         uint32_t n;
         uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];
         uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
+        int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;
     pulsar_gpu_graph graph;   ///< the DeepSeek family's device state (KV, scratch, bank views); untouched on a Qwen session
     pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
@@ -2401,19 +2403,19 @@ struct pulsar_session {
      *
      * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
      * q: dist_build is a pure function of (logits, params), and the rebuild is
-     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
+     * handed BOTH persisted halves — this row and pend_temp/top_k/
      * top_p/min_p below. Feeding it either half from live state is the trap: the
      * live drafter state has advanced, and the live REQUEST params may differ
      * from the draft-time ones, which would leave the stored accept denominator
-     * dspark_pending_q[i] (computed under the draft-time params) and the
+     * pend_q[i] (computed under the draft-time params) and the
      * residual's q describing two different proposals inside one rule.
      *
      * Device-first note (Item 2): storing the logits ROW + params rather than a
      * materialized nucleus is deliberate — the GPU accept kernel wants exactly
      * this, so it swaps this host pool for a resident device buffer instead of
      * reshaping the format. */
-    float *dspark_pending_qrows;
-    uint32_t dspark_pending_qrows_cap;  ///< floats reserved
+    float *pend_qrows;
+    uint32_t pend_qrows_cap;  ///< floats reserved
     /** Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
      * allocated on the first pulsar_session_bank_state_save; NULL / bank_carry_n==0
      * when the pool is disabled (single-session use never touches it). */
@@ -2547,8 +2549,6 @@ struct pulsar_session {
     /** Committed token count for `bank`, live or idle. */
     int bank_pos(uint32_t bank);
     int bank_prefill_frontier(uint32_t bank);
-    /** Adaptive draft depth for `bank`, read from the live state or its carry. */
-    int bank_spec_depth(uint32_t bank);
     /** Borrowed view of `bank`'s committed token history. Do not free. */
     const pulsar_tokens *bank_tokens(uint32_t bank);
     /** Append tokens to the session's checkpoint WITHOUT decoding them: for
@@ -2633,12 +2633,6 @@ struct pulsar_session {
      * @return 0 on success. */
     int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
-
-/** Snapshot of every layer's compressed-row frontier, taken before a
- * speculative block so a rejected draft can be rolled back exactly. */
-typedef struct {
-    uint32_t n_comp[PULSAR_MAX_LAYER];        ///< compressed rows per kv source
-} pulsar_spec_frontier;
 
 /** Userdata wrapping a caller's progress callback during sync().
  *

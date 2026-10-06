@@ -319,7 +319,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int toks[17];
         int ntok = 0;
-        if (pulsar_engine_has_dspark(engine)) {
+        if (pulsar_engine_has_spec_rounds(engine)) {
             ntok = pulsar_session_generate_speculative(session,
                                                     cfg->gen.temperature, 0,
                                                     cfg->gen.top_p, cfg->gen.min_p, &rng,
@@ -1021,7 +1021,7 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
                     pulsar_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_dspark(engine) ||
+    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_spec_rounds(engine) ||
                pulsar_engine_is_tp(engine) || !pulsar_engine_has_argmax(engine)) {
         /* Sampled, drafted, tensor-parallel, OR a family without the whole-graph
          * path (Qwen): the session lane.  A TP engine cannot take the raw
@@ -1246,7 +1246,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int toks[17];
         int ntok = 0;
-        if (pulsar_engine_has_dspark(engine)) {
+        if (pulsar_engine_has_spec_rounds(engine)) {
             ntok = pulsar_session_generate_speculative(chat->session,
                                                     cfg->gen.temperature, 0,
                                                     cfg->gen.top_p, cfg->gen.min_p, &rng,

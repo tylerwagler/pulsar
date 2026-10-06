@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
+#include "spec_internal.h"
 #include "tp/pulsar_tp.h"
 #include "tp/pulsar_tp_gpu.h"
 #include "lib/qwen_tokenizer.h"
@@ -443,6 +444,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
+        e->drafter_ops = &k_dspark_drafter;   /* L272 P1: the drafter behind the round API */
         fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
                 e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
     }
@@ -1017,7 +1019,7 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
     for (int i = 0; i < 16; i++) out->verified_per_pos[i] = e->spec_verified_per_pos[i];
     out->max_draft = e->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
                          ? e->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;   /* L107: waterfall covers the adaptive range */
-    out->has_dspark = e->dspark_ready;
+    out->has_drafter = e->drafter_ops != NULL;
 }
 
 
@@ -1299,7 +1301,7 @@ void pulsar_ds4_session_destroy(pulsar_session *s) {
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
     s->bank_carry_free();
-    free(s->dspark_pending_qrows);
+    free(s->pend_qrows);
     free(s->spec_row_scratch);
     free(s->logits);
     free(s);

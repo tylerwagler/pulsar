@@ -13,6 +13,7 @@
  * touched-KV count is 0, so the guard never spills). */
 #include "pulsar_engine_internal.h"
 #include "family_qwen.h"
+#include "spec_internal.h"
 
 #include <string.h>
 
@@ -33,7 +34,15 @@ static void qwen_bank_save(pulsar_session *s, uint32_t bank) {
     memcpy(c->logits, s->logits, (size_t)nv * sizeof(float));
     c->checkpoint_valid = s->checkpoint_valid;
     c->logits_fresh = s->qwen->logits_fresh;
+    if (!c->spec) c->spec = (pulsar_spec_carry_state *)xcalloc(1, sizeof(*c->spec));
+    pulsar_spec_shadow_save(s, c->spec, &c->pend_qrows, &c->pend_qrows_cap);   /* L272 P1 */
     c->valid = true;
+}
+
+/* L272 P1: a non-live bank's saved speculative shadow for the round API's readers. */
+static const pulsar_spec_carry_state *qwen_bank_spec_carry(pulsar_session *s, uint32_t bank) {
+    if (!s || !s->qwen || bank >= s->qwen->n_banks || !s->qwen->carry[bank].valid) return NULL;
+    return s->qwen->carry[bank].spec;
 }
 
 static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
@@ -46,12 +55,15 @@ static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
         s->qwen->logits_fresh = false;
+        pulsar_spec_drop_pendings(&s->spec);   /* no shadow was saved: the fresh bank has no pendings or carry */
+        s->spec.spec_carry_valid = false;
         return true;
     }
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
     memcpy(s->logits, c->logits, (size_t)qwen_bank_logits_width(s) * sizeof(float));
     s->checkpoint_valid = c->checkpoint_valid;
     s->qwen->logits_fresh = c->logits_fresh;
+    pulsar_spec_shadow_restore(s, c->spec, c->pend_qrows, c->pend_qrows_cap);   /* L272 P1 */
     return true;
 }
 
@@ -108,4 +120,5 @@ const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .demand_paged_bytes = */ qwen_demand_paged_bytes,
     /* .touched_kv_bytes   = */ qwen_bank_touched_kv_bytes,
     /* .growth_bytes       = */ qwen_bank_growth_bytes,
+    /* .spec_carry         = */ qwen_bank_spec_carry,
 };

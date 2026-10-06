@@ -281,7 +281,7 @@ typedef struct {
     uint64_t accepted_per_pos[16];  ///< accepted count per draft position
     uint64_t verified_per_pos[16];  ///< count of rounds verifying position i; rate[i] = accepted_per_pos[i]/verified_per_pos[i]
     int      max_draft;             ///< configured draft depth (pulsar_engine_options::dspark_draft_tokens)
-    bool     has_dspark;            ///< true when speculative decode is active
+    bool     has_drafter;           ///< a drafter is loaded behind the round API (the counters above can move)
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
 /** Stable id for cache compatibility.  0 is the original Flash shape, so old
@@ -1050,7 +1050,16 @@ int pulsar_session_prefill_cap(pulsar_session *s);
  * exact and sync must run to completion. */
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
-bool pulsar_engine_has_dspark(pulsar_engine *e);
+/** Does speculation run on this engine: a drafter is loaded behind the round API AND the loaded family
+ *  provides the verify hooks (L272 P1).  The server's spec-batched lane and the classic
+ *  pulsar_session_generate_speculative key on this; which drafter it is, pulsar_engine_drafter says. */
+bool pulsar_engine_has_spec_rounds(const pulsar_engine *e);
+/** How many decoders one shared speculative verify forward may carry (0 without speculation): the
+ *  server runs its spec-batched lane up to this many decoders and the plain batched lane past it. */
+uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e);
+/** Can the loaded family rewind a live session to an earlier position (pulsar_session_rewind)?  A
+ *  recurrent family cannot; a caller with committed tokens the client never saw invalidates instead. */
+bool pulsar_engine_can_rewind(const pulsar_engine *e);
 /** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
  * front end without it runs greedy through the session lane (Qwen). */
 bool pulsar_engine_has_argmax(const pulsar_engine *e);

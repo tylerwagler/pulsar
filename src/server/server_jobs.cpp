@@ -1197,7 +1197,7 @@ void server::gen_decode_init(session_slot *sl) {
      * distribution left to report for an accepted draft token, and the
      * drafter's own is a different model — so the choice is fewer tokens per
      * second, never a number from the wrong distribution. */
-    g->dspark_spec_enabled = !j->req.logprobs;
+    g->spec_enabled = !j->req.logprobs;
     /* Entries from a superseded attempt (tool-error recovery) go with the
      * text they described: gen_decode_init discards g->text, so the ledger
      * restarts with it. */
@@ -1248,7 +1248,7 @@ void server::gen_decode_init(session_slot *sl) {
  * client sent explicitly is respected as-is. That includes an explicit
  * temperature==0, which selects greedy decode -- and nothing more: it does NOT
  * decide whether DSpark runs. Speculative decode is gated on one condition,
- * `dspark_spec_enabled = !req.logprobs` above, and `spec_accept_walk`
+ * `spec_enabled = !req.logprobs` above, and `spec_accept_walk`
  * (session_spec.cpp) carries BOTH acceptance rules -- greedy argmax match at
  * temperature 0, sampled p/q otherwise, with the L149 compact prefilter
  * (`spec_compact_dist`) serving the sparse min-p contract that the engine

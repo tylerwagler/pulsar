@@ -1259,7 +1259,7 @@ void server::publish_metrics_snapshot() {
         s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
         /* L112: adaptive draft depth, live-or-carry (pure host read) -- DSpark's; the Qwen MTP lane's
          * depth is fixed and the family refuses the query. */
-        s->m_slot_depth[i] = sl->provisioned && pulsar_engine_drafter(s->engine) == PULSAR_DRAFTER_DSPARK
+        s->m_slot_depth[i] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)
                 ? pulsar_session_bank_spec_depth(s->sess, sl->bank) : 0;
     }
     s->m_spec = m;
@@ -1395,36 +1395,28 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
     return sl->active_job && g && g->phase == GEN_DECODE;
 }
 
-/* worker_main's lane select over the gathered decode set (L179 branch 2).
- * 0 = idle, 3 = spec-batched (inc 6): every decoder can speculate, none has
- * joined a plain batch (n_batched == 0 -- no lane switch mid-conversation)
- * and the drafter is loaded; 4 = family-spec (L251): the family has its own
- * speculative generate (family_spec), EXACTLY ONE decoder, not in a plain
- * batch, speculation allowed for its request (no logprobs; the family's
- * generate is greedy or sampled, L270); 2 = plain batched otherwise (L118: every n_dec
- * >= 1 is a batch, a solo session is a batch of one). 1 is the retired
- * classic lane: reachable only with n_dec >= 1 and no pool, which the
- * gather loop never produces. Lane 3 keeps the spec_decode counters
- * advancing; lanes 2 and 4 do not. A slot leaves lane 4 for lane 2 freely
- * (its bank's logits stay fresh, which is what lane 2's entry draw reads);
- * it comes back once it decodes alone (server::batch_leave clears
- * batch_active before this pick, L271). */
-static int server_pick_decode_lane(int pool_banks, bool has_dspark, bool family_spec,
+/* Decode-lane selection, ONE rule for the whole sweep (L179): the spec-batched
+ * lane (3) takes every decoder when a drafter runs behind the round API
+ * (pulsar_engine_has_spec_rounds), every decoder speculates (spec_enabled: a
+ * logprobs request does not), none sits in the plain multiseq batch, and the
+ * decoders are no more than one shared verify forward carries
+ * (pulsar_engine_spec_banks_max: the pool on DeepSeek; one on Qwen until its GDN
+ * and PLE kernels take N banks x R rows, L272 P1 S4); the plain batched lane (2)
+ * otherwise; the classic lane (1) with no pool.  Lane 3 keeps the spec_decode
+ * counters advancing; lane 2 does not.  A lone decoder left in the plain batch
+ * rejoins lane 3 through server::batch_leave before this pick (L271, every
+ * family since L272 P1). */
+static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t banks_max,
                                    session_slot *const *dec, int n_dec, int n_batched) {
-    bool all_spec = has_dspark && n_dec >= 1 && n_batched == 0;
+    bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= banks_max && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
-        if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
+        if (!dg || !dg->spec_enabled || dg->batch_active)
             all_spec = false;
-    }
-    bool solo_spec = false;
-    if (pool_banks > 0 && family_spec && n_dec == 1 && n_batched == 0) {
-        const gen_state *dg = dec[0]->gen;
-        solo_spec = dg && dg->dspark_spec_enabled && !dg->batch_active;
     }
     const bool use_spec_batched = pool_banks > 0 && all_spec;
     const bool use_batched = use_spec_batched || (pool_banks > 0 && n_dec >= 1);
-    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (solo_spec ? 4 : (use_batched ? 2 : 1)));
+    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (use_batched ? 2 : 1));
 }
 
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
@@ -2462,14 +2454,25 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
                 if (done < na) {
                     /* L073, batched-lane edition: committed-but-never-emitted
-                     * tokens rewind, whatever ended the emission. */
+                     * tokens rewind, whatever ended the emission.  A family whose
+                     * state cannot rewind (Qwen's recurrent layers) has its bank's
+                     * view invalidated instead, so the next sync prefills it
+                     * rather than continuing a history the client never saw. */
                     const int ghost = na - done;
                     const int target = pulsar_session_pos(pool) - ghost;
-                    pulsar_session_rewind(pool, target);
-                    server_log(PULSAR_LOG_KVCACHE,
-                               "pulsar-server: spec batched round bank %u: rewound %d "
-                               "ghost tokens to pos %d",
-                               (unsigned)sl->bank, ghost, target);
+                    if (pulsar_engine_can_rewind(s->engine)) {
+                        pulsar_session_rewind(pool, target);
+                        server_log(PULSAR_LOG_KVCACHE,
+                                   "pulsar-server: spec batched round bank %u: rewound %d "
+                                   "ghost tokens to pos %d",
+                                   (unsigned)sl->bank, ghost, target);
+                    } else {
+                        pulsar_session_invalidate(pool);
+                        server_log(PULSAR_LOG_KVCACHE,
+                                   "pulsar-server: spec batched round bank %u: %d committed tokens past "
+                                   "the stop; bank view invalidated (no rewind on this family's state)",
+                                   (unsigned)sl->bank, ghost);
+                    }
                 }
                 pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
                 s->live_bank = -1;   /* saved: the next install need not save it again */
@@ -2566,28 +2569,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     }
 }
 
-/* L251 lane 4: the family's own speculative generate for ONE greedy decoder
- * (server_pick_decode_lane).  Same host discipline as the spec-batched lane
- * with the round loop inside the engine: the bank is made live, the engine
- * commits every returned token into the bank's checkpoint (a stop token is
- * returned last and never fed) and leaves the session's logits as the next
- * token's, so the slot needs no batch_feed/batch_pending reconciliation --
- * its finish step sees a token-true checkpoint.  The engine call is capped at
- * what the request can still take (max_tokens - completion) and the quantum,
- * so it never commits past max_tokens.  Emission is gen_emit_token per token
- * (stop strings, SSE, the Qwen output parser, finish reasons): when it stops
- * before the last returned token, the committed tail is a ghost the client
- * never saw, and a recurrent state has no rewind -- the bank's view is
- * invalidated (the stop-string path already did so), so the next sync
- * prefills it cold rather than continuing a history the client does not
- * have.  Mid-flight continued disk-KV stores are not run here, as on the
- * plain lane this family decoded on before. */
+/* L271 / L272 P1: a lone decoder leaves the plain multiseq batch to rejoin the spec-batched lane.  The
+ * bank is made live again (bank_state_restore clears the multiseq poison), the host checkpoint catches up
+ * to what multiseq committed, and the token the batch sampled (its logprob already captured) is fed,
+ * counted and emitted as the batch's next step would have -- so the session's logits are fresh for the
+ * round API's base draw, which draws the token after it. */
 bool server::batch_leave(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     pulsar_session *pool = s->sess;
-    /* the bank live again (bank_state_restore clears the multiseq poison), then the host checkpoint
-     * caught up to what multiseq committed -- the finish path's reconcile */
     if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         g->finish = "error";
@@ -2617,83 +2607,6 @@ bool server::batch_leave(session_slot *sl) {
     slot_writer_install(&g->writer);
     if (s->gen_emit_token(sl, tok)) g->phase = GEN_FINISH;
     return true;
-}
-
-void server::worker_family_spec_quantum(session_slot *sl) {
-    auto *s = this;
-    pulsar_session *pool = s->sess;
-    gen_state *g = sl->gen;
-    const int eos_token = pulsar_token_eos(s->engine);
-
-    s->guard_maybe_evict(&sl, 1);
-
-    if (lane_should_abandon(g, /*require_batch_feed=*/false, g->j->fd))
-        lane_abandon(g, /*drop_feed=*/false);
-
-    int accepted[PULSAR_SERVER_DECODE_QUANTUM_TOKENS];
-    int emitted_total = 0;
-    while (g->phase == GEN_DECODE && emitted_total < PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
-        if (g_stop_requested || g->completion >= g->max_tokens) {
-            g->phase = GEN_FINISH;
-            break;
-        }
-        if (!s->bank_switch(sl->bank)) {
-            snprintf(g->err, sizeof g->err,
-                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-            g->finish = "error";
-            g->phase = GEN_FINISH;
-            break;
-        }
-        if (pulsar_session_pos(pool) >= pulsar_session_ctx(pool)) {
-            g->finish = "length";
-            g->phase = GEN_FINISH;
-            break;
-        }
-        /* The lane was picked on this resolution; a tool-payload override
-         * that flipped since is picked up at the next quantum's lane select
-         * (one resolution per block, as in every lane). */
-        float temp, top_p, min_p; int top_k;
-        gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        int budget = PULSAR_SERVER_DECODE_QUANTUM_TOKENS - emitted_total;
-        if (budget > g->max_tokens - g->completion) budget = g->max_tokens - g->completion;
-        char err[160];
-        const int na = pulsar_session_generate_speculative(pool, temp, top_k, top_p, min_p, &g->rng,
-                                                           budget, eos_token, accepted, budget,
-                                                           err, sizeof err);
-        if (na <= 0) {
-            /* A refused round may have committed earlier rounds' tokens or
-             * left a half-repaired state: nothing on this bank is continued. */
-            pulsar_session_invalidate(pool);
-            pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
-            snprintf(g->err, sizeof g->err, "speculative generate failed: %s",
-                     na < 0 ? err : "no token returned");
-            g->finish = "error";
-            g->phase = GEN_FINISH;
-            break;
-        }
-        slot_writer_install(&g->writer);
-        int done = 0;
-        bool stopped = false;
-        for (int t = 0; t < na; t++) {
-            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-            done = t + 1;
-            if (s->gen_emit_token(sl, accepted[t])) { stopped = true; break; }
-        }
-        if (done < na) {
-            pulsar_session_invalidate(pool);
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: family spec bank %u: %d committed tokens past the stop; "
-                       "bank view invalidated (no rewind on a recurrent state)",
-                       (unsigned)sl->bank, na - done);
-        }
-        if (stopped) g->phase = GEN_FINISH;
-        sl->committed_pos = pulsar_session_pos(pool);
-        sl->tokens_emitted += (uint64_t)done;
-        pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
-        emitted_total += done;
-    }
-    sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-    slot_writer_flush(&g->writer);
 }
 
 /* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
@@ -3192,17 +3105,16 @@ void *worker_main(void *arg) {
          * loop, so this is what tells a scraper whether the spec_decode_*
          * counters describe the present or some earlier single-request stretch. */
         /* L271: a lone decoder still in the plain batch (it shared it with a request that has since
-         * finished -- Claude Code's side calls) rejoins the family's speculation */
-        if (s->family_spec && n_dec == 1 && n_batched == 1 && dec[0]->gen->dspark_spec_enabled &&
-            !pulsar_engine_has_dspark(s->engine)) {
+         * finished -- Claude Code's side calls) rejoins speculation (L272 P1: every family) */
+        if (n_dec == 1 && n_batched == 1 && dec[0]->gen->spec_enabled && dec[0]->gen->batch_active &&
+            pulsar_engine_has_spec_rounds(s->engine)) {
             s->batch_leave(dec[0]);
             n_batched = 0;
         }
         s->w_decode_lane = server_pick_decode_lane(s->pool_banks,
-                                                   pulsar_engine_has_dspark(s->engine),
-                                                   s->family_spec, dec, n_dec, n_batched);
+                                                   pulsar_engine_has_spec_rounds(s->engine),
+                                                   pulsar_engine_spec_banks_max(s->engine), dec, n_dec, n_batched);
         const bool use_spec_batched = s->w_decode_lane == 3;
-        const bool use_family_spec = s->w_decode_lane == 4;
         const bool use_batched = s->w_decode_lane >= 2;
 
         if (use_batched) {
@@ -3215,8 +3127,6 @@ void *worker_main(void *arg) {
             const int budget = worker_decode_budget(s);
             if (use_spec_batched) {
                 s->worker_spec_batched_quantum(dec, n_dec, budget);
-            } else if (use_family_spec) {
-                s->worker_family_spec_quantum(dec[0]);
             } else {
                 pf_fuse = s->worker_find_fuse_prefill();
                 if (pf_fuse) s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse);

@@ -725,12 +725,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (!worker_refused(e, c, "generate_speculative", &slot, ferr, sizeof(ferr))) {
             uint64_t rng = c->spec.rng;
             int *acc = worker_accepted(slot, c->spec.i2);
-            const pulsar_family_session_ops *fs = e->family->session;
-            const int n = fs->generate_speculative
-                ? fs->generate_speculative(slot->s, c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
-                                           &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr))
-                : slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
-                                                &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
+            const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
+                                                        &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;
             if (status < 0) status = 0;
             if (n < 0) {

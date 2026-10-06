@@ -326,7 +326,7 @@ int GATE_ENTRY(int argc, char **argv) {
     memset(&o, 0, sizeof o);
     o.model_path = argv[1];
     o.backend = PULSAR_BACKEND_CUDA;
-    if (gate_engine_open(&g_e, &o) != 0 || !pulsar_engine_has_dspark(g_e)) {
+    if (gate_engine_open(&g_e, &o) != 0 || !pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "engine open failed or no drafter\n");
         return 1;
     }

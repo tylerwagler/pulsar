@@ -192,7 +192,11 @@ static void gpu_part(const char *dir) {
           "a mixed row at the wrong position refused: %s", err);
     free(logits);
     check(pulsar_session_payload_bytes(sess) == 0, "payload refused (no PAYLOAD cap)");
-    check(pulsar_session_spec_next_base(sess, 0.0f, 0, 1.0f, 0.0f, NULL) < 0, "speculation refused (no SPEC cap)");
+    /* L272 P1 S3: Qwen speculates through the round API -- the family declares CAP_SPEC and its verify hooks;
+     * whether rounds run is the drafter's call, and the fixture carries no MTP sidecar (qwen_family_container.py
+     * skips those tensors), so this engine has none. */
+    check((e->family->caps & PULSAR_FAMILY_CAP_SPEC) && e->family->spec, "the family declares CAP_SPEC + verify hooks");
+    check(!pulsar_engine_has_spec_rounds(e), "no spec rounds without a drafter (the fixture has no MTP sidecar)");
     pulsar_session_invalidate(sess);
     pulsar_session_free(sess);
     pulsar_engine_close(e);

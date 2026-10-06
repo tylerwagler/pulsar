@@ -1365,16 +1365,6 @@ struct server {
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
-    /** L251: the loaded family decodes speculatively through its OWN
-     * pulsar_session_generate_speculative (Qwen's MTP; not the DSpark round
-     * API, which stays DeepSeek-only) and --no-dspark did not turn it off.
-     * Arms decode lane 4 (worker_family_spec_quantum). Set once at startup
-     * from pulsar_engine_family; the engine exposes no query for "this
-     * family has its own speculative generate AND its drafter is loaded", so
-     * an artifact without the MTP sidecar fails its greedy solo decodes by
-     * the engine's own name ("needs the MTP layer") -- start such a model
-     * with --no-dspark. */
-    bool         family_spec;
     /** Deep-concurrent guard for the fused lane: when the aggregate committed
      * depth (sum of committed_pos) of the active decode set exceeds this many
      * rows, worker_find_fuse_prefill refuses to fuse — the decode step is
@@ -2034,17 +2024,8 @@ struct server {
      * fresh conversation's bank at 0 (invalidate), and refuse (no_fuse) a prompt
      * that does not extend the bank's history; leaves no bank live. */
     bool fuse_prepare(session_slot *sl);
-    /** L251 lane 4: ONE greedy decoder on a family with its own speculative
-     * generate (family_spec).  Makes the slot's bank live, runs
-     * pulsar_session_generate_speculative for up to a quantum of tokens (the
-     * engine commits them into the bank's checkpoint and leaves its logits
-     * fresh), and emits each through gen_emit_token.  Tokens committed but
-     * not emitted (a stop string, a failed client write) cannot be rewound
-     * on a recurrent state: the bank's view is invalidated instead, so the
-     * next sync prefills it cold. */
-    void worker_family_spec_quantum(session_slot *sl);
-    /** L271: a slot in the plain batch rejoins speculation once it is the only decoder (the family's
-     *  generate): its committed tokens reconcile onto the host checkpoint and its sampled feed token is
+    /** L271 / L272 P1: a slot in the plain batch rejoins the spec-batched lane once it is the only
+     *  decoder: its committed tokens reconcile onto the host checkpoint and its sampled feed token is
      *  fed and emitted, as the batch would have.  false = the slot failed (its phase says why). */
     bool batch_leave(session_slot *sl);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
@@ -2378,7 +2359,7 @@ struct gen_state {
     bool thinking_gates_tool_markers;
     bool tool_scan_waiting_for_think_close;  ///< a marker was seen inside reasoning; scan resumes after the block
     size_t think_recovery_scan_from;   ///< where to resume scanning after a malformed reasoning block
-    bool dspark_spec_enabled;          ///< speculative decoding is active for this request
+    bool spec_enabled;          ///< speculative decoding is active for this request
     dsml_decode_tracker dsml_tracker;  ///< decode-time DSML marker tracking
 
     /** Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot

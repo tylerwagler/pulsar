@@ -41,6 +41,7 @@
 #include <stdbool.h>
 
 #include "pulsar.h"
+#include "spec_ops.h"
 
 /* Included from pulsar_engine_internal.h, after pulsar_model; not a standalone
  * header. */
@@ -76,7 +77,7 @@ uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k
  * (pulsar_family_require). */
 enum : uint32_t {
     PULSAR_FAMILY_CAP_BANKS   = 1u << 0,  ///< a bank pool > 1: repoint, fork, physical residency, bank state save/restore, per-bank KV spill
-    PULSAR_FAMILY_CAP_SPEC    = 1u << 1,  ///< speculative decoding (the DSpark drafter; Qwen's MTP when it lands)
+    PULSAR_FAMILY_CAP_SPEC    = 1u << 1,  ///< speculative decoding: the family provides pulsar_family::spec (the verify hooks) for whichever drafter is loaded
     PULSAR_FAMILY_CAP_PAYLOAD = 1u << 2,  ///< disk-KV payloads and snapshots (save/load/stage/mirror)
     PULSAR_FAMILY_CAP_REWIND  = 1u << 3,  ///< rewind / rewrite-from-common to an earlier position of a live session
     PULSAR_FAMILY_CAP_VISION  = 1u << 4,  ///< image spans in a prompt
@@ -112,12 +113,6 @@ typedef struct {
                         uint32_t max_head_runs, char *err, size_t errlen);
     /** Forget the session's state (the next sync prefills cold). */
     void (*invalidate)(pulsar_session *s);
-    /** The family's OWN speculative generate (pulsar_session_generate_speculative's contract), or
-     *  NULL = the DSpark path (session_spec.cpp, under PULSAR_FAMILY_CAP_SPEC).  Qwen's MTP drafter
-     *  (L251) implements only this entry, not the round API, so it does not declare CAP_SPEC. */
-    int (*generate_speculative)(pulsar_session *s, float temperature, int top_k, float top_p, float min_p,
-                                uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap,
-                                char *err, size_t errlen);
 } pulsar_family_session_ops;
 
 /** A family's own bank pool (L251): the server's per-bank bookkeeping for a
@@ -151,6 +146,9 @@ typedef struct {
     uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
     /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
     uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
+    /** L272 P1: a NON-live bank's saved speculative shadow (what its save took of pulsar_session::spec), or
+     *  NULL when nothing is saved.  The round API's per-bank readers (pending confidences, depth). */
+    const struct pulsar_spec_carry_state *(*spec_carry)(pulsar_session *s, uint32_t bank);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family
@@ -183,6 +181,9 @@ struct pulsar_family {
      *  20 + the highest rate present in half bits (24 = K2 .. 36 = K8), so an EXL3 build never shares
      *  a store with the IQ2 (2) or MXFP4 (4) tier of the same model id.  0 = no routed experts. */
     int (*quant_bits)(pulsar_engine *e);
+    /** The family's verify hooks for the speculation round API (spec_ops.h), or NULL = no drafter can
+     *  run against this family's forward (L272 P1; a family without them does not declare CAP_SPEC). */
+    const pulsar_spec_target_ops *spec;
     const pulsar_family_session_ops *session;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;

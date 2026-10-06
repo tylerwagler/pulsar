@@ -11,6 +11,8 @@
 #include "exl3_trellis.h"
 #include "lib/qwen_tokenizer.h"
 #include "tp/pulsar_tp.h"
+#include "spec_internal.h"
+#include "qwen_forward.h"
 
 const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
     /* .name              = */ "Qwen3.8-Flash-Next",
@@ -584,6 +586,9 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!pulsar_qwen_s4_load(e, opt)) return false;
     if (!pulsar_qwen_tp_load(e)) return false;
     if (!qwen_load_tokenizer(e, opt->model_path)) return false;
+    /* L272 P1: the MTP layer is the drafter behind the round API (spec_qwen.cpp); the drafter option
+     * (--no-dspark) turns drafting off for this family as it does for DeepSeek's */
+    if (e->qwen_weights->mtp.present && !opt->dspark_disable) e->drafter_ops = &k_mtp_drafter;
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),
@@ -943,12 +948,6 @@ static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_s
 }
 
 static void qwen_session_destroy(pulsar_session *s) {
-    if (s->qwen && s->qwen->spec_rounds)
-        fprintf(stderr, "pulsar: %s: MTP speculation: %llu rounds, %llu drafts, %llu kept (%.1f%%), %.2f tokens per "
-                        "round\n", PULSAR_QWEN_ARCH, (unsigned long long)s->qwen->spec_rounds,
-                (unsigned long long)s->qwen->spec_drafted, (unsigned long long)s->qwen->spec_kept,
-                s->qwen->spec_drafted ? 100.0 * (double)s->qwen->spec_kept / (double)s->qwen->spec_drafted : 0.0,
-                (double)(s->qwen->spec_rounds + s->qwen->spec_kept) / (double)s->qwen->spec_rounds);
     if (s->qwen && s->qwen->mtp_probe_n)
         fprintf(stderr, "pulsar: %s: MTP probe: draft position 1 agreed with the trunk's argmax %llu of %llu (%.1f%%)\n",
                 PULSAR_QWEN_ARCH, (unsigned long long)s->qwen->mtp_probe_hit, (unsigned long long)s->qwen->mtp_probe_n,
@@ -957,6 +956,8 @@ static void qwen_session_destroy(pulsar_session *s) {
         for (uint32_t b = 0; b < s->qwen->n_banks; b++) {
             token_vec_free(&s->qwen->carry[b].checkpoint);
             free(s->qwen->carry[b].logits);
+            free(s->qwen->carry[b].pend_qrows);
+            free(s->qwen->carry[b].spec);
         }
         free(s->qwen->carry);
         s->qwen->carry = NULL;
@@ -1024,9 +1025,9 @@ static bool qwen_tp_allreduce_y(pulsar_session *s, uint32_t il, uint32_t n_rows,
     return ok;
 }
 
-static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
-                         const int32_t *pos, const int32_t *bank, uint32_t n_rows,
-                         uint32_t head_row0, uint32_t head_n, float *logits_out, bool verify = false) {
+bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
+                  const int32_t *pos, const int32_t *bank, uint32_t n_rows,
+                  uint32_t head_row0, uint32_t head_n, float *logits_out, bool verify) {
     pulsar_engine *e = s->engine;
     const pulsar_qwen_ops *ops = &g_qwen_ops;
     uint32_t at = 0;
@@ -1127,9 +1128,9 @@ static bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const in
 /* The MTP layer over rows [0, n_rows) of mtp_h (trunk stacks), tokens = x_{p+1} per row; heads rows
  * [head_row0, head_row0 + head_n) into logits_out.  Its failure leaves the trunk untouched; the MTP
  * rows' banks lose their pending row (their MTP cache has a hole the drafter must not read past). */
-static bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
-                             const int32_t *pos, const int32_t *bank, uint32_t n_rows,
-                             uint32_t head_row0, uint32_t head_n, float *logits_out) {
+bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
+                      const int32_t *pos, const int32_t *bank, uint32_t n_rows,
+                      uint32_t head_row0, uint32_t head_n, float *logits_out) {
     pulsar_engine *e = s->engine;
     const pulsar_qwen_ops *ops = &g_qwen_ops;
     const uint32_t il = e->plan.n_layer;                /* the MTP layer's slot */
@@ -1176,7 +1177,7 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, cons
 
 /* The drafter's greedy token from one MTP head row (n_draft logits); *prob (optional) is its softmax
  * probability over the draft head -- the confidence the draft schedule reads. */
-static int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row, float *prob = NULL) {
+int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row, float *prob) {
     const uint32_t n = e->qwen_weights->n_draft;
     uint32_t a = 0;
     for (uint32_t i = 1; i < n; i++) if (row[i] > row[a]) a = i;
@@ -1433,8 +1434,39 @@ static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_re
                                      uint32_t max_head_runs, char *err, size_t errlen) {
     if (out_n_rows) *out_n_rows = 0;
     if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) {
-        if (err) snprintf(err, errlen, "%s: a verify step (heads on every row) is not implemented", PULSAR_QWEN_ARCH);
-        return 1;
+        /* L272 P1 S3: the speculation lane's verify -- ONE bank's run [p, p + n) at its next position, every
+         * row headed into the caller's block, the per-row state capture armed (the target's commit rolls
+         * the rejected rows back, pulsar_qwen_s4_spec_rollback).  Several banks' runs in one step: S4. */
+        const uint32_t nv = g_qwen_shape.n_vocab;
+        if (!reqs || n_rows == 0 || n_rows > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u || !logits || logits_cap < 0 ||
+            (uint64_t)logits_cap < (uint64_t)n_rows * nv || !s->qwen->mtp) {
+            if (err) snprintf(err, errlen, "%s: a verify step of %u rows refused (bad args, or no MTP layer)",
+                              PULSAR_QWEN_ARCH, n_rows);
+            return 1;
+        }
+        const uint32_t b = reqs[0].bank;
+        int32_t tok[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bk[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
+        for (uint32_t i = 0; i < n_rows; i++) {
+            if (reqs[i].bank != b) {
+                if (err) snprintf(err, errlen, "%s: a verify step over several banks is not implemented (one bank's run "
+                                  "a step until the GDN and PLE kernels take N banks x R rows)", PULSAR_QWEN_ARCH);
+                return 1;
+            }
+            if (b >= s->qwen->n_banks || (uint32_t)reqs[i].pos != s->qwen->bank_pos[b] + i) {
+                if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not the bank's next position",
+                                  PULSAR_QWEN_ARCH, i, b, reqs[i].pos);
+                return 1;
+            }
+            tok[i] = reqs[i].token;
+            pos[i] = reqs[i].pos;
+            bk[i] = (int32_t)b;
+        }
+        if (!qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bk, n_rows, 0, n_rows, logits, true)) {
+            if (err) snprintf(err, errlen, "%s: the verify step refused (see the log for the op)", PULSAR_QWEN_ARCH);
+            return -1;
+        }
+        if (out_n_rows) *out_n_rows = n_rows;
+        return 0;
     }
     for (uint32_t i = 0; reqs && i < n_rows; i++)
         for (uint32_t j = 0; j < i; j++)
@@ -1458,247 +1490,19 @@ static void qwen_session_invalidate(pulsar_session *s) {
     s->qwen->logits_fresh = false;
 }
 
-/* ---- L251 MTP: greedy speculative generation (the family's generate_speculative) ------------------
- * pulsar_session_generate_speculative's contract on the live bank: the first token is the argmax of
- * the session's logits, a stop token is emitted but never fed, and at return the session's logits are
- * the next token's.  A round, at bank position p with next token x:
- *   draft   the MTP row (pending stack at p - 1, x) -- the lockstep row, headed -- gives d_1; each
- *           further step feeds the MTP's own pre-mixer streams with d_j at p + j - 1 (spec (e));
- *   verify  the trunk runs [x, d_1 .. d_k] at p .. p + k as ONE step with every row headed.  k + 1 is
- *           at most 5, so every kernel takes its decode-width arm and each row's logits are the bytes
- *           one-token decode would give: the output IS greedy decoding's, only faster;
- *   accept  greedy: the longest prefix of drafts the trunk agrees with, plus the trunk's next token.
- *           Sampled (temperature > 0): drafts are DRAWN from the MTP's distribution q (built by the
- *           shared sampler from its draft-vocabulary row, same temperature / top-k / top-p / min-p), each
- *           kept with probability min(1, p/q) against the trunk's p (pulsar_sample_dist_accept_pq); the
- *           first rejection draws the next token from (p - q)+ (pulsar_sample_dist_draw_residual), and a
- *           round that keeps every draft draws it from the last row's p -- the output is distributed
- *           exactly as plain sampling's (L186's rule, the one DSpark's sampled lane uses);
- *   repair  the recurrent state rolls back to the last kept row (pulsar_qwen_s4_spec_rollback); the
- *           MTP layer's stage returns to its snapshot after the lockstep row, the kept rows get their
- *           MTP rows (the drafts' KV at those positions is overwritten), the last kept row is pending.
- * The draft schedule (K, tau) only decides how many drafts a round makes, so it never biases the output. */
-static uint32_t qwen_argmax(const float *v, uint32_t n) {
+uint32_t qwen_argmax(const float *v, uint32_t n) {
     uint32_t a = 0;
     for (uint32_t i = 1; i < n; i++) if (v[i] > v[a]) a = i;
     return a;
 }
 
 /* L270: the MTP's sampled distribution q over its draft vocabulary, ids mapped to the vocabulary. */
-static bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
-                          pulsar_sample_dist *q) {
+bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
+                   pulsar_sample_dist *q) {
     const pulsar_qwen_weights *w = s->engine->qwen_weights;
     if (!pulsar_sample_dist_build(row, w->n_draft, temperature, top_k, top_p, min_p, &s->sample_scratch, q)) return false;
     for (uint32_t i = 0; i < q->n; i++) q->ids[i] = (int)w->draft_ids[q->ids[i]];
     return true;
-}
-
-static int qwen_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p,
-                                             float min_p, uint64_t *rng, int max_tokens, int eos_token,
-                                             int *accepted, int accepted_cap, char *err, size_t errlen) {
-    pulsar_engine *e = s->engine;
-    pulsar_qwen_state *q = s->qwen;
-    const pulsar_qwen_shape *sh = &g_qwen_shape;
-    if (!q->mtp) {
-        if (err) snprintf(err, errlen, "%s: speculative decoding needs the MTP layer (the sidecar shard)", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    const bool sampled = temperature > 0.0f;
-    if (sampled && !rng) {
-        if (err) snprintf(err, errlen, "%s: sampled speculation needs the request's rng", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    if (max_tokens <= 0 || !accepted || accepted_cap <= 0) return 0;
-    const uint32_t b = q->live_bank;
-    if (!s->checkpoint_valid || !q->logits_fresh || q->bank_pos[b] != (uint32_t)s->checkpoint.len) {
-        if (err) snprintf(err, errlen, "%s: speculative generate needs a synced session", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    /* The draft schedule: the chain continues while the last draft's MTP probability is >= tau, up to K
-     * (TensorFold's rule).  Swept on sparky over three code prompts (2026-09-29): K = 4, tau = 0.7 gives
-     * 58.7 / 58.9 / 59.2 tok/s vs 53.4 for a fixed K = 3; TensorFold's own 6 / 0.6 is 53.6 here -- a verify
-     * row costs more on this engine (4 rows read up to 40 distinct experts).  tau = 0 is a
-     * fixed depth of K.  PULSAR_QWEN_MTP_TAU / PULSAR_QWEN_MTP_K override them (the engine's DSpark depth
-     * option resolves an unset value to 3, so it cannot carry this family's default). */
-    static const int K = [] {
-        const char *k = getenv("PULSAR_QWEN_MTP_K");
-        const int v = k && k[0] ? atoi(k) : 4;
-        return v < 1 ? 1 : v > (int)PULSAR_QWEN_SPEC_DRAFT_MAX ? (int)PULSAR_QWEN_SPEC_DRAFT_MAX : v;
-    }();
-    static const float tau = [] {
-        const char *t = getenv("PULSAR_QWEN_MTP_TAU");
-        return t && t[0] ? (float)atof(t) : 0.7f;
-    }();
-    /* NOT the adaptive cap (spec_depth.h, DSpark's L107 rule): measured 2026-09-29 on three code prompts it
-     * LOST to the fixed cap of 4 (52-59 vs 59.5-60.4 tok/s at tau 0.6-0.8).  The confidence stop already
-     * adapts inside every round, and the rule's down-signal (< half converted) fires on chains that stopped
-     * early by design.  DSpark needs it because it drafts all K at once and cannot stop early. */
-    const uint32_t V = sh->n_vocab, il_mtp = e->plan.n_layer;
-    const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
-    const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
-    float *L = q->spec_logits;                           /* (DRAFT_MAX + 1) rows, allocated with the MTP state */
-    const int cap = max_tokens < accepted_cap ? max_tokens : accepted_cap;
-    int n_out = 0, rc = 0;
-    /* the trunk's distribution over row `r` of `rows` (sampled), and one token from it */
-    pulsar_sample_dist pd{}, qd[PULSAR_QWEN_SPEC_DRAFT_MAX + 1] = {};
-    auto draw_from = [&](const float *rows) -> int32_t {
-        pulsar_sample_dist t{};
-        int32_t tok = -1;
-        if (pulsar_sample_dist_build(rows, V, temperature, top_k, top_p, min_p, &s->sample_scratch, &t))
-            tok = (int32_t)pulsar_sample_dist_draw(&t, rng);
-        pulsar_sample_dist_free(&t);
-        return tok;
-    };
-    int32_t x = sampled ? draw_from(s->logits) : (int32_t)qwen_argmax(s->logits, V);
-    if (x < 0) {
-        if (err) snprintf(err, errlen, "%s: the logits row has no distribution to sample", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    uint64_t rounds = 0, drafted = 0, kept = 0;
-    while (n_out < cap) {
-        if (pulsar_token_is_stop(e, x) || x == eos_token) { accepted[n_out++] = x; break; }
-        const uint32_t p = q->bank_pos[b];
-        /* drafts: at most what the output and the context still take after x */
-        if ((int64_t)p + 1 > (int64_t)s->ctx_size) {
-            if (err) snprintf(err, errlen, "%s: the context is full", PULSAR_QWEN_ARCH);
-            rc = -1;
-            break;
-        }
-        int k = K;
-        if (k > cap - n_out - 1) k = cap - n_out - 1;
-        if ((int64_t)p + k + 1 > (int64_t)s->ctx_size) k = s->ctx_size - (int)p - 1;
-        /* no pending row (an MTP step failed): this round verifies x alone and re-parks */
-        const bool pend = q->mtp_pend_pos[b] != UINT32_MAX && q->mtp_pend_pos[b] + 1u == p;
-        if (!pend) k = 0;
-        int32_t d[PULSAR_QWEN_SPEC_DRAFT_MAX + 1] = {x};
-        bool ok = true;
-        const int32_t bb = (int32_t)b;
-        if (pend) {
-            /* the lockstep row (stack at p - 1, x), headed: d_1 */
-            int32_t tp = (int32_t)p - 1;
-            ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_pend, (uint64_t)b * hc, hc) != 0 &&
-                 qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, k > 0 ? 1u : 0u, L);
-            q->mtp_pend_pos[b] = UINT32_MAX;              /* consumed; re-parked after the verify */
-            float conf = 1.0f;
-            /* one draft from the MTP row in L: its argmax (greedy), or a draw from q (sampled; conf = q(d)) */
-            auto draft = [&](int j) -> bool {
-                if (!sampled) {
-                    d[j] = qwen_mtp_argmax(e, L, &conf);
-                    return true;
-                }
-                if (!qwen_mtp_dist(s, L, temperature, top_k, top_p, min_p, &qd[j])) return false;
-                d[j] = (int32_t)pulsar_sample_dist_draw(&qd[j], rng);
-                conf = pulsar_sample_dist_prob(&qd[j], d[j]);
-                return d[j] >= 0;
-            };
-            if (ok && k > 0) {
-                ok = draft(1);
-                /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows */
-                ok = ok && pulsar_gpu_tensor_copy_async(q->spec.qsa_stage, (uint64_t)q->spec.n_qsa * itb,
-                                                        q->layer[il_mtp].idx_tail, (uint64_t)b * itb, itb) != 0;
-            }
-            for (int j = 2; ok && j <= k; j++) {
-                if (conf < tau) { k = j - 1; break; }      /* the schedule: stop on an unsure draft */
-                tp = (int32_t)p + j - 2;
-                ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_streams, 0, hc) != 0 &&
-                     qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &d[j - 1], &tp, &bb, 1, 0, 1, L);
-                if (ok) ok = draft(j);
-            }
-        }
-        /* verify [x, d_1 .. d_k] at p .. p + k, every row headed */
-        const uint32_t R = (uint32_t)k + 1u;
-        int32_t vp[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], vb[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
-        for (uint32_t i = 0; i < R; i++) { vp[i] = (int32_t)(p + i); vb[i] = bb; }
-        if (ok) ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, d, vp, vb, R, 0, R, L, true);
-        if (!ok) {
-            if (err) snprintf(err, errlen, "%s: a speculative round failed (see the log)", PULSAR_QWEN_ARCH);
-            rc = -1;
-            break;
-        }
-        uint32_t a = 0;                                   /* drafts the trunk keeps */
-        int32_t next = -1;                                /* sampled: the round's next token */
-        if (!sampled) {
-            while (a < (uint32_t)k && qwen_argmax(L + (size_t)a * V, V) == (uint32_t)d[a + 1]) a++;
-        } else {
-            for (;; a++) {
-                pulsar_sample_dist_free(&pd);
-                if (!pulsar_sample_dist_build(L + (size_t)a * V, V, temperature, top_k, top_p, min_p, &s->sample_scratch,
-                                              &pd)) { ok = false; break; }
-                if (a == (uint32_t)k) { next = (int32_t)pulsar_sample_dist_draw(&pd, rng); break; }
-                if (!pulsar_sample_dist_accept_pq(&pd, d[a + 1], pulsar_sample_dist_prob(&qd[a + 1], d[a + 1]), rng)) {
-                    next = (int32_t)pulsar_sample_dist_draw_residual(&pd, &qd[a + 1], &s->sample_scratch, rng);
-                    break;
-                }
-            }
-            if (ok && next < 0) ok = false;
-            for (int j = 1; j <= k; j++) pulsar_sample_dist_free(&qd[j]);
-            if (!ok) {
-                if (err) snprintf(err, errlen, "%s: a sampled round found no distribution (see the log)", PULSAR_QWEN_ARCH);
-                rc = -1;
-                break;
-            }
-        }
-        /* a stop token among the kept drafts is emitted but not fed: keep the rows before it */
-        uint32_t keep = a + 1u;
-        int32_t stop_tok = -1;
-        for (uint32_t i = 1; i <= a; i++)
-            if (pulsar_token_is_stop(e, d[i]) || d[i] == eos_token) { keep = i; stop_tok = d[i]; break; }
-        pulsar_qwen_step vst{};
-        vst.shape = sh; vst.w = e->qwen_weights; vst.plan = &e->plan; vst.st = q;
-        vst.n_rows = R; vst.tokens = d; vst.pos = vp; vst.bank = vb;
-        ok = pulsar_qwen_s4_spec_rollback(&vst, keep);
-        /* the MTP layer: its stage back to the snapshot, the kept rows' MTP rows (stack at p + i, x_{p+i+1})
-         * for i < keep - 1, the last kept row pending */
-        if (ok && pend && k > 0)
-            ok = pulsar_gpu_tensor_copy_async(q->layer[il_mtp].idx_tail, (uint64_t)b * itb, q->spec.qsa_stage,
-                                              (uint64_t)q->spec.n_qsa * itb, itb) != 0;
-        if (ok && keep > 1u) {
-            ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->streams, 0, (uint64_t)(keep - 1u) * hc) != 0 &&
-                 qwen_mtp_forward(s, PULSAR_QWEN_STEP_PREFILL, d + 1, vp, vb, keep - 1u, 0, 0, NULL);
-        }
-        if (ok) ok = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams,
-                                                  (uint64_t)(keep - 1u) * hc, hc) != 0;
-        if (!ok) {
-            if (err) snprintf(err, errlen, "%s: a speculative round's repair failed (see the log)", PULSAR_QWEN_ARCH);
-            rc = -1;
-            break;
-        }
-        q->mtp_pend_pos[b] = p + keep - 1u;
-        qwen_bank_set_pos(q, b, p + keep);
-        for (uint32_t i = 0; i < keep; i++) {
-            token_vec_push(&s->checkpoint, d[i]);
-            accepted[n_out++] = d[i];
-        }
-        memcpy(s->logits, L + (size_t)(keep - 1u) * V, (size_t)V * sizeof(float));
-        rounds++;
-        drafted += (uint64_t)k;
-        kept += keep - 1u;
-        /* the engine's cumulative counters (pulsar_engine_spec_metrics, /metrics) by DSpark's rule in
-         * session_spec.cpp round_end: a round counts as a draft when it carried one (L272 B12) */
-        e->spec_gen_tokens += keep;
-        if (k > 0) {
-            e->spec_draft_tokens += (uint64_t)k;
-            e->spec_accepted_tokens += keep - 1u;
-            e->spec_num_drafts += 1u;
-            for (int i = 0; i < k && i < 16; i++) e->spec_verified_per_pos[i]++;
-            for (uint32_t i = 0; i + 1u < keep && i < 16u; i++) e->spec_accepted_per_pos[i]++;
-        }
-        if (stop_tok >= 0) { if (n_out < cap) accepted[n_out++] = stop_tok; break; }
-        x = sampled ? next : (int32_t)qwen_argmax(s->logits, V);
-    }
-    pulsar_sample_dist_free(&pd);
-    for (int j = 1; j <= (int)PULSAR_QWEN_SPEC_DRAFT_MAX; j++) pulsar_sample_dist_free(&qd[j]);
-    if (rc < 0) {
-        /* a failed round may have moved the bank's state past what the host view says (a half-applied
-         * repair, a dropped pending row): nothing on this bank is continued -- the next sync prefills */
-        s->checkpoint_valid = false;
-        s->checkpoint.len = 0;
-    }
-    q->logits_fresh = rc == 0;
-    q->spec_rounds += rounds;
-    q->spec_drafted += drafted;
-    q->spec_kept += kept;
-    return rc < 0 ? rc : n_out;
 }
 
 static const pulsar_family_session_ops k_qwen_session_ops = {
@@ -1710,7 +1514,6 @@ static const pulsar_family_session_ops k_qwen_session_ops = {
     /* .decode_multiseq = */ qwen_session_decode_multiseq,
     /* .decode_mixed    = */ qwen_session_decode_mixed,
     /* .invalidate      = */ qwen_session_invalidate,
-    /* .generate_speculative = */ qwen_session_generate_speculative,
 };
 
 /* The trunk's layers and the MTP layer each take an exchange slot (L266 step 7). */
@@ -1724,7 +1527,8 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .id           = */ PULSAR_FAMILY_ID_QWEN4_EXP,
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
-    /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_TP,
+    /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_TP |
+                          PULSAR_FAMILY_CAP_SPEC,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
@@ -1734,6 +1538,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .tp_shape     = */ qwen_tp_shape,
     /* .drafter      = */ qwen_drafter,
     /* .quant_bits   = */ qwen_quant_bits,
+    /* .spec         = */ &k_qwen_spec_target,
     /* .session      = */ &k_qwen_session_ops,
     /* .banks        = */ &k_qwen_bank_ops,
 };

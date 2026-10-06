@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "spec_internal.h"
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
@@ -318,7 +319,9 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_IMATRIX, "imatrix collection", 1); return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); e->dump_tokens(tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
-bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
+bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
+bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
+uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
 bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 
@@ -1136,7 +1139,7 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
 int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     if (s && FAMILY_BANKS(s)) return (int)FAMILY_BANKS(s)->prefill_frontier(s, bank);
     return s ? s->bank_prefill_frontier(bank) : 0; }
-int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return s->bank_spec_depth(bank); }
+int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     return s && !FAMILY_BANKS(s) && bank < s->graph.banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph.ms_comp_state_stale[bank];
 }
@@ -1225,17 +1228,13 @@ static int tp_spec_route(pulsar_session *s, const char *operation, pulsar_tp **t
 
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
-    /* a family with its own speculative generate (Qwen's MTP, L251) runs it; the rest is DSpark's.  Either is
-     * mirrored the same way on a pair (L266: the family's returned before the frame). */
-    const pulsar_family_session_ops *fs = s ? s->engine->family->session : NULL;
-    const bool own_spec = fs && fs->generate_speculative;
-    if (!own_spec) PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
+    /* the round API's single lane (session_spec.cpp), whichever family and drafter are loaded (L272 P1);
+     * mirrored the same way on a pair */
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return 0;
     auto local = [&]() {
-        return own_spec ? fs->generate_speculative(s, temperature, top_k, top_p, min_p, rng, max_tokens, eos_token,
-                                                   accepted, accepted_cap, err, errlen)
-                        : s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token,
-                                                  accepted, accepted_cap, err, errlen);
+        return s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token,
+                                       accepted, accepted_cap, err, errlen);
     };
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "generate_speculative", &tp, err, errlen);

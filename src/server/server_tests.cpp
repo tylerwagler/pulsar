@@ -6205,83 +6205,47 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
     session_slot *dec[4];
     for (int i = 0; i < 4; i++) {
         slots[i].gen = &g[i];
-        g[i].dspark_spec_enabled = true;
+        g[i].spec_enabled = true;
         dec[i] = &slots[i];
     }
     const int pool = 4;
     /* nothing to decode: idle */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, 16u, dec, 0, 0) == 0);
     /* four spec decoders: spec lane */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 4, 0) == 3);
     /* one non-spec slot among four drags the group to plain */
-    g[2].dspark_spec_enabled = false;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
-    g[2].dspark_spec_enabled = true;
+    g[2].spec_enabled = false;
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 4, 0) == 2);
+    g[2].spec_enabled = true;
     /* a slot with no gen state likewise */
     slots[3].gen = NULL;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 4, 0) == 2);
     slots[3].gen = &g[3];
     /* a plain batch in flight locks the lane even when all spec */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 1) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 4, 1) == 2);
     /* ...and a decoder that has joined the plain lane says so itself */
     g[1].batch_active = true;
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 4, 0) == 2);
     g[1].batch_active = false;
     /* no drafter: plain */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 4, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, 16u, dec, 4, 0) == 2);
+    /* L272 P1: a family whose verify carries one bank a forward (Qwen until S4) speculates alone and
+     * batches plain past that */
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 1u, dec, 1, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 1u, dec, 2, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 4u, dec, 4, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 3u, dec, 4, 0) == 2);
     /* L118 batch of one: a solo spec decoder is lane 3, solo plain lane 2 */
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 1, 0) == 3);
-    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 1, 0) == 2);
-    TEST_ASSERT(server_pick_decode_lane(pool, true, false, dec, 1, 1) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 1, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, 16u, dec, 1, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 1, 1) == 2);
     /* no pool: idle with no decoders, else the retired classic code 1 */
     TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 0, 0) == 0);
     TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 1, 0) == 1);
     TEST_ASSERT(server_pick_decode_lane(0, false, false, dec, 4, 0) == 1);
 }
 
-/* L251 -- lane 4 (family-spec): a family with its own speculative generate
- * takes EXACTLY ONE decoder, not in a plain batch, speculation allowed for
- * its request, whose resolved decode sampling is greedy; anything else keeps
- * the existing lanes. */
-static void test_l251_lane_select_family_spec_solo_greedy(void) {
-    job jobs[2];
-    memset(jobs, 0, sizeof jobs);           /* temperature 0, think off: greedy */
-    gen_state g[2];
-    memset(g, 0, sizeof g);
-    session_slot slots[2];
-    memset(slots, 0, sizeof slots);
-    session_slot *dec[2];
-    for (int i = 0; i < 2; i++) {
-        g[i].j = &jobs[i];
-        g[i].dspark_spec_enabled = true;
-        slots[i].gen = &g[i];
-        dec[i] = &slots[i];
-    }
-    const int pool = 2;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 0, 0) == 0);
-    /* one decoder: lane 4 */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 4);
-    /* the family flag off (--no-dspark, or DeepSeek): plain */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 1, 0) == 2);
-    /* two decoders: plain batched, even when both are greedy */
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 2, 0) == 2);
-    /* sampled (L270): the family generate samples too, lane 4 */
-    jobs[0].req.temperature = 0.7f;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 4);
-    jobs[0].req.temperature = 0.0f;
-    /* logprobs (speculation off for the request): plain */
-    g[0].dspark_spec_enabled = false;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
-    g[0].dspark_spec_enabled = true;
-    /* a decoder that joined the plain lane stays there */
-    g[0].batch_active = true;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
-    g[0].batch_active = false;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 1) == 2);
-    /* no pool: the gather loop's impossible shape, as before */
-    TEST_ASSERT(server_pick_decode_lane(0, false, true, dec, 1, 0) == 1);
-}
 
 /* Geometric survival for one bank: np pendings at per-position confidence c,
  * surv[j] = c^(j+1) -- the cumprod spec_alloc_rows' caller derives from the
@@ -7886,7 +7850,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
-    test_l251_lane_select_family_spec_solo_greedy();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

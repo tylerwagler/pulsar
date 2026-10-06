@@ -165,7 +165,7 @@ int GATE_ENTRY(int argc, char **argv) {
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (!pulsar_engine_has_dspark(g_e)) {
+    if (!pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "BANK-SPEC GATE: model has no drafter — this gate needs "
                         "speculation (use the drafter-merged FRONTIER_MODEL)\n");
         gate_engine_close(g_e);

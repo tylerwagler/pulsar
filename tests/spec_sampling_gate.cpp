@@ -428,7 +428,7 @@ int GATE_ENTRY(int argc, char **argv) {
     int (*seqA)[DEPTH] = NULL, (*seqB)[DEPTH] = NULL;
     int rc = 1;
     {
-    if (!pulsar_engine_has_dspark(engine)) {
+    if (!pulsar_engine_has_spec_rounds(engine)) {
         fprintf(stderr, "spec sampling gate: the model has no drafter -- nothing to gate\n");
         goto done;
     }

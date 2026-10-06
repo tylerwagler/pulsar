@@ -73,8 +73,8 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
         uint64_t rng = 0x5eed5eed5eed5eedULL;
         int toks[17];
         while (emitted < 12) {
-            /* the family's drafter, whichever it is (L272 B12: Qwen's MTP warmed with argmax before) */
-            if (pulsar_engine_drafter(engine) != PULSAR_DRAFTER_NONE) {
+            /* whichever drafter runs behind the round API (L272 B12: Qwen's MTP warmed with argmax before) */
+            if (pulsar_engine_has_spec_rounds(engine)) {
                 const int n = pulsar_session_generate_speculative(
                         session, 0.0f, 0, 1.0f, 0.0f, &rng, 12 - emitted,
                         pulsar_token_eos(engine), toks,
@@ -572,18 +572,16 @@ int main(int argc, char **argv) {
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
      * into the main artifact), so the state is logged here, never at parse. */
-    /* L251: a family with its own speculative generate (Qwen's MTP) serves it
-     * on decode lane 4 -- one decoder at a time; --no-dspark turns the
-     * lane off like the DSpark one. */
-    const bool family_spec = pulsar_engine_drafter(engine) == PULSAR_DRAFTER_MTP && !cfg.engine.dspark_disable;
-    if (pulsar_engine_has_dspark(engine)) {
+    /* L272 P1: whichever drafter the family loaded runs behind the one round API; --no-dspark turns
+     * drafting off for every family. */
+    if (pulsar_engine_drafter(engine) == PULSAR_DRAFTER_DSPARK) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
                    pulsar_engine_dspark_draft_tokens(engine));
-    } else if (family_spec) {
+    } else if (pulsar_engine_has_spec_rounds(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: %s speculative decoding (MTP drafter, greedy or sampled) for a solo decoder",
-                   pulsar_engine_family_name(engine));
+                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u decoder(s) a round)",
+                   pulsar_engine_family_name(engine), pulsar_engine_spec_banks_max(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");
@@ -867,7 +865,6 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
-    s.family_spec = family_spec;
     /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
      * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
      * clamps kstep to 1 and the step exceeds the chunk cap on every quantum

@@ -407,7 +407,7 @@ typedef struct pulsar_qwen_state {
     uint32_t *mtp_pend_pos;         ///< [n_banks] the pending row's position; UINT32_MAX = none
     uint64_t mtp_probe_n, mtp_probe_hit;   ///< PULSAR_QWEN_MTP_PROBE counters (qwen_session_eval)
     pulsar_qwen_spec_capture spec;  ///< the verify capture (mtp only)
-    uint64_t spec_rounds, spec_drafted, spec_kept;   ///< speculation counters, printed at session destroy
+    bool mtp_stage_dirty;           ///< L272 P1: a draft chain wrote the MTP layer's stage since spec.qsa_stage[n_qsa] saved it
     float *spec_logits;             ///< host [DRAFT_MAX + 1][n_vocab]: a round's verify / draft rows (mtp only)
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
@@ -443,6 +443,12 @@ typedef struct pulsar_qwen_bank_carry {
     pulsar_tokens checkpoint;
     float *logits;          ///< [n_vocab]
     bool valid, checkpoint_valid, logits_fresh;
+    /** L272 P1: the session's speculative shadow (pulsar_session::spec) and the q rows its sampled
+     *  pendings read, saved with the bank (pulsar_spec_shadow_save / _restore); the shadow is allocated
+     *  at the first save (its type is declared after this header). */
+    struct pulsar_spec_carry_state *spec;
+    float *pend_qrows;
+    uint32_t pend_qrows_cap;
 } pulsar_qwen_bank_carry;
 
 /** L266 step 7: tensor parallelism.  _load (at the family's load, the model bound): this rank's head counts
@@ -453,6 +459,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e);
 
 /** The Qwen family's bank-pool operations (family.h pulsar_family_bank_ops). */
 extern const pulsar_family_bank_ops k_qwen_bank_ops;
+
 
 /** L270: the one writer of a bank's position; it keeps the bank's KV high-water. */
 static inline void qwen_bank_set_pos(pulsar_qwen_state *st, uint32_t bank, uint32_t pos) {
