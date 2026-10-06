@@ -418,7 +418,6 @@ typedef struct pulsar_qwen_state {
     /* The bank pool (L251, family_qwen_banks.cpp): the session's host view (checkpoint,
      * logits) describes `live_bank`; every other bank's view waits in its carry. */
     uint32_t live_bank;     ///< the bank sync / eval run on
-    bool logits_fresh;      ///< the session's logits are live_bank's NEXT-token row
     struct pulsar_qwen_bank_carry *carry;   ///< [n_banks]
     /* L266 step 5: the grid checkpoints (kv_state_qwen.cpp; held by pointer because kv_state.h comes
      * after this header).  prefill_pos[b] ends bank b's PREFILL-ONLY history -- the cold prefill's
@@ -442,7 +441,7 @@ typedef struct pulsar_qwen_state {
 typedef struct pulsar_qwen_bank_carry {
     pulsar_tokens checkpoint;
     float *logits;          ///< [n_vocab]
-    bool valid, checkpoint_valid, logits_fresh;
+    bool valid, checkpoint_valid, logits_stale;
     /** L272 P1: the session's speculative shadow (pulsar_session::spec) and the q rows its sampled
      *  pendings read, saved with the bank (pulsar_spec_shadow_save / _restore); the shadow is allocated
      *  at the first save (its type is declared after this header). */

@@ -123,7 +123,7 @@ static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t c
     const uint32_t keep = 1u + commit;
     if (!pulsar_qwen_s4_spec_rollback(&vst, keep)) return false;
     qwen_bank_set_pos(q, q->live_bank, (uint32_t)r->saved_len + keep);
-    q->logits_fresh = true;
+    s->logits_stale = false;
     return true;
 }
 
@@ -133,7 +133,7 @@ static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t c
 static void qwen_spec_cut(pulsar_session *s, int) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    s->qwen->logits_fresh = false;
+    s->logits_stale = true;
 }
 
 const pulsar_spec_target_ops k_qwen_spec_target = {

@@ -944,6 +944,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
         segment_clear(s, st, bank);
         return 1;
     }
+    if (last) s->logits_stale = true;   /* a restore moves the KV, not the logits (restore_checkpoint sets it too) */
     if (G_out) *G_out = G;
     return 0;
 }

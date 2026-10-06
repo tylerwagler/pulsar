@@ -2350,7 +2350,8 @@ struct pulsar_session {
      *  chain's load), which moves the KV but not the logits.  Set by every cut,
      *  cleared by a prefill or eval that writes them; a sync whose prompt needs
      *  no new rows re-evaluates the last one while it is set.  Fails safe: a
-     *  writer that forgets to clear it costs one row, never a wrong sample. */
+     *  writer that forgets to clear it costs one row, never a wrong sample.
+     *  One flag for every family (L272 P2: Qwen's logits_fresh folded into it). */
     bool logits_stale;
     /** L264 S4e: the leader is inside a mirrored sync -- the workers read only
      *  chunk verdicts until it returns, so no other mirrored frame may ship

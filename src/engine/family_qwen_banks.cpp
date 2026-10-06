@@ -33,7 +33,7 @@ static void qwen_bank_save(pulsar_session *s, uint32_t bank) {
     if (!c->logits) c->logits = (float *)xmalloc((size_t)nv * sizeof(float));
     memcpy(c->logits, s->logits, (size_t)nv * sizeof(float));
     c->checkpoint_valid = s->checkpoint_valid;
-    c->logits_fresh = s->qwen->logits_fresh;
+    c->logits_stale = s->logits_stale;
     if (!c->spec) c->spec = (pulsar_spec_carry_state *)xcalloc(1, sizeof(*c->spec));
     pulsar_spec_shadow_save(s, c->spec, &c->pend_qrows, &c->pend_qrows_cap);   /* L272 P1 */
     c->valid = true;
@@ -54,7 +54,7 @@ static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
          * and prefills cold (never continues whatever the device state holds) */
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
-        s->qwen->logits_fresh = false;
+        s->logits_stale = true;
         pulsar_spec_drop_pendings(&s->spec);   /* no shadow was saved: the fresh bank has no pendings or carry */
         s->spec.spec_carry_valid = false;
         return true;
@@ -62,7 +62,7 @@ static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
     memcpy(s->logits, c->logits, (size_t)qwen_bank_logits_width(s) * sizeof(float));
     s->checkpoint_valid = c->checkpoint_valid;
-    s->qwen->logits_fresh = c->logits_fresh;
+    s->logits_stale = c->logits_stale;
     pulsar_spec_shadow_restore(s, c->spec, c->pend_qrows, c->pend_qrows_cap);   /* L272 P1 */
     return true;
 }
@@ -82,7 +82,7 @@ static const pulsar_tokens *qwen_bank_tokens(pulsar_session *s, uint32_t bank) {
 static void qwen_bank_note_committed(pulsar_session *s, const int *toks, int n) {
     if (!s || !s->qwen || !toks || n <= 0) return;
     for (int i = 0; i < n; i++) pulsar_tokens_push(&s->checkpoint, toks[i]);
-    s->qwen->logits_fresh = false;
+    s->logits_stale = true;
     s->checkpoint_valid = s->qwen->bank_pos[s->qwen->live_bank] == (uint32_t)s->checkpoint.len;
 }
 

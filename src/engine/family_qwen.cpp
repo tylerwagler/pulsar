@@ -1271,7 +1271,7 @@ static bool qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_
         if (ok && canonical) s->qwen->prefill_pos[live] = start + off + rows;
         if (ok && capture_at && start + off + rows == capture_at) ok = pulsar_ckpt_capture(ck, live, capture_at);
     }
-    s->qwen->logits_fresh = ok;
+    s->logits_stale = !ok;
     free(pos);
     free(bank);
     return ok;
@@ -1304,7 +1304,7 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
     /* the same prompt is a no-op only while the logits are its next-token row: after the batched
      * lane (note_committed) they are stale, and a recurrent state cannot rewind one token to redo
      * the last row -- so that case prefills cold */
-    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && s->qwen->logits_fresh) return 0;
+    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
     uint32_t start = 0;
     if (extends) {
         start = (uint32_t)common;
@@ -1318,6 +1318,7 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", PULSAR_QWEN_ARCH, live, G);
                 return 1;
             }
+            s->logits_stale = true;   /* a restore moves the KV, not the logits */
             start = G;
             fprintf(stderr, "pulsar: %s: bank %u resumes from its checkpoint at %u (prompt %d, shared %d)\n",
                     PULSAR_QWEN_ARCH, live, G, prompt->len, common);
@@ -1377,7 +1378,7 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
     }
     token_vec_push(&s->checkpoint, token);
     qwen_bank_set_pos(s->qwen, live, (uint32_t)s->checkpoint.len);
-    s->qwen->logits_fresh = true;
+    s->logits_stale = false;
     return 0;
 }
 
@@ -1419,7 +1420,7 @@ static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq
         qwen_bank_set_pos(s->qwen, reqs[i].bank, s->qwen->bank_pos[reqs[i].bank] + 1u);
         if (reqs[i].bank == s->qwen->live_bank) {   /* the live bank moved past the host view */
             s->checkpoint_valid = false;
-            s->qwen->logits_fresh = false;
+            s->logits_stale = true;
         }
     }
     return 0;
@@ -1487,7 +1488,7 @@ static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_re
 static void qwen_session_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    s->qwen->logits_fresh = false;
+    s->logits_stale = true;
 }
 
 uint32_t qwen_argmax(const float *v, uint32_t n) {

@@ -97,8 +97,7 @@ static bool qwen_prepare_restore(void *state, uint32_t G) {
     qwen_bank_set_pos(st, bank, G);
     st->prefill_pos[bank] = G;
     st->mtp_pend_pos[bank] = st->mtp ? G - 1u : UINT32_MAX;
-    st->logits_fresh = false;
-    return true;
+    return true;   /* the logits: the caller's (s->logits_stale after a restore) */
 }
 
 static void qwen_restored(void *state) { Q_(state)->frontier_stale[Q_(state)->live_bank] = false; }
