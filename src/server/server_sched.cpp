@@ -430,18 +430,49 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 
 
 
+/* L275: the bank's last-turn anchor -- the position of the last user marker among
+ * the tokens the bank PREFILLED, when a completed exchange (an assistant turn)
+ * precedes it.  An agent client sends side requests beside a turn that share the
+ * conversation through that marker and diverge INSIDE the last user turn: Claude
+ * Code's session recap (the main prompt + a recap instruction, sent when the
+ * terminal is unfocused), its subagent summaries ("Describe your most recent
+ * action in 3-5 words...", ~150 tokens after the tool result) and its tool-use
+ * summaries.  Measured on the pair 2026-10-06: every such request took a fresh
+ * bank, evicted an idle one and reloaded the chain from disk (301 provisions,
+ * 188 evictions in three hours); the next real turn of a conversation whose
+ * bank had been evicted came back from disk on another bank.
+ * -1 when the marker ids are unknown (a family whose vocab does not name them --
+ * Qwen, L272 B5 -- reports 0), when the bank holds no completed exchange (a
+ * first-turn bank: two unrelated conversations behind one system prompt share
+ * the marker position and part of the first message, the 2026-10-04 clobber), or
+ * when there is no user marker at all. */
+int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, int user_id, int assistant_id) {
+    if (!bank || !bank->v || user_id <= 0 || assistant_id <= 0) return -1;
+    if (prefilled > bank->len) prefilled = bank->len;
+    int last_user = -1, first_assistant = -1;
+    for (int i = 0; i < prefilled; i++) {
+        if (bank->v[i] == user_id) last_user = i;
+        else if (bank->v[i] == assistant_id && first_assistant < 0) first_assistant = i;
+    }
+    return first_assistant >= 0 && last_user > first_assistant ? last_user : -1;
+}
+
 /* L264: does the job continue on its best bank?  Yes when it carries everything
  * that bank PREFILLED (common >= prefilled: it IS that conversation's next turn,
  * whatever it did to the bank's generated tail -- an agent client drops the
- * previous turn's reasoning, so the echo diverges exactly there), or when what
- * the resume would discard is under the protect floor.  A job that shares only
- * a prefix -- a long common system prompt, the measured case (2026-10-04: four
- * SWE-agent conversations behind one 2.3k-token prompt all landed on bank 0 and
- * clobbered one another every turn) -- diverges INSIDE the bank's last prompt,
+ * previous turn's reasoning, so the echo diverges exactly there), when it
+ * carries the bank's last user marker (common > anchor, L275: it is this
+ * conversation's side request or an edit of its last turn, and what the resume
+ * discards is at most that one turn), or when what the resume would discard is
+ * under the protect floor.  A job that shares only a prefix -- a long common
+ * system prompt, the measured case (2026-10-04: four SWE-agent conversations
+ * behind one 2.3k-token prompt all landed on bank 0 and clobbered one another
+ * every turn) -- diverges INSIDE the bank's first user turn, before any anchor,
  * so it takes a fresh bank, which restores the shared prefix from the disk
  * chain. */
-bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor) {
-    return common >= prefilled || frontier - score < protect_floor;
+bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
+                           int anchor) {
+    return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor;
 }
 
 /* Route the job to a slot. Preferences, in order:
@@ -569,15 +600,20 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     }
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
     const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
+    /* L275: the bank's last-turn anchor, from the history it prefilled. */
+    const int anchor = best && s->sess
+        ? server_route_turn_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled,
+                                   pulsar_token_user(s->engine), pulsar_token_assistant(s->engine))
+        : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
-                                                        s->slot_trivial_common_tokens);
+                                                        s->slot_trivial_common_tokens, anchor);
     /* One line per bind, always: which bank, how deep the match, where it
-     * resumes, and what it costs the bank. */
+     * resumes, what it costs the bank, and where the bank's last turn starts. */
     if (best)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: route: best bank %u common %d resume %d frontier %d prefilled %d "
-                   "prompt %d -> %s",
-                   best->bank, best_common, best_score, frontier, prefilled, j->req.prompt.len,
+                   "anchor %d prompt %d -> %s",
+                   best->bank, best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len,
                    in_place ? "in place" : "fresh preferred");
     if (in_place) return best;
     session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);

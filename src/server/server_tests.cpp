@@ -5513,18 +5513,74 @@ static void test_l264_route_in_place(void) {
      * stripped by the client: the match reaches the end of what the bank
      * prefilled (51200), then diverges in the generated tail -- in place,
      * however much the tail holds */
-    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_));
+    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_, -1));
     /* the measured clobber (2026-10-04): another conversation behind the same
      * 2.3k-token system prompt matches 2318 of a bank that prefilled 2723 --
      * fresh preferred */
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
     /* ...unless what it would discard is under the protect floor */
-    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_));
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_));
+    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_, -1));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_, -1));
     /* an empty bank is simply free */
-    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_));
+    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_, -1));
     /* one token short of the bank's prefill is a different branch */
-    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_));
+    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_, -1));
+}
+
+/* L275: the bank's last-turn anchor -- the position of its last user marker when
+ * a completed exchange precedes it.  Claude Code's session recap, subagent
+ * summaries and tool-use summaries share the conversation through that marker
+ * and diverge inside the last user turn. */
+static void test_l275_route_turn_anchor(void) {
+    const int user = 9001, assistant = 9002;
+    pulsar_tokens bank = {0};
+    pulsar_tokens_push(&bank, 1);          /* 0 bos */
+    pulsar_tokens_push(&bank, 2);          /* 1 system prompt */
+    pulsar_tokens_push(&bank, user);       /* 2 first task */
+    pulsar_tokens_push(&bank, 3);          /* 3 */
+    pulsar_tokens_push(&bank, assistant);  /* 4 the reply */
+    pulsar_tokens_push(&bank, 4);          /* 5 */
+    pulsar_tokens_push(&bank, user);       /* 6 the tool result / next task */
+    pulsar_tokens_push(&bank, 5);          /* 7 */
+    pulsar_tokens_push(&bank, assistant);  /* 8 the generation prompt */
+    /* the last user marker the bank prefilled, with an exchange before it */
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, user, assistant) == 6);
+    /* prefilled stops before the second marker: the only user marker has no
+     * assistant turn before it -- a first-turn bank has no anchor */
+    TEST_ASSERT(server_route_turn_anchor(&bank, 5, user, assistant) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, 4, user, assistant) == -1);
+    /* a prefilled count past the history is clamped to it */
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len + 10, user, assistant) == 6);
+    /* unknown marker ids (a family that does not name them reports 0 or -1,
+     * L272 B5): no anchor */
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, -1, assistant) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, user, 0) == -1);
+    TEST_ASSERT(server_route_turn_anchor(NULL, 9, user, assistant) == -1);
+    pulsar_tokens_free(&bank);
+}
+
+/* L275: the in-place verdict through the last turn -- the pair's measured
+ * shapes of 2026-10-06. */
+static void test_l275_route_in_place_through_last_turn(void) {
+    const int floor_ = 157;
+    /* the session recap on the idle main bank: the bank prefilled 41670 (its
+     * last user turn starts at 41505) and generated to 41860; the recap matches
+     * 41517 and appends its instruction -- in place, the tail is one turn */
+    TEST_ASSERT(server_route_in_place(41517, 41472, 41860, 41670, floor_, 41505));
+    /* the same request without an anchor took a fresh bank (the behaviour
+     * measured 2026-09-29 .. 2026-10-06) */
+    TEST_ASSERT(!server_route_in_place(41517, 41472, 41860, 41670, floor_, -1));
+    /* a subagent summary against the previous summary's bank: that bank
+     * prefilled the main prompt + 153 summary tokens; the new one matches
+     * through the tool result */
+    TEST_ASSERT(server_route_in_place(42468, 42112, 42825, 42620, floor_, 42300));
+    /* the match ends BEFORE the last user marker (an edited earlier turn, or a
+     * conversation sharing the history only up to there): fresh */
+    TEST_ASSERT(!server_route_in_place(41400, 41216, 41860, 41670, floor_, 41505));
+    /* the match ends AT the marker: the marker itself did not match -- fresh */
+    TEST_ASSERT(!server_route_in_place(41505, 41472, 41860, 41670, floor_, 41505));
+    /* the 2026-10-04 clobber: a first-turn bank has no anchor, so it stays fresh */
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
 }
 
 static void test_slot_route_trivial_match_decision(void) {
@@ -7647,6 +7703,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_session_eviction_victim_selection();
     test_slot_route_trivial_match_decision();
     test_l264_route_in_place();
+    test_l275_route_turn_anchor();
+    test_l275_route_in_place_through_last_turn();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

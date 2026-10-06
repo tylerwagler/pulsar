@@ -2919,10 +2919,15 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
                                          int share_ceiling, int protect_floor);
-/* L264 S3: does the best-scoring free bank take the request in place, or is a
- * fresh bank preferred (defined in server_sched.cpp; unit-tested in
- * server_tests.cpp). */
-bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor);
+/* L275: the position of the bank's last user marker among its prefilled tokens
+ * when a completed exchange precedes it; -1 otherwise (defined in
+ * server_sched.cpp; unit-tested in server_tests.cpp). */
+int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, int user_id, int assistant_id);
+/* L264 S3 + L275: does the best-scoring free bank take the request in place, or
+ * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
+ * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
+bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
+                           int anchor);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
