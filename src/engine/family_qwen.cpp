@@ -917,7 +917,6 @@ static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_s
         }
     }
     s->logits = (float *)xmalloc((size_t)g_qwen_shape.n_vocab * sizeof(s->logits[0]));
-    s->qwen->carry = (pulsar_qwen_bank_carry *)xcalloc(n_banks, sizeof(pulsar_qwen_bank_carry));
     s->qwen->ckpt->artifact = e->qwen_weights->artifact_digest;
     if (e->tp) {   /* L266 step 7: the engine's lanes; the ticket is the state's (priced with it), zeroed here */
         const uint32_t zero = 0;
@@ -952,16 +951,7 @@ static void qwen_session_destroy(pulsar_session *s) {
         fprintf(stderr, "pulsar: %s: MTP probe: draft position 1 agreed with the trunk's argmax %llu of %llu (%.1f%%)\n",
                 PULSAR_QWEN_ARCH, (unsigned long long)s->qwen->mtp_probe_hit, (unsigned long long)s->qwen->mtp_probe_n,
                 100.0 * (double)s->qwen->mtp_probe_hit / (double)s->qwen->mtp_probe_n);
-    if (s->qwen && s->qwen->carry) {
-        for (uint32_t b = 0; b < s->qwen->n_banks; b++) {
-            token_vec_free(&s->qwen->carry[b].checkpoint);
-            free(s->qwen->carry[b].logits);
-            free(s->qwen->carry[b].pend_qrows);
-            free(s->qwen->carry[b].spec);
-        }
-        free(s->qwen->carry);
-        s->qwen->carry = NULL;
-    }
+    s->bank_carry_free();   /* the core's carry (L272 P2) */
     qwen_state_free(s->qwen);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);

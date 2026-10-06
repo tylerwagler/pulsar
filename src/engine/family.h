@@ -125,12 +125,12 @@ typedef struct {
  * the 2b guard keeps touched KV under budget). */
 typedef struct {
     int (*count)(pulsar_session *s);
-    /** The live host view (checkpoint, logits) into bank's carry; host only. */
+    /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
+     *  device side of the family's own; the history readers are the core's (pulsar_bank_history). */
     void (*save)(pulsar_session *s, uint32_t bank);
-    /** Make `bank` live: its carry back into the host view.  false = refused. */
+    /** Make `bank` live: the core's pulsar_bank_carry_restore_view, and what a bank with no carry means.
+     *  false = refused. */
     bool (*restore)(pulsar_session *s, uint32_t bank);
-    /** The bank's committed history: the live checkpoint, or its carry.  NULL = none. */
-    const pulsar_tokens *(*tokens)(pulsar_session *s, uint32_t bank);
     /** Tokens the batched lane fed that the host view has not recorded yet. */
     void (*note_committed)(pulsar_session *s, const int *toks, int n);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
@@ -146,9 +146,6 @@ typedef struct {
     uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
     /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
     uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
-    /** L272 P1: a NON-live bank's saved speculative shadow (what its save took of pulsar_session::spec), or
-     *  NULL when nothing is saved.  The round API's per-bank readers (pending confidences, depth). */
-    const struct pulsar_spec_carry_state *(*spec_carry)(pulsar_session *s, uint32_t bank);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family

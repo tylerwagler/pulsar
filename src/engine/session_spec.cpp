@@ -1326,8 +1326,7 @@ uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t ban
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
     if (!s) return NULL;
     if (bank == pulsar_session_live_bank(s)) return &s->spec;
-    if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->spec_carry ? FAMILY_BANKS(s)->spec_carry(s, bank) : NULL;
-    if (bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
+    /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
     return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
 }
 

@@ -2547,11 +2547,7 @@ struct pulsar_session {
     /** Install `bank`: repoint device views, then restore its host carry. Clears
      * the multiseq-poison flag. @return false if the bank cannot be installed. */
     bool bank_state_restore(uint32_t bank);
-    /** Committed token count for `bank`, live or idle. */
-    int bank_pos(uint32_t bank);
     int bank_prefill_frontier(uint32_t bank);
-    /** Borrowed view of `bank`'s committed token history. Do not free. */
-    const pulsar_tokens *bank_tokens(uint32_t bank);
     /** Append tokens to the session's checkpoint WITHOUT decoding them: for
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
@@ -2992,6 +2988,16 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
  * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
  * type or missing tensor refuses loudly. */
 bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
+
+/** L272 P2: the bank carry is the core's (session_banks.cpp).  Save the live host view -- checkpoint,
+ *  logits, the flags, the prefill frontier, the image identity, the speculative shadow -- into `bank`'s
+ *  carry; host only. */
+void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
+/** Bring `bank`'s saved view back into the host view.  false = nothing valid was saved (the family
+ *  decides what a bank with no carry means). */
+bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** A bank's committed history: the live view for the live bank, else its carry.  NULL = none. */
+const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
 
 /** The session's cooperative cancel hook, polled at a prefill chunk boundary (session.cpp).  A mirrored
  *  session stops only together: the leader decides and ships the verdict, every worker reads it, so every

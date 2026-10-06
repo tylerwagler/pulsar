@@ -246,9 +246,7 @@ void pulsar_acquire_instance_lock(void) {
     do { if ((e) && !pulsar_family_require((e), (cap), (op))) return ret; } while (0)
 /* L251: a family with its own bank pool (family.h pulsar_family_bank_ops) -- NULL for DeepSeek, whose
  * members in session_banks.cpp run unchanged. */
-static const pulsar_tokens *family_bank_tokens(pulsar_session *s, uint32_t bank) {
-    return FAMILY_BANKS(s)->tokens(s, bank);
-}
+
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) { return pulsar_engine::open(out, opt); }
 void pulsar_engine_close(pulsar_engine *e) { if (e) e->destroy(); }
@@ -1112,7 +1110,7 @@ bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     if (FAMILY_BANKS(s)) return false;
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
-int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0); if (FAMILY_BANKS(s)) { const pulsar_tokens *t = family_bank_tokens(s, bank); return t ? t->len : 0; } return s->bank_pos(bank); }
+int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0); const pulsar_tokens *t = pulsar_bank_history(s, bank); return t ? t->len : 0; }
 /* The session's grid checkpoints: the family's own store (L266, Qwen), or DeepSeek's graph pool's. */
 pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
     if (!s) return NULL;
@@ -1143,11 +1141,11 @@ int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FA
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     return s && !FAMILY_BANKS(s) && bank < s->graph.banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph.ms_comp_state_stale[bank];
 }
-const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); if (FAMILY_BANKS(s)) return family_bank_tokens(s, bank); return s->bank_tokens(bank); }
+const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); return pulsar_bank_history(s, bank); }
 /* The bank's committed history, the family's reader or DeepSeek's (the prefix readers below are
  * ONE body over it; L272 P0 folded the two copies). */
 static const pulsar_tokens *session_bank_history(pulsar_session *s, uint32_t bank) {
-    return FAMILY_BANKS(s) ? family_bank_tokens(s, bank) : s->bank_tokens(bank);
+    return pulsar_bank_history(s, bank);
 }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0);
     return pulsar_tokens_common_prefix(session_bank_history(s, bank), prompt); }
@@ -1543,7 +1541,7 @@ int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int li
 }
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
     if (!s || !prompt || !FAMILY_BANKS(s)) return -1;
-    const pulsar_tokens *t = family_bank_tokens(s, bank);
+    const pulsar_tokens *t = pulsar_bank_history(s, bank);
     const int common = pulsar_tokens_common_prefix(t, prompt);
     if (t && common == t->len) return common;   /* an extension (or the same prompt): sync continues it */
     return (int)pulsar_session_resume_point(s, bank, common, prompt->len);

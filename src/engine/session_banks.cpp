@@ -62,8 +62,16 @@ void pulsar_session::bank_carry_free() {
     s->bank_carry_n = 0;
 }
 
+/* L272 P2: the bank carry is the core's, for every family -- one array, one save and one restore of the
+ * host view, one live-or-carry reader.  A family adds only its device side around them (DeepSeek: the
+ * graph's frontier counters and views; Qwen: which bank is live).  How many banks: the family's pool,
+ * or DeepSeek's graph pool. */
+static uint32_t session_bank_n(pulsar_session *s) {
+    return FAMILY_BANKS(s) ? (uint32_t)FAMILY_BANKS(s)->count(s) : gpu_graph_bank_pool_count(&s->graph);
+}
+
 static bool bank_carry_ensure(pulsar_session *s) {
-    const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
+    const uint32_t n = session_bank_n(s);
     if (s->bank_carry && s->bank_carry_n == n) return true;
     if (s->bank_carry) s->bank_carry_free();
     s->bank_carry = (pulsar_bank_carry *)xcalloc(n, sizeof(*s->bank_carry));
@@ -93,11 +101,17 @@ void pulsar_session::bank_state_save(uint32_t bank) {
      * counters) are captured on the graph side so a later install re-arms this
      * bank's per-bank truth. */
     gpu_graph_bank_counters_capture(&s->graph, bank);
+    pulsar_bank_carry_save_view(s, bank);
+}
+
+void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
+    if (!s || bank >= session_bank_n(s) || !bank_carry_ensure(s)) return;
     pulsar_bank_carry *c = &s->bank_carry[bank];
     /* heap-backed deep copies */
     pulsar_tokens_copy(&c->checkpoint, &s->checkpoint);
-    if (!c->logits) c->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
-    memcpy(c->logits, s->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
+    const size_t nv = (size_t)s->engine->logits_width();
+    if (!c->logits) c->logits = (float *)xmalloc(nv * sizeof(float));
+    memcpy(c->logits, s->logits, nv * sizeof(float));
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
     c->logits_stale           = s->logits_stale;
@@ -124,17 +138,20 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     if (s->graph.banks.n_banks != 0 && !gpu_graph_bank_repoint(&s->graph, bank))
         return false;
     gpu_graph_bank_counters_install(&s->graph, bank);
-    if (!s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) {
-        /* No saved host state for a fresh bank: the counters_install above set
-         * the (zeroed) frontier; leave the session's host shadow as the caller
-         * primed it (a fresh sync just ran).  Clear the multiseq poison so
-         * classic work resumes. */
-        s->mseq_dirty = false;
-        return true;
-    }
-    pulsar_bank_carry *c = &s->bank_carry[bank];
+    /* No saved host state for a fresh bank: the counters_install above set the
+     * (zeroed) frontier; the session's host shadow stays as the caller primed it
+     * (a fresh sync just ran).  Either way, per-bank frontier truth is now
+     * installed, so the multiseq superset poison no longer applies to this bank. */
+    (void)pulsar_bank_carry_restore_view(s, bank);
+    s->mseq_dirty = false;
+    return true;
+}
+
+bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
+    if (!s || !s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) return false;
+    const pulsar_bank_carry *c = &s->bank_carry[bank];
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
-    memcpy(s->logits, c->logits, (size_t)PULSAR_N_VOCAB * sizeof(float));
+    memcpy(s->logits, c->logits, (size_t)s->engine->logits_width() * sizeof(float));
     s->checkpoint_valid       = c->checkpoint_valid;
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
@@ -142,9 +159,6 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
     s->live_image_barrier     = c->live_image_barrier;
     /* Mirror of the save above: the whole shadow and its q rows. */
     pulsar_spec_shadow_restore(s, &c->spec, c->pend_qrows, c->pend_qrows_cap);
-    /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
-     * superset poison no longer applies to this bank. */
-    s->mseq_dirty = false;
     return true;
 }
 
@@ -161,10 +175,9 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
  * checkpoint; every other bank reads its saved host carry (which the server
  * keeps current for idle banks by bank_state_save'ing at job end).  Pure host
  * reads — no CUDA, safe on the worker thread at routing/publish time. */
-static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t bank) {
-    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
-    const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
-    if (bank == cur) return s->checkpoint_valid ? &s->checkpoint : NULL;
+const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
+    if (!s || bank >= session_bank_n(s)) return NULL;
+    if (bank == pulsar_session_live_bank(s)) return s->checkpoint_valid ? &s->checkpoint : NULL;
     if (s->bank_carry && bank < s->bank_carry_n &&
         s->bank_carry[bank].valid && s->bank_carry[bank].checkpoint_valid)
         return &s->bank_carry[bank].checkpoint;
@@ -172,24 +185,14 @@ static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t ban
 }
 
 
-int pulsar_session::bank_pos(uint32_t bank) {
-    auto *s = this;
-    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
-    return t ? t->len : 0;
-}
 
 /* L264: how far the bank's PREFILL reached (decode rows past it are the decode
  * kernels'; L195) -- the end of the last prompt it served, the same live-vs-
- * carry rule as bank_frontier_tokens.  0 when nothing valid. */
+ * carry rule as pulsar_bank_history.  0 when nothing valid. */
 int pulsar_session::bank_prefill_frontier(uint32_t bank) {
     auto *s = this;
-    if (!bank_frontier_tokens(s, bank)) return 0;
-    const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
-    const int pf = bank == cur ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
+    if (!pulsar_bank_history(s, bank)) return 0;
+    const int pf = bank == pulsar_session_live_bank(s) ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
     return pf > 0 ? pf : 0;
 }
 
-const pulsar_tokens *pulsar_session::bank_tokens(uint32_t bank) {
-    auto *s = this;
-    return bank_frontier_tokens(s, bank);
-}

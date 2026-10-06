@@ -418,7 +418,6 @@ typedef struct pulsar_qwen_state {
     /* The bank pool (L251, family_qwen_banks.cpp): the session's host view (checkpoint,
      * logits) describes `live_bank`; every other bank's view waits in its carry. */
     uint32_t live_bank;     ///< the bank sync / eval run on
-    struct pulsar_qwen_bank_carry *carry;   ///< [n_banks]
     /* L266 step 5: the grid checkpoints (kv_state_qwen.cpp; held by pointer because kv_state.h comes
      * after this header).  prefill_pos[b] ends bank b's PREFILL-ONLY history -- the cold prefill's
      * bytes; decode never advances it -- and bounds every checkpoint and resume. */
@@ -436,18 +435,6 @@ typedef struct pulsar_qwen_state {
     uint64_t tp_vocab_seq;
 } pulsar_qwen_state;
 
-/** A bank's saved host view: what bank_state_save took from the session. */
-typedef struct pulsar_qwen_bank_carry {
-    pulsar_tokens checkpoint;
-    float *logits;          ///< [n_vocab]
-    bool valid, checkpoint_valid, logits_stale;
-    /** L272 P1: the session's speculative shadow (pulsar_session::spec) and the q rows its sampled
-     *  pendings read, saved with the bank (pulsar_spec_shadow_save / _restore); the shadow is allocated
-     *  at the first save (its type is declared after this header). */
-    struct pulsar_spec_carry_state *spec;
-    float *pend_qrows;
-    uint32_t pend_qrows_cap;
-} pulsar_qwen_bank_carry;
 
 /** L266 step 7: tensor parallelism.  _load (at the family's load, the model bound): this rank's head counts
  *  into g_qwen_shape, the stored tensors it slices and the other rank's experts marked unstaged, the rank
