@@ -1583,7 +1583,7 @@ void pulsar_session_rewind(pulsar_session *s, int pos) {
 }
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
-uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the prefill quantum", 0); if (FAMILY_BANKS(s)) return 1; /* L272 P2: the family's prefill runs the core loop, and a cut anywhere is the cold bytes (qwen_chunk_neutrality_gate C1, C5) -- any interrupted sync resumes exactly */ return s ? s->prefill_quantum_min_suffix() : 0; }
+uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the prefill quantum", 0); if (FAMILY_BANKS(s)) return 1; /* L272 P2: the family's prefill runs the core loop, and a cut anywhere is the cold bytes (session_contract_gate C1, C5) -- any interrupted sync resumes exactly */ return s ? s->prefill_quantum_min_suffix() : 0; }
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->tokens() : NULL; }
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }

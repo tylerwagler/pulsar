@@ -90,7 +90,7 @@ typedef struct {
     const uint8_t *sf;
     int out, in;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_lowrank;
@@ -106,7 +106,7 @@ typedef struct {
     int k2;          /**< rate in half-bit units, 4..10; 0 = mxfp8_lt */
     int in, out;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_linear;
@@ -199,7 +199,7 @@ typedef struct {
      *  0 / 1: every expert, as one GPU runs it. */
     int ep_rank, ep_ranks;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the routed prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_moe_dev;
@@ -229,7 +229,7 @@ typedef struct {
     pulsar_qwen_lowrank up;   /**< input_mix_weight_up [10240][320]; the same format as down */
     const uint16_t *inject;   /**< block_inject_weight bf16 [4][10240]; NULL = the mixer (no write) */
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_gr_dev;

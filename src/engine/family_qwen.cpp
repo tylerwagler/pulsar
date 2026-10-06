@@ -1239,7 +1239,7 @@ static bool qwen_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, u
  * chunks, progress, and the cancel hook at every chunk boundary.  When the prefill continues the bank's
  * prefill-only history, the chunk that crosses the prompt's last grid point is cut there and the state
  * captured -- the checkpoint the next divergent turn resumes from.  A cut changes no byte: every prompt
- * chunk takes the prefill arms (qwen_chunk_neutrality_gate), which is also why an interrupted sync
+ * chunk takes the prefill arms (session_contract_gate C1), which is also why an interrupted sync
  * resumes exactly.  Returns the loop's 0 / PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
 static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
     qwen_prefill_ctx c;

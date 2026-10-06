@@ -677,15 +677,15 @@ qwen-family-gate: tests/qwen_family_gate qwen-family-containers
 	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
 qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
 	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
-# L272 P2: the Qwen family on REAL weights in the battery -- the session's chunk neutrality (C1-C4: any
-# cut == cold, decode after, divergent resume, the segment chain) and the bank surface (B1-B5).  The zero-weight
-# family gate above proves wiring only.  About 40 + 60 s on sparky.
+# L272 P5: the session contract every family meets, on REAL weights (tests/session_contract_gate.cpp: chunk
+# neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
+# zero-weight family gate above proves wiring only.  A new family adds one line here.
 QWEN_GATE_MODEL ?= /srv/models/qwen38fn-td405
-.PHONY: qwen-banks-gate-device qwen-chunk-neutrality-gate-device
-qwen-banks-gate-device: tests/qwen_banks_gate
-	PULSAR_MSEQ_BANKS=4 ./tests/qwen_banks_gate $(QWEN_GATE_MODEL)
-qwen-chunk-neutrality-gate-device: tests/qwen_chunk_neutrality_gate
-	./tests/qwen_chunk_neutrality_gate $(QWEN_GATE_MODEL)
+.PHONY: session-contract-gate-qwen session-contract-gate-ds
+session-contract-gate-qwen: tests/session_contract_gate
+	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
+session-contract-gate-ds: tests/session_contract_gate
+	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
 
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
@@ -1721,7 +1721,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
-	qwen-banks-gate-device qwen-chunk-neutrality-gate-device \
+	session-contract-gate-qwen session-contract-gate-ds \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1917,7 +1917,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/engine/*qwen*|tests/qwen_*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/session*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
@@ -1947,7 +1947,7 @@ gates-dev:
 	if [ -z "$$sel" ]; then printf '  runner sub-gates: (none -- all coverage for this path set is in the targets below)\n'; \
 	else printf '  runner sub-gates: %s\n' "$$(echo $$sel | tr ' ' ',')"; fi; \
 	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
-	if [ $$family -eq 1 ]; then printf '  qwen family gates: selected (the family interface; banks + chunk neutrality on real weights)\n'; fi; \
+	if [ $$family -eq 1 ]; then printf '  family gates: selected (the family interface; the session contract on both families)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -1977,7 +1977,7 @@ gates-dev:
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory qwen-banks-gate-device qwen-chunk-neutrality-gate-device CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory session-contract-gate-qwen session-contract-gate-ds CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
@@ -2286,13 +2286,9 @@ tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/qwen_banks_gate.o: tests/qwen_banks_gate.cpp
+tests/session_contract_gate.o: tests/session_contract_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/qwen_banks_gate: tests/qwen_banks_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/qwen_chunk_neutrality_gate.o: tests/qwen_chunk_neutrality_gate.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/qwen_chunk_neutrality_gate: tests/qwen_chunk_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+tests/session_contract_gate: tests/session_contract_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 .PHONY: qwen-generate
 qwen-generate: tests/qwen_generate
