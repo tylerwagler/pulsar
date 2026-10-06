@@ -214,7 +214,7 @@ static int write_frontier_logits_json(
         int                 previous) {
     if (!cfg->dump_frontier_logits_dir) return 0;
 
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
     float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         fprintf(stderr, "pulsar-bench: out of memory copying frontier logits\n");

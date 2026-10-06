@@ -159,7 +159,6 @@ struct pulsar_family {
     pulsar_family_id id;
     const char *arch;              ///< the artifact's `general.architecture` value this family claims
     const char *name;              ///< human-readable family name
-    pulsar_drafter_kind drafter;   ///< the speculative drafter this family's artifacts carry
     uint32_t caps;                 ///< PULSAR_FAMILY_CAP_* bits
     /** Everything between model_open and the GPU: tokenizer, config
      * validation, the layer plan (e->plan), weight binding.  Exits or returns
@@ -176,6 +175,14 @@ struct pulsar_family {
     /** The tensor-parallel transport's shape (L266): exchange slots per step (layers), the row width an
      *  all-reduce moves, and the vocab -- the TP identity and the slab are sized by it. */
     void (*tp_shape)(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab);
+    /** The speculative drafter the OPENED artifact carries (its weights loaded), or NONE (L272 B15:
+     *  the one answer pulsar_engine_drafter gives; the server's lanes key on it). */
+    pulsar_drafter_kind (*drafter)(pulsar_engine *e);
+    /** Bits per weight of the routed experts -- the artifact's dominant quantisation, the quant field
+     *  of the disk-KV (pulsar_segstore_identity) and TP identities.  EXL3 is its own value space:
+     *  20 + the highest rate present in half bits (24 = K2 .. 36 = K8), so an EXL3 build never shares
+     *  a store with the IQ2 (2) or MXFP4 (4) tier of the same model id.  0 = no routed experts. */
+    int (*quant_bits)(pulsar_engine *e);
     const pulsar_family_session_ops *session;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;

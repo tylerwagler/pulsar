@@ -474,7 +474,7 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
     pulsar_session_set_progress(session, NULL, NULL);
     pulsar_session_set_display_progress(session, NULL, NULL);
 
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
     float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         pulsar_session_free(session);
@@ -712,7 +712,7 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
         return 1;
     }
     const int stride = cfg->gen.kl_stride > 0 ? cfg->gen.kl_stride : 4;
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
 
     pulsar_tokens tokens = {0};
     if (cfg->gen.kl_tokens_path) {
@@ -1379,8 +1379,9 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                     ok = mode >= PULSAR_THINK_EFFORT_MIN && mode <= PULSAR_THINK_EFFORT_MAX;
                 }
             }
-            if (ok && !pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(mode)) {
-                fprintf(stderr, "pulsar: the V4 (0731) encoder has three levels -- /think-low, /think-high, /think-max\n");
+            char why[200];
+            if (ok && !pulsar_engine_think_mode_supported(engine, mode, why, sizeof why)) {
+                fprintf(stderr, "pulsar: /think %d: %s\n", (int)mode, why);
                 ok = false;
             }
             if (!ok) {
@@ -1690,9 +1691,9 @@ int main(int argc, char **argv) {
      * effort the 0731 encoder cannot spell is refused here by name rather than
      * rendered (L239). */
     if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);
-    if (!pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(cfg.gen.think_mode)) {
-        fprintf(stderr, "pulsar: --think-effort %d: the V4 (0731) encoder has three levels -- "
-                        "low, high, max (--think-low/--think-high/--think-max)\n", (int)cfg.gen.think_mode);
+    char think_why[200];
+    if (!pulsar_engine_think_mode_supported(engine, cfg.gen.think_mode, think_why, sizeof think_why)) {
+        fprintf(stderr, "pulsar: thinking effort %d: %s\n", (int)cfg.gen.think_mode, think_why);
         pulsar_engine_close(engine);
         free(cfg.prompt_owned);
         return 2;
@@ -1739,7 +1740,16 @@ int main(int argc, char **argv) {
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
-        rc = run_repl(engine, &cfg);
+        /* L272 B10: the REPL builds DeepSeek's template turn by turn (pulsar_chat_begin and the
+         * append entries); a family that renders its chat whole has no REPL here -- refused by name
+         * at startup, not inside the tokenizer's exit(1). */
+        if (pulsar_engine_chat_format(engine) == PULSAR_CHAT_QWEN) {
+            fprintf(stderr, "pulsar: the interactive REPL renders DeepSeek's chat template; %s takes -p <prompt>\n",
+                    pulsar_engine_family_name(engine));
+            rc = 2;
+        } else {
+            rc = run_repl(engine, &cfg);
+        }
     } else {
         rc = run_generation(engine, &cfg);
     }

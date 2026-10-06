@@ -7,41 +7,7 @@
 
 int pulsar_engine::routed_quant_bits() {
     auto *e = this;
-    if (!e) return 0;
-    /* Report the routed-expert precision tier actually present, derived from
-     * the loaded tensor types (was hardcoded 2, which under-reported the mixed
-     * IQ2 + MXFP4/type-40 build as pure 2-bit). Any 4-bit routed format
-     * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
-     * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
-     * routed experts. pulsar_engine_model_id() is a compile-time constant, so
-     * this is the model-variant discriminator in the KV segment store's
-     * identity (pulsar_segstore_identity): a value change puts a build on a
-     * fresh store (one-time re-prefill). */
-    /* EXL3 (L245) is its own value space -- 20 + the rate in half-bit units
-     * (24 = K2, 25 = K2.5, 26 = K3; the highest rate present wins) -- so an
-     * EXL3 artifact never shares KV with the IQ2 (2) or MXFP4 (4) tier of the
-     * same model id. */
-    int bits = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const pulsar_tensor *proj[3] = {
-            e->weights.layer[il].ffn_gate_exps,
-            e->weights.layer[il].ffn_up_exps,
-            e->weights.layer[il].ffn_down_exps,
-        };
-        for (int k = 0; k < 3; k++) {
-            const pulsar_tensor *t = proj[k];
-            if (!t) continue;
-            if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
-                return 4;
-            const int k2 = exl3_type_k2(t->type);
-            if (k2) {
-                if (20 + k2 > bits) bits = 20 + k2;
-                continue;
-            }
-            if (bits == 0) bits = 2;
-        }
-    }
-    return bits;
+    return e ? e->family->quant_bits(e) : 0;
 }
 
 
@@ -386,7 +352,7 @@ static bool tp_register_expert_half(pulsar_engine *e, const pulsar_model *m,
                                                mid, out, 1, lo, hi, ds, dd, hds, hdd))
         return false;
     /* what the three half-stacks just built hold: n_exp experts at the half strides */
-    e->tp_expert_half_bytes += (uint64_t)n_exp * (2u * hgs + hds);
+    e->tp_built_bytes += (uint64_t)n_exp * (2u * hgs + hds);
     return true;
 }
 
@@ -900,8 +866,9 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         uint32_t tp_layers = 0, tp_embd = 0, tp_vocab = 0;
         e->family->tp_shape(e, &tp_layers, &tp_embd, &tp_vocab);
         pulsar_tp_identity id;
+        /* mapped_bytes, not size: a safetensors model's size is one shard (L272 B13) */
         pulsar_tp_identity_init_defaults(&id,
-                                         (uint64_t)e->model.size,
+                                         (uint64_t)e->model.mapped_bytes,
                                          (uint32_t)e->model_id(),
                                          tp_layers,
                                          tp_embd,
@@ -1015,7 +982,9 @@ void pulsar_engine::summary() {
 
 int pulsar_engine::vocab_size() {
     auto *e = this;
-    return e ? e->vocab.n_vocab : 0;
+    if (!e) return 0;
+    /* the tokenizer TABLE length (L272 B3: Qwen never loads e->vocab; its table is the checkpoint's) */
+    return e->qwen_tok ? qwen_tokenizer_n_tokens(e->qwen_tok) : e->vocab.n_vocab;
 }
 
 
@@ -1076,9 +1045,10 @@ uint64_t pulsar_engine::weights_resident_bytes() {
     /* Under TP the stored expert stacks are unstaged (subtracted above) and this
      * rank's HALF of every expert is built on the device at open instead: ~73 GiB
      * per rank on V4-Flash that the admission budget read as free memory
-     * (2026-09-29: static bound 89 GiB on a box with 16 GiB for KV).  The small
+     * (2026-09-29: static bound 89 GiB on a box with 16 GiB for KV); Qwen builds
+     * its dense slices and expert halves the same way (L272 B9).  The small
      * shared-expert K-slice repacks are left to the process overhead reserve. */
-    bytes += e->tp_expert_half_bytes;
+    bytes += e->tp_built_bytes;
     return bytes;
 }
 
@@ -2189,6 +2159,13 @@ int pulsar_session::set_logits(const float *logits, int n) {
 }
 
 
+bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen) {
+    if (token >= 0 && token < pulsar_engine_vocab_size(s->engine)) return true;
+    snprintf(err, errlen, "eval: token %d is not a vocab id (a refused sample must fail the "
+                          "request, not be evaluated)", token);
+    return false;
+}
+
 int pulsar_session::eval(int token, char *err, size_t errlen) {
     auto *s = this;
     if (!s) return 1;
@@ -2216,13 +2193,9 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     /* L188: a refused sample is -1 (PULSAR_SAMPLE_REFUSED); the embed kernel
      * would clamp it to token 0 and the step would look like a good one.  The
-     * check lives HERE, once, for every caller that feeds a sampled token back
-     * (server lanes, CLI, agent, eval): a non-id fails the request. */
-    if (token < 0 || token >= pulsar_engine_vocab_size(e)) {
-        snprintf(err, errlen, "eval: token %d is not a vocab id (a refused sample must fail the "
-                              "request, not be evaluated)", token);
-        return 1;
-    }
+     * check runs in every family's eval, for every caller that feeds a sampled
+     * token back (server lanes, CLI, agent, eval): a non-id fails the request. */
+    if (!pulsar_session_token_is_id(s, token, err, errlen)) return 1;
     /* Steady-state decode must reuse preallocated scratch, never touch the host
      * heap. The guard is a no-op unless PULSAR_ALLOC_GUARD is set, so this is
      * free in production; armed, it makes any xmalloc/xrealloc inside the decode

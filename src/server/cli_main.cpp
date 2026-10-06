@@ -73,7 +73,8 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
         uint64_t rng = 0x5eed5eed5eed5eedULL;
         int toks[17];
         while (emitted < 12) {
-            if (pulsar_engine_has_dspark(engine)) {
+            /* the family's drafter, whichever it is (L272 B12: Qwen's MTP warmed with argmax before) */
+            if (pulsar_engine_drafter(engine) != PULSAR_DRAFTER_NONE) {
                 const int n = pulsar_session_generate_speculative(
                         session, 0.0f, 0, 1.0f, 0.0f, &rng, 12 - emitted,
                         pulsar_token_eos(engine), toks,
@@ -1023,18 +1024,7 @@ int main(int argc, char **argv) {
      * prologue overlap on top (see the constant's comment for the sizing
      * evidence). */
     {
-        const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_HIGH, PULSAR_THINK_MAX};
-        int hdr_len = 0;
-        for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
-            buf hdr = {0};
-            buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
-            buf_puts(&hdr, pulsar_think_effort_prefix_family(prefixed_modes[i], pulsar_engine_chat_v41(engine)));
-            pulsar_tokens hdr_tokens = {0};
-            pulsar_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
-            if (hdr_tokens.len > hdr_len) hdr_len = hdr_tokens.len;
-            pulsar_tokens_free(&hdr_tokens);
-            buf_free(&hdr);
-        }
+        const int hdr_len = chat_family_trivial_header_tokens(engine);   /* the loaded family's (L272 B6) */
         s.slot_trivial_common_tokens =
             hdr_len + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
         server_log(PULSAR_LOG_DEFAULT,
@@ -1043,6 +1033,10 @@ int main(int argc, char **argv) {
                    s.slot_trivial_common_tokens, hdr_len,
                    PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
     }
+    /* L272 B5: the template's turn markers, for the sys-prefix cold store and the routing anchor. */
+    if (!pulsar_chat_turn_markers(engine, &s.turn_markers))
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: the tokenizer does not spell the chat turn markers: "
+                   "the sys-prefix cold store and the last-turn routing anchor are off");
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
     if (cfg.kv_disk_dir &&

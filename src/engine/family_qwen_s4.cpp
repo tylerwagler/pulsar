@@ -15,6 +15,7 @@
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 #include "qwen_ngram.h"
+#include "tp/pulsar_tp.h"
 #include "cuda/pulsar_cuda_qwen.h"
 #include "cuda/pulsar_cuda_gdn.h"
 
@@ -106,13 +107,28 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
     const pulsar_model *m = &e->model;
     pulsar_qwen_weights *w = e->qwen_weights;
     w->tp = new pulsar_qwen_tp_slices();
-    const uint64_t r = s->tp_rank;
-    const uint64_t qk = (uint64_t)s->gdn_n_k_head * s->gdn_k_dim, vt = (uint64_t)s->gdn_n_v_head * s->gdn_v_dim;
-    const uint64_t qkF = qk * pulsar_qwen_tp(s);
+    const uint32_t nr = pulsar_qwen_tp(s);
+    const int rank = (int)s->tp_rank;
+    /* L272 P0: every range from the ONE range rule (pulsar_tp_owned_range, as DeepSeek's slices and
+     * the vocab gather).  The shape holds the rank's widths (pulsar_qwen_tp_load divided the heads),
+     * so the full tensor is nr times each; a range the rule hands out that is not that width refuses. */
+    struct span { uint32_t lo, hi; };
+    auto owned = [&](uint64_t rank_width, span *o) {
+        return pulsar_tp_owned_range(rank, nr, (uint32_t)(rank_width * nr), &o->lo, &o->hi) &&
+               (uint64_t)(o->hi - o->lo) == rank_width;
+    };
+    span qk, vt, qin, kvin, od, ex;
+    if (!owned((uint64_t)s->gdn_n_k_head * s->gdn_k_dim, &qk) || !owned((uint64_t)s->gdn_n_v_head * s->gdn_v_dim, &vt) ||
+        !owned(pulsar_qwen_qsa_q_in(s), &qin) || !owned(pulsar_qwen_qsa_kv_in(s), &kvin) ||
+        !owned(pulsar_qwen_qsa_out_dim(s), &od) || !pulsar_tp_owned_range(rank, nr, s->n_expert, &ex.lo, &ex.hi)) {
+        fprintf(stderr, "pulsar: %s: TP rank %d of %u owns no whole range of the heads or the experts -- refusing\n",
+                PULSAR_QWEN_ARCH, rank, nr);
+        return false;
+    }
+    const uint64_t qkF = (uint64_t)s->gdn_n_k_head * s->gdn_k_dim * nr;
     /* the rank's q, k, v channels of the GDN conv / in_proj_qkv, in the model's order */
-    const col_ranges qkv = {{r * qk, r * qk + qk}, {qkF + r * qk, qkF + r * qk + qk}, {2u * qkF + r * vt, 2u * qkF + r * vt + vt}};
-    const col_ranges vcols = {{r * vt, r * vt + vt}};
-    const uint64_t qin = pulsar_qwen_qsa_q_in(s), kvin = pulsar_qwen_qsa_kv_in(s), od = pulsar_qwen_qsa_out_dim(s);
+    const col_ranges qkv = {{qk.lo, qk.hi}, {qkF + qk.lo, qkF + qk.hi}, {2u * qkF + vt.lo, 2u * qkF + vt.hi}};
+    const col_ranges vcols = {{vt.lo, vt.hi}};
     uint64_t built = 0;
     bool ok = true;
     auto put = [&](const pulsar_tensor *t, const std::vector<uint8_t> &bytes) {
@@ -153,7 +169,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
         if (L.gdn_in_qkv) {
             cols(L.gdn_in_qkv, qkv);
             cols(L.gdn_in_z, vcols);
-            rows(L.gdn_out, r * vt, r * vt + vt);
+            rows(L.gdn_out, vt.lo, vt.hi);
             /* the conv: bf16 [channels][kernel], the rank's channels gathered */
             const uint64_t ck = (uint64_t)s->gdn_conv_kernel * 2u;
             const uint8_t *src = (const uint8_t *)tensor_data(m, L.gdn_conv);
@@ -162,23 +178,32 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
             if (ok) put(L.gdn_conv, b);
         }
         if (L.attn_q) {
-            cols(L.attn_q, {{r * qin, r * qin + qin}});
-            cols(L.attn_k, {{r * kvin, r * kvin + kvin}});
-            cols(L.attn_v, {{r * kvin, r * kvin + kvin}});
-            rows(L.attn_o, r * od, r * od + od);
+            cols(L.attn_q, {{qin.lo, qin.hi}});
+            cols(L.attn_k, {{kvin.lo, kvin.hi}});
+            cols(L.attn_v, {{kvin.lo, kvin.hi}});
+            rows(L.attn_o, od.lo, od.hi);
         }
-        /* the rank's expert half of each stack, staged now rather than at the first step */
+        /* the rank's experts [ex.lo, ex.hi) of each stack, staged now rather than at the first step */
         for (const pulsar_tensor *t : {L.moe_gate_up, L.moe_gate, L.moe_up, L.moe_down}) {
             if (!t || !ok) continue;
-            const uint64_t half = t->bytes / pulsar_qwen_tp(s);
-            ok = pulsar_qwen_weight_ptr(tensor_map_base(m, t), t->abs_offset + r * half, half, "qwen TP expert half") != NULL;
-            if (ok) built += half;
+            if (t->bytes % s->n_expert) {
+                fprintf(stderr, "pulsar: %s: %.*s is not n_expert equal slices -- refusing\n", PULSAR_QWEN_ARCH,
+                        (int)t->name.len, t->name.ptr);
+                ok = false;
+                continue;
+            }
+            const uint64_t stride = t->bytes / s->n_expert, bytes = (uint64_t)(ex.hi - ex.lo) * stride;
+            ok = pulsar_qwen_weight_ptr(tensor_map_base(m, t), t->abs_offset + (uint64_t)ex.lo * stride, bytes,
+                                        "qwen TP expert half") != NULL;
+            if (ok) built += bytes;
         }
     }
     if (!ok) {
         fprintf(stderr, "pulsar: %s: TP rank %u could not build its slices -- refusing\n", PULSAR_QWEN_ARCH, s->tp_rank);
         return false;
     }
+    /* L272 B9: resident weights the model's staged count never sees (pulsar_engine::weights_resident_bytes) */
+    e->tp_built_bytes += built;
     fprintf(stderr, "pulsar: %s TP rank %u: %zu dense slices + the expert halves built, %.2f GiB\n", PULSAR_QWEN_ARCH,
             s->tp_rank, w->tp->by_tensor.size(), (double)built / 1073741824.0);
     return true;
@@ -699,7 +724,11 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         return fail("an expert stack's bytes are not n_expert EXL3 slices");
     /* L266 step 7: under TP the rank holds experts [rank * E / tp, +E / tp) -- expert parallelism -- and reads
      * that half of each stack (only it was staged) */
-    const uint32_t tp = pulsar_qwen_tp(s), nE = s->n_expert / tp, e0 = s->tp_rank * nE;
+    const uint32_t tp = pulsar_qwen_tp(s);
+    uint32_t e0 = 0, e1 = s->n_expert;
+    if (tp > 1 && !pulsar_tp_owned_range((int)s->tp_rank, tp, s->n_expert, &e0, &e1))
+        return fail("the rank owns no expert range");
+    const uint32_t nE = e1 - e0;
     w.ep_rank = (int)s->tp_rank;
     w.ep_ranks = (int)tp;
     auto stack = [&](const pulsar_tensor *t, uint64_t stride, const char *what) -> const void * {
@@ -804,10 +833,13 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
         pulsar_qwen_weights *wm = const_cast<pulsar_qwen_weights *>(st->w);
         /* L266 step 7: under TP a rank's head is its vocab range [rank * V / tp, +V / tp) -- the rows it
          * computes, the gather below fills the rest; the draft head stays whole on every rank */
-        const uint32_t tp = pulsar_qwen_tp(s), Vl = s->n_vocab / tp;
-        if (!wm->head_mx) {
+        const uint32_t tp = pulsar_qwen_tp(s);
+        uint32_t v_lo = 0, v_hi = s->n_vocab;
+        if (tp > 1 && !pulsar_tp_owned_range((int)s->tp_rank, tp, s->n_vocab, &v_lo, &v_hi)) ok = false;
+        const uint32_t Vl = v_hi - v_lo;
+        if (ok && !wm->head_mx) {
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
-            if (hb) hb += (uint64_t)s->tp_rank * Vl * H;
+            if (hb) hb += (uint64_t)v_lo * H;
             const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)Vl, H);
             wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
             ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
@@ -824,7 +856,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
             /* this rank's rows of the head into `dst` -- the whole head on one GPU, the vocab range the engine's
              * gather asks for under TP (the rank's own; the gather assembles the rest) */
             auto head = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
-                if (!dh && tp > 1 && (lo != s->tp_rank * Vl || width != Vl)) return false;
+                if (!dh && tp > 1 && (lo != v_lo || width != Vl)) return false;
                 return pulsar_qwen_mxfp8_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), NULL, 0,
                                                        0) == 0;
             };

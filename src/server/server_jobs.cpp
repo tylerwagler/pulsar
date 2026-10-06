@@ -904,9 +904,7 @@ void server::gen_begin(session_slot *sl) {
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens)
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    pulsar_token_user(s->engine),
-                                                    pulsar_token_assistant(s->engine));
+        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers);
         cold_store_len = kv_cache_sys_prefix_cut(&s->kv, anchor);
     }
     /* An image request's cold phase covers the shared preamble only, and the
@@ -1274,9 +1272,11 @@ void gen_resolve_sampling(const request *req, float *temperature,
 
 
 /* Decode-lane sampling resolution: gen_resolve_sampling plus the tool-payload
- * greedy override (temperature=0 while the DSML tracker sits inside a tool
- * call outside a payload-sampling region). L116: ONE authority for every
- * decode lane — classic, plain-batched, spec-batched, mixed — so a tool
+ * greedy override (temperature=0 while the decode sits inside a tool call: the
+ * DSML tracker's region outside a payload-sampling span for DeepSeek, the Qwen
+ * parser's open <tool_call> block for Qwen -- L272 B8; a Qwen argument is the
+ * JSON text itself, with no payload-sampling region). L116: ONE authority for
+ * every decode lane — classic, plain-batched, spec-batched, mixed — so a tool
  * request samples the same wherever the scheduler routes it. Granularity is
  * one resolution per spec block / batched round in every lane (the classic
  * lane always worked this way: the override can lag a mid-block tool-marker
@@ -1285,11 +1285,15 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
     const request *req = &g->j->req;
     gen_resolve_sampling(req, temperature, top_k, top_p, min_p);
-    const dsml_decode_state st = req->kind == REQ_CHAT && req->has_tools ?
-        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
-    if (dsml_decode_state_is_tool(st) &&
-        !dsml_decode_state_uses_payload_sampling(st))
-        *temperature = 0.0f;
+    if (req->kind != REQ_CHAT || !req->has_tools) return;
+    bool in_tool;
+    if (g->qwen) {
+        in_tool = g->qwen->parser.in_tool_call();
+    } else {
+        const dsml_decode_state st = g->dsml_tracker.decode;
+        in_tool = dsml_decode_state_is_tool(st) && !dsml_decode_state_uses_payload_sampling(st);
+    }
+    if (in_tool) *temperature = 0.0f;
 }
 
 
@@ -1884,7 +1888,9 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
+        /* a Qwen turn keeps no live tool state (qwen_render refuses a continuation
+         * that would need it), so nothing is remembered for one (L272 B14) */
+        if (parsed_calls.len && !j->req.chat_qwen && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);

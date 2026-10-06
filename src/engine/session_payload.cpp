@@ -737,14 +737,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
  * refused, never misread. */
 #define SEGMENT_U32_FIELDS 8u
 
-/* The session's grid checkpoint store and the bank a segment reads or writes: a bank-pool family's
- * own (L266, Qwen) or DeepSeek's graph pool's installed bank. */
-static pulsar_ckpt_store *segment_store(pulsar_session *s) {
-    return FAMILY_BANKS(s) ? FAMILY_BANKS(s)->kv_store(s) : &s->graph.ckpt;
-}
-static uint32_t segment_bank(pulsar_session *s) {
-    return FAMILY_BANKS(s) ? FAMILY_BANKS(s)->live(s) : gpu_graph_cur_bank(&s->graph);
-}
 /* The bank holds nothing: a chain's root replaces its history, a failed load leaves it empty.  A
  * bank-pool family's lanes are written by the chain's last restore and its counters by
  * set_frontier_stale, so its host view and its checkpoints are all there is to clear. */
@@ -782,7 +774,7 @@ static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32
 }
 
 uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G) {
-    pulsar_ckpt_store *st = segment_store(this);
+    pulsar_ckpt_store *st = pulsar_session_kv_store(this);
     if (!segment_span_ok(st, G_prev, G)) return 0;
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
@@ -796,8 +788,8 @@ uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G) {
 
 int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen) {
     auto *s = this;
-    pulsar_ckpt_store *st = segment_store(s);
-    const uint32_t bank = segment_bank(s);
+    pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const uint32_t bank = pulsar_session_live_bank(s);
     if (!fp || !s->checkpoint_valid || !segment_span_ok(st, G_prev, G) || G > (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "save segment: the session does not hold that grid span");
         return 1;
@@ -852,8 +844,8 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
 
 int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen) {
     auto *s = this;
-    pulsar_ckpt_store *st = segment_store(s);
-    const uint32_t bank = segment_bank(s);
+    pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const uint32_t bank = pulsar_session_live_bank(s);
     if (G_out) *G_out = 0u;
     if (!fp) { payload_set_err(err, errlen, "load segment: no stream"); return 1; }
     payload_io io;

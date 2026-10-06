@@ -168,6 +168,8 @@ public:
     const std::string &content() const { return content_; }
     const std::vector<qwen_out_call> &calls() const { return calls_; }
     int errors() const { return errors_; }
+    /** The parser sits inside an open <tool_call> block: its arguments decode greedily (L272 B8). */
+    bool in_tool_call() const { return mode_ == M_TOOL; }
 
 private:
     enum mode_t { M_REASONING, M_CONTENT, M_TOOL, M_AFTER_TOOL };

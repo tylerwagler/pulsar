@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import numpy as np
 
+import exl3_rates
+
 # --------------------------------------------------------------------------
 # E4M3 codec: the C reference, vectorised.
 # --------------------------------------------------------------------------
@@ -370,8 +372,7 @@ def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
 _NATIVE_DTYPE_LAYOUT = {"F32": "f32", "I32": "i32", "BF16": "bf16"}
 # twice the rate K (exl3m_k2h is K = 2.5).  k4 / k5 are the Qwen lane's rates (L251: routed experts K4,
 # EXL3-able dense Linears K5); k6 / k8 are turboderp's (L266).  Every rate has the same [trellis | suh | svh] byte model.
-_EXL3_K2 = {"exl3m_k2": 4, "exl3m_k2h": 5, "exl3m_k3": 6, "exl3m_k4": 8, "exl3m_k5": 10, "exl3m_k6": 12,
-            "exl3m_k8": 16}
+_EXL3_K2 = exl3_rates.K2
 EXL3_HAD_BLOCK = 128
 
 
@@ -430,8 +431,7 @@ def bytes_for(layout: str, dims_ne: list, dtype: str | None = None) -> int:
         k, n = int(dims_ne[0]), int(dims_ne[1])
         if k % EXL3_HAD_BLOCK or n % EXL3_HAD_BLOCK:
             raise ValueError(f"bytes_for: {layout} refuses dims [{k}, {n}] (both must be multiples of {EXL3_HAD_BLOCK})")
-        k2 = _EXL3_K2[layout]
-        words = 16 * (k2 >> 1) + (8 if k2 & 1 else 0)
+        words = exl3_rates.words_for(layout)
         per_expert = (k // 16) * (n // 16) * words * 2 + (k + n) * 2
         return per_expert * _prod(dims_ne[2:])
     raise ValueError(f"bytes_for: unknown layout {layout!r}")

@@ -313,6 +313,11 @@ const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
 const char *pulsar_think_effort_prefix_family(pulsar_think_mode mode, bool v41);
 /** Whether the V4 (0731) encoder can spell `mode` at all: none, low, high, max. */
 bool pulsar_think_effort_v4_valid(pulsar_think_mode mode);
+/** Does the LOADED family render thinking at `mode`?  V4.1: every effort in [1, 100]; V4 (0731):
+ * none, low, high, max (pulsar_think_effort_v4_valid); Qwen: on at the template's default
+ * (PULSAR_THINK_DEFAULT) or off, no effort level.  `why` (optional) receives the family's rule when
+ * it does not.  Front ends validate an explicit effort here, after open (L272 B10). */
+bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mode mode, char *why, size_t n);
 /** The loaded model's DEFAULT thinking effort: V4.1's reference default is high
  * (PULSAR_THINK_DEFAULT); the V4 (0731) encoder's is low, which renders no
  * effort line; Qwen's is thinking on at the template's default effort.  Every front end that did not receive an explicit effort
@@ -477,8 +482,27 @@ int pulsar_token_eos(pulsar_engine *e);
 /** L251: whether `token` ends generation -- the family's whole stop set (Qwen: <|im_end|> and
  * <|endoftext|>, generation_config.json); DeepSeek: its one eos id. */
 bool pulsar_token_is_stop(pulsar_engine *e, int token);
-int pulsar_token_user(pulsar_engine *e);
-int pulsar_token_assistant(pulsar_engine *e);
+/** The chat template's TURN MARKERS as token sequences (L272 B5): the tokens that open a user turn
+ * and an assistant turn in a rendered prompt.  DeepSeek names each with one special token
+ * (<｜User｜>, <｜Assistant｜>); Qwen's template spells a turn as the added token <|im_start|> followed
+ * by the role word, so a marker is two tokens there.  The server's prefix anchors (the sys-prefix
+ * cold store, the last-turn routing anchor) scan a prompt with pulsar_turn_marker_at.  false, with
+ * `out` zeroed (no marker matches anywhere), when the loaded tokenizer does not spell them -- said
+ * once, never a marker that matches at the wrong place. */
+typedef struct {
+    int user[2];       ///< the user-turn marker, n_user tokens
+    int n_user;
+    int assistant[2];  ///< the assistant-turn marker, n_assistant tokens
+    int n_assistant;
+} pulsar_turn_markers;
+bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out);
+/** The role whose marker begins at v[i] of v[0..n): 1 = user, 2 = assistant, 0 = none.  A marker
+ * whose tokens run past n does not match.  Pure host code. */
+int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i);
+/** The ONE token that closes a reasoning block -- "</think>" as the loaded tokenizer spells it
+ * (DeepSeek's special, Qwen's added token); -1 when it has none.  A front end that forces the
+ * close feeds this id, never the text re-tokenized (L272 B11: BPE pieces on Qwen). */
+int pulsar_token_think_close(pulsar_engine *e);
 
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
 void pulsar_session_free(pulsar_session *s);
@@ -1030,9 +1054,10 @@ bool pulsar_engine_has_dspark(pulsar_engine *e);
 /** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
  * front end without it runs greedy through the session lane (Qwen). */
 bool pulsar_engine_has_argmax(const pulsar_engine *e);
-/** The speculative drafter the OPENED engine actually carries: DSPARK when its dspark.* drafter loaded,
- *  MTP when a Qwen artifact carries the mtp.* layer (the sidecar shard; served by the family's own
- *  pulsar_session_generate_speculative, greedy), NONE otherwise. */
+/** The speculative drafter the OPENED engine actually carries -- the family's answer
+ *  (pulsar_family::drafter): DSPARK when DeepSeek's dspark.* drafter loaded, MTP when a Qwen artifact
+ *  carries the mtp.* layer (the sidecar shard; served by the family's own
+ *  pulsar_session_generate_speculative), NONE otherwise. */
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
 /** L263: the spec lane's step cost, MEASURED -- the one authority the yield

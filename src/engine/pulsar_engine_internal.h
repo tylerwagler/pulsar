@@ -1822,7 +1822,7 @@ struct pulsar_engine {
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_kv_dir;            ///< a worker's segment copies (pulsar_engine_options.tp_kv_dir), owned, or NULL
-    uint64_t tp_expert_half_bytes;   ///< 4g-2: device bytes of this rank's routed-expert half-stacks, built at open -- resident weights the model's staged count never sees
+    uint64_t tp_built_bytes;    ///< 4g-2: device bytes this rank BUILT at open (DeepSeek: its routed-expert half-stacks; Qwen: its dense slices and expert halves) -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
     void *tp_bulk_base;         ///< the bulk lane's buffer (host-pinned, v14), or NULL
@@ -2551,11 +2551,6 @@ struct pulsar_session {
     int bank_spec_depth(uint32_t bank);
     /** Borrowed view of `bank`'s committed token history. Do not free. */
     const pulsar_tokens *bank_tokens(uint32_t bank);
-    /** Longest common token prefix between `bank`'s history and `prompt`. */
-    int bank_common_prefix(uint32_t bank, const pulsar_tokens *prompt);
-    /** Byte-level prefix match against `bank` -- the seam-aware form that reports
-     * live-side and prompt-side cuts separately (see pulsar_prefix_match). */
-    void bank_prefix_match(uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out);
     /** Append tokens to the session's checkpoint WITHOUT decoding them: for
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
@@ -2970,6 +2965,33 @@ void config_validate_model(const pulsar_model *m);
  */
 void weights_bind(pulsar_weights *w, const pulsar_model *m);
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
+/** The whole-artifact scans EVERY family's bind runs (L272 B7): refuse a tensor type no reader
+ * takes, an E8M0 scale byte of 0xFF (NaN) and a non-finite EXL3 scale. */
+void weights_reject_unsupported_types(const pulsar_model *m);
+void weights_reject_bad_e8m0(const pulsar_model *m);
+
+/* ---- L272 P0: the session readers both families share (engine_api.cpp) ------------------------
+ * The one answer each, over the family's bank ops or DeepSeek's graph pool: a family's sync and the
+ * C API read the same store, the same live bank and the same resume rule. */
+/** The session's grid checkpoint store: the family's own (L266, Qwen) or DeepSeek's graph pool's. */
+struct pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s);
+/** The bank the session's sync and eval run on. */
+uint32_t pulsar_session_live_bank(pulsar_session *s);
+/** L266 step 5: where a sync of `prompt_len` tokens sharing `common` with `bank`'s history resumes --
+ * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
+ * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0. */
+uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
+/** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
+ * token 0.  false with `err` filled when `token` is not a vocab id. */
+bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen);
+/** Tokens `t` (NULL = none) and `p` share from the start. */
+static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const pulsar_tokens *p) {
+    if (!t || !p) return 0;
+    const int n = t->len < p->len ? t->len : p->len;
+    int i = 0;
+    while (i < n && t->v[i] == p->v[i]) i++;
+    return i;
+}
 /** Bind + layout-validate the Vision-Exp tower.  Returns false (and leaves the
  * struct zeroed) when the artifact carries no `vision.patch_embed.proj.weight`,
  * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,

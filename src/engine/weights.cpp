@@ -1121,7 +1121,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
 
 
 
-static void weights_reject_unsupported_types(const pulsar_model *m) {
+void weights_reject_unsupported_types(const pulsar_model *m) {
     bool seen[256] = { false };
     bool any = false;
 
@@ -1246,7 +1246,7 @@ static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
 
 
 
-static void weights_reject_bad_e8m0(const pulsar_model *m) {
+void weights_reject_bad_e8m0(const pulsar_model *m) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
         switch (t->type) {

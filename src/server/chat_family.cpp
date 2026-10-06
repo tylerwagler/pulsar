@@ -446,6 +446,34 @@ static bool qwen_render(pulsar_engine *e, chat_conversation *c, request *r, qwen
 
 
 
+/* L272 B6: the longest rendered prefix two UNRELATED prompts share by template construction -- the
+ * slot router's trivial-match header (server::slot_trivial_common_tokens).  DeepSeek: the BOS plus
+ * the longest effort preamble the loaded encoder renders (V4.1 renders the numeric line, 0731 its
+ * high / max texts; measured before this lived here, the header was built from DeepSeek's BOS on a
+ * Qwen engine too).  Qwen: the system turn's opener -- no BOS, no effort line. */
+int chat_family_trivial_header_tokens(pulsar_engine *e) {
+    int hdr_len = 0;
+    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
+        pulsar_tokens t = {0};
+        pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t);
+        hdr_len = t.len;
+        pulsar_tokens_free(&t);
+        return hdr_len;
+    }
+    const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_HIGH, PULSAR_THINK_MAX};
+    for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
+        buf hdr = {0};
+        buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
+        buf_puts(&hdr, pulsar_think_effort_prefix_family(prefixed_modes[i], pulsar_engine_chat_v41(e)));
+        pulsar_tokens hdr_tokens = {0};
+        pulsar_tokenize_rendered_chat(e, hdr.ptr, &hdr_tokens);
+        if (hdr_tokens.len > hdr_len) hdr_len = hdr_tokens.len;
+        pulsar_tokens_free(&hdr_tokens);
+        buf_free(&hdr);
+    }
+    return hdr_len;
+}
+
 /* ---- the dispatch --------------------------------------------------------------------------------- */
 
 bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *s, chat_conversation *c,

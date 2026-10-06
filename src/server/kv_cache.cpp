@@ -333,15 +333,13 @@ void build_prompt_from_exact_prefix_and_text_suffix(
 /* The stable rendered chat prefix is everything before the user message that
  * asks this specific task.  Some clients put stable user-role scaffolding
  * first, so the anchor is the last user marker before the first assistant. */
-int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
-                                    const pulsar_tokens *prompt,
-                                    int user_token_id,
-                                    int assistant_token_id) {
-    if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
+int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
+    if (!prompt || !m || m->n_user <= 0 || m->n_assistant <= 0) return -1;
     int last_user = -1;
     for (int i = 0; i < prompt->len; i++) {
-        if (prompt->v[i] == assistant_token_id) break;
-        if (prompt->v[i] == user_token_id) last_user = i;
+        const int role = pulsar_turn_marker_at(m, prompt->v, prompt->len, i);
+        if (role == 2) break;
+        if (role == 1) last_user = i;
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }

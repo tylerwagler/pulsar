@@ -41,14 +41,15 @@ import os
 import re
 import struct
 
+import exl3_rates
 from hf_source import EXL3_MUL1  # noqa: F401  (the codebook the EXL3 sources are checked against)
 import kv as KV
 import producers as PR
 
 FAMILY = "qwen4_exp"
 PFX = "model.language_model."
-EXL3_RATES = {64: "exl3m_k4", 80: "exl3m_k5", 96: "exl3m_k6", 128: "exl3m_k8"}   # words per 16x16 tile -> layout (16 K)
-FORMATS = {"bf16", "mxfp8_lt", "exl3m_k4", "exl3m_k5", "exl3m_k6", "exl3m_k8", "ple_rows", "kv", "omit"}
+EXL3_RATES = exl3_rates.rates(exl3_rates.QWEN)   # words per 16x16 tile -> layout, the rates Qwen's arms read
+FORMATS = {"bf16", "mxfp8_lt", *exl3_rates.QWEN, "ple_rows", "kv", "omit"}
 EXPERT_STACKS = ("gate_up_proj", "down_proj")
 
 

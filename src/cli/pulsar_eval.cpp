@@ -3836,7 +3836,17 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     bool generation_in_think = pulsar_think_mode_enabled(think_mode);
     eval_think_close_info think_close = {};
     pulsar_tokens think_close_tokens = {0};
-    if (generation_in_think) pulsar_tokenize_text(engine, "</think>", &think_close_tokens);
+    /* the tokenizer's ONE think-close id (L272 B11: re-tokenizing the text gave BPE pieces on Qwen) */
+    if (generation_in_think) {
+        const int close_id = pulsar_token_think_close(engine);
+        if (close_id < 0) {
+            fprintf(stderr, "pulsar-eval: the tokenizer has no </think> token to force a close with\n");
+            free(raw.v);
+            free(question);
+            return EVAL_RUN_ERROR;
+        }
+        pulsar_tokens_push(&think_close_tokens, close_id);
+    }
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
@@ -4218,9 +4228,9 @@ int main(int argc, char **argv) {
     /* The default effort is the loaded family's (L239); an effort the 0731
      * encoder cannot spell is refused by name. */
     if (!cfg.think_mode_set) cfg.think_mode = pulsar_engine_think_default(engine);
-    if (!pulsar_engine_chat_v41(engine) && !pulsar_think_effort_v4_valid(cfg.think_mode)) {
-        fprintf(stderr, "pulsar-eval: --think-effort %d: the V4 (0731) encoder has three levels -- low, high, max\n",
-                (int)cfg.think_mode);
+    char think_why[200];
+    if (!pulsar_engine_think_mode_supported(engine, cfg.think_mode, think_why, sizeof think_why)) {
+        fprintf(stderr, "pulsar-eval: thinking effort %d: %s\n", (int)cfg.think_mode, think_why);
         return 2;
     }
     int max_prompt_tokens = 0;

@@ -4669,6 +4669,7 @@ static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     const int user = 9001;
     const int assistant = 9002;
+    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 4;
@@ -4682,7 +4683,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     pulsar_tokens_push(&codex, user);  /* actual task starts here */
     pulsar_tokens_push(&codex, 5);
     pulsar_tokens_push(&codex, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, user, assistant) == 5);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, &m) == 5);
 
     pulsar_tokens claude = {0};
     pulsar_tokens_push(&claude, 1);
@@ -4692,10 +4693,30 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     pulsar_tokens_push(&claude, user); /* system reminder and task share a turn */
     pulsar_tokens_push(&claude, 5);
     pulsar_tokens_push(&claude, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, user, assistant) == 4);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, &m) == 4);
+
+    /* L272 B5: Qwen's markers are two tokens, <|im_start|> plus the role word; the
+     * anchor is the position of the marker's first token */
+    const int start = 151644, u = 872, a = 77091;
+    const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    pulsar_tokens qwen = {0};
+    pulsar_tokens_push(&qwen, start);  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qwen, 8948);
+    pulsar_tokens_push(&qwen, 2);      /* 2 the system prompt */
+    pulsar_tokens_push(&qwen, 3);
+    pulsar_tokens_push(&qwen, start);  /* 4 <|im_start|>user: the task */
+    pulsar_tokens_push(&qwen, u);
+    pulsar_tokens_push(&qwen, u);      /* 6 the word "user" inside the message: not a marker */
+    pulsar_tokens_push(&qwen, 5);
+    pulsar_tokens_push(&qwen, start);  /* 8 <|im_start|>assistant */
+    pulsar_tokens_push(&qwen, a);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &q) == 4);
+    /* a one-token marker table does not match Qwen's two-token turns */
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &m) == -1);
 
     pulsar_tokens_free(&codex);
     pulsar_tokens_free(&claude);
+    pulsar_tokens_free(&qwen);
 }
 
 
@@ -4724,6 +4745,7 @@ static void test_kv_cache_sys_prefix_cut_clears_preamble_jitter(void) {
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     const int user = 9001;
     const int assistant = 9002;
+    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 2;
@@ -4738,12 +4760,17 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     pulsar_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
     pulsar_tokens_push(&prompt, 5);
     pulsar_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == 2);
 
     kc.opt.min_tokens = 3;
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == -1);
+    /* unknown markers (the tokenizer does not spell them): no anchor */
+    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers no_assistant = {{user, 0}, 1, {0, 0}, 0};
+    kc.opt.min_tokens = 2;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &none) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &no_assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, NULL) == -1);
 
     pulsar_tokens_free(&prompt);
 }
@@ -5533,6 +5560,7 @@ static void test_l264_route_in_place(void) {
  * and diverge inside the last user turn. */
 static void test_l275_route_turn_anchor(void) {
     const int user = 9001, assistant = 9002;
+    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
     pulsar_tokens bank = {0};
     pulsar_tokens_push(&bank, 1);          /* 0 bos */
     pulsar_tokens_push(&bank, 2);          /* 1 system prompt */
@@ -5544,19 +5572,48 @@ static void test_l275_route_turn_anchor(void) {
     pulsar_tokens_push(&bank, 5);          /* 7 */
     pulsar_tokens_push(&bank, assistant);  /* 8 the generation prompt */
     /* the last user marker the bank prefilled, with an exchange before it */
-    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, user, assistant) == 6);
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &m) == 6);
     /* prefilled stops before the second marker: the only user marker has no
      * assistant turn before it -- a first-turn bank has no anchor */
-    TEST_ASSERT(server_route_turn_anchor(&bank, 5, user, assistant) == -1);
-    TEST_ASSERT(server_route_turn_anchor(&bank, 4, user, assistant) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, 5, &m) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, 4, &m) == -1);
     /* a prefilled count past the history is clamped to it */
-    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len + 10, user, assistant) == 6);
-    /* unknown marker ids (a family that does not name them reports 0 or -1,
-     * L272 B5): no anchor */
-    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, -1, assistant) == -1);
-    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, user, 0) == -1);
-    TEST_ASSERT(server_route_turn_anchor(NULL, 9, user, assistant) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len + 10, &m) == 6);
+    /* unknown markers (the tokenizer does not spell them, L272 B5): no anchor */
+    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers no_user = {{0, 0}, 0, {assistant, 0}, 1};
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &none) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &no_user) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, NULL) == -1);
+    TEST_ASSERT(server_route_turn_anchor(NULL, 9, &m) == -1);
     pulsar_tokens_free(&bank);
+
+    /* Qwen's two-token markers (L272 B5): the same shape rendered by its template */
+    const int start = 151644, u = 872, a = 77091;
+    const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    pulsar_tokens qb = {0};
+    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, 8948);  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qb, 2);                                     /* 2 */
+    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 3 <|im_start|>user */
+    pulsar_tokens_push(&qb, 3);                                     /* 5 */
+    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 6 <|im_start|>assistant */
+    pulsar_tokens_push(&qb, 4);                                     /* 8 */
+    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 9 <|im_start|>user */
+    pulsar_tokens_push(&qb, u);                                     /* 11 the word "user" in the message */
+    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 12 <|im_start|>assistant */
+    TEST_ASSERT(server_route_turn_anchor(&qb, qb.len, &q) == 9);
+    /* the marker's second token is past what the bank prefilled: no marker there */
+    TEST_ASSERT(server_route_turn_anchor(&qb, 10, &q) == -1);
+    TEST_ASSERT(server_route_turn_anchor(&qb, 11, &q) == 9);
+    /* pulsar_turn_marker_at itself: the roles at every position */
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, qb.len, 0) == 0);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, qb.len, 3) == 1);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, qb.len, 4) == 0);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, qb.len, 6) == 2);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, qb.len, 12) == 2);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, qb.v, 13, 12) == 0);
+    TEST_ASSERT(pulsar_turn_marker_at(&m, bank.v, 0, 0) == 0);
+    pulsar_tokens_free(&qb);
 }
 
 /* L275: the in-place verdict through the last turn -- the pair's measured

@@ -1424,6 +1424,10 @@ struct server {
      * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.cpp; immutable after
      * startup, worker thread reads only). */
     int slot_trivial_common_tokens;
+    /** L272 B5: the template's turn markers (pulsar_chat_turn_markers at startup; zeroed when the
+     * tokenizer does not spell them, which leaves the sys-prefix cold store and the last-turn routing
+     * anchor off).  Immutable after startup. */
+    pulsar_turn_markers turn_markers;
     int default_tokens;      ///< generation cap when the request does not set one
     kv_disk_cache kv;        ///< on-disk prompt-prefix KV cache
     tool_memory tool_mem;    ///< tool call/result bodies kept for replay matching
@@ -2911,10 +2915,10 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
-int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
-                                    const pulsar_tokens *prompt,
-                                    int user_token_id,
-                                    int assistant_token_id);
+int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
+/* L272 B6: the rendered prefix two UNRELATED prompts share by template construction, in tokens
+ * (chat_family.cpp): the slot router's trivial-match header. */
+int chat_family_trivial_header_tokens(pulsar_engine *e);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
@@ -2922,7 +2926,7 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 /* L275: the position of the bank's last user marker among its prefilled tokens
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
-int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, int user_id, int assistant_id);
+int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */

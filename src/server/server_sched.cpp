@@ -441,18 +441,19 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  * bank, evicted an idle one and reloaded the chain from disk (301 provisions,
  * 188 evictions in three hours); the next real turn of a conversation whose
  * bank had been evicted came back from disk on another bank.
- * -1 when the marker ids are unknown (a family whose vocab does not name them --
- * Qwen, L272 B5 -- reports 0), when the bank holds no completed exchange (a
+ * -1 when the markers are unknown (server::turn_markers zeroed: the tokenizer
+ * does not spell them), when the bank holds no completed exchange (a
  * first-turn bank: two unrelated conversations behind one system prompt share
  * the marker position and part of the first message, the 2026-10-04 clobber), or
  * when there is no user marker at all. */
-int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, int user_id, int assistant_id) {
-    if (!bank || !bank->v || user_id <= 0 || assistant_id <= 0) return -1;
+int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
+    if (!bank || !bank->v || !m || m->n_user <= 0 || m->n_assistant <= 0) return -1;
     if (prefilled > bank->len) prefilled = bank->len;
     int last_user = -1, first_assistant = -1;
     for (int i = 0; i < prefilled; i++) {
-        if (bank->v[i] == user_id) last_user = i;
-        else if (bank->v[i] == assistant_id && first_assistant < 0) first_assistant = i;
+        const int role = pulsar_turn_marker_at(m, bank->v, prefilled, i);
+        if (role == 1) last_user = i;
+        else if (role == 2 && first_assistant < 0) first_assistant = i;
     }
     return first_assistant >= 0 && last_user > first_assistant ? last_user : -1;
 }
@@ -556,9 +557,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * slot (the round-robin bounce under Claude Code). protect_floor stays the
      * static threshold. */
     int share_ceiling = s->slot_trivial_common_tokens;
-    const int job_anchor = kv_cache_chat_anchor_pos(&s->kv, &j->req.prompt,
-                                                    pulsar_token_user(s->engine),
-                                                    pulsar_token_assistant(s->engine));
+    const int job_anchor = kv_cache_chat_anchor_pos(&s->kv, &j->req.prompt, &s->turn_markers);
     if (job_anchor > 0) {
         const int anchor_ceiling =
             job_anchor + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
@@ -602,8 +601,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
     /* L275: the bank's last-turn anchor, from the history it prefilled. */
     const int anchor = best && s->sess
-        ? server_route_turn_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled,
-                                   pulsar_token_user(s->engine), pulsar_token_assistant(s->engine))
+        ? server_route_turn_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
         : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);

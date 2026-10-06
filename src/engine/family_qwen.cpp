@@ -10,6 +10,7 @@
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 #include "lib/qwen_tokenizer.h"
+#include "tp/pulsar_tp.h"
 
 const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
     /* .name              = */ "Qwen3.8-Flash-Next",
@@ -572,6 +573,10 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
         }
         e->qwen_weights->artifact_digest = h;
     }
+    /* L272 B7: the whole-artifact scans DeepSeek's bind runs -- a tensor type no reader takes, a NaN
+     * E8M0 scale, a non-finite EXL3 scale -- run for this family's artifact too. */
+    weights_reject_unsupported_types(&e->model);
+    weights_reject_bad_e8m0(&e->model);
     if (!qwen_bind_weights(&e->model, &g_qwen_shape, &e->plan, e->qwen_weights)) {
         fprintf(stderr, "pulsar: %s: the artifact does not bind -- refusing\n", PULSAR_QWEN_ARCH);
         return false;
@@ -593,9 +598,9 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
     pulsar_qwen_shape *s = &g_qwen_shape;
     const uint32_t nr = m->tp_n_ranks;
     if (nr != 2 || m->tp_rank < 0 || m->tp_rank >= 2 || s->gdn_n_k_head % nr || s->gdn_n_v_head % nr ||
-        s->n_head_kv % nr || s->n_head % nr || s->n_expert % nr) {
-        fprintf(stderr, "pulsar: %s: tensor parallelism is built for 2 ranks over whole heads and experts "
-                        "(rank %d of %u) -- refusing\n", PULSAR_QWEN_ARCH, m->tp_rank, nr);
+        s->n_head_kv % nr || s->n_head % nr || s->n_expert % nr || s->n_vocab % nr) {
+        fprintf(stderr, "pulsar: %s: tensor parallelism is built for 2 ranks over whole heads, experts and vocab "
+                        "rows (rank %d of %u) -- refusing\n", PULSAR_QWEN_ARCH, m->tp_rank, nr);
         return false;
     }
     m->tp_unstaged = (uint8_t *)xcalloc((size_t)m->n_tensors, 1);
@@ -635,10 +640,11 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
     const uint64_t rk[2] = {(uint64_t)m->tp_rank, nr};
     for (int i = 0; i < 2; i++)
         for (int b = 0; b < 8; b++) { w->artifact_digest ^= (uint8_t)(rk[i] >> (8 * b)); w->artifact_digest *= 1099511628211ull; }
+    uint32_t e0 = 0, e1 = 0;
+    (void)pulsar_tp_owned_range(m->tp_rank, nr, s->n_expert, &e0, &e1);
     fprintf(stderr, "pulsar: %s TP rank %d/%u: GDN %u key + %u value heads, QSA %u query + %u KV heads, experts "
                     "[%u, %u); %.2f GiB of stored tensors unstaged (slices and the expert half built at open)\n",
-            PULSAR_QWEN_ARCH, m->tp_rank, nr, s->gdn_n_k_head, s->gdn_n_v_head, s->n_head, s->n_head_kv,
-            (uint32_t)m->tp_rank * (s->n_expert / nr), ((uint32_t)m->tp_rank + 1u) * (s->n_expert / nr),
+            PULSAR_QWEN_ARCH, m->tp_rank, nr, s->gdn_n_k_head, s->gdn_n_v_head, s->n_head, s->n_head_kv, e0, e1,
             (double)unstaged / 1073741824.0);
     return true;
 }
@@ -664,6 +670,24 @@ static bool qwen_family_after_gpu(pulsar_engine *e) {
 /* ---- engine facts ------------------------------------------------------------- */
 
 static uint32_t qwen_logits_width(const pulsar_engine *) { return g_qwen_shape.n_vocab; }
+/* L272 B15: the drafter the opened artifact carries -- the MTP layer, when its sidecar shard loaded. */
+static pulsar_drafter_kind qwen_drafter(pulsar_engine *e) {
+    return e->qwen_weights && e->qwen_weights->mtp.present ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE;
+}
+/* The routed experts' precision tier in EXL3's value space (family.h quant_bits): 20 + the highest
+ * rate present in half bits.  Qwen admits EXL3 experts only, so the tier is never 2 or 4. */
+static int qwen_quant_bits(pulsar_engine *e) {
+    int bits = 0;
+    if (!e->qwen_weights) return 0;
+    for (uint32_t il = 0; il < e->plan.n_layer; il++) {
+        const pulsar_qwen_layer_weights &L = e->qwen_weights->layer[il];
+        for (const pulsar_tensor *t : {L.moe_gate_up, L.moe_gate, L.moe_up, L.moe_down}) {
+            const int k2 = t ? exl3_type_k2(t->type) : 0;
+            if (k2 && 20 + k2 > bits) bits = 20 + k2;
+        }
+    }
+    return bits;
+}
 static const char *qwen_model_name(const pulsar_engine *) { return g_qwen_shape.name; }
 static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSAR_CHAT_QWEN; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's two profiles. */
@@ -1262,16 +1286,14 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
         if (err) snprintf(err, errlen, "%s: images are not implemented for this family", PULSAR_QWEN_ARCH);
         return 1;
     }
-    if (!prompt || prompt->len <= 0 || prompt->len > s->ctx_size) {
-        if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d]", PULSAR_QWEN_ARCH,
+    /* the bound is DeepSeek's (pulsar_session::sync): a prompt that fills the context leaves no row
+     * for the eval that follows it (L272 B4) */
+    if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d)", PULSAR_QWEN_ARCH,
                           prompt ? prompt->len : -1, s->ctx_size);
         return 1;
     }
-    int common = 0;
-    if (s->checkpoint_valid) {
-        while (common < s->checkpoint.len && common < prompt->len &&
-               s->checkpoint.v[common] == prompt->v[common]) common++;
-    }
+    const int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
     /* bank_pos[live] is the state's authority; the checkpoint must agree with it
      * to be continued (a batched step on the live bank moves the state, not the
      * checkpoint, and clears checkpoint_valid). */
@@ -1289,9 +1311,7 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
         /* L266 step 5: resume from the deepest grid checkpoint the prompt still shares -- within the
          * common prefix, the bank's prefill-only history, and one token short of the prompt (the last
          * row must be evaluated for the logits) -- else clear the bank and prefill from 0 */
-        uint32_t limit = (uint32_t)common < s->qwen->prefill_pos[live] ? (uint32_t)common : s->qwen->prefill_pos[live];
-        if (limit > (uint32_t)prompt->len - 1u) limit = (uint32_t)prompt->len - 1u;
-        const uint32_t G = limit ? pulsar_ckpt_best(s->qwen->ckpt, live, limit) : 0u;
+        const uint32_t G = pulsar_session_resume_point(s, live, common, prompt->len);
         if (G) {
             if (!pulsar_ckpt_restore(s->qwen->ckpt, live, G)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", PULSAR_QWEN_ARCH, live, G);
@@ -1322,6 +1342,7 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
         if (err) snprintf(err, errlen, "%s: eval needs a synced session with room left", PULSAR_QWEN_ARCH);
         return 1;
     }
+    if (!pulsar_session_token_is_id(s, token, err, errlen)) return 1;   /* L188 (L272 B2) */
     const uint32_t live = s->qwen->live_bank;
     if (s->qwen->bank_pos[live] != (uint32_t)s->checkpoint.len) {
         if (err) snprintf(err, errlen, "%s: eval: bank %u holds %u tokens, the checkpoint %d", PULSAR_QWEN_ARCH, live,
@@ -1652,6 +1673,16 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         rounds++;
         drafted += (uint64_t)k;
         kept += keep - 1u;
+        /* the engine's cumulative counters (pulsar_engine_spec_metrics, /metrics) by DSpark's rule in
+         * session_spec.cpp round_end: a round counts as a draft when it carried one (L272 B12) */
+        e->spec_gen_tokens += keep;
+        if (k > 0) {
+            e->spec_draft_tokens += (uint64_t)k;
+            e->spec_accepted_tokens += keep - 1u;
+            e->spec_num_drafts += 1u;
+            for (int i = 0; i < k && i < 16; i++) e->spec_verified_per_pos[i]++;
+            for (uint32_t i = 0; i + 1u < keep && i < 16u; i++) e->spec_accepted_per_pos[i]++;
+        }
         if (stop_tok >= 0) { if (n_out < cap) accepted[n_out++] = stop_tok; break; }
         x = sampled ? next : (int32_t)qwen_argmax(s->logits, V);
     }
@@ -1693,7 +1724,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .id           = */ PULSAR_FAMILY_ID_QWEN4_EXP,
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
-    /* .drafter      = */ PULSAR_DRAFTER_MTP,
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_TP,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
@@ -1702,6 +1732,8 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .chat_format  = */ qwen_chat_format,
     /* .model_id     = */ qwen_model_id,
     /* .tp_shape     = */ qwen_tp_shape,
+    /* .drafter      = */ qwen_drafter,
+    /* .quant_bits   = */ qwen_quant_bits,
     /* .session      = */ &k_qwen_session_ops,
     /* .banks        = */ &k_qwen_bank_ops,
 };

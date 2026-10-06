@@ -84,9 +84,11 @@ static void test_short_prefill_ratio4(void) {
     pulsar_engine *engine = test_get_engine();
     if (!engine) return;
 
+    pulsar_turn_markers markers;
+    TEST_ASSERT(pulsar_chat_turn_markers(engine, &markers));
     const int tokens[] = {
-        pulsar_token_user(engine),
-        pulsar_token_assistant(engine),
+        markers.user[0],
+        markers.assistant[0],
         pulsar_token_eos(engine),
     };
     for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {

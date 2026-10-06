@@ -8,6 +8,49 @@
  * order, as before the interface existed.  The graph (pulsar_session::graph)
  * is this family's session state. */
 #include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"
+
+/* L272 B15: the drafter the opened artifact carries -- DSpark when its dspark.* tensors loaded. */
+static pulsar_drafter_kind ds4_drafter(pulsar_engine *e) {
+    return e->has_dspark() ? PULSAR_DRAFTER_DSPARK : PULSAR_DRAFTER_NONE;
+}
+
+static int ds4_quant_bits(pulsar_engine *e) {
+    /* Report the routed-expert precision tier actually present, derived from
+     * the loaded tensor types (was hardcoded 2, which under-reported the mixed
+     * IQ2 + MXFP4/type-40 build as pure 2-bit). Any 4-bit routed format
+     * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
+     * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
+     * routed experts. pulsar_engine_model_id() is the profile, so
+     * this is the model-variant discriminator in the KV segment store's
+     * identity (pulsar_segstore_identity): a value change puts a build on a
+     * fresh store (one-time re-prefill). */
+    /* EXL3 (L245) is its own value space -- 20 + the rate in half-bit units
+     * (24 = K2, 25 = K2.5, 26 = K3; the highest rate present wins) -- so an
+     * EXL3 artifact never shares KV with the IQ2 (2) or MXFP4 (4) tier of the
+     * same model id. */
+    int bits = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_tensor *proj[3] = {
+            e->weights.layer[il].ffn_gate_exps,
+            e->weights.layer[il].ffn_up_exps,
+            e->weights.layer[il].ffn_down_exps,
+        };
+        for (int k = 0; k < 3; k++) {
+            const pulsar_tensor *t = proj[k];
+            if (!t) continue;
+            if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
+                return 4;
+            const int k2 = exl3_type_k2(t->type);
+            if (k2) {
+                if (20 + k2 > bits) bits = 20 + k2;
+                continue;
+            }
+            if (bits == 0) bits = 2;
+        }
+    }
+    return bits;
+}
 
 static uint32_t ds4_logits_width(const pulsar_engine *) { return PULSAR_N_VOCAB; }
 
@@ -66,7 +109,6 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .id           = */ PULSAR_FAMILY_ID_DEEPSEEK4,
     /* .arch         = */ "deepseek4",
     /* .name         = */ "DeepSeek V4",
-    /* .drafter      = */ PULSAR_DRAFTER_DSPARK,
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_PAYLOAD |
                           PULSAR_FAMILY_CAP_REWIND | PULSAR_FAMILY_CAP_VISION | PULSAR_FAMILY_CAP_TP |
                           PULSAR_FAMILY_CAP_IMATRIX | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_GENERATE |
@@ -78,5 +120,7 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .chat_format  = */ ds4_chat_format,
     /* .model_id     = */ ds4_model_id,
     /* .tp_shape     = */ ds4_tp_shape,
+    /* .drafter      = */ ds4_drafter,
+    /* .quant_bits   = */ ds4_quant_bits,
     /* .session      = */ &k_ds4_session_ops,
 };

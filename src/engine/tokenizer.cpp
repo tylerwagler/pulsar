@@ -1292,16 +1292,61 @@ int pulsar_token_eos(pulsar_engine *e) {
 
 
 
-int pulsar_token_user(pulsar_engine *e) {
-    tokenizer_require(e, "pulsar_token_user");
-    return e->vocab.user_id;
+/* L272 B5: the turn markers the server's prefix anchors scan for.  DeepSeek names a turn with one
+ * special token; Qwen's template spells it as <|im_start|> plus the role word, which the checkpoint's
+ * BPE holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either
+ * word leaves the anchors off, said once -- never a marker that matches at the wrong place. */
+bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
+    tokenizer_require(e, "pulsar_chat_turn_markers");
+    memset(out, 0, sizeof(*out));
+    if (!e->qwen_tok) {
+        out->user[0] = e->vocab.user_id;
+        out->n_user = 1;
+        out->assistant[0] = e->vocab.assistant_id;
+        out->n_assistant = 1;
+        return true;
+    }
+    const int start = qwen_tokenizer_added_id(e->qwen_tok, "<|im_start|>");
+    pulsar_tokens user = {0}, assistant = {0};
+    pulsar_tokenize_text(e, "user", &user);
+    pulsar_tokenize_text(e, "assistant", &assistant);
+    const bool ok = start >= 0 && user.len == 1 && assistant.len == 1;
+    if (ok) {
+        out->user[0] = start;
+        out->user[1] = user.v[0];
+        out->n_user = 2;
+        out->assistant[0] = start;
+        out->assistant[1] = assistant.v[0];
+        out->n_assistant = 2;
+    } else {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: %s: the tokenizer does not spell a turn as <|im_start|> (%d) plus one role "
+                            "token (\"user\" %d, \"assistant\" %d tokens): the chat turn markers are unknown\n",
+                    e->family->name, start, user.len, assistant.len);
+        }
+    }
+    pulsar_tokens_free(&user);
+    pulsar_tokens_free(&assistant);
+    return ok;
 }
 
+int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
+    if (!m || !v || i < 0) return 0;
+    if (m->n_user > 0 && i + m->n_user <= n && v[i] == m->user[0] &&
+        (m->n_user < 2 || v[i + 1] == m->user[1]))
+        return 1;
+    if (m->n_assistant > 0 && i + m->n_assistant <= n && v[i] == m->assistant[0] &&
+        (m->n_assistant < 2 || v[i + 1] == m->assistant[1]))
+        return 2;
+    return 0;
+}
 
-
-int pulsar_token_assistant(pulsar_engine *e) {
-    tokenizer_require(e, "pulsar_token_assistant");
-    return e->vocab.assistant_id;
+int pulsar_token_think_close(pulsar_engine *e) {
+    tokenizer_require(e, "pulsar_token_think_close");
+    if (e->qwen_tok) return qwen_tokenizer_added_id(e->qwen_tok, "</think>");
+    return e->vocab.think_end_id;
 }
 
 

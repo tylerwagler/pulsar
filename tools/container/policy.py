@@ -45,13 +45,14 @@ from __future__ import annotations
 
 from fnmatch import fnmatchcase
 
+import exl3_rates
 from names import Mapped, ModelShape, hf_for_gguf
 
 # The engine's layout vocabulary (src/engine/model.cpp pulsar_layout_names)
 # restricted to what the builder produces (README, order of work step 1).
 NATIVE = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
-EXPERT_LAYOUTS = {"cutlass_mxfp4", "exl3m_k2", "exl3m_k2h", "exl3m_k3"}
-EXL3_WORDS = {32: "exl3m_k2", 40: "exl3m_k2h", 48: "exl3m_k3"}
+EXPERT_LAYOUTS = {"cutlass_mxfp4", *exl3_rates.DEEPSEEK_EXPERT}
+EXL3_WORDS = exl3_rates.rates(exl3_rates.DEEPSEEK_EXPERT)   # words per tile -> layout
 LAYOUTS = set(NATIVE.values()) | EXPERT_LAYOUTS | {"mxfp8_lt", "fp8_e4m3_soa_k"}
 
 # GGUF-era spellings a prisma format map uses -> the engine's.  IQ2 is named so

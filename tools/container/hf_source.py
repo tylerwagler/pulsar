@@ -11,6 +11,8 @@ import json
 import os
 import struct
 
+import exl3_rates
+
 
 class HFCheckpoint:
     """`config` is the language-model config (V4.1 nests it under `text_config`;
@@ -96,7 +98,7 @@ class HFCheckpoint:
 # with that model, so this and the header are checked against each other at
 # every load.
 # ---------------------------------------------------------------------------
-EXL3_LAYOUT = {32: 'exl3m_k2', 40: 'exl3m_k2h', 48: 'exl3m_k3'}
+EXL3_LAYOUT = exl3_rates.rates(exl3_rates.DEEPSEEK_EXPERT)   # words per tile -> layout, DeepSeek's expert arms
 # exllamav3's mul1 codebook multiplier (exl3_lib/quantize.py codebook_mul1_mult; the device decode's
 # EXL3_MUL1_MULTIPLIER): the `.mul1` marker a tensor carries names the codebook it was encoded with.
 EXL3_MUL1 = 0x83DCD12D

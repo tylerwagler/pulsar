@@ -250,26 +250,3 @@ const pulsar_tokens *pulsar_session::bank_tokens(uint32_t bank) {
     auto *s = this;
     return bank_frontier_tokens(s, bank);
 }
-
-int pulsar_session::bank_common_prefix(uint32_t bank,
-                                   const pulsar_tokens *prompt) {
-    auto *s = this;
-    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
-    if (!t || !prompt) return 0;
-    int n = t->len < prompt->len ? t->len : prompt->len;
-    int i = 0;
-    while (i < n && t->v[i] == prompt->v[i]) i++;
-    return i;
-}
-
-/* L115: the prefix-reuse authority against one bank's committed history. */
-void pulsar_session::bank_prefix_match(uint32_t bank, const pulsar_tokens *prompt,
-                                       pulsar_prefix_match *out) {
-    auto *s = this;
-    out->live_cut = 0;
-    out->prompt_cut = 0;
-    out->seamed = false;
-    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
-    if (!t || !prompt) return;
-    pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, out);
-}
