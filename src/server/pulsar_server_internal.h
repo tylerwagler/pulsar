@@ -807,7 +807,7 @@ typedef struct {
 } sink_tool_ops;
 
 /** L267: where DeepSeek's raw generated text is, for its one stream projection (deepseek_stream.cpp):
- * every protocol's live response is fed by the same walk over <think>, the answer and DSML blocks. */
+ * every protocol's live response is fed by the same walk over \<think\>, the answer and DSML blocks. */
 typedef enum {
     DS_WALK_THINKING,   ///< inside the reasoning block
     DS_WALK_TEXT,       ///< the answer
@@ -839,7 +839,7 @@ struct chat_sink {
     /** Reasoning or answer text; `release_upto` is the byte offset in the generation the text ends at
      * (OpenAI's logprob entries ride with the delta that releases their bytes). */
     bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
-    /** The current section ended; `think_closed`: at the model's own </think>. */
+    /** The current section ended; `think_closed`: at the model's own \</think\>. */
     bool (*end)(chat_sink *k, bool think_closed);
     /** Live tool-call events; NULL: calls go out with the finish. */
     const sink_tool_ops *tool_ops;
@@ -2378,6 +2378,7 @@ struct qwen_gen {
     bool finished = false;           ///< the end of the turn was fed (the finish did it)
     bool stream_ok = true;           ///< no client write failed while projecting
     std::string last_error;          ///< the last malformed-call report (the retry's detail)
+    int undeclared = 0;              ///< calls dropped for naming an undeclared tool (L272)
     ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
 };
 
@@ -2563,6 +2564,9 @@ void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
+/** Append a NUL-terminated string.  Nearly every renderer and emitter calls it, so its caller graph is
+ *  past DOT_GRAPH_MAX_NODES and is not drawn.
+ *  \hidecallergraph */
 void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...);
 char *buf_take(buf *b);
@@ -2601,6 +2605,9 @@ void chat_msgs_free(chat_msgs *msgs);
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg);
 void tool_schema_orders_free(tool_schema_orders *orders);
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name);
+/** Whether a parsed call names a tool the request declared (L272); when it does not, `detail` gets the
+ * model-visible tool error: the name and the declared ones. */
+bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
 pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort);
@@ -2867,7 +2874,7 @@ bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
 /** DeepSeek's call-block finder (kv_cache.cpp): every DSML spelling either template renders. */
 const char *find_next_dsml_tool_block(const char *p, const char **end_out);
-void request_apply_forced_tool_prefill(request *r);
+bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd,

@@ -173,7 +173,7 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
     const bool forced = c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED;
     if (forced && r->has_tools && r->prompt_text) {
         r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
     /* With an engine: tokenise the rendered TEXT, then replace every image
      * placeholder with that image's sentinel block -- the reference's order, and
@@ -460,7 +460,7 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     const bool forced = c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED;
     if (forced && r->has_tools) {
         r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
     if (e) pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
     return true;

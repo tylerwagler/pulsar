@@ -130,6 +130,8 @@ void buf_putc(buf *b, char c) {
 
 
 
+/** See the declaration in pulsar_server_internal.h; doxygen applies \hidecallergraph per entity.
+ *  \hidecallergraph */
 void buf_puts(buf *b, const char *s) {
     buf_append(b, s, strlen(s));
 }

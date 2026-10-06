@@ -987,6 +987,12 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
     char *name = pulsar_dsml_attr(tag, "name");
     free(tag);
     if (!name) return dsml_tool_stream_fail(ts);
+    if (!tool_call_declared(k->r, name, NULL, 0)) {
+        /* L272: a call to an undeclared tool is a malformed block -- the live projection stops before
+         * announcing it, and the finish drops it (or retries) */
+        free(name);
+        return dsml_tool_stream_fail(ts);
+    }
 
     /* the id the client sees, fixed per index once created (apply_stream_tool_ids copies it into the
      * parsed call at the finish) */

@@ -81,6 +81,16 @@ static bool qwen_parser_feed(void *st, server *s, gen_state *g, size_t upto, boo
         case qwen_out_event::TOOL_BEGIN:
             break;   /* a call goes out whole, at TOOL_END */
         case qwen_out_event::TOOL_END: {
+            char undeclared[512];
+            if (!tool_call_declared(&j->req, e.name.c_str(), undeclared, sizeof(undeclared))) {
+                /* a malformed call (L272): never announced, so the stream and the final message agree */
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s qwen output: %s",
+                           g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, undeclared);
+                s->trace_event(g->trace_id, "qwen output: %s", undeclared);
+                q->last_error = undeclared;
+                q->undeclared++;
+                break;
+            }
             tool_call tc = {0};
             tc.name = xstrdup(e.name.c_str());
             tc.arguments = xstrdup(e.arguments.c_str());
@@ -124,7 +134,7 @@ static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state 
     out->finish = g->finish;
     bool ok = true;
     if (strcmp(g->finish, "error") != 0) ok = qwen_parser_feed(q, s, g, g->text.len, true);
-    if (q->parser.errors() > 0 && q->calls.len == 0 && strcmp(g->finish, "error") != 0 && !j->req.stream &&
+    if ((q->parser.errors() > 0 || q->undeclared > 0) && q->calls.len == 0 && strcmp(g->finish, "error") != 0 && !j->req.stream &&
         !g->recovery_attempted && !j->req.force_tool_call && j->req.has_tools)
     {
         int recovery_tokens = 0;
@@ -153,7 +163,9 @@ static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state 
     out->calls = q->calls;
     memset(&q->calls, 0, sizeof(q->calls));
     size_t raw_lo = 0, raw_hi = 0;
-    if (q->parser.raw_span(&raw_lo, &raw_hi)) {
+    /* the sampled bytes are the tool memory's key only when they are exactly the kept calls: a dropped
+     * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
+    if (q->undeclared == 0 && q->parser.raw_span(&raw_lo, &raw_hi)) {
         if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("qwen parser: raw span outside the turn's text");
         out->calls.raw_dsml = xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
         s->tool_memory_remember(&out->calls);

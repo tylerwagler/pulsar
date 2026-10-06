@@ -33,9 +33,20 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
 
 /* Rewrite the rendered prompt's tail for a forced tool call: the family says how much of the tail to
  * keep and what to append (server_family_ops::forced_call_prefill); this keeps the prompt's client-data
- * ranges, clamping one that reached into the dropped tail. */
-void request_apply_forced_tool_prefill(request *r) {
-    if (!r->force_tool_call || !r->prompt_text) return;
+ * ranges, clamping one that reached into the dropped tail.  L272: the forced name is a declared tool --
+ * a named choice that is not one refuses, and a required call with exactly one declared tool is that
+ * tool by name, so the model cannot sample an undeclared one (Qwen answered "required" with "reply"). */
+bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen) {
+    if (!r->force_tool_call || !r->prompt_text) return true;
+    if (r->forced_tool_name && r->forced_tool_name[0]) {
+        if (!tool_schema_orders_find(&r->tool_orders, r->forced_tool_name)) {
+            snprintf(err, errlen, "tool_choice names \"%.60s\", which is not a declared tool", r->forced_tool_name);
+            return false;
+        }
+    } else if (r->tool_orders.len == 1 && r->tool_orders.v[0].name) {
+        free(r->forced_tool_name);
+        r->forced_tool_name = xstrdup(r->tool_orders.v[0].name);
+    }
     buf pt = {0};
     const char *base = r->prompt_text;
     size_t blen = strlen(base);
@@ -62,6 +73,7 @@ void request_apply_forced_tool_prefill(request *r) {
     pt.spans = NULL;
     pt.n_spans = pt.cap_spans = 0;
     r->prompt_text = buf_take(&pt);
+    return true;
 }
 
 
@@ -255,6 +267,26 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+
+/* L272: a parsed call is executable only when it names a tool the request declared -- request::tool_orders,
+ * the one table every protocol's tools fill (parse_tools_value; Responses tool_search loads too).  The model
+ * samples names freely (Qwen answered a tool_choice "required" turn with an undeclared "reply"), so each
+ * family's parser treats an undeclared name as a malformed call: dropped, never streamed, and retried with
+ * the model-visible tool error this writes (the name, then the declared ones, cut to fit). */
+bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len) {
+    if (name && tool_schema_orders_find(&r->tool_orders, name)) return true;
+    if (detail && detail_len) {
+        buf b = {0};
+        buf_printf(&b, "unknown tool \"%s\"; the declared tools are:", name ? name : "");
+        for (int i = 0; i < r->tool_orders.len; i++)
+            buf_printf(&b, "%s %s", i ? "," : "", r->tool_orders.v[i].name ? r->tool_orders.v[i].name : "");
+        if (r->tool_orders.len == 0) buf_printf(&b, " (none)");
+        snprintf(detail, detail_len, "%s", b.ptr ? b.ptr : "");
+        buf_free(&b);
+    }
+    return false;
 }
 
 
