@@ -2998,6 +2998,23 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
  *  rank must poll at the same boundaries. */
 bool pulsar_session_cancelled(pulsar_session *s);
 
+/** What a family supplies for the core's default sync (sync_driver.cpp, L272 P2). */
+typedef struct pulsar_sync_ops {
+    const char *name;                                  ///< the family's name in messages
+    /** The live bank's state holds exactly what the session's view (checkpoint) says. */
+    bool (*state_agrees)(pulsar_session *s);
+    /** Clear the live bank to position 0 (a cold prefill follows). */
+    bool (*reset_bank)(pulsar_session *s);
+    /** Prefill `prompt` on the live bank from `start` -- the core loop's 0 /
+     *  PULSAR_SESSION_SYNC_INTERRUPTED / 1 (pulsar_prefill_loop). */
+    int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+} pulsar_sync_ops;
+/** The core's default sync: continue the view, else resume from the shared prefix's deepest grid
+ *  checkpoint, else reset and prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2).  Returns 0,
+ *  PULSAR_SESSION_SYNC_INTERRUPTED, or 1 with `err`. */
+int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_sync_ops *ops,
+                                char *err, size_t errlen);
+
 /** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
  *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so
  *  DeepSeek's planner and the session loop are one walk.  `next_end` returns the chunk's end in

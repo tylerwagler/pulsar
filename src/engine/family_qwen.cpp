@@ -1285,62 +1285,31 @@ static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     return rc;
 }
 
-/* Make the live bank hold exactly `prompt`: continue when the prompt extends what the bank holds;
- * otherwise resume from the deepest grid checkpoint the prompt still shares (L266 step 5,
- * kv_state_qwen.cpp -- the recurrent state cannot be cut back, but it can be restored), else clear
- * the bank and prefill from 0. */
+/* The family's sync is the core's default (sync_driver.cpp, L272 P2) over three ops: the bank's
+ * position is the state's authority, a reset clears the bank's recurrent and attention state, and the
+ * prefill is qwen_prefill (the core loop, with Qwen's capture on its prefill-only history). */
+static bool qwen_sync_state_agrees(pulsar_session *s) {
+    return s->qwen->bank_pos[s->qwen->live_bank] == (uint32_t)s->checkpoint.len;
+}
+
+static bool qwen_sync_reset_bank(pulsar_session *s) {
+    return qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, s->qwen->live_bank);
+}
+
+static const pulsar_sync_ops k_qwen_sync = {
+    /* .name         = */ PULSAR_QWEN_ARCH,
+    /* .state_agrees = */ qwen_sync_state_agrees,
+    /* .reset_bank   = */ qwen_sync_reset_bank,
+    /* .prefill      = */ qwen_prefill,
+};
+
 static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
                              const pulsar_image_ref *, int n_images, char *err, size_t errlen) {
     if (n_images > 0) {
         if (err) snprintf(err, errlen, "%s: images are not implemented for this family", PULSAR_QWEN_ARCH);
         return 1;
     }
-    /* the bound is DeepSeek's (pulsar_session::sync): a prompt that fills the context leaves no row
-     * for the eval that follows it (L272 B4) */
-    if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
-        if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d)", PULSAR_QWEN_ARCH,
-                          prompt ? prompt->len : -1, s->ctx_size);
-        return 1;
-    }
-    const int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
-    /* bank_pos[live] is the state's authority; the checkpoint must agree with it
-     * to be continued (a batched step on the live bank moves the state, not the
-     * checkpoint, and clears checkpoint_valid). */
-    const uint32_t live = s->qwen->live_bank;
-    if (s->checkpoint_valid && s->qwen->bank_pos[live] != (uint32_t)s->checkpoint.len) s->checkpoint_valid = false;
-    const bool extends = s->checkpoint_valid && common == s->checkpoint.len && common < prompt->len;
-    /* the same prompt is a no-op only while the logits are its next-token row: after the batched
-     * lane (note_committed) they are stale, and a recurrent state cannot rewind one token to redo
-     * the last row -- so that case prefills cold */
-    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
-    uint32_t start = 0;
-    if (extends) {
-        start = (uint32_t)common;
-    } else {
-        /* L266 step 5: resume from the deepest grid checkpoint the prompt still shares -- within the
-         * common prefix, the bank's prefill-only history, and one token short of the prompt (the last
-         * row must be evaluated for the logits) -- else clear the bank and prefill from 0 */
-        const uint32_t G = pulsar_session_resume_point(s, live, common, prompt->len);
-        if (G) {
-            if (!pulsar_ckpt_restore(s->qwen->ckpt, live, G)) {
-                if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", PULSAR_QWEN_ARCH, live, G);
-                return 1;
-            }
-            s->logits_stale = true;   /* a restore moves the KV, not the logits */
-            start = G;
-            fprintf(stderr, "pulsar: %s: bank %u resumes from its checkpoint at %u (prompt %d, shared %d)\n",
-                    PULSAR_QWEN_ARCH, live, G, prompt->len, common);
-        } else if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, live)) {
-            if (err) snprintf(err, errlen, "%s: could not clear the session's state", PULSAR_QWEN_ARCH);
-            return 1;
-        }
-    }
-    s->qwen->last_resume = start;
-    /* the loop owns the view from here: it stands at each chunk's end as the chunk lands, so an
-     * interrupted sync leaves a valid prefix the next sync extends */
-    const int rc = qwen_prefill(s, prompt, start);
-    if (rc == 1 && err) snprintf(err, errlen, "%s: prefill refused (see the log for the op)", PULSAR_QWEN_ARCH);
-    return rc;
+    return pulsar_session_sync_default(s, prompt, &k_qwen_sync, err, errlen);
 }
 
 static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {

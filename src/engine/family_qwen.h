@@ -426,7 +426,6 @@ typedef struct pulsar_qwen_state {
     uint32_t *prefill_pos;  ///< [n_banks]
     bool *frontier_stale;   ///< [n_banks] a segment load wrote the pools without the lanes
     uint32_t n_trunk_layers;   ///< the plan's layers (the MTP layer's state sits at this index)
-    uint32_t last_resume;   ///< the position the last sync started its prefill at (0 = cold)
     /* L266 step 7: the session's share of the engine's tensor-parallel transport (NULL tp = one GPU): the
      * row all-reduce's stage ticket and the exchange seq, advanced identically on every rank. */
     struct pulsar_tp *tp;

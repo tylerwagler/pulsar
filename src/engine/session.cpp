@@ -1661,7 +1661,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
             const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
-            uint32_t B = pulsar_ckpt_best(&s->graph.ckpt, bank, G);
+            /* the one resume rule (L272 P2; Qwen's sync and bank_resume_at read it too): the deepest
+             * checkpoint within the shared prefix (ck: this path extends it) and the prefill frontier --
+             * checkpoints sit on the grid, so that is the deepest at or below G */
+            uint32_t B = pulsar_session_resume_point(s, bank, (int)ck, prompt->len);
             /* L226: an image request's reuse may not RE-EVALUATE a row inside an
              * image block: a checkpoint below the floor the licence set (the grid
              * point above the last held block) is not a resume point, and the
