@@ -10,7 +10,7 @@
  *   B4  the router's view: bank_pos / bank_tokens per bank, live and carried
  *   B5  the shared demand-paged accounting (L270): each bank's touched KV is priced, they sum to the
  *       session's, a decode quantum is priced; a per-bank physical eviction still refuses
- * Not part of the battery: it needs the real container. */
+ * In the battery since L272 P2 (`make qwen-banks-gate-device`, QWEN_GATE_MODEL = the real container). */
 #include "pulsar.h"
 
 #include <math.h>

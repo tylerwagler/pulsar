@@ -17,7 +17,7 @@
  *   C4  disk segments: sync(P[0:600]) then sync(P) leave checkpoints at 512 and P's last grid point; the
  *       chain [0, 512) + [512, G) saved, loaded into a FRESH session, then sync(Q) == Q cold, byte for
  *       byte (the pools' rows and the slot travel through the file).
- * Not part of the battery: it needs the real container. */
+ * In the battery since L272 P2 (`make qwen-chunk-neutrality-gate-device`, QWEN_GATE_MODEL = the real container). */
 #include "pulsar.h"
 
 #include <math.h>
