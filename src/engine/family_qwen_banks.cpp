@@ -82,6 +82,20 @@ static uint32_t qwen_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
 
 static uint32_t qwen_bank_live(pulsar_session *s) { return s && s->qwen ? s->qwen->live_bank : 0u; }
 
+/* L270: the demand-paged KV accounting.  A bank's touched KV is its high-water's rows (the pages stay
+ * resident once written: the banks share one managed tensor per layer); a quantum of q tokens grows it by
+ * at most q rows (plus a partial index block). */
+uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size);
+
+static uint64_t qwen_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
+    if (!s->qwen || bank >= s->qwen->n_banks) return 0;
+    return qwen_kv_bytes_at(s->qwen, s->qwen->kv_hw[bank]);
+}
+
+static uint64_t qwen_bank_growth_bytes(pulsar_session *s, uint32_t q) {
+    return s->qwen ? qwen_kv_bytes_at(s->qwen, q) : 0;
+}
+
 const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .count          = */ qwen_bank_count,
     /* .save           = */ qwen_bank_save,
@@ -91,4 +105,7 @@ const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .kv_store         = */ qwen_bank_kv_store,
     /* .prefill_frontier = */ qwen_bank_prefill_frontier,
     /* .live             = */ qwen_bank_live,
+    /* .demand_paged_bytes = */ qwen_demand_paged_bytes,
+    /* .touched_kv_bytes   = */ qwen_bank_touched_kv_bytes,
+    /* .growth_bytes       = */ qwen_bank_growth_bytes,
 };

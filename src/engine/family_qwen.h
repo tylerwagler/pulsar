@@ -411,7 +411,10 @@ typedef struct pulsar_qwen_state {
     float *spec_logits;             ///< host [DRAFT_MAX + 1][n_vocab]: a round's verify / draft rows (mtp only)
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
-    uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds
+    uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds (written by qwen_bank_set_pos)
+    /** L270: [n_banks] the most tokens each bank has held -- its KV pages up to here are resident (the
+     * demand-paged tensors are shared by the banks, so a rewind or a reset frees none of them). */
+    uint32_t *kv_hw;
     /* The bank pool (L251, family_qwen_banks.cpp): the session's host view (checkpoint,
      * logits) describes `live_bank`; every other bank's view waits in its carry. */
     uint32_t live_bank;     ///< the bank sync / eval run on
@@ -450,6 +453,15 @@ bool pulsar_qwen_tp_build(pulsar_engine *e);
 
 /** The Qwen family's bank-pool operations (family.h pulsar_family_bank_ops). */
 extern const pulsar_family_bank_ops k_qwen_bank_ops;
+
+/** L270: the one writer of a bank's position; it keeps the bank's KV high-water. */
+static inline void qwen_bank_set_pos(pulsar_qwen_state *st, uint32_t bank, uint32_t pos) {
+    st->bank_pos[bank] = pos;
+    if (pos > st->kv_hw[bank]) st->kv_hw[bank] = pos;
+}
+/** L270: the demand-paged KV bytes `rows` positions take in one bank (every QSA layer's KV + pooled
+ * indexer keys, the MTP layer's included) -- the allocation's own row functions. */
+uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows);
 
 /* ---- 5. The step and the op table ------------------------------------------ */
 

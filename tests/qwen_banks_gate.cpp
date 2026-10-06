@@ -8,7 +8,8 @@
  *   B2  a batched decode of both banks equals each bank's own single-row decode, byte for byte
  *   B3  an invalidate while bank 1 is live does not touch bank 0: restored, bank 0 decodes on
  *   B4  the router's view: bank_pos / bank_tokens per bank, live and carried
- *   B5  what a recurrent pool cannot do refuses: forks (permanently infeasible), KV spill, residency
+ *   B5  the shared demand-paged accounting (L270): each bank's touched KV is priced, they sum to the
+ *       session's, a decode quantum is priced; a per-bank physical eviction still refuses
  * Not part of the battery: it needs the real container. */
 #include "pulsar.h"
 
@@ -174,9 +175,15 @@ int main(int argc, char **argv) {
         pulsar_tokens_free(&A3);
     }
 
-    /* B5 (the fork legs went with the bank fork, L264/L265) */
-    CHECK(pulsar_session_bank_touched_kv_bytes(s, 0) == 0 && !pulsar_session_bank_free_physical(s, 1),
-          "B5 no per-bank KV accounting / residency");
+    /* B5 (L270; the fork legs went with the bank fork, L264/L265) */
+    {
+        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, 0), t1 = pulsar_session_bank_touched_kv_bytes(s, 1);
+        const uint64_t all = pulsar_session_touched_kv_bytes(s), q = pulsar_session_quantum_growth_bytes_per_bank(s, 8);
+        CHECK(t0 > 0 && t1 > 0 && all >= t0 + t1 && q > 0,
+              "B5 touched KV per bank %llu / %llu B, session %llu B, an 8-token quantum %llu B",
+              (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)all, (unsigned long long)q);
+        CHECK(!pulsar_session_bank_free_physical(s, 1), "B5 a per-bank physical eviction refuses (shared tensors)");
+    }
 
     pulsar_session_free(s);
     pulsar_tokens_free(&A);

@@ -6147,15 +6147,15 @@ static void test_l251_lane_select_family_spec_solo_greedy(void) {
     }
     const int pool = 2;
     TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 0, 0) == 0);
-    /* one greedy decoder: lane 4 */
+    /* one decoder: lane 4 */
     TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 4);
     /* the family flag off (--no-dspark, or DeepSeek): plain */
     TEST_ASSERT(server_pick_decode_lane(pool, false, false, dec, 1, 0) == 2);
     /* two decoders: plain batched, even when both are greedy */
     TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 2, 0) == 2);
-    /* sampled: plain */
+    /* sampled (L270): the family generate samples too, lane 4 */
     jobs[0].req.temperature = 0.7f;
-    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, true, dec, 1, 0) == 4);
     jobs[0].req.temperature = 0.0f;
     /* logprobs (speculation off for the request): plain */
     g[0].dspark_spec_enabled = false;

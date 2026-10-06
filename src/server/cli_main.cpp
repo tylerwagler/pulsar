@@ -572,7 +572,7 @@ int main(int argc, char **argv) {
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
      * into the main artifact), so the state is logged here, never at parse. */
     /* L251: a family with its own speculative generate (Qwen's MTP) serves it
-     * on decode lane 4 -- one greedy decoder at a time; --no-dspark turns the
+     * on decode lane 4 -- one decoder at a time; --no-dspark turns the
      * lane off like the DSpark one. */
     const bool family_spec = pulsar_engine_drafter(engine) == PULSAR_DRAFTER_MTP && !cfg.engine.dspark_disable;
     if (pulsar_engine_has_dspark(engine)) {
@@ -581,7 +581,7 @@ int main(int argc, char **argv) {
                    pulsar_engine_dspark_draft_tokens(engine));
     } else if (family_spec) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: %s speculative decoding (MTP drafter) for a solo greedy decoder",
+                   "pulsar-server: %s speculative decoding (MTP drafter, greedy or sampled) for a solo decoder",
                    pulsar_engine_family_name(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,

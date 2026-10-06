@@ -1366,9 +1366,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * joined a plain batch (n_batched == 0 -- no lane switch mid-conversation)
  * and the drafter is loaded; 4 = family-spec (L251): the family has its own
  * speculative generate (family_spec), EXACTLY ONE decoder, not in a plain
- * batch, speculation allowed for its request (no logprobs) and its resolved
- * decode sampling greedy (gen_resolve_sampling_decode -- the family's
- * generate is greedy-only); 2 = plain batched otherwise (L118: every n_dec
+ * batch, speculation allowed for its request (no logprobs; the family's
+ * generate is greedy or sampled, L270); 2 = plain batched otherwise (L118: every n_dec
  * >= 1 is a batch, a solo session is a batch of one). 1 is the retired
  * classic lane: reachable only with n_dec >= 1 and no pool, which the
  * gather loop never produces. Lane 3 keeps the spec_decode counters
@@ -1383,18 +1382,14 @@ static int server_pick_decode_lane(int pool_banks, bool has_dspark, bool family_
         if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
             all_spec = false;
     }
-    bool solo_greedy = false;
+    bool solo_spec = false;
     if (pool_banks > 0 && family_spec && n_dec == 1 && n_batched == 0) {
         const gen_state *dg = dec[0]->gen;
-        if (dg && dg->dspark_spec_enabled && !dg->batch_active) {
-            float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling_decode(dg, &temp, &top_k, &top_p, &min_p);
-            solo_greedy = temp <= 0.0f;
-        }
+        solo_spec = dg && dg->dspark_spec_enabled && !dg->batch_active;
     }
     const bool use_spec_batched = pool_banks > 0 && all_spec;
     const bool use_batched = use_spec_batched || (pool_banks > 0 && n_dec >= 1);
-    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (solo_greedy ? 4 : (use_batched ? 2 : 1)));
+    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (solo_spec ? 4 : (use_batched ? 2 : 1)));
 }
 
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up

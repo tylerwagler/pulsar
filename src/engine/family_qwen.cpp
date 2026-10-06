@@ -705,6 +705,7 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) pulsar_gpu_tensor_free(st->scratch[op]);
     free(st->ngram_ctx);
     free(st->bank_pos);
+    free(st->kv_hw);
     pulsar_gpu_tensor_free(st->tp_ticket);
     pulsar_gpu_tensor_free(st->tp_vocab_own);
     if (st->ckpt) pulsar_ckpt_release(st->ckpt);
@@ -806,6 +807,7 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     }
     st->ngram_ctx = (int32_t *)xcalloc((size_t)n_banks * (s->ngram_size - 1u), sizeof(int32_t));
     st->bank_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
+    st->kv_hw = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     st->prefill_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     st->frontier_stale = (bool *)xcalloc(n_banks, sizeof(bool));
     st->n_trunk_layers = plan->n_layer;
@@ -851,7 +853,7 @@ static bool qwen_state_reset_bank(pulsar_qwen_state *st, const pulsar_qwen_shape
     }
     for (uint32_t i = 0; i + 1u < s->ngram_size; i++)
         st->ngram_ctx[(size_t)bank * (s->ngram_size - 1u) + i] = (int32_t)s->eos_id;
-    st->bank_pos[bank] = 0;
+    qwen_bank_set_pos(st, bank, 0);
     st->prefill_pos[bank] = 0;
     st->frontier_stale[bank] = false;
     st->mtp_pend_pos[bank] = UINT32_MAX;
@@ -953,6 +955,26 @@ uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_
     qwen_state_free(st);
     if (managed_bytes) *managed_bytes = ok ? managed : 0;
     return ok ? bytes : 0;
+}
+
+uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows) {
+    const pulsar_qwen_shape *s = &g_qwen_shape;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < PULSAR_FAMILY_MAX_LAYER; il++) {
+        if (!st->layer[il].kv) continue;
+        bytes += rows * pulsar_qwen_kv_row_bytes(s) + qwen_ceil_div(rows, s->idx_block) * pulsar_qwen_index_row_bytes(s);
+    }
+    return bytes;
+}
+
+/* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the allocation's own dry
+ * run (the KV and index pools are cudaMallocManaged: VA reserved, physical on touch). */
+uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready || ctx_size <= 0) return 0;
+    uint64_t managed = 0;
+    pulsar_qwen_state_price(&g_qwen_shape, &e->plan, 1u, (uint32_t)ctx_size, qwen_prefill_cap(e, ctx_size),
+                            e->qwen_weights->mtp.present, &managed);
+    return managed;
 }
 
 static uint64_t qwen_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
@@ -1220,7 +1242,7 @@ static bool qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_
                           rows - 1u, last ? 1u : 0u, s->logits);
         if (ok && s->qwen->mtp)
             ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + start + off, pos, bank, rows, 0, NULL);
-        if (ok) s->qwen->bank_pos[live] = start + off + rows;
+        if (ok) qwen_bank_set_pos(s->qwen, live, start + off + rows);
         if (ok && canonical) s->qwen->prefill_pos[live] = start + off + rows;
         if (ok && capture_at && start + off + rows == capture_at) ok = pulsar_ckpt_capture(ck, live, capture_at);
     }
@@ -1332,7 +1354,7 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
         }
     }
     token_vec_push(&s->checkpoint, token);
-    s->qwen->bank_pos[live] = (uint32_t)s->checkpoint.len;
+    qwen_bank_set_pos(s->qwen, live, (uint32_t)s->checkpoint.len);
     s->qwen->logits_fresh = true;
     return 0;
 }
@@ -1372,7 +1394,7 @@ static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq
         return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
-        s->qwen->bank_pos[reqs[i].bank]++;
+        qwen_bank_set_pos(s->qwen, reqs[i].bank, s->qwen->bank_pos[reqs[i].bank] + 1u);
         if (reqs[i].bank == s->qwen->live_bank) {   /* the live bank moved past the host view */
             s->checkpoint_valid = false;
             s->qwen->logits_fresh = false;
@@ -1424,21 +1446,35 @@ static void qwen_session_invalidate(pulsar_session *s) {
  *   verify  the trunk runs [x, d_1 .. d_k] at p .. p + k as ONE step with every row headed.  k + 1 is
  *           at most 5, so every kernel takes its decode-width arm and each row's logits are the bytes
  *           one-token decode would give: the output IS greedy decoding's, only faster;
- *   accept  the longest prefix of drafts the trunk agrees with, plus the trunk's next token;
+ *   accept  greedy: the longest prefix of drafts the trunk agrees with, plus the trunk's next token.
+ *           Sampled (temperature > 0): drafts are DRAWN from the MTP's distribution q (built by the
+ *           shared sampler from its draft-vocabulary row, same temperature / top-k / top-p / min-p), each
+ *           kept with probability min(1, p/q) against the trunk's p (pulsar_sample_dist_accept_pq); the
+ *           first rejection draws the next token from (p - q)+ (pulsar_sample_dist_draw_residual), and a
+ *           round that keeps every draft draws it from the last row's p -- the output is distributed
+ *           exactly as plain sampling's (L186's rule, the one DSpark's sampled lane uses);
  *   repair  the recurrent state rolls back to the last kept row (pulsar_qwen_s4_spec_rollback); the
  *           MTP layer's stage returns to its snapshot after the lockstep row, the kept rows get their
  *           MTP rows (the drafts' KV at those positions is overwritten), the last kept row is pending.
- * Sampled speculation (temperature > 0) needs rejection sampling against the MTP's distribution and
- * is refused by name until it exists. */
+ * The draft schedule (K, tau) only decides how many drafts a round makes, so it never biases the output. */
 static uint32_t qwen_argmax(const float *v, uint32_t n) {
     uint32_t a = 0;
     for (uint32_t i = 1; i < n; i++) if (v[i] > v[a]) a = i;
     return a;
 }
 
-static int qwen_session_generate_speculative(pulsar_session *s, float temperature, int, float, float, uint64_t *,
-                                             int max_tokens, int eos_token, int *accepted, int accepted_cap,
-                                             char *err, size_t errlen) {
+/* L270: the MTP's sampled distribution q over its draft vocabulary, ids mapped to the vocabulary. */
+static bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
+                          pulsar_sample_dist *q) {
+    const pulsar_qwen_weights *w = s->engine->qwen_weights;
+    if (!pulsar_sample_dist_build(row, w->n_draft, temperature, top_k, top_p, min_p, &s->sample_scratch, q)) return false;
+    for (uint32_t i = 0; i < q->n; i++) q->ids[i] = (int)w->draft_ids[q->ids[i]];
+    return true;
+}
+
+static int qwen_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p,
+                                             float min_p, uint64_t *rng, int max_tokens, int eos_token,
+                                             int *accepted, int accepted_cap, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *q = s->qwen;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
@@ -1446,9 +1482,9 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         if (err) snprintf(err, errlen, "%s: speculative decoding needs the MTP layer (the sidecar shard)", PULSAR_QWEN_ARCH);
         return -1;
     }
-    if (temperature > 0.0f) {
-        if (err) snprintf(err, errlen, "%s: sampled speculation (temperature > 0) is not implemented; greedy only",
-                          PULSAR_QWEN_ARCH);
+    const bool sampled = temperature > 0.0f;
+    if (sampled && !rng) {
+        if (err) snprintf(err, errlen, "%s: sampled speculation needs the request's rng", PULSAR_QWEN_ARCH);
         return -1;
     }
     if (max_tokens <= 0 || !accepted || accepted_cap <= 0) return 0;
@@ -1482,7 +1518,21 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
     float *L = q->spec_logits;                           /* (DRAFT_MAX + 1) rows, allocated with the MTP state */
     const int cap = max_tokens < accepted_cap ? max_tokens : accepted_cap;
     int n_out = 0, rc = 0;
-    int32_t x = (int32_t)qwen_argmax(s->logits, V);
+    /* the trunk's distribution over row `r` of `rows` (sampled), and one token from it */
+    pulsar_sample_dist pd{}, qd[PULSAR_QWEN_SPEC_DRAFT_MAX + 1] = {};
+    auto draw_from = [&](const float *rows) -> int32_t {
+        pulsar_sample_dist t{};
+        int32_t tok = -1;
+        if (pulsar_sample_dist_build(rows, V, temperature, top_k, top_p, min_p, &s->sample_scratch, &t))
+            tok = (int32_t)pulsar_sample_dist_draw(&t, rng);
+        pulsar_sample_dist_free(&t);
+        return tok;
+    };
+    int32_t x = sampled ? draw_from(s->logits) : (int32_t)qwen_argmax(s->logits, V);
+    if (x < 0) {
+        if (err) snprintf(err, errlen, "%s: the logits row has no distribution to sample", PULSAR_QWEN_ARCH);
+        return -1;
+    }
     uint64_t rounds = 0, drafted = 0, kept = 0;
     while (n_out < cap) {
         if (pulsar_token_is_stop(e, x) || x == eos_token) { accepted[n_out++] = x; break; }
@@ -1509,18 +1559,29 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
                  qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, k > 0 ? 1u : 0u, L);
             q->mtp_pend_pos[b] = UINT32_MAX;              /* consumed; re-parked after the verify */
             float conf = 1.0f;
+            /* one draft from the MTP row in L: its argmax (greedy), or a draw from q (sampled; conf = q(d)) */
+            auto draft = [&](int j) -> bool {
+                if (!sampled) {
+                    d[j] = qwen_mtp_argmax(e, L, &conf);
+                    return true;
+                }
+                if (!qwen_mtp_dist(s, L, temperature, top_k, top_p, min_p, &qd[j])) return false;
+                d[j] = (int32_t)pulsar_sample_dist_draw(&qd[j], rng);
+                conf = pulsar_sample_dist_prob(&qd[j], d[j]);
+                return d[j] >= 0;
+            };
             if (ok && k > 0) {
-                d[1] = qwen_mtp_argmax(e, L, &conf);
+                ok = draft(1);
                 /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows */
-                ok = pulsar_gpu_tensor_copy_async(q->spec.qsa_stage, (uint64_t)q->spec.n_qsa * itb,
-                                                  q->layer[il_mtp].idx_tail, (uint64_t)b * itb, itb) != 0;
+                ok = ok && pulsar_gpu_tensor_copy_async(q->spec.qsa_stage, (uint64_t)q->spec.n_qsa * itb,
+                                                        q->layer[il_mtp].idx_tail, (uint64_t)b * itb, itb) != 0;
             }
             for (int j = 2; ok && j <= k; j++) {
                 if (conf < tau) { k = j - 1; break; }      /* the schedule: stop on an unsure draft */
                 tp = (int32_t)p + j - 2;
                 ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_streams, 0, hc) != 0 &&
                      qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &d[j - 1], &tp, &bb, 1, 0, 1, L);
-                if (ok) d[j] = qwen_mtp_argmax(e, L, &conf);
+                if (ok) ok = draft(j);
             }
         }
         /* verify [x, d_1 .. d_k] at p .. p + k, every row headed */
@@ -1533,8 +1594,29 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
             rc = -1;
             break;
         }
-        uint32_t a = 0;                                   /* drafts the trunk agrees with */
-        while (a < (uint32_t)k && qwen_argmax(L + (size_t)a * V, V) == (uint32_t)d[a + 1]) a++;
+        uint32_t a = 0;                                   /* drafts the trunk keeps */
+        int32_t next = -1;                                /* sampled: the round's next token */
+        if (!sampled) {
+            while (a < (uint32_t)k && qwen_argmax(L + (size_t)a * V, V) == (uint32_t)d[a + 1]) a++;
+        } else {
+            for (;; a++) {
+                pulsar_sample_dist_free(&pd);
+                if (!pulsar_sample_dist_build(L + (size_t)a * V, V, temperature, top_k, top_p, min_p, &s->sample_scratch,
+                                              &pd)) { ok = false; break; }
+                if (a == (uint32_t)k) { next = (int32_t)pulsar_sample_dist_draw(&pd, rng); break; }
+                if (!pulsar_sample_dist_accept_pq(&pd, d[a + 1], pulsar_sample_dist_prob(&qd[a + 1], d[a + 1]), rng)) {
+                    next = (int32_t)pulsar_sample_dist_draw_residual(&pd, &qd[a + 1], &s->sample_scratch, rng);
+                    break;
+                }
+            }
+            if (ok && next < 0) ok = false;
+            for (int j = 1; j <= k; j++) pulsar_sample_dist_free(&qd[j]);
+            if (!ok) {
+                if (err) snprintf(err, errlen, "%s: a sampled round found no distribution (see the log)", PULSAR_QWEN_ARCH);
+                rc = -1;
+                break;
+            }
+        }
         /* a stop token among the kept drafts is emitted but not fed: keep the rows before it */
         uint32_t keep = a + 1u;
         int32_t stop_tok = -1;
@@ -1561,7 +1643,7 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
             break;
         }
         q->mtp_pend_pos[b] = p + keep - 1u;
-        q->bank_pos[b] = p + keep;
+        qwen_bank_set_pos(q, b, p + keep);
         for (uint32_t i = 0; i < keep; i++) {
             token_vec_push(&s->checkpoint, d[i]);
             accepted[n_out++] = d[i];
@@ -1571,8 +1653,10 @@ static int qwen_session_generate_speculative(pulsar_session *s, float temperatur
         drafted += (uint64_t)k;
         kept += keep - 1u;
         if (stop_tok >= 0) { if (n_out < cap) accepted[n_out++] = stop_tok; break; }
-        x = (int32_t)qwen_argmax(s->logits, V);
+        x = sampled ? next : (int32_t)qwen_argmax(s->logits, V);
     }
+    pulsar_sample_dist_free(&pd);
+    for (int j = 1; j <= (int)PULSAR_QWEN_SPEC_DRAFT_MAX; j++) pulsar_sample_dist_free(&qd[j]);
     if (rc < 0) {
         /* a failed round may have moved the bank's state past what the host view says (a half-applied
          * repair, a dropped pending row): nothing on this bank is continued -- the next sync prefills */

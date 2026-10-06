@@ -94,7 +94,7 @@ static bool qwen_prepare_restore(void *state, uint32_t G) {
     const uint32_t bank = st->live_bank;
     /* the pools' rows below G are the history the checkpoint references; the walk brings every
      * overwritten lane back, so only the counters move here */
-    st->bank_pos[bank] = G;
+    qwen_bank_set_pos(st, bank, G);
     st->prefill_pos[bank] = G;
     st->mtp_pend_pos[bank] = st->mtp ? G - 1u : UINT32_MAX;
     st->logits_fresh = false;
@@ -106,7 +106,7 @@ static void qwen_restored(void *state) { Q_(state)->frontier_stale[Q_(state)->li
 static void qwen_set_frontier_stale(void *state, uint32_t G) {
     pulsar_qwen_state *st = Q_(state);
     const uint32_t bank = st->live_bank;
-    st->bank_pos[bank] = G;
+    qwen_bank_set_pos(st, bank, G);
     st->prefill_pos[bank] = G;
     st->frontier_stale[bank] = true;
 }

@@ -287,7 +287,7 @@ uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { retu
 uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) { return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : 0; }
 uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinned_by_env = gpu_graph_bank_pool_env_pinned(); return gpu_graph_bank_pool_n(); }
 void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
-uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", 0); if (e && e->family->banks) return 0; /* no demand paging: priced at full size */ return e ? e->demand_paged_bytes_per_bank(ctx_size) : 0; }
+uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", 0); if (e && e->family->banks) return e->family->banks->demand_paged_bytes(e, ctx_size); return e ? e->demand_paged_bytes_per_bank(ctx_size) : 0; }
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return e ? e->weights_resident_bytes() : 0; }
 int pulsar_engine_generate_argmax(pulsar_engine *e, const pulsar_tokens *prompt,
                                int n_predict, int ctx_size,
@@ -317,10 +317,19 @@ pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) {
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
-uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0); if (FAMILY_BANKS(s)) return 0; return s ? s->touched_kv_bytes() : 0; }
+uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0);
+    if (const pulsar_family_bank_ops *ops = FAMILY_BANKS(s)) {
+        pulsar_session *ms = const_cast<pulsar_session *>(s);
+        uint64_t bytes = 0;
+        for (int b = 0, n = ops->count(ms); b < n; b++) bytes += ops->touched_kv_bytes(ms, (uint32_t)b);
+        return bytes;
+    }
+    return s ? s->touched_kv_bytes() : 0;
+}
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); if (FAMILY_BANKS(s)) return false; return s ? s->bank_is_evicted(bank) : false; }
-uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0); if (FAMILY_BANKS(s)) return 0; return s ? s->bank_touched_kv_bytes(bank) : 0; }
-uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", 0); if (FAMILY_BANKS(s)) return 0; return s->quantum_growth_bytes_per_bank(q); }
+uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0); if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->touched_kv_bytes(s, bank); return s ? s->bank_touched_kv_bytes(bank) : 0; }
+uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", 0); if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->growth_bytes(s, q); return s->quantum_growth_bytes_per_bank(q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
 
 

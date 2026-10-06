@@ -124,8 +124,10 @@ typedef struct {
  * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
  * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
  * entries call these, and the operations a family cannot do -- forks, per-bank
- * KV spill, physical residency -- refuse with each entry's own failure value
- * (the server has a path for every one of them). */
+ * KV spill, physical eviction -- refuse with each entry's own failure value
+ * (the server has a path for every one of them).  The demand-paged KV accounting
+ * (L270) is the same contract as DeepSeek's (admission prices the touched share,
+ * the 2b guard keeps touched KV under budget). */
 typedef struct {
     int (*count)(pulsar_session *s);
     /** The live host view (checkpoint, logits) into bank's carry; host only. */
@@ -142,6 +144,13 @@ typedef struct {
     uint32_t (*prefill_frontier)(pulsar_session *s, uint32_t bank);
     /** L266: the bank sync / eval run on (the store's walk reads and writes this one). */
     uint32_t (*live)(pulsar_session *s);
+    /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share
+     * admission prices as it is touched, not up front. */
+    uint64_t (*demand_paged_bytes)(pulsar_engine *e, int ctx_size);
+    /** L270: `bank`'s touched demand-paged KV: what its pages physically hold. */
+    uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
+    /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
+    uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family
