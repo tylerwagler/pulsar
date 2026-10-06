@@ -92,9 +92,12 @@ enum : uint32_t {
  * (engine_api.cpp) calls these at step granularity; the TP mirror wraps the
  * same calls on a family with PULSAR_FAMILY_CAP_TP. */
 typedef struct {
-    /** Create a session at ctx_size tokens per bank with the engine's current
-     * bank pool; allocates the family's state.  0 on success. */
-    int (*create)(pulsar_session **out, pulsar_engine *e, int ctx_size);
+    /** Build the family's state into a session the core allocated (L272 P2: engine, ctx_size, prefill_cap
+     * and the logits row are set; the core measures the GPU bytes this allocates as resident_bytes and
+     * assigns the TP mirror id).  0 on success; on failure the family frees what it built. */
+    int (*create)(pulsar_session *s);
+    /** Free the family's state; the core frees the session's own (the view, the carry, the sampler and
+     * speculation scratch, the logits) and the session itself. */
     void (*destroy)(pulsar_session *s);
     /** GPU bytes create() takes at (ctx_size, n_banks): the allocation run dry,
      * so the price and the allocation are one function.  0 = cannot create. */

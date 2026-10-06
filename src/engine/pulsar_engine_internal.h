@@ -755,7 +755,7 @@ static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
  * until L251). */
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
-int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
+int pulsar_ds4_session_create(pulsar_session *s);
 void pulsar_ds4_session_destroy(pulsar_session *s);
 uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
 

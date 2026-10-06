@@ -1147,45 +1147,52 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 
 
 /* Every session is created by its engine's family (family.h). */
+/* L272 P2: every family's session begins here -- the core allocates the session and its own state (the
+ * view, the prefill cap, the logits row at the family's width), the family builds its state into it, and
+ * the core measures what that allocated on the GPU (the allocator's delta across the create, so callers
+ * can reconcile admission estimates against reality). */
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    const int rc = e->family->session->create(out, e, ctx_size);
-    /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
-     * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
-     * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
-    if (rc == 0 && *out && e->tp) (*out)->tp_session_id = ++e->tp_session_seq;
-    return rc;
-}
-
-
-/* The DeepSeek family's session create: the pulsar_gpu_graph (SWA rings,
- * compressed KV and frontiers, bank slabs), steering, the TP scratch and the
- * drafter's buffers.  pulsar_session::create's body until L251. */
-int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
-    if (!out || !e || ctx_size <= 0) return 1;
+    *out = NULL;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
-
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    s->logits = (float *)xmalloc((size_t)e->logits_width() * sizeof(s->logits[0]));
+    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    if (e->family->session->create(s) != 0) {
+        free(s->logits);
+        free(s);
+        return 1;
+    }
+    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
+    /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
+     * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
+     * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
+    if (e->tp) s->tp_session_id = ++e->tp_session_seq;
+    *out = s;
+    return 0;
+}
+
+
+/* The DeepSeek family's session state: the pulsar_gpu_graph (SWA rings, compressed KV and frontiers, bank
+ * slabs), steering, the TP scratch and the drafter's buffers, built into a session the core allocated.
+ * pulsar_session::create's body until L251. */
+int pulsar_ds4_session_create(pulsar_session *s) {
+    pulsar_engine *e = s->engine;
+    const int ctx_size = s->ctx_size;
     s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
-    s->prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
-                                                        e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
         fprintf(stderr, "pulsar: no transformer layers are loaded\n");
-        free(s);
         return 1;
     }
-    /* Measure the true GPU cost of this session (allocator delta across the
-     * create) so callers can reconcile admission estimates against reality. */
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    gpu_graph_bank_pool_n(), e->dspark_ready))
     {
-        free(s);
         return 1;
     }
     if (!gpu_graph_load_directional_steering(&s->graph,
@@ -1193,7 +1200,6 @@ int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_si
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
         gpu_graph_free(&s->graph);
-        free(s);
         return 1;
     }
     /* Borrow the engine's TP transport into the graph so the prefill big-gate
@@ -1207,21 +1213,15 @@ int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_si
     s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
     if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
         gpu_graph_free(&s->graph);
-        free(s);
         return 1;
     }
-    s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
         if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
             fprintf(stderr, "pulsar: failed to allocate DSpark graph buffers\n");
             gpu_graph_free(&s->graph);
-            free(s->logits);
-            free(s);
             return 1;
         }
     }
-    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
-    *out = s;
     return 0;
 }
 
@@ -1289,15 +1289,12 @@ uint64_t pulsar_session::touched_kv_bytes() const {
 }
 
 
+/* L272 P2: the family frees its state, the core the session's own -- one host half for every family
+ * (Qwen's destroy had kept its own copy of it, without the speculation scratch the round API allocates). */
 void pulsar_session::destroy() {
     auto *s = this;
     if (!s) return;
     s->engine->family->session->destroy(s);
-}
-
-
-void pulsar_ds4_session_destroy(pulsar_session *s) {
-    gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
     s->bank_carry_free();
@@ -1305,6 +1302,11 @@ void pulsar_ds4_session_destroy(pulsar_session *s) {
     free(s->spec_row_scratch);
     free(s->logits);
     free(s);
+}
+
+
+void pulsar_ds4_session_destroy(pulsar_session *s) {
+    gpu_graph_free(&s->graph);
 }
 
 

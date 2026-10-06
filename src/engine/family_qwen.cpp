@@ -890,33 +890,23 @@ static bool qwen_state_reset_bank(pulsar_qwen_state *st, const pulsar_qwen_shape
     return ok;
 }
 
-static uint32_t qwen_prefill_cap(const pulsar_engine *e, int ctx_size) {
-    return pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
-}
 
-static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+/* The family's state, built into a session the core allocated (L272 P2: the core sets ctx_size, the prefill
+ * cap and the logits row, and measures the bytes this allocates). */
+static int qwen_session_create(pulsar_session *s) {
+    pulsar_engine *e = s->engine;
     const uint32_t n_banks = gpu_graph_bank_pool_n();
-    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
-    s->engine = e;
-    s->ctx_size = ctx_size;
-    s->prefill_cap = qwen_prefill_cap(e, ctx_size);
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
-    s->qwen = qwen_state_alloc(&g_qwen_shape, &e->plan, n_banks, (uint32_t)ctx_size, s->prefill_cap,
+    s->qwen = qwen_state_alloc(&g_qwen_shape, &e->plan, n_banks, (uint32_t)s->ctx_size, s->prefill_cap,
                                e->qwen_weights->mtp.present);
-    if (!s->qwen) {
-        free(s);
-        return 1;
-    }
+    if (!s->qwen) return 1;
     for (uint32_t b = 0; b < n_banks; b++) {
         if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &e->plan, b)) {
             fprintf(stderr, "pulsar: %s: could not clear bank %u's state\n", PULSAR_QWEN_ARCH, b);
             qwen_state_free(s->qwen);
-            free(s);
+            s->qwen = NULL;
             return 1;
         }
     }
-    s->logits = (float *)xmalloc((size_t)g_qwen_shape.n_vocab * sizeof(s->logits[0]));
     s->qwen->ckpt->artifact = e->qwen_weights->artifact_digest;
     if (e->tp) {   /* L266 step 7: the engine's lanes; the ticket is the state's (priced with it), zeroed here */
         const uint32_t zero = 0;
@@ -926,23 +916,19 @@ static int qwen_session_create(pulsar_session **out, pulsar_engine *e, int ctx_s
         if (!s->qwen->tp_ticket || !pulsar_gpu_tensor_write(s->qwen->tp_ticket, 0, &zero, sizeof(zero))) {
             fprintf(stderr, "pulsar: %s: the TP stage ticket is missing\n", PULSAR_QWEN_ARCH);
             qwen_state_free(s->qwen);
-            free(s->logits);
-            free(s);
+            s->qwen = NULL;
             return 1;
         }
     }
-    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
-    fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps, %.2f GiB of state "
+    fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
                     "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
-            PULSAR_QWEN_ARCH, n_banks, ctx_size, s->prefill_cap,
-            (double)s->resident_bytes / 1073741824.0,
+            PULSAR_QWEN_ARCH, n_banks, s->ctx_size, s->prefill_cap,
             (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN) *
                      (pulsar_qwen_gdn_state_bytes(&g_qwen_shape) + pulsar_qwen_gdn_conv_bytes(&g_qwen_shape)) +
                      pulsar_qwen_ple_conv_bytes(&g_qwen_shape)) / 1048576.0,
             (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA) *
                      (pulsar_qwen_kv_row_bytes(&g_qwen_shape) +
                       pulsar_qwen_index_row_bytes(&g_qwen_shape) / g_qwen_shape.idx_block)) / 1024.0);
-    *out = s;
     return 0;
 }
 
@@ -951,12 +937,8 @@ static void qwen_session_destroy(pulsar_session *s) {
         fprintf(stderr, "pulsar: %s: MTP probe: draft position 1 agreed with the trunk's argmax %llu of %llu (%.1f%%)\n",
                 PULSAR_QWEN_ARCH, (unsigned long long)s->qwen->mtp_probe_hit, (unsigned long long)s->qwen->mtp_probe_n,
                 100.0 * (double)s->qwen->mtp_probe_hit / (double)s->qwen->mtp_probe_n);
-    s->bank_carry_free();   /* the core's carry (L272 P2) */
     qwen_state_free(s->qwen);
-    token_vec_free(&s->checkpoint);
-    pulsar_sample_scratch_free(&s->sample_scratch);
-    free(s->logits);
-    free(s);
+    s->qwen = NULL;
 }
 
 uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
@@ -987,7 +969,7 @@ uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows) {
 uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready || ctx_size <= 0) return 0;
     uint64_t managed = 0;
-    pulsar_qwen_state_price(&g_qwen_shape, &e->plan, 1u, (uint32_t)ctx_size, qwen_prefill_cap(e, ctx_size),
+    pulsar_qwen_state_price(&g_qwen_shape, &e->plan, 1u, (uint32_t)ctx_size, pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk),
                             e->qwen_weights->mtp.present, &managed);
     return managed;
 }
@@ -995,7 +977,7 @@ uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
 static uint64_t qwen_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     return pulsar_qwen_state_price(&g_qwen_shape, &e->plan, (uint32_t)n_banks, (uint32_t)ctx_size,
-                                   qwen_prefill_cap(e, ctx_size), e->qwen_weights->mtp.present, NULL);
+                                   pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk), e->qwen_weights->mtp.present, NULL);
 }
 
 /* ---- the step driver ------------------------------------------------------------ */
