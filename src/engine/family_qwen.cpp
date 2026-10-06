@@ -1241,40 +1241,48 @@ static bool qwen_mtp_absorb(pulsar_session *s, pulsar_qwen_step_mode mode, const
     return ok;
 }
 
-/* Prefill `n` tokens of the live bank from position `start`, in prefill_cap
- * chunks; the last chunk heads its last row into s->logits.
- * L266 step 5: when the prefill CONTINUES the bank's prefill-only history (start == prefill_pos), it
- * extends that history, and the chunk that crosses the prompt's last grid point is cut there and the
- * state at that point captured -- the checkpoint the next divergent turn resumes from.  A cut changes
- * no byte: every prompt chunk takes the prefill arms (qwen_chunk_neutrality_gate). */
-static bool qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
-    const uint32_t n = (uint32_t)prompt->len - start;
-    const uint32_t live = s->qwen->live_bank;
-    pulsar_ckpt_store *ck = s->qwen->ckpt;
-    const bool canonical = s->qwen->prefill_pos[live] == start && !s->qwen->frontier_stale[live];
-    const uint32_t grid_end = pulsar_ckpt_grid_floor(ck, start + n);
-    const uint32_t capture_at = canonical && grid_end > start ? grid_end : 0u;
-    int32_t *pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
-    int32_t *bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
-    for (uint32_t r = 0; r < s->prefill_cap; r++) bank[r] = (int32_t)live;
-    bool ok = true;
-    for (uint32_t off = 0, rows = 0; ok && off < n; off += rows) {
-        rows = n - off < s->prefill_cap ? n - off : s->prefill_cap;
-        if (capture_at && start + off < capture_at && start + off + rows > capture_at) rows = capture_at - (start + off);
-        for (uint32_t r = 0; r < rows; r++) pos[r] = (int32_t)(start + off + r);
-        const bool last = off + rows == n;
-        ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + start + off, pos, bank, rows,
-                          rows - 1u, last ? 1u : 0u, s->logits);
-        if (ok && s->qwen->mtp)
-            ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + start + off, pos, bank, rows, 0, NULL);
-        if (ok) qwen_bank_set_pos(s->qwen, live, start + off + rows);
-        if (ok && canonical) s->qwen->prefill_pos[live] = start + off + rows;
-        if (ok && capture_at && start + off + rows == capture_at) ok = pulsar_ckpt_capture(ck, live, capture_at);
-    }
-    s->logits_stale = !ok;
-    free(pos);
-    free(bank);
+/* One prefill chunk of the live bank (pulsar_prefill_chunk_fn): rows [pos0, pos0 + rows) of the
+ * prompt through the forward (the MTP layer absorbs them too), the bank's position advanced, and --
+ * while the prefill CONTINUES the bank's prefill-only history (L266 step 5) -- that history extended. */
+struct qwen_prefill_ctx {
+    int32_t *pos, *bank;
+    uint32_t live;
+    bool canonical;
+};
+
+static bool qwen_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0, uint32_t rows,
+                               bool last, void *ud) {
+    qwen_prefill_ctx *c = (qwen_prefill_ctx *)ud;
+    for (uint32_t r = 0; r < rows; r++) c->pos[r] = (int32_t)(pos0 + r);
+    bool ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, rows - 1u,
+                           last ? 1u : 0u, s->logits);
+    if (ok && s->qwen->mtp)
+        ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, NULL);
+    if (ok) qwen_bank_set_pos(s->qwen, c->live, pos0 + rows);
+    if (ok && c->canonical) s->qwen->prefill_pos[c->live] = pos0 + rows;
     return ok;
+}
+
+/* Prefill the live bank from `start` through the core loop (prefill_loop.cpp, L272 P2): prefill_cap
+ * chunks, progress, and the cancel hook at every chunk boundary.  When the prefill continues the bank's
+ * prefill-only history, the chunk that crosses the prompt's last grid point is cut there and the state
+ * captured -- the checkpoint the next divergent turn resumes from.  A cut changes no byte: every prompt
+ * chunk takes the prefill arms (qwen_chunk_neutrality_gate), which is also why an interrupted sync
+ * resumes exactly.  Returns the loop's 0 / PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
+static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
+    qwen_prefill_ctx c;
+    c.live = s->qwen->live_bank;
+    c.canonical = s->qwen->prefill_pos[c.live] == start && !s->qwen->frontier_stale[c.live];
+    pulsar_ckpt_store *ck = s->qwen->ckpt;
+    const uint32_t grid_end = pulsar_ckpt_grid_floor(ck, (uint32_t)prompt->len);
+    const uint32_t capture_at = c.canonical && grid_end > start ? grid_end : 0u;
+    c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
+    c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
+    for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
+    const int rc = pulsar_prefill_loop(s, prompt, start, s->prefill_cap, capture_at, ck, c.live, qwen_prefill_chunk, &c);
+    free(c.pos);
+    free(c.bank);
+    return rc;
 }
 
 /* Make the live bank hold exactly `prompt`: continue when the prompt extends what the bank holds;
@@ -1328,15 +1336,11 @@ static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
         }
     }
     s->qwen->last_resume = start;
-    s->checkpoint_valid = false;
-    if (!qwen_prefill(s, prompt, start)) {
-        if (err) snprintf(err, errlen, "%s: prefill refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return 1;
-    }
-    s->checkpoint.len = 0;
-    for (int i = 0; i < prompt->len; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
-    s->checkpoint_valid = true;
-    return 0;
+    /* the loop owns the view from here: it stands at each chunk's end as the chunk lands, so an
+     * interrupted sync leaves a valid prefix the next sync extends */
+    const int rc = qwen_prefill(s, prompt, start);
+    if (rc == 1 && err) snprintf(err, errlen, "%s: prefill refused (see the log for the op)", PULSAR_QWEN_ARCH);
+    return rc;
 }
 
 static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {

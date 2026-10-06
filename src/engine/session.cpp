@@ -1332,7 +1332,7 @@ void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
 }
 
 
-static bool pulsar_session_cancelled(pulsar_session *s) {
+bool pulsar_session_cancelled(pulsar_session *s) {
     /* A MIRRORED session stops at a chunk boundary only TOGETHER (v15): a
      * leader that stopped after k chunks alone would leave its workers running
      * the rest of the sync, waiting at an exchange the leader never joins (the

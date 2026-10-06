@@ -2993,6 +2993,26 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
  * type or missing tensor refuses loudly. */
 bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 
+/** The session's cooperative cancel hook, polled at a prefill chunk boundary (session.cpp).  A mirrored
+ *  session stops only together: the leader decides and ships the verdict, every worker reads it, so every
+ *  rank must poll at the same boundaries. */
+bool pulsar_session_cancelled(pulsar_session *s);
+
+/** One prefill chunk of the family's forward (L272 P2): rows [pos0, pos0 + rows) of `prompt` on the
+ *  live bank; `last` heads the final row into s->logits.  false = the chunk failed (logged). */
+typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0,
+                                        uint32_t rows, bool last, void *ud);
+
+/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start`, in chunks of
+ *  `cap` rows, a chunk cut at `capture_at` (0 = none) and the state there captured into `ckpt`/`bank`.
+ *  After each chunk the session's view advances (checkpoint = the prompt so far), the progress hooks
+ *  hear prefill_chunk / prefill_display, and the cancel hook is polled -- before every chunk too.
+ *  Returns 0 when the prompt is in, PULSAR_SESSION_SYNC_INTERRUPTED when the hook stopped it at a chunk
+ *  boundary (the view stands there, the logits stale), 1 when a chunk failed. */
+int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
+                        uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
+                        pulsar_prefill_chunk_fn chunk, void *ud);
+
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,
  * so they are graded directly against the reference by tests/vision_layout_gate.cpp

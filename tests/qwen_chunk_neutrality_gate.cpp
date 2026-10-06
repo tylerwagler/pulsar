@@ -17,9 +17,14 @@
  *   C4  disk segments: sync(P[0:600]) then sync(P) leave checkpoints at 512 and P's last grid point; the
  *       chain [0, 512) + [512, G) saved, loaded into a FRESH session, then sync(Q) == Q cold, byte for
  *       byte (the pools' rows and the slot travel through the file).
+ *   C5  L272 P2: the sync is interruptible -- at 256-row chunks the cancel hook stops sync(P) at a chunk
+ *       boundary (PULSAR_SESSION_SYNC_INTERRUPTED, the view standing there), the progress hook heard every
+ *       chunk in order, and the next sync(P) finishes the prompt: logits + 4 decode steps == cold (at the
+ *       default chunk), byte for byte.  The server yields a long prefill and honours a disconnect this way.
  * In the battery since L272 P2 (`make qwen-chunk-neutrality-gate-device`, QWEN_GATE_MODEL = the real container). */
 #include "pulsar.h"
 
+#include <algorithm>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +73,20 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const pulsar_tokens
     if (!ok) { fprintf(stderr, "qwen-chunk-neutrality: %s\n", err); out.clear(); }
     pulsar_session_free(s);
     return out;
+}
+
+/* C5's hooks: the progress events heard, and a cancel hook that stops at its `stop_at`-th poll */
+struct c5_hooks {
+    std::vector<int> chunk_events;
+    int polls = 0;
+    int stop_at = 0;
+};
+static void c5_progress(void *ud, const char *event, int current, int) {
+    if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current);
+}
+static bool c5_cancel(void *ud) {
+    c5_hooks *h = (c5_hooks *)ud;
+    return ++h->polls == h->stop_at;
 }
 
 int main(int argc, char **argv) {
@@ -191,6 +210,55 @@ int main(int argc, char **argv) {
         if (f1) fclose(f1);
         if (f2) fclose(f2);
         pulsar_tokens_free(&Q);
+    }
+    /* C5: an interrupted sync resumes exactly (L272 P2) */
+    if (argc > 2) {
+        printf("  skip  C5 (an explicit prefill_chunk pins the session's chunk; C5 sets its own)\n");
+    } else if (N <= 512) {
+        CHECK(false, "C5 needs a prompt of more than two 256-row chunks (have %d)", N);
+    } else {
+        setenv("PULSAR_CUDA_PREFILL_CHUNK", "256", 1);
+        pulsar_engine_set_bank_pool(1);
+        pulsar_session *s = NULL;
+        char err[256] = "";
+        const bool made = pulsar_session_create(&s, e, 8192) == 0;
+        unsetenv("PULSAR_CUDA_PREFILL_CHUNK");
+        CHECK(made, "C5 session at 256-row chunks: %s", err);
+        if (made) {
+            CHECK(pulsar_session_prefill_quantum_min_suffix(s) == 1, "C5 the server may interrupt this family's prefill");
+            c5_hooks h;
+            h.stop_at = 2;   /* poll 1 is before the first chunk, poll 2 after it: stop at 256 */
+            pulsar_session_set_progress(s, c5_progress, &h);
+            pulsar_session_set_cancel(s, c5_cancel, &h);
+            const int rc1 = pulsar_session_sync(s, &P, err, sizeof(err));
+            CHECK(rc1 == PULSAR_SESSION_SYNC_INTERRUPTED && pulsar_session_pos(s) == 256,
+                  "C5 the cancel hook stopped sync(P) at a chunk boundary: rc %d, pos %d (want %d, 256) %s", rc1,
+                  pulsar_session_pos(s), PULSAR_SESSION_SYNC_INTERRUPTED, err);
+            pulsar_session_set_cancel(s, NULL, NULL);
+            const int rc2 = pulsar_session_sync(s, &P, err, sizeof(err));
+            bool monotone = !h.chunk_events.empty() && h.chunk_events.back() == N;
+            for (size_t i = 1; i < h.chunk_events.size(); i++) monotone &= h.chunk_events[i] >= h.chunk_events[i - 1];
+            const bool heard_256 = std::find(h.chunk_events.begin(), h.chunk_events.end(), 256) != h.chunk_events.end();
+            CHECK(rc2 == 0 && pulsar_session_pos(s) == N, "C5 the next sync(P) finished the prompt: rc %d, pos %d %s", rc2,
+                  pulsar_session_pos(s), err);
+            CHECK(monotone && heard_256, "C5 progress heard every chunk in order (%zu events, last %d)",
+                  h.chunk_events.size(), h.chunk_events.empty() ? -1 : h.chunk_events.back());
+            std::vector<std::vector<float>> got;
+            if (rc2 == 0) {
+                got.push_back(logits_of(s, W));
+                for (int i = 0; i < 4 && pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0; i++)
+                    got.push_back(logits_of(s, W));
+            }
+            bool same = got.size() == 5;
+            double worst = 0;
+            for (size_t i = 0; same && i < 5; i++) {
+                same = memcmp(got[i].data(), cold[i].data(), (size_t)W * sizeof(float)) == 0;
+                worst = fmax(worst, maxdiff(got[i], cold[i]));
+            }
+            CHECK(same, "C5 interrupted + resumed at 256-row chunks: logits + 4 decode steps == cold, max |diff| %.3e %s",
+                  worst, err);
+            pulsar_session_free(s);
+        }
     }
     printf(n_fail ? "QWEN-CHUNK-NEUTRALITY GATE FAIL (%d)\n" : "QWEN-CHUNK-NEUTRALITY GATE PASS\n", n_fail);
     pulsar_tokens_free(&P);
