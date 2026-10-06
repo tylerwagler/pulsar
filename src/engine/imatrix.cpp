@@ -677,6 +677,151 @@ static uint32_t gcd_u32(uint32_t a, uint32_t b) {
     return a;
 }
 
+/* DeepSeek's prefill planner as the walk's hooks (L272 P2; prefill_loop.cpp pulsar_prefill_walk_run).
+ * The arithmetic below is the planner's, moved verbatim: the walk calls next_end with each chunk's
+ * start, and every rule here depends only on that start, the prompt's end and the planner's fixed
+ * inputs -- so the cuts are the ones the planner's own loop made. */
+struct ds4_plan {
+    pulsar_gpu_graph *g;
+    const pulsar_model *model;
+    const pulsar_weights *weights;
+    const token_vec *prompt;
+    float *logits;
+    bool show_progress;
+    pulsar_session_progress_fn progress;
+    void *progress_ud;
+    pulsar_session_progress_fn display_progress;
+    void *display_progress_ud;
+    pulsar_imatrix_collector *imatrix;
+    pulsar_session_cancel_fn cancel;
+    void *cancel_ud;
+    bool *cancelled;
+    uint32_t chunk_cap;
+    int n_blk;
+    const int32_t *blk_s, *blk_e;
+};
+
+static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
+    const ds4_plan *p = (const ds4_plan *)ud;
+    const pulsar_gpu_graph *g = p->g;
+    const uint32_t remaining = end - pos0;
+    uint32_t local_cap = p->chunk_cap;
+    /* Snap to the absolute prefill_cap grid after any unaligned start: a
+     * resume (start != 0) lands on the cold prefill's boundaries, and so does
+     * the chunk after an image cut below -- on the cold pass too, which is
+     * what keeps a resumed image prefill the cold one's chunk for chunk.  A
+     * text-only cold pass starts aligned and never cuts, so it is unchanged. */
+    if (g->prefill_cap != 0) {
+        const uint32_t mod = pos0 % g->prefill_cap;
+        if (mod != 0) {
+            const uint32_t to_boundary = g->prefill_cap - mod;
+            if (to_boundary < local_cap) local_cap = to_boundary;
+        }
+    }
+    uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+    /* Keep every NON-final chunk boundary aligned to the layer compress
+     * ratios (LCM, i.e. 4 for the ratio-4 layers): one unaligned boundary
+     * makes pos0 unaligned for every later chunk, and each of those takes
+     * the per-token compressor fallback instead of the batched aligned
+     * path for the whole rest of the prompt. The final chunk keeps its
+     * exact remainder; an unaligned START (continuation from an arbitrary
+     * position) pays the fallback for its first chunk only, because that
+     * chunk still ENDS on an aligned boundary. */
+    if (chunk < remaining) {
+        uint32_t align = 1;
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const uint32_t r = pulsar_layer_compress_ratio(il);
+            if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
+        }
+        if (align > 1) {
+            const uint32_t aligned_end = ((pos0 + chunk) / align) * align;
+            if (aligned_end > pos0) chunk = aligned_end - pos0;
+        }
+    }
+    /* Never end a chunk inside an image block: cut before a block the chunk
+     * would split, or -- when the chunk STARTS at the block -- carry the whole
+     * block (it fits: vision_spans_fit).  Positions only, so the cold pass and
+     * any resume over the same prompt cut alike; the cost is the compressor
+     * fallback for one unaligned boundary. */
+    for (int b = 0; b < p->n_blk; b++) {
+        const uint32_t bs = (uint32_t)p->blk_s[b], be = (uint32_t)p->blk_e[b];
+        const uint32_t ce = pos0 + chunk;
+        if (bs < ce && ce < be) {
+            if (bs > pos0) chunk = bs - pos0;
+            else chunk = be - pos0;
+        }
+    }
+    /* L264: the final chunk stops at the last grid point inside it, so the
+     * prefill leaves a checkpoint where the next turn of this conversation
+     * resumes.  A chunk that starts on the 128 grid is exactly the cold
+     * prefill's computation (L195), so the split moves no byte -- the
+     * chunk-neutrality gate's resumes are this same cut.  Not when that grid
+     * point falls inside an image block (the block stays whole). */
+    if (pos0 + chunk == end) {
+        const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
+        bool inside = false;
+        for (int b = 0; b < p->n_blk; b++)
+            if ((uint32_t)p->blk_s[b] < grid_end && grid_end < (uint32_t)p->blk_e[b]) inside = true;
+        if (grid_end > pos0 && grid_end < end && !inside) chunk = grid_end - pos0;
+    }
+    return pos0 + chunk;
+}
+
+static bool ds4_plan_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
+    const ds4_plan *p = (const ds4_plan *)ud;
+    /* Only the final chunk's logits are consumed (the progress callback below
+     * reports position only, never reads logits). Running the full output
+     * head + vocab GEMM + readback on every non-final chunk is wasted work
+     * whose result is immediately overwritten. */
+    float *chunk_logits = last ? p->logits : NULL;
+    bool ok = gpu_graph_prefill_layer_major(p->g,
+                                              p->model,
+                                              p->weights,
+                                              p->prompt,
+                                              pos0,
+                                              rows,
+                                              chunk_logits,
+                                              p->show_progress,
+                                              p->imatrix,
+                                              p->display_progress,
+                                              p->display_progress_ud);
+    if (!ok) {
+        if (pulsar_gpu_synchronize() == 0) {
+            fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
+    const ds4_plan *p = (const ds4_plan *)ud;
+    pulsar_gpu_graph *g = p->g;
+    /* L264: a chunk that ended on the grid -- every non-final boundary does,
+     * and the final split above makes the last grid point one too -- is a
+     * checkpoint.  Never inside an image block (the planner never ends a
+     * chunk there, L261): a resume may not re-evaluate a merged row (L226). */
+    bool in_block = false;
+    for (int b = 0; b < p->n_blk; b++)
+        if ((uint32_t)p->blk_s[b] < chunk_end && chunk_end < (uint32_t)p->blk_e[b]) in_block = true;
+    if (chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block &&
+        !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
+    if (p->progress) {
+        p->progress(p->progress_ud, "prefill_chunk", (int)chunk_end, p->prompt->len);
+    }
+    if (p->display_progress) {
+        p->display_progress(p->display_progress_ud, "prefill_display", (int)chunk_end, p->prompt->len);
+    }
+    return true;
+}
+
+static bool ds4_plan_stop(void *ud) {
+    const ds4_plan *p = (const ds4_plan *)ud;
+    if (!(p->cancel && p->cancel(p->cancel_ud))) return false;
+    if (p->cancelled) *p->cancelled = true;
+    return true;
+}
+
 bool gpu_graph_prefill_chunked_range(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -748,122 +893,19 @@ bool gpu_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
-    for (uint32_t pos0 = start; pos0 < end; ) {
-        if (cancel && cancel(cancel_ud)) {
-            if (cancelled) *cancelled = true;
-            /* L188: drain (and consume the non-finite flag) before handing the
-             * stream to whatever runs next */
-            (void)pulsar_gpu_synchronize();
-            return true;
-        }
-        const uint32_t remaining = end - pos0;
-        uint32_t local_cap = chunk_cap;
-        /* Snap to the absolute prefill_cap grid after any unaligned start: a
-         * resume (start != 0) lands on the cold prefill's boundaries, and so does
-         * the chunk after an image cut below -- on the cold pass too, which is
-         * what keeps a resumed image prefill the cold one's chunk for chunk.  A
-         * text-only cold pass starts aligned and never cuts, so it is unchanged. */
-        if (g->prefill_cap != 0) {
-            const uint32_t mod = pos0 % g->prefill_cap;
-            if (mod != 0) {
-                const uint32_t to_boundary = g->prefill_cap - mod;
-                if (to_boundary < local_cap) local_cap = to_boundary;
-            }
-        }
-        uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-        /* Keep every NON-final chunk boundary aligned to the layer compress
-         * ratios (LCM, i.e. 4 for the ratio-4 layers): one unaligned boundary
-         * makes pos0 unaligned for every later chunk, and each of those takes
-         * the per-token compressor fallback instead of the batched aligned
-         * path for the whole rest of the prompt. The final chunk keeps its
-         * exact remainder; an unaligned START (continuation from an arbitrary
-         * position) pays the fallback for its first chunk only, because that
-         * chunk still ENDS on an aligned boundary. */
-        if (chunk < remaining) {
-            uint32_t align = 1;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                const uint32_t r = pulsar_layer_compress_ratio(il);
-                if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
-            }
-            if (align > 1) {
-                const uint32_t aligned_end = ((pos0 + chunk) / align) * align;
-                if (aligned_end > pos0) chunk = aligned_end - pos0;
-            }
-        }
-        /* Never end a chunk inside an image block: cut before a block the chunk
-         * would split, or -- when the chunk STARTS at the block -- carry the whole
-         * block (it fits: vision_spans_fit).  Positions only, so the cold pass and
-         * any resume over the same prompt cut alike; the cost is the compressor
-         * fallback for one unaligned boundary. */
-        for (int b = 0; b < n_blk; b++) {
-            const uint32_t bs = (uint32_t)blk_s[b], be = (uint32_t)blk_e[b];
-            const uint32_t ce = pos0 + chunk;
-            if (bs < ce && ce < be) {
-                if (bs > pos0) chunk = bs - pos0;
-                else chunk = be - pos0;
-            }
-        }
-        /* L264: the final chunk stops at the last grid point inside it, so the
-         * prefill leaves a checkpoint where the next turn of this conversation
-         * resumes.  A chunk that starts on the 128 grid is exactly the cold
-         * prefill's computation (L195), so the split moves no byte -- the
-         * chunk-neutrality gate's resumes are this same cut.  Not when that grid
-         * point falls inside an image block (the block stays whole). */
-        if (pos0 + chunk == end) {
-            const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
-            bool inside = false;
-            for (int b = 0; b < n_blk; b++)
-                if ((uint32_t)blk_s[b] < grid_end && grid_end < (uint32_t)blk_e[b]) inside = true;
-            if (grid_end > pos0 && grid_end < end && !inside) chunk = grid_end - pos0;
-        }
-        const uint32_t chunk_end = pos0 + chunk;
-        /* Only the final chunk's logits are consumed (the progress callback below
-         * reports position only, never reads logits). Running the full output
-         * head + vocab GEMM + readback on every non-final chunk is wasted work
-         * whose result is immediately overwritten. */
-        float *chunk_logits = (chunk_end == end) ? logits : NULL;
-        bool ok = gpu_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
-        if (!ok) {
-            if (pulsar_gpu_synchronize() == 0) {
-                fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
-            }
-            return false;
-        }
-        /* L264: a chunk that ended on the grid -- every non-final boundary does,
-         * and the final split above makes the last grid point one too -- is a
-         * checkpoint.  Never inside an image block (the planner never ends a
-         * chunk there, L261): a resume may not re-evaluate a merged row (L226). */
-        bool in_block = false;
-        for (int b = 0; b < n_blk; b++)
-            if ((uint32_t)blk_s[b] < chunk_end && chunk_end < (uint32_t)blk_e[b]) in_block = true;
-        if (chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block &&
-            !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
-        if (progress) {
-            progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
-        }
-        if (display_progress) {
-            display_progress(display_progress_ud, "prefill_display", (int)chunk_end, prompt->len);
-        }
-        if (cancel && cancel(cancel_ud)) {
-            if (cancelled) *cancelled = true;
-            /* L188: drain (and consume the non-finite flag) before handing the
-             * stream to whatever runs next */
-            (void)pulsar_gpu_synchronize();
-            return true;
-        }
-        pos0 = chunk_end;
-    }
-    if (show_progress) fputc('\n', stderr);
+    /* L272 P2: the walk (prefill_loop.cpp) owns the order -- poll, cut, run, land, poll -- shared with
+     * every family's session loop; this planner is its hooks: the cut (ds4_plan_next_end), the chunk
+     * (gpu_graph_prefill_layer_major), the landing (grid capture + progress). */
+    ds4_plan p;
+    p.g = g; p.model = model; p.weights = weights; p.prompt = prompt; p.logits = logits;
+    p.show_progress = show_progress; p.progress = progress; p.progress_ud = progress_ud;
+    p.display_progress = display_progress; p.display_progress_ud = display_progress_ud; p.imatrix = imatrix;
+    p.cancel = cancel; p.cancel_ud = cancel_ud; p.cancelled = cancelled;
+    p.chunk_cap = chunk_cap; p.n_blk = n_blk; p.blk_s = blk_s; p.blk_e = blk_e;
+    const pulsar_prefill_walk w = { ds4_plan_next_end, ds4_plan_chunk, ds4_plan_landed, ds4_plan_stop, &p };
+    const int rc = pulsar_prefill_walk_run(&w, start, end);
+    if (rc == 1) return false;
+    if (rc == 0 && show_progress) fputc('\n', stderr);
     return true;
 }
 

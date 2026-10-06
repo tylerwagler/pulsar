@@ -2998,6 +2998,23 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
  *  rank must poll at the same boundaries. */
 bool pulsar_session_cancelled(pulsar_session *s);
 
+/** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
+ *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so
+ *  DeepSeek's planner and the session loop are one walk.  `next_end` returns the chunk's end in
+ *  (pos0, end]; `chunk` runs rows [pos0, pos0 + rows) (`last`: it ends the prompt); `landed` takes the
+ *  effects of a chunk that ended at `chunk_end` (captures, the view, progress); `stop` (NULL = never) is
+ *  polled before every chunk and after every chunk but the last. */
+struct pulsar_prefill_walk {
+    uint32_t (*next_end)(void *ud, uint32_t pos0, uint32_t end);
+    bool (*chunk)(void *ud, uint32_t pos0, uint32_t rows, bool last);
+    bool (*landed)(void *ud, uint32_t chunk_end);
+    bool (*stop)(void *ud);
+    void *ud;
+};
+/** Run the walk over [start, end): 0 when it reached `end`, PULSAR_SESSION_SYNC_INTERRUPTED when `stop`
+ *  said so at a chunk boundary (the device drained), 1 when a hook failed or a cut was out of range. */
+int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);
+
 /** One prefill chunk of the family's forward (L272 P2): rows [pos0, pos0 + rows) of `prompt` on the
  *  live bank; `last` heads the final row into s->logits.  false = the chunk failed (logged). */
 typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0,

@@ -8,25 +8,75 @@
  * had its own loop with no progress and no cancel: a disconnected Claude Code request prefilled to the
  * end and held every other slot behind it.
  *
- * DeepSeek's planner (imatrix.cpp gpu_graph_prefill_chunked_range) still runs its own walk -- absolute
- * cap snaps, compress-ratio alignment, image blocks, a capture at every grid chunk end -- and moves
- * onto this loop in a later step under chunk_neutrality_gate.  The events and the poll points here are
- * that planner's: prefill_chunk / prefill_display at the start and after each chunk, the hook polled
- * before and after each chunk. */
+ * Both this loop and DeepSeek's planner (imatrix.cpp gpu_graph_prefill_chunked_range: absolute cap
+ * snaps, compress-ratio alignment, image blocks, a capture at every grid chunk end) run ONE walk,
+ * pulsar_prefill_walk_run: the order is the walk's, the planning and the effects are each caller's
+ * hooks.  The events are the planner's: prefill_chunk / prefill_display at the start and after each
+ * chunk. */
 #include "pulsar_engine_internal.h"
+
+int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end) {
+    for (uint32_t pos0 = start; pos0 < end;) {
+        if (w->stop && w->stop(w->ud)) {
+            (void)pulsar_gpu_synchronize();   /* L188: drain before handing the stream to whatever runs next */
+            return PULSAR_SESSION_SYNC_INTERRUPTED;
+        }
+        const uint32_t chunk_end = w->next_end(w->ud, pos0, end);
+        if (chunk_end <= pos0 || chunk_end > end) {
+            fprintf(stderr, "pulsar: prefill walk: a chunk from %u cut at %u (prompt ends at %u)\n", pos0, chunk_end, end);
+            return 1;
+        }
+        if (!w->chunk(w->ud, pos0, chunk_end - pos0, chunk_end == end)) return 1;
+        if (w->landed && !w->landed(w->ud, chunk_end)) return 1;
+        pos0 = chunk_end;
+        if (pos0 < end && w->stop && w->stop(w->ud)) {
+            (void)pulsar_gpu_synchronize();
+            return PULSAR_SESSION_SYNC_INTERRUPTED;
+        }
+    }
+    return 0;
+}
 
 static void prefill_loop_progress(pulsar_session *s, int current, int total) {
     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
 }
 
-/* A stop at a chunk boundary: the view stands at the last chunk's end (set as it landed), and the
- * logits are not that position's next-token row (only the final chunk heads its last row). */
-static int prefill_loop_interrupted(pulsar_session *s) {
-    s->logits_stale = true;
-    (void)pulsar_gpu_synchronize();   /* L188: drain before handing the stream to whatever runs next */
-    return PULSAR_SESSION_SYNC_INTERRUPTED;
+/* The session loop's hooks over the walk: chunks of `cap`, one cut at `capture_at`, the view advanced and
+ * the state captured as each chunk lands, the session's cancel hook as the stop. */
+struct prefill_loop_ctx {
+    pulsar_session *s;
+    const pulsar_tokens *prompt;
+    uint32_t cap, capture_at, bank;
+    pulsar_ckpt_store *ckpt;
+    pulsar_prefill_chunk_fn chunk;
+    void *ud;
+};
+
+static uint32_t prefill_loop_next_end(void *ud, uint32_t pos0, uint32_t end) {
+    const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
+    uint32_t rows = end - pos0 < c->cap ? end - pos0 : c->cap;
+    if (c->capture_at && pos0 < c->capture_at && pos0 + rows > c->capture_at) rows = c->capture_at - pos0;
+    return pos0 + rows;
 }
+
+static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
+    const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
+    return c->chunk(c->s, c->prompt, pos0, rows, last, c->ud);
+}
+
+static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
+    const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
+    pulsar_session *s = c->s;
+    for (int i = s->checkpoint.len; i < (int)chunk_end; i++) token_vec_push(&s->checkpoint, c->prompt->v[i]);
+    s->checkpoint_valid = true;
+    if (c->capture_at && chunk_end == c->capture_at && !pulsar_ckpt_capture(c->ckpt, c->bank, c->capture_at))
+        return false;
+    prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
+    return true;
+}
+
+static bool prefill_loop_stop(void *ud) { return pulsar_session_cancelled(((const prefill_loop_ctx *)ud)->s); }
 
 int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
                         uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
@@ -41,26 +91,12 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     for (uint32_t i = 0; i < start; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     s->checkpoint_valid = start > 0u;
     prefill_loop_progress(s, (int)start, prompt->len);
-    for (uint32_t pos0 = start; pos0 < end;) {
-        if (pulsar_session_cancelled(s)) return prefill_loop_interrupted(s);
-        uint32_t rows = end - pos0 < cap ? end - pos0 : cap;
-        if (capture_at && pos0 < capture_at && pos0 + rows > capture_at) rows = capture_at - pos0;
-        const uint32_t chunk_end = pos0 + rows;
-        if (!chunk(s, prompt, pos0, rows, chunk_end == end, ud)) {
-            s->checkpoint_valid = false;
-            s->logits_stale = true;
-            return 1;
-        }
-        for (uint32_t i = pos0; i < chunk_end; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
-        s->checkpoint_valid = true;
-        if (capture_at && chunk_end == capture_at && !pulsar_ckpt_capture(ckpt, bank, capture_at)) {
-            s->logits_stale = true;
-            return 1;
-        }
-        prefill_loop_progress(s, (int)chunk_end, prompt->len);
-        pos0 = chunk_end;
-        if (pos0 < end && pulsar_session_cancelled(s)) return prefill_loop_interrupted(s);
-    }
-    s->logits_stale = false;
-    return 0;
+    prefill_loop_ctx c = { s, prompt, cap, capture_at, bank, ckpt, chunk, ud };
+    const pulsar_prefill_walk w = { prefill_loop_next_end, prefill_loop_chunk, prefill_loop_landed, prefill_loop_stop, &c };
+    const int rc = pulsar_prefill_walk_run(&w, start, end);
+    /* the logits are the prompt's next-token row only when the final chunk ran (a stop leaves the view
+     * at a boundary, a failure leaves it at the last chunk that landed) */
+    s->logits_stale = rc != 0;
+    if (rc == 1) s->checkpoint_valid = false;
+    return rc;
 }
