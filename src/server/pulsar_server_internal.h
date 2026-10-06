@@ -500,6 +500,125 @@ typedef struct {
     pulsar_token_score pending_top[PULSAR_SERVER_MAX_TOP_LOGPROBS];  ///< those alternatives
 } logprob_ledger;
 
+/* ---- L272 P3: the model-family half of the server, ONE table per template family --------------------
+ * (chat_family.cpp).  A request carries the loaded family's (request::family); every per-family branch
+ * in the server reads one of these fields where it used to read a flag.  Step 1 of the server audit's
+ * order: the table replaces the chat_v41 / chat_qwen flags; the output parser as a plugin and the
+ * decode hook join it next (steps 2-3), the suffix hooks after (step 4). */
+struct chat_conversation;
+struct server;
+struct request;
+/** How a family's generated text is read. */
+typedef enum {
+    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, truncation repair, recovery, tool memory, the canonical rewrite, live tool state
+    SERVER_PARSER_QWEN = 1,   ///< ONE qwen_output_parser per generation (gen_state::qwen); the turn ends at the family's stop token
+} server_parser_kind;
+typedef struct server_family_ops {
+    const char *name;
+    pulsar_chat_format format;
+    /** DeepSeek's template variant -- V4.1 or V4 (0731): the DSML tag spelling, the effort line, how
+     *  consecutive user-side messages merge, whether a mid-conversation system message is an in-place
+     *  System token or a <system-reminder> note, which assistant turns replay reasoning.  Read by the
+     *  DSML renderer and every KV-key suffix builder, so the live KV and the replay cannot disagree
+     *  about which template produced the bytes (L218 s123).  Meaningless to another family. */
+    bool v41;
+    server_parser_kind parser;
+    /** Resolve the request's thinking controls (c->controls, the model alias) into r->think_mode and
+     *  the family's own effort; refuse by name a control the template cannot express. */
+    bool (*resolve)(pulsar_engine *e, const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
+    /** Render the conversation into r->prompt_text / prompt_spans / prompt; refuse by name what the
+     *  template cannot express (a forced tool call, a live tool continuation, ...). */
+    bool (*render)(pulsar_engine *e, struct server *s, struct chat_conversation *c, struct request *r, char *err,
+                   size_t errlen);
+    /** The rendered prefix two UNRELATED prompts share by template construction, in tokens: the slot
+     *  router's trivial-match header (server::slot_trivial_common_tokens). */
+    int (*trivial_header_tokens)(pulsar_engine *e);
+    /** How the family's generated text is read (steps 2-3). */
+    const struct server_output_parser_ops *output;
+
+    /* ---- step 4: the suffix hooks.  Each is OPTIONAL: a family without one does not have the feature
+     *      built on it, and the server refuses or skips that feature by name (never a DeepSeek
+     *      rendering on another family's KV).  Every hook renders exactly the bytes the family's full
+     *      replay render produces for the same turn, so the live KV and the next prompt agree (L196). */
+    /** The assistant turn as SAMPLED, appended after the prompt's generation prefix: `reasoning`
+     *  (NULL = none replayed), the content, the calls, and the EOS only when the turn sampled one.
+     *  The canonical tool-checkpoint rewrite and the Responses visible memory key on it. */
+    char *(*assistant_turn_sampled)(const request *r, bool think, const char *reasoning, const char *content,
+                                    const tool_calls *calls, chat_text_span **spans_out, uint32_t *n_spans_out);
+    /** The tail after a tool-call turn: the turn's EOS, the new user-side messages from `start` (tool
+     *  results, a mid-loop system message), the generation prefix -- the live tool continuation. */
+    char *(*tool_result_tail)(const request *r, const chat_msgs *msgs, int start, chat_text_span **spans_out,
+                              uint32_t *n_spans_out);
+    /** A model-visible tool error (a malformed call) as ONE tool result appended mid-turn, with the
+     *  system prompt reminded -- the parser's retry. */
+    char *(*tool_error_suffix)(const request *r, const struct thinking_state *thinking, const char *detail,
+                               chat_text_span **spans_out, uint32_t *n_spans_out);
+    /** A forced tool_choice (required / a named function): the text the generated output is SEEDED with
+     *  -- the family's spelling of "thinking skipped, a call opened" -- read by the parser before the
+     *  model's first token. */
+    void (*forced_call_seed)(const request *r, buf *out);
+    /** The rendered prompt's rewrite for that forced call: on entry `*keep` is the prompt's length;
+     *  the hook lowers it to drop a server-written opener the seed replaces and writes the bytes to
+     *  append, so prompt + output = the family's render of the turn (request_apply_forced_tool_prefill
+     *  does the bookkeeping).  With forced_call_seed, both or neither. */
+    void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
+    /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
+     *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
+    const char *(*find_call_block)(const char *p, const char **end);
+} server_family_ops;
+
+/* ---- L272 P3 steps 2-3: the family's OUTPUT PARSER ----------------------------------------------
+ * One reading of the generated text per family, behind this table: per emitted token it tracks the
+ * decode-time state (the greedy region of a tool call, whether a closed call ends the turn) and
+ * projects the released bytes into the request's protocol sink (chat_sink: text deltas, section ends,
+ * the generic tool events); at the finish it gives the turn's final reading.  DeepSeek's is the
+ * <think> / DSML machinery (parser_deepseek.cpp), Qwen's the incremental qwen_output_parser
+ * (parser_qwen.cpp).  The server owns the stop-string scan, the plain (completion) stream, the
+ * protocol finish and the response. */
+struct gen_state;
+struct session_slot;
+/** The turn's final reading. */
+typedef struct {
+    char *content;          ///< owned; NULL = the raw text stands (completions)
+    char *reasoning;        ///< owned, or NULL
+    tool_calls calls;       ///< the turn's calls, ids assigned
+    const char *finish;     ///< the finish label after the reading ("tool_calls", "length", "stop", "error", ...)
+    bool parse_failed;      ///< a malformed call: the raw text was promoted to content
+    /** The parser ran its model-visible retry (a tool error appended to the live session): the
+     *  generation loops back to a fresh decode attempt instead of answering. */
+    bool retry;
+    /** Text the live stream did not send that the final reading returned to content (the Responses
+     *  finish sends it as output_text); NULL = none. */
+    const char *tail;
+    size_t tail_len;
+} server_turn;
+typedef struct server_output_parser_ops {
+    /** The parser's state for one decode attempt, after the protocol sink is set up (g->sink); NULL
+     *  with `err` = the request fails. */
+    void *(*create)(server *s, struct gen_state *g, char *err, size_t errlen);
+    void (*destroy)(void *st);
+    /** Optional.  A forced tool_choice prefill seeded g->text: read it as if the model had emitted it. */
+    void (*seed)(void *st, struct gen_state *g);
+    /** Per emitted token, after g->text grew: `upto` = the bytes the stop-string scan released, to be
+     *  projected into the sink (final = false); at the finish, `final` flushes what the projection held.
+     *  false = a client write failed. */
+    bool (*feed)(void *st, server *s, struct gen_state *g, size_t upto, bool final);
+    /** The decode sits inside a tool call's structured region: its arguments decode greedily. */
+    bool (*in_tool_call)(const void *st, const struct gen_state *g);
+    /** The turn is complete before the stop token (DeepSeek: a closed DSML block). */
+    bool (*turn_complete)(const void *st, const struct gen_state *g);
+    /** Optional, diagnostics: a call has opened / closed in this attempt. */
+    void (*tool_progress)(const void *st, bool *opened, bool *closed);
+    /** The turn's final reading (repair, parse, ids, the family's own retry and memory).  false = a
+     *  client write failed while finishing the stream. */
+    bool (*finish)(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
+} server_output_parser_ops;
+extern const server_output_parser_ops k_parser_deepseek;
+extern const server_output_parser_ops k_parser_qwen;
+/** The table for a chat format (every format has one), and for the loaded engine's. */
+const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
+const server_family_ops *server_family_for_engine(const pulsar_engine *e);
+
 /** One parsed request, normalised across the three supported APIs.
  *
  * `kind` and `api` are separate on purpose: the same logical operation (a chat
@@ -507,7 +626,7 @@ typedef struct {
  * go back in the shape it came from. Everything below is protocol-neutral;
  * `api` is what the emitters branch on.
  */
-typedef struct {
+typedef struct request {
     req_kind kind;             ///< what the request asks for (completion, chat, embedding, ...)
     api_style api;             ///< which wire protocol it arrived on; the response must match
     pulsar_tokens prompt;      ///< the rendered prompt as tokens
@@ -596,25 +715,14 @@ typedef struct {
     pulsar_text_span *anthropic_live_suffix_spans;  ///< its CLIENT-DATA ranges (L223), owned
     uint32_t anthropic_live_suffix_n_spans;   ///< ranges in anthropic_live_suffix_spans
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
-    /** The chat TEMPLATE family the loaded model was trained on (L218's
-     * two-profile engine).  V4 (0731) and V4.1 render DIFFERENTLY: the DSML tag
-     * spelling, the tools-prompt text, where the tool schemas sit, how
-     * consecutive user-side messages merge, whether a mid-conversation system
-     * message is an in-place System token or a <system-reminder> note, and
-     * which assistant turns replay reasoning.  The parser sets this from
-     * pulsar_engine_variant(); every renderer AND every KV-key suffix builder
-     * reads THIS, so the live KV and the replay cannot disagree about which
-     * template produced the bytes.  True (V4.1, the compile-time default)
-     * unless a parser says otherwise, so hand-built requests keep the default
-     * profile's bytes. */
-    bool chat_v41;
-    /** L251: a /v1/chat/completions request for the Qwen family.  Rendered by
-     * qwen_chat_render (src/lib/qwen_chat), and its generated text is read by
-     * ONE qwen_output_parser per generation (gen_state::qwen) instead of the
-     * DeepSeek think/DSML machinery: every DeepSeek continuation, forced-prefill,
-     * tool-memory and checkpoint-suffix builder is skipped for it, because each
-     * of them writes DeepSeek markup.  False for every other request. */
-    bool chat_qwen;
+    /** L272 P3: the loaded model's template family -- the server's per-family table (server_family_ops,
+     *  chat_family.cpp).  Every per-family branch reads one of its fields; a parser that holds the engine
+     *  sets it from the engine (server_family_for_engine), request_init defaults it to the compile-time
+     *  profile's (DeepSeek V4.1) so hand-built requests keep that profile's bytes.  Never NULL. */
+    const struct server_family_ops *family;
+    /** The family's own resolved thinking control, when its template has one beyond think_mode (Qwen's
+     *  qwen_effort); written by family->resolve, read by family->render. */
+    int family_effort;
     /** L251: the request's tools array as the client sent it (JSON text), for
      * the Qwen output parser's argument typing; owned, NULL = no tools. */
     char *qwen_tools_json;
@@ -664,7 +772,7 @@ typedef enum {
  * ONE state machine (dsml_tool_stream_update / _finalize, genmsg.cpp) drives
  * both OpenAI tool_call deltas and Anthropic tool_use blocks; what differs
  * per protocol -- the call header, the argument-fragment event, the
- * block/stop lifecycle -- is the protocol's ::dsml_tool_stream_ops.  Before
+ * block/stop lifecycle -- is the protocol's ::sink_tool_ops.  Before
  * L184 the machine existed twice, verbatim, and `"stream": true` could
  * return a different tool-call reading than the final parse on one protocol
  * but not the other. */
@@ -683,20 +791,20 @@ struct dsml_tool_stream {
     int ids_cap;                   ///< entries allocated in `ids`
 };
 
-/** A protocol's emitters for the shared projection.  Each returns false on a
- * client write failure, which aborts the update; `ctx` is the protocol's own
- * state (socket, request, stream). */
+typedef struct chat_sink chat_sink;
+/** A protocol's emitters for a family's live tool-call events (L272 P3: generic -- the DSML projection
+ * and the Qwen output parser both drive them).  Each returns false on a client write failure, which
+ * aborts the update. */
 typedef struct {
-    /** Invocation ts->index opens, calling `name`: OpenAI sends the tool_call
-     * start delta (id + name), Anthropic starts the tool_use block.  The
-     * argument object's "{" follows through args_fragment. */
-    bool (*begin_invoke)(void *ctx, dsml_tool_stream *ts, const char *name);
-    /** A fragment of the argument object's JSON text (keys, values, braces). */
-    bool (*args_fragment)(void *ctx, dsml_tool_stream *ts, const char *text, size_t len);
-    /** Invocation ts->index is complete (its "}" went out): Anthropic stops
-     * the content block, OpenAI has nothing to send. */
-    bool (*end_invoke)(void *ctx, dsml_tool_stream *ts);
-} dsml_tool_stream_ops;
+    /** Call `index` opens, named `name`, with the id the client will see: OpenAI sends the tool_call
+     * start delta, Anthropic starts the tool_use block.  The argument object's text follows in `args`. */
+    bool (*begin)(chat_sink *k, int index, const char *id, const char *name);
+    /** A fragment of call `index`'s argument object JSON text (keys, values, braces). */
+    bool (*args)(chat_sink *k, int index, const char *text, size_t len);
+    /** Call `index` is complete (its "}" went out): Anthropic stops the content block, OpenAI has
+     * nothing to send. */
+    bool (*end)(chat_sink *k, int index);
+} sink_tool_ops;
 
 /** L267: where DeepSeek's raw generated text is, for its one stream projection (deepseek_stream.cpp):
  * every protocol's live response is fed by the same walk over <think>, the answer and DSML blocks. */
@@ -722,7 +830,6 @@ typedef struct {
  * the end of a reasoning or answer section, and -- on protocols that stream calls as they decode --
  * DSML tool-call events.  The protocol owns the wire shape; the family owns where the text is.  Built by
  * openai_sink_init / anthropic_sink_init / responses_sink_init. */
-typedef struct chat_sink chat_sink;
 struct chat_sink {
     int fd;
     server *s;
@@ -734,8 +841,8 @@ struct chat_sink {
     bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
     /** The current section ended; `think_closed`: at the model's own </think>. */
     bool (*end)(chat_sink *k, bool think_closed);
-    /** DSML tool-call events (ctx = this sink); NULL: calls go out with the finish. */
-    const dsml_tool_stream_ops *tool_ops;
+    /** Live tool-call events; NULL: calls go out with the finish. */
+    const sink_tool_ops *tool_ops;
     /** Also start streaming a block that first appears in the final flush (else the finish sends it). */
     bool tools_on_final;
 };
@@ -783,6 +890,27 @@ typedef struct {
     bool json_in_string;       ///< inside a JSON string, where markers do not apply
     bool json_escaped;         ///< previous byte was a backslash, so this one is literal
 } dsml_decode_tracker;
+
+/** L272 P3: DeepSeek's output-parser state for one decode attempt (parser_deepseek.cpp). */
+typedef struct {
+    deepseek_stream_walk walk;        ///< the live projection into the sink (walk_on: a streamed chat)
+    bool walk_on;
+    dsml_decode_tracker tracker;      ///< decode-time DSML marker tracking: the greedy region of a call
+    bool saw_tool_start;              ///< a tool-call opening marker has appeared
+    bool saw_tool_end;                ///< a tool-call closing marker has appeared (the turn is complete)
+    /** A closing tool marker arrived with no opening one. Logged once per
+     * request rather than per token -- the flag exists to keep a model that
+     * emits the marker repeatedly from flooding the log. */
+    bool saw_orphan_tool_end;
+    size_t tool_scan_from;            ///< where the tool-marker scan resumes (a marker can straddle a piece)
+    int next_tool_progress;           ///< token count at which to emit the next tool-progress event
+    /** Tool markers inside a reasoning block are NOT tool calls -- the model is
+     * thinking about calling something. True when the request has thinking
+     * enabled, so marker scanning must wait for the block to close. */
+    bool thinking_gates_tool_markers;
+    bool tool_scan_waiting_for_think_close;  ///< a marker was seen inside reasoning; scan resumes after the block
+    size_t think_recovery_scan_from;  ///< where to resume scanning after a malformed reasoning block
+} deepseek_parser;
 
 /** /v1/responses SSE projection for one response.
  *
@@ -1256,7 +1384,7 @@ typedef struct gen_state gen_state;
  * the single shared server.sess, and a slot names which bank of it holds this
  * conversation.
  */
-typedef struct {
+typedef struct session_slot {
     bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
     uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
     int          committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
@@ -2247,7 +2375,10 @@ struct qwen_gen {
     std::vector<qwen_out_event> ev;  ///< scratch, reused per feed
     size_t fed = 0;                  ///< bytes of g->text fed to the parser
     tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
-    ~qwen_gen();                     ///< frees `calls` (server_jobs.cpp)
+    bool finished = false;           ///< the end of the turn was fed (the finish did it)
+    bool stream_ok = true;           ///< no client write failed while projecting
+    std::string last_error;          ///< the last malformed-call report (the retry's detail)
+    ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
 };
 
 /** Everything one in-flight generation needs, for the whole life of the
@@ -2305,12 +2436,11 @@ struct gen_state {
     responses_stream responses_live;   ///< /responses SSE projection state
     bool openai_live_chat;             ///< the OpenAI projection is in chat (not completion) shape
     bool responses_live_chat;          ///< the /responses projection is in chat shape
-    /** L267: the request's protocol sink, which ever family's output drives it (set for a streamed
-     * chat on any protocol: sink.text != NULL), and DeepSeek's walk over its raw text into it. */
+    /** L267: the request's protocol sink, whichever family's output parser drives it (set for a
+     * streamed chat on any protocol: sink.text != NULL). */
     chat_sink sink;
-    deepseek_stream_walk ds_walk;
     long responses_created_at;         ///< `created` timestamp, fixed at first emit so it is stable across quanta
-    bool dsml_recovery_attempted;      ///< a malformed tool block already triggered one recovery; do not loop
+    bool recovery_attempted;           ///< a malformed tool call already triggered the parser's one retry; do not loop
     /** Request-lifetime token count: accumulates across decode attempts (the
      * tool-error recovery continuation) so continued generations spend ONE
      * shared max_tokens budget. */
@@ -2329,14 +2459,6 @@ struct gen_state {
     char *stop_sequence;      ///< the client stop sequence that ended generation, when one did; owned
     int completion;           ///< tokens generated this attempt
     int max_tokens;           ///< cap for this attempt
-    bool saw_tool_start;      ///< a tool-call opening marker has appeared
-    bool saw_tool_end;        ///< a tool-call closing marker has appeared
-    /** A closing tool marker arrived with no opening one. Logged once per
-     * request rather than per token -- the flag exists to keep a model that
-     * emits the marker repeatedly from flooding the log. */
-    bool saw_orphan_tool_end;
-    size_t tool_scan_from;    ///< where the tool-marker scan resumes (same straddling problem as stop_scan_from)
-    int next_tool_progress;   ///< token count at which to emit the next tool-progress event
     int next_decode_log;      ///< token count at which to write the next decode log line
     double decode_t0;         ///< wall time decoding began, for tokens/s
     /* L119: request-scoped DSpark counters, accumulated by the spec-batched
@@ -2352,15 +2474,12 @@ struct gen_state {
     uint64_t req_spec_gen;  ///< tokens emitted by spec rounds, this request
     double last_decode_log_t;          ///< wall time of the last decode log line, for interval rates
     int last_decode_log_completion;    ///< token count at that line, for interval rates
-    thinking_state thinking;           ///< reasoning-block tracking
-    /** Tool markers inside a reasoning block are NOT tool calls -- the model is
-     * thinking about calling something. True when the request has thinking
-     * enabled, so marker scanning must wait for the block to close. */
-    bool thinking_gates_tool_markers;
-    bool tool_scan_waiting_for_think_close;  ///< a marker was seen inside reasoning; scan resumes after the block
-    size_t think_recovery_scan_from;   ///< where to resume scanning after a malformed reasoning block
+    thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
     bool spec_enabled;          ///< speculative decoding is active for this request
-    dsml_decode_tracker dsml_tracker;  ///< decode-time DSML marker tracking
+    /** L272 P3: the family's output parser and its state for this decode attempt (created at decode
+     * init, destroyed with the next attempt or the request). */
+    const server_output_parser_ops *parser;
+    void *parser_st;
 
     /** Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
      * becomes batch_active when it joins the shared multiseq lane; it stays
@@ -2385,10 +2504,6 @@ struct gen_state {
      * conversation).  A prompt that is not an extension of its bank's history is
      * marked no_fuse instead and prefills classically. */
     bool fuse_ready;
-
-    /** L251: the Qwen output state for a request with chat_qwen set, owned
-     * (heap-held: gen_state is a memset C struct); NULL for every other request. */
-    qwen_gen *qwen;
 
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker
@@ -2546,7 +2661,7 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
 /** Per-render state: the mode, the reasoning-replay facts of the message
  * list, and where the turn structure stands. */
 typedef struct {
-    bool v41;                 ///< the loaded model's template family (see request::chat_v41)
+    bool v41;                 ///< the loaded model's template family (request::family->v41)
     const pulsar_dsml_syntax *dsml;  ///< the spelling this family WRITES (a row of the table)
     bool think;               ///< thinking mode enabled: assistant turns carry a think block
     bool tool_context;        ///< tools advertised or used in the history: reasoning replays on every turn
@@ -2633,7 +2748,7 @@ typedef struct {
  * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's
  * renderer (render_chat_conversation) makes the prompt from it.  The protocol-only parts of the request
  * (sampling, stream, stops, the API style, forced_tool_name, ...) are already in the request. */
-typedef struct {
+typedef struct chat_conversation {
     chat_msgs msgs;                 ///< the conversation, system / instructions first when sent
     char *tools_raw;                ///< the tools array as sent; NULL when absent or null
     char *tool_schemas;             ///< the same tools, one function schema a line (parse_tools_value)
@@ -2712,9 +2827,9 @@ const char *find_last_substr(const char *s, const char *needle);
 /* ---- the shared DSML tool-stream projection (genmsg.cpp) ---- */
 bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos);
 void dsml_tool_stream_free(dsml_tool_stream *ts);
-bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                              const char *raw, size_t raw_len);
-bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
                                const char *raw, size_t raw_len);
 /** The call id of invocation `index`, generated on first use in the
  * protocol's id style and deduplicated against this stream's earlier ids and
@@ -2750,7 +2865,8 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s);
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
-void request_forced_tool_seed(const request *r, buf *out);
+/** DeepSeek's call-block finder (kv_cache.cpp): every DSML spelling either template renders. */
+const char *find_next_dsml_tool_block(const char *p, const char **end_out);
 void request_apply_forced_tool_prefill(request *r);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
@@ -2791,11 +2907,10 @@ size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                bool is_string);
 /* L267: the protocol-out SINKS (chat_sink): every family's output parser drives the request's
  * protocol through one.  DeepSeek's walk (deepseek_stream_update) streams its DSML calls as they
- * decode on OpenAI and Anthropic; Qwen's parser hands a call over whole -- on OpenAI it goes out
- * then (openai_sink_tool_call); Anthropic and Responses send the calls the stream has not with the
- * finish.  The finish is the protocol's, after the family's last text. */
+ * decode and Qwen's parser hands a call over whole, both through the sink's generic tool events
+ * (OpenAI and Anthropic stream them; Responses sends the calls with the finish).  The finish is the
+ * protocol's, after the family's last text. */
 void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st);
-bool openai_sink_tool_call(chat_sink *k, int index, const tool_call *tc);
 bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish, int prompt_tokens,
                        int completion_tokens);
 void anthropic_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
@@ -2897,9 +3012,6 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_tokens *out);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
-/* L272 B6: the rendered prefix two UNRELATED prompts share by template construction, in tokens
- * (chat_family.cpp): the slot router's trivial-match header. */
-int chat_family_trivial_header_tokens(pulsar_engine *e);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,

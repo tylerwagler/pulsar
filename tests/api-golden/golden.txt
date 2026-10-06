@@ -957,7 +957,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/plain [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "m"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -979,7 +979,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/turns [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "m"
   model_from_request 1 max_tokens 77
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1003,7 +1003,7 @@
 == chat/developer [chat/qwen] REFUSED
   error: "unexpected_role: Unexpected message role (developer)."
 == chat/parts [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1025,7 +1025,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/empty-content [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1047,7 +1047,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/tools [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1069,7 +1069,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/tools-auto [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1091,7 +1091,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/tools-none [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1112,12 +1112,52 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== chat/tools-required [chat/qwen] REFUSED
-  error: "tool_choice: \"required\" is not served for the Qwen family (its chat template cannot force a call); use \"auto\" or \"none\""
-== chat/tools-named [chat/qwen] REFUSED
-  error: "tool_choice: a named function is not served for the Qwen family (its chat template cannot force a call); use \"auto\" or \"none\""
+== chat/tools-required [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 1 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function="
+  prompt_spans: [290-532 533-726 1580-1596]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tools-named [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 1 summary 0
+  forced_tool_name: "search"
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=search>\n"
+  prompt_spans: [290-532 533-726 1580-1596]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == chat/tools-null [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1139,7 +1179,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/tool-turns [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1161,7 +1201,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/tool-turns-thinking-off [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1183,7 +1223,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/think-false [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1205,7 +1245,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/enable-thinking-false [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1227,7 +1267,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/enable-thinking-true [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1249,7 +1289,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/thinking-disabled [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1271,7 +1311,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/thinking-enabled [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1293,7 +1333,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/thinking-null [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1315,7 +1355,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-low [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1337,7 +1377,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-medium [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1363,7 +1403,7 @@
 == chat/effort-max [chat/qwen] REFUSED
   error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got max"
 == chat/effort-xhigh [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1385,7 +1425,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-none [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1415,7 +1455,7 @@
 == chat/effort-101 [chat/qwen] REFUSED
   error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes a name -- low, medium, xhigh or none"
 == chat/effort-None [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1437,7 +1477,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-and-off [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1459,7 +1499,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/kwargs [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1481,7 +1521,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/kwargs-effort [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1505,7 +1545,7 @@
 == chat/kwargs-unknown [chat/qwen] REFUSED
   error: "chat_template_kwargs.add_vision_id is not a template variable this server renders for the Qwen family (enable_thinking, reasoning_effort)"
 == chat/alias-chat [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-chat"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1527,7 +1567,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/alias-reasoner [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-reasoner"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1549,7 +1589,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/stop [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1571,7 +1611,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/stop-str [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1593,7 +1633,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/sampling [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 99
   sampling t 0.699999988/1 top_p 0.899999976/1 top_k 40/1 min_p 0.0500000007/1 seed 1234
@@ -1615,7 +1655,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/logprobs [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1637,7 +1677,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/logprobs-null [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1663,7 +1703,7 @@
 == chat/top-logprobs-big [chat/qwen] REFUSED
   error: "top_logprobs must be an integer between 0 and 20"
 == chat/stream [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1691,7 +1731,7 @@
 == chat/not-object [chat/qwen] REFUSED
   error: "invalid JSON request"
 == chat/system-late [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -1713,7 +1753,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/extension-keys [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -2919,7 +2959,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/mid-system [chat/qwen] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 1
+  kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -2985,7 +3025,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/plain [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "m"
   model_from_request 1 max_tokens 100
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3007,7 +3047,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/system-str [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3029,7 +3069,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/system-blocks [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3051,7 +3091,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/blocks [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3073,7 +3113,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/tools [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3095,7 +3135,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/tools-turns [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3117,7 +3157,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/tool-result-array [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3135,11 +3175,11 @@
   responses_live_suffix: null
   responses_live_suffix_spans: []
   anthropic live tool 0
-  anthropic_live_call_ids: []
-  anthropic_live_suffix: null
-  anthropic_live_suffix_spans: []
+  anthropic_live_call_ids: ["toolu_1"]
+  anthropic_live_suffix: "<|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  anthropic_live_suffix_spans: [44-47]
 == an/tools-websearch [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3161,7 +3201,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/tools-custom [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3185,7 +3225,7 @@
 == an/tools-unsupported [anthropic/qwen] REFUSED
   error: "tools.2: Input tag 'advisor_20260301' found using 'type' does not match any of the expected tags"
 == an/tool-choice-auto [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3206,10 +3246,30 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== an/tool-choice-any [anthropic/qwen] REFUSED
-  error: "tool_choice: \"any\" is not served for the Qwen family (its chat template cannot force a call); use \"auto\" or \"none\""
+== an/tool-choice-any [anthropic/qwen] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 1 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function="
+  prompt_spans: [290-532 533-726 1580-1596]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == an/tool-choice-none [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3230,10 +3290,30 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== an/tool-choice-tool [anthropic/qwen] REFUSED
-  error: "tool_choice: \"tool\" is not served for the Qwen family (its chat template cannot force a call); use \"auto\" or \"none\""
+== an/tool-choice-tool [anthropic/qwen] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 1 summary 0
+  forced_tool_name: "search"
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=search>\n"
+  prompt_spans: [290-532 533-726 1580-1596]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == an/thinking-enabled [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3255,7 +3335,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/thinking-disabled [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3277,7 +3357,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/thinking-adaptive [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3299,7 +3379,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-low [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3321,7 +3401,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-medium [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3343,7 +3423,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-high [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3365,7 +3445,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-max [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3387,7 +3467,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-xhigh [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3411,7 +3491,7 @@
 == an/output-effort-bogus [anthropic/qwen] REFUSED
   error: "output_config.effort: \"bogus\" has no Qwen3.8-Flash-Next level -- send low, medium, high, xhigh or max"
 == an/output-format [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3433,7 +3513,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/effort-then-output [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3455,7 +3535,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-then-effort [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3477,7 +3557,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/thinking-off-effort [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3499,7 +3579,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/alias-chat [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-chat"
   model_from_request 1 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3521,7 +3601,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/stop [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 0.200000003/1 top_p 1/0 top_k 5/1 min_p 0.0500000007/0 seed 0
@@ -3547,7 +3627,7 @@
 == an/missing-messages [anthropic/qwen] REFUSED
   error: "missing messages"
 == an/prefill [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3569,7 +3649,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/string [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "m"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3591,7 +3671,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/array [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3613,7 +3693,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/instructions [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3635,7 +3715,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/instructions-null [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3657,7 +3737,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/tools [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3679,7 +3759,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/tool-turns [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3701,7 +3781,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/tool-turns-off [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3725,7 +3805,7 @@
 == rs/namespace-tools [responses/qwen] REFUSED
   error: "tools.0: a \"namespace\" tool is not served for the Qwen family (function tools only)"
 == rs/tool-choice-auto [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3747,7 +3827,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/tool-choice-none [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3773,7 +3853,7 @@
 == rs/tool-choice-object [responses/qwen] REFUSED
   error: "forced tool_choice not supported"
 == rs/effort-low [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3795,7 +3875,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/effort-medium [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3819,7 +3899,7 @@
 == rs/effort-high [responses/qwen] REFUSED
   error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got high"
 == rs/effort-xhigh [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3841,7 +3921,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/effort-none [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3869,7 +3949,7 @@
 == rs/summary [responses/qwen] REFUSED
   error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got high"
 == rs/summary-only [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3891,7 +3971,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/reasoning-null [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3913,7 +3993,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/alias-chat [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-chat"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3935,7 +4015,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/prev-null [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3961,7 +4041,7 @@
 == rs/conversation [responses/qwen] REFUSED
   error: "conversation is not supported; replay full input instead"
 == rs/params [responses/qwen] OK
-  kind 0 api 2 chat_v41 1 chat_qwen 1
+  kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 64
   sampling t 0.300000012/1 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -3987,7 +4067,7 @@
 == rs/missing-input [responses/qwen] REFUSED
   error: "missing input"
 == an/mid-system [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
@@ -4009,7 +4089,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/mid-system-lead [anthropic/qwen] OK
-  kind 0 api 1 chat_v41 1 chat_qwen 1
+  kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
   model_from_request 0 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0

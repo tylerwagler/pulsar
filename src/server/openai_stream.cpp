@@ -952,40 +952,26 @@ static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, 
 
 static bool openai_sink_end_cb(chat_sink *, bool) { return true; }
 
-/* A DSML invocation as it decodes: the tool_call start delta (id + name), then
- * its argument object's JSON in fragments. */
-static bool openai_tool_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
-    chat_sink *k = (chat_sink *)vctx;
-    const char *tool_id = dsml_tool_stream_id(k->s, ts, ts->index, API_OPENAI);
+/* A tool call as it decodes (a family's live tool events): the tool_call start delta (id + name),
+ * then its argument object's JSON in fragments. */
+static bool openai_tool_begin(chat_sink *k, int index, const char *id, const char *name) {
     ((openai_stream *)k->st)->tools_streamed++;
-    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, ts->index, tool_id, name);
+    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, index, id, name);
 }
 
-static bool openai_tool_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
-    chat_sink *k = (chat_sink *)vctx;
-    return sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, ts->index, text, len);
+static bool openai_tool_args(chat_sink *k, int index, const char *text, size_t len) {
+    return sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, index, text, len);
 }
 
-static bool openai_tool_end_invoke(void *, dsml_tool_stream *) { return true; }
+static bool openai_tool_end(chat_sink *, int) { return true; }
 
-static const dsml_tool_stream_ops openai_tool_ops = {
-    openai_tool_begin_invoke, openai_tool_args_fragment, openai_tool_end_invoke,
-};
+static const sink_tool_ops openai_tool_ops = {openai_tool_begin, openai_tool_args, openai_tool_end};
 
 void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st) {
     *k = {fd, s, r, id, st, openai_sink_text_cb, openai_sink_end_cb, &openai_tool_ops, true};
 }
 
-/* A call handed over whole (Qwen): the start delta (index, id, name, empty
- * arguments) and one arguments delta carrying the whole JSON object -- the
- * OpenAI streaming shape, so a client that concatenates argument fragments gets
- * the object. */
-bool openai_sink_tool_call(chat_sink *k, int index, const tool_call *tc) {
-    const char *args = tc->arguments ? tc->arguments : "";
-    ((openai_stream *)k->st)->tools_streamed++;
-    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, index, tc->id, tc->name) &&
-           sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, index, args, strlen(args));
-}
+
 
 
 

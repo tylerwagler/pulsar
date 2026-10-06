@@ -72,8 +72,11 @@ bool server::continue_after_invalid_dsml(session_slot *sl,
     auto *s = this;
     chat_text_span *spans = NULL;
     uint32_t n_spans = 0;
-    char *suffix = build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail,
-                                                             &spans, &n_spans);
+    if (!r->family->tool_error_suffix) {
+        snprintf(err, errlen, "%s has no tool-error suffix: no model-visible retry", r->family->name);
+        return false;
+    }
+    char *suffix = r->family->tool_error_suffix(r, thinking, detail, &spans, &n_spans);
     bool ok = s->append_rendered_suffix_to_live_session(sl, suffix,
                                                      spans, n_spans,
                                                      tokens_appended,
@@ -1121,19 +1124,17 @@ void server::gen_stream_begin(session_slot *sl) {
                 return;
             }
         }
-        /* L267: the protocol sink this response streams into; a Qwen turn is
-         * driven by its output parser (qwen_gen_feed), a DeepSeek turn by the
-         * walk over its raw text (gen_emit_token). */
+        /* L267: the protocol sink this response streams into; the family's output
+         * parser drives it (gen_emit_token). */
         if (j->req.api == API_ANTHROPIC)
             anthropic_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->anthropic_live);
         else if (g->openai_live_chat)
             openai_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->openai_live);
         else if (g->responses_live_chat)
             responses_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->responses_live);
-        if (g->sink.text && !j->req.chat_qwen) deepseek_stream_walk_init(&g->ds_walk, &j->req);
     }
 
-    g->dsml_recovery_attempted = false;
+    g->recovery_attempted = false;
     if (j->req.seed) {
         g->rng = j->req.seed;
     } else {
@@ -1164,11 +1165,6 @@ void server::gen_decode_init(session_slot *sl) {
      * generated. */
     g->max_tokens = j->req.max_tokens - g->completion_total;
     int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
-    g->saw_tool_start = false;
-    g->saw_tool_end = false;
-    g->saw_orphan_tool_end = false;
-    g->tool_scan_from = 0;
-    g->next_tool_progress = 128;
     g->next_decode_log = 50;
     if (g->max_tokens < 0) g->max_tokens = 0;
     if (g->max_tokens > room) g->max_tokens = room;
@@ -1185,10 +1181,6 @@ void server::gen_decode_init(session_slot *sl) {
     g->last_decode_log_t = g->decode_t0;
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
-    g->thinking_gates_tool_markers = pulsar_think_mode_enabled(j->req.think_mode);
-    g->tool_scan_waiting_for_think_close =
-        g->thinking_gates_tool_markers && g->thinking.inside;
-    g->think_recovery_scan_from = 0;
     /* A logprobs request decodes WITHOUT speculation.  The fused DSpark step
      * verifies K drafts in one batch and keeps each position's target row only
      * inside that batch; by the time pulsar_session_generate_speculative
@@ -1204,37 +1196,23 @@ void server::gen_decode_init(session_slot *sl) {
     logprob_ledger_reset(&g->logprobs);
     g->logprobs.enabled = j->req.logprobs;
     g->logprobs.top_k = j->req.top_logprobs;
-    dsml_decode_tracker_init(&g->dsml_tracker);
 
-    /* tool_choice="required": the prompt was prefilled into an open DSML
-     * tool_calls block (thinking skipped: prompt ends "</think>\n\n<tool_calls>").
-     * Seed the output with that exact prefix — including the closing </think> so
-     * the (thinking-mode) parser sees reasoning end and a complete tool block —
-     * and prime the trackers to "inside tool call"; the model now generates only
-     * the invoke body. */
-    if (j->req.kind == REQ_CHAT && j->req.force_tool_call) {
-        request_forced_tool_seed(&j->req, &g->text);
-        g->saw_tool_start = true;
-        g->tool_scan_waiting_for_think_close = false;
-        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-        g->tool_scan_from = g->text.len;
-        g->plain_stream_pos = g->text.len;
+    /* L272 P3: the family's output parser for this attempt (a retry attempt starts a fresh one) */
+    g->parser = j->req.family->output;
+    if (g->parser_st) g->parser->destroy(g->parser_st);
+    g->parser_st = g->parser->create(s, g, g->err, sizeof(g->err));
+    if (!g->parser_st) {
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
     }
-    /* L251: ONE Qwen output parser per generation.  Its tools are the ones the
-     * prompt rendered (they type the arguments); it starts in reasoning exactly
-     * when the generation prompt opened "<think>\n".  A Qwen request never
-     * loops back here (no DSML recovery runs for it), so this is the only init. */
-    if (j->req.chat_qwen) {
-        delete g->qwen;
-        g->qwen = new qwen_gen();
-        char perr[200];
-        if (!g->qwen->parser.init(pulsar_think_mode_enabled(j->req.think_mode),
-                                  j->req.qwen_tools_json, perr, sizeof perr)) {
-            g->finish = "error";
-            snprintf(g->err, sizeof(g->err), "qwen output parser: %s", perr);
-            g->phase = GEN_FINISH;
-            return;
-        }
+    /* tool_choice="required": the prompt was prefilled into an open tool-call block (thinking
+     * skipped).  Seed the output with that exact prefix and let the parser read it as emitted; the
+     * model now generates only the call's body. */
+    if (j->req.kind == REQ_CHAT && j->req.force_tool_call && j->req.family->forced_call_seed) {
+        j->req.family->forced_call_seed(&j->req, &g->text);
+        if (g->parser->seed) g->parser->seed(g->parser_st, g);
+        g->plain_stream_pos = g->text.len;
     }
     g->phase = GEN_DECODE;
 }
@@ -1286,67 +1264,7 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
     const request *req = &g->j->req;
     gen_resolve_sampling(req, temperature, top_k, top_p, min_p);
     if (req->kind != REQ_CHAT || !req->has_tools) return;
-    bool in_tool;
-    if (g->qwen) {
-        in_tool = g->qwen->parser.in_tool_call();
-    } else {
-        const dsml_decode_state st = g->dsml_tracker.decode;
-        in_tool = dsml_decode_state_is_tool(st) && !dsml_decode_state_uses_payload_sampling(st);
-    }
-    if (in_tool) *temperature = 0.0f;
-}
-
-
-
-qwen_gen::~qwen_gen() { tool_calls_free(&calls); }
-
-/* L251: feed the Qwen output parser g->text[fed, upto) -- the bytes the
- * stop-string scan has released -- and, when `final`, end the turn; then turn
- * its events into the response.  Reasoning and content go out as deltas when
- * streaming, into the request's protocol sink (L267; the parser keeps both for
- * the final message either way); a completed call is given its id and kept,
- * and on OpenAI streamed whole (Anthropic and Responses send calls with the
- * finish).  A malformed call is the model's output, not a server fault: logged,
- * and dropped by the parser.  false = a client write failed. */
-static bool qwen_gen_feed(server *s, gen_state *g, size_t upto, bool final) {
-    job *j = g->j;
-    qwen_gen *q = g->qwen;
-    q->ev.clear();
-    if (upto > q->fed) {
-        q->parser.feed(g->text.ptr + q->fed, upto - q->fed, &q->ev);
-        q->fed = upto;
-    }
-    if (final) q->parser.finish(&q->ev);
-    const bool stream = j->req.stream;
-    for (const qwen_out_event &e : q->ev) {
-        switch (e.kind) {
-        case qwen_out_event::REASONING:
-        case qwen_out_event::CONTENT:
-            if (stream && g->sink.text &&
-                !g->sink.text(&g->sink, e.kind == qwen_out_event::REASONING, e.text.data(), e.text.size(), q->fed))
-                return false;
-            break;
-        case qwen_out_event::TOOL_BEGIN:
-            break;   /* a call goes out whole, at TOOL_END (see qwen_gen) */
-        case qwen_out_event::TOOL_END: {
-            tool_call tc = {0};
-            tc.name = xstrdup(e.name.c_str());
-            tc.arguments = xstrdup(e.arguments.c_str());
-            tool_calls_push(&q->calls, tc);
-            s->assign_tool_call_ids(&q->calls, j->req.api);
-            if (stream && g->openai_live_chat &&
-                !openai_sink_tool_call(&g->sink, q->calls.len - 1, &q->calls.v[q->calls.len - 1]))
-                return false;
-            break;
-        }
-        case qwen_out_event::ERROR:
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s qwen output: %s",
-                       g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, e.text.c_str());
-            s->trace_event(g->trace_id, "qwen output: %s", e.text.c_str());
-            break;
-        }
-    }
-    return true;
+    if (g->parser_st && g->parser->in_tool_call(g->parser_st, g)) *temperature = 0.0f;
 }
 
 
@@ -1407,9 +1325,6 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         const size_t close_base = g->text.len - piece_len;
         if (g->stop_scan_from < close_base) g->stop_scan_from = close_base;
     }
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen) {
-        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-    }
 
     size_t stop_pos = 0, stop_len = 0;
     bool hit_stop = !g->thinking.inside &&
@@ -1438,16 +1353,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         }
         g->plain_stream_pos = stream_len;
     }
-    if (g->qwen && !qwen_gen_feed(s, g, stream_len, false)) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
-        return true;
-    }
-    /* DeepSeek's one walk over its raw text (L267); a Qwen turn is projected by
-     * its output parser (qwen_gen_feed above) */
-    if (g->sink.text && !j->req.chat_qwen &&
-        !deepseek_stream_update(&g->ds_walk, &g->sink, g->text.ptr, stream_len, false)) {
+    /* the family's output parser: its decode-time tracking, and the released bytes into the sink */
+    if (!g->parser->feed(g->parser_st, s, g, stream_len, false)) {
         g->finish = "error";
         snprintf(g->err, sizeof(g->err), "client stream write failed");
         free(piece);
@@ -1455,84 +1362,15 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
     free(piece);
 
-    /* DeepSeek DSML markers only: a Qwen turn's tool calls are read by its
-     * output parser, and it ends at the family's stop token, so saw_tool_* stay
-     * false for it and the tool_calls stop below never fires. */
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen) {
-        if (g->thinking_gates_tool_markers && g->thinking.inside) {
-            /* A DSML block inside reasoning is not executable, and an opening
-             * marker alone can be quoted protocol text. A COMPLETE block is
-             * unambiguous enough to recover: stop with finish=tool_calls and
-             * let the parse-side recovery return the call structurally
-             * (upstream ds4 51a1c14). */
-            if (complete_tool_call_inside_thinking(
-                    g->text.ptr, g->text.len, &g->think_recovery_scan_from)) {
-                g->saw_tool_start = true;
-                g->saw_tool_end = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s recovered a complete tool call "
-                           "from unclosed reasoning after %d generated tokens",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           g->completion);
-                s->trace_event(g->trace_id,
-                            "recovered complete tool call from unclosed reasoning after %d generated tokens",
-                            g->completion);
-            } else {
-                g->tool_scan_waiting_for_think_close = true;
-                g->tool_scan_from = g->text.len;
-            }
-        } else {
-            if (g->tool_scan_waiting_for_think_close) {
-                const char *think_end = find_last_substr(g->text.ptr, "</think>");
-                g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
-                if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                g->tool_scan_waiting_for_think_close = false;
-            }
-            if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-            const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
-            bool orphan_end = false;
-            bool old_start = g->saw_tool_start;
-            bool old_end = g->saw_tool_end;
-            observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
-            if (orphan_end && !g->saw_orphan_tool_end) {
-                g->saw_orphan_tool_end = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           g->completion);
-                s->trace_event(g->trace_id,
-                            "ignored orphan tool-call end marker after %d generated tokens",
-                            g->completion);
-            }
-            if (g->saw_tool_start && !old_start) {
-                s->trace_event(g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
-            }
-            if (g->saw_tool_end && !old_end) {
-                s->trace_event(g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
-            }
-            const size_t marker_hold = 80;
-            size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
-            if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
-            if (s->trace && g->completion >= g->next_tool_progress) {
-                s->trace_event(g->trace_id,
-                            "progress gen=%d dsml_start=%d dsml_end=%d",
-                            g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
-                g->next_tool_progress += 128;
-            }
-        }
-    }
-
     if (g->completion >= g->next_decode_log) {
+        bool tool_open = false, tool_closed = false;
+        if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
         log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
                             g->responses_protocol,
                             j->req.has_tools,
                             g->thinking.inside,
-                            g->saw_tool_start,
-                            g->saw_tool_end,
+                            tool_open,
+                            tool_closed,
                             g->decode_t0,
                             &g->last_decode_log_t,
                             &g->last_decode_log_completion);
@@ -1549,7 +1387,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         return true;
     }
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
+    /* the family's turn ends before the stop token (DeepSeek: a closed DSML block) */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->parser->turn_complete(g->parser_st, g)) {
         g->finish = "tool_calls";
         return true;
     }
@@ -1584,99 +1423,33 @@ void server::gen_step_finish(session_slot *sl) {
         snprintf(g->err, sizeof(g->err), "shutdown requested");
     }
 
-    /* L077 (tool-call truncation): when the tag repair below completes a
-     * LENGTH-CAPPED call, the emitted arguments are well-formed JSON with a
-     * silently cut-off value -- the finish reason is the client's ONLY signal
-     * that the turn was cut (openai_stream.cpp's finalize comment already
-     * states this contract; the unconditional "tool_calls" relabel broke it). */
-    bool truncated_tool_repair = false;
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && !j->req.chat_qwen &&
-        g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
-    {
-        /* Deterministically complete a simple truncation.  Anything more than
-         * missing closing tags stays model-owned: for non-streaming requests,
-         * append a tool error plus prompt reminder to the live session and let
-         * the model issue a fresh call. */
-        bool completed_truncation = false;
-        buf repaired = {0};
-        if (try_repair_dsml(g->text.ptr, g->text.len, &repaired)) {
-            /* Parse repaired text to verify it produces valid tool calls */
-            tool_calls test_calls = {0};
-            char *test_content = NULL;
-            char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
-            free(test_content);
-            free(test_reasoning);
-            if (repair_ok && test_calls.len > 0) {
-                /* Repair succeeded - replace text with repaired version */
-                free(g->text.ptr);
-                g->text.ptr = buf_take(&repaired);
-                g->text.len = strlen(g->text.ptr);
-                g->text.cap = g->text.len ? g->text.len + 1 : 0;
-                g->saw_tool_end = true;
-                completed_truncation = true;
-                if (strcmp(g->finish, "length") == 0) truncated_tool_repair = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           test_calls.len);
-                s->trace_event(g->trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
-            }
-            tool_calls_free(&test_calls);
-        }
-        if (!completed_truncation) {
-            if (!j->req.stream && !g->dsml_recovery_attempted) {
-                int recovery_tokens = 0;
-                char recovery_err[160] = {0};
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags);
-                s->trace_event(g->trace_id,
-                            "unterminated tool call; continuing with model-visible tool error");
-                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
-                                                "unterminated tool call",
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
-                {
-                    g->dsml_recovery_attempted = true;
-                    server_log(PULSAR_LOG_GENERATION,
-                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               g->ctx_span,
-                               g->req_flags[0] ? " " : "",
-                               g->req_flags,
-                               recovery_tokens);
-                    s->trace_event(g->trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    buf_free(&repaired);
-                    g->completion_total += g->completion;
-                    buf_free(&g->text);
-                    g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
-                    return;
-                }
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
-            } else {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "unterminated tool call");
-            }
-        }
-        buf_free(&repaired);
+    /* L272 P3: the family's final reading of the turn -- its repair of a truncated call, its parse,
+     * its model-visible retry (the generation loops to a fresh attempt), the stream's ids onto the
+     * calls, its memory, the finish label. */
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    const bool stream_ok = g->parser->finish(g->parser_st, s, sl, g, &turn);
+    if (turn.retry) {
+        g->recovery_attempted = true;
+        g->completion_total += g->completion;
+        buf_free(&g->text);
+        free(turn.content);
+        free(turn.reasoning);
+        tool_calls_free(&turn.calls);
+        g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
+        return;
     }
 
     if (g->completion > g->last_decode_log_completion) {
+        bool tool_open = false, tool_closed = false;
+        if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
         log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
                             g->responses_protocol,
                             j->req.has_tools,
                             g->thinking.inside,
-                            g->saw_tool_start,
-                            g->saw_tool_end,
+                            tool_open,
+                            tool_closed,
                             g->decode_t0,
                             &g->last_decode_log_t,
                             &g->last_decode_log_completion);
@@ -1688,146 +1461,11 @@ void server::gen_step_finish(session_slot *sl) {
         free(tail);
     }
 
-    tool_calls parsed_calls = {0};
-    char *parsed_content = NULL;
-    char *parsed_reasoning = NULL;
-    const char *final_finish = g->finish;
-    bool recovered_tool_parse_failure = false;
-    bool qwen_stream_ok = true;
-    if (j->req.chat_qwen) {
-        /* L251: the rest of the text (a stop string's held tail never reaches
-         * it: g->text was cut at the match) and the end of the turn.  The parser
-         * already holds reasoning, content and the completed calls in the
-         * template's normal form; a malformed call was logged and dropped.  No
-         * parser exists when the request failed before decoding (a bank restore
-         * refused during prefill): that finish is an error with nothing to read. */
-        if (g->qwen) {
-            if (strcmp(g->finish, "error") != 0)
-                qwen_stream_ok = qwen_gen_feed(s, g, g->text.len, true);
-            parsed_content = xstrdup(g->qwen->parser.content().c_str());
-            parsed_reasoning = g->qwen->parser.reasoning().empty()
-                                   ? NULL : xstrdup(g->qwen->parser.reasoning().c_str());
-            parsed_calls = g->qwen->calls;
-            memset(&g->qwen->calls, 0, sizeof(g->qwen->calls));
-        }
-        if (parsed_calls.len && strcmp(final_finish, "error") != 0) final_finish = "tool_calls";
-    } else if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message_for_response(
-            g->text.ptr ? g->text.ptr : "",
-            j->req.has_tools,
-            g->saw_tool_start,
-            pulsar_think_mode_enabled(j->req.think_mode),
-            &final_finish,
-            g->err,
-            sizeof(g->err),
-            &parsed_content,
-            &parsed_reasoning,
-            &parsed_calls,
-            &recovered_tool_parse_failure);
-        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && g->saw_tool_start) {
-            /* parse_generated_message failed even though DSML was present.
-             * Semantic repair is intentionally avoided: if the parser cannot
-             * execute the block, feed the model a tool error and the protocol
-             * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !g->dsml_recovery_attempted) {
-                int recovery_tokens = 0;
-                char recovery_err[160] = {0};
-                const char *detail = g->err[0] ? g->err : "invalid tool call";
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags);
-                s->trace_event(g->trace_id,
-                            "invalid tool call; continuing with model-visible tool error");
-                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
-                                                detail,
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
-                {
-                    g->dsml_recovery_attempted = true;
-                    server_log(PULSAR_LOG_GENERATION,
-                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               g->ctx_span,
-                               g->req_flags[0] ? " " : "",
-                               g->req_flags,
-                               recovery_tokens);
-                    s->trace_event(g->trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    free(parsed_content);
-                    free(parsed_reasoning);
-                    tool_calls_free(&parsed_calls);
-                    g->completion_total += g->completion;
-                    buf_free(&g->text);
-                    g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
-                    return;
-                }
-                final_finish = "error";
-                snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
-            }
-            if (!parsed_ok) {
-                /* Print raw DSML snippet for debugging */
-                size_t dsml_snippet_len = 0;
-                const char *dsml_start = NULL;
-                const char *p;
-                /* g->text.len - 20 underflows (size_t) when the text is under
-                 * 20 bytes -- a bare 19-byte short tool-call marker with no
-                 * body reaches here -- making the bound ~2^64 and walking the
-                 * strncmp off the heap buffer. Scan every valid start offset
-                 * instead; g->text is a NUL-terminated buf, so each strncmp is
-                 * self-bounded at the terminator. */
-                for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len; p++) {
-                    if ((strncmp(p, PULSAR_TOOL_CALLS_START, strlen(PULSAR_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, PULSAR_TOOL_CALLS_START_SHORT, strlen(PULSAR_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0)) {
-                        dsml_start = p;
-                        break;
-                    }
-                }
-                if (dsml_start) {
-                    dsml_snippet_len = g->text.len - (dsml_start - g->text.ptr);
-                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
-                }
-                /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = g->text.len > 300 ? 300 : g->text.len;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           final_finish,
-                           g->text.len,
-                           g->saw_tool_start,
-                           g->saw_tool_end,
-                           (int)text_snippet_len,
-                           g->text.ptr ? g->text.ptr : "(null)");
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           (int)dsml_snippet_len,
-                           dsml_start ? dsml_start : "(none)");
-                s->trace_event(g->trace_id,
-                            "invalid tool call returned as assistant text finish=%s",
-                            final_finish);
-            }
-        }
-        if (parsed_calls.len) {
-            if (g->sink.text) apply_stream_tool_ids(&parsed_calls, &g->ds_walk.tool);
-            s->assign_tool_call_ids(&parsed_calls, j->req.api);
-            s->tool_memory_remember(&parsed_calls);
-            /* L077: a length-capped, tag-repaired call reports "length" -- the
-             * repaired calls are still emitted (replayed transcripts stay
-             * parseable), but the label must not claim a complete call. */
-            final_finish = truncated_tool_repair ? "length" : "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
-            s->responses_live_clear(sl);
-        }
-    }
+    tool_calls parsed_calls = turn.calls;
+    char *parsed_content = turn.content;
+    char *parsed_reasoning = turn.reasoning;
+    const char *final_finish = !strcmp(g->finish, "error") ? g->finish : turn.finish;
+    if (j->req.kind == REQ_CHAT && !parsed_calls.len && j->req.api == API_RESPONSES) s->responses_live_clear(sl);
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
                            g->responses_protocol);
 
@@ -1858,15 +1496,17 @@ void server::gen_step_finish(session_slot *sl) {
         s->observe_request_timings(t, finish_t - g->t0);
     }
 
+    bool tool_open = false, tool_closed = false;
+    if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
     s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,
-                 g->saw_tool_start, g->saw_tool_end,
+                 tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
 
     if (j->req.api == API_RESPONSES) {
-        /* L267: the visible suffix is DeepSeek's render, and the Qwen family keeps
-         * no live tool state (its renderer refuses a request that needs it) */
-        if (!j->req.chat_qwen && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        /* the visible suffix is the family's sampled-turn render; a family without one keeps no
+         * visible memory (its renderer refuses a request that needs the live state) */
+        if (j->req.family->assistant_turn_sampled && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -1888,9 +1528,9 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        /* a Qwen turn keeps no live tool state (qwen_render refuses a continuation
-         * that would need it), so nothing is remembered for one (L272 B14) */
-        if (parsed_calls.len && !j->req.chat_qwen && strcmp(final_finish, "error") &&
+        /* a family without a tool-result tail keeps no live tool state (its renderer refuses a
+         * continuation that would need it), so nothing is remembered for it */
+        if (parsed_calls.len && j->req.family->tool_result_tail && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);
@@ -1899,12 +1539,9 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
 
-    if (j->req.chat_qwen) {
-        /* L251: the canonical rewrite below is built by a DeepSeek suffix
-         * builder (append_assistant_turn_sampled / _close); a Qwen turn has no
-         * Qwen form of it, so the next request resolves by exact token /
-         * rendered-text prefix only (L264 retired the binding there was to
-         * clear). */
+    if (!j->req.family->assistant_turn_sampled) {
+        /* the family has no sampled-turn render, so no canonical rewrite: the next request resolves
+         * by exact token / rendered-text prefix only (L264 retired the binding there was to clear) */
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         pulsar_think_mode_enabled(j->req.think_mode) &&
@@ -1954,19 +1591,14 @@ void server::gen_step_finish(session_slot *sl) {
              * flushes what it held back; a Qwen turn's parser already did -- then
              * the protocol's finish, which sends any calls not yet streamed. */
             const int completion = g->completion_total + g->completion;
-            const char *raw = g->text.ptr ? g->text.ptr : "";
-            response_ok = j->req.chat_qwen ? qwen_stream_ok
-                                           : deepseek_stream_update(&g->ds_walk, &g->sink, raw, g->text.len, true);
+            response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, g->text.len, true);
             if (response_ok && j->req.api == API_ANTHROPIC) {
                 response_ok = anthropic_sse_finish(&g->sink, &parsed_calls, final_finish, g->stop_sequence, completion);
             } else if (response_ok && j->req.api == API_RESPONSES) {
-                /* A malformed tool call the final parse turned back into text:
-                 * the walk stopped at its marker, so the rest goes out now. */
-                const bool recover = recovered_tool_parse_failure && !j->req.chat_qwen &&
-                                     g->ds_walk.emit_pos < g->text.len;
+                /* A malformed tool call the final reading turned back into text:
+                 * the stream stopped at its marker, so the rest goes out now. */
                 response_ok = responses_sse_finish(j->fd, &j->req, &g->responses_live,
-                                                   recover ? raw + g->ds_walk.emit_pos : NULL,
-                                                   recover ? g->text.len - g->ds_walk.emit_pos : 0, &parsed_calls,
+                                                   turn.tail, turn.tail_len, &parsed_calls,
                                                    final_finish, g->prompt_tokens, completion,
                                                    g->responses_created_at);
             } else if (response_ok) {
@@ -2014,8 +1646,8 @@ void server::gen_step_finish(session_slot *sl) {
                   g->responses_protocol,
                   true,
                   g->thinking.inside,
-                  g->saw_tool_start,
-                  g->saw_tool_end);
+                  tool_open,
+                  tool_closed);
         if (!strcmp(final_finish, "error") && g->err[0]) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
@@ -2086,9 +1718,8 @@ void server::gen_state_free(session_slot *sl) {
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    deepseek_stream_walk_free(&g->ds_walk);
+    if (g->parser_st) g->parser->destroy(g->parser_st);
     responses_stream_free(&g->responses_live);
-    delete g->qwen;
     buf_free(&g->text);
     logprob_ledger_free(&g->logprobs);
     pulsar_tokens_free(&g->effective_prompt);

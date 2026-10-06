@@ -1451,11 +1451,12 @@ static bool parse_prompt(const char **p, char **out) {
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
-    r->chat_v41 = pulsar_engine_chat_v41(e);
+    r->family = server_family_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    char why[160];
     int skr = 0;
     /* The default effort is the loaded family's: V4.1 defaults to high (the
      * reference's default); the V4 (0731) encoder's default is low, which
@@ -1589,15 +1590,15 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    if (!r->chat_v41 && thinking_enabled && !pulsar_think_effort_v4_valid(reasoning_effort)) {
-        if (err && errlen) snprintf(err, errlen, "reasoning_effort: the V4 (0731) encoder has three levels -- low, high, max");
+    if (thinking_enabled && !pulsar_engine_think_mode_supported(e, reasoning_effort, why, sizeof why)) {
+        if (err && errlen) snprintf(err, errlen, "reasoning_effort: %s", why);
         goto bad;
     }
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     free(r->prompt_spans);
     r->prompt_spans = NULL;
     r->prompt_n_spans = 0;
-    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode, r->chat_v41,
+    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode, r->family->v41,
                                                          &r->prompt_spans, &r->prompt_n_spans);
     pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
                                         r->prompt_n_spans, &r->prompt);

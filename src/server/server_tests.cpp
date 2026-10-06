@@ -1811,7 +1811,12 @@ static void test_decode_sampling_tool_payload_forcing(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.j = &j;
-    dsml_decode_tracker_init(&g.dsml_tracker);
+    /* L272 P3: the decode-time region is the family's output parser's (DeepSeek's tracker here) */
+    deepseek_parser ps;
+    memset(&ps, 0, sizeof ps);
+    dsml_decode_tracker_init(&ps.tracker);
+    g.parser = j.req.family->output;
+    g.parser_st = &ps;
     static const struct { dsml_decode_state st; bool tools; float want; } cases[] = {
         {DSML_DECODE_OUTSIDE,         true,  0.8f},
         {DSML_DECODE_STRUCTURAL,      true,  0.0f},
@@ -1822,7 +1827,7 @@ static void test_decode_sampling_tool_payload_forcing(void) {
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         j.req.has_tools = cases[i].tools;
-        g.dsml_tracker.decode = cases[i].st;
+        ps.tracker.decode = cases[i].st;
         float temperature = -1.0f, top_p = -1.0f, min_p = -1.0f;
         int top_k = -1;
         gen_resolve_sampling_decode(&g, &temperature, &top_k, &top_p, &min_p);
@@ -2643,6 +2648,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
 
 static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     request r = {};
+    r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);   /* a request always names its family (L272 P3) */
     r.think_mode = PULSAR_THINK_HIGH;
     r.prompt_text = xstrdup(
         "<｜begin▁of▁sentence｜>"
@@ -3069,6 +3075,256 @@ static void test_anthropic_tool_result_id_validation(void) {
     chat_msgs_free(&msgs);
     live_tool_state_free(&s.slots[0].anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
+}
+
+
+
+/* ---- L272 P3 step 4b: Qwen's suffix hooks ------------------------------------------------------ */
+
+static chat_msg qwen_test_msg(const char *role, const char *content) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    if (content) m.content = xstrdup(content);
+    return m;
+}
+
+static void qwen_test_call(chat_msg *m, const char *id, const char *name, const char *args) {
+    tool_call tc = {0};
+    tc.id = xstrdup(id);
+    tc.name = xstrdup(name);
+    tc.arguments = xstrdup(args);
+    tool_calls_push(&m->calls, tc);
+}
+
+/* Render `msgs` with the Qwen family and no engine (the text is the whole contract); `thinking_off`
+ * sends enable_thinking=false.  The messages are TAKEN. */
+static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off) {
+    chat_conversation c = {};
+    c.msgs = *msgs;
+    memset(msgs, 0, sizeof(*msgs));
+    c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
+    if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    char err[200] = {0};
+    const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "qwen render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    char *text = xstrdup(r.prompt_text);
+    request_free(&r);
+    chat_conversation_free(&c);
+    return text;
+}
+
+/* full(history) + assistant_turn_sampled + tool_result_tail == full(history + turn + results): the
+ * three hooks are the one renderer's writer, and this is the identity the live KV depends on. */
+static void test_qwen_hooks_compose_to_the_full_render(void) {
+    for (int off = 0; off < 2; off++) {
+        const bool thinking_off = off == 1;
+        const char *reasoning = thinking_off ? NULL : "  Let me check both.\n";
+        chat_msgs prefix = {0};
+        chat_msgs_push(&prefix, qwen_test_msg("system", "Be terse."));
+        chat_msgs_push(&prefix, qwen_test_msg("user", "Weather in Paris and Rome?"));
+        chat_msgs full = {0};
+        chat_msgs_push(&full, qwen_test_msg("system", "Be terse."));
+        chat_msgs_push(&full, qwen_test_msg("user", "Weather in Paris and Rome?"));
+        chat_msg a = qwen_test_msg("assistant", "Checking.\n");
+        if (reasoning) a.reasoning = xstrdup(reasoning);
+        qwen_test_call(&a, "call_1", "get_weather", "{\"city\":\"Paris\",\"n\":2}");
+        qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
+        chat_msgs_push(&full, a);
+        chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
+        full.v[2].tool_call_id = xstrdup("call_1");
+        chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
+        full.v[3].tool_call_id = xstrdup("call_2");
+        /* a mid-loop system message renders as a user system-reminder in both */
+        chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));
+
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.family = server_family_for_format(PULSAR_CHAT_QWEN);
+        r.family_effort = thinking_off ? QWEN_EFFORT_NONE : QWEN_EFFORT_XHIGH;
+        r.think_mode = thinking_off ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT;
+        chat_text_span *turn_spans = NULL, *tail_spans = NULL;
+        uint32_t turn_n = 0, tail_n = 0;
+        char *turn = r.family->assistant_turn_sampled(&r, !thinking_off, reasoning, "Checking.\n", &full.v[2].calls,
+                                                      &turn_spans, &turn_n);
+        char *tail = r.family->tool_result_tail(&r, &full, 3, &tail_spans, &tail_n);
+        TEST_ASSERT(turn && tail);
+        /* the turn ends where the model stopped: at the last call, before the stop token; the tail
+         * supplies the close */
+        TEST_ASSERT(strlen(turn) > 12 && !strcmp(turn + strlen(turn) - 12, "</tool_call>"));
+        const char *want_tail = "<|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n22C\n"
+                                "</tool_response><|im_end|>\n<|im_start|>user\n<system-reminder>\nHurry.\n</system-reminder>"
+                                "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        TEST_ASSERT(!strncmp(tail, want_tail, strlen(want_tail)));
+        TEST_ASSERT(!strcmp(tail + strlen(want_tail), thinking_off ? "\n</think>\n\n" : ""));
+        const char *want_turn = "Let me check both.\n</think>\n\nChecking.\n\n<tool_call>\n";
+        if (thinking_off) TEST_ASSERT(strstr(turn, "</think>") == NULL && !strncmp(turn, "Checking.\n\n<tool_call>\n", 23));
+        else TEST_ASSERT(!strncmp(turn, want_turn, strlen(want_turn)));
+        /* the call bodies are client data in the turn, the results in the tail */
+        TEST_ASSERT(turn_n >= 4 && tail_n == 3);
+
+        char *full_text = qwen_test_full_render(&full, thinking_off);
+        char *prefix_text = qwen_test_full_render(&prefix, thinking_off);
+        buf composed = {0};
+        buf_puts(&composed, prefix_text);
+        buf_puts(&composed, turn);
+        buf_puts(&composed, tail);
+        TEST_ASSERT(!strcmp(composed.ptr, full_text));
+
+        /* a stop turn (no calls) closes itself, and reasoning replayed as NULL renders the empty block */
+        tool_calls none = {0};
+        char *stop = r.family->assistant_turn_sampled(&r, !thinking_off, NULL, " Done. ", &none, NULL, NULL);
+        TEST_ASSERT(stop && !strcmp(stop, thinking_off ? "Done.<|im_end|>\n" : "\n</think>\n\nDone.<|im_end|>\n"));
+        /* a thinking-off turn cannot carry reasoning */
+        if (thinking_off) TEST_ASSERT(r.family->assistant_turn_sampled(&r, false, "thought", "x", &none, NULL, NULL) == NULL);
+
+        free(stop);
+        buf_free(&composed);
+        free(full_text);
+        free(prefix_text);
+        free(turn);
+        free(tail);
+        free(turn_spans);
+        free(tail_spans);
+        request_free(&r);
+    }
+}
+
+/* Tool memory on Qwen: the parser records the turn's calls as sampled (whitespace and spelling the
+ * template would normalise), the renderer replays them verbatim, and the block finder keys the run. */
+static void test_qwen_raw_calls_replay_verbatim(void) {
+    const char *sampled =   /* the template's spelling of the turn, as the model learnt it */
+        "I will.\n</think>\n\nOn it.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=cmd>\nls   -la\n</parameter>\n<parameter=cmd>\npwd\n</parameter>\n"
+        "</function>\n</tool_call>\n\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=n>\n007\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\nbroken\n</tool_call>";
+    qwen_output_parser p;
+    char err[100];
+    TEST_ASSERT(p.init(true, NULL, err, sizeof err));
+    std::vector<qwen_out_event> ev;
+    for (size_t i = 0; sampled[i]; i++) p.feed(sampled + i, 1, &ev);   /* one byte at a time */
+    p.finish(&ev);
+    TEST_ASSERT(p.calls().size() == 2 && p.errors() == 1);
+    TEST_ASSERT(p.calls()[0].arguments == "{\"cmd\": \"pwd\"}");   /* the normal form: last value wins */
+    TEST_ASSERT(p.calls()[1].arguments == "{\"n\": \"007\"}");     /* not tojson's spelling: a string */
+    size_t lo = 0, hi = 0;
+    TEST_ASSERT(p.raw_span(&lo, &hi));
+    const char *first = strstr(sampled, "<tool_call>");
+    TEST_ASSERT(lo == (size_t)(first - sampled) && hi == strlen(sampled));   /* the broken block included */
+
+    /* the finder sees one run for the three blocks, and nothing after it */
+    const char *end = NULL;
+    const server_family_ops *qwen = server_family_for_format(PULSAR_CHAT_QWEN);
+    TEST_ASSERT(qwen->find_call_block(sampled, &end) == first && end == sampled + hi);
+    TEST_ASSERT(qwen->find_call_block(end, &end) == NULL);
+    TEST_ASSERT(qwen->find_call_block("x<tool_call>\n<function=a>", &end) == NULL);   /* unclosed: no key */
+
+    /* a replay with the raw bytes renders them where the calls go, verbatim */
+    char *raw = xstrndup(sampled + lo, hi - lo);
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_msg("user", "List."));
+    chat_msg a = qwen_test_msg("assistant", "On it.");
+    a.reasoning = xstrdup("I will.");
+    qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"pwd\"}");
+    qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
+    a.calls.raw_dsml = xstrdup(raw);
+    chat_msgs_push(&msgs, a);
+    chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
+    char *text = qwen_test_full_render(&msgs, false);
+    buf expect = {0};
+    buf_puts(&expect, "<|im_start|>assistant\n<think>\nI will.\n</think>\n\nOn it.\n\n");
+    buf_puts(&expect, raw);
+    buf_puts(&expect, "<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n");
+    TEST_ASSERT(strstr(text, expect.ptr) != NULL);
+    /* and the sampled turn with those bytes is prefix-exact with the KV that produced them */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.family = qwen;
+    r.family_effort = QWEN_EFFORT_XHIGH;
+    chat_msg k = qwen_test_msg("assistant", NULL);
+    qwen_test_call(&k, "call_1", "bash", "{\"cmd\":\"pwd\"}");
+    qwen_test_call(&k, "call_2", "bash", "{\"n\":\"007\"}");
+    k.calls.raw_dsml = xstrdup(raw);
+    char *turn = r.family->assistant_turn_sampled(&r, true, "I will.", "On it.", &k.calls, NULL, NULL);
+    TEST_ASSERT(turn && !strcmp(turn, sampled));
+    free(turn);
+    chat_msg_free(&k);
+    request_free(&r);
+    buf_free(&expect);
+    free(text);
+    free(raw);
+}
+
+static void test_qwen_forced_call_prefill_and_seed(void) {
+    for (int off = 0; off < 2; off++) {
+        const bool thinking_off = off == 1;
+        chat_conversation c = {};
+        chat_msgs_push(&c.msgs, qwen_test_msg("user", "Search for pulsars."));
+        c.tools_raw = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                              "\"properties\":{\"q\":{\"type\":\"string\"}}}}}]");
+        c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
+        if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.forced_tool_name = xstrdup("search");
+        char err[200] = {0};
+        TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err));
+        TEST_ASSERT(r.force_tool_call && r.has_tools);
+        /* the prompt ends in the template's empty think block and an open named call -- what the
+         * template renders for a turn with no reasoning, no content and that call */
+        const char *want = "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=search>\n";
+        const size_t plen = strlen(r.prompt_text);
+        TEST_ASSERT(plen > strlen(want) && !strcmp(r.prompt_text + plen - strlen(want), want));
+        /* the output seed is the part the model's prompt did not already have */
+        buf seed = {0};
+        r.family->forced_call_seed(&r, &seed);
+        TEST_ASSERT(!strcmp(seed.ptr, thinking_off ? "<tool_call>\n<function=search>\n"
+                                                   : "\n</think>\n\n<tool_call>\n<function=search>\n"));
+        /* the parser reads the seed as an open call, then the model's body as its arguments */
+        qwen_output_parser p;
+        TEST_ASSERT(p.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
+        std::vector<qwen_out_event> ev;
+        p.feed(seed.ptr, seed.len, &ev);
+        TEST_ASSERT(p.in_tool_call() && p.calls().empty());
+        const char *body = "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>";
+        p.feed(body, strlen(body), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.calls().size() == 1 && p.calls()[0].name == "search" && p.calls()[0].arguments == "{\"q\": \"pulsars\"}");
+        TEST_ASSERT(p.reasoning().empty() && p.content().empty() && p.errors() == 0);
+        buf_free(&seed);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+}
+
+static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.family = server_family_for_format(PULSAR_CHAT_QWEN);
+    r.family_effort = QWEN_EFFORT_XHIGH;
+    r.prompt_text = xstrdup("<|im_start|>system\nRules here.  \n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+                            "<|im_start|>assistant\n<think>\n");
+    thinking_state st = {.inside = true};
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    char *suffix = r.family->tool_error_suffix(&r, &st, "malformed tool call 0: expected <function= at byte 1 of the block",
+                                               &spans, &n_spans);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(!strncmp(suffix, "<|im_end|>\n<|im_start|>user\n<tool_response>\nTool error: malformed tool call: malformed tool call 0",
+                         strlen("<|im_end|>\n<|im_start|>user\n<tool_response>\nTool error: malformed tool call: malformed tool call 0")));
+    TEST_ASSERT(strstr(suffix, "was not executed because its <tool_call> block was malformed") != NULL);
+    TEST_ASSERT(strstr(suffix, "System prompt reminder:\nRules here.\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n") != NULL);
+    TEST_ASSERT(strstr(suffix, "Hi") == NULL);
+    TEST_ASSERT(n_spans == 1);   /* the error text is the tool body: client data */
+    free(suffix);
+    free(spans);
+    request_free(&r);
 }
 
 
@@ -6506,29 +6762,33 @@ typedef struct {
     int ends;
 } capture_tool_ctx;
 
-static bool capture_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
-    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
-    (void)ts;
+static bool capture_begin(chat_sink *k, int, const char *, const char *name) {
+    capture_tool_ctx *c = (capture_tool_ctx *)k->st;
     buf_printf(&c->events, "B%s;", name);
     c->begins++;
     return true;
 }
-static bool capture_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
-    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
-    (void)ts;
+static bool capture_args(chat_sink *k, int, const char *text, size_t len) {
+    capture_tool_ctx *c = (capture_tool_ctx *)k->st;
     buf_append(&c->args, text, len);
     return true;
 }
-static bool capture_end_invoke(void *vctx, dsml_tool_stream *ts) {
-    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
-    (void)ts;
+static bool capture_end(chat_sink *k, int) {
+    capture_tool_ctx *c = (capture_tool_ctx *)k->st;
     buf_puts(&c->events, "E;");
     c->ends++;
     return true;
 }
-static const dsml_tool_stream_ops capture_tool_ops = {
-    capture_begin_invoke, capture_args_fragment, capture_end_invoke,
-};
+static const sink_tool_ops capture_tool_ops = {capture_begin, capture_args, capture_end};
+/* a sink whose protocol state is the capture (L272 P3: the machine speaks the generic tool events) */
+static chat_sink capture_sink(request *r, capture_tool_ctx *c) {
+    chat_sink k;
+    memset(&k, 0, sizeof k);
+    k.r = r;
+    k.st = c;
+    k.tool_ops = &capture_tool_ops;
+    return k;
+}
 
 static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     const char *raw =
@@ -6543,13 +6803,16 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
         PULSAR_TOOL_CALLS_END;
     const size_t n = strlen(raw);
 
+    request r;
+    request_init(&r, REQ_CHAT, 128);
     capture_tool_ctx c;
     memset(&c, 0, sizeof c);
+    chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
     TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
     for (size_t len = 1; len <= n; len++) {
-        TEST_ASSERT(dsml_tool_stream_update(&ts, &capture_tool_ops, &c, raw, len));
+        TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     }
     TEST_ASSERT(!ts.active);
     TEST_ASSERT(ts.state == DSML_TOOL_DONE);
@@ -6572,15 +6835,16 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     memset(&c, 0, sizeof c);
     memset(&ts, 0, sizeof ts);
     TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), 0));
-    TEST_ASSERT(dsml_tool_stream_update(&ts, &capture_tool_ops, &c, cut, strlen(cut)));
+    TEST_ASSERT(dsml_tool_stream_update(&ts, &k, cut, strlen(cut)));
     TEST_ASSERT(ts.active && ts.state == DSML_TOOL_PARAM_VALUE);
-    TEST_ASSERT(dsml_tool_stream_finalize(&ts, &capture_tool_ops, &c, cut, strlen(cut)));
+    TEST_ASSERT(dsml_tool_stream_finalize(&ts, &k, cut, strlen(cut)));
     TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_DONE);
     TEST_ASSERT(ts.index == 1 && c.ends == 1);
     TEST_ASSERT(c.args.ptr && !strcmp(c.args.ptr, "{\"command\":\"ls -la\"}"));
     dsml_tool_stream_free(&ts);
     buf_free(&c.events);
     buf_free(&c.args);
+    request_free(&r);
 }
 
 /* L184: one entity encode/decode pair (src/lib/pulsar_dsml).  The renderer's
@@ -7795,6 +8059,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_qwen_hooks_compose_to_the_full_render();
+    test_qwen_raw_calls_replay_verbatim();
+    test_qwen_forced_call_prefill_and_seed();
+    test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();

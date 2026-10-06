@@ -286,35 +286,28 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
 
 
 
-/* The Anthropic side of the DSML tool-call events (deepseek_stream_update): a
- * tool_use content block per invocation, its arguments as input_json_delta,
- * stopped when the invocation closes.  ctx is the sink. */
-static bool anthropic_tool_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
-    chat_sink *k = (chat_sink *)vctx;
-    /* This id is already visible to the client.  After final parsing,
-     * apply_stream_tool_ids() copies it into the parsed tool_call before
-     * tool_memory_remember(), so the next tool_result can continue from the
-     * live KV state instead of re-rendering canonical JSON. */
-    const char *tool_id = dsml_tool_stream_id(k->s, ts, ts->index, API_ANTHROPIC);
-    return anthropic_sse_open_tool_block(k->fd, (anthropic_stream *)k->st, tool_id, name);
+/* The Anthropic side of a family's live tool-call events: a tool_use content
+ * block per call, its arguments as input_json_delta, stopped when the call
+ * closes.  The id is the one the client sees from here on: a DeepSeek parse
+ * copies it into the parsed tool_call (apply_stream_tool_ids) before
+ * tool_memory_remember(), so the next tool_result can continue from the live
+ * KV state instead of re-rendering canonical JSON. */
+static bool anthropic_tool_begin(chat_sink *k, int, const char *id, const char *name) {
+    return anthropic_sse_open_tool_block(k->fd, (anthropic_stream *)k->st, id, name);
 }
 
-static bool anthropic_tool_args_fragment(void *vctx, dsml_tool_stream *, const char *text, size_t len) {
-    chat_sink *k = (chat_sink *)vctx;
+static bool anthropic_tool_args(chat_sink *k, int, const char *text, size_t len) {
     return anthropic_sse_tool_delta_live(k->fd, (anthropic_stream *)k->st, text, len);
 }
 
-static bool anthropic_tool_end_invoke(void *vctx, dsml_tool_stream *) {
-    chat_sink *k = (chat_sink *)vctx;
+static bool anthropic_tool_end(chat_sink *k, int) {
     anthropic_stream *st = (anthropic_stream *)k->st;
     if (!anthropic_sse_close_block_live(k->fd, k->id, st)) return false;
     st->tools_streamed++;
     return true;
 }
 
-static const dsml_tool_stream_ops anthropic_tool_ops = {
-    anthropic_tool_begin_invoke, anthropic_tool_args_fragment, anthropic_tool_end_invoke,
-};
+static const sink_tool_ops anthropic_tool_ops = {anthropic_tool_begin, anthropic_tool_args, anthropic_tool_end};
 
 
 

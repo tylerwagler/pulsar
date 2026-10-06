@@ -31,46 +31,20 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
 
 
 
-/* The exact byte sequence a forced tool call is seeded with: close thinking,
- * open the tool_calls block, and (when a specific tool was requested) open
- * the named invoke. Used for BOTH the prompt suffix and the generate_job
- * output seed - they must stay byte-identical or the DSML tracker and the
- * prompt disagree about parser state. */
-void request_forced_tool_seed(const request *r, buf *out) {
-    const pulsar_dsml_syntax *d = pulsar_dsml_canonical(r->chat_v41);
-    buf_puts(out, "</think>\n\n");
-    buf_puts(out, d->tool_calls_start);
-    buf_puts(out, "\n");
-    if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, d->invoke_start);
-        buf_puts(out, " name=\"");
-        buf_puts(out, r->forced_tool_name);
-        buf_puts(out, "\">\n");
-    }
-}
-
-/* Rewrite the rendered prompt tail for a forced tool call: drop a trailing
- * "<think>" opener, then append the forced-tool seed (which begins with the
- * "</think>" close; if the render already ended with one, skip the extra). */
+/* Rewrite the rendered prompt's tail for a forced tool call: the family says how much of the tail to
+ * keep and what to append (server_family_ops::forced_call_prefill); this keeps the prompt's client-data
+ * ranges, clamping one that reached into the dropped tail. */
 void request_apply_forced_tool_prefill(request *r) {
     if (!r->force_tool_call || !r->prompt_text) return;
     buf pt = {0};
     const char *base = r->prompt_text;
     size_t blen = strlen(base);
-    if (blen >= 7 && !memcmp(base + blen - 7, "<think>", 7)) blen -= 7;
-    buf_append(&pt, base, blen);
     buf seed = {0};
-    request_forced_tool_seed(r, &seed);
-    if (pt.len >= 8 && !memcmp(pt.ptr + pt.len - 8, "</think>", 8)) {
-        buf_puts(&pt, seed.ptr + 8);   /* already closed: skip seed's close */
-    } else {
-        buf_puts(&pt, seed.ptr);
-    }
+    r->family->forced_call_prefill(r, base, &blen, &seed);
+    buf_append(&pt, base, blen);
+    if (seed.len) buf_append(&pt, seed.ptr, seed.len);
     buf_free(&seed);
     free(r->prompt_text);
-    /* The prefix keeps the prompt's client-data ranges (this rewrite only drops a
-     * trailing server-written opener); a range that reached into the dropped tail
-     * is clamped to the new end. */
     if (r->prompt_spans) {
         uint32_t k = 0;
         for (uint32_t i = 0; i < r->prompt_n_spans; i++) {
@@ -297,9 +271,9 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->min_p = PULSAR_DEFAULT_MIN_P;
     r->think_mode = PULSAR_THINK_DEFAULT;
     /* The template family, defaulted to the compile-time default PROFILE
-     * (V4.1); a parser that holds the engine overwrites it from
-     * pulsar_engine_variant(). */
-    r->chat_v41 = true;
+     * (V4.1); a parser that holds the engine overwrites it from the engine
+     * (server_family_for_engine). */
+    r->family = server_family_for_format(PULSAR_CHAT_DS4_V41);
 }
 
 

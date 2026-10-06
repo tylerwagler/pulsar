@@ -94,7 +94,7 @@ char *path_join(const char *dir, const char *name) {
 
 
 
-static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
+const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
     struct block_form {
         const char *start;
         const char *end;
@@ -141,7 +141,7 @@ bool server::kv_tool_map_measure_locked(const char *text,
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        const char *start = server_family_for_engine(s->engine)->find_call_block(p, &end);
         if (!start || !end) break;
         tool_memory_block *b =
             tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
@@ -209,7 +209,7 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        const char *start = server_family_for_engine(s->engine)->find_call_block(p, &end);
         if (!start || !end || !ok) break;
         tool_memory_block *b =
             tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));

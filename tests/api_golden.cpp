@@ -18,6 +18,8 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_stream.cpp"
+#include "../src/server/parser_deepseek.cpp"
+#include "../src/server/parser_qwen.cpp"
 #include "../src/server/openai_stream.cpp"
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"
@@ -57,7 +59,9 @@ static void put_list(const char *key, const stop_list *l) {
 }
 
 static void dump(const request *r) {
-    printf("  kind %d api %d chat_v41 %d chat_qwen %d\n", (int)r->kind, (int)r->api, r->chat_v41, r->chat_qwen);
+    /* the golden's labels predate the family table (L272 P3): the same two facts, read from it */
+    printf("  kind %d api %d chat_v41 %d chat_qwen %d\n", (int)r->kind, (int)r->api, (int)r->family->v41,
+           (int)(r->family->parser == SERVER_PARSER_QWEN));
     put_str("model", r->model);
     printf("  model_from_request %d max_tokens %d\n", r->model_from_request, r->max_tokens);
     printf("  sampling t %.9g/%d top_p %.9g/%d top_k %d/%d min_p %.9g/%d seed %llu\n", r->temperature,

@@ -936,10 +936,12 @@ void responses_prepare_live_continuation(request *r,
     free(r->responses_live_suffix_spans);
     r->responses_live_suffix_spans = NULL;
     r->responses_live_suffix_n_spans = 0;
-    r->responses_live_suffix_text =
-        render_live_tool_tail_spans(msgs, tail_start, r->has_tools, r->think_mode, true,
-                                    &r->responses_live_suffix_spans,
-                                    &r->responses_live_suffix_n_spans);
+    /* the family's tail (L272 P3: NULL = no live continuation on this family; the render refuses a
+     * request that needs one) */
+    r->responses_live_suffix_text = r->family->tool_result_tail
+        ? r->family->tool_result_tail(r, msgs, tail_start, &r->responses_live_suffix_spans,
+                                      &r->responses_live_suffix_n_spans)
+        : NULL;
 }
 
 
@@ -1098,9 +1100,9 @@ void anthropic_prepare_live_continuation(request *r,
     free(r->anthropic_live_suffix_spans);
     r->anthropic_live_suffix_spans = NULL;
     r->anthropic_live_suffix_n_spans = 0;
-    r->anthropic_live_suffix_text =
-        render_live_tool_tail_spans(msgs, tail_start, r->has_tools, r->think_mode, true,
-                                    &r->anthropic_live_suffix_spans,
-                                    &r->anthropic_live_suffix_n_spans);
+    r->anthropic_live_suffix_text = r->family->tool_result_tail
+        ? r->family->tool_result_tail(r, msgs, tail_start, &r->anthropic_live_suffix_spans,
+                                      &r->anthropic_live_suffix_n_spans)
+        : NULL;
 }
 

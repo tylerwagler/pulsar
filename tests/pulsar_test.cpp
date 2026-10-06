@@ -7,6 +7,8 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_stream.cpp"
+#include "../src/server/parser_deepseek.cpp"
+#include "../src/server/parser_qwen.cpp"
 #include "../src/server/openai_stream.cpp"
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"
@@ -4037,7 +4039,7 @@ static void test_control_token_suffix(void) {
         request r;
         request_init(&r, REQ_CHAT, 128);
         r.think_mode = PULSAR_THINK_HIGH;
-        r.chat_v41 = true;
+        r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
         tool_calls calls = {0};
         tool_call call = {0};
         call.id = xstrdup("call_1");
@@ -4086,7 +4088,7 @@ static void test_control_token_suffix(void) {
             TEST_ASSERT(!"control-token-suffix: the composite probe must parse");
         } else {
             r.think_mode = PULSAR_THINK_HIGH;
-            r.chat_v41 = true;
+            r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
             tool_calls calls = {0};
             tool_call call = {0};
             call.id = xstrdup("call_1");

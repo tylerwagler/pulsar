@@ -1021,7 +1021,7 @@ int main(int argc, char **argv) {
      * prologue overlap on top (see the constant's comment for the sizing
      * evidence). */
     {
-        const int hdr_len = chat_family_trivial_header_tokens(engine);   /* the loaded family's (L272 B6) */
+        const int hdr_len = server_family_for_engine(engine)->trivial_header_tokens(engine);   /* the loaded family's (L272 B6) */
         s.slot_trivial_common_tokens =
             hdr_len + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
         server_log(PULSAR_LOG_DEFAULT,

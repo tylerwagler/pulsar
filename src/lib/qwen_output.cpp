@@ -212,8 +212,16 @@ void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
     index_++;
 }
 
+bool qwen_output_parser::raw_span(size_t *lo, size_t *hi) const {
+    if (calls_.empty()) return false;
+    *lo = raw_lo_;
+    *hi = raw_hi_;
+    return true;
+}
+
 void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_event> *ev) {
     hold_.append(p, n);
+    fed_ += n;
     for (;;) {
         if (mode_ == M_REASONING) {
             const size_t at = hold_.find(kThinkEnd);
@@ -239,6 +247,10 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
             }
             emit_text(false, hold_.data(), at, ev);
             end_section(false);
+            if (!block_seen_) {   /* hold_[0] sits at stream offset fed_ - hold_.size() */
+                raw_lo_ = fed_ - hold_.size() + at;
+                block_seen_ = true;
+            }
             hold_.erase(0, at + strlen(kCallOpen));
             block_.clear();
             began_ = false;
@@ -271,6 +283,7 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
             hold_.erase(0, take);
             return;
         }
+        raw_hi_ = fed_ - hold_.size() + at + strlen(kCallClose);
         hold_.erase(0, at + strlen(kCallClose));
         close_call(ev);
         mode_ = M_AFTER_TOOL;

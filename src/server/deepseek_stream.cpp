@@ -149,9 +149,9 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
     }
 
     if (w->mode == DS_WALK_TOOL) {
-        if (!dsml_tool_stream_update(&w->tool, k->tool_ops, k, raw, raw_len)) return false;
+        if (!dsml_tool_stream_update(&w->tool, k, raw, raw_len)) return false;
         if (final && w->tool.active &&
-            !dsml_tool_stream_finalize(&w->tool, k->tool_ops, k, raw, raw_len)) return false;
+            !dsml_tool_stream_finalize(&w->tool, k, raw, raw_len)) return false;
         if (!w->tool.active) w->mode = DS_WALK_SUPPRESS;
     }
     return true;

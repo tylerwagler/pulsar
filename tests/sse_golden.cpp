@@ -16,6 +16,8 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_stream.cpp"
+#include "../src/server/parser_deepseek.cpp"
+#include "../src/server/parser_qwen.cpp"
 #include "../src/server/openai_stream.cpp"
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"

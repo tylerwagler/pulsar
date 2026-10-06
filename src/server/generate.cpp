@@ -235,7 +235,7 @@ static char *build_live_tool_result_suffix_spans(const request *r,
      * along so the caller tokenises those bytes as plain text. */
     chat_text_span *tail_spans = NULL;
     uint32_t tail_n = 0;
-    char *tail = render_live_tool_tail_spans(&msgs, 0, r && r->has_tools, mode, true,
+    char *tail = render_live_tool_tail_spans(&msgs, 0, r && r->has_tools, mode, r ? r->family->v41 : true,
                                              &tail_spans, &tail_n);
     buf_puts_spanned(&suffix, tail, tail_spans, tail_n);
     free(tail);
@@ -299,17 +299,10 @@ char *build_tool_checkpoint_suffix_spans(const request *r, const char *content,
                                          chat_text_span **spans_out, uint32_t *n_spans_out) {
     if (spans_out) *spans_out = NULL;
     if (n_spans_out) *n_spans_out = 0;
+    if (!r->family->assistant_turn_sampled) return NULL;   /* the family has no sampled-turn render */
     const bool think = pulsar_think_mode_enabled(r->think_mode);
-    buf suffix = {0};
-    append_assistant_turn_sampled(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
-                                  content, calls, r->chat_v41);
-    if (spans_out) {
-        *spans_out = suffix.spans;
-        *n_spans_out = suffix.n_spans;
-        suffix.spans = NULL;
-        suffix.n_spans = suffix.cap_spans = 0;
-    }
-    return buf_take(&suffix);
+    return r->family->assistant_turn_sampled(r, think, think ? (reasoning ? reasoning : "") : NULL, content, calls,
+                                             spans_out, n_spans_out);
 }
 
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -327,7 +320,6 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
                                                      uint32_t *n_spans_out) {
     if (spans_out) *spans_out = NULL;
     if (n_spans_out) *n_spans_out = 0;
-    buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
      * next client replay is expected to include it.  In practice, pi replays
@@ -338,15 +330,9 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
      * match this visible shortcut and can still use exact token-prefix replay. */
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     const bool replay = think && r->reasoning_summary_emit && calls && calls->len > 0;
-    append_assistant_turn_sampled(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
-                                  content, calls, r->chat_v41);
-    if (spans_out) {
-        *spans_out = suffix.spans;
-        *n_spans_out = suffix.n_spans;
-        suffix.spans = NULL;
-        suffix.n_spans = suffix.cap_spans = 0;
-    }
-    return buf_take(&suffix);
+    if (!r->family->assistant_turn_sampled) return NULL;   /* the family has no sampled-turn render */
+    return r->family->assistant_turn_sampled(r, think, replay ? (reasoning ? reasoning : "") : NULL, content, calls,
+                                             spans_out, n_spans_out);
 }
 
 char *build_responses_visible_assistant_suffix(const request *r,

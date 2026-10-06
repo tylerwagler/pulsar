@@ -22,7 +22,11 @@
  *   tools_not_array -- the tools value is not a JSON array (a caller maps an
  *       absent or JSON-null tools field to NULL; HF skips those too);
  *   tool_name_missing -- a call without a function name (HF raises on it);
- *   prompt_too_large -- the text does not fit the 32-bit span map.
+ *   prompt_too_large -- the text does not fit the 32-bit span map;
+ *   raw_calls_without_calls -- a message carries sampled call bytes
+ *       (qwen_msg_in::raw_calls) but no call;
+ *   reasoning_without_thinking -- qwen_chat_render_assistant_turn only: a
+ *       thinking-off turn with reasoning.
  *
  * The API carries a call's arguments as JSON text and HF's template wants the
  * object, so the text is decoded ONCE (what vLLM does before rendering; the
@@ -86,6 +90,10 @@ struct qwen_msg_in {
     const char *reasoning;  ///< assistant reasoning_content; NULL = none
     const qwen_tool_call_in *calls;
     int n_calls;
+    /** The calls' SAMPLED bytes, from the first "<tool_call>" to the last "</tool_call>" (the server's
+     * tool memory, L272 P3): written verbatim after the template's separator in place of rendering
+     * `calls`, so a replayed turn byte-matches the live KV.  NULL = render `calls`. */
+    const char *raw_calls;
 };
 
 struct qwen_render_in {
@@ -103,6 +111,27 @@ struct qwen_render_out {
 
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err, size_t errlen);
+
+/** The assistant turn `m` as the model SAMPLES it: the bytes the full render writes for the turn past
+ * the generation prompt -- past "<|im_start|>assistant\n<think>\n" with `thinking`, past the closed
+ * empty think block without it -- so prefix + this = the full render of the history with the turn
+ * appended (L272 P3; the server's KV key and Responses' visible memory).  With thinking: the stripped
+ * reasoning, "\n</think>\n\n"; then the stripped content, the calls (or `raw_calls`), and
+ * "<|im_end|>\n" when the turn has no calls -- a tool-call turn's close belongs to the tail that
+ * follows it (the live KV ends before the stop token either way; see qwen_chat_render_tail).
+ * Refusals: reasoning_without_thinking (a thinking-off turn cannot carry reasoning: its block was
+ * closed empty by the prompt), and render_calls' (tool_name_missing, tool_arguments_*). */
+bool qwen_chat_render_assistant_turn(const qwen_msg_in &m, bool thinking, qwen_render_out *out, char *err,
+                                     size_t errlen);
+
+/** A continuation tail appended to a live KV that ends where the model stopped (before the stop
+ * token): the turn's close "<|im_end|>\n", then `msgs` as the full render places them after an
+ * assistant turn (a tool result opens the user turn; consecutive results share it), then the
+ * generation prompt for `effort`.  full(history) + sampled turn + this = full(history + turn + msgs)
+ * with add_generation_prompt.  Refusals: no_messages, system_not_first (no tail message is the
+ * conversation's first), unexpected_role, and render_calls'. */
+bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, qwen_render_out *out, char *err,
+                           size_t errlen);
 
 /** Python's str.strip() whitespace (what Jinja's |trim removes): the one
  * definition the renderer and the output parser share. */
@@ -170,6 +199,10 @@ public:
     int errors() const { return errors_; }
     /** The parser sits inside an open <tool_call> block: its arguments decode greedily (L272 B8). */
     bool in_tool_call() const { return mode_ == M_TOOL; }
+    /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from the first "<tool_call>" to the
+     * last "</tool_call>" that closed (a malformed block among them included -- these are the bytes
+     * the live KV holds; qwen_msg_in::raw_calls replays them).  false until a call was read. */
+    bool raw_span(size_t *lo, size_t *hi) const;
 
 private:
     enum mode_t { M_REASONING, M_CONTENT, M_TOOL, M_AFTER_TOOL };
@@ -185,6 +218,10 @@ private:
 
     mode_t mode_ = M_CONTENT;
     std::string hold_;         ///< bytes not yet classified
+    size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
+    bool block_seen_ = false;  ///< a <tool_call> opened: raw_lo_ is set
+    size_t raw_lo_ = 0;        ///< stream offset of the first <tool_call>
+    size_t raw_hi_ = 0;        ///< stream offset past the last </tool_call>
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open tool-call block body
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call

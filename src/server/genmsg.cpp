@@ -951,14 +951,13 @@ static bool dsml_tool_stream_fail(dsml_tool_stream *ts) {
 
 /* A string parameter's value bytes: DSML entities undone, then JSON-string
  * escaped, as a fragment inside the already-open quotes. */
-static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                        void *ctx, const char *text, size_t len) {
+static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, chat_sink *k, const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
     char *unescaped = pulsar_dsml_unescape(raw);
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
-    bool ok = ops->args_fragment(ctx, ts, frag.ptr ? frag.ptr : "", frag.len);
+    bool ok = k->tool_ops->args(k, ts->index, frag.ptr ? frag.ptr : "", frag.len);
     buf_free(&frag);
     free(unescaped);
     free(raw);
@@ -967,23 +966,21 @@ static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, const dsml_tool_st
 
 
 
-static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                        void *ctx, const char *name, bool is_string) {
+static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, chat_sink *k, const char *name, bool is_string) {
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
     else buf_putc(&frag, ',');
     json_escape(&frag, name ? name : "");
     buf_putc(&frag, ':');
     if (is_string) buf_putc(&frag, '"');
-    bool ok = ops->args_fragment(ctx, ts, frag.ptr ? frag.ptr : "", frag.len);
+    bool ok = k->tool_ops->args(k, ts->index, frag.ptr ? frag.ptr : "", frag.len);
     buf_free(&frag);
     return ok;
 }
 
 
 
-static bool dsml_tool_start_invoke(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                   void *ctx, const char *raw, size_t raw_len) {
+static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
@@ -991,8 +988,11 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, const dsml_tool_stream_
     free(tag);
     if (!name) return dsml_tool_stream_fail(ts);
 
-    bool ok = ops->begin_invoke(ctx, ts, name) &&
-              ops->args_fragment(ctx, ts, "{", 1);
+    /* the id the client sees, fixed per index once created (apply_stream_tool_ids copies it into the
+     * parsed call at the finish) */
+    const char *id = dsml_tool_stream_id(k->s, ts, ts->index, k->r->api);
+    bool ok = k->tool_ops->begin(k, ts->index, id, name) &&
+              k->tool_ops->args(k, ts->index, "{", 1);
     free(name);
     if (!ok) return false;
 
@@ -1006,8 +1006,7 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, const dsml_tool_stream_
 
 
 
-static bool dsml_tool_start_param(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                  void *ctx, const char *raw, size_t raw_len) {
+static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
@@ -1020,7 +1019,7 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, const dsml_tool_stream_o
         return dsml_tool_stream_fail(ts);
     }
     bool string_value = !strcmp(is_string, "true");
-    bool ok = dsml_tool_emit_param_prefix(ts, ops, ctx, name, string_value);
+    bool ok = dsml_tool_emit_param_prefix(ts, k, name, string_value);
     free(name);
     free(is_string);
     if (!ok) return false;
@@ -1033,20 +1032,18 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, const dsml_tool_stream_o
 
 
 
-static bool dsml_tool_emit_value(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                 void *ctx, const char *raw, size_t value_end) {
+static bool dsml_tool_emit_value(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
     if (value_end <= ts->parse_pos) return true;
     return ts->param_is_string ?
-        dsml_tool_emit_string_value(ts, ops, ctx, raw + ts->parse_pos, value_end - ts->parse_pos) :
-        ops->args_fragment(ctx, ts, raw + ts->parse_pos, value_end - ts->parse_pos);
+        dsml_tool_emit_string_value(ts, k, raw + ts->parse_pos, value_end - ts->parse_pos) :
+        k->tool_ops->args(k, ts->index, raw + ts->parse_pos, value_end - ts->parse_pos);
 }
 
 
 
-static bool dsml_tool_finish_param(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
-                                   void *ctx, const char *raw, size_t value_end) {
-    if (!dsml_tool_emit_value(ts, ops, ctx, raw, value_end)) return false;
-    if (ts->param_is_string && !ops->args_fragment(ctx, ts, "\"", 1)) return false;
+static bool dsml_tool_finish_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
+    if (!dsml_tool_emit_value(ts, k, raw, value_end)) return false;
+    if (ts->param_is_string && !k->tool_ops->args(k, ts->index, "\"", 1)) return false;
     ts->parse_pos = value_end + strlen(ts->syn->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
@@ -1055,10 +1052,10 @@ static bool dsml_tool_finish_param(dsml_tool_stream *ts, const dsml_tool_stream_
 
 
 /* The invocation's "}" and the protocol's block stop, then the next index. */
-static bool dsml_tool_close_invoke(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx) {
-    if (ts->args_open && !ops->args_fragment(ctx, ts, "}", 1)) return false;
+static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k) {
+    if (ts->args_open && !k->tool_ops->args(k, ts->index, "}", 1)) return false;
     ts->args_open = false;
-    if (!ops->end_invoke(ctx, ts)) return false;
+    if (!k->tool_ops->end(k, ts->index)) return false;
     ts->index++;
     return true;
 }
@@ -1073,7 +1070,7 @@ static bool dsml_tool_close_invoke(dsml_tool_stream *ts, const dsml_tool_stream_
  * close the args object, stop the block.  The argument VALUE stays truncated
  * -- exactly what the repaired non-stream parse of the same bytes yields --
  * and the finish reason (length) still tells the client the turn was cut. */
-bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
                                const char *raw, size_t raw_len) {
     if (!ts->active) return true;
     if (ts->state == DSML_TOOL_PARAM_VALUE) {
@@ -1085,12 +1082,12 @@ bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops 
         size_t limit = tool_param_value_stream_safe_len(
                 raw, ts->parse_pos, raw_len, ts->syn->param_end, ts->param_is_string);
         limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
-        if (!dsml_tool_emit_value(ts, ops, ctx, raw, limit)) return false;
+        if (!dsml_tool_emit_value(ts, k, raw, limit)) return false;
         if (limit > ts->parse_pos) ts->parse_pos = limit;
-        if (ts->param_is_string && !ops->args_fragment(ctx, ts, "\"", 1)) return false;
+        if (ts->param_is_string && !k->tool_ops->args(k, ts->index, "\"", 1)) return false;
         ts->state = DSML_TOOL_BETWEEN_PARAMS;
     }
-    if (ts->args_open && !dsml_tool_close_invoke(ts, ops, ctx)) return false;
+    if (ts->args_open && !dsml_tool_close_invoke(ts, k)) return false;
     ts->active = false;
     ts->state = DSML_TOOL_DONE;
     return true;
@@ -1098,7 +1095,7 @@ bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops 
 
 
 
-bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                              const char *raw, size_t raw_len) {
     const pulsar_dsml_syntax *syn = ts->syn;
     while (ts->active && ts->parse_pos < raw_len) {
@@ -1115,7 +1112,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *o
             if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
-                if (!dsml_tool_start_invoke(ts, ops, ctx, raw, raw_len)) return false;
+                if (!dsml_tool_start_invoke(ts, k, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -1126,7 +1123,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *o
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_end)) {
-                if (!dsml_tool_close_invoke(ts, ops, ctx)) return false;
+                if (!dsml_tool_close_invoke(ts, k)) return false;
                 ts->parse_pos += strlen(syn->invoke_end);
                 ts->state = DSML_TOOL_BETWEEN_INVOKES;
                 continue;
@@ -1135,7 +1132,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *o
             if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->param_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
-                if (!dsml_tool_start_param(ts, ops, ctx, raw, raw_len)) return false;
+                if (!dsml_tool_start_param(ts, k, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -1146,12 +1143,12 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *o
             const char *end = find_lit_bounded(raw + ts->parse_pos, raw_len - ts->parse_pos,
                                                syn->param_end);
             if (end) {
-                if (!dsml_tool_finish_param(ts, ops, ctx, raw, (size_t)(end - raw))) return false;
+                if (!dsml_tool_finish_param(ts, k, raw, (size_t)(end - raw))) return false;
                 continue;
             }
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos, raw_len,
                                                             syn->param_end, ts->param_is_string);
-            if (!dsml_tool_emit_value(ts, ops, ctx, raw, limit)) return false;
+            if (!dsml_tool_emit_value(ts, k, raw, limit)) return false;
             if (limit > ts->parse_pos) ts->parse_pos = limit;
             return true;
         }
