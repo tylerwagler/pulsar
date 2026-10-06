@@ -50,6 +50,7 @@ constexpr int kNormThreads = 256;
 constexpr int kNormPer = kH / kNormThreads;   ///< 10 columns per thread
 constexpr int kDownSplit = 5;                 ///< W_down split-K: 320 blocks of 32 -> 64 per split
 constexpr int kDownTB = 8;                    ///< tokens per down CTA
+constexpr int kDownStageBytes = 48 * 1024;    ///< the W8A16 GEMV's staged activation slice, at most
 constexpr int kUpTB = 16;                     ///< tokens per up CTA, BF16 mixer at prefill widths
 constexpr int kUpTBDecode = 4;                ///< tokens per up CTA at decode widths: small enough that two
                                               ///< CTAs (staged W_up tile + a, prod) share an SM, so the 80
@@ -206,17 +207,21 @@ qwen_gr_norm_kernel(const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat
 /* 2. W_down, split-K: part[t][split][row] = the split's share of W_row . xn_t.
  * MXFP8: 32-blocks, (W_row,blk . x_t,blk) 2^(sw + sx); BF16: 8-element chunks.
  * One warp per row; lane l takes the split's blocks (chunks) l, l + 32, ... in
- * order; the xor tree sums lanes.  Row arithmetic is independent of T. */
+ * order; the xor tree sums lanes.  Row arithmetic is independent of T.  W8A16 (the served arm) stages
+ * the CTA's tokens' activation slice in shared memory first (L271): every one of its 8 row-warps read
+ * it from L2 inside the inner loop, which made the kernel latency-bound (~123 GB/s at one token) and
+ * doubled its time at a 4-row MTP verify.  The products and their order are unchanged; `tb` (tokens per
+ * CTA, gr_down_tokens_per_cta) only regroups tokens, each of whose sums is its own. */
 template <bool W8, bool A8 = W8>
 __global__ void __launch_bounds__(256)
 qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                     const void *__restrict__ xv, const uint8_t *__restrict__ xsf, int x_kbp,
-                    int out, int in, int T, int n_split, float *__restrict__ part) {
+                    int out, int in, int T, int n_split, int tb, float *__restrict__ part) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * 8 + warp;
-    if (row >= out) return;
+    const bool live = row < out;   /* not an early return: the W8A16 arm stages behind a barrier */
     const int split = blockIdx.y;
-    const int t0 = blockIdx.z * kDownTB, nt = min(kDownTB, T - t0);
+    const int t0 = blockIdx.z * tb, nt = min(tb, T - t0);
     float acc[kDownTB];
 #pragma unroll
     for (int tt = 0; tt < kDownTB; ++tt) acc[tt] = 0.0f;
@@ -224,7 +229,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
         const uint8_t *wq = (const uint8_t *)wv, *xq = (const uint8_t *)xv;
         const int nblk = in / 32, per = nblk / n_split, b0 = split * per;
         const int w_kbp = pulsar_mx_kbp(in);
-        for (int b = b0 + lane; b < b0 + per; b += 32) {
+        for (int b = b0 + lane; live && b < b0 + per; b += 32) {
             const uint4 *wp = reinterpret_cast<const uint4 *>(wq + (size_t)row * in + (size_t)b * 32);
             const uint4 w0 = wp[0], w1 = wp[1];
             const unsigned sw = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
@@ -242,19 +247,24 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
         /* W8A16 (L251 / ac69748f): mxfp8_lt weights against the block input's bf16 row.  The weights
          * are read bit-identically to the W8A8 branch above; the activation is bf16, so 32 of them
          * need 4 uint4 instead of 2 -- that asymmetry is the whole difference. */
+        extern __shared__ uint4 xs[];   /* [tb][per * 4]: 32 bf16 = 4 uint4 per block */
         const uint8_t *wq = (const uint8_t *)wv;
         const __nv_bfloat16 *xb = (const __nv_bfloat16 *)xv;
         const int nblk = in / 32, per = nblk / n_split, b0 = split * per;
         const int w_kbp = pulsar_mx_kbp(in);
-        for (int b = b0 + lane; b < b0 + per; b += 32) {
+        for (int i = threadIdx.x; i < nt * per * 4; i += blockDim.x) {
+            const int tt = i / (per * 4), r = i - tt * per * 4;
+            xs[tt * per * 4 + r] = reinterpret_cast<const uint4 *>(xb + (size_t)(t0 + tt) * in + (size_t)b0 * 32)[r];
+        }
+        __syncthreads();
+        for (int b = b0 + lane; live && b < b0 + per; b += 32) {
             const uint4 *wp = reinterpret_cast<const uint4 *>(wq + (size_t)row * in + (size_t)b * 32);
             const uint4 w0 = wp[0], w1 = wp[1];
             const float wsc = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
 #pragma unroll
             for (int tt = 0; tt < kDownTB; ++tt) {
                 if (tt < nt) {
-                    const int t = t0 + tt;
-                    const uint4 *xp = reinterpret_cast<const uint4 *>(xb + (size_t)t * in + (size_t)b * 32);
+                    const uint4 *xp = &xs[tt * per * 4 + (b - b0) * 4];
                     acc[tt] = fmaf(e4m3_bf16_dot32(w0, w1, xp[0], xp[1], xp[2], xp[3]), wsc, acc[tt]);
                 }
             }
@@ -262,7 +272,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
     } else {
         const uint4 *wr = reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)wv + (size_t)row * in);
         const int nch = in / 8, per = nch / n_split, c0 = split * per;
-        for (int ci = c0 + lane; ci < c0 + per; ci += 32) {
+        for (int ci = c0 + lane; live && ci < c0 + per; ci += 32) {
             const uint4 w = wr[ci];
 #pragma unroll
             for (int tt = 0; tt < kDownTB; ++tt)
@@ -276,7 +286,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
         float v = acc[tt];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-        if (lane == 0 && tt < nt) part[((size_t)(t0 + tt) * n_split + split) * out + row] = v;
+        if (live && lane == 0 && tt < nt) part[((size_t)(t0 + tt) * n_split + split) * out + row] = v;
     }
 }
 
@@ -624,6 +634,14 @@ extern "C" size_t pulsar_qwen_gr_workspace_bytes(int T) {
     return T > 0 ? gr_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
+/* The W8A16 GEMV's tokens per CTA: kDownTB, or fewer when that many tokens' activation slices (in / n_split
+ * bf16 each) would not stage in kDownStageBytes.  0 = a slice too wide to stage even alone. */
+static int gr_down_tokens_per_cta(int in, int n_split) {
+    const int slice = in / n_split * 2;
+    const int tb = kDownStageBytes / slice;
+    return tb < 1 ? 0 : tb < kDownTB ? tb : kDownTB;
+}
+
 template <bool W8>
 static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
                             float *inj, const gr_ws &m, cudaStream_t stream) {
@@ -636,8 +654,11 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
         qwen_w8a16_prefill_kernel<<<dim3((kR + kMmaOut - 1) / kMmaOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
             (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)m.xn, kR, kHC, T, kDownSplit, m.part);
     } else {
-        qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + kDownTB - 1) / kDownTB), 256, 0, stream>>>(
-            w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, m.part);
+        const int tb = gr_down_tokens_per_cta(kHC, kDownSplit);
+        static_assert(kHC / kDownSplit * 2 * kDownTB <= kDownStageBytes, "W_down stages a whole token tile");
+        qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + tb - 1) / tb), 256,
+                                         W8 ? (size_t)tb * kHC / kDownSplit * 2 : 0, stream>>>(
+            w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, tb, m.part);
     }
     if (W8 && (w->prompt || T > kDecodeRowsMax)) {
         const int64_t nm = (int64_t)T * kR;
@@ -753,8 +774,15 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
         qwen_w8a16_prefill_kernel<<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
                                                             l->out, l->in, rows, 1, y);
     } else {
-        const dim3 grid((l->out + 7) / 8, 1, (rows + kDownTB - 1) / kDownTB);
-        qwen_gr_down_kernel<true, false><<<grid, 256, 0, stream>>>(l->w, l->sf, x_bf16, nullptr, 0, l->out, l->in, rows, 1, y);
+        const int tb = gr_down_tokens_per_cta(l->in, 1);
+        if (tb == 0) {
+            fprintf(stderr, "pulsar: qwen mxfp8 linear: a %d-wide row does not stage in %d bytes -- refusing\n", l->in,
+                    kDownStageBytes);
+            return -1;
+        }
+        const dim3 grid((l->out + 7) / 8, 1, (rows + tb - 1) / tb);
+        qwen_gr_down_kernel<true, false><<<grid, 256, (size_t)tb * l->in * 2, stream>>>(l->w, l->sf, x_bf16, nullptr, 0,
+                                                                                      l->out, l->in, rows, 1, tb, y);
     }
     const cudaError_t qe = cudaGetLastError();
     if (qe != cudaSuccess) {

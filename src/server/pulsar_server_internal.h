@@ -2039,6 +2039,10 @@ struct server {
      * on a recurrent state: the bank's view is invalidated instead, so the
      * next sync prefills it cold. */
     void worker_family_spec_quantum(session_slot *sl);
+    /** L271: a slot in the plain batch rejoins speculation once it is the only decoder (the family's
+     *  generate): its committed tokens reconcile onto the host checkpoint and its sampled feed token is
+     *  fed and emitted, as the batch would have.  false = the slot failed (its phase says why). */
+    bool batch_leave(session_slot *sl);
     /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
      * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
      * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
@@ -2381,7 +2385,8 @@ struct gen_state {
      * committed via multiseq since the bank's last host-checkpoint save, to be
      * reconciled onto the checkpoint when the slot returns to a classic op
      * (finish/store). */
-    bool batch_active;      ///< this slot has joined the shared multiseq lane (one-way; never switches back)
+    bool batch_active;      ///< this slot is in the shared multiseq lane (it leaves at finish, or for the family's
+                            ///< speculation once it decodes alone: server::batch_leave, L271)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
     int  batch_feed_token;  ///< next token to commit
     int  batch_feed_pos;    ///< position to commit it at (the bank's KV frontier)

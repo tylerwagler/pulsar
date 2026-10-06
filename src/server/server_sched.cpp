@@ -1373,7 +1373,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * gather loop never produces. Lane 3 keeps the spec_decode counters
  * advancing; lanes 2 and 4 do not. A slot leaves lane 4 for lane 2 freely
  * (its bank's logits stay fresh, which is what lane 2's entry draw reads);
- * lane 2 is one-way (batch_active), so it never comes back. */
+ * it comes back once it decodes alone (server::batch_leave clears
+ * batch_active before this pick, L271). */
 static int server_pick_decode_lane(int pool_banks, bool has_dspark, bool family_spec,
                                    session_slot *const *dec, int n_dec, int n_batched) {
     bool all_spec = has_dspark && n_dec >= 1 && n_batched == 0;
@@ -2547,6 +2548,43 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
  * prefills it cold rather than continuing a history the client does not
  * have.  Mid-flight continued disk-KV stores are not run here, as on the
  * plain lane this family decoded on before. */
+bool server::batch_leave(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    pulsar_session *pool = s->sess;
+    /* the bank live again (bank_state_restore clears the multiseq poison), then the host checkpoint
+     * caught up to what multiseq committed -- the finish path's reconcile */
+    if (!s->bank_switch(sl->bank)) {
+        snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return false;
+    }
+    if (g->batch_pending.len > 0)
+        pulsar_session_note_committed_tokens(pool, g->batch_pending.v, g->batch_pending.len);
+    pulsar_tokens_free(&g->batch_pending);
+    g->batch_active = false;
+    if (!g->batch_feed_valid) return true;
+    /* the token the batch sampled (its logprob already captured) is committed here as the batch's next
+     * step would have: fed, counted, emitted -- so the session's logits are fresh for the family's
+     * generate, which draws the token after it */
+    const int tok = g->batch_feed_token;
+    g->batch_feed_valid = false;
+    char err[160] = "";
+    if (pulsar_session_eval(pool, tok, err, sizeof err) != 0) {
+        snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return false;
+    }
+    sl->committed_pos = pulsar_session_pos(pool);
+    sl->tokens_emitted++;
+    if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+    slot_writer_install(&g->writer);
+    if (s->gen_emit_token(sl, tok)) g->phase = GEN_FINISH;
+    return true;
+}
+
 void server::worker_family_spec_quantum(session_slot *sl) {
     auto *s = this;
     pulsar_session *pool = s->sess;
@@ -3119,6 +3157,13 @@ void *worker_main(void *arg) {
         /* Record the lane for /metrics. Only the spec lane runs the fused verify
          * loop, so this is what tells a scraper whether the spec_decode_*
          * counters describe the present or some earlier single-request stretch. */
+        /* L271: a lone decoder still in the plain batch (it shared it with a request that has since
+         * finished -- Claude Code's side calls) rejoins the family's speculation */
+        if (s->family_spec && n_dec == 1 && n_batched == 1 && dec[0]->gen->dspark_spec_enabled &&
+            !pulsar_engine_has_dspark(s->engine)) {
+            s->batch_leave(dec[0]);
+            n_batched = 0;
+        }
         s->w_decode_lane = server_pick_decode_lane(s->pool_banks,
                                                    pulsar_engine_has_dspark(s->engine),
                                                    s->family_spec, dec, n_dec, n_batched);
