@@ -179,6 +179,14 @@ add("rs/image", "responses", {"input": [{"role": "user", "content": [
     {"type": "input_text", "text": "what"}, {"type": "input_image", "image_url": PNG}]}]})
 add("rs/missing-input", "responses", {"model": "m"})
 
+# ---- a role:system message mid-conversation (Claude Code's reminders), every endpoint ---------------
+MID_SYS = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
+           {"role": "system", "content": "todo list empty"}, {"role": "user", "content": "recent pushes?"}]
+for fam in ("deepseek", "qwen"):
+    add("chat/mid-system", "chat", {"messages": [{"role": "system", "content": "You are terse."}] + MID_SYS}, fam)
+add("an/mid-system", "anthropic", {"max_tokens": 50, "system": "You are Claude Code.", "messages": MID_SYS})
+add("an/mid-system-lead", "anthropic", {"max_tokens": 50, "messages": [{"role": "system", "content": "lead"}] + MID_SYS})
+
 # ---- L267: Anthropic and Responses for the Qwen family (the same bodies) ---------------------------
 for c in [c for c in cases if c["endpoint"] in ("anthropic", "responses")]:
     cases.append(dict(c, family="qwen"))

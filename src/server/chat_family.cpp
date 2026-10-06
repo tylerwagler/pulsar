@@ -370,7 +370,10 @@ static char *qwen_tools_openai_shape(const chat_conversation *c, api_style api, 
  * required or named tool call, image content, tool results whose call is not in the history (the
  * family keeps no live tool state), and tools loaded by Responses' tool_search.  tool_choice "none"
  * renders the conversation without the tools.  The request's top-level system / instructions field
- * renders first, wherever its protocol put it. */
+ * renders first, wherever its protocol put it.  The template takes ONE system message, first; a later
+ * one (Claude Code's mid-conversation reminders arrive as role "system") renders IN PLACE as a user
+ * turn wrapped in <system-reminder> -- DeepSeek V4's rule for the same case (L113), and in place so the
+ * rendered prefix stays append-only across turns. */
 static bool qwen_render(pulsar_engine *e, chat_conversation *c, request *r, qwen_effort qe, char *err,
                         size_t errlen) {
     if (c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED) {
@@ -400,6 +403,7 @@ static bool qwen_render(pulsar_engine *e, chat_conversation *c, request *r, qwen
     /* chat_msgs -> the renderer's messages; the pointers borrow `c->msgs`. */
     std::vector<qwen_msg_in> qm;
     std::vector<std::vector<qwen_tool_call_in>> qc((size_t)c->msgs.len);
+    std::vector<std::string> notes((size_t)c->msgs.len);   /* the in-place system reminders' text */
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < c->msgs.len; i++) {
             const chat_msg *m = &c->msgs.v[i];
@@ -411,6 +415,12 @@ static bool qwen_render(pulsar_engine *e, chat_conversation *c, request *r, qwen
             }
             for (int k = 0; k < m->calls.len; k++)
                 qc[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
+            if (!strcmp(m->role, "system") && !qm.empty()) {
+                notes[(size_t)i] = std::string("<system-reminder>\n") + (m->content ? m->content : "") +
+                                   "\n</system-reminder>";
+                qm.push_back({"user", notes[(size_t)i].c_str(), NULL, NULL, 0});
+                continue;
+            }
             qm.push_back({m->role, m->content, m->reasoning, qc[(size_t)i].empty() ? NULL : qc[(size_t)i].data(),
                           m->calls.len});
         }
