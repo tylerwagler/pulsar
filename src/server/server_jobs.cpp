@@ -625,13 +625,16 @@ void server::gen_begin(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    /* An image request rides the LIVE resolvers like any other (L261): a live
-     * continuation keeps the bank's history and the engine merges the new
-     * images where their blocks fall (image_continuation_place re-derives every
-     * image's start_pos on the effective prompt).  The DISK resolver stays off
-     * for it: a chain never holds an image row (pulsar_kvchain_persist ends at
-     * the first block), and placing a request's images on a chain-loaded text
-     * prefix is not proven yet -- so it prefills from its live state or cold. */
+    /* An image request rides the LIVE and DISK resolvers like any other (L261,
+     * L273): a live continuation keeps the bank's history, a chain restores the
+     * text prefix below the conversation's first image block (a chain never holds
+     * an image row: pulsar_kvchain_persist ends at the first block), and in both
+     * cases image_continuation_place re-derives every image's start_pos on the
+     * effective prompt -- the held ones at their live blocks, the rest expanded
+     * from their placeholders in the suffix -- so the engine merges them where
+     * their blocks fall.  Before L273 the disk resolver was off for it: the pair
+     * 2026-10-06 20:21, an image turn routed to a fresh bank prefilled 150k
+     * tokens cold past the sys-prefix cut where a text turn loads the chain. */
     const bool image_request = j->req.n_images > 0;
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
@@ -669,8 +672,8 @@ void server::gen_begin(session_slot *sl) {
     int disk_cached = 0;
     if (image_request) {
         server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: image request (%d image%s): live resolvers apply, disk resolver "
-                   "bypassed, cold phase covers the sys-prefix only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
+                   "pulsar-server: image request (%d image%s): live and disk resolvers apply, "
+                   "cold phase covers the sys-prefix only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
     }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
@@ -774,12 +777,27 @@ void server::gen_begin(session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    /* An effective prompt is the live tokens plus freshly tokenized request
-     * text: place the images on it -- the held ones where the live history
-     * already carries their blocks, the new ones expanded from their
-     * placeholders at their positions there.  A request whose images do not
-     * line up with the live history prefills the rendered prompt instead,
-     * said by name. */
+    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+        /* Loading a chain replaces the live bank.  Persist its history first
+         * (only the segments the store lacks), so the newer conversation state
+         * outlives the restore. */
+        s->kv_cache_persist(sl, "evict");
+    }
+    if (cached == 0) {
+        disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
+                                        &g->disk_cache_path);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-text";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    /* An effective prompt is the live (or chain-restored) tokens plus freshly
+     * tokenized request text: place the images on it -- the held ones where
+     * that history already carries their blocks, the new ones expanded from
+     * their placeholders at their positions there.  A request whose images do
+     * not line up with the history prefills the rendered prompt instead, said
+     * by name. */
     if (image_request && cached > 0 && prompt_for_sync == &effective_prompt) {
         char why[256];
         if (!image_continuation_place(s->engine, &effective_prompt, cached, j->req.images,
@@ -790,24 +808,10 @@ void server::gen_begin(session_slot *sl) {
             pulsar_tokens_free(&effective_prompt);
             prompt_for_sync = &j->req.prompt;
             cached = 0;
+            disk_cached = 0;
             cache_source = "none";
             responses_live_continuation = false;
             anthropic_live_continuation = false;
-        }
-    }
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a chain replaces the live bank.  Persist its history first
-         * (only the segments the store lacks), so the newer conversation state
-         * outlives the restore. */
-        s->kv_cache_persist(sl, "evict");
-    }
-    if (!image_request && cached == 0) {
-        disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
-                                        &g->disk_cache_path);
-        if (disk_cached > 0) {
-            cached = disk_cached;
-            cache_source = "disk-text";
-            prompt_for_sync = &effective_prompt;
         }
     }
     const bool responses_reasoning_state_preserved =
