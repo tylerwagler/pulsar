@@ -686,6 +686,22 @@ session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
 session-contract-gate-ds: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
+# L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
+# no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
+# only for a change that MEANS to move a slice.
+TP_PLAN_MODELS = $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
+.PHONY: tp-plan-gate tp-plan-golden
+tp-plan-gate: tests/tp_plan_test
+	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
+	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
+	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 2>/dev/null | diff -u $$g - >/dev/null \
+	    || { echo "TP-PLAN GATE FAIL: $$g"; exit 1; }; \
+	  echo "tp-plan: $$g ($$(grep -vc '^#' $$g) slices)"; done; done; echo "TP-PLAN GATE PASS"
+tp-plan-golden: tests/tp_plan_test
+	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
+	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
+	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 > $$g 2>/dev/null || exit 1; \
+	  echo "recorded $$g ($$(grep -vc '^#' $$g) slices)"; done; done
 
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
@@ -2286,6 +2302,10 @@ tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/tp_plan_test.o: tests/tp_plan_test.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/session_contract_gate.o: tests/session_contract_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<

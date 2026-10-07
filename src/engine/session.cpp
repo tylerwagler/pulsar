@@ -338,15 +338,9 @@ static bool tp_register_expert_half(pulsar_engine *e, const pulsar_model *m,
     cutlass_mxfp4_expert_layout(in, hi - lo, &hgd, &hgsf, &hgs);
     cutlass_mxfp4_expert_layout(mid, out, &dd, &dsf, &ds);
     cutlass_mxfp4_expert_layout(hi - lo, out, &hdd, &hdsf, &hds);
-    if (!pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, G),
-                                               tensor_map_base(m, G), G->abs_offset, n_exp,
-                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
-        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, U),
-                                               tensor_map_base(m, U), U->abs_offset, n_exp,
-                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
-        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, D),
-                                               tensor_map_base(m, D), D->abs_offset, n_exp,
-                                               mid, out, 1, lo, hi, ds, dd, hds, hdd))
+    if (!pulsar_tp_slice_mxfp4_half(e, m, G, n_exp, in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
+        !pulsar_tp_slice_mxfp4_half(e, m, U, n_exp, in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
+        !pulsar_tp_slice_mxfp4_half(e, m, D, n_exp, mid, out, 1, lo, hi, ds, dd, hds, hdd))
         return false;
     /* what the three half-stacks just built hold: n_exp experts at the half strides */
     e->tp_built_bytes += (uint64_t)n_exp * (2u * hgs + hds);
@@ -371,14 +365,9 @@ static bool tp_register_shared_split(const void *kslice_key, const pulsar_model 
     const uint64_t shared_dim = L->ffn_gate_shexp->dim[1];
     uint32_t lo = 0, hi = 0;
     if (!pulsar_tp_owned_range(rank, nr, (uint32_t)shared_dim, &lo, &hi) || hi <= lo) return false;
-    return pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_gate_shexp),
-                                                L->ffn_gate_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
-           pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_up_shexp),
-                                                L->ffn_up_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
-           pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(m, L->ffn_down_shexp),
-                                             L->ffn_down_shexp->abs_offset, shared_dim,
-                                             L->ffn_down_shexp->dim[1], lo, hi,
-                                             kslice_key, pulsar_tp_kslice_key_offset(L->ffn_down_shexp));
+    return pulsar_tp_slice_fp8_rows(m, L->ffn_gate_shexp, in_dim, shared_dim, lo, hi) &&
+           pulsar_tp_slice_fp8_rows(m, L->ffn_up_shexp, in_dim, shared_dim, lo, hi) &&
+           pulsar_tp_slice_fp8_kslice(m, L->ffn_down_shexp, shared_dim, L->ffn_down_shexp->dim[1], lo, hi, kslice_key);
 }
 
 /* The DeepSeek family's load (family.h pulsar_family::load): the tokenizer, the
@@ -487,6 +476,138 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
  * MoE tier announce and the attention / shared / routed-expert TP slices this
  * rank owns.  Moved verbatim from pulsar_engine::open (L251); runs after the
  * GPU and, on a TP group, the transport are up. */
+/* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one range authority every split shares.
+ * The unit is the group (8 heads and one LoRA-down block each), never the head: a rank's heads are whole groups,
+ * so its attn_q_b rows and its attn_output_a rows are contiguous and 128-row aligned.  One box: [0, n).  The rank
+ * is the model's (set at open from the options; the transport asserts the same), so record mode reads it too. */
+static bool ds4_tp_groups(pulsar_engine *e) {
+    const int tp_rk = e->model.tp_rank;
+    const uint32_t tp_nr = e->model.tp_n_ranks ? e->model.tp_n_ranks : 1u;
+    if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
+        e->tp_group_hi <= e->tp_group_lo) {
+        fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
+                        "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
+                tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
+        return false;
+    }
+    return true;
+}
+
+/* The DeepSeek family's tensor-parallel slices (pulsar_family::tp_slices, L272 P4b): on each layer the owned
+ * attention row slices are registered with the backend, once; the attention block then addresses them by
+ * offset like any other weight.  Every slice goes through the core's operations (tp_slice.cpp). */
+bool pulsar_ds4_tp_slices(pulsar_engine *e) {
+    if (!ds4_tp_groups(e)) return false;
+    const int tp_rk = e->model.tp_rank;
+    const uint32_t tp_nr = e->model.tp_n_ranks ? e->model.tp_n_ranks : 1u;
+    const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
+    const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
+    const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
+    const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
+    const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
+    const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
+    const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
+    const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
+    uint32_t registered = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_layer_weights *L = &e->weights.layer[il];
+        if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
+            fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
+            return false;
+        }
+        const uint64_t q_rank = L->attn_q_a->dim[1];
+        if (!pulsar_tp_slice_fp8_rows(&e->model, L->attn_q_b, q_rank, q_out_full, q_lo, q_hi) ||
+            !pulsar_tp_slice_fp8_rows(&e->model, L->attn_output_a, group_dim, a_out_full, a_lo, a_hi) ||
+            /* 4g-2: stage 'b' row-parallel -- the K-half over the same
+             * owned group columns [a_lo, a_hi) of its a_out_full input. */
+            !pulsar_tp_slice_fp8_kslice(&e->model, L->attn_output_b, a_out_full, L->attn_output_b->dim[1], a_lo,
+                                        a_hi, e)) {
+            fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
+                            "registered -- refusing\n", il);
+            return false;
+        }
+        registered += 3;
+        /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
+         * compressor and indexer projections, each rank its floor row
+         * range, gathered in one row-lane exchange per layer
+         * (tp_attn_input_split).  Only the MXFP8_LT ones need their
+         * slice registered; a bf16/f32 slice is plain offset arithmetic. */
+        {
+            static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
+                                                    "attn_compressor_gate", "indexer_compressor_kv",
+                                                    "indexer_compressor_gate", "indexer_proj" };
+            const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
+                                           L->attn_compressor_gate, L->indexer_compressor_kv,
+                                           L->indexer_compressor_gate, L->indexer_proj };
+            for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
+                const pulsar_tensor *w = ain[k];
+                if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
+                uint32_t lo = 0, hi = 0;
+                if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
+                    !pulsar_tp_slice_fp8_rows(&e->model, w, w->dim[0], w->dim[1], lo, hi)) {
+                    fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
+                                    "not be registered -- refusing\n", il, ain_name[k]);
+                    return false;
+                }
+            }
+        }
+        if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
+            fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
+                            "registered -- refusing\n", il);
+            return false;
+        }
+        registered += 3;
+        if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
+            fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
+                            "not be built -- refusing\n", il);
+            return false;
+        }
+        registered += 3;
+    }
+    for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+        if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+            fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
+                            "could not be built -- refusing\n", dl);
+            return false;
+        }
+        if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
+            fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
+                            "registered -- refusing\n", dl);
+            return false;
+        }
+        registered += 3;
+        /* 4g-1b: the drafter's attention head-split exactly like a
+         * target layer's -- attn_q_b rows and attn_output_a rows of the
+         * owned groups, attn_output_b's K-half -- over the drafter's own
+         * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
+        const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
+        if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
+            !pulsar_tp_slice_fp8_rows(&e->dspark_model, DL->attn_q_b, DL->attn_q_a->dim[1], q_out_full, q_lo, q_hi) ||
+            !pulsar_tp_slice_fp8_rows(&e->dspark_model, DL->attn_output_a, group_dim, a_out_full, a_lo, a_hi) ||
+            !pulsar_tp_slice_fp8_kslice(&e->dspark_model, DL->attn_output_b, a_out_full, DL->attn_output_b->dim[1],
+                                        a_lo, a_hi, e)) {
+            fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
+                            "registered -- refusing\n", dl);
+            return false;
+        }
+        registered += 3;
+    }
+    const pulsar_layer_weights *L0 = &e->weights.layer[0];
+    uint32_t sx_lo = 0, sx_hi = 0;
+    (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
+    fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
+                    "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
+                    "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
+                    "%u layers + %u drafter blocks): %u slices registered\n",
+            tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
+            e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
+            (unsigned long long)q_lo, (unsigned long long)q_hi,
+            (unsigned long long)a_lo, (unsigned long long)a_hi,
+            sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
+            (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
+    return true;
+}
+
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
     /* One MoE-tier boot line so a silent slow tier is no longer silent:
      * the resolved expert weight types per layer (grouped-CUTLASS type-40
@@ -531,140 +652,10 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
         }
     }
 
-    /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
-     * range authority every split shares.  The unit is the group (8 heads and
-     * one LoRA-down block each), never the head: a rank's heads are whole
-     * groups, so its attn_q_b rows and its attn_output_a rows are contiguous
-     * and 128-row aligned.  On a group each layer's two owned row slices are
-     * registered with the backend here, once; the attention block then
-     * addresses them by offset like any other weight.  One box: [0, n). */
-    const int tp_rk = e->tp ? pulsar_tp_rank(e->tp) : 0;
-    const uint32_t tp_nr = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
-    if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
-        e->tp_group_hi <= e->tp_group_lo) {
-        fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
-                        "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
-                tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
-        return false;
-    }
-    if (tp_nr > 1) {
-        const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
-        const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
-        const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
-        const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
-        const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
-        uint32_t registered = 0;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const pulsar_layer_weights *L = &e->weights.layer[il];
-            if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
-                fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
-                return false;
-            }
-            const uint64_t q_rank = L->attn_q_a->dim[1];
-            if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
-                                                      L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
-                                                      L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
-                /* 4g-2: stage 'b' row-parallel -- the K-half over the same
-                 * owned group columns [a_lo, a_hi) of its a_out_full input. */
-                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
-                                                   L->attn_output_b->abs_offset, a_out_full,
-                                                   L->attn_output_b->dim[1], a_lo, a_hi,
-                                                   e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
-                fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
-                                "registered -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-            /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
-             * compressor and indexer projections, each rank its floor row
-             * range, gathered in one row-lane exchange per layer
-             * (tp_attn_input_split).  Only the MXFP8_LT ones need their
-             * slice registered; a bf16/f32 slice is plain offset arithmetic. */
-            {
-                static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
-                                                        "attn_compressor_gate", "indexer_compressor_kv",
-                                                        "indexer_compressor_gate", "indexer_proj" };
-                const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
-                                               L->attn_compressor_gate, L->indexer_compressor_kv,
-                                               L->indexer_compressor_gate, L->indexer_proj };
-                for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
-                    const pulsar_tensor *w = ain[k];
-                    if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
-                    uint32_t lo = 0, hi = 0;
-                    if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
-                        !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, w), w->abs_offset,
-                                                              w->dim[0], w->dim[1], lo, hi)) {
-                        fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
-                                        "not be registered -- refusing\n", il, ain_name[k]);
-                        return false;
-                    }
-                }
-            }
-            if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
-                                "registered -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-            if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
-                                "not be built -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-        }
-        for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
-            if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
-                                "could not be built -- refusing\n", dl);
-                return false;
-            }
-            if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
-                                "registered -- refusing\n", dl);
-                return false;
-            }
-            registered += 3;
-            /* 4g-1b: the drafter's attention head-split exactly like a
-             * target layer's -- attn_q_b rows and attn_output_a rows of the
-             * owned groups, attn_output_b's K-half -- over the drafter's own
-             * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
-            const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
-            if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_q_b),
-                                                      DL->attn_q_b->abs_offset, DL->attn_q_a->dim[1],
-                                                      q_out_full, q_lo, q_hi) ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_output_a),
-                                                      DL->attn_output_a->abs_offset, group_dim, a_out_full,
-                                                      a_lo, a_hi) ||
-                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->dspark_model, DL->attn_output_b),
-                                                   DL->attn_output_b->abs_offset, a_out_full,
-                                                   DL->attn_output_b->dim[1], a_lo, a_hi,
-                                                   e, pulsar_tp_kslice_key_offset(DL->attn_output_b))) {
-                fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
-                                "registered -- refusing\n", dl);
-                return false;
-            }
-            registered += 3;
-        }
-        const pulsar_layer_weights *L0 = &e->weights.layer[0];
-        uint32_t sx_lo = 0, sx_hi = 0;
-        (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
-        fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                        "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
-                        "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
-                        "%u layers + %u drafter blocks): %u slices registered\n",
-                tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
-                e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
-                (unsigned long long)q_lo, (unsigned long long)q_hi,
-                (unsigned long long)a_lo, (unsigned long long)a_hi,
-                sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
-                (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
-    }
+    /* the rank's attention output groups (from the model's TP group, which the transport asserts), then
+     * the rank's slices (L272 P4b: the family's tp_slices op, through the core's slice operations) */
+    if (!ds4_tp_groups(e)) return false;
+    if (e->model.tp_n_ranks > 1 && !pulsar_ds4_tp_slices(e)) return false;
     return true;
 }
 

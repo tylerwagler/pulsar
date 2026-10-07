@@ -648,7 +648,7 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
 /* The ops that exist, announced once at open (rule 5): which of the forward's
  * ops this build carries, so a log says what a Qwen engine CAN run. */
 static bool qwen_family_after_gpu(pulsar_engine *e) {
-    if (!pulsar_qwen_tp_build(e)) return false;
+    if (!pulsar_qwen_tp_build(e)) return false;   /* the family's tp_slices op (a no-op on one GPU) */
     char have[256] = "", missing[256] = "";
     for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) {
         char *dst = qwen_op_present(&g_qwen_ops, (pulsar_qwen_op_id)op) ? have : missing;
@@ -1526,5 +1526,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .spec         = */ &k_qwen_spec_target,
     /* .session      = */ &k_qwen_session_ops,
     /* .tokenizer    = */ &k_qwen_tokenizer,
+    /* .tp_slices    = */ pulsar_qwen_tp_build,
     /* .banks        = */ &k_qwen_bank_ops,
 };

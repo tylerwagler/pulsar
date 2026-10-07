@@ -106,7 +106,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
     if (pulsar_qwen_tp(s) == 1) return true;
     const pulsar_model *m = &e->model;
     pulsar_qwen_weights *w = e->qwen_weights;
-    w->tp = new pulsar_qwen_tp_slices();
+    if (!pulsar_tp_recording()) w->tp = new pulsar_qwen_tp_slices();
     const uint32_t nr = pulsar_qwen_tp(s);
     const int rank = (int)s->tp_rank;
     /* L272 P0: every range from the ONE range rule (pulsar_tp_owned_range, as DeepSeek's slices and
@@ -131,15 +131,11 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
     const col_ranges vcols = {{vt.lo, vt.hi}};
     uint64_t built = 0;
     bool ok = true;
-    auto put = [&](const pulsar_tensor *t, const std::vector<uint8_t> &bytes) {
-        pulsar_gpu_tensor *g = pulsar_gpu_tensor_alloc(bytes.size());
-        if (!g || !pulsar_gpu_tensor_write(g, 0, bytes.data(), bytes.size())) {
-            pulsar_gpu_tensor_free(g);
-            ok = false;
-            return;
-        }
-        w->tp->by_tensor[t] = g;
-        built += bytes.size();
+    /* L272 P4b: a host-built slice through the core's operation (record mode keeps nothing) */
+    auto put = [&](const pulsar_tensor *t, const std::vector<uint8_t> &bytes, const char *how) {
+        pulsar_gpu_tensor *g = pulsar_tp_slice_built(t, how, bytes.data(), bytes.size(), &ok);
+        if (g) w->tp->by_tensor[t] = g;
+        if (ok) built += bytes.size();
     };
     auto cols = [&](const pulsar_tensor *t, const col_ranges &c) {
         if (!t || !ok) return;
@@ -150,7 +146,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
             ok = false;
             return;
         }
-        put(t, b);
+        put(t, b, "exl3_cols");
     };
     auto rows = [&](const pulsar_tensor *t, uint64_t k0, uint64_t k1) {
         if (!t || !ok) return;
@@ -161,7 +157,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
             ok = false;
             return;
         }
-        put(t, b);
+        put(t, b, "exl3_rows");
     };
     const uint32_t n_state = e->plan.n_layer + (w->mtp.present ? 1u : 0u);
     for (uint32_t il = 0; ok && il < n_state; il++) {
@@ -175,7 +171,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
             const uint8_t *src = (const uint8_t *)tensor_data(m, L.gdn_conv);
             std::vector<uint8_t> b;
             for (const auto &c : qkv) b.insert(b.end(), src + c.first * ck, src + c.second * ck);
-            if (ok) put(L.gdn_conv, b);
+            if (ok) put(L.gdn_conv, b, "bf16_channels");
         }
         if (L.attn_q) {
             cols(L.attn_q, {{qin.lo, qin.hi}});
@@ -193,8 +189,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
                 continue;
             }
             const uint64_t stride = t->bytes / s->n_expert, bytes = (uint64_t)(ex.hi - ex.lo) * stride;
-            ok = pulsar_qwen_weight_ptr(tensor_map_base(m, t), t->abs_offset + (uint64_t)ex.lo * stride, bytes,
-                                        "qwen TP expert half") != NULL;
+            ok = pulsar_tp_slice_stage_range(m, t, (uint64_t)ex.lo * stride, bytes, "qwen TP expert half");
             if (ok) built += bytes;
         }
     }
@@ -205,7 +200,7 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
     /* L272 B9: resident weights the model's staged count never sees (pulsar_engine::weights_resident_bytes) */
     e->tp_built_bytes += built;
     fprintf(stderr, "pulsar: %s TP rank %u: %zu dense slices + the expert halves built, %.2f GiB\n", PULSAR_QWEN_ARCH,
-            s->tp_rank, w->tp->by_tensor.size(), (double)built / 1073741824.0);
+            s->tp_rank, w->tp ? w->tp->by_tensor.size() : (size_t)0, (double)built / 1073741824.0);
     return true;
 }
 

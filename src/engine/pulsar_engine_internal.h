@@ -755,6 +755,8 @@ static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
  * until L251). */
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
+/* L272 P4b: DeepSeek's TP slices for this rank (the family's tp_slices op), through tp_slice.cpp */
+bool pulsar_ds4_tp_slices(pulsar_engine *e);
 int pulsar_ds4_session_create(pulsar_session *s);
 void pulsar_ds4_session_destroy(pulsar_session *s);
 uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
@@ -2996,6 +2998,28 @@ void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
 void pulsar_load_refuse(void);
 uint32_t pulsar_load_refusals(void);
 void pulsar_load_refusals_reset(void);
+
+/** L272 P4b: the tensor-parallel slice operations (tp_slice.cpp).  Record mode writes one canonical line per
+ *  slice to `f` instead of touching the device (tests/tp_plan_test.cpp). */
+void pulsar_tp_record_begin(FILE *f);
+void pulsar_tp_record_end(void);
+bool pulsar_tp_recording(void);
+/** Rows [lo, hi) of an MXFP8_LT weight [out_full][in_dim] (a column-parallel split). */
+bool pulsar_tp_slice_fp8_rows(const pulsar_model *m, const pulsar_tensor *t, uint64_t in_dim, uint64_t out_full,
+                              uint64_t lo, uint64_t hi);
+/** Input columns [lo, hi) of an MXFP8_LT weight (a row-parallel split), keyed by (key, the tensor). */
+bool pulsar_tp_slice_fp8_kslice(const pulsar_model *m, const pulsar_tensor *t, uint64_t in_full, uint64_t out_dim,
+                                uint64_t lo, uint64_t hi, const void *key);
+/** The half [lo, hi) of every expert of a routed CUTLASS MXFP4 stack (rows, or input columns when k_half). */
+bool pulsar_tp_slice_mxfp4_half(const void *key_map, const pulsar_model *m, const pulsar_tensor *t, uint32_t n_expert,
+                                uint64_t k, uint64_t n, int k_half, uint64_t lo, uint64_t hi, uint64_t src_stride,
+                                uint64_t src_data, uint64_t dst_stride, uint64_t dst_data);
+/** A slice built on the host (`how`: its gather), on the device -- NULL while recording, or on a failure (`*ok`). */
+pulsar_gpu_tensor *pulsar_tp_slice_built(const pulsar_tensor *t, const char *how, const uint8_t *bytes, size_t n,
+                                         bool *ok);
+/** A contiguous range of a stored stack staged as is (a rank's whole experts). */
+bool pulsar_tp_slice_stage_range(const pulsar_model *m, const pulsar_tensor *t, uint64_t rel, uint64_t bytes,
+                                 const char *what);
 
 /** L272 P4: a tensor's ROLE in the forward, declared by its family (weight_format.cpp). */
 typedef enum {

@@ -40,6 +40,7 @@ __pycache__/
 /tests/sse_golden
 /tests/spec_teacher_forced_probe
 /tests/session_contract_gate
+/tests/tp_plan_test
 /tests/qwen_s4_gate
 /tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe

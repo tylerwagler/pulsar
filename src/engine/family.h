@@ -216,6 +216,10 @@ struct pulsar_family {
     const pulsar_family_session_ops *session;
     /** The tokenizer and chat front (L272 P2), or NULL = none. */
     const pulsar_family_tokenizer *tokenizer;
+    /** L272 P4b: this rank's tensor-parallel slices of the loaded model (the rank and group are the model's,
+     *  e->model.tp_rank / tp_n_ranks), through the core's slice operations (tp_slice.cpp) -- run after the GPU is up,
+     *  or in record mode on an inspect-only engine (tests/tp_plan_test.cpp).  NULL = the family has no TP. */
+    bool (*tp_slices)(pulsar_engine *e);
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
 };
