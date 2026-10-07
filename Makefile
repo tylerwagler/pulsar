@@ -689,7 +689,10 @@ session-contract-gate-ds: tests/session_contract_gate
 # L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
 # no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
 # only for a change that MEANS to move a slice.
-TP_PLAN_MODELS = $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
+# DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
+# (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
+TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
+TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(QWEN_GATE_MODEL)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
 	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
