@@ -35,7 +35,8 @@ def stop(rc, why):
     if rc:
         print("--- server log tail ---\n" + open(log_path, "rb").read()[-2000:].decode("utf-8", "replace"))
     shutil.rmtree(d, ignore_errors=True)
-    os._exit(rc)   # the two decode threads are still streaming
+    sys.stdout.flush()   # os._exit skips the interpreter's flush
+    os._exit(rc)         # the two decode threads are still streaming
 
 
 t0 = time.time()
