@@ -37,7 +37,9 @@ namespace {
 constexpr int kH = PULSAR_QWEN_HIDDEN;
 constexpr int kE = PULSAR_QWEN_N_EXPERT;
 constexpr int kTopK = PULSAR_QWEN_TOPK;
-constexpr int kRouterTB = 8;                      ///< tokens per router CTA row
+constexpr int kRouterTB = 32;                     ///< tokens per router CTA row (L284: 8 re-read the activations
+                                                   ///< once per 8 experts -- 5% of a prefill; same per-token arithmetic)
+constexpr int kRouterWarps = 16;                   ///< experts (warps) per router CTA
 static_assert(kH % 256 == 0, "the router's uint4 walk covers the row in whole warps");
 static_assert(kE % 32 == 0, "the top-k warp holds E / 32 logits per lane");
 
@@ -53,15 +55,15 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
     }
 }
 
-/* One warp per expert row (row kE = the shared-expert gate), kRouterTB tokens
- * per CTA row.  Lane l owns the uint4 chunks l, l + 32, ... of the row and
+/* One warp per expert row (row kE = the shared-expert gate), kRouterWarps experts and kRouterTB tokens
+ * per CTA.  Lane l owns the uint4 chunks l, l + 32, ... of the row and
  * accumulates each token's partial in chunk order; the xor tree then sums the
  * lanes.  A token's logit is the same arithmetic at any T. */
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(kRouterWarps * 32)
 qwen_router_logits_kernel(const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ wr,
                           const __nv_bfloat16 *__restrict__ wsg, int T, float *__restrict__ logits) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = blockIdx.x * 8 + warp;
+    const int e = blockIdx.x * kRouterWarps + warp;
     if (e > kE) return;                           /* whole warps */
     const int t0 = blockIdx.y * kRouterTB;
     const int nt = min(kRouterTB, T - t0);
@@ -312,8 +314,8 @@ extern "C" int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t 
         fprintf(stderr, "pulsar: qwen router: bf16 rows must be 16-byte aligned -- refusing\n");
         return -1;
     }
-    const dim3 lg((kE + 1 + 7) / 8, (T + kRouterTB - 1) / kRouterTB);
-    qwen_router_logits_kernel<<<lg, 256, 0, stream>>>((const __nv_bfloat16 *)x_bf16, (const __nv_bfloat16 *)router_w,
+    const dim3 lg((kE + 1 + kRouterWarps - 1) / kRouterWarps, (T + kRouterTB - 1) / kRouterTB);
+    qwen_router_logits_kernel<<<lg, kRouterWarps * 32, 0, stream>>>((const __nv_bfloat16 *)x_bf16, (const __nv_bfloat16 *)router_w,
                                                       (const __nv_bfloat16 *)shared_gate_w, T, logits);
     qwen_router_topk_kernel<<<(T + 3) / 4, 128, 0, stream>>>(logits, T, selected, weights, sgate);
     return launch_ok("router") ? 0 : -3;
