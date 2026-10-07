@@ -826,6 +826,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
              indexer-score-check attn-pack-fixture-check tp-core-test
 	./pulsar-eval --self-test-extractors
+	cd tools/container && python3 test_exl3_rates.py   # L272 P4a: the builder's EXL3 rate table == the engine's
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
 # ORDER cost bandwidth?  Model-free and standalone -- it allocates one real IQ2
@@ -1105,7 +1106,7 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_names.py test_kv.py test_producers.py test_qwen.py; do \
+	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_qwen.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
