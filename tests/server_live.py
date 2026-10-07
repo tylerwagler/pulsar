@@ -200,7 +200,7 @@ def c7():
 
 
 def c8():
-    d, dt = post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "temperature": 0, "messages": [
+    d, dt = post("/v1/chat/completions", {"model": "m", "max_tokens": 1024, "temperature": 0, "messages": [
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG_B64}},
             {"type": "text", "text": "What color is the circle in this image? Answer with one word."}]}]})
