@@ -5984,6 +5984,25 @@ static void test_l264_route_in_place(void) {
  * a completed exchange precedes it.  Claude Code's session recap, subagent
  * summaries and tool-use summaries share the conversation through that marker
  * and diverge inside the last user turn. */
+/* L273 (3): an image request's cold phase is the plain text sync up to the sys-prefix cut, so it is kept only
+ * when every image begins at or past the cut; one that begins inside it drops the phase (the main pass merges from
+ * token 0) and is named. */
+static void test_l273_image_cold_cut(void) {
+    pulsar_image_ref imgs[2] = {};
+    int inside = 7;
+    imgs[0].start_pos = 5000;
+    imgs[1].start_pos = 6000;
+    TEST_ASSERT(server_image_cold_cut(4096, imgs, 2, &inside) == 4096 && inside == -1);
+    imgs[0].start_pos = 4096;   /* a block that begins AT the cut is past it */
+    TEST_ASSERT(server_image_cold_cut(4096, imgs, 2, &inside) == 4096 && inside == -1);
+    imgs[1].start_pos = 4095;   /* the second image begins inside: no cold phase, and it is the one named */
+    TEST_ASSERT(server_image_cold_cut(4096, imgs, 2, &inside) == 0 && inside == 1);
+    imgs[0].start_pos = 12;
+    TEST_ASSERT(server_image_cold_cut(4096, imgs, 2, &inside) == 0 && inside == 0);
+    TEST_ASSERT(server_image_cold_cut(0, imgs, 2, &inside) == 0 && inside == -1);   /* no cut, nothing to drop */
+    TEST_ASSERT(server_image_cold_cut(4096, NULL, 0, &inside) == 4096 && inside == -1);
+}
+
 static void test_l275_route_turn_anchor(void) {
     const int user = 9001, assistant = 9002;
     const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
@@ -8233,6 +8252,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_slot_route_trivial_match_decision();
     test_l264_route_in_place();
     test_l275_route_turn_anchor();
+    test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
