@@ -2174,7 +2174,7 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
-tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/engine/pulsar_engine_internal.h src/pulsar.h src/lib/pulsar_segstore.h
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h

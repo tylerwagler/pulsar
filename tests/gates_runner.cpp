@@ -550,7 +550,7 @@ int main(int argc, char **argv) {
      * next-step logits.  Same engine config as the prefill gate (chunk 4096,
      * drafter off), so it runs beside it. */
     const gate_spec chunk_neutrality = {"cuda-chunk-neutrality-gate", gate_chunk_neutrality_gate_main, 1, NULL, NULL,
-                                        {NULL}, DS4};
+                                        {NULL}, NEED_TOKENIZER};
     /* The reference gates are built per model, from its anchors (the hosted-model loop below); their names are
      * fixed here for the selection. */
     static const char *const ref_names[4] = {"cuda-reference-gate-story", "cuda-reference-gate-code",
