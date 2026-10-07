@@ -9,8 +9,11 @@
  *
  * What a recurrent state cannot do is refused in engine_api.cpp, each with the value the server
  * already has a path for: forks (PULSAR_FORK_RING_SCROLLED -- permanently infeasible, so the router
- * takes a fresh bank or prefills cold in place), per-bank KV spill and physical residency (the
- * touched-KV count is 0, so the guard never spills). */
+ * takes a fresh bank or prefills cold in place), per-bank KV spill and physical residency.  The
+ * touched-KV count is NOT 0 (L270: a bank's KV high-water, below), so the server's 2b guard does pick
+ * Qwen victims; pulsar_session_bank_free_physical refuses them (one managed tensor per layer holds
+ * every bank's KV, and on GB10 only a cudaFree returns physical), so a breach ends in back-pressure
+ * with the touched pages still resident (L284 #3). */
 #include "pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include "spec_internal.h"
