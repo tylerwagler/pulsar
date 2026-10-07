@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     char err[512] = "";
     int rc = 1;
     pulsar_session *s = NULL;
-    if (!pulsar_expand_image_placeholders(e, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(e, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         printf("IMAGE CHAT SMOKE FAIL: the expansion refused: %s\n", err);
     } else if (pulsar_session_create(&s, e, prompt.len + max_new + 64) != 0) {
         printf("IMAGE CHAT SMOKE FAIL: no session\n");

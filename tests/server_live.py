@@ -253,17 +253,20 @@ def c10():
 
 
 def c11():
-    shared = "Reference notes: " + " ".join("entry%d" % i for i in range(700))
+    # A persists a chain to the grid point below its prompt's end; B repeats A's message and asks on, so B's prefix
+    # holds that whole chain.  A's long answer moves its bank's frontier past the protect floor: B routes to a fresh
+    # bank, where only the disk chain can serve it.
+    shared = ("Reference notes: " + " ".join("entry%d" % i for i in range(700)) +
+              "\nDescribe the picture in about 150 words.")
 
-    def ask(tail):
-        return {"model": "m", "max_tokens": 1024, "temperature": 0, "messages": [{"role": "user", "content": [
+    def ask(text):
+        return {"model": "m", "max_tokens": 2048, "temperature": 0, "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG_B64}},
-            {"type": "text", "text": shared + "\n" + tail}]}]}
+            {"type": "text", "text": text}]}]}
 
-    # A's own tail is long enough that B (diverging there) does not continue A's bank in place
-    post("/v1/chat/completions", ask(" ".join("aside%d" % i for i in range(300)) + "\nWhat colour is the circle? One word."))
+    post("/v1/chat/completions", ask(shared))
     seen = os.path.getsize(log_path)
-    d, dt = post("/v1/chat/completions", ask("What colour is the shape in the picture? Answer with one word."))
+    d, dt = post("/v1/chat/completions", ask(shared + " Then, on its own line, name the circle's colour in one word."))
     j = json.loads(d)
     txt = j["choices"][0]["message"].get("content") or ""
     cached = (j.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens") or 0
@@ -272,7 +275,7 @@ def c11():
         new = f.read().decode("utf-8", "replace")
     hit = "kv cache hit" in new
     check(hit and cached >= 1024 and "red" in txt.lower(),
-          "image disk chain on a fresh bank (hit=%s, cached %d) -> %r (%.1fs)" % (hit, cached, txt[:60], dt))
+          "image disk chain on a fresh bank (hit=%s, cached %d) -> %r (%.1fs)" % (hit, cached, txt[-60:], dt))
 
 
 for n, f in (("plain", c1), ("forced", c2), ("forced-stream", c3), ("continuation", c4), ("required", c5),

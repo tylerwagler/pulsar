@@ -2210,10 +2210,11 @@ int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine 
                              const pulsar_image_identity *id);
 
 /* ---- L268: the image path every family shares (image_front.cpp) ---- */
-/** Replace each placeholder token in `prompt` by its image's block (appended to `out`, which the caller owns and
- *  passes empty) and set each image's start_pos.  false + `err` (a client condition): no tower bound, no
- *  placeholder token, a count mismatch, an image the family cannot prepare. */
-bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, pulsar_image_ref *images,
+/** Replace each placeholder token in `prompt` at or past `from` by its image's block (appended to `out`, which the
+ *  caller owns and passes empty) and set each image's start_pos; [0, from) is copied unchanged (a continuation's
+ *  held history).  false + `err` (a client condition): no tower bound, no placeholder token, a count mismatch, an
+ *  image the family cannot prepare. */
+bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, int from, pulsar_image_ref *images,
                          int n_images, pulsar_tokens *out, char *err, size_t errlen);
 /** Every image names a block the prompt carries and every block fits one prefill chunk of `chunk_cap` rows;
  *  *end_out = the exclusive end of the last block.  The ONE statement of the rule (sync, TP preflight, planner). */

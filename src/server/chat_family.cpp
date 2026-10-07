@@ -73,7 +73,7 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
      * happens again on every turn even when the KV rows are reused.  Timed here
      * because it is the thing a prepared-span cache would remove (L226). */
     const double vp_t0 = server_now_sec();
-    if (!pulsar_expand_image_placeholders(e, &r->prompt, r->images, r->n_images,
+    if (!pulsar_expand_image_placeholders(e, &r->prompt, 0, r->images, r->n_images,
                                           &expanded, err, errlen)) {
         return false;
     }

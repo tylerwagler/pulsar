@@ -197,7 +197,7 @@ bool pulsar_image_spans_fit(const pulsar_engine *e, const int32_t *ids, int n, c
     return true;
 }
 
-bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, pulsar_image_ref *images,
+bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, int from, pulsar_image_ref *images,
                          int n_images, pulsar_tokens *out, char *err, size_t errlen) {
     const pulsar_family_vision *v = front_of(e);
     if (!v) {
@@ -215,9 +215,15 @@ bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, pu
         snprintf(err, errlen, "the tokenizer has no image placeholder token (\"%s\")", v->placeholder_text);
         return false;
     }
-    /* Count first so a mismatch reports both numbers. */
+    if (from < 0 || from > prompt->len) {
+        snprintf(err, errlen, "the expansion starts at %d, outside the %d-token prompt", from, prompt->len);
+        return false;
+    }
+    /* Below `from` is history whose blocks are already expanded -- and a family whose placeholder is also its block
+     * token (Qwen's <|image_pad|>) would read a held block's rows as placeholders.  Count first so a mismatch reports
+     * both numbers. */
     int seen = 0;
-    for (int i = 0; i < prompt->len; i++) seen += prompt->v[i] == placeholder;
+    for (int i = from; i < prompt->len; i++) seen += prompt->v[i] == placeholder;
     if (seen != n_images) {
         snprintf(err, errlen, "the prompt carries %d image placeholder(s) but the request has %d image(s)", seen,
                  n_images);
@@ -225,7 +231,7 @@ bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, pu
     }
     int next = 0;
     for (int i = 0; i < prompt->len; i++) {
-        if (prompt->v[i] != placeholder) {
+        if (i < from || prompt->v[i] != placeholder) {
             pulsar_tokens_push(out, prompt->v[i]);
             continue;
         }

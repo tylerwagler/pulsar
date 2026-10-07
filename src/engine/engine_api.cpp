@@ -760,7 +760,7 @@ int pulsar_session_persist_end(pulsar_session *s) {
                                     &s->live_images);
 }
 
-int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
+int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen) {
     PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_VISION, "image placeholders", 0);
@@ -770,7 +770,7 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
         return 0;
     }
     /* L268: the family's front, through the core's walk (image_front.cpp) */
-    const bool ok = pulsar_image_expand(e, prompt, images, n_images, out, err, errlen);
+    const bool ok = pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen);
     if (!ok) pulsar_tokens_free(out);
     return ok ? 1 : 0;
 }

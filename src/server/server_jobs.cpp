@@ -606,7 +606,7 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
     }
     for (int i = 0; i < held; i++) images[i].start_pos = starts[i];
     pulsar_tokens out = {0};
-    if (!pulsar_expand_image_placeholders(e, eff, images + held, n_images - held, &out, why, whylen))
+    if (!pulsar_expand_image_placeholders(e, eff, live_len, images + held, n_images - held, &out, why, whylen))
         return false;
     pulsar_tokens_free(eff);
     *eff = out;

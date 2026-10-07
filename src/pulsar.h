@@ -544,8 +544,11 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images,
                            char *err, size_t errlen);
 /** The renderer's half of prepare_vl_inputs(), and the ONLY producer of the
- * out-of-vocab sentinel ids the engine's mm prefill consumes: walk `prompt` and
- * replace every PULSAR_IMAGE_PLACEHOLDER token with that image's sentinel block,
+ * sentinel blocks the engine's mm prefill consumes: walk `prompt` from `from`
+ * and replace every placeholder token with that image's block (the family's
+ * geometry); [0, from) is copied unchanged -- 0 for a rendered prompt, the live
+ * length for a continuation whose held history already carries its blocks (a
+ * family's placeholder may be its block token: Qwen's <|image_pad|>),
  * in request order, setting `images[i].start_pos` to the block's first slot
  * (the token count at that moment; see pulsar_image_ref).
  *
@@ -559,7 +562,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
  *
  * The engine's sync API is BLOCK-based, so this call must happen before it: a
  * placeholder id reaching pulsar_session_sync_mm() is a caller bug. */
-int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
+int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen);
 /** The image BLOCKS already present in tokens [0, len), by the engine's family's geometry: writes each block's

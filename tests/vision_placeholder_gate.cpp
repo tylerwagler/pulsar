@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
         pulsar_image_ref img = { enc.data(), enc.size(), -1 };
         int bad = 0;
         char err[256] = "";
-        if (!pulsar_image_expand(e, &in, &img, 1, &out, err, sizeof err)) {
+        if (!pulsar_image_expand(e, &in, 0, &img, 1, &out, err, sizeof err)) {
             printf("  FAIL case %u: expander refused a valid prompt: %s\n", c, err);
             bad++;                     /* every later check is guarded on !bad */
         }
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
         /* a placeholder/image count mismatch is refused, not guessed */
         if (!bad) {
             pulsar_tokens o2 = {};
-            if (pulsar_image_expand(e, &in, NULL, 0, &o2, err, sizeof err)) {
+            if (pulsar_image_expand(e, &in, 0, NULL, 0, &o2, err, sizeof err)) {
                 printf("  FAIL case %u: a prompt with a placeholder and zero images was accepted\n", c);
                 bad++;
             }

@@ -881,7 +881,7 @@ static void test_image_span_cache_is_transparent(void) {
     }
     char err[256] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-span-cache gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
@@ -966,7 +966,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
     }
     char err[256] = {0};
     pulsar_tokens turn1 = {0};
-    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, &img, 1, &turn1, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, 0, &img, 1, &turn1, err, sizeof err)) {
         fprintf(stderr, "image-reuse gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&turn1_raw);
         return;
@@ -1072,7 +1072,7 @@ static void test_image_prefill_interrupt_resumes(void) {
     }
     char err[256] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-interrupt gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
@@ -1157,7 +1157,7 @@ static void test_image_chain_round_trip(void) {
     }
     char err[384] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-chain gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
