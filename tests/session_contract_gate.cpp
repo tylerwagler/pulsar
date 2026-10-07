@@ -78,18 +78,18 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const pulsar_tokens
     return out;
 }
 
-/* C5's hooks: the progress events heard, and a cancel hook that stops at its `stop_at`-th poll */
+/* C5's hooks: the progress events heard, and a cancel hook that stops at the first poll after a chunk has
+ * landed -- family-neutral (a family's sync may poll more than its walk does, e.g. once before any work) */
 struct c5_hooks {
     std::vector<int> chunk_events;
-    int polls = 0;
-    int stop_at = 0;
 };
 static void c5_progress(void *ud, const char *event, int current, int) {
     if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current);
 }
 static bool c5_cancel(void *ud) {
-    c5_hooks *h = (c5_hooks *)ud;
-    return ++h->polls == h->stop_at;
+    const c5_hooks *h = (const c5_hooks *)ud;
+    for (int e : h->chunk_events) if (e > 0) return true;   /* a chunk landed: stop at this boundary */
+    return false;
 }
 
 #define TRACE(s, what) printf("    [%s] pos %d | bank_pos 0:%d 1:%d\n", what, pulsar_session_pos(s), pulsar_session_bank_pos(s, 0), pulsar_session_bank_pos(s, 1))
@@ -284,7 +284,6 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
         if (made) {
             CHECK(pulsar_session_prefill_quantum_min_suffix(s) == 1, "C5 the server may interrupt this family's prefill");
             c5_hooks h;
-            h.stop_at = 2;   /* poll 1 is before the first chunk, poll 2 after it: stop at 256 */
             pulsar_session_set_progress(s, c5_progress, &h);
             pulsar_session_set_cancel(s, c5_cancel, &h);
             const int rc1 = pulsar_session_sync(s, &P, err, sizeof(err));
@@ -429,7 +428,9 @@ static void part_banks(pulsar_engine *e, int W) {
     /* B6 (L272 P1 S4): a verify step over several banks' runs -- the speculation lane's step, every row headed --
      * gives each bank the rows its run gives verified alone, byte for byte: bank 0's run [ta, 11, 12] and bank 1's
      * [tb, 13] in one step against each in a one-bank session */
-    {
+    if (!pulsar_engine_has_spec_rounds(e)) {
+        printf("  skip  B6 (no drafter on this model: a verify step needs one)\n");
+    } else {
         const int runA[3] = {ta, 11, 12}, runB[2] = {tb, 13};
         auto solo = [&](const pulsar_tokens *P, const int *run, int nr) {
             std::vector<float> rows;

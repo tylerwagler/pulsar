@@ -680,7 +680,7 @@ qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
 # L272 P5: the session contract every family meets, on REAL weights (tests/session_contract_gate.cpp: chunk
 # neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
 # zero-weight family gate above proves wiring only.  A new family adds one line here.
-QWEN_GATE_MODEL ?= /srv/models/qwen38fn-td405
+QWEN_GATE_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp   # the served quant, MTP sidecar included (B6 needs a drafter)
 .PHONY: session-contract-gate-qwen session-contract-gate-ds
 session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
