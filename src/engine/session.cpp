@@ -1189,36 +1189,39 @@ int pulsar_ds4_session_create(pulsar_session *s) {
         fprintf(stderr, "pulsar: no transformer layers are loaded\n");
         return 1;
     }
-    if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
+    s->graph = (pulsar_gpu_graph *)xcalloc(1, sizeof(*s->graph));   /* L272 P6: the family's own */
+    if (!gpu_graph_alloc_raw_cap(s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    gpu_graph_bank_pool_n(), e->dspark_ready))
     {
+        free(s->graph);
+        s->graph = NULL;
         return 1;
     }
-    if (!gpu_graph_load_directional_steering(&s->graph,
+    if (!gpu_graph_load_directional_steering(s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
-        gpu_graph_free(&s->graph);
+        pulsar_ds4_session_destroy(s);
         return 1;
     }
     /* Borrow the engine's TP transport into the graph so the prefill big-gate
      * call sites can reach it without threading the engine through every
      * gpu_graph entry point (slice 4b).  NULL when the pair is not armed. */
-    s->graph.tp = e->tp;
-    s->graph.tp_group_lo = e->tp_group_lo;
-    s->graph.tp_group_hi = e->tp_group_hi;
-    s->graph.tp_slab_dev = e->tp_slab_dev;
-    s->graph.tp_bulk_dev = e->tp_bulk_dev;
-    s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
-    if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
-        gpu_graph_free(&s->graph);
+    s->graph->tp = e->tp;
+    s->graph->tp_group_lo = e->tp_group_lo;
+    s->graph->tp_group_hi = e->tp_group_hi;
+    s->graph->tp_slab_dev = e->tp_slab_dev;
+    s->graph->tp_bulk_dev = e->tp_bulk_dev;
+    s->graph->tp_kslice_key = e->tp ? (const void *)e : NULL;
+    if (!session_alloc_tp_scratch(s->graph, e->tp)) {
+        pulsar_ds4_session_destroy(s);
         return 1;
     }
     if (e->dspark_ready) {
-        if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
+        if (!gpu_graph_init_dspark_target(s->graph, e->dspark_weights.target_layer_ids)) {
             fprintf(stderr, "pulsar: failed to allocate DSpark graph buffers\n");
-            gpu_graph_free(&s->graph);
+            pulsar_ds4_session_destroy(s);
             return 1;
         }
     }
@@ -1285,7 +1288,7 @@ uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
 uint64_t pulsar_session::touched_kv_bytes() const {
     auto *s = this;
     if (!s) return 0;
-    return gpu_graph_touched_kv_bytes(&s->graph);
+    return gpu_graph_touched_kv_bytes(s->graph);
 }
 
 
@@ -1306,7 +1309,10 @@ void pulsar_session::destroy() {
 
 
 void pulsar_ds4_session_destroy(pulsar_session *s) {
-    gpu_graph_free(&s->graph);
+    if (!s->graph) return;
+    gpu_graph_free(s->graph);
+    free(s->graph);
+    s->graph = NULL;
 }
 
 
@@ -1462,7 +1468,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
         /* Before any state moves: a block that cannot sit whole in one chunk is
          * refused here (and by the TP leader before it mirrors anything). */
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph->prefill_cap,
                               &image_barrier, err, errlen))
             return 1;
         /* L226 + L261: reuse the live KV across an image request.  The images the
@@ -1534,7 +1540,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * the seam rescue's rewind+stitch, and a history this bank does not hold
          * rebuilds cold. */
         resume_floor = held_end > 0
-            ? pulsar_ckpt_grid_floor(&s->graph.ckpt, (uint32_t)held_end + s->graph.ckpt.ops->resume_grid - 1u)
+            ? pulsar_ckpt_grid_floor(&s->graph->ckpt, (uint32_t)held_end + s->graph->ckpt.ops->resume_grid - 1u)
             : 0u;
         const bool reuse =
             s->checkpoint_valid &&
@@ -1587,7 +1593,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         ~vision_scope() { g->vision_req = prev; }
     };
     pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
-    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
+    vision_scope vscope(s->graph, n_images > 0 ? &vreq : NULL);
 
     /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
      * carry path re-prefills from a grid point at or above the salvage floor and
@@ -1624,11 +1630,11 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * the checkpoint first: L120's clamp, applied where the stale copy is
          * consumed.  Cost: one host loop over the layers per sync. */
         {
-            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            const uint32_t bank = gpu_graph_cur_bank(s->graph);
             bool ahead = false;
             for (uint32_t il = 0; il < PULSAR_N_LAYER && !ahead; il++) {
                 if (!gpu_graph_layer_is_kv_source(il)) continue;
-                if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
+                if (gpu_graph_n_comp(s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
             if (ahead) s->rewind(s->checkpoint.len);
@@ -1658,11 +1664,11 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * live has nothing to redo; a bank with no checkpoint below G prefills
          * from 0, said once. */
         if (prompt->len > s->checkpoint.len && s->prefill_cap != 0) {
-            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            const uint32_t bank = gpu_graph_cur_bank(s->graph);
             const uint32_t ck = (uint32_t)s->checkpoint.len;
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
-            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
+            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph->ckpt, pf);
             /* the one resume rule (L272 P2; Qwen's sync and bank_resume_at read it too): the deepest
              * checkpoint within the shared prefix (ck: this path extends it) and the prefill frontier --
              * checkpoints sit on the grid, so that is the deepest at or below G */
@@ -1672,14 +1678,14 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
              * point above the last held block) is not a resume point, and the
              * prefill restarts from 0 -- every block merged again. */
             if (resume_floor > 0 && B < resume_floor) B = 0u;
-            if (G == ck && !s->graph.ms_comp_state_stale[bank]) {
+            if (G == ck && !s->graph->ms_comp_state_stale[bank]) {
                 s->resume_origin = (int)ck;   /* standing at a prefill grid point: nothing to redo */
             } else if (B > 0u && s->restore_checkpoint(B)) {
                 s->resume_origin = (int)B;
                 fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
                         ck, B, bank, ck - B);
             } else {
-                if (ck >= s->graph.ckpt.ops->resume_grid)
+                if (ck >= s->graph->ckpt.ops->resume_grid)
                     fprintf(stderr, "pulsar: resume at %u on bank %u: no grid checkpoint at or below %u -- "
                                     "prefilling the prompt from 0\n", ck, bank, G);
                 s->rewind(0);
@@ -1696,7 +1702,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 .user = s->progress,
                 .user_ud = s->progress_ud,
             };
-            bool ok = gpu_graph_prefill_chunked_range(&s->graph,
+            bool ok = gpu_graph_prefill_chunked_range(s->graph,
                                                         &e->model,
                                                         &e->weights,
                                                         prompt,
@@ -1809,7 +1815,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     bool ok;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    if (!gpu_graph_reset_prefill_state(&s->graph)) {
+    if (!gpu_graph_reset_prefill_state(s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
@@ -1838,7 +1844,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             .user = s->progress,
             .user_ud = s->progress_ud,
         };
-        ok = gpu_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
+        ok = gpu_graph_prefill_chunked(s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
                                          pulsar_session_note_prefill_progress, &progress,
                                          s->display_progress,
@@ -2192,7 +2198,7 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     /* L264: same shape for a rewind that left the bank stale -- its compressor
      * lanes and raw window describe a position it no longer stands at.  A sync
      * restores a grid checkpoint (or rebuilds from 0) and clears this. */
-    if (s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)]) {
+    if (s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)]) {
         snprintf(err, errlen,
                  "session eval after a rewind to %d: the bank's state is only valid at its grid "
                  "checkpoints; re-sync the session first", s->checkpoint.len);
@@ -2230,9 +2236,9 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
      * here weakens pulsar_session_decode_mixed's contract for its own callers. */
     int     ms_tok[1]  = { token };
     int32_t ms_pos[1]  = { (int32_t)s->checkpoint.len };
-    int32_t ms_bank[1] = { (int32_t)(s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u) };
+    int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep. */
-    const int ms_rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights,
+    const int ms_rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights,
                                                       ms_tok, ms_pos, ms_bank, 1u,
                                                       s->logits, NULL, 0u,
                                                       /*capture_cur=*/true, NULL);
@@ -2279,9 +2285,9 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
      * one at every grid chunk end, so the fused lane's prompts resume like the
      * classic sync's.  (The server's fused planners end chunks on grid points.) */
     const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % s->graph.ckpt.ops->resume_grid == 0u && G >= s->graph.ckpt.ops->min_checkpoint(s->graph.ckpt.state) &&
-        !s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)])
-        (void)pulsar_ckpt_capture(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), G);
+    if (G % s->graph->ckpt.ops->resume_grid == 0u && G >= s->graph->ckpt.ops->min_checkpoint(s->graph->ckpt.state) &&
+        !s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)])
+        (void)pulsar_ckpt_capture(&s->graph->ckpt, gpu_graph_cur_bank(s->graph), G);
     if (head >= 0)
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
                (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
@@ -2310,8 +2316,8 @@ void pulsar_session::invalidate() {
      * generated tokens (and the drafter is near-useless without a valid
      * window: masked-window eval 4.7% vs 86% top-1). Positions are
      * drafter-relative, so restarting at 0 is exact. */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
+    s->graph->dspark_prompt_n = 0;
     s->prefill_frontier = 0;   /* L195: the history is gone */
 }
 
@@ -2336,11 +2342,11 @@ void pulsar_session::rewind(int pos) {
      * be raised here.  Rows beyond the clamp are invisible (readers cap at
      * n_comp) and are rewritten by the next emit at that index; the clamp also
      * drops the grid checkpoints above pos (gpu_graph_set_n_comp). */
-    const uint32_t rw_bank = gpu_graph_cur_bank(&s->graph);
+    const uint32_t rw_bank = gpu_graph_cur_bank(s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
-        if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(&s->graph, rw_bank, il, want);
+        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
      * re-established in exactly two cases: position 0, whose state is the
@@ -2356,13 +2362,13 @@ void pulsar_session::rewind(int pos) {
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
-        pulsar_ckpt_drop_bank(&s->graph.ckpt, rw_bank);
-        ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
+        pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
+        ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
     }
-    else if (pulsar_ckpt_best(&s->graph.ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = pulsar_ckpt_restore(&s->graph.ckpt, rw_bank, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
+        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, (uint32_t)pos);
     else {
-        s->graph.ms_comp_state_stale[rw_bank] = true;
+        s->graph->ms_comp_state_stale[rw_bank] = true;
         return;
     }
     if (!ok) {
@@ -2370,7 +2376,7 @@ void pulsar_session::rewind(int pos) {
         s->checkpoint_valid = false;
         return;
     }
-    s->graph.ms_comp_state_stale[rw_bank] = false;
+    s->graph->ms_comp_state_stale[rw_bank] = false;
 }
 
 
@@ -2389,18 +2395,18 @@ void pulsar_session::trim_history(int pos) {
     spec_quench_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
+    s->graph->dspark_prompt_n = 0;
     if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
 }
 
 
 bool pulsar_session::restore_checkpoint(uint32_t G) {
     auto *s = this;
-    const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+    const uint32_t bank = gpu_graph_cur_bank(s->graph);
     if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        pulsar_ckpt_best(&s->graph.ckpt, bank, G) != G) return false;
-    if (!pulsar_ckpt_restore(&s->graph.ckpt, bank, G)) {
+        pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
+    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;
@@ -2455,7 +2461,7 @@ int pulsar_session_prefill_cap(pulsar_session *s) {
 uint32_t pulsar_session::prefill_quantum_min_suffix() const {
     auto *s = this;
     if (!s) return 0;
-    if (s->graph.prefill_cap > s->graph.raw_cap) return 0;
+    if (s->graph->prefill_cap > s->graph->raw_cap) return 0;
     /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
      * compress-ratio LCM, while a resumed (start!=0) loop snaps to absolute
      * prefill_cap boundaries. The two produce the same chunk ends only when
@@ -2470,7 +2476,7 @@ uint32_t pulsar_session::prefill_quantum_min_suffix() const {
             align *= r / a;
         }
     }
-    if (align > 1 && s->graph.prefill_cap % align != 0) return 0;
+    if (align > 1 && s->graph->prefill_cap % align != 0) return 0;
     return 1u;
 }
 

@@ -38,7 +38,7 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
         return false;
     }
     bool cancelled = false;
-    if (!gpu_graph_prefill_chunked_range(&s->graph, &s->engine->model, &s->engine->weights, toks,
+    if (!gpu_graph_prefill_chunked_range(s->graph, &s->engine->model, &s->engine->weights, toks,
                                          (uint32_t)start, (uint32_t)(end - start), s->logits,
                                          false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &cancelled)) {
         snprintf(err, errlen, "classic suffix prefill [%d, %d) failed", start, end);
@@ -131,7 +131,7 @@ static inline bool gate_width_inexact(int rows) { return rows > pulsar_gpu_matmu
  * The session does not take ownership of v. */
 static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const int *v, int len,
                                       int *argtok, const char *what) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     char err[256];
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, bank)) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
@@ -150,7 +150,7 @@ static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const in
 
 /* The pool must hold at least `need` banks; false + a message otherwise. */
 static inline bool gate_pool_fits(pulsar_session *s, uint32_t need) {
-    const uint32_t have = gpu_graph_bank_pool_count(&s->graph);
+    const uint32_t have = gpu_graph_bank_pool_count(s->graph);
     if (have >= need) return true;
     fprintf(stderr, "pool too small: %u < %u (set PULSAR_MSEQ_BANKS)\n", have, need);
     return false;

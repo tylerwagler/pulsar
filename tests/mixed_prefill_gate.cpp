@@ -60,7 +60,7 @@ static bool decode_cont(pulsar_session *s, int F, int t0, int *out){
  * grid), copy the last-position full-vocab logits, then decode NGEN. */
 static bool classic_stream(int c0, int F, int *out, float *out_lg){
     pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
-    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    pulsar_gpu_graph *g=s->graph; char e[256]; bool ok=true;
     if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
     pulsar_session_invalidate(s);
     pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
@@ -76,7 +76,7 @@ static bool classic_stream(int c0, int F, int *out, float *out_lg){
  * timed mixed-run seconds when non-NULL. */
 static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
     pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
-    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    pulsar_gpu_graph *g=s->graph; char e[256]; bool ok=true;
     if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
     pulsar_session_invalidate(s);
     pulsar_tokens p={.v=g_toks.v,.len=c0,.cap=c0};
@@ -99,7 +99,7 @@ static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
 /* classic prefill of K tokens from a c0 frontier (for the speed baseline). */
 static bool classic_prefill_time(int c0, int K, double *secs){
     pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
-    pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
+    pulsar_gpu_graph *g=s->graph; char e[256]; bool ok=true;
     if(g->banks.n_banks && !gpu_graph_bank_repoint(g,0)){ pulsar_session_free(s); return false; }
     pulsar_session_invalidate(s);
     pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};

@@ -217,7 +217,7 @@ static uint64_t session_payload_live_tensor_bytes(pulsar_gpu_graph *g, uint32_t 
  * exactly would restore.  0 when the session holds none (a short one). */
 static uint32_t payload_resume_checkpoint(pulsar_session *s) {
     const uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
-    return pulsar_ckpt_best(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), pulsar_ckpt_grid_floor(&s->graph.ckpt, pf));
+    return pulsar_ckpt_best(&s->graph->ckpt, gpu_graph_cur_bank(s->graph), pulsar_ckpt_grid_floor(&s->graph->ckpt, pf));
 }
 
 
@@ -355,7 +355,7 @@ static int payload_read_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint
 uint64_t pulsar_session::payload_bytes() {
     auto *s = this;
     if (!s || !s->checkpoint_valid) return 0;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
     bytes += (uint64_t)PULSAR_N_VOCAB * sizeof(float);   /* the frontier's logits */
@@ -398,7 +398,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         payload_set_err(err, errlen, "prefill frontier lies outside the checkpoint");
         return 1;
     }
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     if (g->ms_comp_state_stale[gpu_graph_cur_bank(g)]) {
         payload_set_err(err, errlen, "session's state is stale (rewound off its grid checkpoints); sync it first");
         return 1;
@@ -525,7 +525,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     spec_quench_reset(s);
     /* L264: same argument for the bank's grid checkpoints -- they reference the
      * rows this load overwrites. */
-    pulsar_ckpt_drop_bank(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph));
+    pulsar_ckpt_drop_bank(&s->graph->ckpt, gpu_graph_cur_bank(s->graph));
     payload_io io;
     io.fp = fp;
     payload_digest_init(&io.digest);
@@ -540,7 +540,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
     const uint32_t saved_raw_window = h[5];

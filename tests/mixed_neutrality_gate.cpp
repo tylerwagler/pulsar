@@ -262,7 +262,7 @@ static bool multirun_step_rows(const int *rpb_of, int only_bank, bool reverse, f
 static bool classic_resume(int K, float *out_lg, int *next_tok) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     char err[256]; bool ok = true;
     const int *pptr = g_toks.v + PBASE;
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, 0)) { pulsar_session_free(s); return false; }

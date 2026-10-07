@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "session create failed\n");
             return 1;
         }
-        pulsar_gpu_graph *g = &s->graph;
+        pulsar_gpu_graph *g = s->graph;
         if ((int)gpu_graph_bank_pool_count(g) < PROBE_MAX_B) {
             fprintf(stderr, "pool too small: %u < %d (set PULSAR_MSEQ_BANKS)\n",
                     gpu_graph_bank_pool_count(g), PROBE_MAX_B);

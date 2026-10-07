@@ -8,25 +8,25 @@
 bool pulsar_session::bank_free_physical(uint32_t bank) {
     auto *s = this;
     if (!s) return false;
-    return gpu_graph_bank_free_physical(&s->graph, bank);
+    return gpu_graph_bank_free_physical(s->graph, bank);
 }
 
 bool pulsar_session::bank_alloc_physical(uint32_t bank) {
     auto *s = this;
     if (!s) return false;
-    return gpu_graph_bank_alloc_physical(&s->graph, bank);
+    return gpu_graph_bank_alloc_physical(s->graph, bank);
 }
 
 bool pulsar_session::bank_is_evicted(uint32_t bank) const {
     auto *s = this;
     if (!s) return false;
-    return gpu_graph_bank_is_evicted(&s->graph, bank);
+    return gpu_graph_bank_is_evicted(s->graph, bank);
 }
 
 uint64_t pulsar_session::bank_touched_kv_bytes(uint32_t bank) {
     auto *s = this;
     if (!s) return 0;
-    return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
+    return gpu_graph_bank_touched_kv_bytes(s->graph, bank);
 }
 
 uint64_t pulsar_session::quantum_growth_bytes_per_bank(uint32_t q) {
@@ -67,7 +67,7 @@ void pulsar_session::bank_carry_free() {
  * graph's frontier counters and views; Qwen: which bank is live).  How many banks: the family's pool,
  * or DeepSeek's graph pool. */
 static uint32_t session_bank_n(pulsar_session *s) {
-    return FAMILY_BANKS(s) ? (uint32_t)FAMILY_BANKS(s)->count(s) : gpu_graph_bank_pool_count(&s->graph);
+    return FAMILY_BANKS(s) ? (uint32_t)FAMILY_BANKS(s)->count(s) : gpu_graph_bank_pool_count(s->graph);
 }
 
 static bool bank_carry_ensure(pulsar_session *s) {
@@ -81,26 +81,26 @@ static bool bank_carry_ensure(pulsar_session *s) {
 
 int pulsar_session::bank_count() {
     auto *s = this;
-    return s ? (int)gpu_graph_bank_pool_count(&s->graph) : 0;
+    return s ? (int)gpu_graph_bank_pool_count(s->graph) : 0;
 }
 
 int pulsar_session::bank_repoint(uint32_t bank) {
     auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return 1;
+    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return 1;
     /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
-    if (s->graph.banks.n_banks == 0) return bank == 0 ? 0 : 1;
-    return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
+    if (s->graph->banks.n_banks == 0) return bank == 0 ? 0 : 1;
+    return gpu_graph_bank_repoint(s->graph, bank) ? 0 : 1;
 }
 
 
 void pulsar_session::bank_state_save(uint32_t bank) {
     auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
+    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return;
     if (!bank_carry_ensure(s)) return;
     /* Graph frontier counters (attn/index comp; Option F also the drafter ring
      * counters) are captured on the graph side so a later install re-arms this
      * bank's per-bank truth. */
-    gpu_graph_bank_counters_capture(&s->graph, bank);
+    gpu_graph_bank_counters_capture(s->graph, bank);
     pulsar_bank_carry_save_view(s, bank);
 }
 
@@ -131,13 +131,13 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
 
 bool pulsar_session::bank_state_restore(uint32_t bank) {
     auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
+    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return false;
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
      * cheap and safe (per-bank truth is re-established without a re-prefill). */
-    if (s->graph.banks.n_banks != 0 && !gpu_graph_bank_repoint(&s->graph, bank))
+    if (s->graph->banks.n_banks != 0 && !gpu_graph_bank_repoint(s->graph, bank))
         return false;
-    gpu_graph_bank_counters_install(&s->graph, bank);
+    gpu_graph_bank_counters_install(s->graph, bank);
     /* No saved host state for a fresh bank: the counters_install above set the
      * (zeroed) frontier; the session's host shadow stays as the caller primed it
      * (a fresh sync just ran).  Either way, per-bank frontier truth is now

@@ -77,7 +77,7 @@ static char *read_file(const char *path) {
 }
 
 static bool bank_prefill(pulsar_session *s, int k) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     char err[256];
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) return false;
     pulsar_session_invalidate(s);
@@ -149,8 +149,8 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
      * from the temperatures would be a second copy of the min-p contract
      * (top_k/top_p/min_p are part of it, not just temperature) and would go
      * stale the moment a shape used different knobs. */
-    const bool expect_compact = s->graph.spec_compact_armed;
-    const bool expect_argmax  = s->graph.spec_argmax_armed;
+    const bool expect_compact = s->graph->spec_compact_armed;
+    const bool expect_argmax  = s->graph->spec_argmax_armed;
     uint32_t got = 0;
     const int rc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)vocab),
                                                &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
@@ -160,7 +160,7 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         return -1;
     }
     if (audit) {
-        pulsar_gpu_graph *g = &s->graph;
+        pulsar_gpu_graph *g = s->graph;
         if (expect_argmax) {
             CHECK(g->spec_argmax_rows >= rows && g->spec_compact_rows == 0,
                   "STALE COMPACT ROWS: the engine armed the argmax readback for %u rows, but "
@@ -196,9 +196,9 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
 static int run_shape(const char *name, const float *temps, const float *temps_alt, int ticks) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "%s: session create", name); return 0; }
-    if ((int)gpu_graph_bank_pool_count(&s->graph) < g_nb) {
+    if ((int)gpu_graph_bank_pool_count(s->graph) < g_nb) {
         CHECK(0, "%s: pool has %u banks, need %d (PULSAR_MSEQ_BANKS)", name,
-              gpu_graph_bank_pool_count(&s->graph), g_nb);
+              gpu_graph_bank_pool_count(s->graph), g_nb);
         pulsar_session_free(s);
         return 0;
     }
@@ -257,9 +257,9 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
                 ser_nd[b] = d.n_draft;
                 ser_logits[b] = (float *)malloc((size_t)d.n_draft * (size_t)vocab * sizeof(float));
                 ser_hidden[b] = (float *)malloc((size_t)d.n_draft * PULSAR_N_EMBD * sizeof(float));
-                pulsar_gpu_tensor_read(s->graph.spec_logits, 0, ser_logits[b],
+                pulsar_gpu_tensor_read(s->graph->spec_logits, 0, ser_logits[b],
                                        (uint64_t)d.n_draft * (uint64_t)vocab * sizeof(float));
-                pulsar_gpu_tensor_read(s->graph.batch_ffn_cur, 0, ser_hidden[b],
+                pulsar_gpu_tensor_read(s->graph->batch_ffn_cur, 0, ser_hidden[b],
                                        (uint64_t)d.n_draft * PULSAR_N_EMBD * sizeof(float));
             }
         }
@@ -293,8 +293,8 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
             float *bh = (float *)malloc((size_t)ROWS * PULSAR_N_EMBD * sizeof(float));
             uint32_t total = 0;
             for (int b = 0; b < g_nb; b++) total += ser_nd[b];
-            pulsar_gpu_tensor_read(s->graph.spec_logits, 0, bl, (uint64_t)total * (uint64_t)vocab * sizeof(float));
-            pulsar_gpu_tensor_read(s->graph.batch_ffn_cur, 0, bh, (uint64_t)total * PULSAR_N_EMBD * sizeof(float));
+            pulsar_gpu_tensor_read(s->graph->spec_logits, 0, bl, (uint64_t)total * (uint64_t)vocab * sizeof(float));
+            pulsar_gpu_tensor_read(s->graph->batch_ffn_cur, 0, bh, (uint64_t)total * PULSAR_N_EMBD * sizeof(float));
             /* row order: greedy banks (temps == 0) first, then sampled, each in bank order */
             uint32_t off = 0;
             for (int pass = 0; pass < 2; pass++)
@@ -374,7 +374,7 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
 static void markov_bank_identity(int n_banks) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "bank identity: session create"); return; }
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const pulsar_dspark_weights *w = &g_e->dspark_weights;
     const uint32_t vocab = w->vocab_size, embed_dim = 256, depth = 4;
     const uint64_t row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);

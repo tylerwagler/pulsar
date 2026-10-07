@@ -131,7 +131,7 @@ static double rel_l1(const float *a, const float *b, uint64_t n) {
 static int sync_prefix(pulsar_session *s, const pulsar_tokens *full, int len, char *err, size_t errlen) {
     pulsar_tokens p = *full;      /* borrowed view of the first len tokens */
     p.len = len;
-    if (s->graph.banks.n_banks) {
+    if (s->graph->banks.n_banks) {
         if (pulsar_session_bank_repoint(s, 0) != 0) { snprintf(err, errlen, "repoint 0"); return 1; }
     }
     pulsar_session_invalidate(s);
@@ -208,7 +208,7 @@ int GATE_ENTRY(int argc, char **argv) {
             if (pulsar_session_pos(s) != L) { fprintf(stderr, "pos after sync(%d) = %d\n", L, pulsar_session_pos(s)); goto done; }
             for (uint32_t il = 0; il < n_layer; il++) {
                 if (!gpu_graph_layer_has_comp_state(il)) continue;
-                read_state(&s->graph, il, &A[il]);
+                read_state(s->graph, il, &A[il]);
             }
             /* Path B: prefill of L - 1 tokens, then one classic decode step of the same token */
             if (sync_prefix(s, &prompt, L - 1, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L - 1, err); goto done; }
@@ -221,7 +221,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 state_rows *a = &A[il];
                 if (!a->ok) continue;
                 state_rows b;
-                if (!read_state(&s->graph, il, &b)) { fprintf(stderr, "read decode state kv source %u\n", il); goto done; }
+                if (!read_state(s->graph, il, &b)) { fprintf(stderr, "read decode state kv source %u\n", il); goto done; }
                 checked += check_placement(a, &b, il, L, "prefill-vs-decode");
                 if ((uint32_t)L % a->ratio) {
                     /* PENDING ROW: printed, not asserted (see header).  The
@@ -253,7 +253,7 @@ int GATE_ENTRY(int argc, char **argv) {
             for (uint32_t il = 0; il < n_layer; il++) {
                 if (!gpu_graph_layer_has_comp_state(il)) continue;
                 state_rows a;
-                if (!read_state(&s->graph, il, &a)) continue;
+                if (!read_state(s->graph, il, &a)) continue;
                 checked += check_placement(&a, NULL, il, L, "short-prompt");
                 free_state(&a);
             }
@@ -263,7 +263,7 @@ int GATE_ENTRY(int argc, char **argv) {
          * lane can admit (PULSAR_SPEC_LOGITS_ROWS).  It held 16 after the L117
          * budget went to 32; the host mirror is sized by the constant. */
         {
-            pulsar_gpu_graph *g = &s->graph;
+            pulsar_gpu_graph *g = s->graph;
             const uint64_t need = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t);
             const uint64_t have = g->dspark_prefilter_sel ? pulsar_gpu_tensor_bytes(g->dspark_prefilter_sel) : 0ull;
             if (have < need) {

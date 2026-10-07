@@ -444,10 +444,11 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
  * the leader's collect and the worker's ack read it the same way.  The width
  * seeds the digest, so the three forms cannot collide. */
 uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows) {
-    const pulsar_gpu_graph *g = &s->graph;
-    if (g->spec_argmax_rows > 0)
+    /* the compact / argmax forms are DeepSeek's graph's (L272 P6: a family without a graph digests full rows) */
+    const pulsar_gpu_graph *g = s->graph;
+    if (g && g->spec_argmax_rows > 0)
         return pulsar_tp_logits_digest((const float *)g->spec_argmax_host, g->spec_argmax_rows, 1u);
-    if (g->spec_compact_rows > 0)
+    if (g && g->spec_compact_rows > 0)
         return pulsar_tp_logits_digest((const float *)g->spec_compact_host, g->spec_compact_rows,
                                        (uint32_t)PULSAR_DSPARK_PREFILTER_ROW_I32);
     return pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
@@ -650,7 +651,7 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
      * the pair down instead of failing its request). */
     if (n_images > 0) {
         char verr[384];
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->prefill_cap,
                               NULL, verr, sizeof(verr))) {
             if (err) snprintf(err, errlen, "%s", verr);
             return 1;
@@ -1115,10 +1116,10 @@ int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_RE
 pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
     if (!s) return NULL;
     if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->kv_store(s);
-    return &s->graph.ckpt;
+    return &s->graph->ckpt;
 }
 uint32_t pulsar_session_live_bank(pulsar_session *s) {
-    return FAMILY_BANKS(s) ? FAMILY_BANKS(s)->live(s) : gpu_graph_cur_bank(&s->graph);
+    return FAMILY_BANKS(s) ? FAMILY_BANKS(s)->live(s) : gpu_graph_cur_bank(s->graph);
 }
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len) {
     if (!s || common <= 0 || prompt_len <= 0) return 0;
@@ -1139,7 +1140,7 @@ int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     return s ? s->bank_prefill_frontier(bank) : 0; }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
-    return s && !FAMILY_BANKS(s) && bank < s->graph.banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph.ms_comp_state_stale[bank];
+    return s && !FAMILY_BANKS(s) && bank < s->graph->banks.n_banks && bank < PULSAR_MSEQ_MAX && s->graph->ms_comp_state_stale[bank];
 }
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); return pulsar_bank_history(s, bank); }
 /* The bank's committed history, the family's reader or DeepSeek's (the prefix readers below are
@@ -1210,8 +1211,10 @@ static pulsar_tp_spec_command tp_spec_cmd(const pulsar_session *s, int bank) {
     c.bank = bank;
     return c;
 }
+/* the bank a mirrored speculative command runs on: the family's live bank (L272 P6: this read DeepSeek's graph,
+ * so a Qwen pair's commands named bank 0 whichever bank was live) */
 static int tp_spec_live_bank(const pulsar_session *s) {
-    return (int)gpu_graph_cur_bank(&s->graph);
+    return (int)pulsar_session_live_bank(const_cast<pulsar_session *>(s));
 }
 /* Returns 1 when the operation may run locally without mirroring (pair off),
  * 0 when it was refused (err filled), 2 when it must be mirrored. */
@@ -1238,7 +1241,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
     const int route = tp_spec_route(s, "generate_speculative", &tp, err, errlen);
     if (route == 0) return -1;
     if (route == 1) return local();
-    pulsar_tp_spec_command c = tp_spec_cmd(s, FAMILY_BANKS(s) ? (int)FAMILY_BANKS(s)->live(s) : tp_spec_live_bank(s));
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
     c.i0 = max_tokens; c.i1 = eos_token; c.i2 = accepted_cap;
     c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
     c.rng = rng ? *rng : 0;

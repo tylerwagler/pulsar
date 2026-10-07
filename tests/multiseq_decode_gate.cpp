@@ -202,7 +202,7 @@ static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double
 static bool check_stale_classic_fails_loud(void) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     if ((int)gpu_graph_bank_pool_count(g) < 2) {
         printf("STALE-GUARD: skipped (pool %u < 2)\n", gpu_graph_bank_pool_count(g));
         pulsar_session_free(s);
@@ -294,7 +294,7 @@ static bool check_stale_classic_fails_loud(void) {
  * rows, same head -- the mode only selects which rows are headed).  This is
  * the contract the batched speculative verify's accept walk stands on. */
 static bool check_all_rows_head_mode(pulsar_session *s) {
-    if (gpu_graph_bank_pool_count(&s->graph) < 2) {
+    if (gpu_graph_bank_pool_count(s->graph) < 2) {
         fprintf(stderr, "all-rows gate: pool too small\n");
         return false;
     }

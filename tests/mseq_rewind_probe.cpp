@@ -47,7 +47,7 @@ static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "MSEQ-REWIND FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } } while (0)
 
 static void show(pulsar_session *s, const char *when, int pos) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint32_t il = 2;
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     /* ONE storage since the stage-1b collapse: the accessor and ms_n_comp[0]
@@ -120,7 +120,7 @@ int GATE_ENTRY(int argc, char **argv) {
     show(s, "after rewind (single live slot)", target);
     /* THE ASSERTION: both representations clamped, for every compressing layer. */
     {
-        pulsar_gpu_graph *g = &s->graph;
+        pulsar_gpu_graph *g = s->graph;
         const uint32_t b = g->banks.n_banks ? g->banks.cur_bank : 0u;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             if (!gpu_graph_layer_is_kv_source(il)) continue;

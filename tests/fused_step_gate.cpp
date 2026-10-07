@@ -164,9 +164,9 @@ static bool classic_split(int off, int K, int split, const classic_ref *c, doubl
     }
     if (ok && !gate_prefill_suffix_classic(s, &t, pre + split, pre + K, e, sizeof e)) { fprintf(stderr, "%s\n", e); ok = false; }
     if (ok) {
-        gpu_graph_bank_counters_capture(&s->graph, 0);
+        gpu_graph_bank_counters_capture(s->graph, 0);
         pulsar_session_copy_logits(s, two, (int)V);
-        ok = ring_read(&s->graph, 0, &r2);
+        ok = ring_read(s->graph, 0, &r2);
     }
     if (ok) {
         *dl = rel_rms(two, c->lg, V);
@@ -190,9 +190,9 @@ static bool classic_reference(int off, int K, classic_ref *c, int pre = 0) {
         ok = false;
     }
     if (ok) {
-        gpu_graph_bank_counters_capture(&s->graph, 0);
+        gpu_graph_bank_counters_capture(s->graph, 0);
         pulsar_session_copy_logits(s, c->lg, (int)V);
-        ok = ring_read(&s->graph, 0, &c->r);
+        ok = ring_read(s->graph, 0, &c->r);
     }
     if (s) pulsar_session_free(s);
     c->env_lg = c->env_ring = 0;
@@ -210,7 +210,7 @@ static bool classic_reference(int off, int K, classic_ref *c, int pre = 0) {
 static bool fused(int K, int order, float *lg, uint32_t *nr, ring *r2, ring *r3) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     /* banks 2 and 3 first hold another conversation, then are invalidated: the
      * served shape (a reused bank) */
     bool ok = gate_pool_fits(s, 4) &&
@@ -276,7 +276,7 @@ static bool fused_long(float *lg, uint32_t *nr, ring *r2) {
         fprintf(stderr, "long fused step: %s\n", e);
         ok = false;
     }
-    if (ok) ok = ring_read(&s->graph, 2, r2);
+    if (ok) ok = ring_read(s->graph, 2, r2);
     free(rq);
     pulsar_session_free(s);
     return ok;

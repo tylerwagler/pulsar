@@ -2319,7 +2319,7 @@ struct pulsar_session {
         uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
         int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;
-    pulsar_gpu_graph graph;   ///< the DeepSeek family's device state (KV, scratch, bank views); untouched on a Qwen session
+    pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
     pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
