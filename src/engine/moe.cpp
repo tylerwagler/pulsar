@@ -139,5 +139,5 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     w.down_table = table(D, "routed experts down");
     if (!w.down_table) return false;
     return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws, c->ws_bytes,
-                                         c->nf_flag, c->nf_code, (cudaStream_t)c->stream) == 0;
+                                         c->nf_flag, c->nf_code, 0) == 0;   /* the per-thread default stream */
 }
