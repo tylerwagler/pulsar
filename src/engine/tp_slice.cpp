@@ -34,6 +34,8 @@ struct pulsar_tp_plan {
     std::vector<pulsar_tp_slice> slices;
     std::vector<pulsar_tp_op> ops;    ///< per slice, chosen at build
     std::unordered_map<const pulsar_tensor *, pulsar_gpu_tensor *> built;   ///< the host-built slices, by the tensor
+    std::unordered_map<const pulsar_tensor *, size_t> by_tensor;            ///< a tensor's slice, by its index
+    const void *key = nullptr;   ///< the engine: the key the registered halves and K slices resolve under
 };
 
 static FILE *g_tp_record;
@@ -136,8 +138,10 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
         return false;
     }
     pulsar_tp_plan *p = new pulsar_tp_plan();
+    p->key = e;
     e->tp_plan = p;
     e->model.tp_plan = p;
+    e->dspark_model.tp_plan = p;   /* the drafter's tensors are in the plan too (a merged drafter aliases the model) */
     if (!e->family->tp_slices(e, p)) return false;
     uint32_t count[9] = {0};
     uint64_t unstaged = 0;
@@ -156,6 +160,7 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
                     e->family->name, op_name(op), nm, tensor_type_name(s.t->type));
             return false;
         }
+        p->by_tensor[s.t] = p->ops.size();
         p->ops.push_back(op);
         for (uint32_t b = 0; b < 9; b++) if ((uint32_t)op == 1u << b) count[b]++;
         if (op_replaces(op)) {
@@ -179,6 +184,20 @@ void pulsar_tp_plan_free(pulsar_engine *e) {
     delete e->tp_plan;
     e->tp_plan = NULL;
     e->model.tp_plan = NULL;
+    e->dspark_model.tp_plan = NULL;
+}
+
+bool pulsar_tp_slice_of(const pulsar_model *m, const pulsar_tensor *t, pulsar_tp_op *op, uint64_t *lo, uint64_t *hi,
+                        const void **key) {
+    if (!m->tp_plan) return false;
+    const auto it = m->tp_plan->by_tensor.find(t);
+    if (it == m->tp_plan->by_tensor.end()) return false;
+    const pulsar_tp_slice &s = m->tp_plan->slices[it->second];
+    *op = m->tp_plan->ops[it->second];
+    *lo = s.lo[0];
+    *hi = s.hi[0];
+    if (key) *key = m->tp_plan->key;
+    return true;
 }
 
 const void *pulsar_tp_built_ptr(const pulsar_model *m, const pulsar_tensor *t) {

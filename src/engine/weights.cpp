@@ -226,8 +226,8 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
 /* ONE side's byte model from (type, in = k, out = n): the per-expert stride
  * and the "row bytes" value that side's consumers read -- an ordinary row
  * stride for the IQ2 arm, the data/SF split point for CUTLASS MXFP4, the
- * trellis/scales split point for EXL3 (exl3_expert_layout).  Both
- * routed_expert_gate_down_layout() and the container's expert-stack check
+ * trellis/scales split point for EXL3 (exl3_expert_layout).  The routed MoE's
+ * front door (moe.cpp) and the container's expert-stack check
  * (st_add_expert_stacks) read this, so a stack whose declared expert_bytes
  * disagrees with the type's own layout is refused at load instead of being
  * addressed with a guessed stride. */
@@ -251,42 +251,6 @@ bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
         return true;
     }
     return false;
-}
-
-
-
-/* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
- * for any supported routed-expert quant combo, centralizing the
- * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
- * t->dim[1] * row_bytes` that's repeated across gpu_prefill.cpp/gpu_decode.cpp.
- *
- * For CUTLASS_MXFP4 (type 40) "row_bytes" has no ordinary per-row meaning --
- * the tensor is expert-major ColumnMajor+swizzle with no per-row byte stride
- * at all. It instead carries the data/SF split point within each expert's
- * block: the SF blob starts *row_bytes bytes into that expert's slice, and
- * *expert_bytes is the full [data + SF] stride to the next expert. Callers
- * that dispatch on gate->type == PULSAR_TENSOR_CUTLASS_MXFP4 must read it that
- * way; only the CUTLASS MoE path does.  The EXL3 layouts carry the same shape
- * of answer: *row_bytes is the trellis/scales split point of an expert's
- * slice and *expert_bytes its stride (exl3_expert_layout). */
-bool routed_expert_gate_down_layout(
-        const pulsar_tensor *gate,
-        const pulsar_tensor *down,
-        uint64_t         *gate_expert_bytes,
-        uint64_t         *gate_row_bytes,
-        uint64_t         *down_expert_bytes,
-        uint64_t         *down_row_bytes) {
-    /* NOTE: gate and down are NOT always the same type -- gate/up and down
-     * formats pair freely per layer by design (see
-     * tensor_expect_routed_expert_combo). Each side's layout is computed
-     * independently so MIXED layers (cutlass_mxfp4 on one side, iq2/q2k on the
-     * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
-     * the dp4a side yields ordinary expert/row byte counts. */
-    if (!gate || !down) return false;
-    return routed_expert_side_layout(gate->type, gate->dim[0], gate->dim[1],
-                                     gate_expert_bytes, gate_row_bytes) &&
-           routed_expert_side_layout(down->type, down->dim[0], down->dim[1],
-                                     down_expert_bytes, down_row_bytes);
 }
 
 

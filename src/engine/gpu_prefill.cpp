@@ -2628,16 +2628,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    uint64_t gate_expert_bytes = 0, gate_row_bytes = 0;
-    uint64_t down_expert_bytes = 0, down_row_bytes = 0;
-    if (!routed_expert_gate_down_layout(layer->ffn_gate_exps, layer->ffn_down_exps,
-                                        &gate_expert_bytes, &gate_row_bytes,
-                                        &down_expert_bytes, &down_row_bytes)) {
-        return false;
-    }
     pulsar_gpu_tensor *hc_mix_view = pulsar_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
@@ -2898,62 +2889,28 @@ bool gpu_graph_encode_layer_ffn_batch(
         } \
     } while (0)
 
-    /* L241 4g-2 expert tensor-parallel: under TP every rank runs EVERY selected
-     * expert over its half of the intermediate width, from the compact
-     * half-stacks built at open (tp_register_expert_half) and resolved under
-     * the engine key.  The rank's routed output is a partial the FFN exchange
-     * sums.  One box: the stored stacks, the whole width. */
-    const void *moe_map = tensor_map_base(model, layer->ffn_gate_exps);
-    uint64_t moe_size = tensor_map_size(model, layer->ffn_gate_exps);
-    uint64_t moe_gate_off = layer->ffn_gate_exps->abs_offset;
-    uint64_t moe_up_off = layer->ffn_up_exps->abs_offset;
-    uint64_t moe_down_off = layer->ffn_down_exps->abs_offset;
-    uint64_t moe_mid = down_in_dim;
-    if (g->tp) {
-        uint32_t lo = 0, hi = 0;
-        uint64_t sf = 0;
-        if (!pulsar_tp_owned_range(pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp),
-                                   (uint32_t)down_in_dim, &lo, &hi) || !g->tp_kslice_key) {
-            fprintf(stderr, "pulsar: tp expert half refused (layer %u)\n", il);
-            ok = false;
-        }
-        moe_map = g->tp_kslice_key;
-        moe_size = UINT64_MAX / 2u;
-        moe_gate_off = pulsar_tp_expert_half_offset(model, layer->ffn_gate_exps);
-        moe_up_off = pulsar_tp_expert_half_offset(model, layer->ffn_up_exps);
-        moe_down_off = pulsar_tp_expert_half_offset(model, layer->ffn_down_exps);
-        moe_mid = hi - lo;
-        cutlass_mxfp4_expert_layout(expert_in_dim, moe_mid, &gate_row_bytes, &sf, &gate_expert_bytes);
-        cutlass_mxfp4_expert_layout(moe_mid, routed_out_dim, &down_row_bytes, &sf, &down_expert_bytes);
-    }
+    /* The routed experts through the core's front door (moe.cpp): the arm by the stacks' formats; under TP the
+     * rank's plan halved them (L241 4g-2 expert tensor-parallel: every selected expert over half the
+     * intermediate width, from the half stacks built at open -- a partial the FFN exchange sums). */
     if (ok) {
-        ok = pulsar_gpu_routed_moe_batch_tensor(g->batch_routed_out,
-                                               g->batch_routed_up,
-                                               g->batch_routed_mid,
-                                               g->batch_routed_down,
-                                               moe_map,
-                                               moe_size,
-                                               moe_gate_off,
-                                               moe_up_off,
-                                               moe_down_off,
-                                               layer->ffn_gate_exps->type,
-                                               layer->ffn_down_exps->type,
-                                               gate_expert_bytes,
-                                               gate_row_bytes,
-                                               down_expert_bytes,
-                                               down_row_bytes,
-                                               (uint32_t)expert_in_dim,
-                                               (uint32_t)moe_mid,
-                                               (uint32_t)routed_out_dim,
-                                               g->batch_router_selected,
-                                               g->batch_router_weights,
-                                               layer->n_expert_present,
-                                               layer->n_expert_used,
-                                               PULSAR_SWIGLU_CLAMP_EXP,
-                                               g->batch_ffn_norm,
-                                               il,
-                                               n_tokens,
-                                               g->tp ? 1u : 0u) != 0;
+        pulsar_moe_slot_call mc{};
+        mc.out = g->batch_routed_out;
+        mc.up_out = g->batch_routed_up;
+        mc.mid_out = g->batch_routed_mid;
+        mc.experts_out = g->batch_routed_down;
+        mc.m = model;
+        mc.gate = layer->ffn_gate_exps;
+        mc.up = layer->ffn_up_exps;
+        mc.down = layer->ffn_down_exps;
+        mc.selected = g->batch_router_selected;
+        mc.weights = g->batch_router_weights;
+        mc.n_expert_present = layer->n_expert_present;
+        mc.n_expert_used = layer->n_expert_used;
+        mc.clamp = PULSAR_SWIGLU_CLAMP_EXP;
+        mc.x = g->batch_ffn_norm;
+        mc.layer = il;
+        mc.n_tokens = n_tokens;
+        ok = pulsar_moe_routed_slot(&mc);
     }
     if (ok && g->imatrix_f32_rows) {
         /* L246: the imatrix collector reads batch_routed_mid as the down

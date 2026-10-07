@@ -582,68 +582,51 @@ bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_g
 bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     const uint32_t n = st->n_rows;
     const pulsar_qwen_shape *s = st->shape;
-    const int H = (int)s->n_embd, MID = (int)s->n_ff_exp, SMID = (int)s->n_ff_shexp;
+    const int H = (int)s->n_embd, SMID = (int)s->n_ff_shexp;
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
-    pulsar_qwen_moe_dev w{};
-    w.prompt = step_is_prompt(st);
-    w.router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
-    w.shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
-    /* the expert stacks: [trellis | suh | svh] per expert (exl3_expert_layout).  The trunk's gate_up is
-     * ONE fused stack (2 MID outputs); the MTP layer's gate and up are two stacks of MID (split). */
-    const bool split = L.moe_gate_up == NULL;
-    const pulsar_tensor *first = split ? L.moe_gate : L.moe_gate_up;
-    const uint64_t first_out = split ? (uint64_t)MID : 2ull * MID;
-    uint64_t tgu = 0, sc_gu = 0, stride_gu = 0, td = 0, sc_d = 0, stride_d = 0;
-    w.k2_gate_up = exl3_type_k2(first->type);
-    w.k2_down = exl3_type_k2(L.moe_down->type);
-    if (!exl3_expert_layout((uint64_t)H, first_out, w.k2_gate_up, &tgu, &sc_gu, &stride_gu) ||
-        !exl3_expert_layout((uint64_t)MID, (uint64_t)H, w.k2_down, &td, &sc_d, &stride_d) ||
-        first->bytes != stride_gu * s->n_expert || L.moe_down->bytes != stride_d * s->n_expert ||
-        (split && L.moe_up->bytes != stride_gu * s->n_expert))
-        return fail("an expert stack's bytes are not n_expert EXL3 slices");
-    /* L266 step 7: under TP the rank holds experts [rank * E / tp, +E / tp) -- expert parallelism -- and reads
-     * that half of each stack (only it was staged) */
-    const uint32_t tp = pulsar_qwen_tp(s);
-    uint32_t e0 = 0, e1 = s->n_expert;
-    if (tp > 1 && !pulsar_tp_owned_range((int)s->tp_rank, tp, s->n_expert, &e0, &e1))
-        return fail("the rank owns no expert range");
-    const uint32_t nE = e1 - e0;
-    w.ep_rank = (int)s->tp_rank;
-    w.ep_ranks = (int)tp;
-    auto stack = [&](const pulsar_tensor *t, uint64_t stride, const char *what) -> const void * {
-        if (tp == 1) return wptr(st, t, what);
-        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(st->model, t), t->abs_offset + (uint64_t)e0 * stride,
-                                               (uint64_t)nE * stride, what);
-        if (!p) fprintf(stderr, "pulsar: %s: no device copy of this rank's half of %.*s -- refusing\n",
-                        PULSAR_QWEN_ARCH, (int)t->name.len, t->name.ptr);
-        return p;
-    };
-    const void *gu = stack(first, stride_gu, split ? "qwen experts gate" : "qwen experts gate_up");
-    const void *up = split ? stack(L.moe_up, stride_gu, "qwen experts up") : NULL;
-    const void *dn = stack(L.moe_down, stride_d, "qwen experts down");
-    if (!gu || (split && !up) || !dn || !w.router_w || !w.shared_gate_w) return false;
-    if (split) {
-        w.gate_table = pulsar_qwen_expert_table(gu, nE, stride_gu, tgu);
-        w.up_table = pulsar_qwen_expert_table(up, nE, stride_gu, tgu);
-    } else {
-        w.gate_up_table = pulsar_qwen_expert_table(gu, nE, stride_gu, tgu);
-    }
-    w.down_table = pulsar_qwen_expert_table(dn, nE, stride_d, td);
-    if ((split ? !w.gate_table || !w.up_table : !w.gate_up_table) || !w.down_table)
-        return fail("no EXL3 expert table");
-    if (!linear_dev(st, L.sh_gate, H, SMID, "qwen shared gate_proj", &w.shared_gate) ||
-        !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &w.shared_up) ||
-        !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &w.shared_down))
-        return false;
-    /* L251 / ac69748f: there is no E4M3 activation slot in this family.  The MoE reads the block
-     * input's bf16 row directly -- the routed arm by ids_src1 and the shared expert as a plain row --
-     * so unlike the GDN and QSA ops there is nothing here to fetch, arm or encode. */
+    /* L251 / ac69748f: there is no E4M3 activation slot in this family.  The block reads its input's bf16 row
+     * directly -- the router, the routed arm (by ids_src1) and the shared expert as a plain row. */
+    const uint16_t *x = (const uint16_t *)dptr(st->st->x);
+    float *y = (float *)dptr(st->st->y);
     const moe_scratch m = moe_layout(st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     if (!sc) return fail("no MoE scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
-    return pulsar_qwen_moe_launch(&w, (const uint16_t *)dptr(st->st->x), (int)n, (float *)dptr(st->st->y),
-                                  base + m.ws, m.ws_bytes, (uint32_t *)(base + m.nf), 0x51000000u | il, 0) == 0;
+    pulsar_qwen_moe_parts parts;
+    if (pulsar_qwen_moe_carve((int)n, base + m.ws, m.ws_bytes, &parts) != 0) return false;
+    /* the router: softmax top-k over the experts and the shared expert's sigmoid gate (the architecture's) */
+    const uint16_t *router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
+    const uint16_t *shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
+    if (!router_w || !shared_gate_w ||
+        pulsar_qwen_router_launch(x, router_w, shared_gate_w, (int)n, H, (int)s->n_expert, (int)s->n_expert_used,
+                                  parts.logits, parts.sel, parts.wts, parts.sgate, 0) != 0)
+        return false;
+    /* the routed experts through the core's front door (moe.cpp): the trunk's gate_up is ONE fused stack, the MTP
+     * layer's gate and up are two; under TP the rank reads its plan's range of whole experts */
+    pulsar_moe_rows_call rc{};
+    rc.m = st->model;
+    rc.gate = L.moe_gate_up ? L.moe_gate_up : L.moe_gate;
+    rc.up = L.moe_gate_up ? NULL : L.moe_up;
+    rc.down = L.moe_down;
+    rc.selected = parts.sel;
+    rc.weights = parts.wts;
+    rc.x_bf16 = x;
+    rc.n_rows = (int)n;
+    rc.out = y;
+    rc.ws = parts.routed;
+    rc.ws_bytes = parts.routed_bytes;
+    rc.nf_flag = (uint32_t *)(base + m.nf);
+    rc.nf_code = 0x51000000u | il;
+    rc.prompt = step_is_prompt(st);
+    if (!pulsar_moe_routed_rows(&rc)) return false;
+    /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone */
+    if (pulsar_qwen_tp(s) > 1 && s->tp_rank != 0) return true;
+    pulsar_rows_linear sg, su, sd;
+    if (!linear_dev(st, L.sh_gate, H, SMID, "qwen shared gate_proj", &sg) ||
+        !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &su) ||
+        !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &sd))
+        return false;
+    return pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x, (int)n, y, &parts, 0) == 0;
 }
 
 /* L251 MTP: the draft head (pulsar_qwen_weights::draft_head_mx), gathered once from the bf16 head.  With

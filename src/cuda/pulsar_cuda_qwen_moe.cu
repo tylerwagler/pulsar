@@ -210,30 +210,40 @@ struct ws_bump {
     }
 };
 
-struct moe_ws {
-    float *logits, *wts, *sgate, *gu_z, *down_z, *yg, *yu, *ys;
-    int32_t *sel;
-    uint8_t *mid_x, *h_x;           /* the routed fold's and the shared SwiGLU's bf16 rows (ac69748f) */
-    void *lin;
-    size_t lin_bytes;
+/* L272 P4c: the routed part's workspace (the front door's, pulsar_rows_moe_routed_launch): the gate / up
+ * outputs, the fold's bf16 rows, the down outputs -- a function of the rows and the routing shape alone. */
+struct routed_ws {
+    float *gu_z, *down_z;
+    uint8_t *mid_x;                 /* the routed fold's bf16 rows (ac69748f) */
 };
-
-/* The one layout of the MoE workspace: sizing and carving are the same walk. */
-static size_t moe_ws_layout(int T, void *base, size_t cap, moe_ws *o) {
+static size_t routed_ws_layout(int T, void *base, size_t cap, routed_ws *o) {
     ws_bump b{(uint8_t *)base, base ? cap : (size_t)-1, 0, false};
     const size_t pairs = (size_t)T * kTopK;
-    const int mid = PULSAR_QWEN_EXPERT_MID, smid = PULSAR_QWEN_SHARED_MID;
-    moe_ws m{};
+    const int mid = PULSAR_QWEN_EXPERT_MID;
+    routed_ws m{};
+    m.gu_z   = (float *)b.take(pairs * 2 * mid * 4);
+    m.mid_x  = (uint8_t *)b.take((size_t)pairs * mid * 2);   /* bf16: no per-32 block, no scale slab */
+    m.down_z = (float *)b.take(pairs * kH * 4);
+    if (o) *o = m;
+    return b.failed ? 0 : b.used;
+}
+
+/* The one layout of the Qwen MoE block's workspace (router, routed region, shared expert): sizing and carving
+ * are the same walk. */
+static size_t moe_ws_layout(int T, void *base, size_t cap, pulsar_qwen_moe_parts *o) {
+    ws_bump b{(uint8_t *)base, base ? cap : (size_t)-1, 0, false};
+    const size_t pairs = (size_t)T * kTopK;
+    const int smid = PULSAR_QWEN_SHARED_MID;
+    pulsar_qwen_moe_parts m{};
     m.logits = (float *)b.take((size_t)T * (kE + 1) * 4);
     m.sel    = (int32_t *)b.take(pairs * 4);
     m.wts    = (float *)b.take(pairs * 4);
     m.sgate  = (float *)b.take((size_t)T * 4);
-    m.gu_z   = (float *)b.take(pairs * 2 * mid * 4);
-    m.mid_x  = (uint8_t *)b.take((size_t)pairs * mid * 2);   /* bf16: no per-32 block, no scale slab */
-    m.down_z = (float *)b.take(pairs * kH * 4);
+    m.routed_bytes = routed_ws_layout(T, nullptr, 0, nullptr);
+    m.routed = b.take(m.routed_bytes);
     m.yg     = (float *)b.take((size_t)T * smid * 4);
     m.yu     = (float *)b.take((size_t)T * smid * 4);
-    m.h_x    = (uint8_t *)b.take((size_t)T * smid * 2);   /* bf16: no per-32 block, no scale slab */
+    m.h_x    = (uint16_t *)b.take((size_t)T * smid * 2);   /* bf16: no per-32 block, no scale slab */
     m.ys     = (float *)b.take((size_t)T * kH * 4);
     /* the dense arm's workspace is a function of (rows, in, out) alone */
     size_t lb = ds4_exl3_dense_workspace_bytes(T, kH, smid);
@@ -311,36 +321,45 @@ extern "C" size_t pulsar_qwen_moe_workspace_bytes(int T) {
     return T > 0 ? moe_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
-extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
-                                      int T, float *out, void *ws, size_t ws_bytes,
-                                      uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
-    if (!w || !x_bf16 || !out || !nf_flag || T <= 0 || !w->down_table) {
-        fprintf(stderr, "pulsar: qwen MoE: a null input or a slot that is not %d wide -- refusing\n", kH);
+extern "C" int pulsar_qwen_moe_carve(int T, void *ws, size_t ws_bytes, pulsar_qwen_moe_parts *parts) {
+    if (T <= 0 || !ws || !parts || moe_ws_layout(T, ws, ws_bytes, parts) == 0) {
+        fprintf(stderr, "pulsar: qwen MoE: workspace %zu B < %zu B for %d rows -- refusing\n", ws_bytes,
+                pulsar_qwen_moe_workspace_bytes(T), T);
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T) {
+    return T > 0 ? routed_ws_layout(T, nullptr, 0, nullptr) : 0;
+}
+
+extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const float *wts,
+                                             const uint16_t *x_bf16, int T, float *out, void *ws, size_t ws_bytes,
+                                             uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
+    if (!w || !sel || !wts || !x_bf16 || !out || !nf_flag || T <= 0 || !w->down_table) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): a null input -- refusing\n");
         return -1;
     }
     const bool split = w->gate_table != nullptr;
     if (split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr)) {
-        fprintf(stderr, "pulsar: qwen MoE: the routed experts must be ONE of a fused gate_up table or a gate + up "
-                        "pair -- refusing\n");
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of a fused gate_up table or a gate + "
+                        "up pair -- refusing\n");
         return -1;
     }
-    const int smid = w->shared_gate.out;
-    if (w->shared_gate.in != kH || w->shared_up.in != kH || w->shared_up.out != smid ||
-        w->shared_down.in != smid || w->shared_down.out != kH || smid != PULSAR_QWEN_SHARED_MID) {
-        fprintf(stderr, "pulsar: qwen MoE: shared expert %d->%d / %d->%d / %d->%d, built for %d->%d->%d -- refusing\n",
-                w->shared_gate.in, w->shared_gate.out, w->shared_up.in, w->shared_up.out,
-                w->shared_down.in, w->shared_down.out, kH, PULSAR_QWEN_SHARED_MID, kH);
+    if (w->n_local <= 0 || w->ex_lo < 0 || w->ex_lo + w->n_local > kE) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): experts [%d, +%d) of %d -- refusing\n", w->ex_lo, w->n_local, kE);
         return -1;
     }
 #ifndef PULSAR_HAVE_MMQ
     (void)ws; (void)ws_bytes; (void)nf_code; (void)stream;
-    fprintf(stderr, "pulsar: qwen MoE: built without the MMQ drivers the EXL3 routed arm rides -- refusing\n");
+    fprintf(stderr, "pulsar: routed MoE (bf16 rows): built without the MMQ drivers the EXL3 routed arm rides -- refusing\n");
     return -1;
 #else
-    moe_ws m;
-    if (!ws || moe_ws_layout(T, ws, ws_bytes, &m) == 0) {
-        fprintf(stderr, "pulsar: qwen MoE: workspace %zu B < %zu B for %d rows -- refusing\n",
-                ws_bytes, pulsar_qwen_moe_workspace_bytes(T), T);
+    routed_ws m;
+    if (!ws || routed_ws_layout(T, ws, ws_bytes, &m) == 0) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): workspace %zu B < %zu B for %d rows -- refusing\n",
+                ws_bytes, pulsar_rows_moe_routed_workspace_bytes(T), T);
         return -1;
     }
     static int mmq_ready = -1;
@@ -350,56 +369,41 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
         mmq_ready = ds4_mmq_init(dev) == 0 ? 1 : 0;
     }
     if (!mmq_ready) {
-        fprintf(stderr, "pulsar: qwen MoE: the MMQ drivers are unavailable on this device -- refusing\n");
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): the MMQ drivers are unavailable on this device -- refusing\n");
         return -1;
     }
-    static int announced = 0;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "pulsar: L251 qwen MoE = bf16 router softmax top-%d of %d + EXL3 routed trellis GEMV "
-                        "(fused gate_up K=%g, down K=%g) + EXL3 dense shared expert (K=%g/%g/%g), sigmoid-gated\n",
-                kTopK, kE, w->k2_gate_up / 2.0, w->k2_down / 2.0, w->shared_gate.k2 / 2.0,
-                w->shared_up.k2 / 2.0, w->shared_down.k2 / 2.0);
-    }
-    static int announced_split = 0;
-    if (split && !announced_split) {
-        announced_split = 1;
-        fprintf(stderr, "pulsar: L251 qwen MoE (split experts, the MTP layer) = gate + up pair GEMV K=%g, pair fold, "
-                        "down K=%g\n", w->k2_gate_up / 2.0, w->k2_down / 2.0);
+    static int announced[2] = {0, 0};
+    if (!announced[split]) {
+        announced[split] = 1;
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows) = EXL3 %s K=%g, %s, down K=%g, top-%d of %d (experts [%d, +%d))\n",
+                split ? "gate + up pair GEMV" : "fused gate_up trellis GEMV", w->k2_gate_up / 2.0,
+                split ? "pair fold" : "fused fold", w->k2_down / 2.0, kTopK, kE, w->ex_lo, w->n_local);
     }
     const int mid = PULSAR_QWEN_EXPERT_MID;
     const int64_t pairs = (int64_t)T * kTopK;
-    int rc = pulsar_qwen_router_launch(x_bf16, w->router_w, w->shared_gate_w, T, kH, kE, kTopK,
-                                       m.logits, m.sel, m.wts, m.sgate, stream);
-    if (rc) return rc;
-    const bool ep = w->ep_ranks == 2;
-    if (w->ep_ranks != 0 && w->ep_ranks != 1 && !(ep && w->ep_rank >= 0 && w->ep_rank < 2)) {
-        fprintf(stderr, "pulsar: qwen MoE: expert parallelism %d / %d is not 1 or 2 ranks -- refusing\n", w->ep_rank,
-                w->ep_ranks);
-        return -1;
-    }
-    const int nE = ep ? kE / 2 : kE;   /* the experts this rank's tables hold */
-    if (ep) {
-        qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(m.sel, (int)pairs, w->ep_rank * nE, nE);
+    const int nE = w->n_local;   /* the experts this rank's tables hold */
+    if (nE != kE) {
+        qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(sel, (int)pairs, w->ex_lo, nE);
         if (!launch_ok("expert localize")) return -3;
     }
 
-    /* Routed: the four launches, all on the block input's bf16 row and the fold's bf16 output.
-     * L251 / ac69748f: there is no E4M3 activation slot in this family, so nothing here stages or
-     * encodes one -- the fused arm reads x_bf16 by ids_src1, and the fold hands the down arm bf16. */
+    /* The four launches, all on the block input's bf16 row and the fold's bf16 output.  L251 / ac69748f:
+     * there is no E4M3 activation slot here, so nothing stages or encodes one -- the fused arm reads x_bf16
+     * by ids_src1, and the fold hands the down arm bf16. */
+    int rc;
     if (split) {
         /* gate z in the first half of gu_z, up z in the second: [pairs][mid] each */
         float *gz = m.gu_z, *uz = m.gu_z + (size_t)pairs * mid;
-        rc = ds4_exl3_moe_pair_bf16(w->gate_table, w->up_table, w->k2_gate_up, m.sel, gz, uz, mid, kH, T, nE, kTopK,
+        rc = ds4_exl3_moe_pair_bf16(w->gate_table, w->up_table, w->k2_gate_up, sel, gz, uz, mid, kH, T, nE, kTopK,
                                     stream, x_bf16, w->prompt);
-        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate/up pair declined (rc=%d) -- no fallback\n", rc); return -1; }
-        rc = ds4_exl3_moe_fold_launch(gz, uz, m.sel, m.wts, w->gate_table, w->up_table, w->down_table,
+        if (rc) { fprintf(stderr, "pulsar: routed MoE gate/up pair declined (rc=%d) -- no fallback\n", rc); return -1; }
+        rc = ds4_exl3_moe_fold_launch(gz, uz, sel, wts, w->gate_table, w->up_table, w->down_table,
                                       kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
     } else {
-        rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, m.sel, m.gu_z, 2 * mid, kH, T, nE, kTopK,
+        rc = ds4_exl3_moe_fused_bf16(w->gate_up_table, w->k2_gate_up, sel, m.gu_z, 2 * mid, kH, T, nE, kTopK,
                                      stream, x_bf16, w->prompt);
-        if (rc) { fprintf(stderr, "pulsar: qwen MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
-        rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, m.sel, m.wts, w->gate_up_table, w->down_table,
+        if (rc) { fprintf(stderr, "pulsar: routed MoE gate_up declined (rc=%d) -- no fallback\n", rc); return -1; }
+        rc = ds4_exl3_moe_fold_fused_launch(m.gu_z, sel, wts, w->gate_up_table, w->down_table,
                                             kH, mid, pairs, 0.0f, nullptr, nullptr, 0, stream, m.mid_x);
     }
     if (rc) return -1;
@@ -421,23 +425,34 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
           free(hb);
       }
     }
-    rc = ds4_exl3_moe_single_bf16(w->down_table, w->k2_down, m.sel, m.down_z, kH, mid, (int)pairs, nE, 1,
+    rc = ds4_exl3_moe_single_bf16(w->down_table, w->k2_down, sel, m.down_z, kH, mid, (int)pairs, nE, 1,
                                   stream, m.mid_x, w->prompt);
-    if (rc) { fprintf(stderr, "pulsar: qwen MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
-    rc = ds4_exl3_moe_sum_launch(out, m.down_z, m.sel, w->down_table, mid, kH, kTopK, T, nf_flag, nf_code, stream);
-    if (rc) return -1;
+    if (rc) { fprintf(stderr, "pulsar: routed MoE down declined (rc=%d) -- no fallback\n", rc); return -1; }
+    rc = ds4_exl3_moe_sum_launch(out, m.down_z, sel, w->down_table, mid, kH, kTopK, T, nf_flag, nf_code, stream);
+    return rc ? -1 : 0;
+#endif
+}
 
-    /* shared: gate + up on the same slot, the SwiGLU producer, down -- under EP, rank 0's alone */
-    if (ep && w->ep_rank != 0) return 0;
-    rc = pulsar_rows_linear_launch(&w->shared_gate, x_bf16, T, m.yg, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_rows_linear_launch(&w->shared_up, x_bf16, T, m.yu, m.lin, m.lin_bytes, stream);
+extern "C" int pulsar_qwen_moe_shared_launch(const pulsar_rows_linear *gate, const pulsar_rows_linear *up,
+                                             const pulsar_rows_linear *down, const uint16_t *x_bf16, int T,
+                                             float *out, const pulsar_qwen_moe_parts *p, cudaStream_t stream) {
+    const int smid = gate ? gate->out : 0;
+    if (!gate || !up || !down || !x_bf16 || !out || !p || T <= 0 || gate->in != kH || up->in != kH || up->out != smid ||
+        down->in != smid || down->out != kH || smid != PULSAR_QWEN_SHARED_MID) {
+        fprintf(stderr, "pulsar: qwen MoE: shared expert %d->%d / %d->%d / %d->%d, built for %d->%d->%d -- refusing\n",
+                gate ? gate->in : -1, smid, up ? up->in : -1, up ? up->out : -1, down ? down->in : -1,
+                down ? down->out : -1, kH, PULSAR_QWEN_SHARED_MID, kH);
+        return -1;
+    }
+    /* gate + up on the same row, the SwiGLU producer, down, then out += sigmoid(w_sg . x) * shared */
+    int rc = pulsar_rows_linear_launch(gate, x_bf16, T, p->yg, p->lin, p->lin_bytes, stream);
+    if (!rc) rc = pulsar_rows_linear_launch(up, x_bf16, T, p->yu, p->lin, p->lin_bytes, stream);
     if (rc) return rc;
-    qwen_swiglu_emit_kernel<<<T, 256, 0, stream>>>(m.yg, m.yu, smid, (__nv_bfloat16 *)m.h_x);
+    qwen_swiglu_emit_kernel<<<T, 256, 0, stream>>>(p->yg, p->yu, smid, (__nv_bfloat16 *)p->h_x);
     if (!launch_ok("shared swiglu")) return -3;
-    rc = pulsar_rows_linear_launch(&w->shared_down, (const uint16_t *)m.h_x, T, m.ys, m.lin, m.lin_bytes, stream);
+    rc = pulsar_rows_linear_launch(down, p->h_x, T, p->ys, p->lin, p->lin_bytes, stream);
     if (rc) return rc;
     const size_t n = (size_t)T * kH;
-    qwen_shared_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, m.ys, m.sgate, T);
+    qwen_shared_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, p->ys, p->sgate, T);
     return launch_ok("shared add") ? 0 : -3;
-#endif
 }

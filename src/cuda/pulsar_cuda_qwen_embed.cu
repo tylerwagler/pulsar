@@ -33,7 +33,7 @@ extern "C" const void *pulsar_gpu_weight_range_ptr(const void *model_map, uint64
     return cuda_model_range_ptr(model_map, offset, bytes, what);
 }
 
-extern "C" const void *const *pulsar_qwen_expert_table(const void *stack, uint32_t n_expert, uint64_t stride,
+extern "C" const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert, uint64_t stride,
                                                        uint64_t split) {
     return exl3_expert_table(stack, n_expert, stride, split);
 }

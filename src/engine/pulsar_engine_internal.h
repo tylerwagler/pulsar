@@ -2921,13 +2921,6 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t);
  *  layout or a shape the layout refuses. */
 bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
                                uint64_t *expert_bytes, uint64_t *row_bytes);
-bool routed_expert_gate_down_layout(
-        const pulsar_tensor *gate,
-        const pulsar_tensor *down,
-        uint64_t         *gate_expert_bytes,
-        uint64_t         *gate_row_bytes,
-        uint64_t         *down_expert_bytes,
-        uint64_t         *down_row_bytes);
 bool weights_have_output_head(const pulsar_weights *w);
 const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w);
 /** Validate metadata values that affect semantics: attention shape, HC count,
@@ -3025,6 +3018,10 @@ bool pulsar_tp_plan_run(pulsar_engine *e);
 void pulsar_tp_plan_free(pulsar_engine *e);
 /** The device copy of a host-built slice of `t`, or NULL = `t` has none (the forward reads the stored tensor). */
 const void *pulsar_tp_built_ptr(const pulsar_model *m, const pulsar_tensor *t);
+/** What the rank's plan does to `t`: its operation and first range, and the key its registered slices resolve
+ *  under (the engine).  false = the plan does not slice `t` (or there is no plan: one GPU). */
+bool pulsar_tp_slice_of(const pulsar_model *m, const pulsar_tensor *t, pulsar_tp_op *op, uint64_t *lo, uint64_t *hi,
+                        const void **key);
 void pulsar_tp_record_begin(FILE *f);
 void pulsar_tp_record_end(void);
 
@@ -3062,6 +3059,47 @@ bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pul
 struct pulsar_rows_linear;
 bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int in, int out, bool prompt,
                             const char *what, struct pulsar_rows_linear *l);
+/** L272 P4c: the routed MoE's front door (moe.cpp): the arm for (gate / up format, down format, activation) -- `up`
+ *  NULL = a fused gate_up stack in `gate` -- from the format registry. */
+typedef enum {
+    PULSAR_MOE_ARM_NONE = 0,
+    PULSAR_MOE_ARM_SLOT,         ///< the backend's routed dispatcher over the E4M3 slot (CUTLASS MXFP4 / IQ2 / EXL3 / mixed)
+    PULSAR_MOE_ARM_ROWS_FUSED,   ///< EXL3 fused gate_up + down over raw bf16 rows
+    PULSAR_MOE_ARM_ROWS_PAIR,    ///< EXL3 gate + up pair + down over raw bf16 rows
+} pulsar_moe_arm;
+pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
+                                  pulsar_act_format act);
+/** The routed part over the MX slot: out = the selected experts' weighted SwiGLU FFN of the activation armed for
+ *  `x`; the up / mid / experts buffers are the backend's scratch.  A stack the rank's plan halved reads its halves. */
+typedef struct {
+    pulsar_gpu_tensor *out, *up_out, *mid_out, *experts_out;
+    const pulsar_model *m;
+    const pulsar_tensor *gate, *up, *down;
+    const pulsar_gpu_tensor *selected, *weights;
+    uint32_t n_expert_present, n_expert_used;
+    float clamp;
+    const pulsar_gpu_tensor *x;
+    uint32_t layer, n_tokens;
+} pulsar_moe_slot_call;
+bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c);
+/** The routed part over raw bf16 rows (pulsar_rows_moe_routed_launch): `selected` is localised in place under
+ *  expert parallelism (the rank's plan's range of whole experts). */
+typedef struct {
+    const pulsar_model *m;
+    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
+    int32_t *selected;
+    const float *weights;
+    const uint16_t *x_bf16;
+    int n_rows;
+    float *out;
+    void *ws;
+    size_t ws_bytes;
+    uint32_t *nf_flag;
+    uint32_t nf_code;
+    bool prompt;
+    void *stream;
+} pulsar_moe_rows_call;
+bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c);
 /** Whether stored format `type` has a kernel for `role` at activation `act` -- the one table (weight_format.cpp). */
 bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_format act);
 /** Admission by role: t's format serves `role` at one of the activations in the mask `acts`; a refusal names the

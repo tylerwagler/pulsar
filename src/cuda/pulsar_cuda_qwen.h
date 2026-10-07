@@ -153,7 +153,7 @@ const void *pulsar_gpu_weight_range_ptr(const void *model_map, uint64_t offset, 
 /** The device table of [trellis, scales] pointer pairs over an EXL3 expert
  *  stack (exl3_expert_table): n_expert slices of `stride` bytes, the scales
  *  plane at `split` into each. */
-const void *const *pulsar_qwen_expert_table(const void *stack, uint32_t n_expert, uint64_t stride, uint64_t split);
+const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert, uint64_t stride, uint64_t split);
 
 /** tokens (device i32 [T]) -> streams bf16 [T][4][2560]: each token's
  *  embed_tokens row (bf16 [n_vocab][2560]) repeated into the 4 streams. */
@@ -182,44 +182,51 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
                               float *logits, int32_t *selected, float *weights, float *sgate,
                               cudaStream_t stream);
 
-typedef struct {
-    const uint16_t *router_w;        /**< bf16 [512][2560] */
-    const uint16_t *shared_gate_w;   /**< bf16 [2560] */
-    const void *const *gate_up_table;/**< exl3_expert_table pairs [512][2]: the FUSED gate_up 2560 -> 1280
-                                          (output rows 0..639 gate, 640..1279 up -- the container's layout) */
-    const void *const *down_table;   /**< down_proj 640 -> 2560 */
-    /** L251 MTP: the SPLIT form -- gate 2560 -> 640 and up 2560 -> 640 as two slices, each with its own
-     *  suh (the MTP layer's experts, turboderp's EXL3).  Exactly one of gate_up_table and
-     *  (gate_table, up_table) is set; the artifact decides, the launcher refuses anything else. */
-    const void *const *gate_table, *const *up_table;
-    int k2_gate_up, k2_down;         /**< routed rates (half-bit units); k2_gate_up is the pair's rate in the split form */
-    pulsar_rows_linear shared_gate, shared_up, shared_down;
-    /** L266 step 7: expert parallelism.  ep_ranks 2: this rank owns experts [ep_rank * 256, +256) and its
-     *  tables hold exactly those (entry 0 = its first); a token's picks of the other rank's experts are
-     *  dropped here and summed there (the all-reduce after the block), and the shared expert is rank 0's.
-     *  0 / 1: every expert, as one GPU runs it. */
-    int ep_rank, ep_ranks;
-    /** L266: a PROMPT chunk (a prefill step, not a verify): the routed prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
-     *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
+/** L272 P4c: the routed MoE over bf16 ROWS -- the core front door's arm (moe.cpp builds it from the expert
+ *  stacks' formats; family-neutral).  EXL3 experts: a FUSED gate_up stack (output rows 0..mid-1 gate, mid..2mid-1
+ *  up) or a gate + up PAIR (two stacks, each with its own suh), and a down stack.  The tables hold experts
+ *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
+ *  rank's experts are dropped here and summed there. */
+typedef struct pulsar_rows_moe {
+    const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
+    const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */
+    const void *const *down_table;
+    int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
+    int ex_lo, n_local;                  /**< the experts the tables hold */
+    /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is
+     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode widths take the GEMV. */
     bool prompt;
-} pulsar_qwen_moe_dev;
+} pulsar_rows_moe;
+/** Workspace bytes for T rows of the routed part. */
+size_t pulsar_rows_moe_routed_workspace_bytes(int T);
+/** out [T][hidden] f32 = sum over each row's top-k picks (`sel` [T][k], localised IN PLACE under expert
+ *  parallelism; `wts` [T][k]) of w_k * down_k(silu(gate_k x) * up_k x), x the bf16 rows.  Non-finite outputs
+ *  record `nf_code` in *nf_flag (first writer wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ). */
+int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const float *wts, const uint16_t *x_bf16,
+                                  int T, float *out, void *ws, size_t ws_bytes, uint32_t *nf_flag, uint32_t nf_code,
+                                  cudaStream_t stream);
 
-/** Workspace bytes for T rows (everything but the MMQ drivers' own arena):
- *  a function of the shape alone. */
+/** The Qwen MoE block's workspace, carved: the router's outputs, the routed part's region, the shared expert's. */
+typedef struct {
+    float *logits;      /**< [T][513] the router's logits (row 512: the shared gate's) */
+    int32_t *sel;       /**< [T][10] */
+    float *wts;         /**< [T][10] */
+    float *sgate;       /**< [T] sigmoid of the shared gate */
+    void *routed;       /**< pulsar_rows_moe_routed_launch's workspace */
+    size_t routed_bytes;
+    float *yg, *yu, *ys;
+    uint16_t *h_x;      /**< the shared SwiGLU's bf16 rows */
+    void *lin;          /**< the shared expert's dense-arm workspace */
+    size_t lin_bytes;
+} pulsar_qwen_moe_parts;
+/** Workspace bytes for T rows of the whole block (a function of the shape alone). */
 size_t pulsar_qwen_moe_workspace_bytes(int T);
-
-/** The MoE block: out [T][2560] f32 = sum over the top-10 (slot order) of
- *  w_k * down_k(silu(gate_k x) * up_k x) + sigmoid(w_sg . x) * shared(x).
- *  `x_bf16` is the block input row and `x` its E4M3 slot (both from the GR
- *  read).  Non-finite outputs record `nf_code` in *nf_flag (first writer
- *  wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ); refuses without them. */
-/* L251 / ac69748f: x_bf16 only.  There is no E4M3 activation slot in this family, so the MoE takes
- * the block input's bf16 row and nothing else -- the routed arm reads it by ids_src1 and the shared
- * expert reads it directly. */
-int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
-                           int T, float *out, void *ws, size_t ws_bytes,
-                           uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream);
+int pulsar_qwen_moe_carve(int T, void *ws, size_t ws_bytes, pulsar_qwen_moe_parts *parts);
+/** The block's shared expert, after the routed sum is in `out`: out += sgate * down(silu(gate x) * up x), the
+ *  three linears through the front door's references (pulsar_linear_rows_ref). */
+int pulsar_qwen_moe_shared_launch(const pulsar_rows_linear *gate, const pulsar_rows_linear *up,
+                                  const pulsar_rows_linear *down, const uint16_t *x_bf16, int T, float *out,
+                                  const pulsar_qwen_moe_parts *p, cudaStream_t stream);
 
 /* ======================================================================== */
 /* Gated Residual (Qwen4ExpTextGatedResidual) + the top-level mixer           */
