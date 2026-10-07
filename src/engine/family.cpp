@@ -58,3 +58,13 @@ bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op)
             e->family->name, op);
     return false;
 }
+
+
+/* L272: every family's loader has one failure policy.  A refusal is said where it is found and counted
+ * here; the stage that found it finishes (so one load reports every problem it can see), and the family's
+ * load fails at its next stage boundary -- pulsar_engine_open returns an error, the process never exits on
+ * a bad artifact.  Loads run one at a time (engine open is not concurrent). */
+static uint32_t g_load_refusals;
+void pulsar_load_refuse(void) { g_load_refusals++; }
+uint32_t pulsar_load_refusals(void) { return g_load_refusals; }
+void pulsar_load_refusals_reset(void) { g_load_refusals = 0; }

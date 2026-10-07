@@ -85,8 +85,11 @@ static linear make_linear(int in, int out, int k2) {
     l.dequant();
     return l;
 }
-static pulsar_qwen_linear dev_linear(const linear &l) {
-    pulsar_qwen_linear d;
+static pulsar_rows_linear dev_linear(const linear &l) {
+    /* value-initialised: sf NULL (EXL3) and prompt false (the decode widths' GEMV).  It was `d;` -- prompt was
+     * whatever the stack held, so the shared expert took the prefill GEMM at decode width once a refactor moved
+     * the frame (L272 P4c: every T = 5 row off by ~1e-3, the one-plane GEMM's envelope). */
+    pulsar_rows_linear d{};
     d.w = up(l.bytes); d.k2 = l.k2; d.in = l.in; d.out = l.out;
     return d;
 }
@@ -492,6 +495,41 @@ static void section_ple(void) {
     size_t moved = 0;
     for (size_t i = 0; i < mut.size(); i++) moved += mut[i] != batch_out[i];
     CHECK(rc == 0 && moved > 0, "mutation: one conv tap moved %zu outputs", moved);
+
+    /* L272 P1 S4: the verify capture over several sequences -- batch B (runs of 1, 7 and 2 rows, one per
+     * bank) with state_rows: the state captured after row j of sequence q (at batch row sf[q] + j, every
+     * row but each sequence's last) == the state a batch of just that sequence's first j + 1 rows leaves */
+    {
+        const size_t slot_f = (size_t)PULSAR_QWEN_PLE_STATE * HC;
+        float *cap = (float *)dalloc((size_t)T * slot_f * 4);
+        CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+        pulsar_qwen_rows pc = pr;
+        pc.state_rows = cap;
+        rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pc, state, ws, wsb, 0);
+        const auto captured = down(cap, (size_t)T * slot_f);
+        bool same_all = rc == 0;
+        int compared = 0;
+        for (int q = 0; q < n_seq; q++) {
+            for (int j = 0; j + 1 < rowsB[q]; j++) {
+                CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+                std::vector<int32_t> pj(j + 1), pz(j + 1, 0);
+                for (int i = 0; i <= j; i++) pj[i] = i;
+                const std::vector<int32_t> zero = {0}, len = {j + 1}, bank = {q};
+                pulsar_qwen_rows p1 = {up(pz), up(pj), up(zero), up(len), up(bank), 1};
+                rc |= pulsar_qwen_ple_launch(&w, de + (size_t)sf[q] * H, ds + (size_t)sf[q] * HC, j + 1, &p1, state, ws,
+                                             wsb, 0);
+                const auto after = down(state, snap.size());
+                same_all = same_all && memcmp(after.data() + (size_t)q * slot_f,
+                                              captured.data() + (size_t)(sf[q] + j) * slot_f, slot_f * 4) == 0;
+                compared++;
+            }
+        }
+        CHECK(rc == 0 && same_all, "verify capture over 3 sequences: %d captured row states == the prefix runs' states",
+              compared);
+        cudaFree(cap);
+    }
 }
 
 /* ======================================================================== */
@@ -526,10 +564,13 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         for (int e = 0; e < E; e++) { t[2 * e] = base[e % P]; t[2 * e + 1] = (const uint8_t *)base[e % P] + trellis; }
         return (const void *const *)up(t);
     };
-    pulsar_qwen_moe_dev w{};
+    /* L272 P4c: the block as the engine composes it (pulsar_qwen_s4_moe): the router, the routed part through
+     * the front door's launch (pulsar_rows_moe_routed_launch), then the sigmoid-gated shared expert */
+    pulsar_rows_moe w{};
+    w.ex_lo = 0;
+    w.n_local = E;
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
-    w.router_w = up(wr);
-    w.shared_gate_w = up(wsg);
+    const uint16_t *router_w = up(wr), *shared_gate_w = up(wsg);
     if (split) {
         w.gate_table = table(pg); w.up_table = table(pu); w.down_table = table(pd);
         w.k2_gate_up = k2_ex ? k2_ex : 6; w.k2_down = k2_ex ? k2_ex : 6;
@@ -537,7 +578,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         w.gate_up_table = table(pgu); w.down_table = table(pd);
         w.k2_gate_up = k2_ex ? k2_ex : 8; w.k2_down = k2_ex ? k2_ex : 10;
     }
-    w.shared_gate = dev_linear(sg); w.shared_up = dev_linear(su); w.shared_down = dev_linear(sd);
+    const pulsar_rows_linear shg = dev_linear(sg), shu = dev_linear(su), shd = dev_linear(sd);
     const auto x = rnd_act(T, H, 0.7);
     /* L251 / ac69748f: the MoE reads the bf16 rows directly -- there is no A8 slot, so the
      * reference's activation is the bf16 VALUE, not a decoded E4M3 code. */
@@ -548,7 +589,17 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     uint32_t *nf = (uint32_t *)dalloc(4);
     const size_t wsb = pulsar_qwen_moe_workspace_bytes(T);
     void *ws = dalloc(wsb);
-    int rc = pulsar_qwen_moe_launch(&w, dx, T, out, ws, wsb, nf, 0x7351u, 0);
+    auto block = [&](const pulsar_rows_moe &rm, const uint16_t *xr, int rows, bool shared) -> int {
+        pulsar_qwen_moe_parts p;
+        if (pulsar_qwen_moe_carve(rows, ws, wsb, &p) != 0) return -1;
+        int r = pulsar_qwen_router_launch(xr, router_w, shared_gate_w, rows, H, E, TOPK, p.logits, p.sel, p.wts,
+                                          p.sgate, 0);
+        if (!r) r = pulsar_rows_moe_routed_launch(&rm, p.sel, p.wts, xr, rows, out, p.routed, p.routed_bytes, nf,
+                                                  0x7351u, 0);
+        if (!r && shared) r = pulsar_qwen_moe_shared_launch(&shg, &shu, &shd, xr, rows, out, &p, 0);
+        return r;
+    };
+    int rc = block(w, dx, T, true);
     CHECK(rc == 0, "launch T=%d (workspace %.1f MB)", T, wsb / 1e6);
     const auto O = down(out, (size_t)T * H);
     const auto NF = down(nf, 1);
@@ -559,13 +610,13 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         std::vector<double> sum((size_t)T * H, 0.0);
         bool ok = true;
         for (int r = 0; r < 2; r++) {
-            pulsar_qwen_moe_dev we = w;
-            we.ep_rank = r;
-            we.ep_ranks = 2;
+            pulsar_rows_moe we = w;
+            we.ex_lo = r * (E / 2);
+            we.n_local = E / 2;
             auto half = [&](const void *const *t) { return t ? t + (size_t)2 * (E / 2) * r : t; };
             we.gate_up_table = half(w.gate_up_table); we.gate_table = half(w.gate_table);
             we.up_table = half(w.up_table); we.down_table = half(w.down_table);
-            ok = ok && pulsar_qwen_moe_launch(&we, dx, T, out, ws, wsb, nf, 0x7351u, 0) == 0;
+            ok = ok && block(we, dx, T, r == 0) == 0;
             const auto Or = down(out, (size_t)T * H);
             for (size_t i = 0; i < sum.size(); i++) sum[i] = (double)(float)(sum[i] + (double)Or[i]);
         }
@@ -584,7 +635,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     /* the device's routing, from the router alone on the same rows */
     float *lg = (float *)dalloc((size_t)T * (E + 1) * 4), *rw = (float *)dalloc((size_t)T * TOPK * 4), *rs = (float *)dalloc(T * 4);
     int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
-    pulsar_qwen_router_launch(dx, w.router_w, w.shared_gate_w, T, H, E, TOPK, lg, sel, rw, rs, 0);
+    pulsar_qwen_router_launch(dx, router_w, shared_gate_w, T, H, E, TOPK, lg, sel, rw, rs, 0);
     const auto Sel = down(sel, (size_t)T * TOPK);
     const auto RW = down(rw, (size_t)T * TOPK);
     const auto RS = down(rs, T);
@@ -647,7 +698,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
     if (T <= 16) {
         /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
-        rc = pulsar_qwen_moe_launch(&w, dx + (size_t)2 * H, 1, out, ws, wsb, nf, 0x7351u, 0);
+        rc = block(w, dx + (size_t)2 * H, 1, true);
         const auto O1 = down(out, H);
         CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d%s "
               "batch's row", T, split ? " split-expert" : "");

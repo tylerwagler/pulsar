@@ -137,17 +137,23 @@ qwen_ple_state_kernel(const float *__restrict__ gvn, const int32_t *__restrict__
     for (int i = 0; i < kState; ++i) state[((size_t)q * kState + i) * kHC + ch] = nv[i];
 }
 
-/* the verify capture: the conv state after each row r < T - 1 of the one sequence -- the state
- * kernel's rule with the call cut after row r.  Launched before it, so the old state is intact. */
+/* the verify capture: the conv state after each row of a sequence but its last -- the state kernel's
+ * rule with the sequence cut after that row -- at the row's batch index (L272 P1 S4: any number of
+ * sequences, one per bank).  Launched before it, so the old state is intact.  grid (channels, T). */
 __global__ void __launch_bounds__(kThreads)
-qwen_ple_state_rows_kernel(const float *__restrict__ gvn, const int32_t *__restrict__ seq_bank,
+qwen_ple_state_rows_kernel(const float *__restrict__ gvn, const int32_t *__restrict__ row_seq,
+                           const int32_t *__restrict__ row_j, const int32_t *__restrict__ seq_first,
+                           const int32_t *__restrict__ seq_rows, const int32_t *__restrict__ seq_bank,
                            const float *__restrict__ state, float *__restrict__ state_rows) {
-    const int ch = blockIdx.x * kThreads + threadIdx.x, r = blockIdx.y, q = seq_bank[0], n = r + 1;
+    const int ch = blockIdx.x * kThreads + threadIdx.x, t = blockIdx.y;
+    const int sq = row_seq[t], j = row_j[t];
+    if (j >= seq_rows[sq] - 1) return;                    /* the sequence's last row: the pool's */
+    const int f = seq_first[sq], q = seq_bank[sq], n = j + 1;
 #pragma unroll
     for (int i = 0; i < kState; ++i) {
         const int p = n + i - kState;
-        state_rows[((size_t)r * kState + i) * kHC + ch] =
-            p >= 0 ? gvn[(size_t)p * kHC + ch] : state[((size_t)q * kState + (n + i)) * kHC + ch];
+        state_rows[((size_t)t * kState + i) * kHC + ch] =
+            p >= 0 ? gvn[(size_t)(f + p) * kHC + ch] : state[((size_t)q * kState + (n + i)) * kHC + ch];
     }
 }
 
@@ -224,8 +230,8 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16
     /* L251 / ac69748f: the gathered rows ARE bf16, so the key/value projections read them directly
      * and the E4M3 emit step (which existed only to build the A8 slot) is gone.  The bf16 row is the
      * one activation encoding, emitted by whatever produced `emb` (rule 3). */
-    int rc = pulsar_qwen_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_qwen_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
+    int rc = pulsar_rows_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
+    if (!rc) rc = pulsar_rows_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     qwen_ple_gate_kernel<<<dim3(kS, T), kThreads, 0, stream>>>(
         m.key, m.value, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_key,
@@ -233,15 +239,10 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16
     qwen_ple_conv_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
         m.gvn, m.value, m.sig, (const __nv_bfloat16 *)w->conv_w, conv_state, rows->row_seq, rows->row_j,
         rows->seq_bank, (__nv_bfloat16 *)streams);
-    if (rows->state_rows) {
-        if (rows->n_seq != 1) {
-            fprintf(stderr, "pulsar: qwen PLE: the verify capture takes one sequence -- refusing\n");
-            return -1;
-        }
-        if (T > 1)
-            qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, T - 1), kThreads, 0, stream>>>(
-                m.gvn, rows->seq_bank, conv_state, rows->state_rows);
-    }
+    if (rows->state_rows && T > 1)
+        qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
+            m.gvn, rows->row_seq, rows->row_j, rows->seq_first, rows->seq_rows, rows->seq_bank, conv_state,
+            rows->state_rows);
     qwen_ple_state_kernel<<<dim3(kHC / kThreads, rows->n_seq), kThreads, 0, stream>>>(
         m.gvn, rows->seq_first, rows->seq_rows, rows->seq_bank, conv_state);
     return launch_ok("inject") ? 0 : -3;

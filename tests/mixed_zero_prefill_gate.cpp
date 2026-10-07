@@ -98,7 +98,7 @@ static bool solo_decode_row(float *lg_out) {
 static bool mixed_zero(int K, bool dirty, float *dec_lg, float *pf_lg, int *out) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     bool ok = gate_pool_fits(s, 2);
     if (ok && dirty) ok = gate_populate_bank(s, 1, g_toks.v + 500, 2500, NULL, "dirty bank 1");
     if (ok) ok = gate_populate_bank(s, 0, g_toks.v + 1000, C0, NULL, "partner");

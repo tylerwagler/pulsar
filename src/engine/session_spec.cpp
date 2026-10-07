@@ -1211,7 +1211,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
     /* L260: each bank's walk records its committed capture rows; one banked seed
      * after the loop shares the drafter's main_proj / attn_kv reads across every
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
-    s->seed_defer.active = FAMILY_BANKS(s) ? FAMILY_BANKS(s)->count(s) > 0 : s->graph.banks.n_banks > 0;
+    s->seed_defer.active = FAMILY_BANKS(s) ? FAMILY_BANKS(s)->count(s) > 0 : s->graph->banks.n_banks > 0;
     s->seed_defer.n = 0;
     s->spec.spec_round_banks = n;   /* L263: the round's flat cost is shared n ways */
     for (int i = 0; i < n; i++) {
@@ -1326,8 +1326,7 @@ uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t ban
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
     if (!s) return NULL;
     if (bank == pulsar_session_live_bank(s)) return &s->spec;
-    if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->spec_carry ? FAMILY_BANKS(s)->spec_carry(s, bank) : NULL;
-    if (bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
+    /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
     return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
 }
 

@@ -94,16 +94,20 @@ typedef struct {
     const uint16_t *norm_w;   /**< [128], the gated norm's weight (used as is, no 1+w) */
 } pulsar_gdn_weights;
 
-/** One call: n_seq sequences of seq_rows consecutive rows each (rows =
- *  n_seq * seq_rows) -- the family step's two modes: DECODE is n_seq rows of
- *  one token (seq_rows 1), a PREFILL chunk is one sequence (n_seq 1) of
- *  seq_rows tokens.  row_slot is per ROW (the step's row_bank slot as it is);
- *  sequence s runs on slot row_slot[s * seq_rows].  Pointers are device
+/** One call: n_seq sequences of consecutive rows -- the family step's modes: DECODE is n_seq rows of
+ *  one token (seq_rows 1), a PREFILL chunk is one sequence (n_seq 1) of seq_rows tokens, and (L272 P1
+ *  S4) a multi-bank verify is n_seq RAGGED runs, one per bank: seq_first gives each run's first row.
+ *  row_slot is per ROW (the step's row_bank slot as it is); sequence s runs on the slot of its first row.  Pointers are device
  *  pointers; every f32 pointer 16-byte aligned and every pitch a multiple of
  *  4 floats. */
 typedef struct {
     int            n_seq;
-    int            seq_rows;
+    int            seq_rows;      /**< rows per sequence; with seq_first, the LONGEST sequence's */
+    /** L272 P1 S4: device [n_seq + 1] row offsets of ragged sequences (s is rows
+     *  [seq_first[s], seq_first[s + 1])), or NULL = uniform (s is rows [s * seq_rows, (s + 1) * seq_rows)).
+     *  With it, n_rows is the call's total rows (= seq_first[n_seq]); without, n_rows is 0 or n_seq * seq_rows. */
+    const int32_t *seq_first;
+    int            n_rows;
     const int32_t *row_slot;      /**< [n_seq * seq_rows] state slot (bank) of each row */
     float         *conv_state;    /**< pool, PULSAR_GDN_CONV_STATE_FLOATS per slot */
     float         *rec_state;     /**< pool, PULSAR_GDN_REC_STATE_FLOATS per slot */
@@ -119,10 +123,11 @@ typedef struct {
     void          *out_e4m3;          /**< A8 slot data [rows][6144] or NULL */
     void          *out_scale;         /**< A8 slot ue8m0 scales (zeroed by the slot owner) */
     int            out_kbp;           /**< must equal pulsar_mx_kbp(6144) = 192 */
-    /** L251 MTP verify: the state AFTER each row r < seq_rows - 1 of a one-sequence call (the last
-     *  row's is the pool's), so a rejected draft rolls back by copying row r's back.  Both NULL
-     *  (every other call) or both set with n_seq == 1:
-     *    conv_rows [seq_rows - 1][PULSAR_GDN_CONV_STATE_FLOATS], rec_rows [seq_rows - 1][PULSAR_GDN_REC_STATE_FLOATS].
+    /** L251 MTP verify: the state AFTER each row of a sequence but its last (the last row's is the pool's),
+     *  so a rejected draft rolls back by copying that row's back.  Indexed by the call's ROW (L272 P1 S4:
+     *  any number of sequences -- row r of sequence s at slot seq_first[s] + r; each sequence's last-row
+     *  slot is unused).  Both NULL (every other call) or both set:
+     *    conv_rows [rows][PULSAR_GDN_CONV_STATE_FLOATS], rec_rows [rows][PULSAR_GDN_REC_STATE_FLOATS].
      *  The arithmetic is unchanged -- the kernels only also store what they hold. */
     float         *conv_rows;
     float         *rec_rows;

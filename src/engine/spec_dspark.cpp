@@ -232,7 +232,7 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
 
 static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     memset(f, 0, sizeof(*f));
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     if (!spec_frontier_copy_tables_init(g)) return false;
 
     bool ok = pulsar_gpu_begin_commands() != 0;
@@ -252,7 +252,7 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
 }
 
 static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     /* The tables cache the CURRENT bank's state pointers and
      * gpu_graph_bank_repoint drops them, so in the batched lane a round's
      * restore usually finds them gone: the server switches banks between
@@ -279,7 +279,7 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
  * drafter conditioning (target_h -> main_x) and seed one drafter-KV row from it.
  * Mirrors the reference invariant "drafter KV row j = f(hidden at position j)". */
 static bool dspark_absorb(pulsar_session *s, uint32_t row, int32_t /*next: DSpark conditions on the row's hidden alone*/) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     pulsar_engine *e = s->engine;
     for (int i = 0; i < 3; i++) {
         if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
@@ -335,7 +335,7 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base,
                                    float temperature, int top_k, float top_p,
                                    float min_p, uint64_t *rng) {
     pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
@@ -649,7 +649,7 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base,
 static void dspark_harvest(pulsar_session *s) {
     if (!s->spec.dspark_chain_unharvested) return;
     s->spec.dspark_chain_unharvested = false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint32_t n_draft = s->spec.dspark_chain_n;
     if (n_draft == 0 || n_draft > 16u) return;
     int32_t ids[17];
@@ -699,7 +699,7 @@ static void dspark_harvest(pulsar_session *s) {
  * begins here but sits the step out only makes the result more conservative (ok=false) or the superset
  * wider (lower floor): both safe. */
 static void ds4_round_note(pulsar_session *s, float temperature, int top_k, float top_p, float min_p) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const bool in_contract = temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
                              min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && min_p <= 1.0f &&
                              spec_vocab(s) <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX;
@@ -723,7 +723,7 @@ static void ds4_round_note(pulsar_session *s, float temperature, int top_k, floa
 }
 
 static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = n_rows;
     g->spec_comp_save_n = n_rows;
     /* L149 phase 2: arm (n_rows > 0) the compact verify read from the rounds
@@ -751,7 +751,7 @@ static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
 static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_spec_rows *out,
                               char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     /* ONE batched forward: base decode + draft verify + anchor capture. */
     g->dspark_capture_batch_n = r->n_batch;
     g->spec_comp_save_n = r->n_batch;   /* Stage-B: save per-position comp projections */
@@ -796,7 +796,7 @@ static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_sp
  * armed -- the compact candidate block, the per-row argmaxes, or the caller's full block. */
 static bool ds4_verify_rows(pulsar_session *s, pulsar_spec_round *r, const float *rows, uint32_t row0,
                             pulsar_spec_rows *out, char *err, size_t errlen) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     /* L149 phase 2: the step read the compact block instead of `rows`. Row
      * argmaxes come from its headers (the host tie rule, computed on device);
      * the walk builds from candidates; any row that needs its full logits
@@ -862,7 +862,7 @@ static bool ds4_verify_rows(pulsar_session *s, pulsar_spec_round *r, const float
  * without a valid window (masked-window eval: 4.7% vs 86% top-1). */
 static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
@@ -910,7 +910,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                               char *err, size_t errlen) {
     PULSAR_NVTX("redraft group");
     pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
@@ -1159,7 +1159,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
 static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
                                       const uint32_t *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     if (!rounds || !banks || !rngs || n <= 0) return 0;
     if (!g->dspark_markov_logits || !g->dspark_refined_ids ||
         !g->dspark_bank_meta || !g->dspark_conf_scores || !g->dspark_conf_tokens ||
@@ -1251,7 +1251,7 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
     /* a full accept: the verify advanced the target state by exactly the committed tokens */
     if (commit == r->K) return true;
     if (!ds4_spec_restore(s, r)) return false;
-    return gpu_graph_dspark_compressor_rollforward(&s->graph, &e->model, &e->weights,
+    return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights,
                                                    (uint32_t)r->saved_len, 1u + commit, row0);
 }
 
@@ -1285,7 +1285,7 @@ static uint32_t dspark_depth_default(const pulsar_engine *e) { return (uint32_t)
 static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *,
                                  uint32_t n) {
     pulsar_engine *e = s->engine;
-    return gpu_graph_dspark_seed_rows_banked(&s->graph, &e->dspark_model, &e->dspark_weights, rows, banks, n);
+    return gpu_graph_dspark_seed_rows_banked(s->graph, &e->dspark_model, &e->dspark_weights, rows, banks, n);
 }
 
 const pulsar_drafter_ops k_dspark_drafter = {

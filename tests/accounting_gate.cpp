@@ -113,7 +113,7 @@ int GATE_ENTRY(int argc, char **argv) {
     fprintf(stderr, "accounting_gate: session price == allocation (%.3f GiB)\n",
             (double)priced / (1024.0 * 1024.0 * 1024.0));
 
-    const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
+    const uint32_t pool = gpu_graph_bank_pool_count(s->graph);
     fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "
                     "attn_row=%" PRIu64 " idx_row=%" PRIu64 "\n",
             pool, ctx, peak, PULSAR_ENGINE_MAINKV_ROWBYTES,
@@ -128,7 +128,7 @@ int GATE_ENTRY(int argc, char **argv) {
      * equal what THIS session's bank 0 actually holds, to the byte: the raw
      * slab's per-bank share plus the per-(layer, bank) comp/index allocations,
      * read from the tensors the allocator made -- not from the sizing formulas. */
-    if (!s->graph.banks.n_banks) {
+    if (!s->graph->banks.n_banks) {
         fprintf(stderr, "accounting_gate: FAIL bank pool disabled; the estimate check "
                         "reads the per-bank slabs (set PULSAR_MSEQ_BANKS>=2)\n");
         goto done;
@@ -138,9 +138,9 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_context_memory_estimate(PULSAR_BACKEND_CUDA, ctx, 0);
         uint64_t held_raw = 0, held_comp_index = 0;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            held_raw += pulsar_gpu_tensor_bytes(s->graph.banks.raw[il]) / s->graph.banks.n_banks;
-            held_comp_index += pulsar_gpu_tensor_bytes(s->graph.banks.comp[il][0]) +
-                               pulsar_gpu_tensor_bytes(s->graph.banks.index[il][0]);
+            held_raw += pulsar_gpu_tensor_bytes(s->graph->banks.raw[il]) / s->graph->banks.n_banks;
+            held_comp_index += pulsar_gpu_tensor_bytes(s->graph->banks.comp[il][0]) +
+                               pulsar_gpu_tensor_bytes(s->graph->banks.index[il][0]);
         }
         if (est.raw_bytes != held_raw || est.comp_index_bytes != held_comp_index) {
             fprintf(stderr, "accounting_gate: FAIL context estimate raw %" PRIu64 " B, comp/idx %" PRIu64
@@ -178,7 +178,7 @@ int GATE_ENTRY(int argc, char **argv) {
             fprintf(stderr, "accounting_gate: warmup sync to %d failed: %s\n", warm, err);
             goto done;
         }
-        gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+        gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
         (void)pulsar_gpu_synchronize();
         fprintf(stderr, "accounting_gate: warmup prefill %d tokens done\n", warm);
     }
@@ -210,7 +210,7 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         /* Capture the current bank's frontier so idle-bank readers agree; the
          * touched getter already uses the live layer_n_comp for the cur bank. */
-        gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+        gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
         (void)pulsar_gpu_synchronize();
 
         uint64_t free_now = 0, total_now = 0;
@@ -280,7 +280,7 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_gpu_mem_info(&f_a, &t_a);
             const uint64_t touched_a = pulsar_session_touched_kv_bytes(s);
             pulsar_session_rewind(s, cut);
-            gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+            gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
             (void)pulsar_gpu_synchronize();
             uint64_t f_b = 0;
             pulsar_gpu_mem_info(&f_b, &t_a);
@@ -305,7 +305,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 fprintf(stderr, "accounting_gate: re-prefill to %d failed: %s\n", top, err);
                 fail = 1;
             } else {
-                gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+                gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
                 const uint64_t touched_c = pulsar_session_touched_kv_bytes(s);
                 const int regrow_ok = touched_c == touched_a;
                 if (!regrow_ok) fail = 1;
@@ -338,8 +338,8 @@ int GATE_ENTRY(int argc, char **argv) {
      * and checking cudaMemGetInfo free rises by ~the bank's touched bytes. Runs
      * LAST (the session is torn down right after); the freed slots are nulled so
      * gpu_graph_free does not double-free. */
-    if (s->graph.banks.n_banks) {
-        pulsar_gpu_graph *g = &s->graph;
+    if (s->graph->banks.n_banks) {
+        pulsar_gpu_graph *g = s->graph;
         (void)pulsar_gpu_synchronize();
         const uint64_t touched_bank0 = pulsar_session_touched_kv_bytes(s); /* only bank 0 prefilled */
         uint64_t f_before = 0, tt = 0;

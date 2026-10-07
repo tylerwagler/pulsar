@@ -1,7 +1,5 @@
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
-#include "lib/qwen_chat.h"
-#include "lib/qwen_tokenizer.h"
 
 
 
@@ -489,7 +487,8 @@ int pulsar_vocab::vocab_lookup(const char *text) const {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "pulsar: required tokenizer token is missing: %s\n", text);
-        exit(1);
+        pulsar_load_refuse();   /* L272: load time only (vocab_load); the load fails at its stage boundary */
+        return -1;
     }
     return token;
 }
@@ -788,64 +787,35 @@ static void encode_chat_prompt(
  * family without one ends the process here, by name, instead of tokenizing
  * with an empty vocabulary; the front ends refuse such an engine at startup
  * (pulsar_engine_has_tokenizer) before they can reach this. */
-static void tokenizer_require(const pulsar_engine *e, const char *op) {
-    if (e && e->qwen_tok) return;   /* L251 S5: the Qwen family's own tokenizer (below) */
-    if (pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return;
-    fprintf(stderr, "pulsar: %s has no tokenizer in this build -- exiting\n", e->family->name);
+static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
+    if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op) && e->family->tokenizer) return e->family->tokenizer;
+    fprintf(stderr, "pulsar: %s has no tokenizer in this build -- exiting\n", e ? e->family->name : "(no engine)");
     exit(1);
 }
 
 /* The entries below that BUILD DeepSeek's chat template from marker ids (lead-in, message, assistant
- * prefix) have no Qwen form: a Qwen chat is rendered whole by qwen_chat_render.  A Qwen engine ends
- * the process here, by name, instead of pushing DeepSeek's markers from an empty vocabulary. */
+ * prefix) serve only a family whose chat IS that template; one that renders its chat whole (Qwen:
+ * qwen_chat_render) ends the process here, by name, instead of pushing DeepSeek's markers from a
+ * vocabulary it does not have. */
 static void ds4_template_require(const pulsar_engine *e, const char *op) {
-    tokenizer_require(e, op);
-    if (!e || !e->qwen_tok) return;
+    if (tokenizer_require(e, op)->incremental_ds4_template) return;
     fprintf(stderr, "pulsar: %s builds DeepSeek's chat template; %s renders its chat whole -- exiting\n", op,
             e->family->name);
     exit(1);
 }
 
 bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
-    return !e || e->qwen_tok || (e->family->caps & PULSAR_FAMILY_CAP_CHAT) != 0;
-}
-
-/* L251 S5: a Qwen engine tokenizes with src/lib/qwen_tokenizer (byte-exact with HF on the
- * checkpoint's own tokenizer.json, make qwen-chat-gate).  `spans` are the client-data ranges where
- * no added token may match.  The entries have no error return; an encode refusal (text that is not
- * UTF-8 -- HF cannot take it either -- or spans out of order, a renderer defect) is reported by name
- * and yields no tokens, never a different tokenization. */
-static void qwen_encode_into(const pulsar_engine *e, const char *text, const pulsar_text_span *spans,
-                             uint32_t n_spans, pulsar_tokens *out) {
-    std::vector<int> ids;
-    char err[256] = "";
-    const size_t len = text ? strlen(text) : 0;
-    if (!qwen_tokenizer_encode(e->qwen_tok, text ? text : "", len, spans, n_spans, &ids, err, sizeof(err))) {
-        fprintf(stderr, "pulsar: qwen tokenizer refused %zu bytes: %s\n", len, err);
-        return;
-    }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    return !e || ((e->family->caps & PULSAR_FAMILY_CAP_CHAT) != 0 && e->family->tokenizer);
 }
 
 bool pulsar_token_is_stop(pulsar_engine *e, int token) {
-    tokenizer_require(e, "pulsar_token_is_stop");
-    if (e->qwen_tok) {
-        for (int id : qwen_tokenizer_stop_ids(e->qwen_tok)) if (id == token) return true;
-        return false;
-    }
-    return token == e->vocab.eos_id;
+    return tokenizer_require(e, "pulsar_token_is_stop")->is_stop(e, token);
 }
 
 
 
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_tokenize_text");
-    if (e->qwen_tok) {   /* raw text: all of it is client data, so no added token matches */
-        const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
-        qwen_encode_into(e, text, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
-        return;
-    }
-    e->vocab.bpe_tokenize_text(text ? text : "", out);
+    tokenizer_require(e, "pulsar_tokenize_text")->encode_text(e, text, out);
 }
 
 
@@ -961,18 +931,14 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
 }
 
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_tokenize_rendered_chat");
-    if (e->qwen_tok) { qwen_encode_into(e, text, NULL, 0u, out); return; }
-    e->vocab.tokenize_rendered_chat_vocab(text, out);
+    tokenizer_require(e, "pulsar_tokenize_rendered_chat")->encode_rendered(e, text, NULL, 0u, out);
 }
 
 void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
                                          pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
-    if (!n_spans || !spans) { pulsar_tokenize_rendered_chat(e, text, out); return; }
-    if (e->qwen_tok) { qwen_encode_into(e, text, spans, n_spans, out); return; }
-    e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
+    t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out);
 }
 
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
@@ -1012,25 +978,7 @@ void pulsar_encode_chat_prompt(
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_encode_chat_prompt");
-    if (e->qwen_tok) {   /* the server's path: render (HF's template, byte for byte), tokenize with its spans */
-        qwen_effort qe = QWEN_EFFORT_NONE;
-        char err[256] = "";
-        const qwen_msg_in msgs[2] = {{"system", system, NULL, NULL, 0}, {"user", prompt ? prompt : "", NULL, NULL, 0}};
-        const bool has_system = system && system[0];
-        qwen_render_out r;
-        bool ok = think_mode == PULSAR_THINK_NONE || think_mode == PULSAR_THINK_DEFAULT;
-        if (!ok) snprintf(err, sizeof(err), "thinking effort %d has no Qwen effort (on or off only)", think_mode);
-        ok = ok && qwen_effort_resolve(NULL, pulsar_think_mode_enabled(think_mode) ? 1 : 0, &qe, err, sizeof(err)) &&
-             qwen_chat_render({has_system ? msgs : msgs + 1, has_system ? 2 : 1, NULL, qe, true}, &r, err, sizeof(err));
-        if (!ok) {
-            fprintf(stderr, "pulsar: pulsar_encode_chat_prompt: %s -- exiting\n", err);
-            exit(1);
-        }
-        pulsar_tokenize_rendered_chat_spans(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), out);
-        return;
-    }
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+    tokenizer_require(e, "pulsar_encode_chat_prompt")->encode_chat_prompt(e, system, prompt, think_mode, out);
 }
 
 
@@ -1142,7 +1090,7 @@ void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens
 
 /* Print a decoded piece as a quoted string: printable ASCII and well-formed
  * UTF-8 verbatim, \n \r \t \" \\ as escapes, every other byte as \xNN. */
-static void dump_piece_quoted(FILE *fp, const char *s, size_t n) {
+void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n) {
     fputc('"', fp);
     for (size_t i = 0; i < n;) {
         const unsigned char c = (unsigned char)s[i];
@@ -1187,7 +1135,7 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
             size_t n = 0;
             char *piece = vocab_token_text(vocab, id, &n);
             fprintf(fp, "%6d  ", id);
-            dump_piece_quoted(fp, piece, n);
+            pulsar_dump_piece_quoted(fp, piece, n);
             fprintf(fp, "  raw=%.*s\n", (int)vocab->token[id].len, vocab->token[id].ptr);
             free(piece);
         }
@@ -1196,10 +1144,6 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 
 
 
-void pulsar_vocab::dump_tokens(const token_vec *tokens) const {
-    const auto *vocab = this;
-    dump_tokens_fp(stdout, vocab, tokens);
-}
 
 
 
@@ -1235,18 +1179,7 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
-    tokenizer_require(e, "pulsar_token_text");
-    if (e->qwen_tok) {
-        size_t n = 0;
-        const char *b = qwen_tokenizer_token_bytes(e->qwen_tok, token, &n);
-        if (!b) n = 0;   /* out of range, e.g. the padded logits rows past the table: no text */
-        char *out = (char *)xmalloc(n + 1);
-        if (n) memcpy(out, b, n);
-        out[n] = '\0';
-        if (len) *len = n;
-        return out;
-    }
-    return vocab_token_text(&e->vocab, token, len);
+    return tokenizer_require(e, "pulsar_token_text")->token_text(e, token, len);
 }
 
 
@@ -1283,11 +1216,7 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 int pulsar_token_eos(pulsar_engine *e) {
-    tokenizer_require(e, "pulsar_token_eos");
-    /* Qwen: the FIRST of generation_config's stop ids (<|im_end|>); a caller that ends generation
-     * must test the whole set with pulsar_token_is_stop */
-    if (e->qwen_tok) return qwen_tokenizer_stop_ids(e->qwen_tok).front();
-    return e->vocab.eos_id;
+    return tokenizer_require(e, "pulsar_token_eos")->eos(e);
 }
 
 
@@ -1297,39 +1226,9 @@ int pulsar_token_eos(pulsar_engine *e) {
  * BPE holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either
  * word leaves the anchors off, said once -- never a marker that matches at the wrong place. */
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
-    tokenizer_require(e, "pulsar_chat_turn_markers");
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_chat_turn_markers");
     memset(out, 0, sizeof(*out));
-    if (!e->qwen_tok) {
-        out->user[0] = e->vocab.user_id;
-        out->n_user = 1;
-        out->assistant[0] = e->vocab.assistant_id;
-        out->n_assistant = 1;
-        return true;
-    }
-    const int start = qwen_tokenizer_added_id(e->qwen_tok, "<|im_start|>");
-    pulsar_tokens user = {0}, assistant = {0};
-    pulsar_tokenize_text(e, "user", &user);
-    pulsar_tokenize_text(e, "assistant", &assistant);
-    const bool ok = start >= 0 && user.len == 1 && assistant.len == 1;
-    if (ok) {
-        out->user[0] = start;
-        out->user[1] = user.v[0];
-        out->n_user = 2;
-        out->assistant[0] = start;
-        out->assistant[1] = assistant.v[0];
-        out->n_assistant = 2;
-    } else {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            fprintf(stderr, "pulsar: %s: the tokenizer does not spell a turn as <|im_start|> (%d) plus one role "
-                            "token (\"user\" %d, \"assistant\" %d tokens): the chat turn markers are unknown\n",
-                    e->family->name, start, user.len, assistant.len);
-        }
-    }
-    pulsar_tokens_free(&user);
-    pulsar_tokens_free(&assistant);
-    return ok;
+    return t->turn_markers(e, out);
 }
 
 int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
@@ -1344,9 +1243,7 @@ int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int
 }
 
 int pulsar_token_think_close(pulsar_engine *e) {
-    tokenizer_require(e, "pulsar_token_think_close");
-    if (e->qwen_tok) return qwen_tokenizer_added_id(e->qwen_tok, "</think>");
-    return e->vocab.think_end_id;
+    return tokenizer_require(e, "pulsar_token_think_close")->think_close(e);
 }
 
 
@@ -2296,3 +2193,50 @@ const char *pulsar_backend_name(pulsar_backend backend) {
     return "unknown";
 }
 
+
+
+/* ---- the DeepSeek family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2) ---------------- */
+
+static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    e->vocab.bpe_tokenize_text(text ? text : "", out);
+}
+
+static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                                    uint32_t n_spans, pulsar_tokens *out) {
+    if (!spans || !n_spans) e->vocab.tokenize_rendered_chat_vocab(text, out);
+    else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
+}
+
+static void ds4_tok_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt,
+                                       pulsar_think_mode think_mode, pulsar_tokens *out) {
+    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+}
+
+static bool ds4_tok_is_stop(pulsar_engine *e, int token) { return token == e->vocab.eos_id; }
+static int ds4_tok_eos(pulsar_engine *e) { return e->vocab.eos_id; }
+static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { return vocab_token_text(&e->vocab, token, len); }
+static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id; }
+
+/* DeepSeek names a turn with one special token */
+static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
+    out->user[0] = e->vocab.user_id;
+    out->n_user = 1;
+    out->assistant[0] = e->vocab.assistant_id;
+    out->n_assistant = 1;
+    return true;
+}
+
+static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) { dump_tokens_fp(fp, &e->vocab, tokens); }
+
+const pulsar_family_tokenizer k_ds4_tokenizer = {
+    /* .encode_text              = */ ds4_tok_encode_text,
+    /* .encode_rendered          = */ ds4_tok_encode_rendered,
+    /* .encode_chat_prompt       = */ ds4_tok_encode_chat_prompt,
+    /* .is_stop                  = */ ds4_tok_is_stop,
+    /* .eos                      = */ ds4_tok_eos,
+    /* .token_text               = */ ds4_tok_token_text,
+    /* .think_close              = */ ds4_tok_think_close,
+    /* .turn_markers             = */ ds4_tok_turn_markers,
+    /* .dump                     = */ ds4_tok_dump,
+    /* .incremental_ds4_template = */ true,
+};

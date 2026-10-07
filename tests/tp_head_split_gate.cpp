@@ -77,8 +77,7 @@ static void check_q_b(pulsar_engine *e, const pulsar_layer_weights *L, uint32_t 
      * way.  One emit serves the whole GEMM and every slice: identical operand. */
     if (!pulsar_gpu_mxfp8_act_emit_f32(x, n_rows, q_rank)) { CHECK(0, "q_b: x E4M3 emit refused"); goto out; }
     pulsar_gpu_matmul_set_batch_decode_rows(decode ? (int)n_rows : 0);
-    if (!gpu_graph_matmul_mxfp8_rows_named_tensor("gate attn_q_b whole", 0, 0, full, &e->model, L->attn_q_b,
-                                                  q_rank, q_full, 0, q_full, x, n_rows)) {
+    if (!pulsar_linear_slot(full, &e->model, L->attn_q_b, q_rank, 0, q_full, x, n_rows)) {
         CHECK(0, "q_b whole GEMM refused (%s)", regime);
         goto out;
     }
@@ -100,8 +99,7 @@ static void check_q_b(pulsar_engine *e, const pulsar_layer_weights *L, uint32_t 
             pulsar_gpu_tensor *sl = pulsar_gpu_tensor_alloc((uint64_t)n_rows * (hi - lo) * sizeof(float));
             float *hsl = (float *)malloc((size_t)n_rows * (hi - lo) * sizeof(float));
             if (!sl || !hsl) { CHECK(0, "q_b slice allocation"); if (sl) pulsar_gpu_tensor_free(sl); free(hsl); continue; }
-            if (!gpu_graph_matmul_mxfp8_rows_named_tensor("gate attn_q_b slice", 0, 0, sl, &e->model, L->attn_q_b,
-                                                          q_rank, q_full, lo, hi, x, n_rows)) {
+            if (!pulsar_linear_slot(sl, &e->model, L->attn_q_b, q_rank, lo, hi, x, n_rows)) {
                 CHECK(0, "q_b slice GEMM refused (rank %d of %d, %s)", r, n, regime);
             } else {
                 pulsar_gpu_tensor_read(sl, 0, hsl, (uint64_t)n_rows * (hi - lo) * sizeof(float));
@@ -244,8 +242,7 @@ static void check_refusals(pulsar_engine *e, const pulsar_layer_weights *L) {
         if (hx) { pulsar_gpu_tensor_write(x, 0, hx, (uint64_t)n_rows * q_rank * sizeof(float)); free(hx); }
         pulsar_gpu_mxfp8_act_emit_f32(x, n_rows, q_rank);
         pulsar_gpu_matmul_set_batch_decode_rows((int)n_rows);
-        const bool wrong = gpu_graph_matmul_mxfp8_rows_named_tensor("gate attn_q_b wrong dims", 0, 0, o, &e->model,
-                                                                    L->attn_q_b, q_rank, q_full, 0, hi / 2, x, n_rows);
+        const bool wrong = pulsar_linear_slot(o, &e->model, L->attn_q_b, q_rank, 0, hi / 2, x, n_rows);
         pulsar_gpu_matmul_set_batch_decode_rows(0);
         CHECK(!wrong, "an unregistered row range at a registered slice's offset was ACCEPTED");
         if (!wrong) printf("  ok    an unregistered row range at a registered slice's offset is refused at the GEMM\n");

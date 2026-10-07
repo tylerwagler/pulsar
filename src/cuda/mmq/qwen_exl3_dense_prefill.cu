@@ -18,7 +18,7 @@
 //              checked to support each other row count (an unsupported one refuses).
 //              cublasGemmEx(CUBLAS_GEMM_DEFAULT) sat here and picked a kernel (and split-K) by M, so a
 //              prompt cut at G got different bytes from the same prompt prefilled whole --
-//              tests/qwen_chunk_neutrality_gate measured 1-2 nats of logit difference.  DeepSeek's bf16
+//              the chunk-neutrality gate (now tests/session_contract_gate) measured 1-2 nats of logit difference.  DeepSeek's bf16
 //              GEMM met the same fact in L183 (pulsar_cuda_matmul.cu bf16_lt_matmul).
 //   4. EPILOGUE per row: times 2^-P, the output H128 per 128-block, times svh.
 //

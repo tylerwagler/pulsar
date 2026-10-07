@@ -1375,6 +1375,19 @@ void server::worker_finish_slot(session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (pulsar_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
+/* L272: a slot's draw from the pool session's live logits row -- through the declared-name mask while it
+ * samples a constrained tool name (the row copied out: the session's own stays the target distribution
+ * the logprob capture reads). */
+static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
+                           float min_p) {
+    if (!gen_tool_name_open(g)) return pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+    const int width = pulsar_engine_logits_width(s->engine);
+    std::vector<float> row((size_t)width);
+    if (pulsar_session_copy_logits(pool, row.data(), width) != width) return -1;
+    (void)gen_mask_tool_name(s, g, row.data(), width);
+    return pulsar_sample_logits(row.data(), width, temp, top_k, top_p, min_p, &g->rng);
+}
+
 /* A slot is eligible for the batched decode lanes when it is in steady-state
  * decode. L116: tool-call requests are admitted — measured 2026-08-26, the old
  * has_tools exclusion forced ALL agent traffic onto the classic per-slot RR,
@@ -1411,7 +1424,8 @@ static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t ba
     bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= banks_max && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
-        if (!dg || !dg->spec_enabled || dg->batch_active)
+        /* L272: a slot sampling a constrained tool name holds speculation (lane 3 samples in the engine) */
+        if (!dg || !dg->spec_enabled || dg->batch_active || gen_tool_name_open(dg))
             all_spec = false;
     }
     const bool use_spec_batched = pool_banks > 0 && all_spec;
@@ -1757,8 +1771,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token =
-            pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (g->batch_feed_token < 0) {
             snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
@@ -1841,9 +1854,10 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
                 g->phase = GEN_FINISH;
                 continue;
             }
-            const float *row = logits + (size_t)q * (size_t)vocab;
+            float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
+            if (gen_tool_name_open(g)) (void)gen_mask_tool_name(s, g, row, vocab);   /* L272 */
             g->batch_feed_token =
                 pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
             if (g->batch_feed_token < 0) {
@@ -2746,7 +2760,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (g->batch_feed_token < 0) {
             snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
@@ -2902,9 +2916,10 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             if (s->gen_emit_token(sl, committed)) {
                 g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
             }
-            const float *row = logits + (size_t)q * (size_t)vocab;
+            float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
+            if (gen_tool_name_open(g)) (void)gen_mask_tool_name(s, g, row, vocab);   /* L272 */
             g->batch_feed_token = pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
             if (g->batch_feed_token < 0) {
                 snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");

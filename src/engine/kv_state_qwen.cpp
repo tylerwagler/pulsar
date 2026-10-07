@@ -12,7 +12,7 @@
  *
  * THE RESUME GRID: Qwen's recurrent GDN and per-row QSA are split-invariant by construction, and every
  * prompt chunk takes the prefill arms at every row count with a pinned GEMM (L266:
- * qwen_chunk_neutrality_gate) -- so a prompt cut ANYWHERE is the cold prefill's bytes.  The grid is
+ * session_contract_gate C1) -- so a prompt cut ANYWHERE is the cold prefill's bytes.  The grid is
  * therefore free; 128 keeps the slots on the server's and DeepSeek's cadence and is a multiple of the
  * indexer block (4).
  *
@@ -97,8 +97,7 @@ static bool qwen_prepare_restore(void *state, uint32_t G) {
     qwen_bank_set_pos(st, bank, G);
     st->prefill_pos[bank] = G;
     st->mtp_pend_pos[bank] = st->mtp ? G - 1u : UINT32_MAX;
-    st->logits_fresh = false;
-    return true;
+    return true;   /* the logits: the caller's (s->logits_stale after a restore) */
 }
 
 static void qwen_restored(void *state) { Q_(state)->frontier_stale[Q_(state)->live_bank] = false; }

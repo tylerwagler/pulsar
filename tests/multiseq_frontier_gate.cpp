@@ -131,7 +131,7 @@ static int stream_tok(int stream, int i) {
 }
 
 static bool populate_bank(pulsar_session *s, uint32_t bank, int stream, int len) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, bank)) return false;
     pulsar_tokens p;
     memset(&p, 0, sizeof(p));
@@ -150,7 +150,7 @@ static bool populate_bank(pulsar_session *s, uint32_t bank, int stream, int len)
 typedef struct { int bank; int pos; int token; } step_row;
 
 static bool run_step(pulsar_session *s, const step_row *rows, uint32_t n) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     pulsar_tokens vec;
     memset(&vec, 0, sizeof(vec));
     vec.v = (int *)malloc((size_t)n * sizeof(int));
@@ -490,7 +490,7 @@ static bool solo_reference(int stream, int len, int steps,
         const step_row r = {0, len + i, stream_tok(stream, len + i)};
         ok = run_step(s, &r, 1);
     }
-    if (ok) ok = collect_emit_rows(&s->graph, 0, row_r4, row_r128, er);
+    if (ok) ok = collect_emit_rows(s->graph, 0, row_r4, row_r128, er);
     pulsar_session_free(s);
     return ok;
 }
@@ -507,7 +507,7 @@ static bool mixed_scenario_order(int a_bank, int a_len, int b_bank, int b_len,
                            int check_a_untouched, int populate_b_first) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     /* populate_b_first flips which bank the graph's views are repointed at
      * when the step runs (cur_bank) — the banked step must be bit-invariant
      * to it (any cur-bank leakage in stores/reads/emits breaks this). */

@@ -197,7 +197,7 @@ public:
     const std::string &content() const { return content_; }
     const std::vector<qwen_out_call> &calls() const { return calls_; }
     int errors() const { return errors_; }
-    /** The parser sits inside an open <tool_call> block: its arguments decode greedily (L272 B8). */
+    /** The parser sits inside an open \<tool_call\> block: its arguments decode greedily (L272 B8). */
     bool in_tool_call() const { return mode_ == M_TOOL; }
     /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from the first "<tool_call>" to the
      * last "</tool_call>" that closed (a malformed block among them included -- these are the bytes
@@ -219,9 +219,9 @@ private:
     mode_t mode_ = M_CONTENT;
     std::string hold_;         ///< bytes not yet classified
     size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
-    bool block_seen_ = false;  ///< a <tool_call> opened: raw_lo_ is set
-    size_t raw_lo_ = 0;        ///< stream offset of the first <tool_call>
-    size_t raw_hi_ = 0;        ///< stream offset past the last </tool_call>
+    bool block_seen_ = false;  ///< a \<tool_call\> opened: raw_lo_ is set
+    size_t raw_lo_ = 0;        ///< stream offset of the first \<tool_call\>
+    size_t raw_hi_ = 0;        ///< stream offset past the last \</tool_call\>
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open tool-call block body
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call

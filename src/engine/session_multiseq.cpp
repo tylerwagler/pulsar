@@ -65,7 +65,7 @@ int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
     }
     /* decode_multiseq is decode-only (1 row per bank), so n_runs == n; no
      * out-param needed (the caller reads n logit rows). max_head_runs = 0 (all). */
-    const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
+    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model,
                                                    &e->weights, tokens, pos,
                                                    bank, n, logits, NULL, 0u,
                                                    /*capture_cur=*/false, NULL);
@@ -114,9 +114,9 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
-        n_rows > s->graph.prefill_cap) {
+        n_rows > s->graph->prefill_cap) {
         PULSAR_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
-                      n_rows, s ? s->graph.prefill_cap : 0u);
+                      n_rows, s ? s->graph->prefill_cap : 0u);
         return 1;
     }
     /* plan-34 inc 3: the engine emits ONE logit row per BANK RUN (last-of-run),
@@ -156,7 +156,7 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
         bank[k]   = (int32_t)reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
-    const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
+    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model,
                                                    &e->weights, tokens, pos,
                                                    bank, n_rows, logits, out_n_rows,
                                                    max_head_runs,
@@ -188,8 +188,8 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
     if (out_n_rows) *out_n_rows = 0;
     s->fused_logits = nullptr;
     s->fused_n_dec = s->fused_heads = 0;
-    if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->graph.prefill_cap) {
-        PULSAR_MIXED_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph.prefill_cap);
+    if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->graph->prefill_cap) {
+        PULSAR_MIXED_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph->prefill_cap);
         return 1;
     }
     uint32_t heads = 0;
@@ -208,7 +208,7 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
         bank[k] = (int32_t)reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
-    const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights, tokens, pos, bank,
+    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, tokens, pos, bank,
                                                    n_rows, logits, out_n_rows, 0u,
                                                    /*capture_cur=*/false, shape);
     free(pos); free(bank); free(tokens);

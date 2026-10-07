@@ -201,7 +201,7 @@ int GATE_ENTRY(int argc, char **argv) {
              * fetches a full row only when it needs one), and a uniform p is
              * exactly what an unwritten block measured as (E[accept] 1.6e-5). */
             if (have_q) {
-                if (!gpu_graph_read_spec_logits_row(&s->graph, 0u, prow)) {
+                if (!gpu_graph_read_spec_logits_row(s->graph, 0u, prow)) {
                     fprintf(stderr, "spec logits row 0 read failed at %d\n", pos);
                     pulsar_sample_dist_free(&qd);
                     goto done;

@@ -90,15 +90,16 @@ typedef struct {
     const uint8_t *sf;
     int out, in;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_lowrank;
 
-/** A dense Linear in the EXL3 format: one [trellis | suh | svh] slice in
- *  exl3_expert_layout's byte model (so an exllamav3 checkpoint's tensors copy
- *  in verbatim), run by the EXL3 dense arm (mmq/ds4_exl3_dense.cuh). */
-typedef struct {
+/** L272 P4c: the bf16-ROWS dense linear's reference (family-neutral; built by the core's front door,
+ *  pulsar_linear_rows_ref in linear.cpp, from the format table): an mxfp8_lt weight (the W8A16 arm) or an
+ *  EXL3 one -- one [trellis | suh | svh] slice in exl3_expert_layout's byte model, so an exllamav3
+ *  checkpoint's tensors copy in verbatim (mmq/ds4_exl3_dense.cuh). */
+typedef struct pulsar_rows_linear {
     const void *w;
     const uint8_t *sf;   /**< the mxfp8_lt E8M0 plane (NULL for EXL3): the
                           *  recipe's dense tier is MIXED, so the arm follows
@@ -106,10 +107,10 @@ typedef struct {
     int k2;          /**< rate in half-bit units, 4..10; 0 = mxfp8_lt */
     int in, out;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
-} pulsar_qwen_linear;
+} pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
 typedef struct {
@@ -147,22 +148,22 @@ int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, const int32_t *rows, int out, i
 
 /** A weight's device pointer: the engine's model-range cache for the span
  *  [offset, offset + bytes) of `model_map` (cuda_model_range_ptr). */
-const void *pulsar_qwen_weight_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+const void *pulsar_gpu_weight_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 
 /** The device table of [trellis, scales] pointer pairs over an EXL3 expert
  *  stack (exl3_expert_table): n_expert slices of `stride` bytes, the scales
  *  plane at `split` into each. */
-const void *const *pulsar_qwen_expert_table(const void *stack, uint32_t n_expert, uint64_t stride, uint64_t split);
+const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert, uint64_t stride, uint64_t split);
 
 /** tokens (device i32 [T]) -> streams bf16 [T][4][2560]: each token's
  *  embed_tokens row (bf16 [n_vocab][2560]) repeated into the 4 streams. */
 int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
                              cudaStream_t stream);
 
-/** Workspace bytes pulsar_qwen_linear_launch needs for `rows` rows. */
-size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l, int rows);
+/** Workspace bytes pulsar_rows_linear_launch needs for `rows` rows. */
+size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows);
 /** y [rows][out] f32 = the complete Linear of the bf16 rows in `x_bf16`. */
-int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const uint16_t *x_bf16, int rows, float *y,
+int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
                               void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /* ======================================================================== */
@@ -181,44 +182,51 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
                               float *logits, int32_t *selected, float *weights, float *sgate,
                               cudaStream_t stream);
 
-typedef struct {
-    const uint16_t *router_w;        /**< bf16 [512][2560] */
-    const uint16_t *shared_gate_w;   /**< bf16 [2560] */
-    const void *const *gate_up_table;/**< exl3_expert_table pairs [512][2]: the FUSED gate_up 2560 -> 1280
-                                          (output rows 0..639 gate, 640..1279 up -- the container's layout) */
-    const void *const *down_table;   /**< down_proj 640 -> 2560 */
-    /** L251 MTP: the SPLIT form -- gate 2560 -> 640 and up 2560 -> 640 as two slices, each with its own
-     *  suh (the MTP layer's experts, turboderp's EXL3).  Exactly one of gate_up_table and
-     *  (gate_table, up_table) is set; the artifact decides, the launcher refuses anything else. */
-    const void *const *gate_table, *const *up_table;
-    int k2_gate_up, k2_down;         /**< routed rates (half-bit units); k2_gate_up is the pair's rate in the split form */
-    pulsar_qwen_linear shared_gate, shared_up, shared_down;
-    /** L266 step 7: expert parallelism.  ep_ranks 2: this rank owns experts [ep_rank * 256, +256) and its
-     *  tables hold exactly those (entry 0 = its first); a token's picks of the other rank's experts are
-     *  dropped here and summed there (the all-reduce after the block), and the shared expert is rank 0's.
-     *  0 / 1: every expert, as one GPU runs it. */
-    int ep_rank, ep_ranks;
-    /** L266: a PROMPT chunk (a prefill step, not a verify): the routed prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
-     *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
+/** L272 P4c: the routed MoE over bf16 ROWS -- the core front door's arm (moe.cpp builds it from the expert
+ *  stacks' formats; family-neutral).  EXL3 experts: a FUSED gate_up stack (output rows 0..mid-1 gate, mid..2mid-1
+ *  up) or a gate + up PAIR (two stacks, each with its own suh), and a down stack.  The tables hold experts
+ *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
+ *  rank's experts are dropped here and summed there. */
+typedef struct pulsar_rows_moe {
+    const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
+    const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */
+    const void *const *down_table;
+    int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
+    int ex_lo, n_local;                  /**< the experts the tables hold */
+    /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is
+     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode widths take the GEMV. */
     bool prompt;
-} pulsar_qwen_moe_dev;
+} pulsar_rows_moe;
+/** Workspace bytes for T rows of the routed part. */
+size_t pulsar_rows_moe_routed_workspace_bytes(int T);
+/** out [T][hidden] f32 = sum over each row's top-k picks (`sel` [T][k], localised IN PLACE under expert
+ *  parallelism; `wts` [T][k]) of w_k * down_k(silu(gate_k x) * up_k x), x the bf16 rows.  Non-finite outputs
+ *  record `nf_code` in *nf_flag (first writer wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ). */
+int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const float *wts, const uint16_t *x_bf16,
+                                  int T, float *out, void *ws, size_t ws_bytes, uint32_t *nf_flag, uint32_t nf_code,
+                                  cudaStream_t stream);
 
-/** Workspace bytes for T rows (everything but the MMQ drivers' own arena):
- *  a function of the shape alone. */
+/** The Qwen MoE block's workspace, carved: the router's outputs, the routed part's region, the shared expert's. */
+typedef struct {
+    float *logits;      /**< [T][513] the router's logits (row 512: the shared gate's) */
+    int32_t *sel;       /**< [T][10] */
+    float *wts;         /**< [T][10] */
+    float *sgate;       /**< [T] sigmoid of the shared gate */
+    void *routed;       /**< pulsar_rows_moe_routed_launch's workspace */
+    size_t routed_bytes;
+    float *yg, *yu, *ys;
+    uint16_t *h_x;      /**< the shared SwiGLU's bf16 rows */
+    void *lin;          /**< the shared expert's dense-arm workspace */
+    size_t lin_bytes;
+} pulsar_qwen_moe_parts;
+/** Workspace bytes for T rows of the whole block (a function of the shape alone). */
 size_t pulsar_qwen_moe_workspace_bytes(int T);
-
-/** The MoE block: out [T][2560] f32 = sum over the top-10 (slot order) of
- *  w_k * down_k(silu(gate_k x) * up_k x) + sigmoid(w_sg . x) * shared(x).
- *  `x_bf16` is the block input row and `x` its E4M3 slot (both from the GR
- *  read).  Non-finite outputs record `nf_code` in *nf_flag (first writer
- *  wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ); refuses without them. */
-/* L251 / ac69748f: x_bf16 only.  There is no E4M3 activation slot in this family, so the MoE takes
- * the block input's bf16 row and nothing else -- the routed arm reads it by ids_src1 and the shared
- * expert reads it directly. */
-int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16_t *x_bf16,
-                           int T, float *out, void *ws, size_t ws_bytes,
-                           uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream);
+int pulsar_qwen_moe_carve(int T, void *ws, size_t ws_bytes, pulsar_qwen_moe_parts *parts);
+/** The block's shared expert, after the routed sum is in `out`: out += sgate * down(silu(gate x) * up x), the
+ *  three linears through the front door's references (pulsar_linear_rows_ref). */
+int pulsar_qwen_moe_shared_launch(const pulsar_rows_linear *gate, const pulsar_rows_linear *up,
+                                  const pulsar_rows_linear *down, const uint16_t *x_bf16, int T, float *out,
+                                  const pulsar_qwen_moe_parts *p, cudaStream_t stream);
 
 /* ======================================================================== */
 /* Gated Residual (Qwen4ExpTextGatedResidual) + the top-level mixer           */
@@ -229,7 +237,7 @@ typedef struct {
     pulsar_qwen_lowrank up;   /**< input_mix_weight_up [10240][320]; the same format as down */
     const uint16_t *inject;   /**< block_inject_weight bf16 [4][10240]; NULL = the mixer (no write) */
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
-     *  prompt cut anywhere is byte-identical to one prefilled whole (qwen_chunk_neutrality_gate).
+     *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
 } pulsar_qwen_gr_dev;
@@ -254,8 +262,8 @@ int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, const float
 /* PLE at layer index 1 (Qwen4ExpTextPLELayer)                               */
 
 typedef struct {
-    pulsar_qwen_linear key_proj;     /**< 2560 -> 10240 */
-    pulsar_qwen_linear value_proj;   /**< 2560 -> 2560 */
+    pulsar_rows_linear key_proj;     /**< 2560 -> 10240 */
+    pulsar_rows_linear value_proj;   /**< 2560 -> 2560 */
     const uint16_t *norm_key;        /**< bf16 [10240], (1 + w) */
     const uint16_t *norm_query;      /**< bf16 [10240] */
     const uint16_t *norm_conv;       /**< bf16 [10240] */
@@ -270,9 +278,10 @@ typedef struct {
 typedef struct {
     const int32_t *row_seq, *row_j, *seq_first, *seq_rows, *seq_bank;
     int n_seq;
-    /** L251 MTP verify (NULL otherwise; set only with n_seq 1): the conv state AFTER each row
-     *  r < rows - 1, [rows - 1][PULSAR_QWEN_PLE_STATE][10240] f32, so a rejected draft rolls back by
-     *  copying row r's back.  The arithmetic is unchanged. */
+    /** L251 MTP verify (NULL otherwise): the conv state AFTER each row of a sequence but its last, at the
+     *  row's batch index (L272 P1 S4: any number of sequences), [rows][PULSAR_QWEN_PLE_STATE][10240] f32 --
+     *  each sequence's last-row slot unused -- so a rejected draft rolls back by copying a row's back.
+     *  The arithmetic is unchanged. */
     float *state_rows;
 } pulsar_qwen_rows;
 

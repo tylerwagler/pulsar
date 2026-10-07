@@ -1382,6 +1382,15 @@ static void test_stream_heartbeat_openai_uses_sse_comment(void) {
 
 
 
+/* The tools the DSML stream tests call, declared the way the protocol parse declares a request's tools
+ * (L272: a call to an undeclared tool is a malformed block, so the live projection would stop at it). */
+static void declare_stream_test_tools(request *r) {
+    for (const char *name : {"bash", "read", "edit", "write"}) {
+        std::string json = std::string("{\"name\":\"") + name + "\",\"parameters\":{\"type\":\"object\"}}";
+        tool_schema_orders_add_json(&r->tool_orders, json.c_str());
+    }
+}
+
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -1389,6 +1398,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1434,6 +1444,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1474,6 +1485,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1522,6 +1534,7 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1581,6 +1594,7 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -3273,6 +3287,8 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
         r.forced_tool_name = xstrdup("search");
+        tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                                                    "\"properties\":{\"q\":{\"type\":\"string\"}}}}");
         char err[200] = {0};
         TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err));
         TEST_ASSERT(r.force_tool_call && r.has_tools);
@@ -3298,9 +3314,104 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         TEST_ASSERT(p.calls().size() == 1 && p.calls()[0].name == "search" && p.calls()[0].arguments == "{\"q\": \"pulsars\"}");
         TEST_ASSERT(p.reasoning().empty() && p.content().empty() && p.errors() == 0);
         buf_free(&seed);
+        /* L272: an UNNAMED forced call's seed stops before the name's "=" (token healing: Qwen's tokenizer
+         * joins "=get"); the model's "=search>" completes the tag and the parser reads the call */
+        char *named = r.forced_tool_name;
+        r.forced_tool_name = NULL;
+        buf useed = {0};
+        r.family->forced_call_seed(&r, &useed);
+        TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "<tool_call>\n<function" : "\n</think>\n\n<tool_call>\n<function"));
+        TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
+        qwen_output_parser u;
+        TEST_ASSERT(u.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
+        std::vector<qwen_out_event> uev;
+        u.feed(useed.ptr, useed.len, &uev);
+        TEST_ASSERT(u.in_tool_call() && u.calls().empty());
+        const std::string rest = std::string("=search>\n") + body;
+        u.feed(rest.data(), rest.size(), &uev);
+        u.finish(&uev);
+        TEST_ASSERT(u.calls().size() == 1 && u.calls()[0].name == "search" && u.calls()[0].arguments == "{\"q\": \"pulsars\"}");
+        TEST_ASSERT(u.errors() == 0);
+        r.forced_tool_name = named;
+        buf_free(&useed);
         request_free(&r);
         chat_conversation_free(&c);
     }
+}
+
+/* L272: a forced call names a declared tool, for every family.  "required" with one declared tool renders
+ * as that tool by name (Qwen sampled an undeclared "reply" for an unnamed required call); a named choice
+ * that is not declared refuses; the declared-name check writes the model-visible error. */
+static void test_forced_call_names_a_declared_tool(void) {
+    static const char *const one_tool =
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"}}}}}]";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4};
+    for (pulsar_chat_format fmt : fmts) {
+        for (int named_bad = 0; named_bad < 2; named_bad++) {
+            std::string body = std::string("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Joke?\"}],") +
+                               one_tool + (named_bad ? ",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"reply\"}}}"
+                                                     : ",\"tool_choice\":\"required\"}");
+            chat_conversation c = {};
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_OPENAI;
+            char err[200] = {0};
+            TEST_ASSERT(parse_chat_conversation_openai(body.c_str(), &c, &r, err, sizeof err));
+            const bool ok = render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+            if (named_bad) {
+                TEST_ASSERT(!ok && strstr(err, "\"reply\"") && strstr(err, "not a declared tool"));
+            } else {
+                TEST_ASSERT(ok && r.force_tool_call && r.forced_tool_name && !strcmp(r.forced_tool_name, "get_weather"));
+                /* the prefill opens the call by that name */
+                TEST_ASSERT(strstr(r.prompt_text, fmt == PULSAR_CHAT_QWEN ? "<function=get_weather>" : "\"get_weather\""));
+                buf seed = {0};
+                r.family->forced_call_seed(&r, &seed);
+                TEST_ASSERT(seed.ptr && strstr(seed.ptr, "get_weather"));
+                buf_free(&seed);
+            }
+            request_free(&r);
+            chat_conversation_free(&c);
+        }
+    }
+    /* the check itself: a declared name passes; any other writes the name and the declared ones */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
+    char detail[200] = "";
+    TEST_ASSERT(tool_call_declared(&r, "search", detail, sizeof detail) && !detail[0]);
+    TEST_ASSERT(!tool_call_declared(&r, "reply", detail, sizeof detail));
+    TEST_ASSERT(!strcmp(detail, "unknown tool \"reply\"; the declared tools are: get_weather, search"));
+    TEST_ASSERT(!tool_call_declared(&r, NULL, NULL, 0));
+    request_free(&r);
+}
+
+/* L272: the declared-name mask's token rule -- a token is allowed while the joined bytes stay a prefix of
+ * a declared name + the closer, or pass the closer with only whitespace after. */
+static void test_tool_name_token_allowed(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 16);
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
+    const tool_schema_orders *d = &r.tool_orders;
+    TEST_ASSERT(tool_name_token_allowed("", 0, "get", 3, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("", 0, "se", 2, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "ask", 3, "", d, ">"));          /* Qwen's undeclared ask_user */
+    TEST_ASSERT(tool_name_token_allowed("get_", 4, "weather", 7, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">", 1, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">\n", 2, "", d, ">"));   /* closer + newline in one token */
+    TEST_ASSERT(!tool_name_token_allowed("get_weather", 11, ">x", 2, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("get", 3, ">", 1, "", d, ">"));           /* a strict prefix cannot close */
+    TEST_ASSERT(!tool_name_token_allowed("search", 6, "_web", 4, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "", 0, "", d, ">"));               /* an empty token: never */
+    /* L272: the opener rides the name's first token (Qwen "=get"); a bare opener is a prefix too */
+    TEST_ASSERT(tool_name_token_allowed("", 0, "=get", 4, "=", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("", 0, "=", 1, "=", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("=", 1, "search", 6, "=", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "get", 3, "=", d, ">"));        /* the opener is not optional */
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "=ask", 4, "=", d, ">"));
+    request_free(&r);
 }
 
 static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
@@ -6790,6 +6901,34 @@ static chat_sink capture_sink(request *r, capture_tool_ctx *c) {
     return k;
 }
 
+/* L272: a call to an undeclared tool stops the live projection before it is announced -- no begin, no
+ * argument bytes -- so a stream never carries a call the finish drops. */
+static void test_dsml_stream_never_announces_an_undeclared_tool(void) {
+    const char *raw =
+        PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"reply\">\n"
+        PULSAR_PARAM_START " name=\"text\" string=\"true\">hi" PULSAR_PARAM_END "\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_TOOL_CALLS_END;
+    const size_t n = strlen(raw);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
+    capture_tool_ctx c;
+    memset(&c, 0, sizeof c);
+    chat_sink k = capture_sink(&r, &c);
+    dsml_tool_stream ts;
+    memset(&ts, 0, sizeof ts);
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    for (size_t len = 1; len <= n; len++) TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
+    TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_ERROR);
+    TEST_ASSERT(c.begins == 0 && c.ends == 0 && !c.args.ptr);
+    dsml_tool_stream_free(&ts);
+    buf_free(&c.events);
+    buf_free(&c.args);
+    request_free(&r);
+}
+
 static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     const char *raw =
         PULSAR_TOOL_CALLS_START "\n"
@@ -6805,6 +6944,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
+    declare_stream_test_tools(&r);
     capture_tool_ctx c;
     memset(&c, 0, sizeof c);
     chat_sink k = capture_sink(&r, &c);
@@ -8062,6 +8202,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_qwen_hooks_compose_to_the_full_render();
     test_qwen_raw_calls_replay_verbatim();
     test_qwen_forced_call_prefill_and_seed();
+    test_forced_call_names_a_declared_tool();
+    test_tool_name_token_allowed();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
@@ -8123,6 +8265,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();
     test_l184_shared_tool_stream_drives_protocol_emitters();
+    test_dsml_stream_never_announces_an_undeclared_tool();
     test_l184_dsml_entity_pair_round_trips();
     test_l185_every_renderer_produces_the_authority_bytes();
     test_l192_tool_history_validation_is_nearest_preceding();

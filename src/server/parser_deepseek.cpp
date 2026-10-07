@@ -317,8 +317,48 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
     }
     if (out->calls.len) {
         if (ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
+        /* L272: a call to an undeclared tool is not executable.  A turn left with no valid call takes the
+         * model-visible retry; otherwise the call is dropped -- after the stream's ids were applied: the
+         * live projection stopped at the first such call, so every call before it kept its index */
+        char undeclared[512] = "";
+        int kept = 0;
+        for (int i = 0; i < out->calls.len; i++) {
+            char detail[512];
+            if (tool_call_declared(&j->req, out->calls.v[i].name, detail, sizeof(detail))) {
+                out->calls.v[kept++] = out->calls.v[i];
+                continue;
+            }
+            if (!undeclared[0]) snprintf(undeclared, sizeof(undeclared), "%s", detail);
+            free(out->calls.v[i].id);
+            free(out->calls.v[i].name);
+            free(out->calls.v[i].arguments);
+        }
+        const bool dropped = kept < out->calls.len;
+        out->calls.len = kept;
+        if (dropped) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s %s", g->ctx_span,
+                       g->req_flags[0] ? " " : "", g->req_flags, undeclared);
+            s->trace_event(g->trace_id, "%s", undeclared);
+            if (kept == 0 && retry_allowed && !j->req.force_tool_call) {
+                if (ds_parser_retry(ps, s, sl, g, undeclared, "call to an undeclared tool", out)) {
+                    free(out->content);
+                    free(out->reasoning);
+                    out->content = out->reasoning = NULL;
+                    tool_calls_free(&out->calls);
+                    return true;
+                }
+                out->finish = "error";
+                return true;
+            }
+            /* the sampled bytes hold the dropped call: no tool memory for this turn (a prefix miss) */
+            free(out->calls.raw_dsml);
+            out->calls.raw_dsml = NULL;
+            if (kept == 0 && out->finish && !strcmp(out->finish, "tool_calls")) out->finish = "stop";
+        }
+    }
+    if (out->calls.len) {
         s->assign_tool_call_ids(&out->calls, j->req.api);
-        s->tool_memory_remember(&out->calls);
+        s->tool_memory_remember(&out->calls);   /* a no-op without the sampled bytes */
         /* L077: a length-capped, tag-repaired call reports "length" -- the
          * repaired calls are still emitted (replayed transcripts stay
          * parseable), but the label must not claim a complete call. */

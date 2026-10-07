@@ -433,24 +433,10 @@ static bool accelerator_span_filter_contains(uint64_t off,
 
 
 
-/* A routed-expert STACK: gate/up/down experts stored back to back, `dim[2]`
- * experts of `bytes/dim[2]` each (blk.N and dspark.N `*_exps.weight`). */
-static bool model_tensor_is_expert_stack(const pulsar_tensor *t) {
-    static const char suffix[] = "_exps.weight";
-    const size_t sl = sizeof(suffix) - 1;
-    if (t->ndim != 3 || t->dim[2] == 0 || t->bytes == 0) return false;
-    if (t->name.len < sl || memcmp(t->name.ptr + t->name.len - sl, suffix, sl) != 0) return false;
-    return t->bytes % t->dim[2] == 0;
-}
-
-/* L241 4g-2 expert tensor-parallel: a TP rank serves its HALF of every expert
- * from compact per-rank stacks the engine builds at open straight from the
- * mapping (pulsar_gpu_register_mxfp4_expert_half); the stacks as stored are
- * never staged or read on the device.  One box stages every tensor. */
+/* Under TP a rank never stages a stored tensor its plan replaces -- a slice built at open, a routed stack's
+ * half, the other rank's experts (tp_slice.cpp marks them; L272 P4b).  One box stages every tensor. */
 static bool model_tensor_unstaged(const pulsar_model *m, const pulsar_tensor *t) {
-    if (m->tp_n_ranks <= 1) return false;
-    if (m->tp_unstaged) return m->tp_unstaged[t - m->tensors] != 0;   /* the family's rule (L266) */
-    return model_tensor_is_expert_stack(t);
+    return m->tp_n_ranks > 1 && m->tp_unstaged && m->tp_unstaged[t - m->tensors] != 0;
 }
 
 uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
@@ -615,16 +601,10 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     if (!m || m->size == 0) return false;
     if (m->n_shards == 0 && !m->map) return false;
     /* Announce the residency lane (rule 5) with the bytes it withholds. */
-    if (m->tp_n_ranks > 1 && m->tp_unstaged) {
-        fprintf(stderr, "pulsar: TP residency: rank %d/%u leaves %.2f GiB unstaged -- the other ranks' experts and the "
-                        "stored tensors whose rank slices the family builds at open\n",
+    if (m->tp_n_ranks > 1)
+        fprintf(stderr, "pulsar: TP residency: rank %d/%u leaves %.2f GiB unstaged -- the stored tensors its plan's "
+                        "slices replace (built or staged at open)\n",
                 m->tp_rank, m->tp_n_ranks, (double)pulsar_model_unstaged_expert_bytes(m) / 1073741824.0);
-    } else if (m->tp_n_ranks > 1) {
-        fprintf(stderr, "pulsar: TP residency: rank %d/%u stages no routed-expert stack whole; "
-                        "its half of every expert (%.2f GiB of stored stacks) is built at open\n",
-                m->tp_rank, m->tp_n_ranks,
-                (double)pulsar_model_unstaged_expert_bytes(m) / 1073741824.0);
-    }
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
      * rejected at dispatch). Runs before the weight-cache early-out so it
@@ -743,13 +723,15 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
         if (!ov) {
             fprintf(stderr, "pulsar: expert overlay is missing tensor: %.*s\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         if (ov->ndim != t->ndim ||
             memcmp(ov->dim, t->dim, sizeof(ov->dim)) != 0) {
             fprintf(stderr, "pulsar: expert overlay shape mismatch for %.*s\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         if (ov->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
             /* The CUTLASS grouped-GEMM prefill path device-asserts when its
@@ -759,7 +741,8 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
             fprintf(stderr, "pulsar: expert overlay does not support CUTLASS "
                             "type-40 donor tensors yet (%.*s)\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         t->type = ov->type;
         t->rel_offset = ov->rel_offset;

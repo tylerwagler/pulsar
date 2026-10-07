@@ -28,10 +28,6 @@ const pulsar_tokens *pulsar_session::tokens() {
 }
 
 
-void pulsar_engine::dump_tokens(const pulsar_tokens *tokens) {
-    auto *e = this;
-    e->vocab.dump_tokens(tokens);  /* the pulsar_vocab member */
-}
 
 
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
@@ -310,79 +306,41 @@ static void register_model_fds(const pulsar_model *m) {
     }
 }
 
-/* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
- * one layer's three routed stacks -- gate/up by intermediate ROWS, down by
- * intermediate (input) COLUMNS, the same owned range for all three, so the
- * SwiGLU halves line up and the rank's down output is a partial the FFN
- * exchange sums.  Both ranks do identical work (every selected expert, half
- * width), so there is no skew by construction.  Byte geometry: one authority,
- * cutlass_mxfp4_expert_layout, for the full and the half shapes. */
-static bool tp_register_expert_half(pulsar_engine *e, const pulsar_model *m,
-                                    const pulsar_layer_weights *L, int rank, uint32_t nr) {
+/* L241 4g-2 expert tensor-parallel: this rank's half of every expert of one layer's three routed stacks --
+ * gate/up by intermediate ROWS (OUT), down by intermediate (input) COLUMNS (IN), the same owned range for all
+ * three, so the SwiGLU halves line up and the rank's down output is a partial the FFN exchange sums.  Both ranks
+ * do identical work (every selected expert, half width), so there is no skew by construction.  How a half is
+ * built is the format's (tp_slice.cpp: a CUTLASS MXFP4 stack's half; another format refuses there by name). */
+static bool tp_declare_expert_half(pulsar_tp_plan *p, pulsar_model *m, const pulsar_layer_weights *L, int rank,
+                                   uint32_t nr) {
     if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */
-    const pulsar_tensor *G = L->ffn_gate_exps, *U = L->ffn_up_exps, *D = L->ffn_down_exps;
-    if (G->type != PULSAR_TENSOR_CUTLASS_MXFP4 || U->type != PULSAR_TENSOR_CUTLASS_MXFP4 ||
-        D->type != PULSAR_TENSOR_CUTLASS_MXFP4) {
-        fprintf(stderr, "pulsar: expert tensor-parallel needs cutlass_mxfp4 routed stacks "
-                        "(gate %u up %u down %u) -- refusing\n", G->type, U->type, D->type);
-        return false;
-    }
-    const uint64_t in = G->dim[0], mid = G->dim[1], out = D->dim[1];
-    const uint32_t n_exp = (uint32_t)G->dim[2];
+    const uint64_t mid = L->ffn_gate_exps->dim[1];
     uint32_t lo = 0, hi = 0;
-    if (D->dim[0] != mid || U->dim[1] != mid || D->dim[2] != n_exp ||
-        !pulsar_tp_owned_range(rank, nr, (uint32_t)mid, &lo, &hi) || lo % 128 || hi % 128) {
-        fprintf(stderr, "pulsar: expert tensor-parallel: intermediate %llu cannot split 128-aligned "
-                        "over %u ranks -- refusing\n", (unsigned long long)mid, nr);
+    if (L->ffn_down_exps->dim[0] != mid || L->ffn_up_exps->dim[1] != mid || !pulsar_tp_owned_range(rank, nr, (uint32_t)mid, &lo, &hi)) {
+        fprintf(stderr, "pulsar: expert tensor-parallel: the routed stacks' intermediate %llu does not split over %u "
+                        "ranks -- refusing\n", (unsigned long long)mid, nr);
         return false;
     }
-    uint64_t gd = 0, gsf = 0, gs = 0, hgd = 0, hgsf = 0, hgs = 0;
-    uint64_t dd = 0, dsf = 0, ds = 0, hdd = 0, hdsf = 0, hds = 0;
-    cutlass_mxfp4_expert_layout(in, mid, &gd, &gsf, &gs);
-    cutlass_mxfp4_expert_layout(in, hi - lo, &hgd, &hgsf, &hgs);
-    cutlass_mxfp4_expert_layout(mid, out, &dd, &dsf, &ds);
-    cutlass_mxfp4_expert_layout(hi - lo, out, &hdd, &hdsf, &hds);
-    if (!pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, G),
-                                               tensor_map_base(m, G), G->abs_offset, n_exp,
-                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
-        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, U),
-                                               tensor_map_base(m, U), U->abs_offset, n_exp,
-                                               in, mid, 0, lo, hi, gs, gd, hgs, hgd) ||
-        !pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, D),
-                                               tensor_map_base(m, D), D->abs_offset, n_exp,
-                                               mid, out, 1, lo, hi, ds, dd, hds, hdd))
-        return false;
-    /* what the three half-stacks just built hold: n_exp experts at the half strides */
-    e->tp_built_bytes += (uint64_t)n_exp * (2u * hgs + hds);
-    return true;
+    return pulsar_tp_plan_add1(p, m, L->ffn_gate_exps, PULSAR_TP_AXIS_OUT, lo, hi) &&
+           pulsar_tp_plan_add1(p, m, L->ffn_up_exps, PULSAR_TP_AXIS_OUT, lo, hi) &&
+           pulsar_tp_plan_add1(p, m, L->ffn_down_exps, PULSAR_TP_AXIS_IN, lo, hi);
 }
 
-/* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by
- * OUTPUT rows (column-parallel: this rank's half of the intermediate), down by
- * INPUT columns (row-parallel: the matching half of the reduction).  The rank's
- * shared output is then a PARTIAL that rides the FFN's existing exchange with
- * the routed partial, so the split costs no exchange of its own.  The range is
- * the one authority every split shares (pulsar_tp_owned_range over the shared
- * width).  Registered once at open, for the target's layers and the drafter's.
- * The K-half's key is (engine, the tensor OBJECT's address) -- never its
- * abs_offset: a safetensors checkpoint is one shard per layer with identical
- * layouts, so every layer's down projection sits at the SAME offset, and an
- * offset key made all 43 layers resolve to whichever registered last. */
-static bool tp_register_shared_split(const void *kslice_key, const pulsar_model *m,
-                                     const pulsar_layer_weights *L, int rank, uint32_t nr) {
+/* L241 4g-2: the shared expert, split like a Megatron MLP -- gate/up by OUTPUT rows (column-parallel: this rank's
+ * half of the intermediate), down by INPUT columns (row-parallel: the matching half of the reduction).  The rank's
+ * shared output is then a PARTIAL that rides the FFN's existing exchange with the routed partial, so the split
+ * costs no exchange of its own.  The range is the one authority every split shares (pulsar_tp_owned_range over
+ * the shared width).  For the target's layers and the drafter's.  (An MXFP8 down's K-half is keyed by the engine
+ * and the tensor OBJECT, never its abs_offset: a safetensors checkpoint is one shard per layer with identical
+ * layouts, so every layer's down projection sits at the SAME offset -- tp_slice.cpp.) */
+static bool tp_declare_shared_split(pulsar_tp_plan *p, pulsar_model *m, const pulsar_layer_weights *L, int rank,
+                                    uint32_t nr) {
     if (!L->ffn_gate_shexp || !L->ffn_up_shexp || !L->ffn_down_shexp) return false;
-    const uint64_t in_dim = L->ffn_gate_shexp->dim[0];
-    const uint64_t shared_dim = L->ffn_gate_shexp->dim[1];
     uint32_t lo = 0, hi = 0;
-    if (!pulsar_tp_owned_range(rank, nr, (uint32_t)shared_dim, &lo, &hi) || hi <= lo) return false;
-    return pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_gate_shexp),
-                                                L->ffn_gate_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
-           pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, L->ffn_up_shexp),
-                                                L->ffn_up_shexp->abs_offset, in_dim, shared_dim, lo, hi) &&
-           pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(m, L->ffn_down_shexp),
-                                             L->ffn_down_shexp->abs_offset, shared_dim,
-                                             L->ffn_down_shexp->dim[1], lo, hi,
-                                             kslice_key, pulsar_tp_kslice_key_offset(L->ffn_down_shexp));
+    if (!pulsar_tp_owned_range(rank, nr, (uint32_t)L->ffn_gate_shexp->dim[1], &lo, &hi) || hi <= lo) return false;
+    return pulsar_tp_plan_add1(p, m, L->ffn_gate_shexp, PULSAR_TP_AXIS_OUT, lo, hi) &&
+           pulsar_tp_plan_add1(p, m, L->ffn_up_shexp, PULSAR_TP_AXIS_OUT, lo, hi) &&
+           pulsar_tp_plan_add1(p, m, L->ffn_down_shexp, PULSAR_TP_AXIS_IN, lo, hi);
 }
 
 /* The DeepSeek family's load (family.h pulsar_family::load): the tokenizer, the
@@ -390,9 +348,22 @@ static bool tp_register_shared_split(const void *kslice_key, const pulsar_model 
  * target / drafter / vision weight binding -- the steps pulsar_engine::open ran
  * inline until L251, moved here verbatim and in the same order.  Every refusal
  * prints its reason; the caller tears the engine down. */
+/* L272: the loader's one failure policy -- each stage below reports every refusal it finds
+ * (pulsar_load_refuse) and the load stops at the stage's end, so a bad artifact fails
+ * pulsar_engine_open instead of exiting the process. */
+static bool ds4_load_stage_ok(const char *stage) {
+    const uint32_t n = pulsar_load_refusals();
+    if (n == 0) return true;
+    fprintf(stderr, "pulsar: deepseek4: %u refusal(s) in %s -- the model does not load\n", n, stage);
+    return false;
+}
+
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
+    pulsar_load_refusals_reset();
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
+    if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
+    if (!ds4_load_stage_ok("the configuration")) return false;
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
@@ -422,6 +393,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         uint32_t swapped = 0;
         for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
             const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
+            if (!ds4_load_stage_ok("the expert overlay")) return false;
             if (n == 0) {
                 fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
                         p);
@@ -433,6 +405,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights, &e->model);
+    if (!ds4_load_stage_ok("the weights")) return false;
     /* the drafter binds before the inspect-only exit so --inspect proves the
      * whole artifact binds, drafter included */
     if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
@@ -441,6 +414,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
          * site reads e->dspark_model, and close is guarded on dspark_external
          * so the shared mapping is only torn down once). */
         dspark_weights_bind(&e->dspark_weights, &e->model);
+        if (!ds4_load_stage_ok("the DSpark drafter")) return false;
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
@@ -452,7 +426,9 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
      * half-present vision stack refuses at load rather than at first image.
      * Absent tower is normal for text-only artifacts and simply leaves
      * vision_ready false; the image path is refused until it is true. */
-    if (vision_weights_bind(&e->vision_weights, &e->model)) {
+    const bool vision = vision_weights_bind(&e->vision_weights, &e->model);
+    if (!ds4_load_stage_ok("the vision tower")) return false;
+    if (vision) {
         e->vision_ready = true;
         fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
                 "patch %u, aligner %ux%d -> %u)\n",
@@ -469,10 +445,91 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     return true;
 }
 
-/* The DeepSeek family's device-side step of open (family.h after_gpu): the
- * MoE tier announce and the attention / shared / routed-expert TP slices this
- * rank owns.  Moved verbatim from pulsar_engine::open (L251); runs after the
- * GPU and, on a TP group, the transport are up. */
+/* The DeepSeek family's device-side step of open (family.h after_gpu): the MoE tier announce and the rank's
+ * attention groups.  Runs after the GPU, the transport and the core's TP plan (pulsar_tp_plan_run) are up. */
+/* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one range authority every split shares.
+ * The unit is the group (8 heads and one LoRA-down block each), never the head: a rank's heads are whole groups,
+ * so its attn_q_b rows and its attn_output_a rows are contiguous and 128-row aligned.  One box: [0, n).  The rank
+ * is the model's (set at open from the options; the transport asserts the same), so record mode reads it too. */
+static bool ds4_tp_groups(pulsar_engine *e) {
+    const int tp_rk = e->model.tp_rank;
+    const uint32_t tp_nr = e->model.tp_n_ranks ? e->model.tp_n_ranks : 1u;
+    if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
+        e->tp_group_hi <= e->tp_group_lo) {
+        fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
+                        "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
+                tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
+        return false;
+    }
+    return true;
+}
+
+/* The DeepSeek family's tensor-parallel slices (pulsar_family::tp_slices, L272 P4b): on each layer the owned
+ * attention row slices are registered with the backend, once; the attention block then addresses them by
+ * offset like any other weight.  Every slice goes through the core's operations (tp_slice.cpp). */
+bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
+    if (!ds4_tp_groups(e)) return false;
+    const int tp_rk = e->model.tp_rank;
+    const uint32_t tp_nr = e->model.tp_n_ranks ? e->model.tp_n_ranks : 1u;
+    const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
+    const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
+    const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
+    const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
+    const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
+    /* the attention head split, for a target layer and a drafter block alike: attn_q_b's and attn_output_a's rows
+     * of the owned groups, attn_output_b's K-half over the same group columns (4g-2) */
+    auto attention = [&](pulsar_model *m, const pulsar_layer_weights *L) {
+        return L->attn_q_a && L->attn_q_b && L->attn_output_a && L->attn_output_b &&
+               pulsar_tp_plan_add1(plan, m, L->attn_q_b, PULSAR_TP_AXIS_OUT, q_lo, q_hi) &&
+               pulsar_tp_plan_add1(plan, m, L->attn_output_a, PULSAR_TP_AXIS_OUT, a_lo, a_hi) &&
+               pulsar_tp_plan_add1(plan, m, L->attn_output_b, PULSAR_TP_AXIS_IN, a_lo, a_hi);
+    };
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_layer_weights *L = &e->weights.layer[il];
+        if (!attention(&e->model, L)) {
+            fprintf(stderr, "pulsar: layer %u: the attention projections do not split -- refusing\n", il);
+            return false;
+        }
+        /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the compressor and indexer projections, each
+         * rank its floor row range, gathered in one row-lane exchange per layer (tp_attn_input_split) */
+        for (const pulsar_tensor *w : { L->attn_q_a, L->attn_kv, L->attn_compressor_kv, L->attn_compressor_gate,
+                                        L->indexer_compressor_kv, L->indexer_compressor_gate, L->indexer_proj }) {
+            if (!w) continue;
+            const uint64_t out = w->ndim >= 2 ? w->dim[w->ndim - 1] : 0;
+            uint32_t lo = 0, hi = 0;
+            if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)out, &lo, &hi) ||
+                !pulsar_tp_plan_add1(plan, &e->model, w, PULSAR_TP_AXIS_OUT, lo, hi)) {
+                fprintf(stderr, "pulsar: layer %u: %.*s does not row-split -- refusing\n", il, (int)w->name.len,
+                        w->name.ptr);
+                return false;
+            }
+        }
+        if (!tp_declare_shared_split(plan, &e->model, L, tp_rk, tp_nr) ||
+            !tp_declare_expert_half(plan, &e->model, L, tp_rk, tp_nr)) {
+            fprintf(stderr, "pulsar: layer %u: the experts do not split -- refusing\n", il);
+            return false;
+        }
+    }
+    /* 4g-1b: the drafter's blocks split exactly like a target layer's, over the drafter's own mapping */
+    for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
+        const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
+        if (!tp_declare_expert_half(plan, &e->dspark_model, DL, tp_rk, tp_nr) ||
+            !tp_declare_shared_split(plan, &e->dspark_model, DL, tp_rk, tp_nr) || !attention(&e->dspark_model, DL)) {
+            fprintf(stderr, "pulsar: drafter block %u does not split -- refusing\n", dl);
+            return false;
+        }
+    }
+    const pulsar_layer_weights *L0 = &e->weights.layer[0];
+    uint32_t sx_lo = 0, sx_hi = 0;
+    (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
+    fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads [%u,%u) and "
+                    "shared-expert intermediate [%u,%u) of %u (%u layers + %u drafter blocks)\n",
+            tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
+            e->tp_group_lo * group_heads, e->tp_group_hi * group_heads, sx_lo, sx_hi,
+            (unsigned)L0->ffn_gate_shexp->dim[1], (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u);
+    return true;
+}
+
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
     /* One MoE-tier boot line so a silent slow tier is no longer silent:
      * the resolved expert weight types per layer (grouped-CUTLASS type-40
@@ -517,141 +574,8 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
         }
     }
 
-    /* Slice 4g (L241): the attention OUTPUT GROUPS this rank owns, from the one
-     * range authority every split shares.  The unit is the group (8 heads and
-     * one LoRA-down block each), never the head: a rank's heads are whole
-     * groups, so its attn_q_b rows and its attn_output_a rows are contiguous
-     * and 128-row aligned.  On a group each layer's two owned row slices are
-     * registered with the backend here, once; the attention block then
-     * addresses them by offset like any other weight.  One box: [0, n). */
-    const int tp_rk = e->tp ? pulsar_tp_rank(e->tp) : 0;
-    const uint32_t tp_nr = e->tp ? pulsar_tp_n_ranks(e->tp) : 1u;
-    if (!pulsar_tp_owned_range(tp_rk, tp_nr, PULSAR_N_OUT_GROUP, &e->tp_group_lo, &e->tp_group_hi) ||
-        e->tp_group_hi <= e->tp_group_lo) {
-        fprintf(stderr, "pulsar: TP rank %d/%u owns no attention output group (%u groups per "
-                        "layer; a group of more than %u ranks cannot split attention) -- refusing\n",
-                tp_rk, tp_nr, (unsigned)PULSAR_N_OUT_GROUP, (unsigned)PULSAR_N_OUT_GROUP);
-        return false;
-    }
-    if (tp_nr > 1) {
-        const uint32_t group_heads = PULSAR_N_HEAD / PULSAR_N_OUT_GROUP;
-        const uint64_t q_out_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
-        const uint64_t q_lo = (uint64_t)e->tp_group_lo * group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t q_hi = (uint64_t)e->tp_group_hi * group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t group_dim = (uint64_t)group_heads * PULSAR_N_HEAD_DIM;
-        const uint64_t a_out_full = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
-        const uint64_t a_lo = (uint64_t)e->tp_group_lo * PULSAR_N_LORA_O;
-        const uint64_t a_hi = (uint64_t)e->tp_group_hi * PULSAR_N_LORA_O;
-        uint32_t registered = 0;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const pulsar_layer_weights *L = &e->weights.layer[il];
-            if (!L->attn_q_a || !L->attn_q_b || !L->attn_output_a) {
-                fprintf(stderr, "pulsar: layer %u has no attention projections to split -- refusing\n", il);
-                return false;
-            }
-            const uint64_t q_rank = L->attn_q_a->dim[1];
-            if (!pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_q_b),
-                                                      L->attn_q_b->abs_offset, q_rank, q_out_full, q_lo, q_hi) ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, L->attn_output_a),
-                                                      L->attn_output_a->abs_offset, group_dim, a_out_full, a_lo, a_hi) ||
-                /* 4g-2: stage 'b' row-parallel -- the K-half over the same
-                 * owned group columns [a_lo, a_hi) of its a_out_full input. */
-                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->model, L->attn_output_b),
-                                                   L->attn_output_b->abs_offset, a_out_full,
-                                                   L->attn_output_b->dim[1], a_lo, a_hi,
-                                                   e, pulsar_tp_kslice_key_offset(L->attn_output_b))) {
-                fprintf(stderr, "pulsar: layer %u: the owned attention row slices could not be "
-                                "registered -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-            /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the
-             * compressor and indexer projections, each rank its floor row
-             * range, gathered in one row-lane exchange per layer
-             * (tp_attn_input_split).  Only the MXFP8_LT ones need their
-             * slice registered; a bf16/f32 slice is plain offset arithmetic. */
-            {
-                static const char *const ain_name[] = { "attn_q_a", "attn_kv", "attn_compressor_kv",
-                                                        "attn_compressor_gate", "indexer_compressor_kv",
-                                                        "indexer_compressor_gate", "indexer_proj" };
-                const pulsar_tensor *ain[] = { L->attn_q_a, L->attn_kv, L->attn_compressor_kv,
-                                               L->attn_compressor_gate, L->indexer_compressor_kv,
-                                               L->indexer_compressor_gate, L->indexer_proj };
-                for (uint32_t k = 0; k < sizeof(ain) / sizeof(ain[0]); k++) {
-                    const pulsar_tensor *w = ain[k];
-                    if (!w || w->type != PULSAR_TENSOR_MXFP8_LT) continue;
-                    uint32_t lo = 0, hi = 0;
-                    if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)w->dim[1], &lo, &hi) ||
-                        !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->model, w), w->abs_offset,
-                                                              w->dim[0], w->dim[1], lo, hi)) {
-                        fprintf(stderr, "pulsar: layer %u: the attention-input row slice of %s could "
-                                        "not be registered -- refusing\n", il, ain_name[k]);
-                        return false;
-                    }
-                }
-            }
-            if (!tp_register_shared_split(e, &e->model, L, tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: layer %u: the owned shared-expert split could not be "
-                                "registered -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-            if (!tp_register_expert_half(e, &e->model, L, tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: layer %u: this rank's half of the routed experts could "
-                                "not be built -- refusing\n", il);
-                return false;
-            }
-            registered += 3;
-        }
-        for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
-            if (!tp_register_expert_half(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: drafter block %u: this rank's half of the routed experts "
-                                "could not be built -- refusing\n", dl);
-                return false;
-            }
-            if (!tp_register_shared_split(e, &e->dspark_model, &e->dspark_weights.layer[dl], tp_rk, tp_nr)) {
-                fprintf(stderr, "pulsar: drafter block %u: the owned shared-expert split could not be "
-                                "registered -- refusing\n", dl);
-                return false;
-            }
-            registered += 3;
-            /* 4g-1b: the drafter's attention head-split exactly like a
-             * target layer's -- attn_q_b rows and attn_output_a rows of the
-             * owned groups, attn_output_b's K-half -- over the drafter's own
-             * mapping (the forward reads tensor_map_base(&e->dspark_model)). */
-            const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
-            if (!DL->attn_q_a || !DL->attn_q_b || !DL->attn_output_a || !DL->attn_output_b ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_q_b),
-                                                      DL->attn_q_b->abs_offset, DL->attn_q_a->dim[1],
-                                                      q_out_full, q_lo, q_hi) ||
-                !pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(&e->dspark_model, DL->attn_output_a),
-                                                      DL->attn_output_a->abs_offset, group_dim, a_out_full,
-                                                      a_lo, a_hi) ||
-                !pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(&e->dspark_model, DL->attn_output_b),
-                                                   DL->attn_output_b->abs_offset, a_out_full,
-                                                   DL->attn_output_b->dim[1], a_lo, a_hi,
-                                                   e, pulsar_tp_kslice_key_offset(DL->attn_output_b))) {
-                fprintf(stderr, "pulsar: drafter block %u: the owned attention slices could not be "
-                                "registered -- refusing\n", dl);
-                return false;
-            }
-            registered += 3;
-        }
-        const pulsar_layer_weights *L0 = &e->weights.layer[0];
-        uint32_t sx_lo = 0, sx_hi = 0;
-        (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
-        fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads "
-                        "[%u,%u) (attn_q_b rows [%llu,%llu), attn_output_a rows [%llu,%llu), attn_output_b K-half) and "
-                        "shared-expert intermediate [%u,%u) of %u (gate/up row slices, down K-half, "
-                        "%u layers + %u drafter blocks): %u slices registered\n",
-                tp_rk, tp_nr, e->tp_group_lo, e->tp_group_hi, (unsigned)PULSAR_N_OUT_GROUP,
-                e->tp_group_lo * group_heads, e->tp_group_hi * group_heads,
-                (unsigned long long)q_lo, (unsigned long long)q_hi,
-                (unsigned long long)a_lo, (unsigned long long)a_hi,
-                sx_lo, sx_hi, (unsigned)L0->ffn_gate_shexp->dim[1],
-                (unsigned)PULSAR_N_LAYER, e->dspark_ready ? 3u : 0u, registered);
-    }
-    return true;
+    /* the rank's attention output groups (one GPU: all of them); the slices are the core's plan (L272 P4b) */
+    return ds4_tp_groups(e);
 }
 
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
@@ -748,6 +672,13 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     fprintf(stderr, "pulsar: model family %s (%s): %u layers\n",
             e->family->name, e->family->arch, e->plan.n_layer);
 
+    /* L272 P4b: the rank's TP plan -- declared by the family, its operations and the residency rule the core's --
+     * before staging and before the inspect-only exit (tests/tp_plan_test.cpp records it from there) */
+    if (tp_n_ranks_at_load > 1 && !pulsar_tp_plan_build(e)) {
+        e->destroy();
+        *out = NULL;
+        return 1;
+    }
     /* the family's load binds everything (drafter and vision tower included)
      * before the inspect-only exit: --inspect proves the whole artifact binds */
     if (opt->inspect_only) {
@@ -935,15 +866,14 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, %s (%.2f GiB of stored "
-                        "tensors unstaged)\n",
+        fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, %.2f GiB of stored tensors "
+                        "unstaged (the plan's)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
-                e->model.tp_unstaged ? "the family's residency rule" : "routed experts as per-rank halves",
                 (double)pulsar_model_unstaged_expert_bytes(&e->model) / 1073741824.0);
     }
 
-    /* The family's own device-side registrations and announces. */
-    if (graph_backend && !e->family->after_gpu(e)) {
+    /* The rank's TP slices (the core's plan), then the family's own device-side registrations and announces. */
+    if (graph_backend && (!pulsar_tp_plan_run(e) || !e->family->after_gpu(e))) {
         e->destroy();
         *out = NULL;
         return 1;
@@ -1097,6 +1027,7 @@ void pulsar_engine::destroy() {
         e->tp_bulk_bytes = 0;
     }
     weights_free(&e->weights);
+    pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
     if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
     if (e->qwen_tok) qwen_tokenizer_free(e->qwen_tok);
     e->qwen_tok = NULL;
@@ -1147,81 +1078,84 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 
 
 /* Every session is created by its engine's family (family.h). */
+/* L272 P2: every family's session begins here -- the core allocates the session and its own state (the
+ * view, the prefill cap, the logits row at the family's width), the family builds its state into it, and
+ * the core measures what that allocated on the GPU (the allocator's delta across the create, so callers
+ * can reconcile admission estimates against reality). */
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    const int rc = e->family->session->create(out, e, ctx_size);
-    /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
-     * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
-     * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
-    if (rc == 0 && *out && e->tp) (*out)->tp_session_id = ++e->tp_session_seq;
-    return rc;
-}
-
-
-/* The DeepSeek family's session create: the pulsar_gpu_graph (SWA rings,
- * compressed KV and frontiers, bank slabs), steering, the TP scratch and the
- * drafter's buffers.  pulsar_session::create's body until L251. */
-int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
-    if (!out || !e || ctx_size <= 0) return 1;
+    *out = NULL;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
-
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    s->logits = (float *)xmalloc((size_t)e->logits_width() * sizeof(s->logits[0]));
+    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    if (e->family->session->create(s) != 0) {
+        free(s->logits);
+        free(s);
+        return 1;
+    }
+    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
+    /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
+     * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
+     * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
+    if (e->tp) s->tp_session_id = ++e->tp_session_seq;
+    *out = s;
+    return 0;
+}
+
+
+/* The DeepSeek family's session state: the pulsar_gpu_graph (SWA rings, compressed KV and frontiers, bank
+ * slabs), steering, the TP scratch and the drafter's buffers, built into a session the core allocated.
+ * pulsar_session::create's body until L251. */
+int pulsar_ds4_session_create(pulsar_session *s) {
+    pulsar_engine *e = s->engine;
+    const int ctx_size = s->ctx_size;
     s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
-    s->prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
-                                                        e->prefill_chunk);
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
         fprintf(stderr, "pulsar: no transformer layers are loaded\n");
-        free(s);
         return 1;
     }
-    /* Measure the true GPU cost of this session (allocator delta across the
-     * create) so callers can reconcile admission estimates against reality. */
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
-    if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
+    s->graph = (pulsar_gpu_graph *)xcalloc(1, sizeof(*s->graph));   /* L272 P6: the family's own */
+    if (!gpu_graph_alloc_raw_cap(s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    gpu_graph_bank_pool_n(), e->dspark_ready))
     {
-        free(s);
+        free(s->graph);
+        s->graph = NULL;
         return 1;
     }
-    if (!gpu_graph_load_directional_steering(&s->graph,
+    if (!gpu_graph_load_directional_steering(s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
-        gpu_graph_free(&s->graph);
-        free(s);
+        pulsar_ds4_session_destroy(s);
         return 1;
     }
     /* Borrow the engine's TP transport into the graph so the prefill big-gate
      * call sites can reach it without threading the engine through every
      * gpu_graph entry point (slice 4b).  NULL when the pair is not armed. */
-    s->graph.tp = e->tp;
-    s->graph.tp_group_lo = e->tp_group_lo;
-    s->graph.tp_group_hi = e->tp_group_hi;
-    s->graph.tp_slab_dev = e->tp_slab_dev;
-    s->graph.tp_bulk_dev = e->tp_bulk_dev;
-    s->graph.tp_kslice_key = e->tp ? (const void *)e : NULL;
-    if (!session_alloc_tp_scratch(&s->graph, e->tp)) {
-        gpu_graph_free(&s->graph);
-        free(s);
+    s->graph->tp = e->tp;
+    s->graph->tp_group_lo = e->tp_group_lo;
+    s->graph->tp_group_hi = e->tp_group_hi;
+    s->graph->tp_slab_dev = e->tp_slab_dev;
+    s->graph->tp_bulk_dev = e->tp_bulk_dev;
+    s->graph->tp_kslice_key = e->tp ? (const void *)e : NULL;
+    if (!session_alloc_tp_scratch(s->graph, e->tp)) {
+        pulsar_ds4_session_destroy(s);
         return 1;
     }
-    s->logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
-        if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
+        if (!gpu_graph_init_dspark_target(s->graph, e->dspark_weights.target_layer_ids)) {
             fprintf(stderr, "pulsar: failed to allocate DSpark graph buffers\n");
-            gpu_graph_free(&s->graph);
-            free(s->logits);
-            free(s);
+            pulsar_ds4_session_destroy(s);
             return 1;
         }
     }
-    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
-    *out = s;
     return 0;
 }
 
@@ -1285,19 +1219,16 @@ uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
 uint64_t pulsar_session::touched_kv_bytes() const {
     auto *s = this;
     if (!s) return 0;
-    return gpu_graph_touched_kv_bytes(&s->graph);
+    return gpu_graph_touched_kv_bytes(s->graph);
 }
 
 
+/* L272 P2: the family frees its state, the core the session's own -- one host half for every family
+ * (Qwen's destroy had kept its own copy of it, without the speculation scratch the round API allocates). */
 void pulsar_session::destroy() {
     auto *s = this;
     if (!s) return;
     s->engine->family->session->destroy(s);
-}
-
-
-void pulsar_ds4_session_destroy(pulsar_session *s) {
-    gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
     s->bank_carry_free();
@@ -1305,6 +1236,14 @@ void pulsar_ds4_session_destroy(pulsar_session *s) {
     free(s->spec_row_scratch);
     free(s->logits);
     free(s);
+}
+
+
+void pulsar_ds4_session_destroy(pulsar_session *s) {
+    if (!s->graph) return;
+    gpu_graph_free(s->graph);
+    free(s->graph);
+    s->graph = NULL;
 }
 
 
@@ -1332,7 +1271,7 @@ void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
 }
 
 
-static bool pulsar_session_cancelled(pulsar_session *s) {
+bool pulsar_session_cancelled(pulsar_session *s) {
     /* A MIRRORED session stops at a chunk boundary only TOGETHER (v15): a
      * leader that stopped after k chunks alone would leave its workers running
      * the rest of the sync, waiting at an exchange the leader never joins (the
@@ -1460,7 +1399,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
         /* Before any state moves: a block that cannot sit whole in one chunk is
          * refused here (and by the TP leader before it mirrors anything). */
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph.prefill_cap,
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph->prefill_cap,
                               &image_barrier, err, errlen))
             return 1;
         /* L226 + L261: reuse the live KV across an image request.  The images the
@@ -1532,7 +1471,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * the seam rescue's rewind+stitch, and a history this bank does not hold
          * rebuilds cold. */
         resume_floor = held_end > 0
-            ? pulsar_ckpt_grid_floor(&s->graph.ckpt, (uint32_t)held_end + s->graph.ckpt.ops->resume_grid - 1u)
+            ? pulsar_ckpt_grid_floor(&s->graph->ckpt, (uint32_t)held_end + s->graph->ckpt.ops->resume_grid - 1u)
             : 0u;
         const bool reuse =
             s->checkpoint_valid &&
@@ -1585,7 +1524,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         ~vision_scope() { g->vision_req = prev; }
     };
     pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
-    vision_scope vscope(&s->graph, n_images > 0 ? &vreq : NULL);
+    vision_scope vscope(s->graph, n_images > 0 ? &vreq : NULL);
 
     /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
      * carry path re-prefills from a grid point at or above the salvage floor and
@@ -1622,11 +1561,11 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * the checkpoint first: L120's clamp, applied where the stale copy is
          * consumed.  Cost: one host loop over the layers per sync. */
         {
-            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            const uint32_t bank = gpu_graph_cur_bank(s->graph);
             bool ahead = false;
             for (uint32_t il = 0; il < PULSAR_N_LAYER && !ahead; il++) {
                 if (!gpu_graph_layer_is_kv_source(il)) continue;
-                if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
+                if (gpu_graph_n_comp(s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
             if (ahead) s->rewind(s->checkpoint.len);
@@ -1656,25 +1595,28 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * live has nothing to redo; a bank with no checkpoint below G prefills
          * from 0, said once. */
         if (prompt->len > s->checkpoint.len && s->prefill_cap != 0) {
-            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            const uint32_t bank = gpu_graph_cur_bank(s->graph);
             const uint32_t ck = (uint32_t)s->checkpoint.len;
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
-            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph.ckpt, pf);
-            uint32_t B = pulsar_ckpt_best(&s->graph.ckpt, bank, G);
+            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph->ckpt, pf);
+            /* the one resume rule (L272 P2; Qwen's sync and bank_resume_at read it too): the deepest
+             * checkpoint within the shared prefix (ck: this path extends it) and the prefill frontier --
+             * checkpoints sit on the grid, so that is the deepest at or below G */
+            uint32_t B = pulsar_session_resume_point(s, bank, (int)ck, prompt->len);
             /* L226: an image request's reuse may not RE-EVALUATE a row inside an
              * image block: a checkpoint below the floor the licence set (the grid
              * point above the last held block) is not a resume point, and the
              * prefill restarts from 0 -- every block merged again. */
             if (resume_floor > 0 && B < resume_floor) B = 0u;
-            if (G == ck && !s->graph.ms_comp_state_stale[bank]) {
+            if (G == ck && !s->graph->ms_comp_state_stale[bank]) {
                 s->resume_origin = (int)ck;   /* standing at a prefill grid point: nothing to redo */
             } else if (B > 0u && s->restore_checkpoint(B)) {
                 s->resume_origin = (int)B;
                 fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
                         ck, B, bank, ck - B);
             } else {
-                if (ck >= s->graph.ckpt.ops->resume_grid)
+                if (ck >= s->graph->ckpt.ops->resume_grid)
                     fprintf(stderr, "pulsar: resume at %u on bank %u: no grid checkpoint at or below %u -- "
                                     "prefilling the prompt from 0\n", ck, bank, G);
                 s->rewind(0);
@@ -1691,7 +1633,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
                 .user = s->progress,
                 .user_ud = s->progress_ud,
             };
-            bool ok = gpu_graph_prefill_chunked_range(&s->graph,
+            bool ok = gpu_graph_prefill_chunked_range(s->graph,
                                                         &e->model,
                                                         &e->weights,
                                                         prompt,
@@ -1804,7 +1746,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     bool ok;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    if (!gpu_graph_reset_prefill_state(&s->graph)) {
+    if (!gpu_graph_reset_prefill_state(s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
@@ -1833,7 +1775,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             .user = s->progress,
             .user_ud = s->progress_ud,
         };
-        ok = gpu_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
+        ok = gpu_graph_prefill_chunked(s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
                                          pulsar_session_note_prefill_progress, &progress,
                                          s->display_progress,
@@ -2187,7 +2129,7 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     /* L264: same shape for a rewind that left the bank stale -- its compressor
      * lanes and raw window describe a position it no longer stands at.  A sync
      * restores a grid checkpoint (or rebuilds from 0) and clears this. */
-    if (s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)]) {
+    if (s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)]) {
         snprintf(err, errlen,
                  "session eval after a rewind to %d: the bank's state is only valid at its grid "
                  "checkpoints; re-sync the session first", s->checkpoint.len);
@@ -2225,9 +2167,9 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
      * here weakens pulsar_session_decode_mixed's contract for its own callers. */
     int     ms_tok[1]  = { token };
     int32_t ms_pos[1]  = { (int32_t)s->checkpoint.len };
-    int32_t ms_bank[1] = { (int32_t)(s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u) };
+    int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep. */
-    const int ms_rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights,
+    const int ms_rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights,
                                                       ms_tok, ms_pos, ms_bank, 1u,
                                                       s->logits, NULL, 0u,
                                                       /*capture_cur=*/true, NULL);
@@ -2274,9 +2216,9 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
      * one at every grid chunk end, so the fused lane's prompts resume like the
      * classic sync's.  (The server's fused planners end chunks on grid points.) */
     const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % s->graph.ckpt.ops->resume_grid == 0u && G >= s->graph.ckpt.ops->min_checkpoint(s->graph.ckpt.state) &&
-        !s->graph.ms_comp_state_stale[gpu_graph_cur_bank(&s->graph)])
-        (void)pulsar_ckpt_capture(&s->graph.ckpt, gpu_graph_cur_bank(&s->graph), G);
+    if (G % s->graph->ckpt.ops->resume_grid == 0u && G >= s->graph->ckpt.ops->min_checkpoint(s->graph->ckpt.state) &&
+        !s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)])
+        (void)pulsar_ckpt_capture(&s->graph->ckpt, gpu_graph_cur_bank(s->graph), G);
     if (head >= 0)
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
                (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
@@ -2305,8 +2247,8 @@ void pulsar_session::invalidate() {
      * generated tokens (and the drafter is near-useless without a valid
      * window: masked-window eval 4.7% vs 86% top-1). Positions are
      * drafter-relative, so restarting at 0 is exact. */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
+    s->graph->dspark_prompt_n = 0;
     s->prefill_frontier = 0;   /* L195: the history is gone */
 }
 
@@ -2331,11 +2273,11 @@ void pulsar_session::rewind(int pos) {
      * be raised here.  Rows beyond the clamp are invisible (readers cap at
      * n_comp) and are rewritten by the next emit at that index; the clamp also
      * drops the grid checkpoints above pos (gpu_graph_set_n_comp). */
-    const uint32_t rw_bank = gpu_graph_cur_bank(&s->graph);
+    const uint32_t rw_bank = gpu_graph_cur_bank(s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
-        if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(&s->graph, rw_bank, il, want);
+        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
      * re-established in exactly two cases: position 0, whose state is the
@@ -2351,13 +2293,13 @@ void pulsar_session::rewind(int pos) {
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
-        pulsar_ckpt_drop_bank(&s->graph.ckpt, rw_bank);
-        ok = gpu_graph_compressor_state_reset(&s->graph, rw_bank);
+        pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
+        ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
     }
-    else if (pulsar_ckpt_best(&s->graph.ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = pulsar_ckpt_restore(&s->graph.ckpt, rw_bank, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
+        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, (uint32_t)pos);
     else {
-        s->graph.ms_comp_state_stale[rw_bank] = true;
+        s->graph->ms_comp_state_stale[rw_bank] = true;
         return;
     }
     if (!ok) {
@@ -2365,7 +2307,7 @@ void pulsar_session::rewind(int pos) {
         s->checkpoint_valid = false;
         return;
     }
-    s->graph.ms_comp_state_stale[rw_bank] = false;
+    s->graph->ms_comp_state_stale[rw_bank] = false;
 }
 
 
@@ -2384,18 +2326,18 @@ void pulsar_session::trim_history(int pos) {
     spec_quench_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
+    s->graph->dspark_prompt_n = 0;
     if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
 }
 
 
 bool pulsar_session::restore_checkpoint(uint32_t G) {
     auto *s = this;
-    const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+    const uint32_t bank = gpu_graph_cur_bank(s->graph);
     if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        pulsar_ckpt_best(&s->graph.ckpt, bank, G) != G) return false;
-    if (!pulsar_ckpt_restore(&s->graph.ckpt, bank, G)) {
+        pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
+    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;
@@ -2450,7 +2392,7 @@ int pulsar_session_prefill_cap(pulsar_session *s) {
 uint32_t pulsar_session::prefill_quantum_min_suffix() const {
     auto *s = this;
     if (!s) return 0;
-    if (s->graph.prefill_cap > s->graph.raw_cap) return 0;
+    if (s->graph->prefill_cap > s->graph->raw_cap) return 0;
     /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
      * compress-ratio LCM, while a resumed (start!=0) loop snaps to absolute
      * prefill_cap boundaries. The two produce the same chunk ends only when
@@ -2465,7 +2407,7 @@ uint32_t pulsar_session::prefill_quantum_min_suffix() const {
             align *= r / a;
         }
     }
-    if (align > 1 && s->graph.prefill_cap % align != 0) return 0;
+    if (align > 1 && s->graph->prefill_cap % align != 0) return 0;
     return 1u;
 }
 

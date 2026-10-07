@@ -18,8 +18,9 @@
  *            loop's record in L270).  Sampled drafts are draws from the MTP's q, recorded for the
  *            core's accept walk.
  *
- * One bank a step until the GDN and PLE kernels take N banks x R rows (S4): banks_max = 1, and the
- * banked absorb and draft refuse several banks by name. */
+ * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed,
+ * every kernel at its decode-width arm while the step stays within PULSAR_QWEN_SPEC_ROWS); each bank's
+ * commit rolls its own run back, and the absorb and the draft serve each bank in turn. */
 #include "pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include "spec_internal.h"
@@ -73,7 +74,7 @@ static bool qwen_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_s
                                size_t errlen) {
     pulsar_qwen_state *q = s->qwen;
     const uint32_t V = g_qwen_shape.n_vocab, R = r->n_batch;
-    if (!q->mtp || R > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) {
+    if (!q->mtp || R > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u || R > PULSAR_QWEN_SPEC_ROWS) {
         snprintf(err, errlen, "%s: a verify step of %u rows is outside the capture", PULSAR_QWEN_ARCH, R);
         return false;
     }
@@ -98,16 +99,12 @@ static bool qwen_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_s
     return true;
 }
 
-/* The walk kept `commit` drafts: the recurrent state back to the last kept row (rows 1 + commit .. R of
- * the capture undone), the bank's position counter there, the kept row's logits fresh. */
-static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t row0) {
+/* The walk kept `commit` drafts: the installed bank's run of the last verify back to its last kept row
+ * (rows 1 + commit .. of the run undone; the rollback finds the bank's run in the capture, wherever it sat
+ * in the step -- row0), the bank's position counter there, the kept row's logits fresh. */
+static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *q = s->qwen;
-    if (row0 != 0) {
-        fprintf(stderr, "pulsar: %s: a verify of several banks' rows (row0 %u) is not implemented -- refusing the "
-                        "round\n", PULSAR_QWEN_ARCH, row0);
-        return false;
-    }
     int32_t tok[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bank[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
     qwen_verify_rows(s, r, tok, pos, bank);
     pulsar_qwen_step vst{};
@@ -123,7 +120,7 @@ static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t c
     const uint32_t keep = 1u + commit;
     if (!pulsar_qwen_s4_spec_rollback(&vst, keep)) return false;
     qwen_bank_set_pos(q, q->live_bank, (uint32_t)r->saved_len + keep);
-    q->logits_fresh = true;
+    s->logits_stale = false;
     return true;
 }
 
@@ -133,7 +130,7 @@ static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t c
 static void qwen_spec_cut(pulsar_session *s, int) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    s->qwen->logits_fresh = false;
+    s->logits_stale = true;
 }
 
 const pulsar_spec_target_ops k_qwen_spec_target = {
@@ -147,40 +144,35 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
     /* .commit        = */ qwen_spec_commit,
     /* .cut           = */ qwen_spec_cut,
     /* .depth         = */ NULL,   /* a fixed depth: the drafter's K and tau */
-    /* .banks_max     = */ 1u,
+    /* .banks_max     = */ 2u,   /* L272 P1 S4: 2 x (K + 1) <= 14 rows at the deepest K (6) -- within SPEC_ROWS */
 };
 
 /* ---- the MTP drafter --------------------------------------------------------------------------- */
 
-/* The committed rows of the last verify, one bank: the MTP layer's stage back to the draft chain's
- * snapshot, the kept rows' MTP rows (stack at row i, next[i]) in one PREFILL step, the last kept row's
- * stack parked for the next draft. */
-static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
-                              uint32_t n) {
+/* One bank's committed rows: the MTP layer's stage back to the snapshot its draft chain took, the kept rows'
+ * MTP rows (stack at row i, next[i]) in one PREFILL step, the last kept row's stack parked for the next draft. */
+static bool mtp_absorb_bank(pulsar_session *s, const uint32_t *rows, uint32_t b, const int32_t *next, uint32_t n) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *q = s->qwen;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
-    if (n == 0) return true;
-    const uint32_t b = banks[0], il_mtp = e->plan.n_layer;
-    for (uint32_t i = 0; i < n; i++) {
-        if (banks[i] != b || rows[i] != rows[0] + i) {
-            fprintf(stderr, "pulsar: %s: an absorb over several banks' rows is not implemented -- refusing\n",
-                    PULSAR_QWEN_ARCH);
+    const uint32_t il_mtp = e->plan.n_layer;
+    for (uint32_t i = 1; i < n; i++)
+        if (rows[i] != rows[0] + i) {
+            fprintf(stderr, "pulsar: %s: bank %u's absorbed rows are not one run -- refusing\n", PULSAR_QWEN_ARCH, b);
             return false;
         }
-    }
     if (b >= q->n_banks || q->bank_pos[b] < n) return false;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
     const uint32_t p0 = q->bank_pos[b] - n;   /* the commit moved the counter past the kept rows */
     bool ok = true;
-    if (q->mtp_stage_dirty) {
-        ok = pulsar_gpu_tensor_copy_async(q->layer[il_mtp].idx_tail, (uint64_t)b * itb, q->spec.qsa_stage,
-                                          (uint64_t)q->spec.n_qsa * itb, itb) != 0;
-        q->mtp_stage_dirty = false;
+    if (q->mtp_stage_dirty[b]) {
+        ok = pulsar_gpu_tensor_copy_async(q->layer[il_mtp].idx_tail, (uint64_t)b * itb, q->mtp_stage, (uint64_t)b * itb,
+                                          itb) != 0;
+        q->mtp_stage_dirty[b] = false;
     }
     if (ok && n > 1) {
-        int32_t pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bank[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
+        int32_t pos[PULSAR_QWEN_SPEC_ROWS], bank[PULSAR_QWEN_SPEC_ROWS];
         for (uint32_t i = 0; i + 1 < n; i++) { pos[i] = (int32_t)(p0 + i); bank[i] = (int32_t)b; }
         ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->streams, (uint64_t)rows[0] * hc, (uint64_t)(n - 1) * hc) != 0 &&
              qwen_mtp_forward(s, PULSAR_QWEN_STEP_PREFILL, next, pos, bank, n - 1, 0, 0, NULL);
@@ -188,23 +180,36 @@ static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
     if (ok) ok = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams, (uint64_t)rows[n - 1] * hc, hc) != 0;
     if (!ok) {
         q->mtp_pend_pos[b] = UINT32_MAX;
-        fprintf(stderr, "pulsar: %s: the MTP absorb failed; the bank drafts nothing until its next row\n", PULSAR_QWEN_ARCH);
+        fprintf(stderr, "pulsar: %s: the MTP absorb failed; bank %u drafts nothing until its next row\n", PULSAR_QWEN_ARCH, b);
         return false;
     }
     q->mtp_pend_pos[b] = p0 + n - 1;
     return true;
 }
 
-/* The chain for the installed bank after the carry `x` at the bank's next position, into a redraft
+/* The committed rows of the last verify, any number of banks: each bank's rows in turn (L272 P1 S4). */
+static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
+                              uint32_t n) {
+    bool ok = true;
+    for (uint32_t i = 0; i < n;) {
+        uint32_t j = i + 1;
+        while (j < n && banks[j] == banks[i]) j++;
+        ok = mtp_absorb_bank(s, rows + i, banks[i], next + i, j - i) && ok;
+        i = j;
+    }
+    return ok;
+}
+
+/* The chain for bank `b` after the carry `x` at the bank's next position, into a redraft
  * record: refined[0] = x, refined[1..keep] = the drafts, conf[] their MTP probabilities, and for sampled
  * drafts q(d) with q's support (compact, or the MTP logits scattered to the vocabulary for the walk to
  * rebuild q under the same params). */
-static bool mtp_draft_record(pulsar_session *s, int32_t x, uint32_t K, float temperature, int top_k, float top_p,
-                             float min_p, uint64_t *rng, spec_redraft_req *q, char *err, size_t errlen) {
+static bool mtp_draft_record(pulsar_session *s, uint32_t b, int32_t x, uint32_t K, float temperature, int top_k,
+                             float top_p, float min_p, uint64_t *rng, spec_redraft_req *q, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *st = s->qwen;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
-    const uint32_t b = st->live_bank, il_mtp = e->plan.n_layer, V = sh->n_vocab;
+    const uint32_t il_mtp = e->plan.n_layer, V = sh->n_vocab;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
     const uint32_t p = st->bank_pos[b];   /* the carry's position */
@@ -235,9 +240,9 @@ static bool mtp_draft_record(pulsar_session *s, int32_t x, uint32_t K, float tem
     st->mtp_pend_pos[b] = UINT32_MAX;   /* consumed; the absorb re-parks */
     /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows into it */
     if (ok) {
-        ok = pulsar_gpu_tensor_copy_async(st->spec.qsa_stage, (uint64_t)st->spec.n_qsa * itb, st->layer[il_mtp].idx_tail,
+        ok = pulsar_gpu_tensor_copy_async(st->mtp_stage, (uint64_t)b * itb, st->layer[il_mtp].idx_tail,
                                           (uint64_t)b * itb, itb) != 0;
-        st->mtp_stage_dirty = true;
+        st->mtp_stage_dirty[b] = true;
     }
     float conf = 1.0f;
     pulsar_sample_dist qd{};
@@ -306,7 +311,8 @@ static uint32_t mtp_draft(pulsar_session *s, int next_base, bool, float temperat
     rec.min_p = min_p;
     char err[200];
     uint32_t keep = 0;
-    if (mtp_draft_record(s, (int32_t)next_base, rec.n_draft, temperature, top_k, top_p, min_p, rng, &rec, err, sizeof err)) {
+    if (mtp_draft_record(s, s->qwen->live_bank, (int32_t)next_base, rec.n_draft, temperature, top_k, top_p, min_p, rng,
+                         &rec, err, sizeof err)) {
         pulsar_spec_redraft_stamp(s, &rec);
         keep = rec.keep;
     } else {
@@ -317,24 +323,22 @@ static uint32_t mtp_draft(pulsar_session *s, int next_base, bool, float temperat
     return keep;
 }
 
-/* The batched lane's draft: one bank's round (several banks' in one pass: S4). */
+/* The batched lane's draft: each bank's round in turn (L272 P1 S4; the chain is one MTP layer a step, so the
+ * banks' chains need not share a step to stay cheap beside the verify). */
 static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n,
                            char *err, size_t errlen) {
-    if (n != 1) {
-        snprintf(err, errlen, "%s: a draft over %d banks is not implemented (one bank a round until S4)", PULSAR_QWEN_ARCH, n);
-        return -1;
+    for (int i = 0; i < n; i++) {
+        spec_redraft_req *q = &rounds[i]->redraft;
+        if (!q->valid || q->n_draft == 0) continue;
+        if (banks[i] >= s->qwen->n_banks) {
+            snprintf(err, errlen, "%s: the draft's bank %u is outside the pool", PULSAR_QWEN_ARCH, banks[i]);
+            return -1;
+        }
+        if (!mtp_draft_record(s, banks[i], q->next_base, q->n_draft, q->temperature, q->top_k, q->top_p, q->min_p,
+                              rngs[i], q, err, errlen))
+            return -1;
+        q->done = true;
     }
-    if (banks[0] != s->qwen->live_bank) {
-        snprintf(err, errlen, "%s: the draft's bank %u is not the installed bank %u", PULSAR_QWEN_ARCH, banks[0],
-                 s->qwen->live_bank);
-        return -1;
-    }
-    spec_redraft_req *q = &rounds[0]->redraft;
-    if (!q->valid || q->n_draft == 0) return 0;
-    if (!mtp_draft_record(s, q->next_base, q->n_draft, q->temperature, q->top_k, q->top_p, q->min_p, rngs[0], q,
-                          err, errlen))
-        return -1;
-    q->done = true;
     return 0;
 }
 

@@ -133,7 +133,7 @@ static bool solo_spec(int k, int steps, int *stream,
 /* Prefill bank k of the pooled session through the classic path and save its
  * per-bank host carry + frontier counters. */
 static bool bank_prefill(pulsar_session *s, int k) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     char err[256];
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) return false;
     pulsar_session_invalidate(s);
@@ -196,7 +196,7 @@ int GATE_ENTRY(int argc, char **argv) {
     for (int pass = 0; pass < 2; pass++) {
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "T1 create"); break; }
-        if ((int)gpu_graph_bank_pool_count(&s->graph) < 2) {
+        if ((int)gpu_graph_bank_pool_count(s->graph) < 2) {
             printf("TEST1: SKIP (pool < 2; set PULSAR_MSEQ_BANKS>=2)\n");
             pulsar_session_free(s); break;
         }
@@ -223,7 +223,7 @@ int GATE_ENTRY(int argc, char **argv) {
     {
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "T2 create"); goto done; }
-        if ((int)gpu_graph_bank_pool_count(&s->graph) < 2) {
+        if ((int)gpu_graph_bank_pool_count(s->graph) < 2) {
             printf("TEST2: SKIP (pool < 2)\n"); pulsar_session_free(s); goto done;
         }
         bool ok = bank_prefill(s, 0) && bank_prefill(s, 1);
@@ -287,7 +287,7 @@ int GATE_ENTRY(int argc, char **argv) {
     {
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "T3 create"); goto done; }
-        if ((int)gpu_graph_bank_pool_count(&s->graph) < 2) {
+        if ((int)gpu_graph_bank_pool_count(s->graph) < 2) {
             printf("TEST3: SKIP (pool < 2)\n"); pulsar_session_free(s); goto done;
         }
         const int vocab = pulsar_engine_logits_width(g_e);

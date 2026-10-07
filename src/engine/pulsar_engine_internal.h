@@ -642,25 +642,6 @@ typedef struct {
     uint64_t value_pos; ///< byte offset of the value within the file
 } pulsar_kv;
 
-/** THE accept set for gpu_graph_matmul_plain_tensor -- ONE definition.
- *
- * This lived as three parallel lists: the dispatcher's arms, the load
- * validator's accept set, and a decode-time predicate, each with a comment
- * telling the next person to keep it in step with the other two. They drifted
- * exactly as you would expect -- the validator's comment said "the four arms"
- * while there were three -- and the failure mode is nasty: a type accepted by
- * the validator but missing an arm passes load and dies at runtime on a tensor
- * the artifact was told was fine.
- *
- * The dispatcher still switches, because it must MAP a type to an arm. What it
- * may not do is disagree about membership, so it asserts against this instead
- * of restating it. */
-static inline bool pulsar_weight_is_plain_or_mxfp8(uint32_t type) {
-    return type == PULSAR_TENSOR_BF16 ||
-           type == PULSAR_TENSOR_F32 ||
-           type == PULSAR_TENSOR_MXFP8_LT;
-}
-
 /** One entry of the tensor directory: where a tensor lives and how to read
  * it. Describes bytes inside a mapped shard; owns nothing. */
 typedef struct {
@@ -707,10 +688,13 @@ typedef struct {
      * the load, is asserted to come up as this same rank. */
     int tp_rank;
     uint32_t tp_n_ranks;
-    /** L266: a family's own residency rule under TP, set by its load -- tp_unstaged[i] marks tensor i as
-     *  never staged (Qwen: the other rank's experts, and the stored tensors whose rank slices the family
-     *  builds at open).  NULL = DeepSeek's rule alone (the routed stacks, model_tensor_unstaged). */
+    /** The residency rule under TP (L272 P4b): tp_unstaged[i] marks tensor i as never staged -- a stored tensor
+     *  the rank's plan replaces (a slice built at open, a routed stack's half, the other rank's experts).  Set
+     *  by pulsar_tp_plan_build; NULL = nothing unstaged. */
     uint8_t *tp_unstaged;
+    /** L272 P4b: the engine's TP plan (owned by the engine; tp_slice.cpp), for the forward's lookup of a built
+     *  slice (pulsar_tp_built_ptr).  NULL on one GPU. */
+    struct pulsar_tp_plan *tp_plan;
 
     uint32_t version;       ///< GGUF format version
     uint64_t n_kv;          ///< metadata key/value pair count
@@ -755,7 +739,9 @@ static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
  * until L251). */
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
-int pulsar_ds4_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
+/* L272 P4b: DeepSeek's TP slices for this rank (the family's tp_slices op) */
+bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan);
+int pulsar_ds4_session_create(pulsar_session *s);
 void pulsar_ds4_session_destroy(pulsar_session *s);
 uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
 
@@ -1764,8 +1750,6 @@ struct pulsar_vocab {
     void tokenize_rendered_chat_vocab(const char *text, token_vec *out) const;
     void tokenize_rendered_chat_spans_vocab(const char *text, const pulsar_text_span *spans,
                                           uint32_t n_spans, token_vec *out) const;
-    /** Debug: print ids with their decoded bytes to stderr. */
-    void dump_tokens(const token_vec *tokens) const;
 };
 
 /** The loaded model and everything derived from it.
@@ -1822,6 +1806,7 @@ struct pulsar_engine {
      * pulsar_tp_attach_slab. */
     struct pulsar_tp *tp;       ///< transport handle, or NULL when off
     char *tp_kv_dir;            ///< a worker's segment copies (pulsar_engine_options.tp_kv_dir), owned, or NULL
+    struct pulsar_tp_plan *tp_plan;   ///< L272 P4b: this rank's slices (tp_slice.cpp), or NULL on one GPU
     uint64_t tp_built_bytes;    ///< 4g-2: device bytes this rank BUILT at open (DeepSeek: its routed-expert half-stacks; Qwen: its dense slices and expert halves) -- resident weights the model's staged count never sees
     void *tp_slab_base;         ///< registered slab base (host-pinned), or NULL
     void *tp_slab_dev;          ///< the slab's device mapping (row-lane kernels), or NULL
@@ -1930,8 +1915,6 @@ struct pulsar_engine {
      * @return 0 on success. */
     int collect_imatrix(const char *dataset_path, const char *output_path,
                         int ctx_size, int max_prompts, int max_tokens);
-    /** Debug: print ids with decoded text to stderr. */
-    void dump_tokens(const pulsar_tokens *tokens);
     /** Bits per weight of the ROUTED expert tensors (the artifact's dominant
      * quantisation), for reporting and tier selection. */
     int routed_quant_bits();
@@ -2319,7 +2302,7 @@ struct pulsar_session {
         uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
         int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;
-    pulsar_gpu_graph graph;   ///< the DeepSeek family's device state (KV, scratch, bank views); untouched on a Qwen session
+    pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
     pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
@@ -2350,7 +2333,8 @@ struct pulsar_session {
      *  chain's load), which moves the KV but not the logits.  Set by every cut,
      *  cleared by a prefill or eval that writes them; a sync whose prompt needs
      *  no new rows re-evaluates the last one while it is set.  Fails safe: a
-     *  writer that forgets to clear it costs one row, never a wrong sample. */
+     *  writer that forgets to clear it costs one row, never a wrong sample.
+     *  One flag for every family (L272 P2: Qwen's logits_fresh folded into it). */
     bool logits_stale;
     /** L264 S4e: the leader is inside a mirrored sync -- the workers read only
      *  chunk verdicts until it returns, so no other mirrored frame may ship
@@ -2546,11 +2530,7 @@ struct pulsar_session {
     /** Install `bank`: repoint device views, then restore its host carry. Clears
      * the multiseq-poison flag. @return false if the bank cannot be installed. */
     bool bank_state_restore(uint32_t bank);
-    /** Committed token count for `bank`, live or idle. */
-    int bank_pos(uint32_t bank);
     int bank_prefill_frontier(uint32_t bank);
-    /** Borrowed view of `bank`'s committed token history. Do not free. */
-    const pulsar_tokens *bank_tokens(uint32_t bank);
     /** Append tokens to the session's checkpoint WITHOUT decoding them: for
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
@@ -2941,13 +2921,6 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t);
  *  layout or a shape the layout refuses. */
 bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
                                uint64_t *expert_bytes, uint64_t *row_bytes);
-bool routed_expert_gate_down_layout(
-        const pulsar_tensor *gate,
-        const pulsar_tensor *down,
-        uint64_t         *gate_expert_bytes,
-        uint64_t         *gate_row_bytes,
-        uint64_t         *down_expert_bytes,
-        uint64_t         *down_row_bytes);
 bool weights_have_output_head(const pulsar_weights *w);
 const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w);
 /** Validate metadata values that affect semantics: attention shape, HC count,
@@ -2991,6 +2964,229 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
  * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
  * type or missing tensor refuses loudly. */
 bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
+
+/** The families' tokenizer tables (L272 P2: tokenizer.cpp, tokenizer_qwen.cpp). */
+extern const pulsar_family_tokenizer k_ds4_tokenizer;
+extern const pulsar_family_tokenizer k_qwen_tokenizer;
+/** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
+void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
+
+/** L272: the loader's one failure policy (family.cpp): count a refusal (said by the caller where it was
+ *  found); the family's load checks the count at each stage boundary and fails cleanly. */
+void pulsar_load_refuse(void);
+uint32_t pulsar_load_refusals(void);
+void pulsar_load_refusals_reset(void);
+
+/** L272 P4b: the tensor-parallel plan (tp_slice.cpp).  A family declares its rank's slices (pulsar_family::tp_slices)
+ *  as a tensor, an axis and ranges; the core chooses the operation by the tensor's format, derives the residency
+ *  rule from it, and runs it after the GPU is up -- or, in record mode, writes one canonical line per slice to `f`
+ *  instead (tests/tp_plan_test.cpp). */
+typedef enum {
+    PULSAR_TP_AXIS_OUT = 0,       ///< a linear's output rows (dim[1]); a plain tensor's outermost dim
+    PULSAR_TP_AXIS_IN = 1,        ///< a linear's input (dim[0]): the rank's output is a partial the all-reduce sums
+    PULSAR_TP_AXIS_EXPERTS = 2,   ///< whole experts of a stack (dim[2])
+} pulsar_tp_axis;
+/** The operation a slice takes (tp_slice.cpp plan_op: by the tensor's format, the axis and the family's act_kind). */
+typedef enum {
+    PULSAR_TP_OP_NONE = 0,
+    PULSAR_TP_OP_FP8_ROWS = 1u << 0,
+    PULSAR_TP_OP_FP8_K = 1u << 1,
+    PULSAR_TP_OP_EXL3_COLS = 1u << 2,
+    PULSAR_TP_OP_EXL3_ROWS = 1u << 3,
+    PULSAR_TP_OP_VIEW = 1u << 4,
+    PULSAR_TP_OP_GATHER = 1u << 5,
+    PULSAR_TP_OP_MXFP4_HALF = 1u << 6,
+    PULSAR_TP_OP_EXPERTS = 1u << 7,
+} pulsar_tp_op;
+#define PULSAR_TP_SLICE_RANGES 3
+typedef struct {
+    pulsar_model *m;              ///< the model whose mapping holds the tensor
+    const pulsar_tensor *t;
+    pulsar_tp_axis axis;
+    uint32_t n;                   ///< ranges (several only for a gather: Qwen's q | k | v channels)
+    uint64_t lo[PULSAR_TP_SLICE_RANGES], hi[PULSAR_TP_SLICE_RANGES];
+} pulsar_tp_slice;
+bool pulsar_tp_plan_add(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor *t, pulsar_tp_axis axis, uint32_t n,
+                        const uint64_t *lo, const uint64_t *hi);
+bool pulsar_tp_plan_add1(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor *t, pulsar_tp_axis axis, uint64_t lo,
+                         uint64_t hi);
+/** At open, after the family's load (before the inspect-only exit): the family declares, the core chooses each
+ *  operation and marks what the rank never stages.  Refuses an operation the format has not, or the forward reads not. */
+bool pulsar_tp_plan_build(pulsar_engine *e);
+/** After the GPU is up: every slice, in the declared order. */
+bool pulsar_tp_plan_run(pulsar_engine *e);
+void pulsar_tp_plan_free(pulsar_engine *e);
+/** The device copy of a host-built slice of `t`, or NULL = `t` has none (the forward reads the stored tensor). */
+const void *pulsar_tp_built_ptr(const pulsar_model *m, const pulsar_tensor *t);
+/** What the rank's plan does to `t`: its operation and first range, and the key its registered slices resolve
+ *  under (the engine).  false = the plan does not slice `t` (or there is no plan: one GPU). */
+bool pulsar_tp_slice_of(const pulsar_model *m, const pulsar_tensor *t, pulsar_tp_op *op, uint64_t *lo, uint64_t *hi,
+                        const void **key);
+void pulsar_tp_record_begin(FILE *f);
+void pulsar_tp_record_end(void);
+
+/** L272 P4: a tensor's ROLE in the forward, declared by its family (weight_format.cpp). */
+typedef enum {
+    PULSAR_ROLE_DENSE = 0,             ///< a linear through the family's dense path
+    PULSAR_ROLE_EXPERT_GATE_UP = 1,    ///< a routed expert's gate or up stack (a split pair)
+    PULSAR_ROLE_EXPERT_DOWN = 2,       ///< a routed expert's down stack
+    PULSAR_ROLE_EXPERT_GATE_UP_FUSED = 3,   ///< one [in -> 2 mid] gate | up stack
+    PULSAR_ROLE_SHARED_EXPERT = 4,     ///< a shared expert's projection inside the MoE launcher
+} pulsar_weight_role;
+/** The activation a linear reads, as its producer emitted it (L272 P4c: the names say how it is REFERENCED -- the
+ *  MX slot is the backend's activation cache, keyed by the f32 buffer the producer wrote; rows are a raw pointer). */
+typedef enum {
+    PULSAR_ACT_SLOT_BF16 = 0,   ///< the slot's bf16 plane (DeepSeek's plain F32 / BF16 weights, cuBLAS)
+    PULSAR_ACT_ROWS_BF16 = 1,   ///< raw bf16 rows (Qwen)
+    PULSAR_ACT_SLOT_E4M3 = 2,   ///< the slot's E4M3 MX plane (DeepSeek's MXFP8 dense and routed experts)
+    PULSAR_ACT_COUNT = 3,
+} pulsar_act_format;
+#define PULSAR_ACTS(a) (1u << (a))
+/** L272 P4c: the kernel arm a dense linear takes for (stored format, activation) -- admission (pulsar_format_serves)
+ *  and the launcher (linear.cpp) read this one table. */
+typedef enum {
+    PULSAR_DENSE_ARM_NONE = 0,
+    PULSAR_DENSE_ARM_F32_PLANE,    ///< f32 weight (converted once to bf16), the slot's bf16 plane (cuBLAS)
+    PULSAR_DENSE_ARM_BF16_PLANE,   ///< bf16 weight, the slot's bf16 plane (cuBLAS)
+    PULSAR_DENSE_ARM_MXFP8_SLOT,   ///< mxfp8_lt, the slot's E4M3 (cuBLASLt)
+    PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
+    PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
+} pulsar_dense_arm;
+pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
+/** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the
+ *  mapped range (NULL = said). */
+const void *pulsar_weight_device_ptr(const pulsar_model *m, const pulsar_tensor *t, const char *what);
+/** out [n_tok][row_hi - row_lo] = rows [row_lo, row_hi) of w [in_dim -> dim[1]] times the activation armed in the
+ *  backend's MX slot for `x` -- the arm by w's format (E4M3 for mxfp8_lt, the bf16 plane for bf16 / f32). */
+bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pulsar_tensor *w, uint64_t in_dim,
+                        uint64_t row_lo, uint64_t row_hi, const pulsar_gpu_tensor *x, uint64_t n_tok);
+/** The bf16-rows launcher's reference to t (pulsar_rows_linear_launch, and the composite ops that take one): the
+ *  arm by t's format, refused by name when the table has none. */
+struct pulsar_rows_linear;
+bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int in, int out, bool prompt,
+                            const char *what, struct pulsar_rows_linear *l);
+/** L272 P4c: the routed MoE's front door (moe.cpp): the arm for (gate / up format, down format, activation) -- `up`
+ *  NULL = a fused gate_up stack in `gate` -- from the format registry. */
+typedef enum {
+    PULSAR_MOE_ARM_NONE = 0,
+    PULSAR_MOE_ARM_SLOT,         ///< the backend's routed dispatcher over the E4M3 slot (CUTLASS MXFP4 / IQ2 / EXL3 / mixed)
+    PULSAR_MOE_ARM_ROWS_FUSED,   ///< EXL3 fused gate_up + down over raw bf16 rows
+    PULSAR_MOE_ARM_ROWS_PAIR,    ///< EXL3 gate + up pair + down over raw bf16 rows
+} pulsar_moe_arm;
+pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
+                                  pulsar_act_format act);
+/** The routed part over the MX slot: out = the selected experts' weighted SwiGLU FFN of the activation armed for
+ *  `x`; the up / mid / experts buffers are the backend's scratch.  A stack the rank's plan halved reads its halves. */
+typedef struct {
+    pulsar_gpu_tensor *out, *up_out, *mid_out, *experts_out;
+    const pulsar_model *m;
+    const pulsar_tensor *gate, *up, *down;
+    const pulsar_gpu_tensor *selected, *weights;
+    uint32_t n_expert_present, n_expert_used;
+    float clamp;
+    const pulsar_gpu_tensor *x;
+    uint32_t layer, n_tokens;
+} pulsar_moe_slot_call;
+bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c);
+/** The routed part over raw bf16 rows (pulsar_rows_moe_routed_launch): `selected` is localised in place under
+ *  expert parallelism (the rank's plan's range of whole experts). */
+typedef struct {
+    const pulsar_model *m;
+    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
+    int32_t *selected;
+    const float *weights;
+    const uint16_t *x_bf16;
+    int n_rows;
+    float *out;
+    void *ws;
+    size_t ws_bytes;
+    uint32_t *nf_flag;
+    uint32_t nf_code;
+    bool prompt;
+} pulsar_moe_rows_call;
+bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c);
+/** Whether stored format `type` has a kernel for `role` at activation `act` -- the one table (weight_format.cpp). */
+bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_format act);
+/** Admission by role: t's format serves `role` at one of the activations in the mask `acts`; a refusal names the
+ *  formats that would (pulsar_tensor_admit's report). */
+bool pulsar_tensor_admit_role(const pulsar_tensor *t, const char *owner, pulsar_weight_role role, uint32_t acts);
+/** The MoE launchers' pairing rules for a layer's stacks (`up` NULL for a fused gate_up). */
+bool pulsar_format_moe_combo(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
+                             pulsar_act_format act, const char *owner);
+
+/** L272 P4a: the mechanics of a family's weight binder (tensor_bind.cpp) -- report the same way for every
+ *  family and return the verdict; the binder keeps its failure policy.  `owner` names the family in the
+ *  message.  The required tensor `name`, or NULL (said). */
+pulsar_tensor *pulsar_tensor_bind(const pulsar_model *m, const char *owner, const char *name);
+/** `t` has `nd` dims equal to d0, d1, d2 (ne order); false = said, with both shapes. */
+bool pulsar_tensor_dims(const pulsar_tensor *t, const char *owner, uint32_t nd, uint64_t d0, uint64_t d1 = 0,
+                        uint64_t d2 = 0);
+/** `ok` is whether `t`'s format is one its reading op takes (`want` names them); false = said. */
+bool pulsar_tensor_admit(const pulsar_tensor *t, const char *owner, bool ok, const char *want);
+
+/** L272 P2: the bank carry is the core's (session_banks.cpp).  Save the live host view -- checkpoint,
+ *  logits, the flags, the prefill frontier, the image identity, the speculative shadow -- into `bank`'s
+ *  carry; host only. */
+void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
+/** Bring `bank`'s saved view back into the host view.  false = nothing valid was saved (the family
+ *  decides what a bank with no carry means). */
+bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** A bank's committed history: the live view for the live bank, else its carry.  NULL = none. */
+const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
+
+/** The session's cooperative cancel hook, polled at a prefill chunk boundary (session.cpp).  A mirrored
+ *  session stops only together: the leader decides and ships the verdict, every worker reads it, so every
+ *  rank must poll at the same boundaries. */
+bool pulsar_session_cancelled(pulsar_session *s);
+
+/** What a family supplies for the core's default sync (sync_driver.cpp, L272 P2). */
+typedef struct pulsar_sync_ops {
+    const char *name;                                  ///< the family's name in messages
+    /** The live bank's state holds exactly what the session's view (checkpoint) says. */
+    bool (*state_agrees)(pulsar_session *s);
+    /** Clear the live bank to position 0 (a cold prefill follows). */
+    bool (*reset_bank)(pulsar_session *s);
+    /** Prefill `prompt` on the live bank from `start` -- the core loop's 0 /
+     *  PULSAR_SESSION_SYNC_INTERRUPTED / 1 (pulsar_prefill_loop). */
+    int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+} pulsar_sync_ops;
+/** The core's default sync: continue the view, else resume from the shared prefix's deepest grid
+ *  checkpoint, else reset and prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2).  Returns 0,
+ *  PULSAR_SESSION_SYNC_INTERRUPTED, or 1 with `err`. */
+int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_sync_ops *ops,
+                                char *err, size_t errlen);
+
+/** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
+ *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so
+ *  DeepSeek's planner and the session loop are one walk.  `next_end` returns the chunk's end in
+ *  (pos0, end]; `chunk` runs rows [pos0, pos0 + rows) (`last`: it ends the prompt); `landed` takes the
+ *  effects of a chunk that ended at `chunk_end` (captures, the view, progress); `stop` (NULL = never) is
+ *  polled before every chunk and after every chunk but the last. */
+struct pulsar_prefill_walk {
+    uint32_t (*next_end)(void *ud, uint32_t pos0, uint32_t end);
+    bool (*chunk)(void *ud, uint32_t pos0, uint32_t rows, bool last);
+    bool (*landed)(void *ud, uint32_t chunk_end);
+    bool (*stop)(void *ud);
+    void *ud;
+};
+/** Run the walk over [start, end): 0 when it reached `end`, PULSAR_SESSION_SYNC_INTERRUPTED when `stop`
+ *  said so at a chunk boundary (the device drained), 1 when a hook failed or a cut was out of range. */
+int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);
+
+/** One prefill chunk of the family's forward (L272 P2): rows [pos0, pos0 + rows) of `prompt` on the
+ *  live bank; `last` heads the final row into s->logits.  false = the chunk failed (logged). */
+typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0,
+                                        uint32_t rows, bool last, void *ud);
+
+/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start`, in chunks of
+ *  `cap` rows, a chunk cut at `capture_at` (0 = none) and the state there captured into `ckpt`/`bank`.
+ *  After each chunk the session's view advances (checkpoint = the prompt so far), the progress hooks
+ *  hear prefill_chunk / prefill_display, and the cancel hook is polled -- before every chunk too.
+ *  Returns 0 when the prompt is in, PULSAR_SESSION_SYNC_INTERRUPTED when the hook stopped it at a chunk
+ *  boundary (the view stands there, the logits stale), 1 when a chunk failed. */
+int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
+                        uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
+                        pulsar_prefill_chunk_fn chunk, void *ud);
 
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,
@@ -3564,29 +3760,6 @@ bool gpu_graph_dspark_draft_forward_banks(
         const uint32_t          *row_bank,
         const uint32_t         (*bank_n_raw)[3],
         const uint32_t          *bank_n_draft);
-bool gpu_graph_matmul_plain_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
-bool gpu_graph_matmul_mxfp8_named_tensor(
-        const char             *module,
-        uint32_t                il,
-        uint32_t                pos0,
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
-/* The same GEMM over the OUTPUT-ROW range [row_lo, row_hi) of `w` (slice 4g):
- * the whole tensor when the range is [0, out_full), otherwise the row slice the
- * engine registered at open (pulsar_gpu_register_fp8_lt_row_slice), which the
- * backend resolves by its own offset.  Writes row_hi - row_lo columns per row. */
 /* The pair's all-reduce of `n_tokens` n_embd-wide f32 rows of `t` (gpu_prefill.cpp):
  * the row lane at decode/verify width, the bulk lane above it, the host big gate
  * on transports without either.  `addend` (optional) is folded in first and
@@ -3630,19 +3803,6 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *x, uint32_t n_rows, const pul
 bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                                  pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                                  const char *what);
-bool gpu_graph_matmul_mxfp8_rows_named_tensor(
-        const char             *module,
-        uint32_t                il,
-        uint32_t                pos0,
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_full,
-        uint64_t                row_lo,
-        uint64_t                row_hi,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,

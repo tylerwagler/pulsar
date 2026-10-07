@@ -484,7 +484,7 @@ int pulsar_token_eos(pulsar_engine *e);
 bool pulsar_token_is_stop(pulsar_engine *e, int token);
 /** The chat template's TURN MARKERS as token sequences (L272 B5): the tokens that open a user turn
  * and an assistant turn in a rendered prompt.  DeepSeek names each with one special token
- * (<｜User｜>, <｜Assistant｜>); Qwen's template spells a turn as the added token <|im_start|> followed
+ * (\<｜User｜\>, \<｜Assistant｜\>); Qwen's template spells a turn as the added token \<|im_start|\> followed
  * by the role word, so a marker is two tokens there.  The server's prefix anchors (the sys-prefix
  * cold store, the last-turn routing anchor) scan a prompt with pulsar_turn_marker_at.  false, with
  * `out` zeroed (no marker matches anywhere), when the loaded tokenizer does not spell them -- said

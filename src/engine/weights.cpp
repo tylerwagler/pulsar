@@ -7,7 +7,8 @@ static float required_f32(const pulsar_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0.0f;
     }
     return v;
 }
@@ -18,19 +19,24 @@ static bool required_bool(const pulsar_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return false;
     }
     return v;
 }
 
 
 
+/* The family's binders stop at the first refusal (L272 P4a: the find / dims / format mechanics are the
+ * core's, tensor_bind.cpp). */
+static const char *const DS4_OWNER = "deepseek4";
+/* L272: a missing required tensor binds to this inert, zeroed tensor (refused once, where it was looked
+ * up), so the binder finishes and reports every problem; the load fails at its stage boundary. */
+static pulsar_tensor g_ds4_absent;
+
 static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
-    pulsar_tensor *t = model_find_tensor(m, name);
-    if (!t) {
-        fprintf(stderr, "pulsar: required tensor is missing: %s\n", name);
-        exit(1);
-    }
+    pulsar_tensor *t = pulsar_tensor_bind(m, DS4_OWNER, name);
+    if (!t) { pulsar_load_refuse(); return &g_ds4_absent; }   /* inert: the checks after it skip it */
     return t;
 }
 
@@ -69,28 +75,8 @@ static void tensor_expect_dims(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (t->ndim != ndim) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
-    }
-
-    const uint64_t want[3] = { d0, d1, d2 };
-    for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "pulsar: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
-    }
+    if (t == &g_ds4_absent) return;   /* refused where it was bound */
+    if (!pulsar_tensor_dims(t, DS4_OWNER, ndim, d0, d1, d2)) pulsar_load_refuse();
 }
 
 
@@ -102,15 +88,8 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != type) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected %s\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type),
-                tensor_type_name(type));
-        exit(1);
-    }
+    if (t == &g_ds4_absent) return;
+    if (!pulsar_tensor_admit(t, DS4_OWNER, t->type == type, tensor_type_name(type))) pulsar_load_refuse();
     tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
@@ -142,10 +121,12 @@ static void tensor_expect_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_MXFP8_LT)
-        tensor_expect_layout(t, PULSAR_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the site emits the E4M3 slot -- the format registry's dense kernels for it (weight_format.cpp) */
+    if (pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3)))
+        tensor_expect_dims(t, ndim, d0, d1, d2);
     else
-        pulsar_die("tensor has unsupported weight type; expected mxfp8_lt");
+        pulsar_load_refuse();
 }
 static void tensor_expect_plain_or_mxfp8(
         const pulsar_tensor *t,
@@ -154,20 +135,16 @@ static void tensor_expect_plain_or_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    /* Membership comes from pulsar_weight_is_plain_or_mxfp8 -- see the note on
-     * it. This function used to restate the set, and drifted from the
-     * dispatcher it is supposed to mirror.
-     *
-     * MXFP8_LT was rejected here until 2026-08-17, deliberately and correctly:
-     * gpu_graph_matmul_plain_tensor had no type-41 branch, so such a tensor
-     * would have passed load and dispatched into nothing. The guard did its job
-     * -- a repacked artifact was tried that day and died HERE, at load, instead
-     * of misbehaving. The arm exists now, so the type is in the set. */
-    if (!pulsar_weight_is_plain_or_mxfp8(t->type)) {
-        fprintf(stderr, "pulsar: tensor %.*s has type %s, which the plain matmul "
-                        "cannot dispatch\n",
-                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
-        pulsar_die("unsupported weight type for the plain matmul path");
+    /* Membership is the dense arm table's (pulsar_dense_arm_for, weight_format.cpp), the one the launcher runs
+     * (pulsar_linear_slot, linear.cpp): a type admitted here has an arm there by construction.  (Three parallel
+     * lists once drifted -- MXFP8_LT passed load with no dispatcher arm until 2026-08-17.) */
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the slot's bf16 plane for the F32 / BF16 arms, its E4M3 for MXFP8 -- the registry's dense kernels at
+     * those two activations */
+    if (!pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE,
+                                  PULSAR_ACTS(PULSAR_ACT_SLOT_BF16) | PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -201,7 +178,7 @@ static void tensor_expect_plain_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    /* Accepts the three NON-fp8 arms of gpu_graph_matmul_plain_tensor, which is
+    /* Accepts the two NON-fp8 arms of pulsar_linear_slot (the slot's bf16 plane), which is
      * what every caller here feeds. BF16 was missing until 2026-08-16 and the
      * drafter's router is bf16 now, so an otherwise-correct artifact died at
      * load with "expected F16 or F32". The main model's router is checked by
@@ -215,30 +192,13 @@ static void tensor_expect_plain_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
 
-
-/* The two routed-expert types the engine still reads.  IQ2_XXS (16),
- * IQ2_XXS_SOA (42), Q2_K (10) and FP4_E2M1 (39) were dropped: a scan of the
- * shipped artifact found only types 0/1/26/38/40/41/44 in the file, none of the
- * four is ever synthesised at load -- a legacy layout is refused by name at
- * kernels behind them are gone.  Refusing here is what keeps that honest -- an
- * old artifact now fails to load with a clear message instead of dispatching
- * into a reader that no longer exists. */
-static bool tensor_is_routed_expert_type(uint32_t type) {
-    /* EXL3: the rates the DeepSeek arm reads for its split gate / up stacks AND
-     * its down (exl3_arm_has_rate, the one table) -- Qwen's K = 4 / 5 stacks are
-     * the Qwen family's, and a DeepSeek artifact carrying them is refused here,
-     * at load, not by the kernel at first use. */
-    const int k2 = exl3_type_k2(type);
-    return type == PULSAR_TENSOR_IQ2_XXS_MMQ_K ||
-           type == PULSAR_TENSOR_CUTLASS_MXFP4 ||
-           (k2 != 0 && exl3_arm_has_rate(EXL3_ARM_PAIR, k2) && exl3_arm_has_rate(EXL3_ARM_DOWN, k2));
-}
 
 
 
@@ -266,8 +226,8 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
 /* ONE side's byte model from (type, in = k, out = n): the per-expert stride
  * and the "row bytes" value that side's consumers read -- an ordinary row
  * stride for the IQ2 arm, the data/SF split point for CUTLASS MXFP4, the
- * trellis/scales split point for EXL3 (exl3_expert_layout).  Both
- * routed_expert_gate_down_layout() and the container's expert-stack check
+ * trellis/scales split point for EXL3 (exl3_expert_layout).  The routed MoE's
+ * front door (moe.cpp) and the container's expert-stack check
  * (st_add_expert_stacks) read this, so a stack whose declared expert_bytes
  * disagrees with the type's own layout is refused at load instead of being
  * addressed with a guessed stride. */
@@ -295,42 +255,6 @@ bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
 
 
 
-/* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
- * for any supported routed-expert quant combo, centralizing the
- * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
- * t->dim[1] * row_bytes` that's repeated across gpu_prefill.cpp/gpu_decode.cpp.
- *
- * For CUTLASS_MXFP4 (type 40) "row_bytes" has no ordinary per-row meaning --
- * the tensor is expert-major ColumnMajor+swizzle with no per-row byte stride
- * at all. It instead carries the data/SF split point within each expert's
- * block: the SF blob starts *row_bytes bytes into that expert's slice, and
- * *expert_bytes is the full [data + SF] stride to the next expert. Callers
- * that dispatch on gate->type == PULSAR_TENSOR_CUTLASS_MXFP4 must read it that
- * way; only the CUTLASS MoE path does.  The EXL3 layouts carry the same shape
- * of answer: *row_bytes is the trellis/scales split point of an expert's
- * slice and *expert_bytes its stride (exl3_expert_layout). */
-bool routed_expert_gate_down_layout(
-        const pulsar_tensor *gate,
-        const pulsar_tensor *down,
-        uint64_t         *gate_expert_bytes,
-        uint64_t         *gate_row_bytes,
-        uint64_t         *down_expert_bytes,
-        uint64_t         *down_row_bytes) {
-    /* NOTE: gate and down are NOT always the same type -- gate/up and down
-     * formats pair freely per layer by design (see
-     * tensor_expect_routed_expert_combo). Each side's layout is computed
-     * independently so MIXED layers (cutlass_mxfp4 on one side, iq2/q2k on the
-     * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
-     * the dp4a side yields ordinary expert/row byte counts. */
-    if (!gate || !down) return false;
-    return routed_expert_side_layout(gate->type, gate->dim[0], gate->dim[1],
-                                     gate_expert_bytes, gate_row_bytes) &&
-           routed_expert_side_layout(down->type, down->dim[0], down->dim[1],
-                                     down_expert_bytes, down_row_bytes);
-}
-
-
-
 /* The CUDA routed-MoE dispatcher selects kernels per role and per layer:
  * gate/up (always a matching pair -- the fused gate+up kernels assume one
  * format) in {IQ2_XXS, Q2_K, MXFP4}, down in {IQ2_XXS, Q2_K, MXFP4}, in any
@@ -344,68 +268,29 @@ static void tensor_expect_routed_expert_combo(
         const pulsar_tensor *gate,
         const pulsar_tensor *up,
         const pulsar_tensor *down) {
-    /* gate/up must match (the fused gate+up kernels assume one format). Each of
-     * gate/up and down is independently either IQ2_XXS_MMQ_K (44, read by the MMQ
-     * arms) or CUTLASS_MXFP4 (40) -- the GPU MoE path handles all-cutlass
-     * (uniform, grouped/gemv), all-MMQ, AND the two MIXED shapes via
-     * per-projection dispatch, which is what the shipped artifact needs: its 43
-     * routed layers are 9 all-40, 27 all-44 and 7 mixed.
-     *
-     * The old dp4a types (IQ2_XXS 16, IQ2_XXS_SOA 42, Q2_K 10, FP4_E2M1 39) are
-     * gone along with their kernels, so the former "bad_mix" cross (CUTLASS
-     * against a legacy type-39 side) can no longer be expressed and its check
-     * went with them. */
-    const bool gate_up_pair = gate->type == up->type;
-    const bool gate_ok = tensor_is_routed_expert_type(gate->type);
-    const bool down_ok = tensor_is_routed_expert_type(down->type);
-    /* EXL3 (L245) runs its own arm on both projections: an EXL3 side never
-     * pairs with a 40/44 side (no kernel reads that mix), but the RATE may
-     * differ between gate/up and down -- the arm decodes each side by its own
-     * type. */
-    const bool gate_exl3 = exl3_type_k2(gate->type) != 0;
-    const bool down_exl3 = exl3_type_k2(down->type) != 0;
-    if (gate_up_pair && gate_ok && down_ok && gate_exl3 == down_exl3) return;
-    fprintf(stderr,
-            "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; gate/up must match, an exl3 side pairs only "
-            "with an exl3 side, and each of gate/up and down must be one of:",
-            (int)gate->name.len,
-            gate->name.ptr,
-            tensor_type_name(gate->type),
-            tensor_type_name(up->type),
-            tensor_type_name(down->type));
-    /* DERIVED from tensor_is_routed_expert_type(), for the reason spelled out on
-     * weights_reject_unsupported_types().  This message used to name
-     * "iq2_xxs_mmq (43)" by hand; that reader was deleted (L202) and 43 is
-     * refused, so the engine was telling users to repack their artifact into a
-     * type it then rejects -- L207's failure mode, in the one message L207
-     * missed. */
-    for (uint32_t t = 0; t < 256u; ++t) {
-        if (tensor_is_routed_expert_type(t)) {
-            fprintf(stderr, " %s (%u)", tensor_type_name(t), t);
-        }
-    }
-    fprintf(stderr, "\n  the combo may differ per layer\n");
-    exit(1);
+    /* L272 P4: the MoE launchers' pairing rules are the format registry's (pulsar_format_moe_combo): one format
+     * per gate / up pair, and at E4M3 activations an EXL3 side pairs only with an EXL3 side.  The GPU MoE path
+     * handles all-CUTLASS, all-MMQ and the two mixed 40 / 44 shapes per projection -- the shipped artifact's
+     * 43 routed layers are 9 all-40, 27 all-44 and 7 mixed. */
+    if (gate == &g_ds4_absent || up == &g_ds4_absent || down == &g_ds4_absent) return;
+    if (!pulsar_format_moe_combo(gate, up, down, PULSAR_ACT_SLOT_E4M3, DS4_OWNER)) pulsar_load_refuse();
 }
 
 
 
 static void tensor_expect_routed_expert(
         const pulsar_tensor *t,
+        pulsar_weight_role role,
         uint32_t          ndim,
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing routed expert tensor while validating layout");
-    if (!tensor_is_routed_expert_type(t->type)) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %u (%s), expected a routed expert quant type\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->type,
-                tensor_type_name(t->type));
-        exit(1);
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the stack's role at this family's E4M3 activations (the registry's routed-expert kernels) */
+    if (!pulsar_tensor_admit_role(t, DS4_OWNER, role, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_dims(t, ndim, d0, d1, d2);
 }
@@ -540,7 +425,8 @@ static void weights_validate_layout(
         const pulsar_layer_weights *l = &w->layer[il];
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
@@ -610,9 +496,9 @@ static void weights_validate_layout(
             tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2,
                                  PULSAR_N_EXPERT_USED, PULSAR_N_VOCAB, 0);
         }
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_gate_exps, PULSAR_ROLE_EXPERT_GATE_UP, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   PULSAR_ROLE_EXPERT_GATE_UP, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, PULSAR_ROLE_EXPERT_DOWN,    3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
@@ -732,7 +618,8 @@ static void pulsar_select_shape_from_metadata(
             n_expert,
             n_ff_exp,
             n_indexer_top_k);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -745,12 +632,14 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
         fprintf(stderr, "pulsar: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0;
     }
     if (arr.len > cap) {
         fprintf(stderr, "pulsar: %s has %llu entries, at most %u are meaningful\n",
                 key, (unsigned long long)arr.len, cap);
-        exit(1);
+        pulsar_load_refuse();
+        return 0;
     }
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint64_t i = 0; i < arr.len; i++) {
@@ -820,7 +709,8 @@ static void validate_attention_layout_metadata(const pulsar_model *m) {
         fprintf(stderr, "pulsar: candidate pool is %u blocks of %u, %s expects %u of %u\n",
                 topk_blocks, block_size, PULSAR_MODEL_SHAPE_NAME,
                 sh->candidate_topk_blocks, sh->candidate_block_size);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);
 }
@@ -867,7 +757,8 @@ static void validate_reap_metadata(const pulsar_model *m) {
             fprintf(stderr,
                     "pulsar: reap.layer.keep_count[%u]=%u out of range [1, %u]\n",
                     il, got, PULSAR_N_EXPERT);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
         g_pulsar_layer_expert_count[il] = got;
     }
@@ -881,7 +772,8 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_FLOAT32 && arr.type != PULSAR_META_FLOAT64)) {
         fprintf(stderr, "pulsar: required float array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     if (arr.len < PULSAR_N_LAYER) {
         pulsar_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
@@ -907,7 +799,8 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%u for %s, got %u\n",
             name, expected, PULSAR_MODEL_SHAPE_NAME, got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -920,7 +813,8 @@ static void config_expect_f32(const char *name, float got, float expected) {
     if (fabsf(got - expected) <= tol) return;
     fprintf(stderr, "pulsar: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, PULSAR_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -929,7 +823,8 @@ static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%s for %s, got %s\n",
             name, expected ? "true" : "false", PULSAR_MODEL_SHAPE_NAME, got ? "true" : "false");
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -990,6 +885,7 @@ void config_validate_model(const pulsar_model *m) {
                                    n_indexer_top_k,
                                    n_hc,
                                    n_hc_sinkhorn_iter);
+    if (pulsar_load_refusals()) return;   /* L272: no shape was selected -- nothing below can be checked */
 
     config_expect_u32("embedding_length",            n_embd,         PULSAR_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        PULSAR_N_VOCAB);
@@ -1028,7 +924,8 @@ void config_validate_model(const pulsar_model *m) {
         fprintf(stderr, "pulsar: expected rope.scaling.original_context_length=%" PRIu64
                 " for %s, got %" PRIu64 "\n",
                 (uint64_t)PULSAR_ROPE_ORIG_CTX, PULSAR_MODEL_SHAPE_NAME, rope_orig_ctx);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     const float rope_freq_base = required_f32(m, "deepseek4.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, PULSAR_ROPE_FREQ_BASE);
@@ -1060,7 +957,8 @@ void config_validate_model(const pulsar_model *m) {
         fprintf(stderr, "pulsar: attention.layer_norm_rms_epsilon=%.9g is neither 0731's %.9g "
                         "nor Vision-Exp's/V4.1's %.9g\n",
                 (double)rms_eps, (double)PULSAR_V4_RMS_EPS, (double)PULSAR_V41_RMS_EPS);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     g_pulsar_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
@@ -1078,7 +976,8 @@ void config_validate_model(const pulsar_model *m) {
         declared_hash != (uint32_t)PULSAR_N_HASH_LAYER) {
         fprintf(stderr, "pulsar: hash_layer_count is %u, %s expects %u\n",
                 declared_hash, PULSAR_MODEL_SHAPE_NAME, (unsigned)PULSAR_N_HASH_LAYER);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
 }
 
@@ -1152,7 +1051,8 @@ void weights_reject_unsupported_types(const pulsar_model *m) {
             }
         }
         fprintf(stderr, "\n");
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
 }
 
@@ -1208,7 +1108,8 @@ static void e8m0_scan_blocks(
             fprintf(stderr,
                     "pulsar: 0xFF never decodes consistently (custom GEMVs read +Inf, "
                     "cuBLASLt/CUTLASS read NaN); refusing the artifact\n");
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
 }
@@ -1239,7 +1140,8 @@ static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
                     i < t->dim[0] ? "suh" : "svh",
                     (unsigned long long)(i < t->dim[0] ? i : i - t->dim[0]),
                     (p[i] & 0x03ffu) ? "NaN" : "Inf", p[i]);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
 }
@@ -1379,7 +1281,8 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
         if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
         if (!attn_bound[i] && model_find_tensor(m, name)) {
             fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il, name);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
     l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
@@ -1406,7 +1309,8 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
             fprintf(stderr, "pulsar: layer %u carries ffn_gate_tid2eid but only the first %u "
                             "layers are hash-routed -- refusing\n",
                     il, (unsigned)PULSAR_N_HASH_LAYER);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
@@ -1517,9 +1421,9 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
          * V4.1 against a 384 / top-6 target, and 256 / top-6 on 0731. */
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_gate_exps, PULSAR_ROLE_EXPERT_GATE_UP, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps,   PULSAR_ROLE_EXPERT_GATE_UP, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, PULSAR_ROLE_EXPERT_DOWN,    3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);

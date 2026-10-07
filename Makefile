@@ -677,6 +677,34 @@ qwen-family-gate: tests/qwen_family_gate qwen-family-containers
 	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
 qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
 	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
+# L272 P5: the session contract every family meets, on REAL weights (tests/session_contract_gate.cpp: chunk
+# neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
+# zero-weight family gate above proves wiring only.  A new family adds one line here.
+QWEN_GATE_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp   # the served quant, MTP sidecar included (B6 needs a drafter)
+.PHONY: session-contract-gate-qwen session-contract-gate-ds
+session-contract-gate-qwen: tests/session_contract_gate
+	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
+session-contract-gate-ds: tests/session_contract_gate
+	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
+# L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
+# no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
+# only for a change that MEANS to move a slice.
+# DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
+# (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
+TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
+TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(QWEN_GATE_MODEL)
+.PHONY: tp-plan-gate tp-plan-golden
+tp-plan-gate: tests/tp_plan_test
+	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
+	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
+	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 2>/dev/null | diff -u $$g - >/dev/null \
+	    || { echo "TP-PLAN GATE FAIL: $$g"; exit 1; }; \
+	  echo "tp-plan: $$g ($$(grep -vc '^#' $$g) slices)"; done; done; echo "TP-PLAN GATE PASS"
+tp-plan-golden: tests/tp_plan_test
+	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
+	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
+	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 > $$g 2>/dev/null || exit 1; \
+	  echo "recorded $$g ($$(grep -vc '^#' $$g) slices)"; done; done
 
 # L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
 # against the device-path fixture's rows (read from the checkpoint by the generator):
@@ -817,6 +845,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
              indexer-score-check attn-pack-fixture-check tp-core-test
 	./pulsar-eval --self-test-extractors
+	cd tools/container && python3 test_exl3_rates.py   # L272 P4a: the builder's EXL3 rate table == the engine's
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
 # ORDER cost bandwidth?  Model-free and standalone -- it allocates one real IQ2
@@ -1096,7 +1125,7 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_names.py test_kv.py test_producers.py test_qwen.py; do \
+	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_qwen.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -1712,6 +1741,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
+	session-contract-gate-qwen session-contract-gate-ds \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1907,7 +1937,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|tests/qwen_family*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/session*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
@@ -1937,7 +1967,7 @@ gates-dev:
 	if [ -z "$$sel" ]; then printf '  runner sub-gates: (none -- all coverage for this path set is in the targets below)\n'; \
 	else printf '  runner sub-gates: %s\n' "$$(echo $$sel | tr ' ' ',')"; fi; \
 	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
-	if [ $$family -eq 1 ]; then printf '  qwen-family-gate-device: selected (the family interface)\n'; fi; \
+	if [ $$family -eq 1 ]; then printf '  family gates: selected (the family interface; the session contract on both families)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -1967,6 +1997,7 @@ gates-dev:
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory session-contract-gate-qwen session-contract-gate-ds CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
@@ -2275,13 +2306,13 @@ tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/qwen_banks_gate.o: tests/qwen_banks_gate.cpp
+tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/qwen_banks_gate: tests/qwen_banks_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/qwen_chunk_neutrality_gate.o: tests/qwen_chunk_neutrality_gate.cpp
+tests/session_contract_gate.o: tests/session_contract_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/qwen_chunk_neutrality_gate: tests/qwen_chunk_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+tests/session_contract_gate: tests/session_contract_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 .PHONY: qwen-generate
 qwen-generate: tests/qwen_generate

@@ -82,7 +82,7 @@ static char *read_file(const char *path, size_t *len_out) {
 
 
 static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     const size_t cap = 64u * 1024u * 1024u;

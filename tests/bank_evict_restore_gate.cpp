@@ -68,7 +68,7 @@ static char *read_file(const char *path, size_t *len_out) {
 /* FNV-1a fold of bank `bank`'s captured comp+index frontier rows (raw D2H). 0 on
  * a read failure (e.g. an evicted bank) — the caller only checksums resident banks. */
 static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
@@ -176,7 +176,7 @@ int GATE_ENTRY(int argc, char **argv) {
     if (base.len < 256) { fprintf(stderr, "prompt too short\n"); goto done; }
 
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
-    const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
+    const uint32_t pool = gpu_graph_bank_pool_count(s->graph);
     fprintf(stderr, "evict_restore_gate: pool banks=%u ctx=%d L=%d\n", pool, ctx, L);
     if (pool < 2) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=2\n"); goto done; }
 
@@ -186,9 +186,9 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_tokens p; memset(&p, 0, sizeof(p)); p.v = toks; p.len = p.cap = L;
     char err[256];
     if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); goto done; }
-    gpu_graph_bank_counters_capture(&s->graph, 0);
+    gpu_graph_bank_counters_capture(s->graph, 0);
     (void)pulsar_gpu_synchronize();
-    frontier_coverage(&s->graph, 0, L);
+    frontier_coverage(s->graph, 0, L);
     const uint64_t sum_before = checksum_bank_kv(s, 0);
     const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0);
     CHECK(sum_before != 0, "checksum_before failed");
@@ -197,7 +197,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* 2. Save bank 0 (cur) as its segment chain.  Measure the write: an eviction
      * stalls the evicted session's next turn by save+reload time. */
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     FILE *chain_fp[GATE_CHAIN_MAX] = {0};
     uint64_t chain_bytes[GATE_CHAIN_MAX];
     int chain_G[GATE_CHAIN_MAX];
@@ -277,7 +277,7 @@ int GATE_ENTRY(int argc, char **argv) {
     { pulsar_tokens p1; memset(&p1, 0, sizeof p1); p1.v = toks; p1.len = p1.cap = L;
       char e2[256];
       CHECK(pulsar_session_sync(s, &p1, e2, sizeof e2) == 0, "finding2: bank1 sync: %s", e2); }
-    gpu_graph_bank_counters_capture(&s->graph, 1);
+    gpu_graph_bank_counters_capture(s->graph, 1);
     CHECK(pulsar_session_bank_pos(s, 1) == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
           pulsar_session_bank_pos(s, 1), L);
     CHECK(pulsar_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");

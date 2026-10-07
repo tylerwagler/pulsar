@@ -173,7 +173,7 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
     const bool forced = c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED;
     if (forced && r->has_tools && r->prompt_text) {
         r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
     /* With an engine: tokenise the rendered TEXT, then replace every image
      * placeholder with that image's sentinel block -- the reference's order, and
@@ -460,7 +460,7 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     const bool forced = c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED;
     if (forced && r->has_tools) {
         r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
     if (e) pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
     return true;
@@ -547,8 +547,11 @@ static char *qwen_tool_error_suffix(const request *r, const thinking_state *, co
  * call; with thinking off the prompt already closed it. */
 static void qwen_forced_call_seed(const request *r, buf *out) {
     if ((qwen_effort)r->family_effort != QWEN_EFFORT_NONE) buf_puts(out, "\n</think>\n\n");
-    buf_puts(out, "<tool_call>\n<function=");
+    /* unnamed: stop before the name's opener -- the model samples "=name>" under the declared-name mask, as
+     * the tokenizer joins them ("=get"); named: the whole tag, tokenized with the prompt as the model saw it */
+    buf_puts(out, "<tool_call>\n<function");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
+        buf_puts(out, "=");
         buf_puts(out, r->forced_tool_name);
         buf_puts(out, ">\n");
     }
@@ -680,6 +683,8 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
+    /* .forced_name_open      = */ NULL,
+    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_deepseek_v4 = {
@@ -696,6 +701,8 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
+    /* .forced_name_open      = */ NULL,
+    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_qwen = {
@@ -712,6 +719,8 @@ static const server_family_ops k_family_qwen = {
     /* .tool_error_suffix     = */ qwen_tool_error_suffix,
     /* .forced_call_seed      = */ qwen_forced_call_seed,
     /* .forced_call_prefill   = */ qwen_forced_call_prefill,
+    /* .forced_name_open      = */ "=",   /* an unnamed seed ends at <function: "=get" is one token */
+    /* .forced_name_close     = */ ">",
     /* .find_call_block       = */ qwen_find_call_block,
 };
 

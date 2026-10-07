@@ -562,6 +562,16 @@ typedef struct server_family_ops {
      *  append, so prompt + output = the family's render of the turn (request_apply_forced_tool_prefill
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
+    /** L272: an UNNAMED forced call's seed ends where the function name's OPENER starts; the opener, the
+     *  name and the closer (Qwen: "=" and ">") are then sampled under a mask that keeps them a prefix of
+     *  opener + a declared tool's name + closer, so "required" with several tools cannot name an undeclared
+     *  one (Qwen sampled "ask_user").  The seed stops BEFORE the opener (token healing): Qwen's tokenizer
+     *  merges "=" with a name's first piece ("=get"), so a prompt ending in a lone "=" is a state the model
+     *  saw only before names it does not merge ("=", "convert"), and "required" chose convert_currency for
+     *  every question.  forced_name_close NULL = the family's seed does not end at the name: no constraint
+     *  (an undeclared name is dropped at the finish instead); forced_name_open may be "" (no opener). */
+    const char *forced_name_open;
+    const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
      *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
     const char *(*find_call_block)(const char *p, const char **end);
@@ -807,7 +817,7 @@ typedef struct {
 } sink_tool_ops;
 
 /** L267: where DeepSeek's raw generated text is, for its one stream projection (deepseek_stream.cpp):
- * every protocol's live response is fed by the same walk over <think>, the answer and DSML blocks. */
+ * every protocol's live response is fed by the same walk over \<think\>, the answer and DSML blocks. */
 typedef enum {
     DS_WALK_THINKING,   ///< inside the reasoning block
     DS_WALK_TEXT,       ///< the answer
@@ -839,7 +849,7 @@ struct chat_sink {
     /** Reasoning or answer text; `release_upto` is the byte offset in the generation the text ends at
      * (OpenAI's logprob entries ride with the delta that releases their bytes). */
     bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
-    /** The current section ended; `think_closed`: at the model's own </think>. */
+    /** The current section ended; `think_closed`: at the model's own \</think\>. */
     bool (*end)(chat_sink *k, bool think_closed);
     /** Live tool-call events; NULL: calls go out with the finish. */
     const sink_tool_ops *tool_ops;
@@ -1471,6 +1481,10 @@ struct server {
      * it. Slots are pure bank descriptors; all engine work goes through this
      * pointer. */
     pulsar_session *sess;
+    /** L272: every token's bytes (pulsar_token_text over the logits width), built on the first constrained
+     *  tool name and kept: the mask reads them per draw.  A pointer, so the struct stays memset-clean;
+     *  freed with the session at shutdown.  Worker thread only. */
+    std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
@@ -2378,6 +2392,7 @@ struct qwen_gen {
     bool finished = false;           ///< the end of the turn was fed (the finish did it)
     bool stream_ok = true;           ///< no client write failed while projecting
     std::string last_error;          ///< the last malformed-call report (the retry's detail)
+    int undeclared = 0;              ///< calls dropped for naming an undeclared tool (L272)
     ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
 };
 
@@ -2476,6 +2491,11 @@ struct gen_state {
     int last_decode_log_completion;    ///< token count at that line, for interval rates
     thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
     bool spec_enabled;          ///< speculative decoding is active for this request
+    /** L272: an unnamed forced call's function name is being sampled from g->text[tool_name_from..):
+     *  until the family's closer appears the sampler masks every token that would leave the declared
+     *  names, and the slot holds speculation (lane 3 samples inside the engine, past any mask). */
+    bool tool_name_constrained;
+    size_t tool_name_from;
     /** L272 P3: the family's output parser and its state for this decode attempt (created at decode
      * init, destroyed with the next attempt or the request). */
     const server_output_parser_ops *parser;
@@ -2563,6 +2583,9 @@ void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
+/** Append a NUL-terminated string.  Nearly every renderer and emitter calls it, so its caller graph is
+ *  past DOT_GRAPH_MAX_NODES and is not drawn.
+ *  \hidecallergraph */
 void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...);
 char *buf_take(buf *b);
@@ -2601,6 +2624,9 @@ void chat_msgs_free(chat_msgs *msgs);
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg);
 void tool_schema_orders_free(tool_schema_orders *orders);
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name);
+/** Whether a parsed call names a tool the request declared (L272); when it does not, `detail` gets the
+ * model-visible tool error: the name and the declared ones. */
+bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
 pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort);
@@ -2867,7 +2893,17 @@ bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
 /** DeepSeek's call-block finder (kv_cache.cpp): every DSML spelling either template renders. */
 const char *find_next_dsml_tool_block(const char *p, const char **end_out);
-void request_apply_forced_tool_prefill(request *r);
+bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
+/** L272: whether a token whose bytes are `tok` may follow `so_far` in an unnamed forced call's function
+ *  name: the joined bytes stay a prefix of some declared name followed by `close`, or pass it with only
+ *  whitespace after (a token may carry the closer and the newline).  An empty token is never allowed. */
+bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok, const char *open,
+                             const tool_schema_orders *declared, const char *close);
+/** The slot is sampling an unnamed forced call's function name (the closer has not appeared yet). */
+bool gen_tool_name_open(const struct gen_state *g);
+/** Mask a constrained slot's logits row to the declared names (server_jobs.cpp); false = nothing allowed
+ *  (said), the row untouched. */
+bool gen_mask_tool_name(struct server *s, struct gen_state *g, float *row, int width);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd,

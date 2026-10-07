@@ -69,7 +69,7 @@ static char *read_file(const char *path, size_t *len_out) {
 /* Every compressing layer's frontier pair must equal pos/ratio exactly —
  * position-truth, the same predicate the multiseq admission check enforces. */
 static void check_frontiers(pulsar_session *s, int pos, const char *what) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -111,7 +111,7 @@ static bool extend_one(pulsar_session *s, pulsar_tokens *toks, int upto) {
  * pre-rewind sanity, 35 = the re-emitted group, 36 = the first post-heal
  * group). */
 static uint64_t comp_rows_hash(pulsar_session *s) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
@@ -192,7 +192,7 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
 /* FNV-1a over ratio-128 comp row 0 of every ratio-128 layer -- the row the
  * L124 aliasing contaminates. */
 static uint64_t r128_row0_hash(pulsar_session *s) {
-    pulsar_gpu_graph *g = &s->graph;
+    pulsar_gpu_graph *g = s->graph;
     const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint8_t buf[8192];

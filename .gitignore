@@ -39,8 +39,8 @@ __pycache__/
 /tests/api_golden
 /tests/sse_golden
 /tests/spec_teacher_forced_probe
-/tests/qwen_banks_gate
-/tests/qwen_chunk_neutrality_gate
+/tests/session_contract_gate
+/tests/tp_plan_test
 /tests/qwen_s4_gate
 /tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe
@@ -158,3 +158,6 @@ tests/dspark_batch_gate
 /tests/qwen_chat_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
+/tests/comp_state_gate
+/tests/vision_image_gate
+/tests/vision_image_sync_gate
