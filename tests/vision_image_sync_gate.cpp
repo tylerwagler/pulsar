@@ -170,13 +170,23 @@ int main(int argc, char **argv) {
                 step = "stale after the ghost rewind";
                 ok4 = sess->graph->ms_comp_state_stale[gpu_graph_cur_bank(sess->graph)];
             }
+            /* the turn the server builds: the live history, the renderer's placeholder, a little text -- expanded from
+             * the live length (a block's layout depends on where it starts, so the golden's block is not reused) */
+            pulsar_image_ref img4 = { enc.data(), enc.size(), 0 };
             if (ok4) {
+                step = "expanding the turn's placeholder";
                 const pulsar_tokens *live = pulsar_session_tokens(sess);
-                for (int i = 0; i < live->len; i++) pulsar_tokens_push(&turn, live->v[i]);
+                const int live_len = live->len;
+                pulsar_tokens raw = {}, ph = {};
+                for (int i = 0; i < live_len; i++) pulsar_tokens_push(&raw, live->v[i]);
+                pulsar_tokenize_rendered_chat(e, PULSAR_IMAGE_PLACEHOLDER, &ph);
+                for (int i = 0; i < ph.len; i++) pulsar_tokens_push(&raw, ph.v[i]);
+                for (int i = 0; i < 3; i++) pulsar_tokens_push(&raw, 200 + i);
+                ok4 = ph.len == 1 && pulsar_expand_image_placeholders(e, &raw, live_len, &img4, 1, &turn, err4,
+                                                                      sizeof err4) == 1 && img4.start_pos == live_len;
+                pulsar_tokens_free(&raw);
+                pulsar_tokens_free(&ph);
             }
-            pulsar_image_ref img4 = { enc.data(), enc.size(), turn.len };
-            for (int i = 0; i < span_len; i++) pulsar_tokens_push(&turn, vocab + types[i]);
-            for (int i = 0; i < 3; i++) pulsar_tokens_push(&turn, 200 + i);
             if (ok4) {
                 step = "image turn on the stale bank";
                 ok4 = pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0;
