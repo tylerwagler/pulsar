@@ -2568,6 +2568,33 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                uint16_t *out, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks);
 
+/* L268: Qwen3.8-Flash-Next's vision tower (config.json vision_config; every `model.visual.*` tensor's dims follow).
+ * The weights are bf16 and read through the model's mapping, as DeepSeek's tower's are. */
+#define PULSAR_QWEN_VISION_LAYERS     27u
+#define PULSAR_QWEN_VISION_DIM        1152u
+#define PULSAR_QWEN_VISION_HEADS      16u
+#define PULSAR_QWEN_VISION_INTER      4304u
+#define PULSAR_QWEN_VISION_PATCH_IN   1536u     /* 3 channels x 2 frames x 16 x 16 */
+#define PULSAR_QWEN_VISION_POS_SIDE   48u       /* num_position_embeddings 2304 = 48 x 48 */
+#define PULSAR_QWEN_VISION_OUT        2560u     /* out_hidden_size: the language model's width */
+#define PULSAR_QWEN_VISION_ROPE_THETA 10000.0f
+typedef struct {
+    const void *norm1_w, *norm1_b, *qkv_w, *qkv_b, *proj_w, *proj_b;
+    const void *norm2_w, *norm2_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
+} pulsar_qwen_vision_block_dev;
+typedef struct {
+    const void *patch_w, *patch_b, *pos_embed;
+    pulsar_qwen_vision_block_dev block[PULSAR_QWEN_VISION_LAYERS];
+    const void *merger_norm_w, *merger_norm_b, *merger_fc1_w, *merger_fc1_b, *merger_fc2_w, *merger_fc2_b;
+} pulsar_qwen_vision_weights_dev;
+/** Tower + merger over ONE image: `patches` (n_tok x PATCH_IN bf16, 2x2 merge-block order), `pos` (n_tok x 2
+ *  int32: the patch's row and column), the learned-position taps (n_tok x 4 int32 table rows, n_tok x 4 f32
+ *  weights).  Writes n_tok/4 x OUT bf16 rows.  `dbg` (NULL in production) receives 3 x n_tok x DIM bf16: the
+ *  blocks' input, block 0's output, the last block's output.  Returns 0 on any refusal. */
+int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, const uint16_t *patches,
+                                    const int32_t *pos, const int32_t *interp_idx, const float *interp_w,
+                                    int n_tok, uint16_t *out, int out_cap, uint16_t *dbg);
+
 /* Tensor-parallel row lane, GPU half (L241 4g-2; src/cuda/pulsar_cuda_tp.cu).
  * One exchange = stage+publish + combine on the calling thread's stream;
  * nothing here waits on the host.  `slab_dev` is the registered slab's device

@@ -2262,6 +2262,14 @@ bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, s
 /** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
 bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
 void qwen_vision_pixels_free(qwen_vision_pixels *p);
+/** Bind the tower's `model.visual.*` tensors (bf16, the tower's dims) when the artifact carries them; *present
+ *  says whether it does.  false = it carries a tower that does not bind (said). */
+bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present);
+/** Preprocess and encode one image: *rows = malloc'd (*n_rows x PULSAR_QWEN_VISION_OUT) bf16, the rows its
+ *  image_pad block takes, in merge-block raster order.  `dbg` (NULL in production) receives a malloc'd 3 x
+ *  n_patches x PULSAR_QWEN_VISION_DIM stage dump (pulsar_cuda_qwen_vision_forward). */
+bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
+                        int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen);
 
 /** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host

@@ -149,6 +149,7 @@ tests/dspark_batch_gate
 /tests/vision_pixel_gate
 /tests/vision_placeholder_gate
 /tests/vision_qwen_pixel_gate
+/tests/vision_qwen_tower_gate
 /tests/vision_router_gate
 /tests/vision_span_gate
 /tests/vision_visible_gate

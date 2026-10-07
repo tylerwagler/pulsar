@@ -1104,6 +1104,11 @@ vision-placeholder-gate: tests/vision_placeholder_gate
 vision-qwen-pixel-gate: tests/vision_qwen_pixel_gate
 	./tests/vision_qwen_pixel_gate tests/test-vectors/vision-qwen-pixel-goldens.bin
 
+# L268: Qwen's tower + merger vs HF's own modules (tests/vision_qwen_tower_goldens.py), graded against the reference's
+# bf16-vs-fp32 floor like vision-tower-gate; runs on the served Qwen container (it carries model.visual.*).
+vision-qwen-tower-gate: tests/vision_qwen_tower_gate
+	./tests/vision_qwen_tower_gate $(QWEN_GATE_MODEL) tests/test-vectors/vision-qwen-tower-goldens.bin
+
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-tower-gate: set VISION_MODEL=/path/to/a/vision-exp/checkpoint"; \
@@ -2212,6 +2217,9 @@ tests/vision_span_gate.o: tests/vision_span_gate.cpp src/engine/pulsar_engine_in
 tests/vision_tower_gate.o: tests/vision_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_tower_gate.cpp
 
+tests/vision_qwen_tower_gate.o: tests/vision_qwen_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_qwen_tower_gate.cpp
+
 tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_merge_gate.cpp
 
@@ -2414,6 +2422,9 @@ tests/vision_span_gate: tests/vision_span_gate.o src/lib/pulsar_help.o $(CORE_OB
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_qwen_tower_gate: tests/vision_qwen_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_merge_gate: tests/vision_merge_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
