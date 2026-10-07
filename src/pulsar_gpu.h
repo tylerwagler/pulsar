@@ -2568,6 +2568,12 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                uint16_t *out, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks);
 
+/** L268: the image towers' GEMM (both families' towers, pulsar_cuda_vision.cu): C (f32, row-major [m x n], ldc) =
+ *  A (bf16 row-major [m x k], lda) . op(B), B bf16 row-major -- [n x k] with op(B) = B^T when b_trans, else [k x n].
+ *  f32 accumulate on cuBLASLt.  Returns 0 on refusal (said). */
+int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const uint16_t *b, int ldb, int b_trans,
+                            int m, int n, int k);
+
 /* L268: Qwen3.8-Flash-Next's vision tower (config.json vision_config; every `model.visual.*` tensor's dims follow).
  * The weights are bf16 and read through the model's mapping, as DeepSeek's tower's are. */
 #define PULSAR_QWEN_VISION_LAYERS     27u

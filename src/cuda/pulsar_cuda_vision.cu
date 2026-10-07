@@ -5,8 +5,8 @@
  * DeepSeek's RMSNorm / SwiGLU / aligner unfold, Qwen's LayerNorm / tanh-GELU / interpolated learned positions /
  * 2x2 merger.
  *
- * A CORRECTNESS-FIRST implementation: every kernel here is the obvious one, not
- * the fast one.  The tower runs once per image (not per token), and the first
+ * A CORRECTNESS-FIRST implementation: every elementwise kernel here is the obvious one.  L268: the linears and
+ * the attention run on cuBLASLt (pulsar_cuda_vision_gemm: f32 accumulate, one rounding), for both towers.  The tower runs once per image (not per token), and the first
  * job is to agree with the reference -- tests/vision_tower_gate.cpp grades the
  * aligner output against stage dumps from the checkpoint's own
  * inference/vision.py.  Once it agrees, the GEMMs are the obvious thing to
@@ -66,20 +66,6 @@ __global__ static void vk_rmsnorm(const bf16 *__restrict__ x, const bf16 *__rest
         yr[i] = f2b(b2f(w[i]) * (b2f(xr[i]) * rstd));
 }
 
-/* y[m,n] = sum_k x[m,k] * W[n,k] (+ bias[n]), W is [N,K] row-major -- the
- * GGUF's [K,N] with K contiguous is the same bytes. */
-__global__ static void vk_linear(const bf16 *__restrict__ x, const bf16 *__restrict__ W,
-                                 const bf16 *__restrict__ bias, bf16 *__restrict__ y,
-                                 int K, int N) {
-    const int m = blockIdx.y;
-    const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    const bf16 *xr = x + (size_t)m * K;
-    const bf16 *wr = W + (size_t)n * K;
-    float acc = bias ? b2f(bias[n]) : 0.0f;
-    for (int k = 0; k < K; k++) acc += b2f(xr[k]) * b2f(wr[k]);
-    y[(size_t)m * N + n] = f2b(acc);
-}
 
 /* SwiGLU over a fused [gate | up] row of width 2*inter. */
 __global__ static void vk_silu_mul(const bf16 *__restrict__ gu, bf16 *__restrict__ y,
@@ -143,54 +129,6 @@ __global__ static void vk_rope2d(bf16 *__restrict__ q, bf16 *__restrict__ k,
     }
 }
 
-/* Bidirectional attention, one block per (head, query token), one thread per
- * head dimension, running-max softmax in f32.  The block is the head dimension
- * rounded up to a power of two (the tree reduction's shape); lanes past it
- * contribute zero (L268: Qwen's head is 72). */
-__global__ static void vk_attention(const bf16 *__restrict__ q, const bf16 *__restrict__ k,
-                                    const bf16 *__restrict__ v, bf16 *__restrict__ o,
-                                    int n_tok, int n_heads, int head_dim) {
-    extern __shared__ float red[];
-    const int h = blockIdx.x;
-    const int t = blockIdx.y;
-    const int d = threadIdx.x;
-    const bool lane = d < head_dim;
-    const float scale = rsqrtf((float)head_dim);
-    const size_t qbase = ((size_t)t * n_heads + h) * head_dim;
-    const float qv = lane ? b2f(q[qbase + d]) : 0.0f;
-    float m = -INFINITY, l = 0.0f, acc = 0.0f;
-    for (int j = 0; j < n_tok; j++) {
-        const size_t kbase = ((size_t)j * n_heads + h) * head_dim;
-        red[d] = lane ? qv * b2f(k[kbase + d]) : 0.0f;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
-        }
-        const float sc = red[0] * scale;
-        __syncthreads();
-        const float vv = lane ? b2f(v[kbase + d]) : 0.0f;
-        if (sc > m) {
-            const float alpha = expf(m - sc);
-            l = l * alpha + 1.0f;
-            acc = acc * alpha + vv;
-            m = sc;
-        } else {
-            const float p = expf(sc - m);
-            l += p;
-            acc += p * vv;
-        }
-        __syncthreads();
-    }
-    if (lane) o[qbase + d] = f2b(acc / l);
-}
-
-/* The attention launch's block: the head dimension rounded up to a power of two. */
-static unsigned vk_attention_threads(int head_dim) {
-    unsigned t = 1;
-    while ((int)t < head_dim) t <<= 1;
-    return t;
-}
 
 /* LayerNorm with bias (torch's, eps given): mean and biased variance in f32 over
  * the row, y = (x - mean) * rstd * w + b in f32, rounded once.  One block per
@@ -283,6 +221,93 @@ __global__ static void vk_gelu(bf16 *__restrict__ y, size_t n) {
 
 #define VK_THREADS 256
 
+/* L268 (both towers): y bf16 [rows x N] = x bf16 [rows x K] . W^T (+ bias) -- the GEMM accumulates in f32
+ * (pulsar_cuda_vision_gemm, cuBLASLt), then one kernel adds the bias in f32 and rounds once to bf16: what every
+ * reference Linear does.  `f32` is the caller's scratch of at least rows x N floats. */
+__global__ static void vk_bias_round(const float *__restrict__ acc, const bf16 *__restrict__ bias,
+                                     bf16 *__restrict__ y, int N, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f2b(acc[i] + (bias ? b2f(bias[i % (size_t)N]) : 0.0f));
+}
+
+static bool vlinear(const void *x, const void *W, const void *bias, void *y, int K, int N, int rows, float *f32) {
+    if (!pulsar_cuda_vision_gemm(f32, N, (const uint16_t *)x, K, (const uint16_t *)W, K, 1, rows, N, K)) return false;
+    const size_t n = (size_t)rows * N;
+    vk_bias_round<<<(unsigned)((n + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(f32, (const bf16 *)bias, (bf16 *)y,
+                                                                                N, n);
+    return cuda_ok(cudaGetLastError(), "vision bias_round");
+}
+
+/* Softmax over each row of `s` (f32 [rows x n] scores) after scaling, written as bf16 probabilities (the second
+ * GEMM's operand, as flash attention rounds them).  One block per row. */
+__global__ static void vk_softmax_rows(const float *__restrict__ s, bf16 *__restrict__ p, int n, float scale) {
+    extern __shared__ float red[];
+    const float *sr = s + (size_t)blockIdx.x * n;
+    bf16 *pr = p + (size_t)blockIdx.x * n;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) m = fmaxf(m, sr[j] * scale);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if ((int)threadIdx.x < k) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + k]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) sum += expf(sr[j] * scale - m);
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if ((int)threadIdx.x < k) red[threadIdx.x] += red[threadIdx.x + k];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    for (int j = threadIdx.x; j < n; j += blockDim.x) pr[j] = f2b(expf(sr[j] * scale - m) * inv);
+}
+
+/* One head's f32 output rows [rows x hd] into the attention output (bf16 [n_tok][heads][hd]) at row0. */
+__global__ static void vk_store_head(const float *__restrict__ o, bf16 *__restrict__ out, int row0, int rows,
+                                     int heads, int head, int hd) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * hd) return;
+    const size_t r = i / (size_t)hd, d = i % (size_t)hd;
+    out[((size_t)(row0 + r) * heads + head) * hd + d] = f2b(o[i]);
+}
+
+/* Bidirectional attention over one image (q, k, v, out: bf16 [n_tok][heads][hd]), per head and per query chunk:
+ * S = Q K^T in f32 on the GEMM, a scaled row softmax to bf16 P, O = P V in f32, rounded once.  The chunk keeps the
+ * score block within `s_bytes` (`s` f32 and `p` bf16 scratch of that many score entries; `o` f32 chunk x hd). */
+static bool vattention(const void *q, const void *k, const void *v, void *out, int n_tok, int heads, int hd,
+                       float *s, bf16 *p, float *o, size_t s_entries) {
+    const int ld = heads * hd;
+    const float scale = 1.0f / sqrtf((float)hd);
+    int chunk = (int)(s_entries / (size_t)n_tok);
+    if (chunk > n_tok) chunk = n_tok;
+    if (chunk < 1) return false;
+    for (int h = 0; h < heads; h++) {
+        const uint16_t *qh = (const uint16_t *)q + (size_t)h * hd, *kh = (const uint16_t *)k + (size_t)h * hd,
+                       *vh = (const uint16_t *)v + (size_t)h * hd;
+        for (int r0 = 0; r0 < n_tok; r0 += chunk) {
+            const int rows = n_tok - r0 < chunk ? n_tok - r0 : chunk;
+            if (!pulsar_cuda_vision_gemm(s, n_tok, qh + (size_t)r0 * ld, ld, kh, ld, 1, rows, n_tok, hd)) return false;
+            vk_softmax_rows<<<(unsigned)rows, VK_THREADS, VK_THREADS * sizeof(float)>>>(s, p, n_tok, scale);
+            if (!cuda_ok(cudaGetLastError(), "vision softmax")) return false;
+            if (!pulsar_cuda_vision_gemm(o, hd, (const uint16_t *)p, n_tok, vh, ld, 0, rows, hd, n_tok)) return false;
+            vk_store_head<<<(unsigned)(((size_t)rows * hd + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
+                o, (bf16 *)out, r0, rows, heads, h, hd);
+            if (!cuda_ok(cudaGetLastError(), "vision store_head")) return false;
+        }
+    }
+    return true;
+}
+
+/* The attention scratch: score entries per chunk (f32 S + bf16 P), at most 256 Mi entries (1 GiB of f32). */
+static size_t vattention_entries(int n_tok) {
+    const size_t cap = (size_t)256 << 20, full = (size_t)n_tok * n_tok;
+    return full < cap ? full : cap;
+}
+
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const void *map, uint64_t map_size,
                                const uint16_t *patches_host, int n_h, int n_w,
@@ -309,6 +334,10 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     void *d_patches = NULL, *d_x = NULL, *d_tmp = NULL, *d_mid = NULL, *d_qkv = NULL,
          *d_q = NULL, *d_k = NULL, *d_v = NULL, *d_attn = NULL, *d_mlp = NULL,
          *d_normed = NULL, *d_alg = NULL, *d_alg2 = NULL, *d_out = NULL, *d_pos = NULL;
+    void *d_f32 = NULL, *d_s = NULL, *d_p = NULL, *d_o = NULL;   /* L268: the GEMM scratch, the attention's */
+    const size_t s_entries = vattention_entries(n_tok);
+    size_t f32_elems = (size_t)n_tok * (size_t)(3 * D > 2 * I ? 3 * D : 2 * I);
+    if ((size_t)n_llm * T > f32_elems) f32_elems = (size_t)n_llm * T;
     int ok = 0;
 
 #define WT(off) ((const bf16 *)(const void *)((const char *)map + (off)))
@@ -337,6 +366,10 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     CUDA_ALLOC(d_alg, alg_elems * sizeof(bf16));
     CUDA_ALLOC(d_alg2, out_elems * sizeof(bf16));
     CUDA_ALLOC(d_out, out_elems * sizeof(bf16));
+    CUDA_ALLOC(d_f32, f32_elems * sizeof(float));
+    CUDA_ALLOC(d_s, s_entries * sizeof(float));
+    CUDA_ALLOC(d_p, s_entries * sizeof(bf16));
+    CUDA_ALLOC(d_o, (s_entries / (size_t)n_tok + 1) * (size_t)head_dim * sizeof(float));
     if (cudaMemcpy(d_patches, patches_host, (size_t)n_tok * 3 * P * P * sizeof(bf16),
                    cudaMemcpyHostToDevice) != cudaSuccess) goto done;
     {
@@ -350,9 +383,7 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
         if (!up) goto done;
     }
 
-    vk_linear<<<dim3((unsigned)((D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-        (const bf16 *)d_patches, WT(o->patch_proj), WT(o->patch_bias), (bf16 *)d_x, 3 * P * P, D);
-    CUDA_LAUNCH("vision patch_embed");
+    if (!vlinear(d_patches, WT(o->patch_proj), WT(o->patch_bias), d_x, 3 * P * P, D, n_tok, (float *)d_f32)) goto done;
     DUMP_STAGE(0, d_x);
 
     for (uint32_t li = 0; li < o->n_layers; li++) {
@@ -360,10 +391,8 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
             (const bf16 *)d_x, WT(o->block[li].norm1), (bf16 *)d_tmp, D, eps);
         CUDA_LAUNCH("vision norm1");
 
-        vk_linear<<<dim3((unsigned)((3 * D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_tmp, WT(o->block[li].wqkv), WT(o->block[li].wqkv_bias),
-            (bf16 *)d_qkv, D, 3 * D);
-        CUDA_LAUNCH("vision wqkv");
+        if (!vlinear(d_tmp, WT(o->block[li].wqkv), WT(o->block[li].wqkv_bias), d_qkv, D, 3 * D, n_tok,
+                     (float *)d_f32)) goto done;
 
         vk_split_qkv<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
             (const bf16 *)d_qkv, (bf16 *)d_q, (bf16 *)d_k, (bf16 *)d_v, D, x_elems);
@@ -373,17 +402,12 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                 (bf16 *)d_q, (bf16 *)d_k, H, head_dim, (const int2 *)d_pos, rope_dim,
                 (float)PULSAR_VISION_ROPE_THETA);
             CUDA_LAUNCH("vision rope2d");
-            vk_attention<<<dim3(H, (unsigned)n_tok), vk_attention_threads(head_dim),
-                           (size_t)vk_attention_threads(head_dim) * sizeof(float)>>>(
-                (const bf16 *)d_q, (const bf16 *)d_k, (const bf16 *)d_v, (bf16 *)d_attn,
-                n_tok, H, head_dim);
-            CUDA_LAUNCH("vision attention");
+            if (!vattention(d_q, d_k, d_v, d_attn, n_tok, H, head_dim, (float *)d_s, (bf16 *)d_p, (float *)d_o,
+                            s_entries)) goto done;
         }
 
-        vk_linear<<<dim3((unsigned)((D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_attn, WT(o->block[li].wo), WT(o->block[li].wo_bias),
-            (bf16 *)d_tmp, D, D);
-        CUDA_LAUNCH("vision wo");
+        if (!vlinear(d_attn, WT(o->block[li].wo), WT(o->block[li].wo_bias), d_tmp, D, D, n_tok, (float *)d_f32))
+            goto done;
         vk_add<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
             (bf16 *)d_x, (const bf16 *)d_tmp, x_elems);
         CUDA_LAUNCH("vision attn residual");
@@ -392,17 +416,13 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
             (const bf16 *)d_x, WT(o->block[li].norm2), (bf16 *)d_tmp, D, eps);
         CUDA_LAUNCH("vision norm2");
 
-        vk_linear<<<dim3((unsigned)((2 * I + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_tmp, WT(o->block[li].w1), NULL, (bf16 *)d_mlp, D, 2 * I);
-        CUDA_LAUNCH("vision mlp w1");
+        if (!vlinear(d_tmp, WT(o->block[li].w1), NULL, d_mlp, D, 2 * I, n_tok, (float *)d_f32)) goto done;
 
         vk_silu_mul<<<dim3((unsigned)((I + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
             (const bf16 *)d_mlp, (bf16 *)d_mid, I);
         CUDA_LAUNCH("vision silu_mul");
 
-        vk_linear<<<dim3((unsigned)((D + VK_THREADS - 1) / VK_THREADS), (unsigned)n_tok), VK_THREADS>>>(
-            (const bf16 *)d_mid, WT(o->block[li].w2), NULL, (bf16 *)d_attn, I, D);
-        CUDA_LAUNCH("vision mlp w2");
+        if (!vlinear(d_mid, WT(o->block[li].w2), NULL, d_attn, I, D, n_tok, (float *)d_f32)) goto done;
         vk_add<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
             (bf16 *)d_x, (const bf16 *)d_attn, x_elems);
         CUDA_LAUNCH("vision mlp residual");
@@ -418,17 +438,13 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
         (const bf16 *)d_normed, (bf16 *)d_alg, n_h, n_w, D, R);
     CUDA_LAUNCH("vision aligner gather");
 
-    vk_linear<<<dim3((unsigned)((T + VK_THREADS - 1) / VK_THREADS), (unsigned)n_llm), VK_THREADS>>>(
-        (const bf16 *)d_alg, WT(o->aligner_w1), WT(o->aligner_b1), (bf16 *)d_alg2, D * R * R, T);
-    CUDA_LAUNCH("vision aligner w1");
+    if (!vlinear(d_alg, WT(o->aligner_w1), WT(o->aligner_b1), d_alg2, D * R * R, T, n_llm, (float *)d_f32)) goto done;
 
     vk_gelu<<<(unsigned)((out_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>(
         (bf16 *)d_alg2, out_elems);
     CUDA_LAUNCH("vision aligner gelu");
 
-    vk_linear<<<dim3((unsigned)((T + VK_THREADS - 1) / VK_THREADS), (unsigned)n_llm), VK_THREADS>>>(
-        (const bf16 *)d_alg2, WT(o->aligner_w2), WT(o->aligner_b2), (bf16 *)d_out, T, T);
-    CUDA_LAUNCH("vision aligner w2");
+    if (!vlinear(d_alg2, WT(o->aligner_w2), WT(o->aligner_b2), d_out, T, T, n_llm, (float *)d_f32)) goto done;
 
     if (out_elems > (size_t)out_cap) goto done;
     if (cudaMemcpy(out_host, d_out, out_elems * sizeof(bf16), cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -441,6 +457,7 @@ done:
     cudaFree(d_normed);
     cudaFree(d_qkv); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_mlp);
     cudaFree(d_alg); cudaFree(d_alg2); cudaFree(d_out); cudaFree(d_pos);
+    cudaFree(d_f32); cudaFree(d_s); cudaFree(d_p); cudaFree(d_o);
     return ok;
 #undef DUMP_STAGE
 #undef CUDA_LAUNCH
@@ -470,15 +487,17 @@ int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, con
     const float eps = 1e-6f;
     void *d_patches = NULL, *d_x = NULL, *d_tmp = NULL, *d_qkv = NULL, *d_q = NULL, *d_k = NULL, *d_v = NULL,
          *d_attn = NULL, *d_mlp = NULL, *d_pos = NULL, *d_idx = NULL, *d_wt = NULL, *d_mid = NULL, *d_out = NULL;
+    void *d_f32 = NULL, *d_s = NULL, *d_p = NULL, *d_o = NULL;   /* the GEMM scratch, the attention's */
+    const size_t s_entries = vattention_entries(n_tok);
+    size_t f32_elems = (size_t)n_tok * (size_t)(3 * D > I ? 3 * D : I);
+    if ((size_t)n_out * M > f32_elems) f32_elems = (size_t)n_out * M;
     int ok = 0;
 #define WP(p) ((const bf16 *)(p))
 #define CUDA_ALLOC(p, bytes) do { if (cudaMalloc(&(p), (bytes)) != cudaSuccess) goto done; } while (0)
 #define CUDA_UP(dst, src, bytes) do { if (cudaMemcpy((dst), (src), (bytes), cudaMemcpyHostToDevice) != cudaSuccess) goto done; } while (0)
 #define CUDA_LAUNCH(what) do { if (!cuda_ok(cudaGetLastError(), what)) goto done; } while (0)
 #define LINEAR(x, W, B, y, k, n, rows) do { \
-        vk_linear<<<dim3((unsigned)(((n) + VK_THREADS - 1) / VK_THREADS), (unsigned)(rows)), VK_THREADS>>>( \
-            (const bf16 *)(x), WP(W), WP(B), (bf16 *)(y), (k), (n)); \
-        CUDA_LAUNCH("qwen vision linear"); \
+        if (!vlinear((x), (W), (B), (y), (k), (n), (rows), (float *)d_f32)) goto done; \
     } while (0)
 #define DUMP(slot, src) do { \
         if (dbg && cudaMemcpy(dbg + (size_t)(slot) * x_elems, (src), x_elems * sizeof(bf16), \
@@ -499,6 +518,10 @@ int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, con
     CUDA_ALLOC(d_wt, (size_t)n_tok * 4 * sizeof(float));
     CUDA_ALLOC(d_mid, (size_t)n_out * M * sizeof(bf16));
     CUDA_ALLOC(d_out, (size_t)n_out * O * sizeof(bf16));
+    CUDA_ALLOC(d_f32, f32_elems * sizeof(float));
+    CUDA_ALLOC(d_s, s_entries * sizeof(float));
+    CUDA_ALLOC(d_p, s_entries * sizeof(bf16));
+    CUDA_ALLOC(d_o, (s_entries / (size_t)n_tok + 1) * (size_t)head_dim * sizeof(float));
     CUDA_UP(d_patches, patches_host, (size_t)n_tok * K * sizeof(bf16));
     CUDA_UP(d_pos, pos_host, (size_t)n_tok * sizeof(int2));
     CUDA_UP(d_idx, interp_idx_host, (size_t)n_tok * 4 * sizeof(int32_t));
@@ -523,10 +546,8 @@ int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, con
                                                                    (const int2 *)d_pos, rope_dim,
                                                                    (float)PULSAR_QWEN_VISION_ROPE_THETA);
         CUDA_LAUNCH("qwen vision rope2d");
-        vk_attention<<<dim3(H, (unsigned)n_tok), vk_attention_threads(head_dim),
-                       (size_t)vk_attention_threads(head_dim) * sizeof(float)>>>(
-            (const bf16 *)d_q, (const bf16 *)d_k, (const bf16 *)d_v, (bf16 *)d_attn, n_tok, H, head_dim);
-        CUDA_LAUNCH("qwen vision attention");
+        if (!vattention(d_q, d_k, d_v, d_attn, n_tok, H, head_dim, (float *)d_s, (bf16 *)d_p, (float *)d_o, s_entries))
+            goto done;
         LINEAR(d_attn, b->proj_w, b->proj_b, d_tmp, D, D, n_tok);
         vk_add<<<(unsigned)((x_elems + VK_THREADS - 1) / VK_THREADS), VK_THREADS>>>((bf16 *)d_x, (const bf16 *)d_tmp,
                                                                                   x_elems);
@@ -562,7 +583,7 @@ int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, con
 done:
     cudaFree(d_patches); cudaFree(d_x); cudaFree(d_tmp); cudaFree(d_attn); cudaFree(d_qkv); cudaFree(d_q);
     cudaFree(d_k); cudaFree(d_v); cudaFree(d_mlp); cudaFree(d_pos); cudaFree(d_idx); cudaFree(d_wt);
-    cudaFree(d_mid); cudaFree(d_out);
+    cudaFree(d_mid); cudaFree(d_out); cudaFree(d_f32); cudaFree(d_s); cudaFree(d_p); cudaFree(d_o);
     return ok;
 #undef DUMP
 #undef LINEAR
