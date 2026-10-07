@@ -1239,7 +1239,7 @@ static void test_image_chain_round_trip(void) {
     if (dir) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-        (void)system(cmd);
+        if (system(cmd) != 0) fprintf(stderr, "image-chain gate: could not remove %s\n", dir);
     }
     pulsar_tokens_free(&longer);
     pulsar_tokens_free(&prompt);

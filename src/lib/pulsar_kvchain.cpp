@@ -129,8 +129,10 @@ int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session
             const int prc = fp ? pulsar_session_segment_images(fp, pb, rec, 64, &nr) : 1;
             if (fp) fclose(fp);
             bool match = prc == 0 && nr <= 64;
-            for (uint32_t r = 0; match && r < nr; r++, k++)
+            for (uint32_t r = 0; match && r < nr; r++) {   /* k advances only past an image that matched */
                 match = k < n_images && image_hashes && image_hashes[k] == rec[r];
+                if (match) k++;
+            }
             if (!match) {
                 if (err && errlen)
                     snprintf(err, errlen, "chain stops at %u: segment [%u,%u) holds %s (image %d of the request)",
