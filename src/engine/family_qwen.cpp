@@ -722,6 +722,9 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     pulsar_gpu_tensor_free(st->spec.ple);
     pulsar_gpu_tensor_free(st->spec.qsa_stage);
     pulsar_gpu_tensor_free(st->spec.qsa_keys);
+    pulsar_gpu_tensor_free(st->mtp_stage);
+    free(st->mtp_stage_dirty);
+    pulsar_gpu_tensor_free(st->run_first_dev);
     for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) pulsar_gpu_tensor_free(st->scratch[op]);
     free(st->ngram_ctx);
     free(st->bank_pos);
@@ -796,20 +799,26 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     }
     st->mtp_pend_pos = (uint32_t *)xmalloc(n_banks * sizeof(uint32_t));
     for (uint32_t b = 0; b < n_banks; b++) st->mtp_pend_pos[b] = UINT32_MAX;
-    if (mtp) st->spec_logits = (float *)xmalloc((size_t)(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) * s->n_vocab * sizeof(float));
+    if (mtp) st->spec_logits = (float *)xmalloc((size_t)PULSAR_QWEN_SPEC_ROWS * s->n_vocab * sizeof(float));
     if (ok && mtp) {
-        /* the verify capture: per-row recurrent states of ONE bank, each QSA layer's stage + raw keys */
+        /* the verify capture (L272 P1 S4: every bank's run of one step): per-row recurrent states at the row's
+         * step index, each QSA layer's stage per run + the rows' raw keys; the MTP layer's stage per bank */
         pulsar_qwen_spec_capture &sp = st->spec;
         for (uint32_t il = 0; il < plan->n_layer; il++)
             sp.ord[il] = (uint8_t)(plan->kind[il] == PULSAR_LAYER_QWEN_GDN ? sp.n_gdn++ : sp.n_qsa++);
         sp.ord[plan->n_layer] = (uint8_t)sp.n_qsa;           /* the MTP layer's stage slot */
-        const uint64_t D = PULSAR_QWEN_SPEC_DRAFT_MAX;
+        const uint64_t D = PULSAR_QWEN_SPEC_ROWS;
         sp.gdn_rec   = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_qwen_gdn_state_bytes(s));
         sp.gdn_conv  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_qwen_gdn_conv_bytes(s));
         sp.ple       = pulsar_gpu_tensor_alloc(D * pulsar_qwen_ple_conv_bytes(s));
-        sp.qsa_stage = pulsar_gpu_tensor_alloc((uint64_t)(sp.n_qsa + 1u) * pulsar_qwen_index_tail_bytes(s));
-        sp.qsa_keys  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * (D + 1u) * PULSAR_QSA_IDX_IN * sizeof(float));
-        ok = sp.gdn_rec && sp.gdn_conv && sp.ple && sp.qsa_stage && sp.qsa_keys;
+        sp.qsa_stage = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * pulsar_qwen_index_tail_bytes(s));
+        sp.qsa_keys  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * PULSAR_QSA_IDX_IN * sizeof(float));
+        st->mtp_stage = pulsar_gpu_tensor_alloc((uint64_t)n_banks * pulsar_qwen_index_tail_bytes(s));
+        st->run_first_dev = pulsar_gpu_tensor_alloc((uint64_t)(D + 1u) * sizeof(int32_t));
+        ok = sp.gdn_rec && sp.gdn_conv && sp.ple && sp.qsa_stage && sp.qsa_keys && st->mtp_stage && st->run_first_dev;
+    }
+    if (mtp) st->mtp_stage_dirty = (bool *)xcalloc(n_banks, sizeof(bool));
+    if (ok && mtp) {
     }
     for (int op = 0; ok && op < PULSAR_QWEN_OP_COUNT; op++) {
         const uint64_t b = g_qwen_ops.scratch_bytes
@@ -1018,18 +1027,58 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     st.streams = s->qwen->streams;
     st.mixer = &e->qwen_weights->mixer;
     st.verify = verify;
-    if (verify) {
-        /* the capture holds one bank's run of at most DRAFT_MAX + 1 rows, and its n-gram context before */
-        if (mode != PULSAR_QWEN_STEP_PREFILL || n_rows > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u || !s->qwen->mtp) {
-            fprintf(stderr, "pulsar: %s: a verify step of %u rows is outside the capture -- refusing\n",
-                    PULSAR_QWEN_ARCH, n_rows);
-            return false;
+    if (verify && (mode != PULSAR_QWEN_STEP_PREFILL || n_rows > PULSAR_QWEN_SPEC_ROWS || !s->qwen->mtp)) {
+        fprintf(stderr, "pulsar: %s: a verify step of %u rows is outside the capture -- refusing\n", PULSAR_QWEN_ARCH,
+                n_rows);
+        return false;
+    }
+    /* L272 P1 S4: a PREFILL step's rows as runs -- one bank each, consecutive positions.  Several banks' runs
+     * in one step are a verify's (every row headed, at most SPEC_ROWS rows); a bank appears in one run. */
+    uint32_t run_first[PULSAR_QWEN_SPEC_ROWS + 1] = {0};
+    uint32_t n_runs = 0;
+    if (mode == PULSAR_QWEN_STEP_PREFILL && n_rows > 0) {
+        run_first[0] = 0;
+        n_runs = 1;
+        for (uint32_t r = 1; r < n_rows; r++) {
+            if (bank[r] == bank[r - 1]) {
+                if (pos[r] == pos[r - 1] + 1) continue;
+                fprintf(stderr, "pulsar: %s: prefill row %u (bank %d pos %d) does not follow its run -- refusing\n",
+                        PULSAR_QWEN_ARCH, r, bank[r], pos[r]);
+                return false;
+            }
+            bool seen = false;
+            for (uint32_t k = 0; k < n_runs; k++) seen |= bank[run_first[k]] == bank[r];
+            if (!verify || seen) {
+                fprintf(stderr, "pulsar: %s: a prefill step over several banks' runs is a verify with one run a bank "
+                                "(row %u, bank %d) -- refusing\n", PULSAR_QWEN_ARCH, r, bank[r]);
+                return false;
+            }
+            run_first[n_runs++] = r;
         }
+        run_first[n_runs] = n_rows;
+    }
+    st.n_runs = n_runs;
+    st.run_first = n_runs ? run_first : NULL;
+    if (verify) {
+        /* the runs, and each bank's n-gram context before the step: a rollback finds its bank's run */
+        pulsar_qwen_spec_capture &sp = s->qwen->spec;
         const uint32_t nc = g_qwen_shape.ngram_size - 1u;
-        for (uint32_t i = 0; i < nc; i++) s->qwen->spec.ngram_before[i] = s->qwen->ngram_ctx[(size_t)bank[0] * nc + i];
+        sp.n_runs = n_runs;
+        for (uint32_t k = 0; k <= n_runs; k++) sp.run_first[k] = run_first[k];
+        for (uint32_t k = 0; k < n_runs; k++) {
+            sp.run_bank[k] = bank[run_first[k]];
+            sp.run_pos0[k] = pos[run_first[k]];
+            for (uint32_t i = 0; i < nc; i++)
+                sp.ngram_before[k][i] = s->qwen->ngram_ctx[(size_t)sp.run_bank[k] * nc + i];
+        }
     }
     bool ok = pulsar_gpu_tensor_write(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    if (ok && n_runs > 1) {
+        int32_t rf[PULSAR_QWEN_SPEC_ROWS + 1];
+        for (uint32_t k = 0; k <= n_runs; k++) rf[k] = (int32_t)run_first[k];
+        ok = pulsar_gpu_tensor_write(s->qwen->run_first_dev, 0, rf, (uint64_t)(n_runs + 1u) * sizeof(int32_t)) != 0;
+    }
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = ops->embed(&st);
     for (uint32_t il = 0; ok && il < e->plan.n_layer; il++) {
@@ -1371,26 +1420,25 @@ static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_re
                                      uint32_t max_head_runs, char *err, size_t errlen) {
     if (out_n_rows) *out_n_rows = 0;
     if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) {
-        /* L272 P1 S3: the speculation lane's verify -- ONE bank's run [p, p + n) at its next position, every
-         * row headed into the caller's block, the per-row state capture armed (the target's commit rolls
-         * the rejected rows back, pulsar_qwen_s4_spec_rollback).  Several banks' runs in one step: S4. */
+        /* L272 P1 S3/S4: the speculation lane's verify -- one run per bank, each [p, p + k] at its bank's next
+         * position, every row headed into the caller's block, the per-row state capture armed (the target's
+         * commit rolls each bank's rejected rows back, pulsar_qwen_s4_spec_rollback).  At most SPEC_ROWS rows,
+         * so every kernel keeps its decode-width arm. */
         const uint32_t nv = g_qwen_shape.n_vocab;
-        if (!reqs || n_rows == 0 || n_rows > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u || !logits || logits_cap < 0 ||
+        if (!reqs || n_rows == 0 || n_rows > PULSAR_QWEN_SPEC_ROWS || !logits || logits_cap < 0 ||
             (uint64_t)logits_cap < (uint64_t)n_rows * nv || !s->qwen->mtp) {
-            if (err) snprintf(err, errlen, "%s: a verify step of %u rows refused (bad args, or no MTP layer)",
-                              PULSAR_QWEN_ARCH, n_rows);
+            if (err) snprintf(err, errlen, "%s: a verify step of %u rows refused (bad args, over %u rows, or no MTP layer)",
+                              PULSAR_QWEN_ARCH, n_rows, PULSAR_QWEN_SPEC_ROWS);
             return 1;
         }
-        const uint32_t b = reqs[0].bank;
-        int32_t tok[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bk[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
+        int32_t tok[PULSAR_QWEN_SPEC_ROWS], pos[PULSAR_QWEN_SPEC_ROWS], bk[PULSAR_QWEN_SPEC_ROWS];
         for (uint32_t i = 0; i < n_rows; i++) {
-            if (reqs[i].bank != b) {
-                if (err) snprintf(err, errlen, "%s: a verify step over several banks is not implemented (one bank's run "
-                                  "a step until the GDN and PLE kernels take N banks x R rows)", PULSAR_QWEN_ARCH);
-                return 1;
-            }
-            if (b >= s->qwen->n_banks || (uint32_t)reqs[i].pos != s->qwen->bank_pos[b] + i) {
-                if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not the bank's next position",
+            const uint32_t b = reqs[i].bank;
+            /* a run's first row is its bank's next position; each further row follows the one before */
+            const bool run_start = i == 0 || reqs[i - 1].bank != b;
+            const uint32_t want = run_start ? (b < s->qwen->n_banks ? s->qwen->bank_pos[b] : 0u) : (uint32_t)reqs[i - 1].pos + 1u;
+            if (b >= s->qwen->n_banks || (uint32_t)reqs[i].pos != want) {
+                if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not its run's next position",
                                   PULSAR_QWEN_ARCH, i, b, reqs[i].pos);
                 return 1;
             }
