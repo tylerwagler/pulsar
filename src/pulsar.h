@@ -1124,7 +1124,8 @@ pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
- * persistence policy; the engine owns the DS4-specific serialized graph state. */
+ * persistence policy; the engine owns the serialized state (DeepSeek's graph
+ * format, or the kv-state payload below). */
 #define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 /* v3 (2026-08-11): the packed comp row's rope tail narrowed f32 -> bf16,
  * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
@@ -1189,6 +1190,16 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(15)   /* v14 (L281): the image block records after the tokens; v15 (L268): with each block's 2D grid */
 /** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
+/** L284: the payload of a family whose state model (kv_state.h) declares the frontier ops -- Qwen; DeepSeek's
+ * is the graph format above.  Built from a segment's parts, read and written by the same helpers: the header
+ * (the segment's layout digest extended by the trailing pools and the logits width, the token count, the
+ * prefill frontier, the resume grid point, the logits width), the tokens, the image section (count, records),
+ * the frontier's logits, the resume checkpoint's slot (when there is one), the FRONTIER's slot (the state
+ * model's walk at the token count), every pool's and trailing pool's rows to the frontier, and the trailing
+ * digest.  A restore installs the frontier exactly: the session decodes on as the saved one would, and a
+ * sync that does not extend it resumes from the resume checkpoint as the saved one would. */
+#define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(1)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);

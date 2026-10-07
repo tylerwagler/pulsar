@@ -710,6 +710,12 @@ session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
 session-contract-gate-ds: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
+# L284: a session payload at an off-grid, past-the-prefill frontier round-trips through the public API
+# (tests/payload_frontier_gate.cpp): the same logits and decode rows, the same greedy speculation, a byte-identical
+# re-save, the carried checkpoint's resume == cold, the digest.  Qwen's kv-state payload; ~2 min.
+.PHONY: payload-frontier-gate-qwen
+payload-frontier-gate-qwen: tests/payload_frontier_gate
+	./tests/payload_frontier_gate $(QWEN_GATE_MODEL)
 # L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
 # no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
 # only for a change that MEANS to move a slice.
@@ -2362,6 +2368,12 @@ tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(C
 tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/payload_frontier_gate.o: tests/payload_frontier_gate.cpp tests/gate_entry.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/payload_frontier_gate.cpp
+
+tests/payload_frontier_gate: tests/payload_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 # L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
 # BF16 streamed reference.  Needs a real container and the anchors on disk:
 #   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
@@ -2672,7 +2684,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate tests/payload_frontier_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

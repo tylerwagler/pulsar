@@ -190,8 +190,29 @@ static void gpu_part(const char *dir) {
     err[0] = '\0';
     check(pulsar_session_decode_mixed(sess, &row, 1, logits, 248320, NULL, 0, err, sizeof(err)) != 0,
           "a mixed row at the wrong position refused: %s", err);
+    /* L284: the kv-state payload's plumbing (zero weights: the numbers are tests/qwen_payload_gate's) -- a
+     * snapshot at the frontier, an eval, the snapshot back: the frontier's logits and the same next row. */
+    {
+        const int w = pulsar_engine_logits_width(e);
+        float *l0 = (float *)xmalloc((size_t)w * 4 * sizeof(float));
+        float *l1 = l0 + w, *l0b = l0 + 2 * w, *l1b = l0 + 3 * w;
+        pulsar_session_snapshot snap;
+        memset(&snap, 0, sizeof(snap));
+        err[0] = '\0';
+        const uint64_t pb = pulsar_session_payload_bytes(sess);
+        bool ok = pb > 0 && pulsar_session_copy_logits(sess, l0, w) == w &&
+                  pulsar_session_save_snapshot(sess, &snap, err, sizeof(err)) == 0 && snap.len == pb;
+        check(ok, "payload saved at pos %d (%llu bytes) %s", pulsar_session_pos(sess), (unsigned long long)pb, err);
+        ok = ok && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 && pulsar_session_copy_logits(sess, l1, w) == w &&
+             pulsar_session_load_snapshot(sess, &snap, err, sizeof(err)) == 0 && pulsar_session_pos(sess) == 9 &&
+             pulsar_session_copy_logits(sess, l0b, w) == w && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 &&
+             pulsar_session_copy_logits(sess, l1b, w) == w;
+        check(ok && !memcmp(l0, l0b, (size_t)w * sizeof(float)) && !memcmp(l1, l1b, (size_t)w * sizeof(float)),
+              "payload restored: the frontier's logits and the next eval's row byte-identical %s", err);
+        pulsar_session_snapshot_free(&snap);
+        free(l0);
+    }
     free(logits);
-    check(pulsar_session_payload_bytes(sess) == 0, "payload refused (no PAYLOAD cap)");
     /* L272 P1 S3: Qwen speculates through the round API -- the family declares CAP_SPEC and its verify hooks;
      * whether rounds run is the drafter's call, and the fixture carries no MTP sidecar (qwen_family_container.py
      * skips those tensors), so this engine has none. */

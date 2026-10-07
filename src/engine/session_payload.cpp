@@ -171,6 +171,18 @@ static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, ch
     return 0;
 }
 
+/* L281: an image section -- the count, then each block's record (payload, segment and kv-state payload) */
+static int payload_write_images(payload_io *io, const pulsar_image_block *b, uint32_t n, char *err, size_t errlen) {
+    if (payload_write_u32(io, n, err, errlen) != 0) return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t rec[SEGMENT_IMAGE_U32];
+        image_rec_pack(&b[i], rec);
+        for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
+            if (payload_write_u32(io, rec[k], err, errlen) != 0) return 1;
+    }
+    return 0;
+}
+
 
 
 /* An index-K pool exists only where the layer runs an indexer: 0731's ratio-128
@@ -367,8 +379,25 @@ static int payload_read_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint
 
 
 
+/* L284: the kv-state payload (below the segments, built from their parts) -- the payload of a model whose
+ * state ops declare the frontier (kv_state.h); DeepSeek's graph keeps the format of this section. */
+static bool kvp_model(pulsar_session *s);
+static uint64_t kvp_payload_bytes(pulsar_session *s);
+static int kvp_save(pulsar_session *s, FILE *fp, char *err, size_t errlen);
+static int kvp_load(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
+/* A restore replaces the state every speculative lookahead was conditioned on: the carry token, the
+ * pre-drafted pendings, the quench.  Dropped up front (a restore failing midway may already have
+ * overwritten what they read) and again at the commit. */
+static void payload_drop_lookahead(pulsar_session *s) {
+    s->spec.spec_carry_valid = false;
+    pulsar_spec_drop_pendings(&s->spec);
+    spec_quench_reset(s);
+}
+
 uint64_t pulsar_session::payload_bytes() {
     auto *s = this;
+    if (s && kvp_model(s)) return kvp_payload_bytes(s);
     if (!s || !s->checkpoint_valid) return 0;
     pulsar_gpu_graph *g = s->graph;
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -406,6 +435,7 @@ static int payload_raw_row(payload_io *io, pulsar_gpu_graph *g, uint32_t il, uin
 
 int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     auto *s = this;
+    if (s && kvp_model(s)) return kvp_save(s, fp, err, errlen);
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -481,13 +511,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     }
     /* L281 (v14): which images the checkpoint's sentinel blocks are -- a payload carries the rows, so it carries
      * the records, or its restore would pair them with whatever the session held before */
-    if (payload_write_u32(&io, s->live_images.n, err, errlen) != 0) return 1;
-    for (uint32_t i = 0; i < s->live_images.n; i++) {
-        uint32_t rec[SEGMENT_IMAGE_U32];
-        image_rec_pack(&s->live_images.b[i], rec);
-        for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
-            if (payload_write_u32(&io, rec[k], err, errlen) != 0) return 1;
-    }
+    if (payload_write_images(&io, s->live_images.b, s->live_images.n, err, errlen) != 0) return 1;
     if (payload_write_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
     if (payload_write_u32(&io, (uint32_t)s->prefill_frontier, err, errlen) != 0) return 1;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -542,12 +566,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    /* drop speculative lookahead up front, not just on success: a restore
-     * that fails midway may already have overwritten GPU state the carry
-     * and pendings were conditioned on */
-    s->spec.spec_carry_valid = false;
-    pulsar_spec_drop_pendings(&s->spec);
-    spec_quench_reset(s);
+    if (kvp_model(s)) return kvp_load(s, fp, payload_bytes, err, errlen);
+    payload_drop_lookahead(s);
     /* L264: same argument for the bank's grid checkpoints -- they reference the
      * rows this load overwrites. */
     pulsar_ckpt_drop_bank(&s->graph->ckpt, gpu_graph_cur_bank(s->graph));
@@ -769,9 +789,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * were all conditioned on the replaced state. Leaving the ring makes the
      * next drafts (and therefore the verify batch shapes) depend on whatever
      * ran before the restore — the source of run-to-run tie flips. */
-    s->spec.spec_carry_valid = false;
-    pulsar_spec_drop_pendings(&s->spec);
-    spec_quench_reset(s);
+    payload_drop_lookahead(s);
     for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
     g->dspark_prompt_n = 0;
     return 0;
@@ -839,6 +857,31 @@ static uint64_t segment_layout_digest(pulsar_ckpt_store *st) {
     return h;
 }
 
+/* Pool rows [t0 / tokens_per_row, ceil(t1 / tokens_per_row)) of every pool: a segment's span (grid points,
+ * whole rows) or a kv-state payload's [0, frontier) (its open row too).  The one sizing and the one copy of
+ * pool rows either carries. */
+static uint32_t pool_row(const pulsar_kv_pool &p, uint32_t t) { return (t + p.tokens_per_row - 1u) / p.tokens_per_row; }
+
+static uint64_t pools_span_bytes(const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1) {
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < n; i++) bytes += (uint64_t)(pool_row(pools[i], t1) - t0 / pools[i].tokens_per_row) * pools[i].row_bytes;
+    return bytes;
+}
+
+static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1, bool write,
+                         uint8_t *buf, uint64_t *remaining, char *err, size_t errlen) {
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < n; i++) {
+        const uint32_t row0 = t0 / pools[i].tokens_per_row, rows = pool_row(pools[i], t1) - row0;
+        if (!rows) continue;
+        const uint64_t off = pools[i].base + (uint64_t)row0 * pools[i].row_bytes, bytes = (uint64_t)rows * pools[i].row_bytes;
+        rc = write ? payload_write_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen)
+                   : payload_read_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, remaining,
+                                              err, errlen);
+    }
+    return rc;
+}
+
 static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G) {
     const uint32_t grid = st->ops->resume_grid;
     return G > G_prev && G_prev % grid == 0u && G % grid == 0u;
@@ -855,8 +898,7 @@ static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
     if (version >= 4u) bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += st->slot_bytes;
-    for (uint32_t i = 0; i < n; i++)
-        bytes += (uint64_t)(G / pools[i].tokens_per_row - G_prev / pools[i].tokens_per_row) * pools[i].row_bytes;
+    bytes += pools_span_bytes(pools, n, G_prev, G);
     return bytes + sizeof(uint64_t);   /* the trailing digest */
 }
 
@@ -927,24 +969,13 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     {
         const pulsar_image_block *b = NULL;
         const uint32_t n_img = segment_images(s, G_prev, G, &b);
-        if (payload_write_u32(&io, n_img, err, errlen) != 0) return 1;
-        for (uint32_t i = 0; i < n_img; i++) {
-            uint32_t rec[SEGMENT_IMAGE_U32];
-            image_rec_pack(&b[i], rec);
-            for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
-                if (payload_write_u32(&io, rec[k], err, errlen) != 0) return 1;
-        }
+        if (payload_write_images(&io, b, n_img, err, errlen) != 0) return 1;
     }
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
-    for (uint32_t i = 0; rc == 0 && i < n; i++) {
-        const uint32_t row0 = G_prev / pools[i].tokens_per_row, rows = G / pools[i].tokens_per_row - row0;
-        if (rows) rc = payload_write_tensor_span(&io, pools[i].rows, pools[i].base + (uint64_t)row0 * pools[i].row_bytes,
-                                                 (uint64_t)rows * pools[i].row_bytes, buf, PULSAR_SESSION_IO_CHUNK,
-                                                 err, errlen);
-    }
+    if (rc == 0) rc = pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen);
     free(buf);
     if (rc != 0) return rc;
     const uint64_t dg = payload_digest_final(&io.digest);
@@ -1047,12 +1078,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
                                       &remaining, err, errlen);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
-    for (uint32_t i = 0; rc == 0 && i < n; i++) {
-        const uint32_t row0 = G_prev / pools[i].tokens_per_row, rows = G / pools[i].tokens_per_row - row0;
-        if (rows) rc = payload_read_tensor_span(&io, pools[i].rows, pools[i].base + (uint64_t)row0 * pools[i].row_bytes,
-                                                (uint64_t)rows * pools[i].row_bytes, buf, PULSAR_SESSION_IO_CHUNK,
-                                                &remaining, err, errlen);
-    }
+    if (rc == 0) rc = pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen);
     free(buf);
     if (rc != 0) return fail();
     uint64_t stored_dg = 0;
@@ -1082,6 +1108,271 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     }
     if (last) s->logits_stale = true;   /* a restore moves the KV, not the logits (restore_checkpoint sets it too) */
     if (G_out) *G_out = G;
+    return 0;
+}
+
+
+
+/* ===== L284: the kv-state payload =========================================
+ * A payload of a model whose state ops declare the frontier (kv_state.h; Qwen) is a segment's parts at the
+ * session's frontier T (pulsar.h, PULSAR_SESSION_KV_PAYLOAD_MAGIC): the same layout digest, image section,
+ * slot walk, pool copy and digested stream, so the bytes have one authority -- the state model -- and the
+ * format carries nothing a segment's reader does not already validate.  What it adds over a segment is the
+ * frontier: the walk's slot taken AT T (not at a grid point), the pools' open rows and the trailing pools,
+ * the logits, the prefill frontier, and the resume checkpoint a sync that does not extend T restores. */
+#define KVP_U32_FIELDS 8u
+
+static bool kvp_model(pulsar_session *s) {
+    pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    return st && st->ops && st->ops->frontier_at;
+}
+
+/* every pool, then every trailing pool; false past the bound */
+static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
+    const uint32_t a = st->ops->pools(st->state, out, PULSAR_KV_POOLS_MAX);
+    if (a > PULSAR_KV_POOLS_MAX) return false;
+    const uint32_t b = st->ops->trailing_pools(st->state, out + a, PULSAR_KV_POOLS_MAX - a);
+    if (b > PULSAR_KV_POOLS_MAX - a) return false;
+    *n = a + b;
+    return true;
+}
+
+/* the segment's layout digest, extended by every pool the payload carries and the logits width */
+static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t width) {
+    uint64_t h = segment_layout_digest(st);
+    auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
+    mix(n);
+    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row); mix(pools[i].row_bytes); }
+    mix(width);
+    return h;
+}
+
+static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t T,
+                              uint32_t G, uint32_t n_img, uint32_t width) {
+    uint64_t bytes = (uint64_t)KVP_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)T * sizeof(uint32_t);
+    bytes += sizeof(uint32_t) + (uint64_t)n_img * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
+    bytes += (uint64_t)width * sizeof(float);
+    bytes += (G ? st->slot_bytes : 0u) + st->slot_bytes;   /* the resume checkpoint, the frontier */
+    bytes += pools_span_bytes(pools, n, 0u, T);
+    return bytes + sizeof(uint64_t);   /* the trailing digest */
+}
+
+/* What a save of the session writes, decided once: payload_bytes and the save read the same plan. */
+struct kvp_plan {
+    pulsar_ckpt_store *st;
+    uint32_t bank, T, PF, G, width, n_pools;
+    pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
+    uint64_t bytes;
+};
+
+static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errlen) {
+    p->st = pulsar_session_kv_store(s);
+    p->bank = pulsar_session_live_bank(s);
+    p->width = (uint32_t)pulsar_engine_logits_width(s->engine);
+    if (!s->checkpoint_valid || s->logits_stale || s->checkpoint.len <= 0) {
+        payload_set_err(err, errlen, "session has no live frontier to save (sync it first)");
+        return false;
+    }
+    p->T = (uint32_t)s->checkpoint.len;
+    char why[192];
+    if (!p->st->ops->frontier_at(p->st->state, p->T, &p->PF, why, sizeof(why)) || p->PF > p->T) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "session payload: %s", why);
+        payload_set_err(err, errlen, msg);
+        return false;
+    }
+    if (!kvp_pools(p->st, p->pools, &p->n_pools)) {
+        payload_set_err(err, errlen, "session payload: the model has more pools than a payload carries");
+        return false;
+    }
+    /* the deepest checkpoint at or below the prefill frontier's grid point: what a sync that does not extend
+     * the frontier restores */
+    p->G = pulsar_ckpt_best(p->st, p->bank, pulsar_ckpt_grid_floor(p->st, p->PF));
+    p->bytes = kvp_bytes_for(p->st, p->pools, p->n_pools, p->T, p->G, s->live_images.n, p->width);
+    return true;
+}
+
+static uint64_t kvp_payload_bytes(pulsar_session *s) {
+    kvp_plan p;
+    char err[256];
+    return kvp_plan_save(s, &p, err, sizeof(err)) ? p.bytes : 0u;
+}
+
+static int kvp_save(pulsar_session *s, FILE *fp, char *err, size_t errlen) {
+    if (!fp) { payload_set_err(err, errlen, "session payload: no stream"); return 1; }
+    if (pulsar_session_is_mirrored(s)) {
+        payload_set_err(err, errlen, "session payload: a tensor-parallel session's payload is not mirrored");
+        return 1;
+    }
+    kvp_plan p;
+    if (!kvp_plan_save(s, &p, err, errlen)) return 1;
+    pulsar_ckpt_store *st = p.st;
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t slot_off = 0;
+    if (p.G && !pulsar_ckpt_locate(st, p.bank, p.G, &slab, &slot_off)) {
+        payload_set_err(err, errlen, "session payload: the resume checkpoint vanished while saving");
+        return 1;
+    }
+    /* the frontier's slot, staged: the state model's walk at T, over zeros (the slot's alignment tail is
+     * written too, so the same state always saves the same bytes) */
+    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(st->slot_bytes);
+    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, st->slot_bytes / sizeof(float)) == 0 ||
+        !st->ops->walk(st->state, 0, front, 0, p.T, NULL) || pulsar_gpu_synchronize() == 0) {
+        pulsar_gpu_tensor_free(front);
+        payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
+        return 1;
+    }
+    payload_io io;
+    io.fp = fp;
+    payload_digest_init(&io.digest);
+    pulsar_writeback_init(&io.wb, fp);
+    const uint64_t layout = kvp_layout_digest(st, p.pools, p.n_pools, p.width);
+    const uint32_t header[KVP_U32_FIELDS] = {
+        PULSAR_SESSION_KV_PAYLOAD_MAGIC, PULSAR_SESSION_KV_PAYLOAD_VERSION, (uint32_t)layout, (uint32_t)(layout >> 32),
+        p.T, p.PF, p.G, p.width,
+    };
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < KVP_U32_FIELDS; i++) rc = payload_write_u32(&io, header[i], err, errlen);
+    for (uint32_t i = 0; rc == 0 && i < p.T; i++) rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen);
+    if (rc == 0) rc = payload_write_images(&io, s->live_images.b, s->live_images.n, err, errlen);
+    if (rc == 0) rc = payload_write_bytes(&io, s->logits, (uint64_t)p.width * sizeof(float), err, errlen);
+    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    if (rc == 0 && p.G)
+        rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) rc = pools_span_io(&io, p.pools, p.n_pools, 0u, p.T, true, buf, NULL, err, errlen);
+    free(buf);
+    pulsar_gpu_tensor_free(front);
+    if (rc != 0) return rc;
+    const uint64_t dg = payload_digest_final(&io.digest);
+    if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
+        payload_set_err(err, errlen, "session payload: failed to write the digest");
+        return 1;
+    }
+    pulsar_writeback_finish(&io.wb);
+    return 0;
+}
+
+static int kvp_load(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (pulsar_session_is_mirrored(s)) {
+        payload_set_err(err, errlen, "session payload: a tensor-parallel session's payload is not mirrored");
+        return 1;
+    }
+    payload_drop_lookahead(s);
+    pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const uint32_t bank = pulsar_session_live_bank(s);
+    const uint32_t width = (uint32_t)pulsar_engine_logits_width(s->engine);
+    pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
+    uint32_t n = 0;
+    if (!kvp_pools(st, pools, &n)) {
+        payload_set_err(err, errlen, "session payload: the model has more pools than a payload carries");
+        return 1;
+    }
+    payload_io io;
+    io.fp = fp;
+    payload_digest_init(&io.digest);
+    pulsar_writeback_init(&io.wb, NULL);
+    uint64_t remaining = payload_bytes;
+    uint32_t h[KVP_U32_FIELDS];
+    for (uint32_t i = 0; i < KVP_U32_FIELDS; i++)
+        if (payload_read_u32(&io, &h[i], &remaining, err, errlen) != 0) return 1;
+    if (h[0] != PULSAR_SESSION_KV_PAYLOAD_MAGIC || h[1] != PULSAR_SESSION_KV_PAYLOAD_VERSION) {
+        payload_set_err(err, errlen, "unsupported session payload version");
+        return 1;
+    }
+    const uint64_t layout = kvp_layout_digest(st, pools, n, width);
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[7] != width) {
+        payload_set_err(err, errlen, "session payload: written for a different state layout");
+        return 1;
+    }
+    const uint32_t T = h[4], PF = h[5], G = h[6];
+    if (T == 0u || T >= (uint32_t)s->ctx_size || PF > T || G > PF || G % st->ops->resume_grid != 0u ||
+        (G && G < st->ops->min_checkpoint(st->state))) {
+        payload_set_err(err, errlen, "session payload: its frontier, prefill frontier or grid point does not fit "
+                                     "this session");
+        return 1;
+    }
+    token_vec toks = {0};
+    pulsar_image_identity imgs;
+    imgs.n = 0;
+    float *logits = (float *)xmalloc((size_t)width * sizeof(float));
+    auto drop = [&]() { token_vec_free(&toks); free(logits); return 1; };
+    for (uint32_t i = 0; i < T; i++) {
+        uint32_t t = 0;
+        if (payload_read_u32(&io, &t, &remaining, err, errlen) != 0) return drop();
+        token_vec_push(&toks, (int)t);
+    }
+    uint32_t n_img = 0;
+    if (payload_read_u32(&io, &n_img, &remaining, err, errlen) != 0) return drop();
+    if (n_img > PULSAR_IMAGE_BLOCKS_MAX || payload_bytes != kvp_bytes_for(st, pools, n, T, G, n_img, width)) {
+        payload_set_err(err, errlen, "session payload: size does not match its header");
+        return drop();
+    }
+    for (uint32_t i = 0; i < n_img; i++) {
+        uint32_t rec[SEGMENT_IMAGE_U32];
+        for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
+            if (payload_read_u32(&io, &rec[k], &remaining, err, errlen) != 0) return drop();
+        const pulsar_image_block b = image_rec_unpack(rec);
+        if (b.end <= b.start || b.end > T || (i && b.start < imgs.b[i - 1].end)) {
+            payload_set_err(err, errlen, "session payload: its image records are out of order or outside its tokens");
+            return drop();
+        }
+        imgs.b[imgs.n++] = b;
+    }
+    if (payload_read_bytes(&io, logits, (uint64_t)width * sizeof(float), &remaining, err, errlen) != 0) return drop();
+    if (pulsar_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "session payload: failed to synchronize accelerator");
+        return drop();
+    }
+    /* Device writes begin: from here a failure leaves the bank holding nothing. */
+    segment_clear(s, st, bank);
+    pulsar_gpu_tensor *front = NULL;
+    auto fail = [&]() { pulsar_gpu_tensor_free(front); segment_clear(s, st, bank); return drop(); };
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t slot_off = 0;
+    uint32_t slot = PULSAR_CKPT_SLOTS_MAX;
+    if (G && !pulsar_ckpt_claim(st, bank, G, &slab, &slot_off, &slot)) {
+        payload_set_err(err, errlen, "session payload: no grid-checkpoint slot");
+        return fail();
+    }
+    front = pulsar_gpu_tensor_alloc(st->slot_bytes);
+    if (!front) {
+        payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
+        return fail();
+    }
+    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    int rc = 0;
+    if (G) rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining,
+                                         err, errlen);
+    if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining,
+                                               err, errlen);
+    if (rc == 0) rc = pools_span_io(&io, pools, n, 0u, T, false, buf, &remaining, err, errlen);
+    free(buf);
+    if (rc != 0) return fail();
+    uint64_t stored_dg = 0;
+    if (remaining != sizeof(uint64_t) || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||
+        stored_dg != payload_digest_final(&io.digest)) {
+        payload_set_err(err, errlen, "session payload: digest mismatch (corrupt payload)");
+        return fail();
+    }
+    /* Commit: the frontier's counters, its lanes from the staged slot, then the resume checkpoint. */
+    if (!st->ops->install_frontier(st->state, T, PF) || !st->ops->walk(st->state, 1, front, 0, T, NULL) ||
+        pulsar_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "session payload: installing the frontier's state failed");
+        return fail();
+    }
+    st->ops->restored(st->state);
+    pulsar_gpu_tensor_free(front);
+    if (G) pulsar_ckpt_commit(st, bank, slot, G);
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = toks;
+    s->live_images = imgs;
+    memcpy(s->logits, logits, (size_t)width * sizeof(float));
+    free(logits);
+    s->checkpoint_valid = true;
+    s->logits_stale = false;
+    payload_drop_lookahead(s);
     return 0;
 }
 
