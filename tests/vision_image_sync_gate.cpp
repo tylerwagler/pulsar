@@ -154,43 +154,56 @@ int main(int argc, char **argv) {
         /* ---- L273: an image turn on a STALE bank (a reply's ghost rewind leaves it mid-group) resumes from its
          *      grid checkpoint, byte for byte the cold prefill of the same prompt (before fab03497: rebuilt cold) */
         {
-            pulsar_session *a = NULL, *cold = NULL;
             char err4[512] = {0};
+            const char *step = "text sync";
             pulsar_tokens text = {}, turn = {};
             for (int i = 0; i < 300; i++) pulsar_tokens_push(&text, 100 + i % 7);
-            bool ok4 = pulsar_session_create(&a, e, 4096) == 0 && pulsar_session_create(&cold, e, 4096) == 0 &&
-                       pulsar_session_sync(a, &text, err4, sizeof err4) == 0;
-            for (int k = 0; ok4 && k < 3; k++) ok4 = pulsar_session_eval(a, pulsar_session_argmax(a), err4, sizeof err4) == 0;
-            if (ok4) pulsar_session_rewind(a, pulsar_session_pos(a) - 1);   /* the ghost token */
-            const bool stale = ok4 && pulsar_session_bank_comp_stale(a, 0);
+            pulsar_session_invalidate(sess);
+            bool ok4 = pulsar_session_sync(sess, &text, err4, sizeof err4) == 0;
+            if (ok4) step = "decode";
+            for (int k = 0; ok4 && k < 3; k++)
+                ok4 = pulsar_session_eval(sess, pulsar_session_argmax(sess), err4, sizeof err4) == 0;
             if (ok4) {
-                const pulsar_tokens *live = pulsar_session_tokens(a);
+                pulsar_session_rewind(sess, pulsar_session_pos(sess) - 1);   /* the ghost token */
+                step = "stale after the ghost rewind";
+                ok4 = pulsar_session_bank_comp_stale(sess, 0);
+            }
+            if (ok4) {
+                const pulsar_tokens *live = pulsar_session_tokens(sess);
                 for (int i = 0; i < live->len; i++) pulsar_tokens_push(&turn, live->v[i]);
             }
             pulsar_image_ref img4 = { enc.data(), enc.size(), turn.len };
             for (int i = 0; i < span_len; i++) pulsar_tokens_push(&turn, vocab + types[i]);
             for (int i = 0; i < 3; i++) pulsar_tokens_push(&turn, 200 + i);
-            ok4 = ok4 && stale && pulsar_session_sync_mm(a, &turn, &img4, 1, err4, sizeof err4) == 0;
-            const int origin = ok4 ? pulsar_session_resume_origin(a) : -1;
+            if (ok4) {
+                step = "image turn on the stale bank";
+                ok4 = pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0;
+            }
+            const int origin = ok4 ? pulsar_session_resume_origin(sess) : -1;
             std::vector<float> resumed((size_t)PULSAR_N_VOCAB);
-            ok4 = ok4 && pulsar_session_copy_logits(a, resumed.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB &&
-                  pulsar_session_sync_mm(cold, &turn, &img4, 1, err4, sizeof err4) == 0 &&
-                  pulsar_session_copy_logits(cold, logits.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
+            if (ok4) {
+                step = "the cold prefill of the same prompt";
+                ok4 = pulsar_session_copy_logits(sess, resumed.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
+                pulsar_session_invalidate(sess);
+                ok4 = ok4 && pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0 &&
+                      pulsar_session_copy_logits(sess, logits.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
+            }
             int differ = 0;
             for (size_t i = 0; ok4 && i < logits.size(); i++) differ += memcmp(&resumed[i], &logits[i], 4) != 0;
-            if (!ok4 || origin <= 0 || origin > text.len || differ) {
-                printf("  FAIL case %u: stale-bank image turn: stale=%d resumed at %d (want a grid checkpoint in "
-                       "(0,%d]), %d/%u logits differ from cold %s\n", c, (int)stale, origin, text.len, differ,
-                       (unsigned)PULSAR_N_VOCAB, err4);
+            if (!ok4) {
+                printf("  FAIL case %u: stale-bank image turn: %s failed %s\n", c, step, err4);
+                bad++;
+            } else if (origin <= 0 || origin > text.len || differ) {
+                printf("  FAIL case %u: stale-bank image turn resumed at %d (want a grid checkpoint in (0,%d]), "
+                       "%d/%u logits differ from cold\n", c, origin, text.len, differ, (unsigned)PULSAR_N_VOCAB);
                 bad++;
             } else {
                 printf("  ok   case %u: stale-bank image turn resumed from grid checkpoint %d, logits == cold\n", c,
                        origin);
             }
+            pulsar_session_invalidate(sess);
             pulsar_tokens_free(&text);
             pulsar_tokens_free(&turn);
-            if (a) pulsar_session_free(a);
-            if (cold) pulsar_session_free(cold);
         }
 
         printf("%s case %u: %dx%d start=%-3d span %-4d\n", bad ? "FAIL" : "ok  ", c, n_vh, n_vw,
