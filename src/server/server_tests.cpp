@@ -3367,6 +3367,27 @@ static void test_forced_call_names_a_declared_tool(void) {
     request_free(&r);
 }
 
+/* L272: the declared-name mask's token rule -- a token is allowed while the joined bytes stay a prefix of
+ * a declared name + the closer, or pass the closer with only whitespace after. */
+static void test_tool_name_token_allowed(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 16);
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
+    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
+    const tool_schema_orders *d = &r.tool_orders;
+    TEST_ASSERT(tool_name_token_allowed("", 0, "get", 3, d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("", 0, "se", 2, d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "ask", 3, d, ">"));          /* Qwen's undeclared ask_user */
+    TEST_ASSERT(tool_name_token_allowed("get_", 4, "weather", 7, d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">", 1, d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">\n", 2, d, ">"));   /* closer + newline in one token */
+    TEST_ASSERT(!tool_name_token_allowed("get_weather", 11, ">x", 2, d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("get", 3, ">", 1, d, ">"));           /* a strict prefix cannot close */
+    TEST_ASSERT(!tool_name_token_allowed("search", 6, "_web", 4, d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "", 0, d, ">"));               /* an empty token: never */
+    request_free(&r);
+}
+
 static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -8156,6 +8177,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_qwen_raw_calls_replay_verbatim();
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();
+    test_tool_name_token_allowed();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();

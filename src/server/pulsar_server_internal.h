@@ -562,6 +562,12 @@ typedef struct server_family_ops {
      *  append, so prompt + output = the family's render of the turn (request_apply_forced_tool_prefill
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
+    /** L272: an UNNAMED forced call's seed ends where the function name starts, and this literal closes
+     *  the name (Qwen: ">").  While the name is open the sampler only draws tokens that keep it a prefix
+     *  of a declared tool's name, so "required" with several tools cannot name an undeclared one (Qwen
+     *  sampled "ask_user").  NULL = the family's seed does not end at the name: no constraint (an
+     *  undeclared name is dropped at the finish instead). */
+    const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
      *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
     const char *(*find_call_block)(const char *p, const char **end);
@@ -1471,6 +1477,10 @@ struct server {
      * it. Slots are pure bank descriptors; all engine work goes through this
      * pointer. */
     pulsar_session *sess;
+    /** L272: every token's bytes (pulsar_token_text over the logits width), built on the first constrained
+     *  tool name and kept: the mask reads them per draw.  A pointer, so the struct stays memset-clean;
+     *  freed with the session at shutdown.  Worker thread only. */
+    std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
@@ -2477,6 +2487,11 @@ struct gen_state {
     int last_decode_log_completion;    ///< token count at that line, for interval rates
     thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
     bool spec_enabled;          ///< speculative decoding is active for this request
+    /** L272: an unnamed forced call's function name is being sampled from g->text[tool_name_from..):
+     *  until the family's closer appears the sampler masks every token that would leave the declared
+     *  names, and the slot holds speculation (lane 3 samples inside the engine, past any mask). */
+    bool tool_name_constrained;
+    size_t tool_name_from;
     /** L272 P3: the family's output parser and its state for this decode attempt (created at decode
      * init, destroyed with the next attempt or the request). */
     const server_output_parser_ops *parser;
@@ -2875,6 +2890,16 @@ bool http_error_anthropic(int fd, int code, const char *msg);
 /** DeepSeek's call-block finder (kv_cache.cpp): every DSML spelling either template renders. */
 const char *find_next_dsml_tool_block(const char *p, const char **end_out);
 bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
+/** L272: whether a token whose bytes are `tok` may follow `so_far` in an unnamed forced call's function
+ *  name: the joined bytes stay a prefix of some declared name followed by `close`, or pass it with only
+ *  whitespace after (a token may carry the closer and the newline).  An empty token is never allowed. */
+bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok,
+                             const tool_schema_orders *declared, const char *close);
+/** The slot is sampling an unnamed forced call's function name (the closer has not appeared yet). */
+bool gen_tool_name_open(const struct gen_state *g);
+/** Mask a constrained slot's logits row to the declared names (server_jobs.cpp); false = nothing allowed
+ *  (said), the row untouched. */
+bool gen_mask_tool_name(struct server *s, struct gen_state *g, float *row, int width);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd,

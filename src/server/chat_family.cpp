@@ -680,6 +680,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
+    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_deepseek_v4 = {
@@ -696,6 +697,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
+    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_qwen = {
@@ -712,6 +714,7 @@ static const server_family_ops k_family_qwen = {
     /* .tool_error_suffix     = */ qwen_tool_error_suffix,
     /* .forced_call_seed      = */ qwen_forced_call_seed,
     /* .forced_call_prefill   = */ qwen_forced_call_prefill,
+    /* .forced_name_close     = */ ">",   /* the seed ends at <function= */
     /* .find_call_block       = */ qwen_find_call_block,
 };
 
