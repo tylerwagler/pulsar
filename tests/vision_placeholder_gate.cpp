@@ -1,8 +1,9 @@
 /* L216 gate: the sentinel-id PRODUCER -- placeholder in, sentinel block out.
  *
  * The engine's whole image path needs someone to put `vocab_size + role` ids into
- * a prompt; the renderer will, via vision_expand_image_placeholders(), which is
- * the reference's prepare_vl_inputs(): walk the tokenized prompt and replace each
+ * a prompt; the renderer will, via pulsar_image_expand() (L268: the core's walk,
+ * every family, over DeepSeek's front here), which is the reference's
+ * prepare_vl_inputs(): walk the tokenized prompt and replace each
  * IMAGE_PLACEHOLDER token with that image's block.
  *
  * This grades that producer against the LAYOUT math rather than against a new
@@ -43,12 +44,19 @@ static void rd(void *dst, size_t n, FILE *f) {
     if (n && fread(dst, 1, n, f) != n) { fprintf(stderr, "placeholder gate: short read\n"); exit(2); }
 }
 
-/* The prompt's stand-in for the tokenizer's IMAGE_PLACEHOLDER.  The producer takes
- * the id as an argument precisely so it does not have to know which token the
- * tokenizer assigned; the engine passes the real one. */
+/* The prompt's stand-in for the tokenizer's IMAGE_PLACEHOLDER.  The front reads
+ * the id from the engine's vocab (pulsar_family_vision::placeholder_id), so the
+ * stub engine below carries this one. */
 enum { PLACEHOLDER = 129264, TEXT = 100 };
 
 int main(int argc, char **argv) {
+    /* L268: the walk is the core's and takes an engine; this gate needs only DeepSeek's front from it -- the
+     * family, a bound tower, the placeholder id -- so a zeroed engine carries exactly those (no model, no GPU). */
+    pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    if (!e) return 2;
+    e->family = &PULSAR_FAMILY_DEEPSEEK4;
+    e->vision_ready = true;
+    e->vocab.image_id = PLACEHOLDER;
     const char *path = (argc > 1) ? argv[1] : "tests/test-vectors/vision-image-goldens.bin";
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "placeholder gate: cannot open %s\n", path); return 2; }
@@ -77,7 +85,17 @@ int main(int argc, char **argv) {
         std::vector<uint16_t> skip((size_t)span_len * PULSAR_VISION_GOLDEN_N_EMBD);
         rd(skip.data(), skip.size() * 2, f);
 
-        pulsar_vision_args args = { patch, downsample, max_n_token, min_pixels, max_wh_ratio };
+        /* L268: DeepSeek's front expands with THIS build's args and vocab; a golden captured at others grades
+         * nothing here, so it is refused by name. */
+        pulsar_vision_args args;
+        vision_ds4_args(&args);
+        if (args.patch_size != patch || args.downsample_ratio != downsample || args.max_n_token != max_n_token ||
+            args.min_pixels != min_pixels || args.max_wh_ratio != max_wh_ratio || vocab != (int)PULSAR_N_VOCAB) {
+            printf("  FAIL case %u: the golden's args / vocab (%d) are not this build's (%d)\n", c, vocab,
+                   (int)PULSAR_N_VOCAB);
+            failures++;
+            continue;
+        }
 
         /* The prompt the renderer would hand over: `start_pos` text tokens, the
          * placeholder, then a tail.  Placing it at start_pos makes the block land
@@ -89,17 +107,14 @@ int main(int argc, char **argv) {
         pulsar_tokens_push(&in, TEXT + 2);
 
         pulsar_tokens out = {};
-        pulsar_vision_prepared prep;
-        memset(&prep, 0, sizeof prep);
-        int start = -1;
-        pulsar_image_ref img = { enc.data(), enc.size(), 0 };
+        pulsar_image_ref img = { enc.data(), enc.size(), -1 };
         int bad = 0;
-
-        if (!vision_expand_image_placeholders(&out, &in, PLACEHOLDER, &img, 1,
-                                              &args, vocab, &prep, &start)) {
-            printf("  FAIL case %u: expander refused a valid prompt\n", c);
+        char err[256] = "";
+        if (!pulsar_image_expand(e, &in, &img, 1, &out, err, sizeof err)) {
+            printf("  FAIL case %u: expander refused a valid prompt: %s\n", c, err);
             bad++;                     /* every later check is guarded on !bad */
         }
+        const int start = img.start_pos;
         if (!bad && start != start_pos) {
             printf("  FAIL case %u: block start %d, want %d\n", c, start, start_pos);
             bad++;
@@ -173,10 +188,7 @@ int main(int argc, char **argv) {
         /* a placeholder/image count mismatch is refused, not guessed */
         if (!bad) {
             pulsar_tokens o2 = {};
-            pulsar_vision_prepared p2; memset(&p2, 0, sizeof p2);
-            int s2 = -1;
-            if (vision_expand_image_placeholders(&o2, &in, PLACEHOLDER, NULL, 0,
-                                                 &args, vocab, &p2, &s2)) {
+            if (pulsar_image_expand(e, &in, NULL, 0, &o2, err, sizeof err)) {
                 printf("  FAIL case %u: a prompt with a placeholder and zero images was accepted\n", c);
                 bad++;
             }
@@ -187,7 +199,6 @@ int main(int argc, char **argv) {
                bad ? "FAIL" : "ok  ", c, n_vh, n_vw, start_pos, span_len, out.len);
         failures += bad;
         checked++;
-        vision_prepared_free(&prep);
         pulsar_tokens_free(&out);
         pulsar_tokens_free(&in);
     }
@@ -195,5 +206,6 @@ int main(int argc, char **argv) {
     fclose(f);
     printf("VISION PLACEHOLDER GATE: %s (%d cases, %d failures)\n",
            failures ? "FAIL" : "PASS", checked, failures);
+    free(e);
     return failures ? 1 : 0;
 }

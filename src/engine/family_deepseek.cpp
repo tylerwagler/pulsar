@@ -112,7 +112,29 @@ static bool ds4_is_image_sentinel(const pulsar_engine *, int32_t id) { return id
 static bool ds4_image_block_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
     return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
 }
-static const pulsar_family_vision k_ds4_vision = { ds4_is_image_sentinel, ds4_image_block_extent };
+/* L268: the rest of DeepSeek's image front -- its placeholder token, one image's sentinel block (vision.cpp), and its
+ * tower's block rows over the core's cache */
+static int ds4_image_placeholder_id(const pulsar_engine *e) { return e->vocab.image_id; }
+static bool ds4_image_expand(const pulsar_engine *, const pulsar_image_ref *img, pulsar_tokens *out, char *err,
+                             size_t errlen) {
+    return vision_ds4_expand(img, out, err, errlen);
+}
+static uint32_t ds4_image_row_width(const pulsar_engine *) { return (uint32_t)PULSAR_N_EMBD; }
+static bool ds4_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+                                 const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
+                                 uint16_t *out, char *err, size_t errlen) {
+    return vision_ds4_block_rows(&e->vision_weights, &e->model, img, block_len, tower, n_tower, tower_out,
+                                 n_tower_out, out, err, errlen);
+}
+static const pulsar_family_vision k_ds4_vision = {
+    /* .is_sentinel      = */ ds4_is_image_sentinel,
+    /* .block_extent     = */ ds4_image_block_extent,
+    /* .placeholder_text = */ PULSAR_IMAGE_PLACEHOLDER,
+    /* .placeholder_id   = */ ds4_image_placeholder_id,
+    /* .expand           = */ ds4_image_expand,
+    /* .row_width        = */ ds4_image_row_width,
+    /* .block_rows       = */ ds4_image_block_rows,
+};
 
 const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .id           = */ PULSAR_FAMILY_ID_DEEPSEEK4,

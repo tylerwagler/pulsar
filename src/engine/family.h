@@ -65,14 +65,32 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k);
 /** L272 P4b: a rank's tensor-parallel plan (tp_slice.cpp; opaque to the families, which add to it). */
 typedef struct pulsar_tp_plan pulsar_tp_plan;
 
-/** L281: a family's image GEOMETRY -- which token ids are image sentinels and how long the block starting at a
- *  position is.  The core keeps the identity of the blocks a session holds (image_identity.cpp) and decides reuse,
- *  resume and disk persistence from it; the family says only where blocks are.  NULL on a family that serves no
- *  images: no id is a sentinel. */
+/** A family's IMAGE FRONT (L281 geometry, L268 the rest).  The core owns the image path
+ *  (image_identity.cpp, image_front.cpp): the placeholder expansion, the block fit, the reuse licence, the
+ *  identity a session holds, the chunk merge and its tower-output cache.  The family supplies only what is its
+ *  own -- where blocks are, what its renderer writes, how one image becomes block ids, and its tower.  NULL on a
+ *  family that serves no images: no id is a sentinel and an image request is refused by name.  Whether the loaded
+ *  artifact carries a bound tower is `pulsar_engine::vision_ready`, set by the family's load. */
 typedef struct pulsar_family_vision {
     bool (*is_sentinel)(const pulsar_engine *e, int32_t id);
     /** true and *len = the block's length when `ids[start..]` begins an image block */
     bool (*block_extent)(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+    /** The text a chat renderer writes where one image goes; it carries the placeholder token once. */
+    const char *placeholder_text;
+    /** The placeholder token the expansion replaces, one per image, or -1 when the tokenizer has none. */
+    int (*placeholder_id)(const pulsar_engine *e);
+    /** Append image `img`'s block ids to `out` -- the block begins at out->len.  false + `err` when the image
+     *  cannot be decoded or is not one the tower accepts. */
+    bool (*expand)(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *out, char *err,
+                   size_t errlen);
+    /** bf16 elements in one block row (the language model's embedding width). */
+    uint32_t (*row_width)(const pulsar_engine *e);
+    /** The `block_len` rows image `img` puts at its block `ids[0..block_len)`, into `out`.  `tower` is the image's
+     *  tower output (n_tower rows, position-independent) when the core's cache holds it; NULL = run the tower and
+     *  hand its output to the core through *tower_out / *n_tower_out (malloc'd; the core caches and frees it). */
+    bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+                       const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out,
+                       char *err, size_t errlen);
 } pulsar_family_vision;
 
 /** L272 P4c: how a family's forward hands its linears their activation -- the backend's MX slot (DeepSeek) or raw

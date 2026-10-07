@@ -1289,12 +1289,8 @@ static const pulsar_sync_ops k_qwen_sync = {
 };
 
 static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
-                             const pulsar_image_ref *, int n_images, char *err, size_t errlen) {
-    if (n_images > 0) {
-        if (err) snprintf(err, errlen, "%s: images are not implemented for this family", PULSAR_QWEN_ARCH);
-        return 1;
-    }
-    return pulsar_session_sync_default(s, prompt, &k_qwen_sync, err, errlen);
+                             const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
+    return pulsar_session_sync_default(s, prompt, images, n_images, &k_qwen_sync, err, errlen);
 }
 
 static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {

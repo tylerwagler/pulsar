@@ -420,8 +420,7 @@ static bool gpu_graph_seed_chunk_hc(pulsar_gpu_graph *g, const pulsar_model *mod
      * so every attention launch below takes its NULL path unchanged. */
     if (!gpu_graph_upload_vision_visible(g, prompt->v, prompt->len, start, n_tokens))
         return false;
-    return gpu_graph_merge_image_spans(g->batch_cur_hc, model, prompt->v, prompt->len,
-                                       g->vision_req, start, n_tokens);
+    return gpu_graph_merge_image_spans(g->batch_cur_hc, prompt->v, prompt->len, g->vision_req, start, n_tokens);
 }
 
 static bool gpu_graph_prefill_layer_major_inner(
@@ -744,7 +743,7 @@ static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
     }
     /* Never end a chunk inside an image block: cut before a block the chunk
      * would split, or -- when the chunk STARTS at the block -- carry the whole
-     * block (it fits: vision_spans_fit).  Positions only, so the cold pass and
+     * block (it fits: pulsar_image_spans_fit).  Positions only, so the cold pass and
      * any resume over the same prompt cut alike; the cost is the compressor
      * fallback for one unaligned boundary. */
     for (int b = 0; b < p->n_blk; b++) {
@@ -864,8 +863,8 @@ bool gpu_graph_prefill_chunked_range(
     int n_blk = 0;
     if (g->vision_req && g->vision_req->n_images > 0) {
         char verr[384];
-        if (!vision_spans_fit(prompt->v, prompt->len, g->vision_req->images, g->vision_req->n_images,
-                              chunk_cap, NULL, verr, sizeof(verr))) {
+        if (!pulsar_image_spans_fit(g->vision_req->engine, prompt->v, prompt->len, g->vision_req->images,
+                                    g->vision_req->n_images, chunk_cap, NULL, verr, sizeof(verr))) {
             fprintf(stderr, "pulsar: %s\n", verr);
             return false;
         }
@@ -877,7 +876,7 @@ bool gpu_graph_prefill_chunked_range(
         for (int i = 0; i < g->vision_req->n_images; i++) {
             int len = 0;
             const int s0 = g->vision_req->images[i].start_pos;
-            (void)vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB, s0, &len);   /* fit checked it */
+            (void)pulsar_image_block_extent(g->vision_req->engine, prompt->v, prompt->len, s0, &len);   /* fit checked it */
             if ((uint32_t)s0 < start && (uint32_t)(s0 + len) > start) {
                 fprintf(stderr, "pulsar: prefill from %u would start inside image %d's block [%d, %d) -- "
                                 "refusing (its merged rows cannot be re-evaluated)\n", start, i, s0, s0 + len);
