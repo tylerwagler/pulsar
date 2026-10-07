@@ -2997,6 +2997,26 @@ void pulsar_load_refuse(void);
 uint32_t pulsar_load_refusals(void);
 void pulsar_load_refusals_reset(void);
 
+/** L272 P4: a tensor's ROLE in the forward, declared by its family (weight_format.cpp). */
+typedef enum {
+    PULSAR_ROLE_DENSE = 0,             ///< a linear through the family's dense path
+    PULSAR_ROLE_EXPERT_GATE_UP = 1,    ///< a routed expert's gate or up stack (a split pair)
+    PULSAR_ROLE_EXPERT_DOWN = 2,       ///< a routed expert's down stack
+    PULSAR_ROLE_EXPERT_GATE_UP_FUSED = 3,   ///< one [in -> 2 mid] gate | up stack
+    PULSAR_ROLE_SHARED_EXPERT = 4,     ///< a shared expert's projection inside the MoE launcher
+} pulsar_weight_role;
+/** The activation a family's forward emits at a site. */
+typedef enum { PULSAR_ACT_F32 = 0, PULSAR_ACT_BF16 = 1, PULSAR_ACT_E4M3 = 2, PULSAR_ACT_COUNT = 3 } pulsar_act_format;
+#define PULSAR_ACTS(a) (1u << (a))
+/** Whether stored format `type` has a kernel for `role` at activation `act` -- the one table (weight_format.cpp). */
+bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_format act);
+/** Admission by role: t's format serves `role` at one of the activations in the mask `acts`; a refusal names the
+ *  formats that would (pulsar_tensor_admit's report). */
+bool pulsar_tensor_admit_role(const pulsar_tensor *t, const char *owner, pulsar_weight_role role, uint32_t acts);
+/** The MoE launchers' pairing rules for a layer's stacks (`up` NULL for a fused gate_up). */
+bool pulsar_format_moe_combo(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
+                             pulsar_act_format act, const char *owner);
+
 /** L272 P4a: the mechanics of a family's weight binder (tensor_bind.cpp) -- report the same way for every
  *  family and return the verdict; the binder keeps its failure policy.  `owner` names the family in the
  *  message.  The required tensor `name`, or NULL (said). */

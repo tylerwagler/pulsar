@@ -398,16 +398,13 @@ static bool admit(const pulsar_tensor *t, bool ok, const char *want) {
 }
 static bool admit_bf16(const pulsar_tensor *t) { return admit(t, t->type == PULSAR_TENSOR_BF16, "bf16"); }
 static bool admit_mx8(const pulsar_tensor *t) { return admit(t, t->type == PULSAR_TENSOR_MXFP8_LT, "mxfp8_lt"); }
-static bool admit_exl3(const pulsar_tensor *t, int arm, const char *want) {
-    const int k2 = exl3_type_k2(t->type);
-    return admit(t, k2 != 0 && exl3_arm_has_rate(arm, k2), want);
+/* L272 P4: a tensor's role at this family's bf16-row activations -- the format registry's answer
+ * (weight_format.cpp), so which formats serve is the core's, not this family's */
+static bool admit_role(const pulsar_tensor *t, pulsar_weight_role role) {
+    return pulsar_tensor_admit_role(t, PULSAR_QWEN_ARCH, role, PULSAR_ACTS(PULSAR_ACT_BF16));
 }
-/* a dense Linear the shared launcher (linear_dev) reads: the EXL3 dense arm or mxfp8_lt */
-static bool admit_linear(const pulsar_tensor *t) {
-    const int k2 = exl3_type_k2(t->type);
-    return admit(t, (k2 != 0 && exl3_arm_has_rate(EXL3_ARM_DENSE, k2)) || t->type == PULSAR_TENSOR_MXFP8_LT,
-                 "an exl3m rate the dense arm reads, or mxfp8_lt");
-}
+/* a dense Linear the shared launcher (linear_dev) reads */
+static bool admit_linear(const pulsar_tensor *t) { return admit_role(t, PULSAR_ROLE_DENSE); }
 /* the low-rank pair: MXFP8 (the per-layer sites) or BF16 (the mixer, as the
  * graded recipe stores it) -- both arms of the GR read, one format per pair */
 static bool admit_gr(const pulsar_qwen_gr_weights &g) {
@@ -423,15 +420,14 @@ static bool admit_gr(const pulsar_qwen_gr_weights &g) {
 static bool admit_moe(const pulsar_qwen_layer_weights &L) {
     bool ok = admit_bf16(L.moe_router) & admit_bf16(L.sh_gate_scalar);
     if (L.moe_gate_up)
-        ok &= admit_exl3(L.moe_gate_up, EXL3_ARM_GATE_UP_FUSED, "an exl3m rate the fused gate_up arm reads");
+        ok &= admit_role(L.moe_gate_up, PULSAR_ROLE_EXPERT_GATE_UP_FUSED);
     else
-        ok &= admit_exl3(L.moe_gate, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
-              admit_exl3(L.moe_up, EXL3_ARM_PAIR, "an exl3m rate the gate / up pair arm reads") &
-              admit(L.moe_up, L.moe_up->type == L.moe_gate->type, "the gate slice's rate (the pair shares one)");
-    ok &= admit_exl3(L.moe_down, EXL3_ARM_DOWN, "an exl3m rate the routed down arm reads");
-    ok &= admit_exl3(L.sh_gate, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
-          admit_exl3(L.sh_up, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads") &
-          admit_exl3(L.sh_down, EXL3_ARM_DENSE, "an exl3m rate the dense arm reads");
+        ok &= admit_role(L.moe_gate, PULSAR_ROLE_EXPERT_GATE_UP) & admit_role(L.moe_up, PULSAR_ROLE_EXPERT_GATE_UP);
+    ok &= admit_role(L.moe_down, PULSAR_ROLE_EXPERT_DOWN);
+    if (ok) ok = pulsar_format_moe_combo(L.moe_gate_up ? L.moe_gate_up : L.moe_gate, L.moe_gate_up ? NULL : L.moe_up,
+                                         L.moe_down, PULSAR_ACT_BF16, PULSAR_QWEN_ARCH);
+    ok &= admit_role(L.sh_gate, PULSAR_ROLE_SHARED_EXPERT) & admit_role(L.sh_up, PULSAR_ROLE_SHARED_EXPERT) &
+          admit_role(L.sh_down, PULSAR_ROLE_SHARED_EXPERT);
     return ok;
 }
 
