@@ -157,3 +157,6 @@ tests/dspark_batch_gate
 /tests/qwen_chat_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
+/tests/comp_state_gate
+/tests/vision_image_gate
+/tests/vision_image_sync_gate
