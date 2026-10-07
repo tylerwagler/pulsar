@@ -111,6 +111,30 @@ bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img
     return true;
 }
 
+bool pulsar_image_write_stream_rows(pulsar_gpu_tensor *carrier, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
+                                    uint32_t n_tokens, uint32_t width, uint32_t n_streams) {
+    /* The rows are raw bf16 bits, so the copies are memcpys and no numerics live here.  The carrier is
+     * [token][stream][width], contiguous per token, so one tensor write covers the block. */
+    if (!carrier || !rows || n_rows == 0 || width == 0 || n_streams == 0) return false;
+    if (row0 > n_tokens || n_rows > n_tokens - row0) return false;
+    const size_t per_row = (size_t)n_streams * width * sizeof(uint16_t);
+    if (pulsar_gpu_tensor_bytes(carrier) < (uint64_t)n_tokens * per_row) return false;
+    uint16_t *stage = (uint16_t *)malloc((size_t)n_rows * per_row);
+    if (!stage) return false;
+    for (uint32_t r = 0; r < n_rows; r++)
+        for (uint32_t h = 0; h < n_streams; h++)
+            memcpy(stage + ((size_t)r * n_streams + h) * width, rows + (size_t)r * width, (size_t)width * sizeof(uint16_t));
+    const bool ok = pulsar_gpu_tensor_write(carrier, (uint64_t)row0 * per_row, stage, (uint64_t)n_rows * per_row) != 0;
+    free(stage);
+    return ok;
+}
+
+const pulsar_image_identity *pulsar_session_bank_images(const pulsar_session *s, uint32_t bank, uint32_t live_bank) {
+    if (bank == live_bank) return s->sync_images ? &s->sync_identity : &s->live_images;
+    if (s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid) return &s->bank_carry[bank].live_images;
+    return NULL;
+}
+
 bool pulsar_image_merge_chunk(const pulsar_engine *e, const int32_t *ids, int n_ids, const pulsar_image_ref *images,
                               int n_images, uint32_t pos0, uint32_t n_tokens, pulsar_image_row_writer write,
                               void *ud) {

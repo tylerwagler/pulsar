@@ -255,6 +255,11 @@ typedef struct {
     /** L266: every tensor's name, type and size, FNV-1a -- the artifact a Qwen segment was written by
      *  (pulsar_ckpt_store::artifact): two quantisations of the model never load each other's KV. */
     uint64_t artifact_digest;
+    /** L268: the vision tower (model.visual.*, bf16 through the mapping; vision_qwen.cpp), when the artifact carries
+     *  it, and the <|image_pad|> id its image blocks are runs of (-1 = no tower) */
+    bool vision_present;
+    pulsar_qwen_vision_weights_dev vision;
+    int32_t vision_pad_id;
 } pulsar_qwen_weights;
 
 /* ---- 4. Session state -------------------------------------------------------
@@ -497,6 +502,9 @@ typedef struct {
     const int32_t *tokens;                 ///< [n_rows] host token ids
     const int32_t *pos;                    ///< [n_rows] host positions
     const int32_t *bank;                   ///< [n_rows] host bank ids (PREFILL: all equal)
+    /** L268: [n_rows][6] host multi-axis rope positions (pulsar_qsa_io::row_rope), or NULL = text positions -- NULL
+     *  whenever no row's bank holds an image block, so a text step is the bytes it always was */
+    const uint32_t *rope;
     /** The residual streams the step runs on: st->streams for the trunk, st->mtp_streams for the MTP
      *  layer (L251 MTP).  Every op reads and writes THIS, never st->streams directly. */
     pulsar_gpu_tensor *streams;

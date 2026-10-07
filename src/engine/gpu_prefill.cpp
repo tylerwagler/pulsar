@@ -698,25 +698,8 @@ bool gpu_graph_write_vision_span(
         uint32_t           n_rows,
         uint32_t           row0,      /* the span's first row within the chunk */
         uint32_t           n_tokens) {
-    if (!out_hc || !rows || n_rows == 0) return false;
-    if (row0 > n_tokens || n_rows > n_tokens - row0) return false;
-    const uint64_t row_elt = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    const size_t per_row = (size_t)row_elt * PULSAR_HC_ELT_SIZE;
-    if (pulsar_gpu_tensor_bytes(out_hc) < (uint64_t)n_tokens * per_row) return false;
-
-    uint16_t *stage = (uint16_t *)malloc((size_t)n_rows * per_row);
-    if (!stage) return false;
-    for (uint32_t r = 0; r < n_rows; r++) {
-        const uint16_t *src = rows + (size_t)r * PULSAR_N_EMBD;
-        uint16_t *dst = (uint16_t *)(void *)((char *)stage + (size_t)r * per_row);
-        for (uint32_t h = 0; h < PULSAR_N_HC; h++)
-            memcpy(dst + (size_t)h * PULSAR_N_EMBD, src,
-                   (size_t)PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE);
-    }
-    const bool ok = pulsar_gpu_tensor_write(out_hc, (uint64_t)row0 * per_row, stage,
-                                            (uint64_t)n_rows * per_row) != 0;
-    free(stage);
-    return ok;
+    return pulsar_image_write_stream_rows(out_hc, rows, n_rows, row0, n_tokens, (uint32_t)PULSAR_N_EMBD,
+                                          (uint32_t)PULSAR_N_HC);
 }
 
 

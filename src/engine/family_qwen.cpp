@@ -577,6 +577,20 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!pulsar_qwen_s4_load(e, opt)) return false;
     if (!pulsar_qwen_tp_load(e)) return false;
     if (!qwen_load_tokenizer(e, opt->model_path)) return false;
+    /* L268: the vision tower, when the artifact carries it -- then images are served (the front, the tower, the
+     * multi-axis rope through QSA); a text-only artifact refuses them by name */
+    if (!qwen_vision_bind(&e->model, &e->qwen_weights->vision, &e->qwen_weights->vision_present)) return false;
+    e->qwen_weights->vision_pad_id = -1;
+    if (e->qwen_weights->vision_present) {
+        e->qwen_weights->vision_pad_id = qwen_tokenizer_added_id(e->qwen_tok, "<|image_pad|>");
+        if (e->qwen_weights->vision_pad_id < 0 || g_qwen_shape.n_embd != PULSAR_QWEN_VISION_OUT) {
+            fprintf(stderr, "pulsar: %s: the vision tower needs <|image_pad|> in the tokenizer and a %u-wide model "
+                            "(pad %d, n_embd %u) -- refusing\n", PULSAR_QWEN_ARCH, (unsigned)PULSAR_QWEN_VISION_OUT,
+                    e->qwen_weights->vision_pad_id, g_qwen_shape.n_embd);
+            return false;
+        }
+        e->vision_ready = true;
+    }
     /* L272 P1: the MTP layer is the drafter behind the round API (spec_qwen.cpp); the drafter option
      * (--no-dspark) turns drafting off for this family as it does for DeepSeek's */
     if (e->qwen_weights->mtp.present && !opt->dspark_disable) e->drafter_ops = &k_mtp_drafter;
@@ -970,6 +984,33 @@ static bool qwen_tp_allreduce_y(pulsar_session *s, uint32_t il, uint32_t n_rows,
     return ok;
 }
 
+/* L268: the step's multi-axis rope positions (pulsar_image_rope3 over each row's bank's image records) -- NULL when
+ * no row's bank holds a gridded image block: text positions, the bytes a text step always ran.  Per row, its own
+ * (T, H, W) and its indexer block's first token's (pos - 3), which may be an earlier step's. */
+static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
+                                       std::vector<uint32_t> *out) {
+    bool any = false;
+    for (uint32_t r = 0; r < n && !any; r++) {
+        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->qwen->live_bank);
+        for (uint32_t i = 0; id && i < id->n && !any; i++) any = id->b[i].grid_h && id->b[i].grid_w;
+    }
+    if (!any) return NULL;
+    out->resize((size_t)n * 6u);
+    for (uint32_t r = 0; r < n; r++) {
+        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->qwen->live_bank);
+        const uint32_t p = (uint32_t)pos[r], back = PULSAR_QSA_BLOCK - 1u;
+        pulsar_image_rope3(id, p, &(*out)[(size_t)r * 6u]);
+        pulsar_image_rope3(id, p >= back ? p - back : 0u, &(*out)[(size_t)r * 6u + 3u]);
+    }
+    return out->data();
+}
+
+/* L268: image rows into the step's streams -- each row in all of them (the expansion follows the substitution) */
+static bool qwen_write_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
+    return pulsar_image_write_stream_rows((pulsar_gpu_tensor *)ud, rows, n_rows, row0, n_tokens, g_qwen_shape.n_embd,
+                                          g_qwen_shape.n_hc);
+}
+
 bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
                   const int32_t *pos, const int32_t *bank, uint32_t n_rows,
                   uint32_t head_row0, uint32_t head_n, float *logits_out, bool verify) {
@@ -1000,6 +1041,8 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     st.streams = s->qwen->streams;
     st.mixer = &e->qwen_weights->mixer;
     st.verify = verify;
+    std::vector<uint32_t> rope;
+    st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
     if (verify && (mode != PULSAR_QWEN_STEP_PREFILL || n_rows > PULSAR_QWEN_SPEC_ROWS || !s->qwen->mtp)) {
         fprintf(stderr, "pulsar: %s: a verify step of %u rows is outside the capture -- refusing\n", PULSAR_QWEN_ARCH,
                 n_rows);
@@ -1054,6 +1097,11 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     }
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = ops->embed(&st);
+    /* L268: a sync's prefill chunk takes the image rows of the blocks it owns over their pads' embeddings (HF
+     * masked_scatter), each into all 4 streams (the hyper-connection expansion follows the substitution) */
+    if (ok && mode == PULSAR_QWEN_STEP_PREFILL && s->sync_images && n_runs == 1 && bank[0] == (int32_t)s->qwen->live_bank)
+        ok = pulsar_image_merge_chunk(e, s->sync_prompt->v, s->sync_prompt->len, s->sync_images, s->sync_n_images,
+                                      (uint32_t)pos[0], n_rows, qwen_write_image_rows, s->qwen->streams);
     for (uint32_t il = 0; ok && il < e->plan.n_layer; il++) {
         if (il == g_qwen_shape.ple_layer) ok = ops->ple(&st, il);
         if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_ATTN);
@@ -1130,6 +1178,8 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     st.tokens = tokens;
     st.pos = pos;
     st.bank = bank;
+    std::vector<uint32_t> rope;   /* L268: the MTP layer ropes as the trunk does at the same positions */
+    st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
     st.streams = s->qwen->mtp_streams;
     st.mixer = &e->qwen_weights->mtp.mixer;
     st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
@@ -1482,7 +1532,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_TP |
-                          PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_CHAT,
+                          PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_VISION,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
@@ -1497,6 +1547,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .tokenizer    = */ &k_qwen_tokenizer,
     /* .tp_slices    = */ pulsar_qwen_tp_slices,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
-    /* .vision       = */ NULL,   /* no image path yet: no id is a sentinel */
+    /* .vision       = */ &PULSAR_QWEN_IMAGE_FRONT,   /* L268: vision_qwen.cpp */
     /* .banks        = */ &k_qwen_bank_ops,
 };

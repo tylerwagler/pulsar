@@ -129,11 +129,18 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     /* the loop owns the view from here: it stands at each chunk's end as the chunk lands, so an
      * interrupted sync leaves a valid prefix the next sync extends.  The images are borrowed for it (the
      * family's chunk merges the blocks it owns) and released on every exit. */
+    if (n_images > 0 && !pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images,
+                                                     (uint32_t)prompt->len, &s->sync_identity)) {
+        if (err) snprintf(err, errlen, "%s: the request's image blocks do not read", ops->name);
+        return 1;
+    }
     s->sync_images = n_images > 0 ? images : NULL;
     s->sync_n_images = n_images > 0 ? n_images : 0;
+    s->sync_prompt = n_images > 0 ? prompt : NULL;
     const int rc = ops->prefill(s, prompt, start);
     s->sync_images = NULL;
     s->sync_n_images = 0;
+    s->sync_prompt = NULL;
     if (rc != 1) sync_note_images(s, prompt, images, n_images, (uint32_t)s->checkpoint.len);
     else s->live_images.n = 0;
     if (rc == 1 && err) snprintf(err, errlen, "%s: prefill refused (see the log for the op)", ops->name);

@@ -2225,6 +2225,14 @@ bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *pr
  *  family's assembly over its tower output, the tower run at most once per image per process (the cache). */
 bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
                              uint16_t *out, bool *cache_hit, char *err, size_t errlen);
+/** Write `n_rows` rows of `width` bf16 into a [token][stream][width] carrier at chunk row `row0` (of `n_tokens`),
+ *  each replicated into every one of `n_streams` streams -- the hyper-connection expansion both families' models do
+ *  after the embedding (DeepSeek's HC, Qwen's 4 streams).  false, without writing, when it does not fit. */
+bool pulsar_image_write_stream_rows(pulsar_gpu_tensor *carrier, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
+                                    uint32_t n_tokens, uint32_t width, uint32_t n_streams);
+/** The image records of `bank`'s KV: the live bank's (the request's during a sync, whose rows are being written),
+ *  another bank's carry, or NULL (no carry: no images). */
+const pulsar_image_identity *pulsar_session_bank_images(const pulsar_session *s, uint32_t bank, uint32_t live_bank);
 /** Where a family's prefill puts block rows: `n_rows` rows at chunk row `row0` of a chunk of `n_tokens`. */
 typedef bool (*pulsar_image_row_writer)(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
                                         uint32_t n_tokens);
@@ -2269,6 +2277,8 @@ bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, s
 /** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
 bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
 void qwen_vision_pixels_free(qwen_vision_pixels *p);
+/** L268: Qwen's image front (vision_qwen.cpp) -- pulsar_family::vision of PULSAR_FAMILY_QWEN4_EXP. */
+extern const pulsar_family_vision PULSAR_QWEN_IMAGE_FRONT;
 /** Bind the tower's `model.visual.*` tensors (bf16, the tower's dims) when the artifact carries them; *present
  *  says whether it does.  false = it carries a tower that does not bind (said). */
 bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present);
@@ -2454,6 +2464,8 @@ struct pulsar_session {
      *  family's chunk forward merges the blocks it owns (pulsar_image_merge_chunk); NULL / 0 outside a sync. */
     const pulsar_image_ref *sync_images;
     int sync_n_images;
+    const pulsar_tokens *sync_prompt;        ///< ... the prompt their blocks sit in
+    pulsar_image_identity sync_identity;     ///< ... and every block's record (the rows being written, for rope)
     int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
     /** L260 fusion: the last successful fused step's logits block (the caller's
      *  buffer), its decode-row count and its headed rows -- what

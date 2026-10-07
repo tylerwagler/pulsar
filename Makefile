@@ -2427,6 +2427,12 @@ tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_
 tests/vision_qwen_tower_gate: tests/vision_qwen_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# L268: one image question end to end (tests/image_chat_smoke.cpp), graded on the answer's content.
+tests/image_chat_smoke.o: tests/image_chat_smoke.cpp src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/image_chat_smoke.cpp
+tests/image_chat_smoke: tests/image_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/vision_merge_gate: tests/vision_merge_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 

@@ -247,3 +247,107 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
     if (dbg) *dbg = d;
     return true;
 }
+
+/* ---- Qwen's image front (L268; pulsar_family_vision, family.h) ------------------------------------------------
+ *
+ * A Qwen image is `<|vision_start|>` + (h' x w') `<|image_pad|>` + `<|vision_end|>` -- all in the vocabulary.  The
+ * BLOCK is the run of pads (vision_start / vision_end are text: they embed as tokens and take text positions, as
+ * HF's get_rope_index has them); the pads' rows are the merger's output, row-major over the merged grid
+ * (h' = grid_h / 2, w' = grid_w / 2), which is also the grid their multi-axis rope positions follow. */
+
+static int32_t qwen_pad_id(const pulsar_engine *e) {
+    return e && e->qwen_weights ? e->qwen_weights->vision_pad_id : -1;
+}
+
+static bool qwen_image_is_sentinel(const pulsar_engine *e, int32_t id) {
+    const int32_t pad = qwen_pad_id(e);
+    return pad >= 0 && id == pad;
+}
+
+static bool qwen_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
+    const int32_t pad = qwen_pad_id(e);
+    if (pad < 0 || !ids || start < 0 || start >= n || ids[start] != pad || (start > 0 && ids[start - 1] == pad))
+        return false;
+    int k = start;
+    while (k < n && ids[k] == pad) k++;
+    *len = k - start;
+    return true;
+}
+
+static int qwen_image_placeholder_id(const pulsar_engine *e) { return qwen_pad_id(e); }
+
+/* The merged grid of an image -- smart_resize's patch grid over the merge -- decoded once per image per process
+ * (keyed by content: the licence, the identity and the expansion all ask). */
+static struct { uint64_t key; size_t len; uint32_t h, w; } g_qwen_grid[16];
+static int g_qwen_grid_n = 0, g_qwen_grid_next = 0;
+
+static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, uint32_t *h, uint32_t *w) {
+    const uint64_t key = pulsar_image_content_hash(img);
+    for (int i = 0; i < g_qwen_grid_n; i++)
+        if (g_qwen_grid[i].key == key && g_qwen_grid[i].len == img->len) {
+            *h = g_qwen_grid[i].h;
+            *w = g_qwen_grid[i].w;
+            return true;
+        }
+    uint8_t *rgb = NULL;
+    int iw = 0, ih = 0;
+    if (!img->bytes || !vision_decode_rgb(img->bytes, img->len, &rgb, &iw, &ih)) return false;
+    free(rgb);
+    int rh = 0, rw = 0;
+    char err[128];
+    if (!qwen_vision_smart_resize(ih, iw, &rh, &rw, err, sizeof err)) return false;
+    const uint32_t f = PULSAR_QWEN_VISION_PATCH * PULSAR_QWEN_VISION_MERGE;
+    *h = (uint32_t)rh / f;
+    *w = (uint32_t)rw / f;
+    const int slot = g_qwen_grid_n < 16 ? g_qwen_grid_n++ : (g_qwen_grid_next++ % 16);
+    g_qwen_grid[slot].key = key;
+    g_qwen_grid[slot].len = img->len;
+    g_qwen_grid[slot].h = *h;
+    g_qwen_grid[slot].w = *w;
+    return true;
+}
+
+static bool qwen_image_expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *out, char *err,
+                              size_t errlen) {
+    uint32_t h = 0, w = 0;
+    if (!qwen_image_grid(e, img, &h, &w)) {
+        snprintf(err, errlen, "an image could not be decoded or is not one the vision tower accepts");
+        return false;
+    }
+    for (uint32_t i = 0; i < h * w; i++) pulsar_tokens_push(out, qwen_pad_id(e));
+    return true;
+}
+
+static uint32_t qwen_image_row_width(const pulsar_engine *) { return PULSAR_QWEN_VISION_OUT; }
+
+static bool qwen_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+                                  const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
+                                  uint16_t *out, char *err, size_t errlen) {
+    if (!tower) {
+        uint16_t *rows = NULL;
+        int n = 0;
+        if (!qwen_vision_encode(&e->qwen_weights->vision, img->bytes, img->len, &rows, &n, NULL, NULL, err, errlen))
+            return false;
+        *tower_out = rows;
+        *n_tower_out = n;
+        tower = rows;
+        n_tower = n;
+    }
+    if (n_tower != block_len) {
+        snprintf(err, errlen, "the tower made %d rows for a %d-pad block", n_tower, block_len);
+        return false;
+    }
+    memcpy(out, tower, (size_t)block_len * PULSAR_QWEN_VISION_OUT * sizeof(uint16_t));
+    return true;
+}
+
+const pulsar_family_vision PULSAR_QWEN_IMAGE_FRONT = {
+    /* .is_sentinel      = */ qwen_image_is_sentinel,
+    /* .block_extent     = */ qwen_image_block_extent,
+    /* .placeholder_text = */ "<|vision_start|><|image_pad|><|vision_end|>",
+    /* .placeholder_id   = */ qwen_image_placeholder_id,
+    /* .expand           = */ qwen_image_expand,
+    /* .row_width        = */ qwen_image_row_width,
+    /* .block_rows       = */ qwen_image_block_rows,
+    /* .grid             = */ qwen_image_grid,
+};
