@@ -278,7 +278,8 @@ static int qwen_image_placeholder_id(const pulsar_engine *e) { return qwen_pad_i
 
 /* The merged grid of an image -- smart_resize's patch grid over the merge -- decoded once per image per process
  * (keyed by content: the licence, the identity and the expansion all ask). */
-static struct { uint64_t key; size_t len; uint32_t h, w; } g_qwen_grid[16];
+struct qwen_grid_entry { uint64_t key; size_t len; uint32_t h, w; };
+static qwen_grid_entry g_qwen_grid[16];
 static int g_qwen_grid_n = 0, g_qwen_grid_next = 0;
 
 static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, uint32_t *h, uint32_t *w) {
