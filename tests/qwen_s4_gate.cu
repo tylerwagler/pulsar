@@ -86,7 +86,10 @@ static linear make_linear(int in, int out, int k2) {
     return l;
 }
 static pulsar_rows_linear dev_linear(const linear &l) {
-    pulsar_rows_linear d;
+    /* value-initialised: sf NULL (EXL3) and prompt false (the decode widths' GEMV).  It was `d;` -- prompt was
+     * whatever the stack held, so the shared expert took the prefill GEMM at decode width once a refactor moved
+     * the frame (L272 P4c: every T = 5 row off by ~1e-3, the one-plane GEMM's envelope). */
+    pulsar_rows_linear d{};
     d.w = up(l.bytes); d.k2 = l.k2; d.in = l.in; d.out = l.out;
     return d;
 }
