@@ -234,6 +234,8 @@ int pulsar_engine_vocab_size(pulsar_engine *e);
  * check it against pulsar_engine_vocab_size. */
 int pulsar_engine_logits_width(const pulsar_engine *e);
 const char *pulsar_engine_model_name(pulsar_engine *e);
+/** The id the API serves the loaded model as -- the family's (L284: was a family switch in the server). */
+const char *pulsar_engine_served_model_id(const pulsar_engine *e);
 /** Does the loaded model use the V4.1 conversation TEMPLATE?  The server's chat
  * renderer needs the fact: V4 (0731) and V4.1 were trained on different
  * templates -- the DSML tag spelling, the tools-prompt text, where the tool

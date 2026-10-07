@@ -255,6 +255,7 @@ void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
 int pulsar_engine_logits_width(const pulsar_engine *e) { return e ? e->logits_width() : 0; }
 const char *pulsar_engine_model_name(pulsar_engine *e) { return e->model_name(); }
+const char *pulsar_engine_served_model_id(const pulsar_engine *e) { return e->family->served_model_id(e); }
 /* The loaded shape IS the authority (pulsar_select_shape_from_metadata sets it
  * once at load); `e` is taken so a caller must hold the engine it is asking
  * about, exactly like the other engine facts.  One fact, one name: the chat
@@ -563,6 +564,15 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
     if (e && e->tp && pulsar_tp_rank(e->tp) != 0) {
         fprintf(stderr, "pulsar: tp: rank %d is a worker; it does not create sessions -- "
                         "it runs pulsar_tp_worker_run\n", pulsar_tp_rank(e->tp));
+        if (out) *out = NULL;
+        return 1;
+    }
+    /* L284: a context past the model's trained positions runs positions it never saw -- a silently degraded
+     * answer, not an error -- so it is refused here, once, for every family */
+    const uint64_t trained = e ? e->family->trained_context(e) : 0;
+    if (e && ctx_size > 0 && (uint64_t)ctx_size > trained) {
+        fprintf(stderr, "pulsar: a %d-token context is past %s's trained %" PRIu64 " positions -- refusing "
+                        "(no position scaling extends it)\n", ctx_size, e->family->name, trained);
         if (out) *out = NULL;
         return 1;
     }

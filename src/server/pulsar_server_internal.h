@@ -2659,6 +2659,15 @@ bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
+struct chat_conversation;
+/** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
+ *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) then the schemas
+ *  Responses input items loaded (tool_search output).  Appended to `out`; every family renders from this. */
+void conversation_tool_schema_lines(const struct chat_conversation *c, buf *out);
+/** L284: schema lines as an OpenAI tools array ([{"type":"function","function":{name, description, parameters}}]),
+ *  for a template that renders OpenAI's shape (Qwen).  A line's parameters are `parameters` or, Anthropic-shaped,
+ *  `input_schema`.  malloc'd; NULL + err when a line has no name. */
+char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 /* Attach one inline image block to `msg` and write its placeholder into `out`.

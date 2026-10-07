@@ -509,11 +509,8 @@ bool model_alias_enables_thinking(const char *model) {
 
 
 const char *server_model_id_from_engine(pulsar_engine *engine) {
-    /* L251: the family is fixed at load (like the shape id), so this stays a
-     * plain read of immutable engine state on the client threads. */
-    if (pulsar_engine_family(engine) == PULSAR_FAMILY_ID_QWEN4_EXP) return "qwen3.8-flash-next";
-    return pulsar_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads */
+    return pulsar_engine_served_model_id(engine);
 }
 
 const char *server_served_model_id(const server *s) {
@@ -1467,6 +1464,53 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
  * already-direct schemas unchanged. Responses can additionally group tools in a
  * namespace item; those are flattened for DSML prompt rendering while preserving
  * their client-facing name and namespace for response output. */
+void conversation_tool_schema_lines(const chat_conversation *c, buf *out) {
+    if (c->tool_schemas && c->tool_schemas[0]) buf_puts(out, c->tool_schemas);
+    if (c->loaded_tool_schemas.len) {
+        if (out->len) buf_putc(out, '\n');
+        buf_append(out, c->loaded_tool_schemas.ptr, c->loaded_tool_schemas.len);
+    }
+}
+
+char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    int n = 0;
+    for (size_t at = 0; at < len;) {
+        const char *nl = (const char *)memchr(lines + at, '\n', len - at);
+        const size_t end = nl ? (size_t)(nl - lines) : len;
+        std::string line(lines + at, end - at);
+        at = end + 1;
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        char *name = json_object_member_raw(line.c_str(), "name");
+        char *desc = json_object_member_raw(line.c_str(), "description");
+        char *params = json_object_member_raw(line.c_str(), "parameters");
+        if (!params) params = json_object_member_raw(line.c_str(), "input_schema");
+        if (!name) {
+            snprintf(err, errlen, "tool %d has no name", n);
+            free(desc);
+            free(params);
+            buf_free(&out);
+            return NULL;
+        }
+        buf_puts(&out, n++ ? ", " : "");
+        buf_puts(&out, "{\"type\": \"function\", \"function\": {\"name\": ");
+        buf_puts(&out, name);
+        if (desc) {
+            buf_puts(&out, ", \"description\": ");
+            buf_puts(&out, desc);
+        }
+        buf_puts(&out, ", \"parameters\": ");
+        buf_puts(&out, params ? params : "{}");
+        buf_puts(&out, "}}");
+        free(name);
+        free(desc);
+        free(params);
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     json_ws(p);
     if (json_lit(p, "null")) {

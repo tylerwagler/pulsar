@@ -672,9 +672,12 @@ static int qwen_quant_bits(pulsar_engine *e) {
     return bits;
 }
 static const char *qwen_model_name(const pulsar_engine *) { return g_qwen_shape.name; }
+static const char *qwen_served_model_id(const pulsar_engine *) { return "qwen3.8-flash-next"; }
 static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSAR_CHAT_QWEN; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's two profiles. */
 static int qwen_model_id(const pulsar_engine *) { return 2; }
+/* no position scaling yet (L280): the trained positions are the limit */
+static uint64_t qwen_trained_context(const pulsar_engine *) { return g_qwen_shape.max_position; }
 
 /* ---- session state ------------------------------------------------------------ */
 
@@ -1537,8 +1540,10 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
     /* .model_name   = */ qwen_model_name,
+    /* .served_id    = */ qwen_served_model_id,
     /* .chat_format  = */ qwen_chat_format,
     /* .model_id     = */ qwen_model_id,
+    /* .trained_ctx  = */ qwen_trained_context,
     /* .tp_shape     = */ qwen_tp_shape,
     /* .drafter      = */ qwen_drafter,
     /* .quant_bits   = */ qwen_quant_bits,

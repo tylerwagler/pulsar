@@ -62,6 +62,9 @@ static void ds4_tp_shape(const pulsar_engine *, uint32_t *n_layer, uint32_t *n_e
 }
 
 static const char *ds4_model_name(const pulsar_engine *) { return PULSAR_MODEL_SHAPE_NAME; }
+static const char *ds4_served_model_id(const pulsar_engine *) {
+    return PULSAR_MODEL_VARIANT == 1 ? "deepseek-v4-pro" : "deepseek-v4-flash";
+}
 
 /* The conversation format follows the profile: 0731 has its own template,
  * Vision-Exp and V4.1 share one (pulsar_shape::variant). */
@@ -72,6 +75,10 @@ static pulsar_chat_format ds4_chat_format(const pulsar_engine *) {
 /* 0 and 1 are the two profiles' ids since before families existed; disk-KV
  * files carry them. */
 static int ds4_model_id(const pulsar_engine *) { return (int)PULSAR_MODEL_VARIANT; }
+/* YaRN: the original context the rope was trained at, times the scaling factor (both validated at load) */
+static uint64_t ds4_trained_context(const pulsar_engine *) {
+    return (uint64_t)((double)PULSAR_ROPE_ORIG_CTX * (double)PULSAR_ROPE_SCALE_FACTOR);
+}
 
 static int ds4_sync(pulsar_session *s, const pulsar_tokens *prompt,
                     const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
@@ -148,8 +155,10 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .after_gpu    = */ pulsar_ds4_family_after_gpu,
     /* .logits_width = */ ds4_logits_width,
     /* .model_name   = */ ds4_model_name,
+    /* .served_id    = */ ds4_served_model_id,
     /* .chat_format  = */ ds4_chat_format,
     /* .model_id     = */ ds4_model_id,
+    /* .trained_ctx  = */ ds4_trained_context,
     /* .tp_shape     = */ ds4_tp_shape,
     /* .drafter      = */ ds4_drafter,
     /* .quant_bits   = */ ds4_quant_bits,

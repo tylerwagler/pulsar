@@ -236,8 +236,14 @@ struct pulsar_family {
     /** Engine facts that depend on the loaded shape. */
     uint32_t (*logits_width)(const pulsar_engine *e);
     const char *(*model_name)(const pulsar_engine *e);
+    /** The id the API serves the model as (`model` in responses and /v1/models). */
+    const char *(*served_model_id)(const pulsar_engine *e);
     pulsar_chat_format (*chat_format)(const pulsar_engine *e);
     int (*model_id)(const pulsar_engine *e);
+    /** The longest context the loaded model's positions were trained for, with whatever position scaling the
+     *  family implements (DeepSeek: YaRN's original context x factor; Qwen: max_position_embeddings until L280's
+     *  YaRN).  pulsar_session_create refuses a larger one (L284: past it a session ran untrained positions). */
+    uint64_t (*trained_context)(const pulsar_engine *e);
     /** The tensor-parallel transport's shape (L266): exchange slots per step (layers), the row width an
      *  all-reduce moves, and the vocab -- the TP identity and the slab are sized by it. */
     void (*tp_shape)(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab);

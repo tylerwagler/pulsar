@@ -147,11 +147,7 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
                             size_t errlen) {
     /* Responses can also carry schemas in its input items (tool_search output). */
     buf schemas = {0};
-    if (c->tool_schemas && c->tool_schemas[0]) buf_puts(&schemas, c->tool_schemas);
-    if (c->loaded_tool_schemas.len) {
-        if (schemas.len) buf_putc(&schemas, '\n');
-        buf_append(&schemas, c->loaded_tool_schemas.ptr, c->loaded_tool_schemas.len);
-    }
+    conversation_tool_schema_lines(c, &schemas);
     r->has_tools = c->tool_choice != CHAT_TOOL_CHOICE_NONE && schemas.len;
     if (r->api == API_ANTHROPIC) anthropic_fold_tool_results(&c->msgs);
     render_prelude(s, c, r);
@@ -306,78 +302,6 @@ static bool qwen_resolve(pulsar_engine *, const chat_conversation *c, request *r
     return true;
 }
 
-/* An Anthropic or Responses tools array in the shape the template renders (OpenAI's:
- * {"type":"function","function":{"name","description","parameters"}}), each value's JSON as the client
- * wrote it.  Anthropic's server tools (web search) are dropped as for every family; a Responses tool
- * that is not a function (namespace, tool_search, ...) is refused by name. */
-static char *qwen_tools_openai_shape(const chat_conversation *c, api_style api, char *err, size_t errlen) {
-    const char *p = c->tools_raw;
-    json_ws(&p);
-    if (*p != '[') {
-        snprintf(err, errlen, "tools: an array is required");
-        return NULL;
-    }
-    p++;
-    buf out = {0};
-    buf_putc(&out, '[');
-    int n = 0;
-    for (int i = 0;; i++) {
-        json_ws(&p);
-        if (*p == ']') break;
-        char *raw = NULL;
-        if (!json_raw_value(&p, &raw)) {
-            buf_free(&out);
-            return NULL;
-        }
-        json_ws(&p);
-        if (*p == ',') p++;
-        if (api == API_ANTHROPIC && anthropic_server_tool_entry(raw)) {
-            free(raw);
-            continue;
-        }
-        if (api == API_RESPONSES) {
-            char *type = json_object_member_raw(raw, "type");
-            const bool function = type && !strcmp(type, "\"function\"");
-            if (!function) {
-                snprintf(err, errlen, "tools.%d: a %s tool is not served for the Qwen family (function tools only)", i,
-                         type ? type : "typeless");
-                free(type);
-                free(raw);
-                buf_free(&out);
-                return NULL;
-            }
-            free(type);
-        }
-        char *name = json_object_member_raw(raw, "name");
-        char *desc = json_object_member_raw(raw, "description");
-        char *params = json_object_member_raw(raw, api == API_ANTHROPIC ? "input_schema" : "parameters");
-        if (!name) {
-            snprintf(err, errlen, "tools.%d: a tool needs a name", i);
-            free(raw);
-            free(desc);
-            free(params);
-            buf_free(&out);
-            return NULL;
-        }
-        buf_puts(&out, n++ ? ", " : "");
-        buf_puts(&out, "{\"type\": \"function\", \"function\": {\"name\": ");
-        buf_puts(&out, name);
-        if (desc) {
-            buf_puts(&out, ", \"description\": ");
-            buf_puts(&out, desc);
-        }
-        buf_puts(&out, ", \"parameters\": ");
-        buf_puts(&out, params ? params : "{}");
-        buf_puts(&out, "}}");
-        free(raw);
-        free(name);
-        free(desc);
-        free(params);
-    }
-    buf_putc(&out, ']');
-    return buf_take(&out);
-}
-
 /* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
  * offsets, not the spelling, are the authority) and where each image sits in what is left. */
 struct qwen_msg_images {
@@ -458,18 +382,22 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
  * with the family's markers; the tools in the template's shape, typed for the output parser.  A forced
  * tool_choice prefills the turn into an open <tool_call> (qwen_forced_call_prefill); a tool-result-only
  * request continues the live KV with the family's tail (render_prelude).  Images are the template's vision
- * literal in place (L268), expanded by the core's walk.  Refused by name: tools loaded by tool_search (the
- * template renders one tools array). */
+ * literal in place (L268), expanded by the core's walk.  The tools are the conversation's schema lines -- every
+ * protocol's kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape; an OpenAI request's
+ * array goes to the template as sent (HF's input). */
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
-    if (c->loaded_tool_schemas.len) {
-        snprintf(err, errlen, "tools loaded by tool_search are not served for the Qwen family");
-        return false;
-    }
-    if (c->tools_raw && c->tool_choice != CHAT_TOOL_CHOICE_NONE) {
-        r->qwen_tools_json = r->api == API_OPENAI ? xstrdup(c->tools_raw)
-                                                  : qwen_tools_openai_shape(c, r->api, err, errlen);
-        if (!r->qwen_tools_json) return false;
+    if (c->tool_choice != CHAT_TOOL_CHOICE_NONE) {
+        if (r->api == API_OPENAI && c->tools_raw) {
+            r->qwen_tools_json = xstrdup(c->tools_raw);
+        } else {
+            buf lines = {0};
+            conversation_tool_schema_lines(c, &lines);
+            if (lines.len) r->qwen_tools_json = tool_schema_lines_openai_tools(lines.ptr, lines.len, err, errlen);
+            const bool failed = lines.len && !r->qwen_tools_json;
+            buf_free(&lines);
+            if (failed) return false;
+        }
     }
     r->has_tools = r->qwen_tools_json != NULL;
     render_prelude(s, c, r);

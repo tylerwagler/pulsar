@@ -6487,6 +6487,28 @@ static void test_l179_tool_admission_is_bound_decode_only(void) {
     }
 }
 
+/* L284: schema lines (every protocol's tools, tool_search's loads) become the OpenAI tools array a template like
+ * Qwen's renders: a function line keeps its parameters, an Anthropic-shaped line's input_schema becomes them, a
+ * line without description stays without, blank lines are skipped, a nameless line is refused. */
+static void test_l284_schema_lines_openai_tools(void) {
+    const char lines[] =
+        "{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\"}}\n"
+        "\n"
+        "{\"name\":\"Read\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}\n";
+    char err[200] = "";
+    char *json = tool_schema_lines_openai_tools(lines, sizeof lines - 1, err, sizeof err);
+    TEST_ASSERT(json != NULL);
+    if (json)
+        TEST_ASSERT(!strcmp(json,
+                            "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": "
+                            "\"Weather\", \"parameters\": {\"type\":\"object\"}}}, {\"type\": \"function\", "
+                            "\"function\": {\"name\": \"Read\", \"parameters\": {\"type\":\"object\",\"properties\":"
+                            "{\"path\":{\"type\":\"string\"}}}}}]"));
+    free(json);
+    const char nameless[] = "{\"description\":\"x\",\"parameters\":{}}";
+    TEST_ASSERT(tool_schema_lines_openai_tools(nameless, sizeof nameless - 1, err, sizeof err) == NULL && err[0]);
+}
+
 /* L282: a slot that reached GEN_DONE without a step (a prefill the decode quantum abandoned) is released by the
  * next service -- no step, the job detached and its client woken.  Before, the batched branch's classic step skipped
  * it forever: the finish sat inside the `phase != GEN_DONE` guard. */
@@ -8409,6 +8431,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_tool_admission_is_bound_decode_only();
     test_l179_deep_guard_blocks_two_deep_decoders();
     test_l282_done_slot_is_released();
+    test_l284_schema_lines_openai_tools();
     test_l179_bank_floor_exempts_first_bank();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
