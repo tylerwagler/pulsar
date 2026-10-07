@@ -101,6 +101,11 @@ static int ds4_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, 
 }
 
 static void ds4_invalidate(pulsar_session *s) { s->invalidate(); }
+static int ds4_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                            const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                            char *err, size_t errlen) {
+    return s->decode_fused(reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
+}
 
 static const pulsar_family_session_ops k_ds4_session_ops = {
     /* .create          = */ pulsar_ds4_session_create,
@@ -111,6 +116,7 @@ static const pulsar_family_session_ops k_ds4_session_ops = {
     /* .decode_multiseq = */ ds4_decode_multiseq,
     /* .decode_mixed    = */ ds4_decode_mixed,
     /* .invalidate      = */ ds4_invalidate,
+    /* .decode_fused    = */ ds4_decode_fused,
 };
 
 /* L281: DeepSeek's image geometry -- a sentinel is `vocab_size + role`, and a block is compressor pads, IMAGE_START,

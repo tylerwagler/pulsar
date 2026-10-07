@@ -155,6 +155,12 @@ typedef struct {
                         uint32_t max_head_runs, char *err, size_t errlen);
     /** Forget the session's state (the next sync prefills cold). */
     void (*invalidate)(pulsar_session *s);
+    /** The fused step (pulsar_session_decode_fused, contract in pulsar.h): decode rows and prompt runs in one
+     *  forward, each run's last row headed on request.  NULL = the family has none (L284: Qwen until its
+     *  increments land); pulsar_engine_has_fused_step is this op's presence. */
+    int (*decode_fused)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                        const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                        char *err, size_t errlen);
 } pulsar_family_session_ops;
 
 /** A family's tokenizer and chat front (L272 P2): what the public tokenizer entries (tokenizer.cpp) do on

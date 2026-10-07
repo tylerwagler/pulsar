@@ -322,7 +322,7 @@ int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_qua
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
-bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && !e->family->banks; }
+bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
 bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
@@ -935,13 +935,14 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
                                 uint32_t *out_n_rows, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
-    /* the fused step is the DeepSeek graph pool's; a family bank pool runs its own mixed decode */
+    /* a family without the op has no fused step (its prompt rows take the classic sync) */
     if (!pulsar_engine_has_fused_step(s->engine)) {
         snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return s->decode_fused(reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
+    const auto fused = s->engine->family->session->decode_fused;
+    if (!tp) return fused(s, reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "the fused step", err, errlen)) return 1;
     if (tp_mirror_dead(tp, err, errlen)) return 1;
     if (!reqs || n_rows == 0 || !shape) {
@@ -956,7 +957,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     free(items);
     if (!tp_mirror_sent(tp, "fused batch", sent, err, errlen)) return 1;
     uint32_t got = 0;
-    const int body_rc = s->decode_fused(reqs, n_rows, shape, logits, logits_cap, &got, err, errlen);
+    const int body_rc = fused(s, reqs, n_rows, shape, logits, logits_cap, &got, err, errlen);
     if (out_n_rows) *out_n_rows = got;
     if (body_rc != 0) {
         pulsar_tp_drain_command_acks(tp);

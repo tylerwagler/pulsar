@@ -451,7 +451,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 heads += shape->head_last[r] ? 1u : 0u;
             int cap = 0;
             logits = worker_logits(e, slot, shape->n_dec + heads, &cap);
-            rc = slot->s->decode_fused(rows, c->n_items, shape, logits, cap, &out_rows, ferr, sizeof(ferr));
+            rc = pulsar_engine_has_fused_step(slot->s->engine)
+                     ? slot->s->engine->family->session->decode_fused(slot->s, rows, c->n_items, shape, logits, cap,
+                                                                     &out_rows, ferr, sizeof(ferr))
+                     : (snprintf(ferr, sizeof ferr, "%s: no fused step", slot->s->engine->family->name), 1);
             free(rows);
         }
         if (rc != 0) {

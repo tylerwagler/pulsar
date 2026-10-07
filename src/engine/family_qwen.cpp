@@ -1521,6 +1521,7 @@ static const pulsar_family_session_ops k_qwen_session_ops = {
     /* .decode_multiseq = */ qwen_session_decode_multiseq,
     /* .decode_mixed    = */ qwen_session_decode_mixed,
     /* .invalidate      = */ qwen_session_invalidate,
+    /* .decode_fused    = */ NULL,   /* L284 #2: the increments in rows/L284.md */
 };
 
 /* The trunk's layers and the MTP layer each take an exchange slot (L266 step 7). */
