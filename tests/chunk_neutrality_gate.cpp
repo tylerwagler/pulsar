@@ -341,7 +341,7 @@ int GATE_ENTRY(int argc, char **argv) {
          *               from the view's end (0 = a fresh session prefills from 0), anything else resumes from the
          *               deepest grid checkpoint it shares.
          * The bytes are graded the same way on both: every schedule == A, frontier row and one decode step. */
-        enum { NEED_SNAPSHOT = 1, NEED_REWIND = 2 };
+        constexpr unsigned NEED_SNAPSHOT = 1u, NEED_REWIND = 2u;
         struct { const char *label; int first; int evals; int origin; int origin_ext; bool via_snapshot; int cut; int restore; int segments; int share; unsigned needs; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
