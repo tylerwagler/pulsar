@@ -165,8 +165,10 @@ int main(int argc, char **argv) {
                 ok4 = pulsar_session_eval(sess, pulsar_session_argmax(sess), err4, sizeof err4) == 0;
             if (ok4) {
                 pulsar_session_rewind(sess, pulsar_session_pos(sess) - 1);   /* the ghost token */
+                /* the installed bank's flag (pulsar_session_bank_comp_stale answers for a bank POOL; this session
+                 * is classic, one bank) */
                 step = "stale after the ghost rewind";
-                ok4 = pulsar_session_bank_comp_stale(sess, 0);
+                ok4 = sess->graph->ms_comp_state_stale[gpu_graph_cur_bank(sess->graph)];
             }
             if (ok4) {
                 const pulsar_tokens *live = pulsar_session_tokens(sess);
