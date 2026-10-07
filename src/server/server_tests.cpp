@@ -6409,6 +6409,34 @@ static void test_l179_tool_admission_is_bound_decode_only(void) {
     }
 }
 
+/* L282: a slot that reached GEN_DONE without a step (a prefill the decode quantum abandoned) is released by the
+ * next service -- no step, the job detached and its client woken.  Before, the batched branch's classic step skipped
+ * it forever: the finish sat inside the `phase != GEN_DONE` guard. */
+static void test_l282_done_slot_is_released(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    s.n_slots = 2;
+    s.n_generating = 1;
+    job j;
+    memset(&j, 0, sizeof j);
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    session_slot *sl = &s.slots[1];
+    sl->provisioned = true;
+    sl->bank = 1;
+    sl->state = SLOT_PREFILLING;
+    sl->active_job = &j;
+    sl->gen = (gen_state *)calloc(1, sizeof(gen_state));
+    sl->gen->j = &j;
+    sl->gen->phase = GEN_DONE;
+    s.worker_service_slot(sl);
+    TEST_ASSERT(sl->gen == NULL && sl->active_job == NULL && sl->state == SLOT_IDLE);
+    TEST_ASSERT(j.done && s.n_generating == 0);
+    TEST_ASSERT(sl->bank == 1);   /* the bank stays the slot's: a quantum's save after an abandon reads it */
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+}
+
 /* L179 branch 12 -- fused-prefill deep-concurrency guard
  * (worker_find_fuse_prefill). Invariant: the fuse is refused iff at least two
  * provisioned, bound, SLOT_DECODING slots sum committed depth STRICTLY above
@@ -8300,6 +8328,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();
     test_l179_deep_guard_blocks_two_deep_decoders();
+    test_l282_done_slot_is_released();
     test_l179_bank_floor_exempts_first_bank();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
