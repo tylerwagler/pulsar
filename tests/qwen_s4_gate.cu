@@ -492,6 +492,41 @@ static void section_ple(void) {
     size_t moved = 0;
     for (size_t i = 0; i < mut.size(); i++) moved += mut[i] != batch_out[i];
     CHECK(rc == 0 && moved > 0, "mutation: one conv tap moved %zu outputs", moved);
+
+    /* L272 P1 S4: the verify capture over several sequences -- batch B (runs of 1, 7 and 2 rows, one per
+     * bank) with state_rows: the state captured after row j of sequence q (at batch row sf[q] + j, every
+     * row but each sequence's last) == the state a batch of just that sequence's first j + 1 rows leaves */
+    {
+        const size_t slot_f = (size_t)PULSAR_QWEN_PLE_STATE * HC;
+        float *cap = (float *)dalloc((size_t)T * slot_f * 4);
+        CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+        pulsar_qwen_rows pc = pr;
+        pc.state_rows = cap;
+        rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pc, state, ws, wsb, 0);
+        const auto captured = down(cap, (size_t)T * slot_f);
+        bool same_all = rc == 0;
+        int compared = 0;
+        for (int q = 0; q < n_seq; q++) {
+            for (int j = 0; j + 1 < rowsB[q]; j++) {
+                CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+                std::vector<int32_t> pj(j + 1), pz(j + 1, 0);
+                for (int i = 0; i <= j; i++) pj[i] = i;
+                const std::vector<int32_t> zero = {0}, len = {j + 1}, bank = {q};
+                pulsar_qwen_rows p1 = {up(pz), up(pj), up(zero), up(len), up(bank), 1};
+                rc |= pulsar_qwen_ple_launch(&w, de + (size_t)sf[q] * H, ds + (size_t)sf[q] * HC, j + 1, &p1, state, ws,
+                                             wsb, 0);
+                const auto after = down(state, snap.size());
+                same_all = same_all && memcmp(after.data() + (size_t)q * slot_f,
+                                              captured.data() + (size_t)(sf[q] + j) * slot_f, slot_f * 4) == 0;
+                compared++;
+            }
+        }
+        CHECK(rc == 0 && same_all, "verify capture over 3 sequences: %d captured row states == the prefix runs' states",
+              compared);
+        cudaFree(cap);
+    }
 }
 
 /* ======================================================================== */

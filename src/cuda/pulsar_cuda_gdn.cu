@@ -54,6 +54,7 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
                      const uint16_t *__restrict__ A_log,
                      const uint16_t *__restrict__ dt_bias,
                      int seq_rows,
+                     const int32_t *__restrict__ seq_first,
                      const int32_t *__restrict__ row_slot,
                      float *__restrict__ conv_state,
                      float *__restrict__ qkvn,       /* scratch [rows][Sh::QKV] */
@@ -66,8 +67,9 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
     const int head = blockIdx.y;
     const int tid  = threadIdx.x;
     const int ch   = head * 128 + tid;
-    const int r0   = seq * seq_rows;
-    const int T    = seq_rows;
+    const int r0   = seq_first ? seq_first[seq] : seq * seq_rows;
+    const int T    = seq_first ? seq_first[seq + 1] - r0 : seq_rows;
+    if (tg * T1 >= T) return;                 /* a ragged run shorter than the grid's tiles (block-uniform) */
     float *cs = conv_state + (size_t)row_slot[r0] * Sh::CONV_STATE;
 
     /* bf16 -> f32 is a left shift of the 16 stored bits (exact). */
@@ -162,16 +164,22 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
  * call.  Launched before that kernel, so the old state is still in the pool.  grid (T - 1, 80). */
 template <int TP>
 __global__ void __launch_bounds__(128)
-gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, const int32_t *__restrict__ row_slot,
+gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, int seq_rows, const int32_t *__restrict__ seq_first,
+                     const int32_t *__restrict__ row_slot,
                      const float *__restrict__ conv_state, float *__restrict__ conv_rows) {
     using Sh = gdn_shape<TP>;
-    const int r = blockIdx.x, ch = blockIdx.y * 128 + threadIdx.x;
-    const float *cs = conv_state + (size_t)row_slot[0] * Sh::CONV_STATE;
-    float *dst = conv_rows + (size_t)r * Sh::CONV_STATE;
+    /* grid (n_seq x (longest - 1), 80): block (s, r) is row r of sequence s (L272 P1 S4) */
+    const int seq = blockIdx.x / (seq_rows - 1), r = blockIdx.x % (seq_rows - 1);
+    const int ch = blockIdx.y * 128 + threadIdx.x;
+    const int r0 = seq_first ? seq_first[seq] : seq * seq_rows;
+    const int T  = seq_first ? seq_first[seq + 1] - r0 : seq_rows;
+    if (r >= T - 1) return;                   /* the run's last row (the pool's) or past a short run */
+    const float *cs = conv_state + (size_t)row_slot[r0] * Sh::CONV_STATE;
+    float *dst = conv_rows + (size_t)(r0 + r) * Sh::CONV_STATE;
     #pragma unroll
     for (int j = 0; j < 3; j++) {
         const int p = r - 2 + j;
-        dst[j * Sh::QKV + ch] = p >= 0 ? qkv[(size_t)p * ld_qkv + ch] : cs[(3 + p) * Sh::QKV + ch];
+        dst[j * Sh::QKV + ch] = p >= 0 ? qkv[(size_t)(r0 + p) * ld_qkv + ch] : cs[(3 + p) * Sh::QKV + ch];
     }
 }
 
@@ -205,6 +213,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const float *__restrict__ z, int ld_z,
                       const uint16_t *__restrict__ norm_w,
                       int seq_rows,
+                      const int32_t *__restrict__ seq_first,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
                       float *__restrict__ rec_rows,
@@ -230,8 +239,8 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
     const int w    = tid >> 5;
     const int lane = tid & 31;
     const int col  = qr * 32 + lane;                      /* column within the head */
-    const int r0   = seq * seq_rows;
-    const int T    = seq_rows;
+    const int r0   = seq_first ? seq_first[seq] : seq * seq_rows;
+    const int T    = seq_first ? seq_first[seq + 1] - r0 : seq_rows;
 
     float *S = rec_state + (size_t)row_slot[r0] * Sh::REC_STATE + (size_t)h * DK * DV;
     float s[RPW];
@@ -291,7 +300,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
             #pragma unroll
             for (int i = 0; i < RPW; i++) s[i] = fmaf(kr[i], d, dec * s[i]);
             if (rec_rows && t0 + j < T - 1) {               /* the verify capture: S after this row */
-                float *R = rec_rows + (size_t)(t0 + j) * Sh::REC_STATE + (size_t)h * DK * DV;
+                float *R = rec_rows + (size_t)(r0 + t0 + j) * Sh::REC_STATE + (size_t)h * DK * DV;
                 #pragma unroll
                 for (int i = 0; i < RPW; i++) R[(w * RPW + i) * DV + col] = s[i];
             }
@@ -358,7 +367,7 @@ namespace {
 template <int TP>
 int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaStream_t stream) {
     using Sh = gdn_shape<TP>;
-    const int rows = c->n_seq * c->seq_rows;
+    const int rows = c->seq_first ? c->n_rows : c->n_seq * c->seq_rows;
     if (c->ld_qkv < Sh::QKV || c->ld_z < Sh::VDIM || c->ld_a < Sh::NV || c->ld_b < Sh::NV || (c->ld_qkv & 3) || (c->ld_z & 3))
         return refuse("an input pitch is short or not a multiple of 4 floats");
     if (c->out_e4m3 && (!c->out_scale || c->out_kbp != pulsar_mx_kbp(Sh::VDIM) || ((uintptr_t)c->out_e4m3 & 3u)))
@@ -366,17 +375,17 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
     float *qkvn = static_cast<float *>(c->scratch);
     float *gb   = qkvn + (size_t)rows * Sh::QKV;
     const int tiles = (c->seq_rows + T1 - 1) / T1;
-    if ((c->conv_rows == nullptr) != (c->rec_rows == nullptr) || (c->conv_rows && c->n_seq != 1))
-        return refuse("the verify capture needs both row buffers and one sequence");
+    if ((c->conv_rows == nullptr) != (c->rec_rows == nullptr))
+        return refuse("the verify capture needs both row buffers");
     if (c->conv_rows && c->seq_rows > 1)
-        gdn_conv_rows_kernel<TP><<<dim3((unsigned)(c->seq_rows - 1), Sh::CONV_HEADS), 128, 0, stream>>>(
-            c->qkv, c->ld_qkv, c->row_slot, c->conv_state, c->conv_rows);
+        gdn_conv_rows_kernel<TP><<<dim3((unsigned)(c->n_seq * (c->seq_rows - 1)), Sh::CONV_HEADS), 128, 0, stream>>>(
+            c->qkv, c->ld_qkv, c->seq_rows, c->seq_first, c->row_slot, c->conv_state, c->conv_rows);
 
     gdn_conv_prep_kernel<TP><<<dim3((unsigned)(c->n_seq * tiles), Sh::CONV_HEADS), 128, 0, stream>>>(
         c->qkv, c->ld_qkv, c->a, c->ld_a, c->b, c->ld_b, w->conv_w, w->A_log, w->dt_bias,
-        c->seq_rows, c->row_slot, c->conv_state, qkvn, gb, tiles);
+        c->seq_rows, c->seq_first, c->row_slot, c->conv_state, qkvn, gb, tiles);
     gdn_recur_norm_kernel<TP><<<dim3((unsigned)c->n_seq, Sh::NV, VQ), 256, 0, stream>>>(
-        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->row_slot, c->rec_state, c->rec_rows,
+        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->seq_first, c->row_slot, c->rec_state, c->rec_rows,
         c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
         static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
     const cudaError_t e = cudaGetLastError();
@@ -394,7 +403,9 @@ extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_
     if (((uintptr_t)w->conv_w & 7u) != 0) return refuse("conv_w not 8-byte aligned (a bf16 uint2 row)");
     if (c->n_seq < 1 || c->seq_rows < 1 || (int64_t)c->n_seq * c->seq_rows > (1 << 24))
         return refuse("n_seq / seq_rows out of range");
-    const int rows = c->n_seq * c->seq_rows;
+    if (c->seq_first && (c->n_rows < c->n_seq || c->n_rows > c->n_seq * c->seq_rows))
+        return refuse("ragged runs: n_rows outside [n_seq, n_seq * longest]");
+    const int rows = c->seq_first ? c->n_rows : c->n_seq * c->seq_rows;
     if (!c->row_slot || !c->conv_state || !c->rec_state) return refuse("row_slot or a state pointer is null");
     if (!c->qkv || !c->z || !c->a || !c->b) return refuse("an input pointer is null");
     if (!aligned16(c->qkv) || !aligned16(c->z) || !aligned16(c->rec_state) || !aligned16(c->scratch))

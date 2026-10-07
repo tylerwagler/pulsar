@@ -270,9 +270,10 @@ typedef struct {
 typedef struct {
     const int32_t *row_seq, *row_j, *seq_first, *seq_rows, *seq_bank;
     int n_seq;
-    /** L251 MTP verify (NULL otherwise; set only with n_seq 1): the conv state AFTER each row
-     *  r < rows - 1, [rows - 1][PULSAR_QWEN_PLE_STATE][10240] f32, so a rejected draft rolls back by
-     *  copying row r's back.  The arithmetic is unchanged. */
+    /** L251 MTP verify (NULL otherwise): the conv state AFTER each row of a sequence but its last, at the
+     *  row's batch index (L272 P1 S4: any number of sequences), [rows][PULSAR_QWEN_PLE_STATE][10240] f32 --
+     *  each sequence's last-row slot unused -- so a rejected draft rolls back by copying a row's back.
+     *  The arithmetic is unchanged. */
     float *state_rows;
 } pulsar_qwen_rows;
 
