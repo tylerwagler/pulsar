@@ -58,7 +58,8 @@ uint32_t required_u32(const pulsar_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();   /* L272: the load fails at its stage boundary */
+        return 0;
     }
     return v;
 }

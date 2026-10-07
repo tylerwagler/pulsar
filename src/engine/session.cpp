@@ -386,9 +386,22 @@ static bool tp_register_shared_split(const void *kslice_key, const pulsar_model 
  * target / drafter / vision weight binding -- the steps pulsar_engine::open ran
  * inline until L251, moved here verbatim and in the same order.  Every refusal
  * prints its reason; the caller tears the engine down. */
+/* L272: the loader's one failure policy -- each stage below reports every refusal it finds
+ * (pulsar_load_refuse) and the load stops at the stage's end, so a bad artifact fails
+ * pulsar_engine_open instead of exiting the process. */
+static bool ds4_load_stage_ok(const char *stage) {
+    const uint32_t n = pulsar_load_refusals();
+    if (n == 0) return true;
+    fprintf(stderr, "pulsar: deepseek4: %u refusal(s) in %s -- the model does not load\n", n, stage);
+    return false;
+}
+
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
+    pulsar_load_refusals_reset();
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
+    if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
+    if (!ds4_load_stage_ok("the configuration")) return false;
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
@@ -418,6 +431,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         uint32_t swapped = 0;
         for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
             const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
+            if (!ds4_load_stage_ok("the expert overlay")) return false;
             if (n == 0) {
                 fprintf(stderr, "pulsar: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
                         p);
@@ -429,6 +443,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights, &e->model);
+    if (!ds4_load_stage_ok("the weights")) return false;
     /* the drafter binds before the inspect-only exit so --inspect proves the
      * whole artifact binds, drafter included */
     if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
@@ -437,6 +452,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
          * site reads e->dspark_model, and close is guarded on dspark_external
          * so the shared mapping is only torn down once). */
         dspark_weights_bind(&e->dspark_weights, &e->model);
+        if (!ds4_load_stage_ok("the DSpark drafter")) return false;
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
@@ -448,7 +464,9 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
      * half-present vision stack refuses at load rather than at first image.
      * Absent tower is normal for text-only artifacts and simply leaves
      * vision_ready false; the image path is refused until it is true. */
-    if (vision_weights_bind(&e->vision_weights, &e->model)) {
+    const bool vision = vision_weights_bind(&e->vision_weights, &e->model);
+    if (!ds4_load_stage_ok("the vision tower")) return false;
+    if (vision) {
         e->vision_ready = true;
         fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
                 "patch %u, aligner %ux%d -> %u)\n",

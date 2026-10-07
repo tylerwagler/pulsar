@@ -562,8 +562,14 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     }
     /* L272 B7: the whole-artifact scans DeepSeek's bind runs -- a tensor type no reader takes, a NaN
      * E8M0 scale, a non-finite EXL3 scale -- run for this family's artifact too. */
+    pulsar_load_refusals_reset();   /* L272: the loader's one failure policy (family.cpp) */
     weights_reject_unsupported_types(&e->model);
     weights_reject_bad_e8m0(&e->model);
+    if (pulsar_load_refusals()) {
+        fprintf(stderr, "pulsar: %s: %u refusal(s) in the artifact scans -- the model does not load\n", PULSAR_QWEN_ARCH,
+                pulsar_load_refusals());
+        return false;
+    }
     if (!qwen_bind_weights(&e->model, &g_qwen_shape, &e->plan, e->qwen_weights)) {
         fprintf(stderr, "pulsar: %s: the artifact does not bind -- refusing\n", PULSAR_QWEN_ARCH);
         return false;

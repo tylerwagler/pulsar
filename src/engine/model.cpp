@@ -743,13 +743,15 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
         if (!ov) {
             fprintf(stderr, "pulsar: expert overlay is missing tensor: %.*s\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         if (ov->ndim != t->ndim ||
             memcmp(ov->dim, t->dim, sizeof(ov->dim)) != 0) {
             fprintf(stderr, "pulsar: expert overlay shape mismatch for %.*s\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         if (ov->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
             /* The CUTLASS grouped-GEMM prefill path device-asserts when its
@@ -759,7 +761,8 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
             fprintf(stderr, "pulsar: expert overlay does not support CUTLASS "
                             "type-40 donor tensors yet (%.*s)\n",
                     (int)t->name.len, t->name.ptr);
-            exit(1);
+            pulsar_load_refuse();   /* L272: the family's load fails at its stage boundary */
+            return 0;
         }
         t->type = ov->type;
         t->rel_offset = ov->rel_offset;

@@ -2991,6 +2991,12 @@ extern const pulsar_family_tokenizer k_qwen_tokenizer;
 /** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
 void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
 
+/** L272: the loader's one failure policy (family.cpp): count a refusal (said by the caller where it was
+ *  found); the family's load checks the count at each stage boundary and fails cleanly. */
+void pulsar_load_refuse(void);
+uint32_t pulsar_load_refusals(void);
+void pulsar_load_refusals_reset(void);
+
 /** L272 P4a: the mechanics of a family's weight binder (tensor_bind.cpp) -- report the same way for every
  *  family and return the verdict; the binder keeps its failure policy.  `owner` names the family in the
  *  message.  The required tensor `name`, or NULL (said). */

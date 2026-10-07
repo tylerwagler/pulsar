@@ -487,7 +487,8 @@ int pulsar_vocab::vocab_lookup(const char *text) const {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "pulsar: required tokenizer token is missing: %s\n", text);
-        exit(1);
+        pulsar_load_refuse();   /* L272: load time only (vocab_load); the load fails at its stage boundary */
+        return -1;
     }
     return token;
 }

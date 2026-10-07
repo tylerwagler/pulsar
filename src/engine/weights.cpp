@@ -7,7 +7,8 @@ static float required_f32(const pulsar_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0.0f;
     }
     return v;
 }
@@ -18,7 +19,8 @@ static bool required_bool(const pulsar_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return false;
     }
     return v;
 }
@@ -28,10 +30,13 @@ static bool required_bool(const pulsar_model *m, const char *key) {
 /* The family's binders stop at the first refusal (L272 P4a: the find / dims / format mechanics are the
  * core's, tensor_bind.cpp). */
 static const char *const DS4_OWNER = "deepseek4";
+/* L272: a missing required tensor binds to this inert, zeroed tensor (refused once, where it was looked
+ * up), so the binder finishes and reports every problem; the load fails at its stage boundary. */
+static pulsar_tensor g_ds4_absent;
 
 static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
     pulsar_tensor *t = pulsar_tensor_bind(m, DS4_OWNER, name);
-    if (!t) exit(1);
+    if (!t) { pulsar_load_refuse(); return &g_ds4_absent; }   /* inert: the checks after it skip it */
     return t;
 }
 
@@ -70,7 +75,8 @@ static void tensor_expect_dims(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!pulsar_tensor_dims(t, DS4_OWNER, ndim, d0, d1, d2)) exit(1);
+    if (t == &g_ds4_absent) return;   /* refused where it was bound */
+    if (!pulsar_tensor_dims(t, DS4_OWNER, ndim, d0, d1, d2)) pulsar_load_refuse();
 }
 
 
@@ -82,7 +88,8 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (!pulsar_tensor_admit(t, DS4_OWNER, t->type == type, tensor_type_name(type))) exit(1);
+    if (t == &g_ds4_absent) return;
+    if (!pulsar_tensor_admit(t, DS4_OWNER, t->type == type, tensor_type_name(type))) pulsar_load_refuse();
     tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
@@ -187,7 +194,8 @@ static void tensor_expect_plain_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -358,7 +366,8 @@ static void tensor_expect_routed_expert_combo(
         }
     }
     fprintf(stderr, "\n  the combo may differ per layer\n");
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -377,7 +386,8 @@ static void tensor_expect_routed_expert(
                 t->name.ptr,
                 t->type,
                 tensor_type_name(t->type));
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_dims(t, ndim, d0, d1, d2);
 }
@@ -512,7 +522,8 @@ static void weights_validate_layout(
         const pulsar_layer_weights *l = &w->layer[il];
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
@@ -704,7 +715,8 @@ static void pulsar_select_shape_from_metadata(
             n_expert,
             n_ff_exp,
             n_indexer_top_k);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -717,12 +729,14 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
         fprintf(stderr, "pulsar: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0;
     }
     if (arr.len > cap) {
         fprintf(stderr, "pulsar: %s has %llu entries, at most %u are meaningful\n",
                 key, (unsigned long long)arr.len, cap);
-        exit(1);
+        pulsar_load_refuse();
+        return 0;
     }
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint64_t i = 0; i < arr.len; i++) {
@@ -792,7 +806,8 @@ static void validate_attention_layout_metadata(const pulsar_model *m) {
         fprintf(stderr, "pulsar: candidate pool is %u blocks of %u, %s expects %u of %u\n",
                 topk_blocks, block_size, PULSAR_MODEL_SHAPE_NAME,
                 sh->candidate_topk_blocks, sh->candidate_block_size);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);
 }
@@ -839,7 +854,8 @@ static void validate_reap_metadata(const pulsar_model *m) {
             fprintf(stderr,
                     "pulsar: reap.layer.keep_count[%u]=%u out of range [1, %u]\n",
                     il, got, PULSAR_N_EXPERT);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
         g_pulsar_layer_expert_count[il] = got;
     }
@@ -853,7 +869,8 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_FLOAT32 && arr.type != PULSAR_META_FLOAT64)) {
         fprintf(stderr, "pulsar: required float array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     if (arr.len < PULSAR_N_LAYER) {
         pulsar_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
@@ -879,7 +896,8 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%u for %s, got %u\n",
             name, expected, PULSAR_MODEL_SHAPE_NAME, got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -892,7 +910,8 @@ static void config_expect_f32(const char *name, float got, float expected) {
     if (fabsf(got - expected) <= tol) return;
     fprintf(stderr, "pulsar: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, PULSAR_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -901,7 +920,8 @@ static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%s for %s, got %s\n",
             name, expected ? "true" : "false", PULSAR_MODEL_SHAPE_NAME, got ? "true" : "false");
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
@@ -962,6 +982,7 @@ void config_validate_model(const pulsar_model *m) {
                                    n_indexer_top_k,
                                    n_hc,
                                    n_hc_sinkhorn_iter);
+    if (pulsar_load_refusals()) return;   /* L272: no shape was selected -- nothing below can be checked */
 
     config_expect_u32("embedding_length",            n_embd,         PULSAR_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        PULSAR_N_VOCAB);
@@ -1000,7 +1021,8 @@ void config_validate_model(const pulsar_model *m) {
         fprintf(stderr, "pulsar: expected rope.scaling.original_context_length=%" PRIu64
                 " for %s, got %" PRIu64 "\n",
                 (uint64_t)PULSAR_ROPE_ORIG_CTX, PULSAR_MODEL_SHAPE_NAME, rope_orig_ctx);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     const float rope_freq_base = required_f32(m, "deepseek4.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, PULSAR_ROPE_FREQ_BASE);
@@ -1032,7 +1054,8 @@ void config_validate_model(const pulsar_model *m) {
         fprintf(stderr, "pulsar: attention.layer_norm_rms_epsilon=%.9g is neither 0731's %.9g "
                         "nor Vision-Exp's/V4.1's %.9g\n",
                 (double)rms_eps, (double)PULSAR_V4_RMS_EPS, (double)PULSAR_V41_RMS_EPS);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     g_pulsar_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
@@ -1050,7 +1073,8 @@ void config_validate_model(const pulsar_model *m) {
         declared_hash != (uint32_t)PULSAR_N_HASH_LAYER) {
         fprintf(stderr, "pulsar: hash_layer_count is %u, %s expects %u\n",
                 declared_hash, PULSAR_MODEL_SHAPE_NAME, (unsigned)PULSAR_N_HASH_LAYER);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
 }
 
@@ -1124,7 +1148,8 @@ void weights_reject_unsupported_types(const pulsar_model *m) {
             }
         }
         fprintf(stderr, "\n");
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
 }
 
@@ -1180,7 +1205,8 @@ static void e8m0_scan_blocks(
             fprintf(stderr,
                     "pulsar: 0xFF never decodes consistently (custom GEMVs read +Inf, "
                     "cuBLASLt/CUTLASS read NaN); refusing the artifact\n");
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
 }
@@ -1211,7 +1237,8 @@ static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
                     i < t->dim[0] ? "suh" : "svh",
                     (unsigned long long)(i < t->dim[0] ? i : i - t->dim[0]),
                     (p[i] & 0x03ffu) ? "NaN" : "Inf", p[i]);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
 }
@@ -1351,7 +1378,8 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
         if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
         if (!attn_bound[i] && model_find_tensor(m, name)) {
             fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il, name);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
     l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
@@ -1378,7 +1406,8 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
             fprintf(stderr, "pulsar: layer %u carries ffn_gate_tid2eid but only the first %u "
                             "layers are hash-routed -- refusing\n",
                     il, (unsigned)PULSAR_N_HASH_LAYER);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
     }
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
