@@ -17,6 +17,8 @@ the undeclared-tool hole), here with its own server so it is reproducible.
   7. "required" with two tools, 5 sampled turns: every call names a declared tool
   8. (L268) an image: OpenAI image_url -- the model names the shape's colour
   9. (L268) an image inside an Anthropic tool_result (an agent's screenshot) -- the same answer
+ 10. (L268) the same screenshot after a SAMPLED call: the tool_result image continues the live KV (the server
+     logs the anthropic live continuation and places the image on the live history), and the answer is right
 
 Not in `make gates` (one server load per family): `make server-live-gate` runs it on FRONTIER_MODEL and the
 hosted Qwen model.  Exit 0 only when every check passed."""
@@ -222,8 +224,35 @@ def c9():
     check("red" in txt.lower(), "anthropic tool_result screenshot -> %r (%.1fs)" % (txt[:80], dt))
 
 
+def c10():
+    shot_tool = [{"name": "screenshot", "description": "Take a screenshot",
+                  "input_schema": {"type": "object", "properties": {}}}]
+    m10 = [{"role": "user", "content": "Take a screenshot and tell me the colour of the circle in one word."}]
+    d, _ = post("/v1/messages", {"model": "m", "max_tokens": 400, "tools": shot_tool,
+                                 "tool_choice": {"type": "tool", "name": "screenshot"}, "messages": m10})
+    j = json.loads(d)
+    tu = [b for b in j["content"] if b["type"] == "tool_use"]
+    if not tu:
+        check(False, "live image continuation: no sampled screenshot call to continue")
+        return
+    m10 += [{"role": "assistant", "content": j["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tu[0]["id"], "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG_B64}}]}]}]
+    seen = os.path.getsize(log_path)
+    d, dt = post("/v1/messages", {"model": "m", "max_tokens": 1024, "tools": shot_tool, "messages": m10})
+    j2 = json.loads(d)
+    txt = "".join(b.get("text", "") for b in j2["content"] if b["type"] == "text")
+    with open(log_path, "rb") as f:
+        f.seek(seen)
+        new = f.read().decode("utf-8", "replace")
+    live = "anthropic live continuation" in new and "cannot place its images" not in new
+    check(live and "red" in txt.lower(),
+          "live tool_result image continuation (live=%s) -> %r (%.1fs)" % (live, txt[:80], dt))
+
+
 for n, f in (("plain", c1), ("forced", c2), ("forced-stream", c3), ("continuation", c4), ("required", c5),
-             ("undeclared", c6), ("required-two", c7), ("image", c8), ("image-tool-result", c9)):
+             ("undeclared", c6), ("required-two", c7), ("image", c8), ("image-tool-result", c9),
+             ("image-live-continuation", c10)):
     guarded(n, f)
 print("SERVER LIVE GATE: " + ("PASS" if ok else "FAIL"))
 stop(0 if ok else 1)
