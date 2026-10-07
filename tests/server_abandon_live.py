@@ -89,8 +89,14 @@ body = json.dumps({"model": "m", "max_tokens": 50, "messages": [{"role": "user",
 s = socket.create_connection(("127.0.0.1", a.port))
 s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
           b"Content-Length: %d\r\n\r\n" % len(body) + body)
-time.sleep(2.0)
-before = phases()
+t0 = time.time()
+while True:   # hang up the moment the prompt is prefilling (a fixed delay missed it on Qwen: still queued, or done)
+    before = phases()
+    if before.get("prefill_main", 0) + before.get("prefill_cold", 0) >= 1:
+        break
+    if time.time() - t0 > 120:
+        stop(1, "the long prompt never reached prefill beside the decodes (phases %s)" % before)
+    time.sleep(0.2)
 s.close()
 held = []
 for i in range(6):
