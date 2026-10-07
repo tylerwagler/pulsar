@@ -25,12 +25,13 @@ static bool required_bool(const pulsar_model *m, const char *key) {
 
 
 
+/* The family's binders stop at the first refusal (L272 P4a: the find / dims / format mechanics are the
+ * core's, tensor_bind.cpp). */
+static const char *const DS4_OWNER = "deepseek4";
+
 static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
-    pulsar_tensor *t = model_find_tensor(m, name);
-    if (!t) {
-        fprintf(stderr, "pulsar: required tensor is missing: %s\n", name);
-        exit(1);
-    }
+    pulsar_tensor *t = pulsar_tensor_bind(m, DS4_OWNER, name);
+    if (!t) exit(1);
     return t;
 }
 
@@ -69,28 +70,7 @@ static void tensor_expect_dims(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (t->ndim != ndim) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
-    }
-
-    const uint64_t want[3] = { d0, d1, d2 };
-    for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "pulsar: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
-    }
+    if (!pulsar_tensor_dims(t, DS4_OWNER, ndim, d0, d1, d2)) exit(1);
 }
 
 
@@ -102,15 +82,7 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != type) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected %s\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type),
-                tensor_type_name(type));
-        exit(1);
-    }
+    if (!pulsar_tensor_admit(t, DS4_OWNER, t->type == type, tensor_type_name(type))) exit(1);
     tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 

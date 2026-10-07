@@ -394,10 +394,7 @@ g.total = o;
 /* load                                                                      */
 
 static bool admit(const pulsar_tensor *t, bool ok, const char *want) {
-    if (ok) return true;
-    fprintf(stderr, "pulsar: %s: tensor %.*s is %s; the S4 op that reads it takes %s -- refusing\n",
-            PULSAR_QWEN_ARCH, (int)t->name.len, t->name.ptr, tensor_type_name(t->type), want);
-    return false;
+    return pulsar_tensor_admit(t, PULSAR_QWEN_ARCH, ok, want);   /* L272 P4a: the core's mechanics */
 }
 static bool admit_bf16(const pulsar_tensor *t) { return admit(t, t->type == PULSAR_TENSOR_BF16, "bf16"); }
 static bool admit_mx8(const pulsar_tensor *t) { return admit(t, t->type == PULSAR_TENSOR_MXFP8_LT, "mxfp8_lt"); }

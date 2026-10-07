@@ -327,23 +327,8 @@ static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer
  * (the HF shape reversed).  nd dims are checked; missing -> refused. */
 static pulsar_tensor *qbind(const pulsar_model *m, bool *ok, const char *name,
                             uint32_t nd, uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0) {
-    pulsar_tensor *t = model_find_tensor(m, name);
-    if (!t) {
-        fprintf(stderr, "pulsar: %s: required tensor %s is missing\n", PULSAR_QWEN_ARCH, name);
-        *ok = false;
-        return NULL;
-    }
-    const uint64_t want[3] = {d0, d1, d2};
-    bool dims_ok = t->ndim == nd;
-    for (uint32_t i = 0; dims_ok && i < nd; i++) dims_ok = t->dim[i] == want[i];
-    if (!dims_ok) {
-        fprintf(stderr, "pulsar: %s: tensor %s has ne [", PULSAR_QWEN_ARCH, name);
-        for (uint32_t i = 0; i < t->ndim; i++) fprintf(stderr, "%s%llu", i ? ", " : "", (unsigned long long)t->dim[i]);
-        fprintf(stderr, "], want [");
-        for (uint32_t i = 0; i < nd; i++) fprintf(stderr, "%s%llu", i ? ", " : "", (unsigned long long)want[i]);
-        fprintf(stderr, "]\n");
-        *ok = false;
-    }
+    pulsar_tensor *t = pulsar_tensor_bind(m, PULSAR_QWEN_ARCH, name);   /* L272 P4a: the core's mechanics */
+    if (!t || !pulsar_tensor_dims(t, PULSAR_QWEN_ARCH, nd, d0, d1, d2)) *ok = false;
     return t;
 }
 

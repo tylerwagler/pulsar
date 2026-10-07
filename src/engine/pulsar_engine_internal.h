@@ -2989,6 +2989,16 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
  * type or missing tensor refuses loudly. */
 bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 
+/** L272 P4a: the mechanics of a family's weight binder (tensor_bind.cpp) -- report the same way for every
+ *  family and return the verdict; the binder keeps its failure policy.  `owner` names the family in the
+ *  message.  The required tensor `name`, or NULL (said). */
+pulsar_tensor *pulsar_tensor_bind(const pulsar_model *m, const char *owner, const char *name);
+/** `t` has `nd` dims equal to d0, d1, d2 (ne order); false = said, with both shapes. */
+bool pulsar_tensor_dims(const pulsar_tensor *t, const char *owner, uint32_t nd, uint64_t d0, uint64_t d1 = 0,
+                        uint64_t d2 = 0);
+/** `ok` is whether `t`'s format is one its reading op takes (`want` names them); false = said. */
+bool pulsar_tensor_admit(const pulsar_tensor *t, const char *owner, bool ok, const char *want);
+
 /** L272 P2: the bank carry is the core's (session_banks.cpp).  Save the live host view -- checkpoint,
  *  logits, the flags, the prefill frontier, the image identity, the speculative shadow -- into `bank`'s
  *  carry; host only. */
