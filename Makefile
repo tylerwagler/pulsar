@@ -2148,10 +2148,10 @@ tests/mseq_rewind_probe.o: tests/mseq_rewind_probe.cpp src/engine/pulsar_engine_
 tests/resume_suffix_probe.o: tests/resume_suffix_probe.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/resume_suffix_probe.cpp
 
-tests/token_seam_gate.o: tests/token_seam_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/token_seam_gate.o: tests/token_seam_gate.cpp tests/gate_util.h tests/gate_entry.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/token_seam_gate.cpp
 
-tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
 tests/mseq_rowcost_probe.o: tests/mseq_rowcost_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2225,7 +2225,7 @@ tests/vision_qwen_tower_gate.o: tests/vision_qwen_tower_gate.cpp src/engine/puls
 tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_merge_gate.cpp
 
-tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
 tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2467,7 +2467,7 @@ tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o
 
 tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp src/pulsar.h
+tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp tests/gate_util.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/mseq_short_ctx_probe.cpp
 tests/spec_teacher_forced_probe.o: tests/spec_teacher_forced_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/spec_teacher_forced_probe.cpp

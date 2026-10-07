@@ -476,16 +476,16 @@ int main(int argc, char **argv) {
         {"cuda-frontier-gate",        gate_multiseq_frontier_gate_main, 3, NULL, NULL, {NULL}, DS4},
         {"cuda-rewind-gate",          gate_rewind_frontier_gate_main,   1, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
         {"cuda-mseq-rewind-gate",     gate_mseq_rewind_probe_main,      4, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
-        {"cuda-seam-gate",            gate_token_seam_gate_main,        3, NULL, NULL, {NULL}, DS4},
-        {"cuda-multiseq-gate",        gate_multiseq_decode_gate_main,   3, NULL, NULL, {"3", "64", NULL}, DS4},
+        {"cuda-seam-gate",            gate_token_seam_gate_main,        3, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        {"cuda-multiseq-gate",        gate_multiseq_decode_gate_main,   3, NULL, NULL, {"3", "64", NULL}, NEED_TOKENIZER},
         {"cuda-bank-spec-gate",       gate_bank_spec_gate_main,         2, NULL, NULL, {"32", NULL}, DS4 | NEED_SPEC},
         {"cuda-dspark-batch-gate",    gate_dspark_batch_gate_main,      3, NULL, NULL, {"8", "0", NULL}, DS4 | NEED_DSPARK},
         {"cuda-accounting-gate",      gate_accounting_gate_main,        2, NULL, NULL, {NULL}, DS4},
         {"cuda-evict-restore-gate",   gate_bank_evict_restore_gate_main, 2, NULL, NULL, {NULL}, DS4},
-        {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}, DS4},
+        {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}, NEED_TOKENIZER},
         /* L175: the same 1..16 width sweep with bank 0 at ~2200 tokens, so the
          * indexed lane is engaged while the row-count-keyed dispatches vary. */
-        {"cuda-algo-stability-gate-deep", gate_algo_stability_gate_main, 16, NULL, NULL, {"deep", NULL}, DS4},
+        {"cuda-algo-stability-gate-deep", gate_algo_stability_gate_main, 16, NULL, NULL, {"deep", NULL}, NEED_TOKENIZER},
         {"cuda-mixed-prefill-gate",   gate_mixed_prefill_gate_main,     2, NULL, NULL, {NULL}, DS4},
         {"cuda-mixed-neutrality-gate", gate_mixed_neutrality_gate_main, 3, "PULSAR_GATE_ROWS_FATAL", "5,5 8,8", {NULL}, DS4},
         {"cuda-mixed-neutrality-gate-wide", gate_mixed_neutrality_gate_main, 13, "PULSAR_GATE_NDEC", "12", {NULL}, DS4},
@@ -536,7 +536,7 @@ int main(int argc, char **argv) {
      * to the default grid, so they share this engine (four opens per battery,
      * not five: A, D depth 1, D depth 4, B). */
     const gate_spec group_nodspark[] = {
-        {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}, DS4},
+        {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}, NEED_TOKENIZER},
     };
     const gate_spec prefill = {"cuda-prefill-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                {"--check", prefill_baseline, prefill_ref, NULL}, NEED_FIXTURES};
