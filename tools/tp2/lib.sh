@@ -78,7 +78,7 @@ preflight() {   # one protocol, one tree on both nodes
 host_tests() {   # the TP transport / mirror / mesh host tests (no GPU, no pair)
     ( cd "$D" && make -s CUDA_ARCH=sm_120f tests/tp_mirror_test tests/tp_transport_test tests/tp_mesh_test >/dev/null &&
       PULSAR_TP_TIMEOUT_SEC=1 timeout 60 ./tests/tp_mirror_test && PULSAR_TP_RDMA_DEV=none ./tests/tp_transport_test &&
-      ./tests/tp_mesh_test ) > "$OUT/host-tests.log" 2>&1 && verdict "host tests" PASS || verdict "host tests" "FAIL ($OUT/host-tests.log)"
+      PULSAR_TP_RDMA_DEV=none ./tests/tp_mesh_test ) > "$OUT/host-tests.log" 2>&1 && verdict "host tests" PASS || verdict "host tests" "FAIL ($OUT/host-tests.log)"
 }
 
 final_verdict() {   # $1 = the kit's title
