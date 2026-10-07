@@ -509,8 +509,9 @@ bool model_alias_enables_thinking(const char *model) {
 
 
 const char *server_model_id_from_engine(pulsar_engine *engine) {
-    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads */
-    return pulsar_engine_served_model_id(engine);
+    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads.  No engine
+     * is the host-only harnesses (unit tests, api/sse goldens), which record the default id as before L284. */
+    return engine ? pulsar_engine_served_model_id(engine) : "deepseek-v4-flash";
 }
 
 const char *server_served_model_id(const server *s) {

@@ -3842,8 +3842,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== rs/namespace-tools [responses/qwen] REFUSED
-  error: "tools.0: a \"namespace\" tool is not served for the Qwen family (function tools only)"
+== rs/namespace-tools [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 1: {fsread|read|fs|0|path}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"fsread\", \"description\": \"read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"fsread\", \"description\": \"read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [290-450 1304-1305]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/tool-choice-auto [responses/qwen] OK
   kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
