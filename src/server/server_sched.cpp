@@ -1969,7 +1969,7 @@ static bool slot_fusable_prefill(const session_slot *c) {
 }
 
 bool server::fusion_enabled() const {
-    return pool_banks > 0;
+    return pool_banks > 0 && pulsar_engine_has_fused_step(engine);
 }
 
 bool server::fuse_prepare(session_slot *sl) {
