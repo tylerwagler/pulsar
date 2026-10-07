@@ -613,7 +613,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         if (fire) {
             s->spec.spec_quenched = true;
             fprintf(stderr,
-                    "pulsar: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
+                    "pulsar: spec yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
                     saved_len + 1 + commit, s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
