@@ -125,4 +125,5 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .quant_bits   = */ ds4_quant_bits,
     /* .spec         = */ &k_ds4_spec_target,
     /* .session      = */ &k_ds4_session_ops,
+    /* .tokenizer    = */ &k_ds4_tokenizer,
 };

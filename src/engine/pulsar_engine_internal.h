@@ -1764,8 +1764,6 @@ struct pulsar_vocab {
     void tokenize_rendered_chat_vocab(const char *text, token_vec *out) const;
     void tokenize_rendered_chat_spans_vocab(const char *text, const pulsar_text_span *spans,
                                           uint32_t n_spans, token_vec *out) const;
-    /** Debug: print ids with their decoded bytes to stderr. */
-    void dump_tokens(const token_vec *tokens) const;
 };
 
 /** The loaded model and everything derived from it.
@@ -1930,8 +1928,6 @@ struct pulsar_engine {
      * @return 0 on success. */
     int collect_imatrix(const char *dataset_path, const char *output_path,
                         int ctx_size, int max_prompts, int max_tokens);
-    /** Debug: print ids with decoded text to stderr. */
-    void dump_tokens(const pulsar_tokens *tokens);
     /** Bits per weight of the ROUTED expert tensors (the artifact's dominant
      * quantisation), for reporting and tier selection. */
     int routed_quant_bits();
@@ -2988,6 +2984,12 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
  * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
  * type or missing tensor refuses loudly. */
 bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
+
+/** The families' tokenizer tables (L272 P2: tokenizer.cpp, tokenizer_qwen.cpp). */
+extern const pulsar_family_tokenizer k_ds4_tokenizer;
+extern const pulsar_family_tokenizer k_qwen_tokenizer;
+/** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
+void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
 
 /** L272 P4a: the mechanics of a family's weight binder (tensor_bind.cpp) -- report the same way for every
  *  family and return the verdict; the binder keeps its failure policy.  `owner` names the family in the

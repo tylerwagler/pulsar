@@ -118,6 +118,35 @@ typedef struct {
     void (*invalidate)(pulsar_session *s);
 } pulsar_family_session_ops;
 
+/** A family's tokenizer and chat front (L272 P2): what the public tokenizer entries (tokenizer.cpp) do on
+ * this family's model.  NULL on the family = no tokenizer (the entries end the process by name; the front
+ * ends refuse such an engine at startup through pulsar_engine_has_tokenizer).  Before L272 the entries
+ * branched on the Qwen tokenizer's pointer at every site. */
+typedef struct pulsar_family_tokenizer {
+    /** Raw text, all of it client data (no added token matches). */
+    void (*encode_text)(pulsar_engine *e, const char *text, pulsar_tokens *out);
+    /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none). */
+    void (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                            pulsar_tokens *out);
+    /** One system + one user message, rendered and tokenized the family's way (the CLI's one-shot). */
+    void (*encode_chat_prompt)(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
+                               pulsar_tokens *out);
+    bool (*is_stop)(pulsar_engine *e, int token);
+    /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
+    int (*eos)(pulsar_engine *e);
+    /** `token`'s bytes, malloc'd and NUL-terminated (empty for an id outside the table). */
+    char *(*token_text)(pulsar_engine *e, int token, size_t *len);
+    int (*think_close)(pulsar_engine *e);
+    /** The turn markers the server's prefix anchors scan for; false = unknown (said once). */
+    bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
+    /** --dump-tokens: the ids, then one line per token. */
+    void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
+    /** The family's chat is DeepSeek's marker template, which the incremental entries
+     *  (pulsar_chat_begin / _append_lead_in / _append_message / _append_assistant_prefix) build; a family
+     *  that renders its chat whole (Qwen: qwen_chat_render) refuses them by name. */
+    bool incremental_ds4_template;
+} pulsar_family_tokenizer;
+
 /** A family's own bank pool (L251): the server's per-bank bookkeeping for a
  * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
  * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
@@ -185,6 +214,8 @@ struct pulsar_family {
      *  run against this family's forward (L272 P1; a family without them does not declare CAP_SPEC). */
     const pulsar_spec_target_ops *spec;
     const pulsar_family_session_ops *session;
+    /** The tokenizer and chat front (L272 P2), or NULL = none. */
+    const pulsar_family_tokenizer *tokenizer;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
 };

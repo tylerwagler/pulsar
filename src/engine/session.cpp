@@ -28,10 +28,6 @@ const pulsar_tokens *pulsar_session::tokens() {
 }
 
 
-void pulsar_engine::dump_tokens(const pulsar_tokens *tokens) {
-    auto *e = this;
-    e->vocab.dump_tokens(tokens);  /* the pulsar_vocab member */
-}
 
 
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {

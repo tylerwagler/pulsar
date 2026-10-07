@@ -1459,7 +1459,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_TP |
-                          PULSAR_FAMILY_CAP_SPEC,
+                          PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_CHAT,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
@@ -1471,5 +1471,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .quant_bits   = */ qwen_quant_bits,
     /* .spec         = */ &k_qwen_spec_target,
     /* .session      = */ &k_qwen_session_ops,
+    /* .tokenizer    = */ &k_qwen_tokenizer,
     /* .banks        = */ &k_qwen_bank_ops,
 };
