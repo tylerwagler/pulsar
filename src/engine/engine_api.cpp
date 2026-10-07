@@ -3,6 +3,7 @@
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
+#include <string>
 
 
 
@@ -720,6 +721,29 @@ int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int
         i += blk;
     }
     return n;
+}
+
+char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!e || !tokens) return NULL;
+    std::string out;
+    for (int i = 0; i < tokens->len; i++) {
+        int id = tokens->v[i], blk = 1;
+        if (pulsar_image_is_sentinel(e, id)) {   /* the family's geometry: the block stands for its placeholder */
+            if (!pulsar_image_block_extent(e, tokens->v, tokens->len, i, &blk) || blk <= 0) return NULL;
+            id = e->family->vision->placeholder_id(e);
+        }
+        size_t n = 0;
+        char *piece = pulsar_token_text(e, id, &n);
+        out.append(piece, n);
+        free(piece);
+        i += blk - 1;
+    }
+    if (out_len) *out_len = out.size();
+    char *r = (char *)xmalloc(out.size() + 1);
+    memcpy(r, out.data(), out.size());
+    r[out.size()] = '\0';
+    return r;
 }
 
 uint64_t pulsar_image_hash(const pulsar_image_ref *img) { return pulsar_image_content_hash(img); }

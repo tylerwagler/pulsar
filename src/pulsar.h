@@ -567,6 +567,12 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
  *  there are (which may exceed `cap`), or -1 when a sentinel id there belongs to no well-formed block.  The server
  *  uses it to place a live continuation's held images (L261). */
 int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap);
+/** The bytes a token history was rendered from: each token's text, and each image block ONCE as the text of the
+ *  placeholder token its expansion replaced (the family's geometry and placeholder_id -- DeepSeek's
+ *  <｜deepseek_image｜>, Qwen's one <|image_pad|>), so a disk chain over an image is found by the request text that
+ *  brings it; which image it is, the segment's records say (L281).  malloc'd; NULL when a sentinel id belongs to no
+ *  well-formed block. */
+char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len);
 /** L281: the hash an image's bytes are known by in the KV's image records (what a disk chain's segment carries and a
  *  restore compares; never 0). */
 uint64_t pulsar_image_hash(const pulsar_image_ref *img);

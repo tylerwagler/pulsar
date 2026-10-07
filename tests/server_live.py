@@ -19,6 +19,8 @@ the undeclared-tool hole), here with its own server so it is reproducible.
   9. (L268) an image inside an Anthropic tool_result (an agent's screenshot) -- the same answer
  10. (L268) the same screenshot after a SAMPLED call: the tool_result image continues the live KV (the server
      logs the anthropic live continuation and places the image on the live history), and the answer is right
+ 11. (L268/L281) a disk chain over an image serves the next request that brings the SAME image on a fresh bank:
+     the server logs a chain hit past the image block (its text is the placeholder's, every family) and answers
 
 Not in `make gates` (one server load per family): `make server-live-gate` runs it on FRONTIER_MODEL and the
 hosted Qwen model.  Exit 0 only when every check passed."""
@@ -250,9 +252,32 @@ def c10():
           "live tool_result image continuation (live=%s) -> %r (%.1fs)" % (live, txt[:80], dt))
 
 
+def c11():
+    shared = "Reference notes: " + " ".join("entry%d" % i for i in range(700))
+
+    def ask(tail):
+        return {"model": "m", "max_tokens": 1024, "temperature": 0, "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG_B64}},
+            {"type": "text", "text": shared + "\n" + tail}]}]}
+
+    # A's own tail is long enough that B (diverging there) does not continue A's bank in place
+    post("/v1/chat/completions", ask(" ".join("aside%d" % i for i in range(300)) + "\nWhat colour is the circle? One word."))
+    seen = os.path.getsize(log_path)
+    d, dt = post("/v1/chat/completions", ask("What colour is the shape in the picture? Answer with one word."))
+    j = json.loads(d)
+    txt = j["choices"][0]["message"].get("content") or ""
+    cached = (j.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    with open(log_path, "rb") as f:
+        f.seek(seen)
+        new = f.read().decode("utf-8", "replace")
+    hit = "kv cache hit" in new
+    check(hit and cached >= 1024 and "red" in txt.lower(),
+          "image disk chain on a fresh bank (hit=%s, cached %d) -> %r (%.1fs)" % (hit, cached, txt[:60], dt))
+
+
 for n, f in (("plain", c1), ("forced", c2), ("forced-stream", c3), ("continuation", c4), ("required", c5),
              ("undeclared", c6), ("required-two", c7), ("image", c8), ("image-tool-result", c9),
-             ("image-live-continuation", c10)):
+             ("image-live-continuation", c10), ("image-disk-chain", c11)):
     guarded(n, f)
 print("SERVER LIVE GATE: " + ("PASS" if ok else "FAIL"))
 stop(0 if ok else 1)
