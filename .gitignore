@@ -168,3 +168,5 @@ tests/sse-golden/out.txt
 /tests/decode_reference_gate
 /tests/loader_open
 /tests/prefill_chunk_census_probe
+/tests/vision_merge_gate
+/tests/vision_tower_gate
