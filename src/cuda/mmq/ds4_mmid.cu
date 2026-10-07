@@ -72,8 +72,9 @@ static __global__ void mm_ids_helper_global(
             }
         } else {
             // Implementation optimized for specific numbers of experts used:
-            static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-            const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+            static_assert(n_expert_used == 6 || n_expert_used == 10 || warp_size % n_expert_used == 0, "bad n_expert_used");
+            // Padded to next higher power of 2 (the shared-memory helper's rule, mmid.cu; 10 = Qwen's top-10, L284).
+            const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used == 10 ? 16 : n_expert_used;
             for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
                 const int it = it0 + threadIdx.x / neu_padded;
 
@@ -167,6 +168,8 @@ void ds4_launch_mm_ids_helper(
             case  6: mm_ids_helper_global< 6><<<num_blocks, block_size, 0, stream>>>
                          (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used, nchannels_y, si1, sis1); break;
             case  8: mm_ids_helper_global< 8><<<num_blocks, block_size, 0, stream>>>
+                         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used, nchannels_y, si1, sis1); break;
+            case 10: mm_ids_helper_global<10><<<num_blocks, block_size, 0, stream>>>
                          (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used, nchannels_y, si1, sis1); break;
             case 16: mm_ids_helper_global<16><<<num_blocks, block_size, 0, stream>>>
                          (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used, nchannels_y, si1, sis1); break;
