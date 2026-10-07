@@ -7508,6 +7508,51 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
  * admitted for (the log line's). The bank id and `spilled` are NOT the
  * reset's to touch: slot i -> bank i is fixed, and the caller reconciles the
  * spill file / physical against `spilled` right after. */
+/* L281: a prefill that cannot yield (an image prompt's mm sync) used to leave the per-slot gauges at
+ * their pre-prefill values for its whole length, because only the quantum loop published the
+ * snapshot.  The chunk callback publishes too, so /metrics (the TUI's bar) moves with every chunk. */
+static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.stream_cv, NULL);
+    s.n_slots = 1;
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    g.phase = GEN_PREFILL;
+    g.prefill_last_current = -1;
+    g.progress.srv = &s;
+    g.progress.t0 = server_now_sec();
+    g.progress.fd = -1;
+    s.slots[0].provisioned = true;
+    s.slots[0].active_job = &j;
+    s.slots[0].gen = &g;
+    const uint64_t gen0 = s.metrics_generation;
+
+    gen_prefill_progress_cb(&g, "prefill_chunk", 4096, 320284);
+    TEST_ASSERT(g.prefill_last_current == 4096 && g.prefill_total == 320284);
+    TEST_ASSERT(s.m_slot_prefill_done[0] == 4096);
+    TEST_ASSERT(s.m_slot_prefill_total[0] == 320284);
+    TEST_ASSERT(s.m_slot_phase[0] == (int)GEN_PREFILL + 1);
+    TEST_ASSERT(s.metrics_generation == gen0 + 1);
+
+    gen_prefill_progress_cb(&g, "prefill_chunk", 8192, 320284);
+    TEST_ASSERT(s.m_slot_prefill_done[0] == 8192);
+    TEST_ASSERT(g.prefill_chunks_done == 1);
+    TEST_ASSERT(s.metrics_generation == gen0 + 2);
+
+    /* a display event is the keepalive's, not a chunk: nothing to publish */
+    gen_prefill_progress_cb(&g, "prefill_display", 8192, 320284);
+    TEST_ASSERT(s.metrics_generation == gen0 + 2);
+    pthread_cond_destroy(&s.stream_cv);
+    pthread_mutex_destroy(&s.mu);
+}
+
+
+
 static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     session_slot sl;
     memset(&sl, 0, sizeof sl);
@@ -8272,6 +8317,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
+    test_l281_prefill_chunk_publishes_the_slot_gauges();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
     test_l179_mixed_giveup_only_on_recoverable_prefill_reject();

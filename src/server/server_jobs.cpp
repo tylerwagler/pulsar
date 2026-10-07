@@ -476,6 +476,12 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
         }
         if (current > g->prefill_last_current) g->prefill_last_current = current;
         g->prefill_total = total;
+        /* L281: publish the snapshot here as well as per quantum.  A prefill that cannot yield
+         * -- an image prompt's mm sync runs to completion (gen_step_prefill arms no cancel hook
+         * for it) -- kept the worker inside one sync for its whole length, and the per-slot
+         * gauges (/metrics slot_prefill_*, slot_position; the TUI's bar) stood still for minutes
+         * while the chunk lines logged.  One mutex + copy per chunk (~3 s apart) is host noise. */
+        if (g->progress.srv) g->progress.srv->publish_metrics_snapshot();
     }
     server_progress_cb(&g->progress, event, current, total);
 }

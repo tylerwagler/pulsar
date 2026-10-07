@@ -1663,6 +1663,16 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             s->checkpoint_valid = true;
             s->prefill_frontier = prompt->len;   /* L195 */
             s->logits_stale = false;
+            /* L281: the licence above admitted this prompt's whole image set -- the held blocks
+             * and the NEW ones this extension just merged -- so that set is what is live now.
+             * The identity used to survive an extension unchanged, which was right for a text
+             * extension and wrong for one that merged an image: the next request, even an exact
+             * replay, found a held block the identity did not know and rebuilt cold (the pair
+             * 2026-10-07 13:11, 320k tokens from 0 for a 0-token suffix). */
+            if (n_images > 0) {
+                s->live_image_fp = image_set_fingerprint(images, n_images);
+                s->live_image_barrier = image_barrier;
+            }
             return 0;
         }
 
@@ -1670,6 +1680,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * nothing to evaluate.  The single-token fallback that used to live
          * here is gone with its encoder; every positive suffix takes the
          * batched branch above. */
+        if (n_images > 0) {   /* L281: the same set, restated (held == live by the licence) */
+            s->live_image_fp = image_set_fingerprint(images, n_images);
+            s->live_image_barrier = image_barrier;
+        }
         return 0;
     }
 
