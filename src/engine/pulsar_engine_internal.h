@@ -2239,6 +2239,30 @@ typedef struct {
 void pulsar_image_licence_decide(const pulsar_session *s, const pulsar_tokens *prompt,
                                  const pulsar_image_ref *images, int n_images, pulsar_image_licence *out);
 
+/* ---- L268: Qwen3.8-Flash-Next's own part of the image path (vision_qwen.cpp) ----
+ * Preprocessing, from the checkpoint's preprocessor_config.json (HF Qwen2VLImageProcessor). */
+#define PULSAR_QWEN_VISION_PATCH      16u
+#define PULSAR_QWEN_VISION_MERGE      2u
+#define PULSAR_QWEN_VISION_TEMPORAL   2u
+#define PULSAR_QWEN_VISION_MIN_PIXELS 65536u      /* size.shortest_edge */
+#define PULSAR_QWEN_VISION_MAX_PIXELS 16777216u   /* size.longest_edge */
+#define PULSAR_QWEN_VISION_MEAN       0.5
+#define PULSAR_QWEN_VISION_STD        0.5
+/** One image's patches as the tower takes them: `rows` = grid_h * grid_w patches in 2x2 merge-block order, `cols`
+ *  = 3 * temporal * patch^2 float32 values each (channel, frame, y, x). */
+typedef struct {
+    float *values;
+    int rows, cols;
+    int grid_h, grid_w;        ///< the patch grid (the resized image / patch)
+    int resized_h, resized_w;  ///< smart_resize's size
+} qwen_vision_pixels;
+/** HF's smart_resize: the nearest multiple of patch x merge (Python's half-to-even), scaled into
+ *  [min_pixels, max_pixels].  false + `err` past an aspect ratio of 200. */
+bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, size_t errlen);
+/** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
+bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
+void qwen_vision_pixels_free(qwen_vision_pixels *p);
+
 /** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host
  * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
@@ -3330,6 +3354,10 @@ int vision_image_grid(int width, int height, const pulsar_vision_args *args,
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
  * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
  * own .convert("RGB") is a different transform from libjpeg's. */
+/** Pillow's Image.resize(BICUBIC) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical), bit for
+ *  bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor).  Returns
+ *  a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

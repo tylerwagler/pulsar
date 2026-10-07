@@ -1100,6 +1100,10 @@ vision-visible-gate: tests/vision_visible_gate
 vision-placeholder-gate: tests/vision_placeholder_gate
 	./tests/vision_placeholder_gate tests/test-vectors/vision-image-goldens.bin
 
+# L268: Qwen's image preprocessing vs HF's own processor (tests/vision_qwen_pixel_goldens.py), bit for bit; host-only.
+vision-qwen-pixel-gate: tests/vision_qwen_pixel_gate
+	./tests/vision_qwen_pixel_gate tests/test-vectors/vision-qwen-pixel-goldens.bin
+
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-tower-gate: set VISION_MODEL=/path/to/a/vision-exp/checkpoint"; \
@@ -1810,7 +1814,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # shared hub) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
-	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check \
+	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate api-golden-gate sse-golden-gate spec-depth-gate \
 	loader-contract-gate render-gate
 # Every gate target is phony, declared HERE where the list is defined (the
@@ -2181,6 +2185,9 @@ tests/vision_image_sync_gate.o: tests/vision_image_sync_gate.cpp src/engine/puls
 tests/vision_placeholder_gate.o: tests/vision_placeholder_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_placeholder_gate.cpp
 
+tests/vision_qwen_pixel_gate.o: tests/vision_qwen_pixel_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_qwen_pixel_gate.cpp
+
 tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_hc_gate.cpp
 
@@ -2331,6 +2338,9 @@ tests/vision_image_sync_gate: tests/vision_image_sync_gate.o src/lib/pulsar_help
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_placeholder_gate: tests/vision_placeholder_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_qwen_pixel_gate: tests/vision_qwen_pixel_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)

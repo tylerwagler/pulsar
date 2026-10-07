@@ -467,7 +467,7 @@ static void pil_resample_axis(uint8_t *dst, int dst_w, int dst_h,
 /* ImagingResample() for one dimension pair: horizontal first, then vertical,
  * skipping a pass whose size is unchanged (Pillow's need_horizontal/vertical).
  * `box` is always the whole source, which is what Image.resize uses. */
-static uint8_t *pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
                                int dst_w, int dst_h) {
     uint8_t *cur = (uint8_t *)src;
     uint8_t *alloc1 = NULL, *alloc2 = NULL;
@@ -586,7 +586,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
     /* The resize/pad branch, then ImageOps.pad's contain + centred paste. */
     uint8_t *canvas = NULL;
     if (max_wh > 0.0f && (float)width >= max_wh * (float)height) {
-        canvas = pil_resize_rgb(rgb, width, height, best_w, best_h);
+        canvas = vision_pil_resize_rgb(rgb, width, height, best_w, best_h);
     } else {
         const double im_ratio = (double)width / (double)height;
         const double dest_ratio = (double)best_w / (double)best_h;
@@ -600,7 +600,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                 if (nw != best_w) cw = nw;
             }
         }
-        uint8_t *resized = pil_resize_rgb(rgb, width, height, cw, ch);
+        uint8_t *resized = vision_pil_resize_rgb(rgb, width, height, cw, ch);
         if (!resized) return 0;
         if (cw == best_w && ch == best_h) {
             canvas = resized;
