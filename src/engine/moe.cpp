@@ -22,14 +22,14 @@ pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor
                                   pulsar_act_format act) {
     if (!gate || !down) return PULSAR_MOE_ARM_NONE;
     if (up && up->type != gate->type) return PULSAR_MOE_ARM_NONE;   /* a gate / up pair is one format */
-    if (act == PULSAR_ACT_E4M3) {
+    if (act == PULSAR_ACT_SLOT_E4M3) {
         /* at E4M3 an EXL3 side runs its own arm on both projections: it never pairs with a CUTLASS / MMQ side */
         const bool ok = up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP, act) &&
                         pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act) &&
                         (exl3_type_k2(gate->type) != 0) == (exl3_type_k2(down->type) != 0);
         return ok ? PULSAR_MOE_ARM_SLOT : PULSAR_MOE_ARM_NONE;
     }
-    if (act == PULSAR_ACT_BF16 && pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act)) {
+    if (act == PULSAR_ACT_ROWS_BF16 && pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act)) {
         if (!up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP_FUSED, act)) return PULSAR_MOE_ARM_ROWS_FUSED;
         if (up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP, act)) return PULSAR_MOE_ARM_ROWS_PAIR;
     }
@@ -44,7 +44,7 @@ static void say_no_arm(const pulsar_tensor *gate, const pulsar_tensor *down, con
 
 bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
-    if (pulsar_moe_arm_for(G, U, D, PULSAR_ACT_E4M3) != PULSAR_MOE_ARM_SLOT) {
+    if (pulsar_moe_arm_for(G, U, D, PULSAR_ACT_SLOT_E4M3) != PULSAR_MOE_ARM_SLOT) {
         say_no_arm(G, D, "the MX slot (E4M3)");
         return false;
     }
@@ -89,7 +89,7 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
 
 bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
-    const pulsar_moe_arm arm = pulsar_moe_arm_for(G, U, D, PULSAR_ACT_BF16);
+    const pulsar_moe_arm arm = pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
     if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR) {
         say_no_arm(G, D, "raw bf16 rows");
         return false;

@@ -65,6 +65,11 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k);
 /** L272 P4b: a rank's tensor-parallel plan (tp_slice.cpp; opaque to the families, which add to it). */
 typedef struct pulsar_tp_plan pulsar_tp_plan;
 
+/** L272 P4c: how a family's forward hands its linears their activation -- the backend's MX slot (DeepSeek) or raw
+ *  bf16 rows (Qwen).  The core chooses by it: the dense / MoE arm with the format, and a TP slice's operation (a
+ *  slot reader reads slices REGISTERED with the backend, a rows reader slices BUILT and kept on the device). */
+typedef enum { PULSAR_ACT_KIND_SLOT = 0, PULSAR_ACT_KIND_ROWS = 1 } pulsar_act_kind;
+
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
@@ -223,9 +228,9 @@ struct pulsar_family {
      *  are the model's, e->model.tp_rank / tp_n_ranks): which tensors split, along which axis, the rank's ranges.
      *  The core chooses each operation by the tensor's format and runs it (tp_slice.cpp).  NULL = no TP. */
     bool (*tp_slices)(pulsar_engine *e, pulsar_tp_plan *plan);
-    /** The slice operations this family's forward reads (pulsar_tp_op bits): the plan refuses any other, since
-     *  until one launcher serves every format (L272 P4c) a slice the forward does not look up is not used. */
-    uint32_t tp_reads;
+    /** How the forward hands its linears their activation (pulsar_act_kind): what the core's arms and the TP
+     *  plan's operations are chosen for. */
+    pulsar_act_kind act_kind;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
 };

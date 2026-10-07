@@ -123,7 +123,7 @@ static void tensor_expect_mxfp8(
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
     if (t == &g_ds4_absent) return;
     /* L272 P4: the site emits the E4M3 slot -- the format registry's dense kernels for it (weight_format.cpp) */
-    if (pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_E4M3)))
+    if (pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3)))
         tensor_expect_dims(t, ndim, d0, d1, d2);
     else
         pulsar_load_refuse();
@@ -142,7 +142,7 @@ static void tensor_expect_plain_or_mxfp8(
     /* L272 P4: the slot's bf16 plane for the F32 / BF16 arms, its E4M3 for MXFP8 -- the registry's dense kernels at
      * those two activations */
     if (!pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE,
-                                  PULSAR_ACTS(PULSAR_ACT_F32) | PULSAR_ACTS(PULSAR_ACT_E4M3))) {
+                                  PULSAR_ACTS(PULSAR_ACT_SLOT_BF16) | PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
         pulsar_load_refuse();
         return;
     }
@@ -273,7 +273,7 @@ static void tensor_expect_routed_expert_combo(
      * handles all-CUTLASS, all-MMQ and the two mixed 40 / 44 shapes per projection -- the shipped artifact's
      * 43 routed layers are 9 all-40, 27 all-44 and 7 mixed. */
     if (gate == &g_ds4_absent || up == &g_ds4_absent || down == &g_ds4_absent) return;
-    if (!pulsar_format_moe_combo(gate, up, down, PULSAR_ACT_E4M3, DS4_OWNER)) pulsar_load_refuse();
+    if (!pulsar_format_moe_combo(gate, up, down, PULSAR_ACT_SLOT_E4M3, DS4_OWNER)) pulsar_load_refuse();
 }
 
 
@@ -288,7 +288,7 @@ static void tensor_expect_routed_expert(
     if (!t) pulsar_die("internal error: missing routed expert tensor while validating layout");
     if (t == &g_ds4_absent) return;
     /* L272 P4: the stack's role at this family's E4M3 activations (the registry's routed-expert kernels) */
-    if (!pulsar_tensor_admit_role(t, DS4_OWNER, role, PULSAR_ACTS(PULSAR_ACT_E4M3))) {
+    if (!pulsar_tensor_admit_role(t, DS4_OWNER, role, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
         pulsar_load_refuse();
         return;
     }

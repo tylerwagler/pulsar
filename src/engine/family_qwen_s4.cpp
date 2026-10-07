@@ -288,7 +288,7 @@ static bool admit_mx8(const pulsar_tensor *t) { return admit(t, t->type == PULSA
 /* L272 P4: a tensor's role at this family's bf16-row activations -- the format registry's answer
  * (weight_format.cpp), so which formats serve is the core's, not this family's */
 static bool admit_role(const pulsar_tensor *t, pulsar_weight_role role) {
-    return pulsar_tensor_admit_role(t, PULSAR_QWEN_ARCH, role, PULSAR_ACTS(PULSAR_ACT_BF16));
+    return pulsar_tensor_admit_role(t, PULSAR_QWEN_ARCH, role, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16));
 }
 /* a dense Linear the shared launcher (linear_dev) reads */
 static bool admit_linear(const pulsar_tensor *t) { return admit_role(t, PULSAR_ROLE_DENSE); }
@@ -312,7 +312,7 @@ static bool admit_moe(const pulsar_qwen_layer_weights &L) {
         ok &= admit_role(L.moe_gate, PULSAR_ROLE_EXPERT_GATE_UP) & admit_role(L.moe_up, PULSAR_ROLE_EXPERT_GATE_UP);
     ok &= admit_role(L.moe_down, PULSAR_ROLE_EXPERT_DOWN);
     if (ok) ok = pulsar_format_moe_combo(L.moe_gate_up ? L.moe_gate_up : L.moe_gate, L.moe_gate_up ? NULL : L.moe_up,
-                                         L.moe_down, PULSAR_ACT_BF16, PULSAR_QWEN_ARCH);
+                                         L.moe_down, PULSAR_ACT_ROWS_BF16, PULSAR_QWEN_ARCH);
     ok &= admit_role(L.sh_gate, PULSAR_ROLE_SHARED_EXPERT) & admit_role(L.sh_up, PULSAR_ROLE_SHARED_EXPERT) &
           admit_role(L.sh_down, PULSAR_ROLE_SHARED_EXPERT);
     return ok;

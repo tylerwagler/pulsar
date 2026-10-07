@@ -2,21 +2,21 @@
  *
  * A declaration is a tensor, an axis and the rank's ranges along it -- OUT (a linear's output rows: dim[1], or a
  * plain tensor's outermost dim), IN (a linear's input: dim[0]) or EXPERTS (whole experts of a stack: dim[2]).
- * The OPERATION is the core's choice, by the tensor's format (one table, plan_op):
+ * The OPERATION is the core's choice -- one table, plan_op -- by the tensor's format and by how the family's forward
+ * reads its activation (pulsar_family::act_kind): a SLOT reader's linears resolve registered slices in the backend,
+ * a ROWS reader's take a device pointer, so its slices are built and kept on the device:
  *
- *   MXFP8_LT        OUT  -> fp8_rows     a row slice registered with the backend (the stored tensor stays staged)
- *   MXFP8_LT        IN   -> fp8_kslice   an input-column slice registered, keyed by (engine, tensor)
- *   EXL3            OUT  -> exl3_cols    the output columns gathered on the host, kept on the device
- *   EXL3            IN   -> exl3_rows    the input rows gathered likewise
- *   bf16 / f32      OUT  -> view         one range: the forward offsets into the staged tensor
- *                                 -> <type>_channels   several ranges: gathered and kept on the device
- *   CUTLASS MXFP4   OUT/IN on a stack -> mxfp4_half    the [lo, hi) half of every expert, built by the backend
- *   any stack       EXPERTS      -> stage_range        the rank's whole experts staged as stored
+ *   format          axis       slot reader (DeepSeek)                rows reader (Qwen)
+ *   MXFP8_LT        OUT / IN   fp8_rows / fp8_kslice, registered     -- (the scale plane is not row-addressable)
+ *   EXL3            OUT / IN   --                                    exl3_cols / exl3_rows, gathered on the host
+ *   bf16 / f32      OUT        view (one range: offset arithmetic)   <type>_channels, gathered
+ *   CUTLASS MXFP4   OUT / IN   mxfp4_half of every expert            --
+ *     (a stack)
+ *   any stack       EXPERTS    --                                    stage_range, the rank's whole experts
  *
- * Any other pairing refuses by name at load.  So does an operation the family's forward does not read
- * (pulsar_family::tp_reads): until one launcher serves every format (P4c) a slice the forward would not look up
- * computes the full tensor in silence.  A tensor whose slice REPLACES it (built, a half, a staged range) is never
- * staged whole: the plan is the residency rule (pulsar_model::tp_unstaged).
+ * A pairing with no operation refuses by name at load.  A tensor whose slice REPLACES it (built, a half, a staged
+ * range) is never staged whole: the plan is the residency rule (pulsar_model::tp_unstaged).  The front doors ask
+ * the plan what a rank reads (pulsar_tp_slice_of: linear.cpp, moe.cpp).
  *
  * The plan is built at open after the family's load, before the inspect-only exit (pulsar_tp_plan_build), and
  * run after the GPU is up (pulsar_tp_plan_run).  RECORD MODE (pulsar_tp_record_begin): the run writes one
@@ -99,16 +99,17 @@ static uint64_t axis_full(const pulsar_tensor *t, pulsar_tp_axis axis) {
     return axis == PULSAR_TP_AXIS_OUT ? t->dim[1] : t->dim[0];
 }
 
-static pulsar_tp_op plan_op(const pulsar_tp_slice *s) {
+static pulsar_tp_op plan_op(const pulsar_tp_slice *s, pulsar_act_kind kind) {
     const pulsar_tensor *t = s->t;
-    if (s->axis == PULSAR_TP_AXIS_EXPERTS) return t->ndim == 3 && t->bytes % t->dim[2] == 0 ? PULSAR_TP_OP_EXPERTS
-                                                                                            : PULSAR_TP_OP_NONE;
+    const bool rows = kind == PULSAR_ACT_KIND_ROWS, out = s->axis == PULSAR_TP_AXIS_OUT;
+    if (s->axis == PULSAR_TP_AXIS_EXPERTS)
+        return rows && t->ndim == 3 && t->bytes % t->dim[2] == 0 ? PULSAR_TP_OP_EXPERTS : PULSAR_TP_OP_NONE;
     if (t->type == PULSAR_TENSOR_MXFP8_LT && t->ndim == 2)
-        return s->axis == PULSAR_TP_AXIS_OUT ? PULSAR_TP_OP_FP8_ROWS : PULSAR_TP_OP_FP8_K;
+        return rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_FP8_ROWS : PULSAR_TP_OP_FP8_K;
     if (exl3_type_k2(t->type) && t->ndim == 2)
-        return s->axis == PULSAR_TP_AXIS_OUT ? PULSAR_TP_OP_EXL3_COLS : PULSAR_TP_OP_EXL3_ROWS;
-    if (plain_type(t->type) && s->axis == PULSAR_TP_AXIS_OUT) return s->n == 1 ? PULSAR_TP_OP_VIEW : PULSAR_TP_OP_GATHER;
-    if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4 && t->ndim == 3) return PULSAR_TP_OP_MXFP4_HALF;
+        return !rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_EXL3_COLS : PULSAR_TP_OP_EXL3_ROWS;
+    if (plain_type(t->type) && out) return rows ? PULSAR_TP_OP_GATHER : s->n == 1 ? PULSAR_TP_OP_VIEW : PULSAR_TP_OP_NONE;
+    if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4 && t->ndim == 3) return rows ? PULSAR_TP_OP_NONE : PULSAR_TP_OP_MXFP4_HALF;
     return PULSAR_TP_OP_NONE;
 }
 
@@ -146,18 +147,13 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
     uint32_t count[9] = {0};
     uint64_t unstaged = 0;
     for (const pulsar_tp_slice &s : p->slices) {
-        const pulsar_tp_op op = plan_op(&s);
+        const pulsar_tp_op op = plan_op(&s, e->family->act_kind);
         char nm[256];
         tname(s.t, nm, sizeof(nm));
         if (op == PULSAR_TP_OP_NONE || !plan_ranges_ok(&s, op)) {
-            fprintf(stderr, "pulsar: TP plan: no %s slice of %s (%s, %u range(s) along %s) -- refusing\n",
+            fprintf(stderr, "pulsar: TP plan: no %s slice of %s (%s, %u range(s) along %s) for a %s reader -- refusing\n",
                     op == PULSAR_TP_OP_NONE ? "operation for a" : "aligned in-bounds", nm, tensor_type_name(s.t->type),
-                    s.n, axis_name(s.axis));
-            return false;
-        }
-        if (!(e->family->tp_reads & op)) {
-            fprintf(stderr, "pulsar: TP plan: %s's forward does not read a %s slice (%s is %s) -- refusing (L272 P4c)\n",
-                    e->family->name, op_name(op), nm, tensor_type_name(s.t->type));
+                    s.n, axis_name(s.axis), e->family->act_kind == PULSAR_ACT_KIND_ROWS ? "bf16-rows" : "MX-slot");
             return false;
         }
         p->by_tensor[s.t] = p->ops.size();

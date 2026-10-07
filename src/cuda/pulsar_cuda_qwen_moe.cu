@@ -1,22 +1,24 @@
 /* Qwen3.8-Flash-Next MoE block (L251 S4): the router, the EXL3 routed
  * experts, the sigmoid-gated EXL3 shared expert, and the fixed-order sum.
  * Contracts in pulsar_cuda_qwen.h; the source is transformers'
- * Qwen4ExpTextSparseMoeBlock / Qwen4ExpTextTopKRouter.
+ * Qwen4ExpTextSparseMoeBlock / Qwen4ExpTextTopKRouter.  Since L272 P4c the
+ * block is three launches the engine composes (family_qwen_s4.cpp
+ * pulsar_qwen_s4_moe) over one carved workspace (pulsar_qwen_moe_carve):
  *
- *   router     logits = W_r x in f32 (bf16 x bf16, fixed order), rounded to
- *              bf16; softmax; top-10 by probability; renormalised; bf16
- *   routed     the L245 EXL3 arm with Qwen's FUSED gate_up (one [2560 -> 1280]
- *              slice per expert, gate rows then up rows, one suh -- the layout
- *              the graded quant produced and the container carries):
- *              ds4_exl3_moe_fused (one GEMV, the input rotated in-kernel), the
- *              fused fold (no clamp; the router weight folded into the mid
- *              before its E4M3 encode, as on DeepSeek), the down on the fold's
- *              pre-rotated mid (640 = 5 x 128, the arm's K % 128 tail), the
- *              slot-ordered sum with the output rotation
- *   shared     the EXL3 dense arm on the same E4M3 slot (gate, up), SwiGLU
- *              encoded by its producer, the dense down
+ *   router     pulsar_qwen_router_launch: logits = W_r x in f32 (bf16 x bf16,
+ *              fixed order), rounded to bf16; softmax; top-10 by probability;
+ *              renormalised; bf16; and the shared expert's sigmoid gate
+ *   routed     pulsar_rows_moe_routed_launch -- the core front door's arm over
+ *              bf16 rows (moe.cpp), family-neutral: the EXL3 FUSED gate_up
+ *              (one [2560 -> 1280] slice per expert, gate rows then up rows,
+ *              one suh) or a gate + up PAIR, the fold (no clamp; the router
+ *              weight folded into the bf16 mid), the down, the slot-ordered
+ *              sum; expert parallelism localises the picks first
+ *   shared     pulsar_qwen_moe_shared_launch: the dense arm (gate, up) on the
+ *              same bf16 rows, SwiGLU emitted bf16 by its producer, the down
  *   out        routed + sigmoid(w_sg . x) * shared -- in that order
- */
+ *
+ * L251 / ac69748f: there is no E4M3 activation slot in this family. */
 #include "pulsar_cuda_qwen.h"
 #include "pulsar_cuda_mx.cuh"
 #include "mmq/ds4_exl3_dense.cuh"

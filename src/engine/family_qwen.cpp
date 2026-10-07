@@ -1500,6 +1500,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .session      = */ &k_qwen_session_ops,
     /* .tokenizer    = */ &k_qwen_tokenizer,
     /* .tp_slices    = */ pulsar_qwen_tp_slices,
-    /* .tp_reads     = */ PULSAR_TP_OP_EXL3_COLS | PULSAR_TP_OP_EXL3_ROWS | PULSAR_TP_OP_GATHER | PULSAR_TP_OP_EXPERTS,
+    /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .banks        = */ &k_qwen_bank_ops,
 };

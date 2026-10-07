@@ -2986,7 +2986,7 @@ typedef enum {
     PULSAR_TP_AXIS_IN = 1,        ///< a linear's input (dim[0]): the rank's output is a partial the all-reduce sums
     PULSAR_TP_AXIS_EXPERTS = 2,   ///< whole experts of a stack (dim[2])
 } pulsar_tp_axis;
-/** The operation a slice takes (bits: pulsar_family::tp_reads is the set a family's forward reads). */
+/** The operation a slice takes (tp_slice.cpp plan_op: by the tensor's format, the axis and the family's act_kind). */
 typedef enum {
     PULSAR_TP_OP_NONE = 0,
     PULSAR_TP_OP_FP8_ROWS = 1u << 0,
@@ -3033,8 +3033,14 @@ typedef enum {
     PULSAR_ROLE_EXPERT_GATE_UP_FUSED = 3,   ///< one [in -> 2 mid] gate | up stack
     PULSAR_ROLE_SHARED_EXPERT = 4,     ///< a shared expert's projection inside the MoE launcher
 } pulsar_weight_role;
-/** The activation a family's forward emits at a site. */
-typedef enum { PULSAR_ACT_F32 = 0, PULSAR_ACT_BF16 = 1, PULSAR_ACT_E4M3 = 2, PULSAR_ACT_COUNT = 3 } pulsar_act_format;
+/** The activation a linear reads, as its producer emitted it (L272 P4c: the names say how it is REFERENCED -- the
+ *  MX slot is the backend's activation cache, keyed by the f32 buffer the producer wrote; rows are a raw pointer). */
+typedef enum {
+    PULSAR_ACT_SLOT_BF16 = 0,   ///< the slot's bf16 plane (DeepSeek's plain F32 / BF16 weights, cuBLAS)
+    PULSAR_ACT_ROWS_BF16 = 1,   ///< raw bf16 rows (Qwen)
+    PULSAR_ACT_SLOT_E4M3 = 2,   ///< the slot's E4M3 MX plane (DeepSeek's MXFP8 dense and routed experts)
+    PULSAR_ACT_COUNT = 3,
+} pulsar_act_format;
 #define PULSAR_ACTS(a) (1u << (a))
 /** L272 P4c: the kernel arm a dense linear takes for (stored format, activation) -- admission (pulsar_format_serves)
  *  and the launcher (linear.cpp) read this one table. */

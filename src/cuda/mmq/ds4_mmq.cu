@@ -981,17 +981,3 @@ extern "C" int ds4_exl3_moe_single_bf16(
                             NULL, 0, act_bf16, NULL, 0, k2, false, true, prompt);
 }
 
-extern "C" int ds4_exl3_moe_fused(
-        const void * table, int k2, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream,
-        const void * act_q, const void * act_sf, int act_kbp) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
-        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_fused: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_impl("ds4_exl3_moe_fused", table, ids, out,
-                            M, K, n_tokens, n_experts, n_expert_used, stream,
-                            NULL, 0, act_q, act_sf, act_kbp, k2, true);
-}

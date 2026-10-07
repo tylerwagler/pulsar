@@ -6,12 +6,12 @@
  * that site (f32, bf16 rows, or the E4M3 MX slot).  Whether a stored format can serve that (role, activation) is
  * this table's answer -- one per kernel the engine has (research/family-plugin-audit-2026-10-06/09):
  *
- *   dense            f32 act: F32, BF16 (the plain cuBLAS arms)   E4M3: MXFP8_LT (cuBLASLt)
- *                    bf16 act: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate
- *   expert gate/up   E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a pair-arm rate        bf16: EXL3 pair-arm
- *   expert down      E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a down-arm rate        bf16: EXL3 down-arm
- *   fused gate_up    bf16: EXL3 at a fused-arm rate
- *   shared expert    bf16: EXL3 at a dense-arm rate (inside the bf16 MoE launcher)
+ *   dense            slot bf16 plane: F32, BF16 (cuBLAS)            slot E4M3: MXFP8_LT (cuBLASLt)
+ *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate
+ *   expert gate/up   slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a pair-arm rate   rows: EXL3 pair-arm
+ *   expert down      slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a down-arm rate   rows: EXL3 down-arm
+ *   fused gate_up    bf16 rows: EXL3 at a fused-arm rate
+ *   shared expert    bf16 rows: EXL3 at a dense-arm rate
  *
  * A combination with no kernel refuses by name at load -- never a converted activation (rule 3: producers emit,
  * consumers never convert).  Filling one (an E4M3-activation EXL3 dense arm for a DeepSeek EXL3 artifact, a bf16
@@ -27,15 +27,15 @@ static bool exl3_arm(uint32_t type, int arm) {
 }
 
 /* L272 P4c: the dense arm for (format, activation) -- what admission asks at load and what the launcher runs
- * (linear.cpp), one table.  (The F32 label is the slot's bf16 plane keyed on an f32 buffer; BF16 is raw rows.) */
+ * (linear.cpp), one table. */
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act) {
     switch (act) {
-    case PULSAR_ACT_F32:
+    case PULSAR_ACT_SLOT_BF16:
         return type == PULSAR_TENSOR_F32 ? PULSAR_DENSE_ARM_F32_PLANE
              : type == PULSAR_TENSOR_BF16 ? PULSAR_DENSE_ARM_BF16_PLANE : PULSAR_DENSE_ARM_NONE;
-    case PULSAR_ACT_E4M3:
+    case PULSAR_ACT_SLOT_E4M3:
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_SLOT : PULSAR_DENSE_ARM_NONE;
-    case PULSAR_ACT_BF16:
+    case PULSAR_ACT_ROWS_BF16:
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_ROWS
              : exl3_arm(type, EXL3_ARM_DENSE) ? PULSAR_DENSE_ARM_EXL3_ROWS : PULSAR_DENSE_ARM_NONE;
     case PULSAR_ACT_COUNT: break;
@@ -48,24 +48,24 @@ bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_for
     case PULSAR_ROLE_DENSE:
         return pulsar_dense_arm_for(type, act) != PULSAR_DENSE_ARM_NONE;
     case PULSAR_ROLE_EXPERT_GATE_UP:
-        if (act == PULSAR_ACT_E4M3)
+        if (act == PULSAR_ACT_SLOT_E4M3)
             return type == PULSAR_TENSOR_CUTLASS_MXFP4 || type == PULSAR_TENSOR_IQ2_XXS_MMQ_K || exl3_arm(type, EXL3_ARM_PAIR);
-        return act == PULSAR_ACT_BF16 && exl3_arm(type, EXL3_ARM_PAIR);
+        return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_PAIR);
     case PULSAR_ROLE_EXPERT_DOWN:
-        if (act == PULSAR_ACT_E4M3)
+        if (act == PULSAR_ACT_SLOT_E4M3)
             return type == PULSAR_TENSOR_CUTLASS_MXFP4 || type == PULSAR_TENSOR_IQ2_XXS_MMQ_K || exl3_arm(type, EXL3_ARM_DOWN);
-        return act == PULSAR_ACT_BF16 && exl3_arm(type, EXL3_ARM_DOWN);
+        return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_DOWN);
     case PULSAR_ROLE_EXPERT_GATE_UP_FUSED:
-        return act == PULSAR_ACT_BF16 && exl3_arm(type, EXL3_ARM_GATE_UP_FUSED);
+        return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_GATE_UP_FUSED);
     case PULSAR_ROLE_SHARED_EXPERT:
-        return act == PULSAR_ACT_BF16 && exl3_arm(type, EXL3_ARM_DENSE);
+        return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_DENSE);
     }
     return false;
 }
 
 static const char *const k_role_name[] = {"a dense linear", "a routed expert's gate / up", "a routed expert's down",
                                           "a fused routed gate_up", "a shared expert"};
-static const char *const k_act_name[] = {"f32", "bf16", "E4M3-MX"};
+static const char *const k_act_name[] = {"the MX slot's bf16 plane", "raw bf16 rows", "the MX slot's E4M3"};
 
 bool pulsar_tensor_admit_role(const pulsar_tensor *t, const char *owner, pulsar_weight_role role, uint32_t acts) {
     for (int a = 0; a < PULSAR_ACT_COUNT; a++)
@@ -92,7 +92,7 @@ bool pulsar_format_moe_combo(const pulsar_tensor *gate, const pulsar_tensor *up,
      * CUTLASS MXFP4 / IQ2 side (the rates may differ: each side decodes by its own type) */
     if (up && up->type != gate->type)
         return pulsar_tensor_admit(up, owner, false, "the gate stack's format (a gate / up pair is one format)");
-    if (act == PULSAR_ACT_E4M3 && (exl3_type_k2(gate->type) != 0) != (exl3_type_k2(down->type) != 0))
+    if (act == PULSAR_ACT_SLOT_E4M3 && (exl3_type_k2(gate->type) != 0) != (exl3_type_k2(down->type) != 0))
         return pulsar_tensor_admit(down, owner, false,
                                    "the gate side's family of formats (an EXL3 side pairs only with an EXL3 side)");
     return true;

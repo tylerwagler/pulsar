@@ -2878,11 +2878,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                               n_tokens); \
         /* TP: this rank's input-column half of down, repacked at open and keyed \
          * (engine key, parent offset) -- a partial of the shared output. */ \
-        if (ok && g->tp) ok = pulsar_gpu_matmul_mxfp8_tensor(g->batch_shared_out, \
-                                                             g->tp_kslice_key, UINT64_MAX / 2u, \
-                                                             pulsar_tp_kslice_key_offset(layer->ffn_down_shexp), \
-                                                             shared_own, PULSAR_N_EMBD, \
-                                                             g->batch_shared_mid, n_tokens) != 0; \
+        if (ok && g->tp) ok = pulsar_linear_slot(g->batch_shared_out, model, layer->ffn_down_shexp, shared_own, \
+                                                 0, PULSAR_N_EMBD, g->batch_shared_mid, n_tokens); \
         if (ok) { \
             gpu_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out, \
                                           (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0); \
