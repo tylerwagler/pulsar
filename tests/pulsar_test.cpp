@@ -1032,6 +1032,99 @@ static void test_image_conversation_reuse_matches_cold(void) {
 
 
 
+/* L281 (b): an image prefill interrupted at every chunk boundary and resumed through sync_mm with the same images
+ * equals the cold prefill, byte for byte -- the server's quantum loop with a slot yielding after each chunk.  Each
+ * interrupted quantum records the blocks it completed (pulsar_session::live_images) and the planner honours a stop
+ * only at a grid point outside every block, so no resumed quantum may start from 0 (the failure this guards: a stop
+ * right after a block resumed from the grid point inside it, i.e. from 0).
+ *
+ * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
+struct test_quantum {
+    int chunks;   /* prefill_chunk events since the quantum began */
+};
+static void test_quantum_progress(void *ud, const char *event, int, int) {
+    if (!strcmp(event, "prefill_chunk")) ((test_quantum *)ud)->chunks++;
+}
+static bool test_quantum_cancel(void *ud) { return ((test_quantum *)ud)->chunks >= 1; }
+
+static void test_image_prefill_interrupt_resumes(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    pulsar_image_ref img = {0};
+    img.bytes = (uint8_t *)test_reuse_png;
+    img.len = sizeof test_reuse_png;
+    /* ~600 tokens of text, the image, then a tail long enough for several prefill chunks after it */
+    pulsar_tokens raw = {0};
+    {
+        enum { TEXT_MAX = 96 * 1024 };
+        char *text = (char *)xmalloc(TEXT_MAX);
+        size_t n = 0;
+        for (int r = 0; r < 60; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Earlier context line %d. ", r);
+        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Look at " PULSAR_IMAGE_PLACEHOLDER " and then read on. ");
+        for (int r = 0; r < 900 && n < TEXT_MAX - 128; r++)
+            n += (size_t)snprintf(text + n, TEXT_MAX - n, "The quick brown fox jumps over the lazy dog %d. ", r);
+        pulsar_tokenize_rendered_chat(engine, text, &raw);
+        free(text);
+    }
+    char err[256] = {0};
+    pulsar_tokens prompt = {0};
+    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+        fprintf(stderr, "image-interrupt gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
+        pulsar_tokens_free(&raw);
+        return;
+    }
+    const int vocab = pulsar_engine_logits_width(engine);
+    float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
+    float *resumed = (float *)xmalloc((size_t)vocab * sizeof(float));
+    const int ctx = prompt.len + 1024;
+
+    pulsar_session *sc = NULL;
+    TEST_ASSERT(pulsar_session_create(&sc, engine, ctx) == 0);
+    pulsar_image_ref im = img;
+    bool okc = sc && pulsar_session_sync_mm(sc, &prompt, &im, 1, err, sizeof err) == 0 &&
+               pulsar_session_copy_logits(sc, cold, vocab) == vocab;
+    TEST_ASSERT(okc);
+    if (sc) pulsar_session_free(sc);
+
+    pulsar_session *sr = NULL;
+    TEST_ASSERT(pulsar_session_create(&sr, engine, ctx) == 0);
+    test_quantum q = {0};
+    int quanta = 0, rc = PULSAR_SESSION_SYNC_INTERRUPTED, restarts = 0;
+    if (sr) {
+        pulsar_session_set_progress(sr, test_quantum_progress, &q);
+        pulsar_session_set_cancel(sr, test_quantum_cancel, &q);
+    }
+    while (sr && rc == PULSAR_SESSION_SYNC_INTERRUPTED && quanta < 64) {
+        q.chunks = 0;
+        pulsar_image_ref again = img;
+        rc = pulsar_session_sync_mm(sr, &prompt, &again, 1, err, sizeof err);
+        quanta++;
+        if (quanta > 1 && pulsar_session_resume_origin(sr) == 0) restarts++;   /* a resumed quantum started cold */
+    }
+    TEST_ASSERT(rc == 0);
+    if (rc != 0) fprintf(stderr, "  the quantum loop ended rc %d: %s\n", rc, err);
+    const bool okr = rc == 0 && pulsar_session_copy_logits(sr, resumed, vocab) == vocab;
+    TEST_ASSERT(okr);
+    if (sr) pulsar_session_free(sr);
+
+    fprintf(stderr, "image-interrupt gate: %d-token prompt, image block at %d, %d quanta, %d restarted from 0\n",
+            prompt.len, img.start_pos, quanta, restarts);
+    TEST_ASSERT(quanta >= 3);      /* the prompt spans several chunks: it was interrupted */
+    TEST_ASSERT(restarts == 0);
+    if (okc && okr) {
+        int differing = 0;
+        for (int i = 0; i < vocab; i++) differing += memcmp(&cold[i], &resumed[i], sizeof(float)) != 0;
+        fprintf(stderr, "image-interrupt gate: %d/%d logits differ from the cold prefill\n", differing, vocab);
+        TEST_ASSERT(differing == 0);
+    }
+    free(cold);
+    free(resumed);
+    pulsar_tokens_free(&prompt);
+    pulsar_tokens_free(&raw);
+}
+
+
+
 static bool test_mpp_capture_logits_only(pulsar_engine *engine,
                                          const test_mpp_eq_case *tc,
                                          float *logits) {
@@ -4326,6 +4419,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--image-reuse", "image-reuse", "an image conversation's reused continuation equals its cold prefill, byte for byte (L226)", test_image_conversation_reuse_matches_cold},
+    {"--image-interrupt", "image-interrupt", "an image prefill interrupted at every chunk and resumed equals its cold prefill, byte for byte, never restarting from 0 (L281)", test_image_prefill_interrupt_resumes},
     {"--image-span-cache", "image-span-cache", "the encoded-span cache is transparent: cached == freshly encoded, byte for byte (L226)", test_image_span_cache_is_transparent},
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},

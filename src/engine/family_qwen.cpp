@@ -1501,5 +1501,6 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .tokenizer    = */ &k_qwen_tokenizer,
     /* .tp_slices    = */ pulsar_qwen_tp_slices,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
+    /* .vision       = */ NULL,   /* no image path yet: no id is a sentinel */
     /* .banks        = */ &k_qwen_bank_ops,
 };
