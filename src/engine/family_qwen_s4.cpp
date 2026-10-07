@@ -20,8 +20,6 @@
 #include "cuda/pulsar_cuda_gdn.h"
 
 #include <sys/stat.h>
-#include <unordered_map>
-#include <vector>
 
 struct pulsar_qwen_ple_io {
     pulsar_engram_table table;
@@ -34,11 +32,6 @@ struct pulsar_qwen_ple_io {
     uint32_t pending_n;             ///< its tokens
 };
 
-/* L266 step 7: this rank's slices of the tensors TP splits, by the stored tensor they replace. */
-struct pulsar_qwen_tp_slices {
-    std::unordered_map<const pulsar_tensor *, pulsar_gpu_tensor *> by_tensor;
-};
-
 namespace {
 
 constexpr uint64_t kGrInjStride = (uint64_t)PULSAR_QWEN_HC * sizeof(float);   /* inj per row */
@@ -46,10 +39,7 @@ constexpr uint64_t kGrInjStride = (uint64_t)PULSAR_QWEN_HC * sizeof(float);   /*
 const pulsar_qwen_layer_weights &layer_w(const pulsar_qwen_step *st, uint32_t il) { return st->w->layer[il]; }
 
 const void *wptr(const pulsar_qwen_step *st, const pulsar_tensor *t, const char *what) {
-    if (st->w->tp) {
-        const auto it = st->w->tp->by_tensor.find(t);
-        if (it != st->w->tp->by_tensor.end()) return pulsar_gpu_tensor_device_ptr(it->second);
-    }
+    if (const void *slice = pulsar_tp_built_ptr(st->model, t)) return slice;   /* L266 step 7: the rank's slice */
     const void *p = pulsar_qwen_weight_ptr(tensor_map_base(st->model, t), t->abs_offset, t->bytes, what);
     if (!p) fprintf(stderr, "pulsar: %s: no device copy of %.*s (%s) -- refusing\n", PULSAR_QWEN_ARCH,
                     (int)t->name.len, t->name.ptr, what);
@@ -58,55 +48,12 @@ const void *wptr(const pulsar_qwen_step *st, const pulsar_tensor *t, const char 
 
 void *dptr(pulsar_gpu_tensor *t) { return pulsar_gpu_tensor_device_ptr(t); }
 
-/* ---- L266 step 7: this rank's slices (pulsar_qwen_tp_build) ---------------------------------------------
- * EXL3 [trellis | suh | svh], trellis in (k-tile, n-tile, word) order (exl3_trellis.h): an output-column
- * slice is, per k-tile row, a run of n-tiles plus that range of svh (suh whole); an input-row slice is a run
- * of k-tile rows plus that range of suh (svh whole).  Every cut is 128-aligned, so the Hadamard blocks on
- * both sides stay whole and a slice is bytes copied -- the rank's matmul is exactly the full one's rows /
- * columns (a K slice's output is a partial the all-reduce sums). */
-typedef std::vector<std::pair<uint64_t, uint64_t>> col_ranges;
-
-bool exl3_tile_geometry(const pulsar_tensor *t, uint64_t *K, uint64_t *N, uint64_t *trellis, uint64_t *tile) {
-    const int k2 = exl3_type_k2(t->type);
-    uint64_t sc = 0, stride = 0;
-    *K = t->dim[0];
-    *N = t->dim[1];
-    if (!k2 || !exl3_expert_layout(*K, *N, k2, trellis, &sc, &stride) || stride != t->bytes) return false;
-    *tile = *trellis / ((*K / 16u) * (*N / 16u));
-    return true;
-}
-
-bool exl3_slice_cols(const uint8_t *src, const pulsar_tensor *t, const col_ranges &cols, std::vector<uint8_t> &out) {
-    uint64_t K = 0, N = 0, tr = 0, tile = 0;
-    if (!exl3_tile_geometry(t, &K, &N, &tr, &tile)) return false;
-    for (const auto &c : cols) if (c.first % 128u || c.second % 128u || c.second <= c.first || c.second > N) return false;
-    for (uint64_t kt = 0; kt < K / 16u; kt++)
-        for (const auto &c : cols) {
-            const uint8_t *p = src + (kt * (N / 16u) + c.first / 16u) * tile;
-            out.insert(out.end(), p, p + (c.second - c.first) / 16u * tile);
-        }
-    out.insert(out.end(), src + tr, src + tr + K * 2u);                       /* suh: the whole input */
-    for (const auto &c : cols) out.insert(out.end(), src + tr + K * 2u + c.first * 2u, src + tr + K * 2u + c.second * 2u);
-    return true;
-}
-
-bool exl3_slice_rows(const uint8_t *src, const pulsar_tensor *t, uint64_t k0, uint64_t k1, std::vector<uint8_t> &out) {
-    uint64_t K = 0, N = 0, tr = 0, tile = 0;
-    if (!exl3_tile_geometry(t, &K, &N, &tr, &tile) || k0 % 128u || k1 % 128u || k1 <= k0 || k1 > K) return false;
-    out.insert(out.end(), src + k0 / 16u * (N / 16u) * tile, src + k1 / 16u * (N / 16u) * tile);
-    out.insert(out.end(), src + tr + k0 * 2u, src + tr + k1 * 2u);            /* suh: the rank's inputs */
-    out.insert(out.end(), src + tr + K * 2u, src + tr + K * 2u + N * 2u);       /* svh: the whole output */
-    return true;
-}
-
 } // namespace
 
-bool pulsar_qwen_tp_build(pulsar_engine *e) {
+bool pulsar_qwen_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
-    if (pulsar_qwen_tp(s) == 1) return true;
-    const pulsar_model *m = &e->model;
-    pulsar_qwen_weights *w = e->qwen_weights;
-    if (!pulsar_tp_recording()) w->tp = new pulsar_qwen_tp_slices();
+    pulsar_model *m = &e->model;
+    const pulsar_qwen_weights *w = e->qwen_weights;
     const uint32_t nr = pulsar_qwen_tp(s);
     const int rank = (int)s->tp_rank;
     /* L272 P0: every range from the ONE range rule (pulsar_tp_owned_range, as DeepSeek's slices and
@@ -127,81 +74,36 @@ bool pulsar_qwen_tp_build(pulsar_engine *e) {
     }
     const uint64_t qkF = (uint64_t)s->gdn_n_k_head * s->gdn_k_dim * nr;
     /* the rank's q, k, v channels of the GDN conv / in_proj_qkv, in the model's order */
-    const col_ranges qkv = {{qk.lo, qk.hi}, {qkF + qk.lo, qkF + qk.hi}, {2u * qkF + vt.lo, 2u * qkF + vt.hi}};
-    const col_ranges vcols = {{vt.lo, vt.hi}};
-    uint64_t built = 0;
+    const uint64_t qkv_lo[3] = {qk.lo, qkF + qk.lo, 2u * qkF + vt.lo};
+    const uint64_t qkv_hi[3] = {qk.hi, qkF + qk.hi, 2u * qkF + vt.hi};
     bool ok = true;
-    /* L272 P4b: a host-built slice through the core's operation (record mode keeps nothing) */
-    auto put = [&](const pulsar_tensor *t, const std::vector<uint8_t> &bytes, const char *how) {
-        pulsar_gpu_tensor *g = pulsar_tp_slice_built(t, how, bytes.data(), bytes.size(), &ok);
-        if (g) w->tp->by_tensor[t] = g;
-        if (ok) built += bytes.size();
+    auto out = [&](const pulsar_tensor *t, uint64_t lo, uint64_t hi) {
+        ok = ok && pulsar_tp_plan_add1(plan, m, t, PULSAR_TP_AXIS_OUT, lo, hi);
     };
-    auto cols = [&](const pulsar_tensor *t, const col_ranges &c) {
-        if (!t || !ok) return;
-        std::vector<uint8_t> b;
-        if (!exl3_slice_cols((const uint8_t *)tensor_data(m, t), t, c, b)) {
-            fprintf(stderr, "pulsar: %s: %.*s does not slice by output columns -- refusing\n", PULSAR_QWEN_ARCH,
-                    (int)t->name.len, t->name.ptr);
-            ok = false;
-            return;
-        }
-        put(t, b, "exl3_cols");
-    };
-    auto rows = [&](const pulsar_tensor *t, uint64_t k0, uint64_t k1) {
-        if (!t || !ok) return;
-        std::vector<uint8_t> b;
-        if (!exl3_slice_rows((const uint8_t *)tensor_data(m, t), t, k0, k1, b)) {
-            fprintf(stderr, "pulsar: %s: %.*s does not slice by input rows -- refusing\n", PULSAR_QWEN_ARCH,
-                    (int)t->name.len, t->name.ptr);
-            ok = false;
-            return;
-        }
-        put(t, b, "exl3_rows");
+    auto in = [&](const pulsar_tensor *t, uint64_t lo, uint64_t hi) {
+        ok = ok && pulsar_tp_plan_add1(plan, m, t, PULSAR_TP_AXIS_IN, lo, hi);
     };
     const uint32_t n_state = e->plan.n_layer + (w->mtp.present ? 1u : 0u);
     for (uint32_t il = 0; ok && il < n_state; il++) {
         const pulsar_qwen_layer_weights &L = w->layer[il];
         if (L.gdn_in_qkv) {
-            cols(L.gdn_in_qkv, qkv);
-            cols(L.gdn_in_z, vcols);
-            rows(L.gdn_out, vt.lo, vt.hi);
-            /* the conv: bf16 [channels][kernel], the rank's channels gathered */
-            const uint64_t ck = (uint64_t)s->gdn_conv_kernel * 2u;
-            const uint8_t *src = (const uint8_t *)tensor_data(m, L.gdn_conv);
-            std::vector<uint8_t> b;
-            for (const auto &c : qkv) b.insert(b.end(), src + c.first * ck, src + c.second * ck);
-            if (ok) put(L.gdn_conv, b, "bf16_channels");
+            ok = pulsar_tp_plan_add(plan, m, L.gdn_in_qkv, PULSAR_TP_AXIS_OUT, 3, qkv_lo, qkv_hi);
+            out(L.gdn_in_z, vt.lo, vt.hi);
+            in(L.gdn_out, vt.lo, vt.hi);
+            ok = ok && pulsar_tp_plan_add(plan, m, L.gdn_conv, PULSAR_TP_AXIS_OUT, 3, qkv_lo, qkv_hi);
         }
         if (L.attn_q) {
-            cols(L.attn_q, {{qin.lo, qin.hi}});
-            cols(L.attn_k, {{kvin.lo, kvin.hi}});
-            cols(L.attn_v, {{kvin.lo, kvin.hi}});
-            rows(L.attn_o, od.lo, od.hi);
+            out(L.attn_q, qin.lo, qin.hi);
+            out(L.attn_k, kvin.lo, kvin.hi);
+            out(L.attn_v, kvin.lo, kvin.hi);
+            in(L.attn_o, od.lo, od.hi);
         }
-        /* the rank's experts [ex.lo, ex.hi) of each stack, staged now rather than at the first step */
-        for (const pulsar_tensor *t : {L.moe_gate_up, L.moe_gate, L.moe_up, L.moe_down}) {
-            if (!t || !ok) continue;
-            if (t->bytes % s->n_expert) {
-                fprintf(stderr, "pulsar: %s: %.*s is not n_expert equal slices -- refusing\n", PULSAR_QWEN_ARCH,
-                        (int)t->name.len, t->name.ptr);
-                ok = false;
-                continue;
-            }
-            const uint64_t stride = t->bytes / s->n_expert, bytes = (uint64_t)(ex.hi - ex.lo) * stride;
-            ok = pulsar_tp_slice_stage_range(m, t, (uint64_t)ex.lo * stride, bytes, "qwen TP expert half");
-            if (ok) built += bytes;
-        }
+        /* the rank's experts [ex.lo, ex.hi) of each stack, staged at open rather than at the first step */
+        for (const pulsar_tensor *t : {L.moe_gate_up, L.moe_gate, L.moe_up, L.moe_down})
+            if (t) ok = ok && pulsar_tp_plan_add1(plan, m, t, PULSAR_TP_AXIS_EXPERTS, ex.lo, ex.hi);
     }
-    if (!ok) {
-        fprintf(stderr, "pulsar: %s: TP rank %u could not build its slices -- refusing\n", PULSAR_QWEN_ARCH, s->tp_rank);
-        return false;
-    }
-    /* L272 B9: resident weights the model's staged count never sees (pulsar_engine::weights_resident_bytes) */
-    e->tp_built_bytes += built;
-    fprintf(stderr, "pulsar: %s TP rank %u: %zu dense slices + the expert halves built, %.2f GiB\n", PULSAR_QWEN_ARCH,
-            s->tp_rank, w->tp ? w->tp->by_tensor.size() : (size_t)0, (double)built / 1073741824.0);
-    return true;
+    if (!ok) fprintf(stderr, "pulsar: %s: TP rank %u: the slices do not declare -- refusing\n", PULSAR_QWEN_ARCH, s->tp_rank);
+    return ok;
 }
 
 namespace {
@@ -503,11 +405,6 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
 }
 
 void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
-    if (w && w->tp) {                                  /* L266 step 7: the rank's slices */
-        for (auto &kv : w->tp->by_tensor) pulsar_gpu_tensor_free(kv.second);
-        delete w->tp;
-        w->tp = NULL;
-    }
     if (w && w->head_mx) {
         pulsar_gpu_tensor_free(w->head_mx);
         w->head_mx = NULL;

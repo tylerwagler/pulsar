@@ -127,4 +127,5 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .session      = */ &k_ds4_session_ops,
     /* .tokenizer    = */ &k_ds4_tokenizer,
     /* .tp_slices    = */ pulsar_ds4_tp_slices,
+    /* .tp_reads     = */ PULSAR_TP_OP_FP8_ROWS | PULSAR_TP_OP_FP8_K | PULSAR_TP_OP_VIEW | PULSAR_TP_OP_MXFP4_HALF,
 };

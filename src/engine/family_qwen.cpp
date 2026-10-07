@@ -599,32 +599,6 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
                         "rows (rank %d of %u) -- refusing\n", PULSAR_QWEN_ARCH, m->tp_rank, nr);
         return false;
     }
-    m->tp_unstaged = (uint8_t *)xcalloc((size_t)m->n_tensors, 1);
-    bool ok = true;
-    uint64_t unstaged = 0;
-    auto mark = [&](const pulsar_tensor *t, bool exl3) {
-        if (!t) return;
-        if (t < m->tensors || t >= m->tensors + m->n_tensors) { ok = false; return; }
-        if (exl3 && !exl3_type_k2(t->type)) {
-            fprintf(stderr, "pulsar: %s: tensor parallelism slices %.*s, which is %s, not EXL3 -- refusing\n",
-                    PULSAR_QWEN_ARCH, (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
-            ok = false;
-            return;
-        }
-        m->tp_unstaged[t - m->tensors] = 1;
-        unstaged += t->bytes;
-    };
-    pulsar_qwen_weights *w = e->qwen_weights;
-    const uint32_t n_state = e->plan.n_layer + (w->mtp.present ? 1u : 0u);
-    for (uint32_t il = 0; ok && il < n_state; il++) {
-        const pulsar_qwen_layer_weights &L = w->layer[il];
-        /* the slices the rank builds at open (pulsar_qwen_tp_build) */
-        mark(L.gdn_in_qkv, true); mark(L.gdn_in_z, true); mark(L.gdn_out, true); mark(L.gdn_conv, false);
-        mark(L.attn_q, true); mark(L.attn_k, true); mark(L.attn_v, true); mark(L.attn_o, true);
-        /* the expert stacks: the rank's half is staged at open, the other rank's never */
-        mark(L.moe_gate_up, false); mark(L.moe_gate, false); mark(L.moe_up, false); mark(L.moe_down, false);
-    }
-    if (!ok) return false;
     /* the rank's heads: every derived width, state size and scratch layout follows */
     s->gdn_n_k_head /= nr;
     s->gdn_n_v_head /= nr;
@@ -633,22 +607,21 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
     s->tp_rank = (uint32_t)m->tp_rank;
     s->tp_ranks = nr;
     /* a rank's KV is its heads' only: its segments never load into another rank or one GPU */
+    pulsar_qwen_weights *w = e->qwen_weights;
     const uint64_t rk[2] = {(uint64_t)m->tp_rank, nr};
     for (int i = 0; i < 2; i++)
         for (int b = 0; b < 8; b++) { w->artifact_digest ^= (uint8_t)(rk[i] >> (8 * b)); w->artifact_digest *= 1099511628211ull; }
     uint32_t e0 = 0, e1 = 0;
     (void)pulsar_tp_owned_range(m->tp_rank, nr, s->n_expert, &e0, &e1);
     fprintf(stderr, "pulsar: %s TP rank %d/%u: GDN %u key + %u value heads, QSA %u query + %u KV heads, experts "
-                    "[%u, %u); %.2f GiB of stored tensors unstaged (slices and the expert half built at open)\n",
-            PULSAR_QWEN_ARCH, m->tp_rank, nr, s->gdn_n_k_head, s->gdn_n_v_head, s->n_head, s->n_head_kv, e0, e1,
-            (double)unstaged / 1073741824.0);
+                    "[%u, %u)\n", PULSAR_QWEN_ARCH, m->tp_rank, nr, s->gdn_n_k_head, s->gdn_n_v_head, s->n_head,
+            s->n_head_kv, e0, e1);
     return true;
 }
 
 /* The ops that exist, announced once at open (rule 5): which of the forward's
  * ops this build carries, so a log says what a Qwen engine CAN run. */
 static bool qwen_family_after_gpu(pulsar_engine *e) {
-    if (!pulsar_qwen_tp_build(e)) return false;   /* the family's tp_slices op (a no-op on one GPU) */
     char have[256] = "", missing[256] = "";
     for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) {
         char *dst = qwen_op_present(&g_qwen_ops, (pulsar_qwen_op_id)op) ? have : missing;
@@ -1526,6 +1499,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .spec         = */ &k_qwen_spec_target,
     /* .session      = */ &k_qwen_session_ops,
     /* .tokenizer    = */ &k_qwen_tokenizer,
-    /* .tp_slices    = */ pulsar_qwen_tp_build,
+    /* .tp_slices    = */ pulsar_qwen_tp_slices,
+    /* .tp_reads     = */ PULSAR_TP_OP_EXL3_COLS | PULSAR_TP_OP_EXL3_ROWS | PULSAR_TP_OP_GATHER | PULSAR_TP_OP_EXPERTS,
     /* .banks        = */ &k_qwen_bank_ops,
 };

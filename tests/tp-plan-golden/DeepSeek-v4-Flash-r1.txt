@@ -26,6 +26,11 @@ fp8_rows blk.2.attn_output_a.weight off 32430112 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.2.attn_output_b.weight off 67033120 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.2.attn_q_a.weight off 101636128 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.2.attn_kv.weight off 30267424 in 4096 out 512 rows [256,512)
+view blk.2.attn_compressor_kv.weight off 8502048 rows [512,1024) of 1024
+view blk.2.attn_compressor_gate.weight off 113440 rows [512,1024) of 1024
+view blk.2.indexer_compressor_kv.weight off 18992160 rows [128,256) of 256
+view blk.2.indexer_compressor_gate.weight off 16895008 rows [128,256) of 256
+view blk.2.indexer.proj.weight off 21089312 rows [32,64) of 64
 fp8_rows blk.2.ffn_gate_shexp.weight off 145773600 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.2.ffn_up_shexp.weight off 163075104 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.2.ffn_down_shexp.weight off 154424352 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -37,6 +42,8 @@ fp8_rows blk.3.attn_output_a.weight off 10912000 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.3.attn_output_b.weight off 45515008 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.3.attn_q_a.weight off 80118016 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.3.attn_kv.weight off 8749312 in 4096 out 512 rows [256,512)
+view blk.3.attn_compressor_kv.weight off 4551936 rows [256,512) of 512
+view blk.3.attn_compressor_gate.weight off 357632 rows [256,512) of 512
 fp8_rows blk.3.ffn_gate_shexp.weight off 121153792 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.3.ffn_up_shexp.weight off 138455296 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.3.ffn_down_shexp.weight off 129804544 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -48,6 +55,11 @@ fp8_rows blk.4.attn_output_a.weight off 32430080 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.4.attn_output_b.weight off 67033088 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.4.attn_q_a.weight off 101636096 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.4.attn_kv.weight off 30267392 in 4096 out 512 rows [256,512)
+view blk.4.attn_compressor_kv.weight off 8502016 rows [512,1024) of 1024
+view blk.4.attn_compressor_gate.weight off 113408 rows [512,1024) of 1024
+view blk.4.indexer_compressor_kv.weight off 18992128 rows [128,256) of 256
+view blk.4.indexer_compressor_gate.weight off 16894976 rows [128,256) of 256
+view blk.4.indexer.proj.weight off 21089280 rows [32,64) of 64
 fp8_rows blk.4.ffn_gate_shexp.weight off 142671872 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.4.ffn_up_shexp.weight off 159973376 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.4.ffn_down_shexp.weight off 151322624 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -59,6 +71,8 @@ fp8_rows blk.5.attn_output_a.weight off 10912000 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.5.attn_output_b.weight off 45515008 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.5.attn_q_a.weight off 80118016 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.5.attn_kv.weight off 8749312 in 4096 out 512 rows [256,512)
+view blk.5.attn_compressor_kv.weight off 4551936 rows [256,512) of 512
+view blk.5.attn_compressor_gate.weight off 357632 rows [256,512) of 512
 fp8_rows blk.5.ffn_gate_shexp.weight off 121153792 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.5.ffn_up_shexp.weight off 138455296 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.5.ffn_down_shexp.weight off 129804544 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -70,6 +84,11 @@ fp8_rows blk.6.attn_output_a.weight off 32430080 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.6.attn_output_b.weight off 67033088 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.6.attn_q_a.weight off 101636096 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.6.attn_kv.weight off 30267392 in 4096 out 512 rows [256,512)
+view blk.6.attn_compressor_kv.weight off 8502016 rows [512,1024) of 1024
+view blk.6.attn_compressor_gate.weight off 113408 rows [512,1024) of 1024
+view blk.6.indexer_compressor_kv.weight off 18992128 rows [128,256) of 256
+view blk.6.indexer_compressor_gate.weight off 16894976 rows [128,256) of 256
+view blk.6.indexer.proj.weight off 21089280 rows [32,64) of 64
 fp8_rows blk.6.ffn_gate_shexp.weight off 142671872 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.6.ffn_up_shexp.weight off 159973376 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.6.ffn_down_shexp.weight off 151322624 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -81,6 +100,8 @@ fp8_rows blk.7.attn_output_a.weight off 10912000 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.7.attn_output_b.weight off 45515008 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.7.attn_q_a.weight off 80118016 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.7.attn_kv.weight off 8749312 in 4096 out 512 rows [256,512)
+view blk.7.attn_compressor_kv.weight off 4551936 rows [256,512) of 512
+view blk.7.attn_compressor_gate.weight off 357632 rows [256,512) of 512
 fp8_rows blk.7.ffn_gate_shexp.weight off 121153792 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.7.ffn_up_shexp.weight off 138455296 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.7.ffn_down_shexp.weight off 129804544 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -92,6 +113,11 @@ fp8_rows blk.8.attn_output_a.weight off 32430080 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.8.attn_output_b.weight off 67033088 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.8.attn_q_a.weight off 101636096 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.8.attn_kv.weight off 30267392 in 4096 out 512 rows [256,512)
+view blk.8.attn_compressor_kv.weight off 8502016 rows [512,1024) of 1024
+view blk.8.attn_compressor_gate.weight off 113408 rows [512,1024) of 1024
+view blk.8.indexer_compressor_kv.weight off 18992128 rows [128,256) of 256
+view blk.8.indexer_compressor_gate.weight off 16894976 rows [128,256) of 256
+view blk.8.indexer.proj.weight off 21089280 rows [32,64) of 64
 fp8_rows blk.8.ffn_gate_shexp.weight off 142671872 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.8.ffn_up_shexp.weight off 159973376 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.8.ffn_down_shexp.weight off 151322624 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -103,6 +129,8 @@ fp8_rows blk.9.attn_output_a.weight off 10912000 in 4096 out 8192 rows [4096,819
 fp8_kslice blk.9.attn_output_b.weight off 45515008 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.9.attn_q_a.weight off 80118016 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.9.attn_kv.weight off 8749312 in 4096 out 512 rows [256,512)
+view blk.9.attn_compressor_kv.weight off 4551936 rows [256,512) of 512
+view blk.9.attn_compressor_gate.weight off 357632 rows [256,512) of 512
 fp8_rows blk.9.ffn_gate_shexp.weight off 121153792 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.9.ffn_up_shexp.weight off 138455296 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.9.ffn_down_shexp.weight off 129804544 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -114,6 +142,11 @@ fp8_rows blk.10.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.10.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.10.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.10.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.10.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.10.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.10.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.10.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.10.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.10.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.10.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.10.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -125,6 +158,8 @@ fp8_rows blk.11.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.11.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.11.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.11.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.11.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.11.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.11.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.11.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.11.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -136,6 +171,11 @@ fp8_rows blk.12.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.12.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.12.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.12.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.12.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.12.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.12.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.12.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.12.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.12.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.12.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.12.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -147,6 +187,8 @@ fp8_rows blk.13.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.13.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.13.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.13.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.13.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.13.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.13.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.13.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.13.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -158,6 +200,11 @@ fp8_rows blk.14.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.14.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.14.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.14.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.14.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.14.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.14.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.14.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.14.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.14.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.14.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.14.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -169,6 +216,8 @@ fp8_rows blk.15.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.15.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.15.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.15.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.15.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.15.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.15.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.15.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.15.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -180,6 +229,11 @@ fp8_rows blk.16.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.16.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.16.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.16.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.16.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.16.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.16.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.16.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.16.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.16.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.16.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.16.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -191,6 +245,8 @@ fp8_rows blk.17.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.17.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.17.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.17.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.17.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.17.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.17.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.17.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.17.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -202,6 +258,11 @@ fp8_rows blk.18.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.18.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.18.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.18.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.18.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.18.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.18.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.18.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.18.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.18.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.18.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.18.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -213,6 +274,8 @@ fp8_rows blk.19.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.19.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.19.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.19.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.19.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.19.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.19.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.19.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.19.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -224,6 +287,11 @@ fp8_rows blk.20.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.20.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.20.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.20.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.20.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.20.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.20.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.20.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.20.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.20.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.20.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.20.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -235,6 +303,8 @@ fp8_rows blk.21.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.21.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.21.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.21.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.21.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.21.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.21.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.21.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.21.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -246,6 +316,11 @@ fp8_rows blk.22.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.22.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.22.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.22.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.22.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.22.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.22.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.22.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.22.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.22.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.22.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.22.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -257,6 +332,8 @@ fp8_rows blk.23.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.23.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.23.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.23.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.23.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.23.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.23.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.23.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.23.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -268,6 +345,11 @@ fp8_rows blk.24.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.24.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.24.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.24.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.24.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.24.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.24.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.24.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.24.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.24.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.24.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.24.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -279,6 +361,8 @@ fp8_rows blk.25.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.25.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.25.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.25.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.25.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.25.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.25.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.25.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.25.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -290,6 +374,11 @@ fp8_rows blk.26.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.26.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.26.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.26.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.26.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.26.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.26.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.26.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.26.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.26.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.26.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.26.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -301,6 +390,8 @@ fp8_rows blk.27.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.27.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.27.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.27.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.27.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.27.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.27.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.27.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.27.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -312,6 +403,11 @@ fp8_rows blk.28.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.28.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.28.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.28.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.28.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.28.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.28.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.28.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.28.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.28.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.28.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.28.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -323,6 +419,8 @@ fp8_rows blk.29.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.29.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.29.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.29.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.29.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.29.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.29.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.29.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.29.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -334,6 +432,11 @@ fp8_rows blk.30.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.30.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.30.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.30.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.30.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.30.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.30.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.30.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.30.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.30.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.30.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.30.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -345,6 +448,8 @@ fp8_rows blk.31.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.31.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.31.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.31.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.31.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.31.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.31.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.31.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.31.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -356,6 +461,11 @@ fp8_rows blk.32.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.32.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.32.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.32.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.32.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.32.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.32.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.32.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.32.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.32.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.32.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.32.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -367,6 +477,8 @@ fp8_rows blk.33.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.33.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.33.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.33.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.33.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.33.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.33.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.33.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.33.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -378,6 +490,11 @@ fp8_rows blk.34.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.34.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.34.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.34.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.34.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.34.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.34.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.34.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.34.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.34.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.34.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.34.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -389,6 +506,8 @@ fp8_rows blk.35.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.35.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.35.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.35.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.35.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.35.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.35.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.35.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.35.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -400,6 +519,11 @@ fp8_rows blk.36.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.36.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.36.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.36.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.36.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.36.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.36.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.36.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.36.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.36.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.36.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.36.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -411,6 +535,8 @@ fp8_rows blk.37.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.37.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.37.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.37.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.37.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.37.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.37.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.37.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.37.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -422,6 +548,11 @@ fp8_rows blk.38.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.38.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.38.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.38.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.38.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.38.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.38.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.38.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.38.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.38.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.38.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.38.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -433,6 +564,8 @@ fp8_rows blk.39.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.39.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.39.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.39.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.39.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.39.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.39.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.39.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.39.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -444,6 +577,11 @@ fp8_rows blk.40.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.40.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.40.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.40.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.40.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.40.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.40.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.40.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.40.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.40.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.40.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.40.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -455,6 +593,8 @@ fp8_rows blk.41.attn_output_a.weight off 10912832 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.41.attn_output_b.weight off 45515840 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.41.attn_q_a.weight off 80118848 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.41.attn_kv.weight off 8750144 in 4096 out 512 rows [256,512)
+view blk.41.attn_compressor_kv.weight off 4552768 rows [256,512) of 512
+view blk.41.attn_compressor_gate.weight off 358464 rows [256,512) of 512
 fp8_rows blk.41.ffn_gate_shexp.weight off 121154624 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.41.ffn_up_shexp.weight off 138456128 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.41.ffn_down_shexp.weight off 129805376 in 2048 out 4096 cols [1024,2048) key engine+tensor
@@ -466,6 +606,11 @@ fp8_rows blk.42.attn_output_a.weight off 32430944 in 4096 out 8192 rows [4096,81
 fp8_kslice blk.42.attn_output_b.weight off 67033952 in 8192 out 4096 cols [4096,8192) key engine+tensor
 fp8_rows blk.42.attn_q_a.weight off 101636960 in 4096 out 1024 rows [512,1024)
 fp8_rows blk.42.attn_kv.weight off 30268256 in 4096 out 512 rows [256,512)
+view blk.42.attn_compressor_kv.weight off 8502880 rows [512,1024) of 1024
+view blk.42.attn_compressor_gate.weight off 114272 rows [512,1024) of 1024
+view blk.42.indexer_compressor_kv.weight off 18992992 rows [128,256) of 256
+view blk.42.indexer_compressor_gate.weight off 16895840 rows [128,256) of 256
+view blk.42.indexer.proj.weight off 21090144 rows [32,64) of 64
 fp8_rows blk.42.ffn_gate_shexp.weight off 142672736 in 4096 out 2048 rows [1024,2048)
 fp8_rows blk.42.ffn_up_shexp.weight off 159974240 in 4096 out 2048 rows [1024,2048)
 fp8_kslice blk.42.ffn_down_shexp.weight off 151323488 in 2048 out 4096 cols [1024,2048) key engine+tensor

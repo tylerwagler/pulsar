@@ -62,6 +62,9 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k);
  * pulsar_engine_internal.h. */
 #define PULSAR_FAMILY_MAX_LAYER 64u
 
+/** L272 P4b: a rank's tensor-parallel plan (tp_slice.cpp; opaque to the families, which add to it). */
+typedef struct pulsar_tp_plan pulsar_tp_plan;
+
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
@@ -216,10 +219,13 @@ struct pulsar_family {
     const pulsar_family_session_ops *session;
     /** The tokenizer and chat front (L272 P2), or NULL = none. */
     const pulsar_family_tokenizer *tokenizer;
-    /** L272 P4b: this rank's tensor-parallel slices of the loaded model (the rank and group are the model's,
-     *  e->model.tp_rank / tp_n_ranks), through the core's slice operations (tp_slice.cpp) -- run after the GPU is up,
-     *  or in record mode on an inspect-only engine (tests/tp_plan_test.cpp).  NULL = the family has no TP. */
-    bool (*tp_slices)(pulsar_engine *e);
+    /** L272 P4b: DECLARES this rank's tensor-parallel slices of the loaded model into `plan` (the rank and group
+     *  are the model's, e->model.tp_rank / tp_n_ranks): which tensors split, along which axis, the rank's ranges.
+     *  The core chooses each operation by the tensor's format and runs it (tp_slice.cpp).  NULL = no TP. */
+    bool (*tp_slices)(pulsar_engine *e, pulsar_tp_plan *plan);
+    /** The slice operations this family's forward reads (pulsar_tp_op bits): the plan refuses any other, since
+     *  until one launcher serves every format (L272 P4c) a slice the forward does not look up is not used. */
+    uint32_t tp_reads;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
 };

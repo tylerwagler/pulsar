@@ -252,8 +252,6 @@ typedef struct {
     struct pulsar_gpu_tensor *draft_head_mx, *draft_ids_dev;
     int32_t *draft_ids;
     uint32_t n_draft;
-    /** L266 step 7: this rank's slices of the tensors TP splits (built at open; NULL on one GPU). */
-    struct pulsar_qwen_tp_slices *tp;
     /** L266: every tensor's name, type and size, FNV-1a -- the artifact a Qwen segment was written by
      *  (pulsar_ckpt_store::artifact): two quantisations of the model never load each other's KV. */
     uint64_t artifact_digest;
@@ -454,10 +452,11 @@ typedef struct pulsar_qwen_state {
 
 
 /** L266 step 7: tensor parallelism.  _load (at the family's load, the model bound): this rank's head counts
- *  into g_qwen_shape, the stored tensors it slices and the other rank's experts marked unstaged, the rank
- *  folded into the artifact digest.  _build (after the GPU): the slices, and the rank's expert halves staged. */
+ *  into g_qwen_shape, the rank folded into the artifact digest.  _slices (the family's tp_slices op, L272 P4b):
+ *  declares the rank's slices -- the dense heads' columns / rows, the GDN conv's channels, its whole experts --
+ *  into the core's plan, which builds them and is the residency rule (tp_slice.cpp). */
 bool pulsar_qwen_tp_load(pulsar_engine *e);
-bool pulsar_qwen_tp_build(pulsar_engine *e);
+bool pulsar_qwen_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan);
 
 /** The Qwen family's bank-pool operations (family.h pulsar_family_bank_ops). */
 extern const pulsar_family_bank_ops k_qwen_bank_ops;
