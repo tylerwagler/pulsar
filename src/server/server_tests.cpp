@@ -7522,7 +7522,7 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.j = &j;
-    g.phase = GEN_PREFILL;
+    g.phase = GEN_PREFILL_MAIN;
     g.prefill_last_current = -1;
     g.progress.srv = &s;
     g.progress.t0 = server_now_sec();
@@ -7536,7 +7536,7 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     TEST_ASSERT(g.prefill_last_current == 4096 && g.prefill_total == 320284);
     TEST_ASSERT(s.m_slot_prefill_done[0] == 4096);
     TEST_ASSERT(s.m_slot_prefill_total[0] == 320284);
-    TEST_ASSERT(s.m_slot_phase[0] == (int)GEN_PREFILL + 1);
+    TEST_ASSERT(s.m_slot_phase[0] == (int)GEN_PREFILL_MAIN + 1);
     TEST_ASSERT(s.metrics_generation == gen0 + 1);
 
     gen_prefill_progress_cb(&g, "prefill_chunk", 8192, 320284);
