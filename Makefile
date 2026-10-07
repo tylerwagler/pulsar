@@ -1804,7 +1804,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
+	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device vision-qwen-tower-gate \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -2427,7 +2427,13 @@ tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_
 tests/vision_qwen_tower_gate: tests/vision_qwen_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-# L268: one image question end to end (tests/image_chat_smoke.cpp), graded on the answer's content.
+# L268: one image question end to end (tests/image_chat_smoke.cpp), graded on the answer's content.  Manual (a
+# model load of its own); the live server tier (server-live-gate) asks both families about an image too.
+QWEN_IMAGE_SMOKE ?= $(QWEN_GATE_MODEL)
+.PHONY: qwen-image-smoke-gate
+qwen-image-smoke-gate: tests/image_chat_smoke
+	python3 -c "import struct,zlib;w,h=480,360;rows=b''.join(b'\\x00'+b''.join(bytes((220,20,20)) if (x-w/2)**2+(y-h/2)**2<(0.35*h)**2 else b'\\xff\\xff\\xff' for x in range(w)) for y in range(h));c=lambda t,d:struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff);open('/tmp/qwen-image-smoke.png','wb').write(b'\\x89PNG\\r\\n\\x1a\\n'+c(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+c(b'IDAT',zlib.compress(rows,9))+c(b'IEND',b''))"
+	./tests/image_chat_smoke $(QWEN_IMAGE_SMOKE) /tmp/qwen-image-smoke.png "What color is the circle in this image? Answer with one word." red
 tests/image_chat_smoke.o: tests/image_chat_smoke.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/image_chat_smoke.cpp
 tests/image_chat_smoke: tests/image_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
