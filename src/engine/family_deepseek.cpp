@@ -106,6 +106,14 @@ static const pulsar_family_session_ops k_ds4_session_ops = {
     /* .invalidate      = */ ds4_invalidate,
 };
 
+/* L281: DeepSeek's image geometry -- a sentinel is `vocab_size + role`, and a block is compressor pads, IMAGE_START,
+ * the image rows, IMAGE_END (vision_span_extent, the one scan the planner and the merge share). */
+static bool ds4_is_image_sentinel(const pulsar_engine *, int32_t id) { return id >= (int32_t)PULSAR_N_VOCAB; }
+static bool ds4_image_block_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
+    return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
+}
+static const pulsar_family_vision k_ds4_vision = { ds4_is_image_sentinel, ds4_image_block_extent };
+
 const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .id           = */ PULSAR_FAMILY_ID_DEEPSEEK4,
     /* .arch         = */ "deepseek4",
@@ -128,4 +136,5 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .tokenizer    = */ &k_ds4_tokenizer,
     /* .tp_slices    = */ pulsar_ds4_tp_slices,
     /* .act_kind     = */ PULSAR_ACT_KIND_SLOT,
+    /* .vision       = */ &k_ds4_vision,
 };

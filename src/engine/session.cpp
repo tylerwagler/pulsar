@@ -1309,31 +1309,6 @@ static bool pulsar_session_cancelled_cb(void *ud) {
 }
 
 
-/* Identity of an image SET as it enters the KV: order, positions, byte lengths
- * and the bytes themselves.  The sentinel block's token IDs encode only its
- * geometry (vocab_size + role), so two different images of the same size produce
- * the SAME token prefix -- reuse must be decided on the pixels, not the ids.
- * FNV-1a, and 0 is reserved for "no images". */
-static uint64_t image_set_fingerprint(const pulsar_image_ref *images, int n) {
-    uint64_t h = 1469598103934665603ull;
-    const uint8_t *nul = (const uint8_t *)"\0";
-    for (int i = 0; i < n; i++) {
-        const uint8_t *p = (images && images[i].bytes) ? images[i].bytes : nul;
-        const size_t len = (images && images[i].bytes) ? images[i].len : 0;
-        const uint64_t fields[2] = { (uint64_t)(images ? images[i].start_pos : -1), (uint64_t)len };
-        for (int f = 0; f < 2; f++) {
-            for (int b = 0; b < 8; b++) {
-                h ^= (fields[f] >> (8 * b)) & 0xffu;
-                h *= 1099511628211ull;
-            }
-        }
-        for (size_t b = 0; b < len; b++) {
-            h ^= p[b];
-            h *= 1099511628211ull;
-        }
-    }
-    return h ? h : 1u;
-}
 
 
 
@@ -1386,11 +1361,6 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
      * only on the start_pos == 0 pass and asserts that no sentinel id survives a
      * continuation, so neither cache-reuse path may run (the extend path and the
      * L115 seam rescue are both gated on checkpoint_valid). */
-    /* Exclusive end of the LAST image block in this prompt (0 when none): the
-     * resume path below must never RE-EVALUATE a row inside it.  A sentinel row
-     * only carries values because the merge wrote them; a re-evaluated one would
-     * be zero-masked by the embedder (its id is out of vocab). */
-    int image_barrier = 0;
     uint32_t resume_floor = 0;   /* the grid point a licensed image reuse must start from */
     if (n_images > 0) {
         if (!e->vision_ready) {
@@ -1399,8 +1369,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
         /* Before any state moves: a block that cannot sit whole in one chunk is
          * refused here (and by the TP leader before it mirrors anything). */
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph->prefill_cap,
-                              &image_barrier, err, errlen))
+        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph->prefill_cap, NULL, err, errlen))
             return 1;
         /* L226 + L261: reuse the live KV across an image request.  The images the
          * checkpoint already holds must be exactly the live set -- the fingerprint
@@ -1411,10 +1380,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * straddles the checkpoint, an edited history -- clears checkpoint_valid and
          * the cold pass merges every image from token 0.
          *
-         * No sentinel id can reach a cache surface this way: a chain never holds
-         * an image row (pulsar_kvchain_persist_end), the server's cold store for
-         * an image request covers the sys-prefix only, and a LATER prompt whose
-         * sentinel ids outlive their images is still refused by the scan below. */
+         * L281: a disk chain holds an image's rows only with that image's record, and a restore loads past a block
+         * only when the request brings the same image there (pulsar_kvchain_restore), so a restored history's
+         * records are what this licence compares; a LATER prompt whose sentinel ids outlive their images is still
+         * refused by the scan below. */
         /* The live history this prompt can keep: its common token prefix with the
          * checkpoint (an echo that stops short of the live tail -- stripped
          * reasoning, a rollback -- shares a prefix without extending it). */
@@ -1443,24 +1412,22 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         if (!extends_live) {
             resume_floor = 0u;
         } else {
-        enum { LIVE_IMAGES_MAX = 64 };
-        pulsar_image_ref held[LIVE_IMAGES_MAX];
-        int n_held = 0, n_new = 0, held_end = 0;
-        bool straddles = n_images > LIVE_IMAGES_MAX;
+        int n_new = 0;
+        bool straddles = false;
         for (int i = 0; i < n_images && !straddles; i++) {
             int len = 0;
-            (void)vision_span_extent(prompt->v, prompt->len, (int)PULSAR_N_VOCAB, images[i].start_pos, &len);
+            (void)pulsar_image_block_extent(e, prompt->v, prompt->len, images[i].start_pos, &len);
             const uint32_t bs = (uint32_t)images[i].start_pos, be = bs + (uint32_t)len;
-            if (be <= ck) {
-                held[n_held++] = images[i];
-                if ((int)be > held_end) held_end = (int)be;
-            } else if (bs >= ck) {
-                n_new++;
-            } else {
-                straddles = true;
-            }
+            if (be > ck && bs >= ck) n_new++;
+            else if (be > ck) straddles = true;
         }
-        const uint64_t held_fp = n_held > 0 ? image_set_fingerprint(held, n_held) : 0;
+        /* L281: the held images' records -- each block's rows and the bytes merged there -- must be exactly the
+         * live ones (image_identity.cpp) */
+        pulsar_image_identity held;
+        const bool held_ok = pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
+                                                         n_images, ck, &held);
+        const int n_held = held_ok ? (int)held.n : 0;
+        const int held_end = held_ok ? (int)pulsar_image_identity_end(&held) : 0;
         /* The one image-specific constraint on the resume below: the grid
          * checkpoint it restores must lie at or above the end of the last HELD
          * block, so no merged row is re-evaluated (a B below the floor prefills
@@ -1475,9 +1442,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             : 0u;
         const bool reuse =
             s->checkpoint_valid &&
-            !straddles &&
-            s->live_image_fp == held_fp &&
-            s->live_image_barrier == held_end;
+            !straddles && held_ok &&
+            pulsar_image_identity_equal(&s->live_images, &held);
         if (!reuse) {
             if (s->checkpoint_valid)
                 fprintf(stderr, "pulsar: image request: the live history's images are not this prompt's (%s) "
@@ -1500,7 +1466,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * refused too: it is a renderer artifact that
          * pulsar_expand_image_placeholders() must have replaced. */
         for (int i = 0; i < prompt->len; i++) {
-            if (prompt->v[i] >= (int)PULSAR_N_VOCAB || prompt->v[i] == e->vocab.image_id) {
+            if (pulsar_image_is_sentinel(e, prompt->v[i]) || prompt->v[i] == e->vocab.image_id) {
                 snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request "
                                       "carries no images", i, prompt->v[i]);
                 return 1;
@@ -1525,6 +1491,13 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     };
     pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
     vision_scope vscope(s->graph, n_images > 0 ? &vreq : NULL);
+    /* L281: what the KV holds of this request's images -- the blocks that end at or below `limit` (the checkpoint
+     * after a prefill, interrupted or not).  A text sync leaves the records alone: its prefix keeps its blocks. */
+    auto note_images = [&](uint32_t limit) {
+        if (n_images > 0 && !pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
+                                                         n_images, limit, &s->live_images))
+            s->live_images.n = 0;
+    };
 
     /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
      * carry path re-prefills from a grid point at or above the salvage floor and
@@ -1652,6 +1625,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
+                /* L281 (b): the blocks this prefill completed are live, so the next quantum's licence holds them */
+                note_images((uint32_t)s->checkpoint.len);
                 return PULSAR_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
@@ -1669,10 +1644,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
              * extension and wrong for one that merged an image: the next request, even an exact
              * replay, found a held block the identity did not know and rebuilt cold (the pair
              * 2026-10-07 13:11, 320k tokens from 0 for a 0-token suffix). */
-            if (n_images > 0) {
-                s->live_image_fp = image_set_fingerprint(images, n_images);
-                s->live_image_barrier = image_barrier;
-            }
+            note_images((uint32_t)prompt->len);
             return 0;
         }
 
@@ -1680,10 +1652,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * nothing to evaluate.  The single-token fallback that used to live
          * here is gone with its encoder; every positive suffix takes the
          * batched branch above. */
-        if (n_images > 0) {   /* L281: the same set, restated (held == live by the licence) */
-            s->live_image_fp = image_set_fingerprint(images, n_images);
-            s->live_image_barrier = image_barrier;
-        }
+        note_images((uint32_t)prompt->len);   /* L281: the same set, restated (held == live by the licence) */
         return 0;
     }
 
@@ -1735,7 +1704,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             bool placed_ok = n_images <= STITCH_IMAGES_MAX;
             if (placed_ok && n_images > 0) {
                 int starts[STITCH_IMAGES_MAX];
-                const int nb = pulsar_image_block_starts(&stitched, stitched.len, starts, STITCH_IMAGES_MAX);
+                const int nb = pulsar_image_block_starts(e, &stitched, stitched.len, starts, STITCH_IMAGES_MAX);
                 placed_ok = nb == n_images;
                 for (int i = 0; placed_ok && i < n_images; i++) {
                     placed[i] = images[i];
@@ -1760,6 +1729,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     bool ok;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    s->live_images.n = 0;   /* L281: a rebuild replaces every row; the old records described them */
     if (!gpu_graph_reset_prefill_state(s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
@@ -1800,6 +1770,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             s->checkpoint_valid = s->checkpoint.len > 0;
+            note_images((uint32_t)s->checkpoint.len);   /* L281 (b) */
             return PULSAR_SESSION_SYNC_INTERRUPTED;
         }
     }
@@ -1812,13 +1783,9 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     s->checkpoint_valid = true;
     s->prefill_frontier = prompt->len;   /* L195 */
     s->logits_stale = false;
-    /* A rebuild replaces what the checkpoint describes, so the image identity
-     * goes with it: this pass merged THESE images (barrier included), or there
-     * are none in the prompt at all.  A carry/extension keeps the previous
-     * identity -- its blocks are still in the prefix -- and rewind() clears it
-     * when a truncation drops one. */
-    s->live_image_fp = n_images > 0 ? image_set_fingerprint(images, n_images) : 0;
-    s->live_image_barrier = n_images > 0 ? image_barrier : 0;
+    /* A rebuild replaces what the checkpoint describes, so the records go with it: this pass merged THESE images,
+     * or there are none in the prompt at all. */
+    note_images((uint32_t)prompt->len);
     return 0;
 }
 
@@ -2327,13 +2294,10 @@ void pulsar_session::rewind(int pos) {
 
 void pulsar_session::trim_history(int pos) {
     auto *s = this;
-    /* The image blocks above the new end are gone from the live KV: their
-     * identity must go with them or a later request could reuse rows that no
-     * longer exist (L226). */
-    if (pos < s->live_image_barrier) {
-        s->live_image_fp = 0;
-        s->live_image_barrier = 0;
-    }
+    /* The image blocks above the new end are gone from the live KV: their records go with them or a later request
+     * could reuse rows that no longer exist (L226).  L281: the blocks BELOW it survive, records and all -- before,
+     * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
+    pulsar_image_identity_trim(&s->live_images, (uint32_t)(pos < 0 ? 0 : pos));
     s->checkpoint.len = pos;
     pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;

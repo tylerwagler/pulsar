@@ -1,4 +1,7 @@
 #include "pulsar_engine_internal.h"
+
+/* L281: one image block record in a payload or a segment -- u32 start, u32 end, u64 content as two u32 */
+#define SEGMENT_IMAGE_U32 4u
 #include "lib/pulsar_writeback.h"
 
 void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -358,6 +361,7 @@ uint64_t pulsar_session::payload_bytes() {
     pulsar_gpu_graph *g = s->graph;
     uint64_t bytes = (uint64_t)PULSAR_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    bytes += sizeof(uint32_t) + (uint64_t)s->live_images.n * SEGMENT_IMAGE_U32 * sizeof(uint32_t);   /* L281 v14 */
     bytes += (uint64_t)PULSAR_N_VOCAB * sizeof(float);   /* the frontier's logits */
     bytes += sizeof(uint32_t);                            /* the prefill frontier */
     /* ONE per-layer row-count array.  There were two while the index-K pool had
@@ -462,6 +466,15 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     }
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    /* L281 (v14): which images the checkpoint's sentinel blocks are -- a payload carries the rows, so it carries
+     * the records, or its restore would pair them with whatever the session held before */
+    if (payload_write_u32(&io, s->live_images.n, err, errlen) != 0) return 1;
+    for (uint32_t i = 0; i < s->live_images.n; i++) {
+        const pulsar_image_block *b = &s->live_images.b[i];
+        const uint32_t rec[SEGMENT_IMAGE_U32] = { b->start, b->end, (uint32_t)b->content, (uint32_t)(b->content >> 32) };
+        for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
+            if (payload_write_u32(&io, rec[k], err, errlen) != 0) return 1;
     }
     if (payload_write_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
     if (payload_write_u32(&io, (uint32_t)s->prefill_frontier, err, errlen) != 0) return 1;
@@ -597,6 +610,32 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
         token_vec_push(&new_checkpoint, (int)tok);
     }
+    /* L281 (v14): the image records, installed at commit */
+    pulsar_image_identity new_images;
+    new_images.n = 0;
+    {
+        uint32_t n_img = 0;
+        bool ok = payload_read_u32(&io, &n_img, &remaining, err, errlen) == 0;
+        if (ok && n_img > PULSAR_IMAGE_BLOCKS_MAX) {
+            payload_set_err(err, errlen, "KV checkpoint carries more image blocks than a session holds");
+            ok = false;
+        }
+        for (uint32_t i = 0; ok && i < n_img; i++) {
+            uint32_t rec[SEGMENT_IMAGE_U32];
+            for (uint32_t k = 0; ok && k < SEGMENT_IMAGE_U32; k++)
+                ok = payload_read_u32(&io, &rec[k], &remaining, err, errlen) == 0;
+            const pulsar_image_block b = { rec[0], rec[1], (uint64_t)rec[2] | (uint64_t)rec[3] << 32 };
+            if (ok && (b.end <= b.start || b.end > saved_tokens || (i && b.start < new_images.b[i - 1].end))) {
+                payload_set_err(err, errlen, "KV checkpoint's image records are out of order or outside its tokens");
+                ok = false;
+            }
+            if (ok) new_images.b[new_images.n++] = b;
+        }
+        if (!ok) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+    }
     if (payload_read_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float),
                            &remaining, err, errlen) != 0) {
         token_vec_free(&new_checkpoint);
@@ -700,6 +739,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
 
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
+    s->live_images = new_images;   /* L281 */
     const uint32_t bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         gpu_graph_set_n_comp(g, bank, il, n_comp[il]);
@@ -736,11 +776,30 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
  * granularity and row width -- so a segment written under another layout is
  * refused, never misread. */
 #define SEGMENT_U32_FIELDS 8u
+/* L281 (v3): after the span's tokens, the image blocks lying wholly inside the span -- a u32 count, then per block
+ * u32 start, u32 end, u64 content (two u32) -- so a chain carries rows past an image together with WHICH image they
+ * are (image_identity.cpp).  A span boundary is a grid checkpoint, never inside a block, so every block a chain holds
+ * is in exactly one segment.  Each rank's copy carries them: a worker's load sets the same identity as the leader's. */
+
+/* the session's records of the blocks inside [G_prev, G) */
+static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G, const pulsar_image_block **first) {
+    uint32_t n = 0;
+    *first = NULL;
+    for (uint32_t i = 0; i < s->live_images.n; i++) {
+        const pulsar_image_block *b = &s->live_images.b[i];
+        if (b->start >= G_prev && b->end <= G) {
+            if (!n) *first = b;
+            n++;
+        }
+    }
+    return n;
+}
 
 /* The bank holds nothing: a chain's root replaces its history, a failed load leaves it empty.  A
  * bank-pool family's lanes are written by the chain's last restore and its counters by
  * set_frontier_stale, so its host view and its checkpoints are all there is to clear. */
 static void segment_clear(pulsar_session *s, pulsar_ckpt_store *st, uint32_t bank) {
+    s->live_images.n = 0;   /* L281: the bank holds no block */
     if (FAMILY_BANKS(s)) {
         s->engine->family->session->invalidate(s);
         pulsar_ckpt_drop_bank(st, bank);
@@ -773,17 +832,48 @@ static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32
     return G > G_prev && G_prev % grid == 0u && G % grid == 0u;
 }
 
-uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G) {
-    pulsar_ckpt_store *st = pulsar_session_kv_store(this);
-    if (!segment_span_ok(st, G_prev, G)) return 0;
+/* the bytes of a segment over [G_prev, G) carrying `n_images` image records (a v2 segment has no image section:
+ * written before L281, when no chain held a block, it loads as carrying none) */
+static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images,
+                                  uint32_t version = PULSAR_SESSION_SEGMENT_VERSION) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
+    if (version >= 3u) bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += st->slot_bytes;
     for (uint32_t i = 0; i < n; i++)
         bytes += (uint64_t)(G / pools[i].tokens_per_row - G_prev / pools[i].tokens_per_row) * pools[i].row_bytes;
     return bytes + sizeof(uint64_t);   /* the trailing digest */
+}
+
+/* L281: a stored segment's image records, read from its payload's head without loading it (a v2 segment carries
+ * none).  The bytes are the payload digest's to vouch for; this only decides how far a restore goes, and the load
+ * that follows re-reads and checks everything. */
+int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out) {
+    *n_out = 0;
+    uint32_t h[SEGMENT_U32_FIELDS];
+    if (!fp || bytes < sizeof(h) || fread(h, sizeof(uint32_t), SEGMENT_U32_FIELDS, fp) != SEGMENT_U32_FIELDS) return 1;
+    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[7] <= h[6]) return 1;
+    if (h[1] == 2u) return 0;
+    if (h[1] != PULSAR_SESSION_SEGMENT_VERSION) return 1;
+    if (fseek(fp, (long)((uint64_t)(h[7] - h[6]) * sizeof(uint32_t)), SEEK_CUR) != 0) return 1;
+    uint32_t n = 0;
+    if (fread(&n, sizeof(n), 1, fp) != 1 || n > PULSAR_IMAGE_BLOCKS_MAX) return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t rec[SEGMENT_IMAGE_U32];
+        if (fread(rec, sizeof(uint32_t), SEGMENT_IMAGE_U32, fp) != SEGMENT_IMAGE_U32) return 1;
+        if (i < cap) hashes[i] = (uint64_t)rec[2] | (uint64_t)rec[3] << 32;
+    }
+    *n_out = n;
+    return 0;
+}
+
+uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G) {
+    pulsar_ckpt_store *st = pulsar_session_kv_store(this);
+    if (!segment_span_ok(st, G_prev, G)) return 0;
+    const pulsar_image_block *first = NULL;
+    return segment_bytes_for(st, G_prev, G, segment_images(this, G_prev, G, &first));
 }
 
 int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen) {
@@ -821,6 +911,17 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         if (payload_write_u32(&io, header[i], err, errlen) != 0) return 1;
     for (uint32_t p = G_prev; p < G; p++)
         if (payload_write_u32(&io, (uint32_t)s->checkpoint.v[p], err, errlen) != 0) return 1;
+    {
+        const pulsar_image_block *b = NULL;
+        const uint32_t n_img = segment_images(s, G_prev, G, &b);
+        if (payload_write_u32(&io, n_img, err, errlen) != 0) return 1;
+        for (uint32_t i = 0; i < n_img; i++) {
+            const uint32_t rec[SEGMENT_IMAGE_U32] = { b[i].start, b[i].end, (uint32_t)b[i].content,
+                                                      (uint32_t)(b[i].content >> 32) };
+            for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
+                if (payload_write_u32(&io, rec[k], err, errlen) != 0) return 1;
+        }
+    }
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
@@ -856,7 +957,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     uint32_t h[SEGMENT_U32_FIELDS];
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++)
         if (payload_read_u32(&io, &h[i], &remaining, err, errlen) != 0) return 1;
-    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[1] != PULSAR_SESSION_SEGMENT_VERSION) {
+    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || (h[1] != PULSAR_SESSION_SEGMENT_VERSION && h[1] != 2u)) {
         payload_set_err(err, errlen, "load segment: unsupported segment version");
         return 1;
     }
@@ -869,10 +970,6 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     const uint32_t G_prev = h[6], G = h[7];
     if (!segment_span_ok(st, G_prev, G) || G >= (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "load segment: span is not a grid span inside this context");
-        return 1;
-    }
-    if (bytes != s->segment_bytes(G_prev, G)) {
-        payload_set_err(err, errlen, "load segment: size does not match its span");
         return 1;
     }
     /* A chain loads in order: a root resets the bank, every later segment
@@ -892,6 +989,31 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
         uint32_t t = 0;
         if (payload_read_u32(&io, &t, &remaining, err, errlen) != 0) { token_vec_free(&toks); return 1; }
         token_vec_push(&toks, (int)t);
+    }
+    /* L281: the span's image records, appended to the identity at commit (the size check needs their count) */
+    pulsar_image_block imgs[PULSAR_IMAGE_BLOCKS_MAX];
+    uint32_t n_img = 0;
+    if (h[1] >= 3u && payload_read_u32(&io, &n_img, &remaining, err, errlen) != 0) { token_vec_free(&toks); return 1; }
+    if (n_img > PULSAR_IMAGE_BLOCKS_MAX - s->live_images.n) {
+        token_vec_free(&toks);
+        payload_set_err(err, errlen, "load segment: more image blocks than a session holds");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_img; i++) {
+        uint32_t rec[SEGMENT_IMAGE_U32];
+        for (uint32_t k = 0; k < SEGMENT_IMAGE_U32; k++)
+            if (payload_read_u32(&io, &rec[k], &remaining, err, errlen) != 0) { token_vec_free(&toks); return 1; }
+        imgs[i] = (pulsar_image_block){ rec[0], rec[1], (uint64_t)rec[2] | (uint64_t)rec[3] << 32 };
+        if (imgs[i].start < G_prev || imgs[i].end > G || imgs[i].end <= imgs[i].start) {
+            token_vec_free(&toks);
+            payload_set_err(err, errlen, "load segment: an image record lies outside its span");
+            return 1;
+        }
+    }
+    if (bytes != segment_bytes_for(st, G_prev, G, n_img, h[1])) {
+        token_vec_free(&toks);
+        payload_set_err(err, errlen, "load segment: size does not match its span");
+        return 1;
     }
     if (pulsar_gpu_synchronize() == 0) {
         token_vec_free(&toks);
@@ -935,6 +1057,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
      * position yet -- stale until the last segment restores its checkpoint. */
     for (int i = 0; i < toks.len; i++) token_vec_push(&s->checkpoint, toks.v[i]);
     token_vec_free(&toks);
+    for (uint32_t i = 0; i < n_img; i++) s->live_images.b[s->live_images.n++] = imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, G);
     pulsar_ckpt_commit(st, bank, slot, G);
     if (!FAMILY_BANKS(s)) s->prefill_frontier = (int)G;   /* a bank-pool family's frontier is set_frontier_stale's */

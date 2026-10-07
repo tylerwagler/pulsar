@@ -1185,6 +1185,17 @@ char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
 
 
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
+    /* L281: an image block renders as the placeholder the request's text carries there -- once, at its IMAGE_START
+     * (every block has exactly one; its pads, rows and END render as nothing) -- so a disk chain over an image is
+     * found by the request that brings the image, by the text it was rendered with (pulsar_kvchain.h).  Which image
+     * it is, the segment's records say; the text only finds the chain. */
+    if (token == vocab->n_vocab + PULSAR_VISION_ROLE_IMAGE_START) {
+        const size_t n = sizeof(PULSAR_IMAGE_PLACEHOLDER) - 1;
+        char *out = (char *)xmalloc(n + 1);
+        memcpy(out, PULSAR_IMAGE_PLACEHOLDER, n + 1);
+        if (len) *len = n;
+        return out;
+    }
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = (char *)xmalloc(1);

@@ -391,6 +391,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason) {
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   const pulsar_text_span *prompt_spans,
                                   uint32_t prompt_n_spans,
+                                  const uint64_t *image_hashes, int n_images,
                                   pulsar_tokens *effective_prompt,
                                   char **loaded_key_out,
                                   bool responses_protocol) {
@@ -403,12 +404,11 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n = 0;
     char err[384];
-    const int G = pulsar_kvchain_restore(s->kv.st, s->engine, s->sess, prompt_text, prompt_bytes,
-                                         s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
-    if (G == 0) {
-        if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
-        return 0;
-    }
+    const int G = pulsar_kvchain_restore(s->kv.st, s->engine, s->sess, prompt_text, prompt_bytes, image_hashes,
+                                         n_images, s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &n, err,
+                                         sizeof(err));
+    if (err[0]) server_log(G ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+    if (G == 0) return 0;
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const uint64_t text_end = chain[n - 1].text_end;
     /* The chain's tool maps: the exact DSML of every tool call inside it. */
@@ -442,9 +442,15 @@ int server::kv_cache_try_load(session_slot *sl, const request *req,
                              pulsar_tokens *effective_prompt,
                              char **loaded_key_out) {
     auto *s = this;
+    /* L281: the chain loads past an image block only when this request brings the same image there */
+    enum { HASHES_MAX = 64 };
+    uint64_t hashes[HASHES_MAX];
+    const int n_images = req && req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
+    for (int i = 0; req && i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
     return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
                                   req ? req->prompt_spans : NULL,
                                   req ? req->prompt_n_spans : 0,
+                                  hashes, n_images,
                                   effective_prompt, loaded_key_out,
                                   req && req->api == API_RESPONSES);
 }

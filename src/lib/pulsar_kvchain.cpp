@@ -31,14 +31,6 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
 }
 }  // namespace
 
-int pulsar_kvchain_persist_end(const pulsar_tokens *toks) {
-    if (!toks) return 0;
-    int first = 0;
-    const int n_blocks = pulsar_image_block_starts(toks, toks->len, &first, 1);
-    if (n_blocks < 0) return -1;
-    return n_blocks > 0 ? first : toks->len;
-}
-
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
@@ -46,8 +38,10 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     const pulsar_tokens *toks = st ? pulsar_session_tokens(s) : NULL;
     /* The bank's grid checkpoints at or before the chain's end, deepest first:
      * where new segments can end.  No checkpoint is captured inside an image
-     * block, so the end is never inside one either. */
-    const int end = pulsar_kvchain_persist_end(toks);
+     * block, so the end is never inside one either.  L281: the end is past every
+     * block the session records (its segment carries the record), short of the
+     * first it does not. */
+    const int end = toks ? pulsar_session_persist_end(s) : 0;
     if (end < 0) {
         snprintf(r.err, sizeof(r.err), "the history's image blocks are malformed; nothing persisted");
         if (out) *out = r;
@@ -118,12 +112,38 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
 }
 
 int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                           size_t text_len, int min_tokens, pulsar_segstore_seg *chain, int cap, int *n_out,
-                           char *err, size_t errlen) {
+                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
+                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen) {
     if (n_out) *n_out = 0;
     if (err && errlen) err[0] = '\0';
     if (!st || !text) return 0;
-    const int n = pulsar_segstore_lookup(st, text, text_len, chain, cap);
+    int n = pulsar_segstore_lookup(st, text, text_len, chain, cap);
+    /* L281: how far the request's images let the chain go -- every segment's image records must be the request's
+     * next images, by content and in order; the chain stops at the last segment below the first that is not */
+    {
+        int k = 0;   /* the request's next image */
+        for (int i = 0; i < n; i++) {
+            uint64_t pb = 0, rec[64];
+            uint32_t nr = 0;
+            FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
+            const int prc = fp ? pulsar_session_segment_images(fp, pb, rec, 64, &nr) : 1;
+            if (fp) fclose(fp);
+            bool match = prc == 0 && nr <= 64;
+            for (uint32_t r = 0; match && r < nr; r++) {   /* k advances only past an image that matched */
+                match = k < n_images && image_hashes && image_hashes[k] == rec[r];
+                if (match) k++;
+            }
+            if (!match) {
+                if (err && errlen)
+                    snprintf(err, errlen, "chain stops at %u: segment [%u,%u) holds %s (image %d of the request)",
+                             i ? chain[i - 1].G : 0u, chain[i].G_prev, chain[i].G,
+                             prc != 0 ? "unreadable image records" : k >= n_images ? "an image the request does not carry"
+                                                                                     : "a different image", k);
+                n = i;
+                break;
+            }
+        }
+    }
     if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
     for (int i = 0; i < n; i++) {
         uint64_t pb = 0;

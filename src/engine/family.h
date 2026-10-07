@@ -65,6 +65,16 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k);
 /** L272 P4b: a rank's tensor-parallel plan (tp_slice.cpp; opaque to the families, which add to it). */
 typedef struct pulsar_tp_plan pulsar_tp_plan;
 
+/** L281: a family's image GEOMETRY -- which token ids are image sentinels and how long the block starting at a
+ *  position is.  The core keeps the identity of the blocks a session holds (image_identity.cpp) and decides reuse,
+ *  resume and disk persistence from it; the family says only where blocks are.  NULL on a family that serves no
+ *  images: no id is a sentinel. */
+typedef struct pulsar_family_vision {
+    bool (*is_sentinel)(const pulsar_engine *e, int32_t id);
+    /** true and *len = the block's length when `ids[start..]` begins an image block */
+    bool (*block_extent)(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+} pulsar_family_vision;
+
 /** L272 P4c: how a family's forward hands its linears their activation -- the backend's MX slot (DeepSeek) or raw
  *  bf16 rows (Qwen).  The core chooses by it: the dense / MoE arm with the format, and a TP slice's operation (a
  *  slot reader reads slices REGISTERED with the backend, a rows reader slices BUILT and kept on the device). */
@@ -231,6 +241,8 @@ struct pulsar_family {
     /** How the forward hands its linears their activation (pulsar_act_kind): what the core's arms and the TP
      *  plan's operations are chosen for. */
     pulsar_act_kind act_kind;
+    /** L281: the family's image geometry (image_identity.cpp), or NULL = no images. */
+    const pulsar_family_vision *vision;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
 };

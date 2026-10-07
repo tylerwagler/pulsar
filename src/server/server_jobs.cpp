@@ -320,7 +320,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         char *path = NULL;
         pulsar_tokens effective = {0};
         int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
-                                            rendered.spans, rendered.n_spans,
+                                            rendered.spans, rendered.n_spans, NULL, 0,
                                             &effective, &path, false);
         if (loaded == 0) pulsar_session_invalidate(s->sess);
 
@@ -541,10 +541,10 @@ static bool gen_prefill_cancel_cb(void *ud) {
  * next request, never counted a chunk, and the cancel callback never yielded
  * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
  * before every sync this slot issues. */
-static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g, bool cancellable) {
+static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
     pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
     pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
-    pulsar_session_set_cancel(sess, cancellable ? gen_prefill_cancel_cb : NULL, g);
+    pulsar_session_set_cancel(sess, gen_prefill_cancel_cb, g);
 }
 
 
@@ -599,7 +599,7 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
                                      char *why, size_t whylen) {
     enum { HELD_MAX = 64 };
     int starts[HELD_MAX];
-    const int held = pulsar_image_block_starts(eff, live_len, starts, HELD_MAX);
+    const int held = pulsar_image_block_starts(e, eff, live_len, starts, HELD_MAX);
     if (held < 0 || held > HELD_MAX || held > n_images) {
         snprintf(why, whylen, "the live history carries %d image block(s) for %d image(s)", held, n_images);
         return false;
@@ -991,17 +991,19 @@ void server::gen_step_prefill(session_slot *sl) {
      * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
      * setting it here binds the correct callback for this exact sync.
      *
-     * An IMAGE prefill is not interruptible this way: the sentinel blocks are
-     * merged on this one pass, and a resumed quantum would re-enter with a plain
-     * sync whose checkpoint already carries sentinel ids (refused). So no cancel
-     * callback is armed and the mm call runs to completion; a client that has
-     * gone away is noticed at the next quantum boundary. */
+     * L281 (b): an IMAGE prefill is interruptible too.  Every quantum re-enters
+     * through sync_mm with the same images (the job owns them), the engine records
+     * the blocks an interrupted quantum completed (pulsar_session::live_images), and
+     * the planner honours a stop only at a grid point outside every block -- where
+     * the resume is exact.  So a client that hangs up stops the prefill within a
+     * chunk (it ran 379 s to the end on the pair, 2026-10-07), and another slot can
+     * interleave with a long image prompt as with a text one. */
     /* The cold phase's target is the shared preamble, which carries no image
      * block (gen_begin drops a cut that any block begins inside), so it is the
      * plain text sync -- interruptible like any text prefill -- and the
      * checkpoint it leaves is one the main image sync extends. */
     const int n_images = cold ? 0 : g->j->req.n_images;
-    gen_arm_prefill_callbacks(s->sess, g, n_images == 0);
+    gen_arm_prefill_callbacks(s->sess, g);
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;

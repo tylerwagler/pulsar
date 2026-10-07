@@ -2170,6 +2170,38 @@ static inline void pulsar_spec_drop_pendings(pulsar_spec_carry_state *sp) {
  * another bank's chain). Defined in session_spec.cpp. */
 void pulsar_session_spec_chain_harvest(pulsar_session *s);
 
+/** L281: one image block a session's KV holds -- its rows [start, end) and the hash of the image bytes merged there
+ *  (pulsar_image_content_hash).  Block ids encode only geometry, so the record is what says WHICH image. */
+typedef struct {
+    uint32_t start, end;
+    uint64_t content;
+} pulsar_image_block;
+#define PULSAR_IMAGE_BLOCKS_MAX 64
+/** The blocks a KV holds, in position order (image_identity.cpp). */
+typedef struct {
+    uint32_t n;
+    pulsar_image_block b[PULSAR_IMAGE_BLOCKS_MAX];
+} pulsar_image_identity;
+uint64_t pulsar_image_content_hash(const pulsar_image_ref *img);
+/** The family's geometry (pulsar_family::vision); false / no sentinel on a family without images. */
+bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id);
+bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+/** The records of `images` (in prompt order, each naming its block in `ids` by the geometry `v` -- the family's,
+ *  e->family->vision; `e` is the hook's argument) whose blocks end at or below `limit`.  false = an image names no
+ *  block, blocks out of order, or more than PULSAR_IMAGE_BLOCKS_MAX (said). */
+bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                                 const pulsar_image_ref *images, int n_images, uint32_t limit,
+                                 pulsar_image_identity *out);
+/** Keep the records of the blocks that end at or below `pos` (a rewind's survivors). */
+void pulsar_image_identity_trim(pulsar_image_identity *id, uint32_t pos);
+bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_image_identity *b);
+/** The exclusive end of the last block, 0 when none. */
+uint32_t pulsar_image_identity_end(const pulsar_image_identity *id);
+/** How much of `ids` a disk chain may hold: everything, or up to the first image block `id` does not record
+ *  (its rows' image is unknown).  -1 = a malformed block. */
+int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                             const pulsar_image_identity *id);
+
 /** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host
  * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
@@ -2191,12 +2223,9 @@ typedef struct pulsar_bank_carry {
     bool      checkpoint_valid;
     bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
     int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
-    /** L226: mirror of pulsar_session::live_image_fp / _barrier -- the image
-     * identity travels with the bank, exactly like the checkpoint it describes,
-     * so a bank switch can never pair one conversation's barrier with
-     * another's KV. */
-    uint64_t  live_image_fp;
-    int       live_image_barrier;
+    /** L226 / L281: mirror of pulsar_session::live_images -- the image identity travels with the bank, exactly like
+     * the checkpoint it describes, so a bank switch can never pair one conversation's blocks with another's KV. */
+    pulsar_image_identity live_images;
     /** Whole speculative/DSpark shadow, mirrored by value (single assignment in
      * save/restore).  NOTE: pulsar_session.mseq_dirty is deliberately NOT carried:
      * it is a property of the GRAPH's scalar frontier counters, not of a bank's
@@ -2340,15 +2369,11 @@ struct pulsar_session {
      *  chunk verdicts until it returns, so no other mirrored frame may ship
      *  (a disk KV store from the prefill's progress callback). */
     bool tp_in_sync;
-    /** Identity of the images whose sentinel blocks are inside `checkpoint`
-     * (0 = none), and the exclusive end of the last of those blocks.  The
-     * blocks' TOKEN IDS encode only their geometry (`vocab_size + role`), never
-     * the pixels, so a client that swaps an image for a different one of the
-     * same size produces an identical token prefix -- the fingerprint is what
-     * keeps such a request from reusing KV rows computed from the other image.
-     * Cleared by rewind() when the truncation drops a block (see L226). */
-    uint64_t live_image_fp;
-    int live_image_barrier;
+    /** L281: the image blocks inside `checkpoint`, one record each (image_identity.cpp).  The blocks' TOKEN IDS
+     * encode only their geometry, never the pixels, so a client that swaps an image for a different one of the same
+     * size produces an identical token prefix -- the records are what keep such a request from reusing KV rows
+     * computed from the other image.  rewind() keeps the records of the blocks that survive it. */
+    pulsar_image_identity live_images;
     int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
     /** L260 fusion: the last successful fused step's logits block (the caller's
      *  buffer), its decode-row count and its headed rows -- what

@@ -171,7 +171,7 @@ int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n = 0;
     char err[384];
-    const int cached = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, 0, chain,
+    const int cached = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, NULL, 0, 0, chain,
                                               PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
     if (!cached && err[0]) agent_trace(w, "kv restore refused: %s", err);
     free(text);

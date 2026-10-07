@@ -116,8 +116,7 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
     c->checkpoint_valid       = s->checkpoint_valid;
     c->logits_stale           = s->logits_stale;
     c->prefill_frontier       = s->prefill_frontier;   /* L195 */
-    c->live_image_fp          = s->live_image_fp;      /* L226: travels with the checkpoint */
-    c->live_image_barrier     = s->live_image_barrier;
+    c->live_images            = s->live_images;        /* L226 / L281: travels with the checkpoint */
     /* Whole speculative/DSpark shadow in one assignment — a new field added to
      * pulsar_spec_carry_state is carried here for free (the old field-by-field
      * mirror was a silent-corruption footgun: miss one and the entering bank
@@ -155,8 +154,7 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
     s->checkpoint_valid       = c->checkpoint_valid;
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
-    s->live_image_fp          = c->live_image_fp;      /* L226 */
-    s->live_image_barrier     = c->live_image_barrier;
+    s->live_images            = c->live_images;        /* L226 / L281 */
     /* Mirror of the save above: the whole shadow and its q rows. */
     pulsar_spec_shadow_restore(s, &c->spec, c->pend_qrows, c->pend_qrows_cap);
     return true;

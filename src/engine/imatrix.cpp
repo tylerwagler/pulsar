@@ -699,6 +699,10 @@ struct ds4_plan {
     uint32_t chunk_cap;
     int n_blk;
     const int32_t *blk_s, *blk_e;
+    /** L281 (b): the walk stands where a resume is exact -- its start, or a chunk end on the grid outside every
+     *  image block (ds4_plan_landed).  A stop is honoured only there: an image block's end is off the grid, and an
+     *  interrupt there would resume from the grid point below it, inside the block, i.e. from 0. */
+    bool at_resume_point;
 };
 
 static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
@@ -795,7 +799,7 @@ static bool ds4_plan_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
 }
 
 static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
-    const ds4_plan *p = (const ds4_plan *)ud;
+    ds4_plan *p = (ds4_plan *)ud;
     pulsar_gpu_graph *g = p->g;
     /* L264: a chunk that ended on the grid -- every non-final boundary does,
      * and the final split above makes the last grid point one too -- is a
@@ -804,8 +808,8 @@ static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
     bool in_block = false;
     for (int b = 0; b < p->n_blk; b++)
         if ((uint32_t)p->blk_s[b] < chunk_end && chunk_end < (uint32_t)p->blk_e[b]) in_block = true;
-    if (chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block &&
-        !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
+    p->at_resume_point = chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block;
+    if (p->at_resume_point && !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
     if (p->progress) {
         p->progress(p->progress_ud, "prefill_chunk", (int)chunk_end, p->prompt->len);
     }
@@ -817,6 +821,7 @@ static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
 
 static bool ds4_plan_stop(void *ud) {
     const ds4_plan *p = (const ds4_plan *)ud;
+    if (!p->at_resume_point) return false;   /* L281 (b): the next grid point honours it */
     if (!(p->cancel && p->cancel(p->cancel_ud))) return false;
     if (p->cancelled) *p->cancelled = true;
     return true;
@@ -902,6 +907,7 @@ bool gpu_graph_prefill_chunked_range(
     p.display_progress = display_progress; p.display_progress_ud = display_progress_ud; p.imatrix = imatrix;
     p.cancel = cancel; p.cancel_ud = cancel_ud; p.cancelled = cancelled;
     p.chunk_cap = chunk_cap; p.n_blk = n_blk; p.blk_s = blk_s; p.blk_e = blk_e;
+    p.at_resume_point = true;   /* the start is where the caller resumed (or 0) */
     const pulsar_prefill_walk w = { ds4_plan_next_end, ds4_plan_chunk, ds4_plan_landed, ds4_plan_stop, &p };
     const int rc = pulsar_prefill_walk_run(&w, start, end);
     if (rc == 1) return false;

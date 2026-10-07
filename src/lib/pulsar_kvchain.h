@@ -13,7 +13,13 @@
  * restore: load the deepest chain whose text is a byte prefix of `text`; the
  *   bank stands live at its end.  A segment that will not load is dropped with
  *   everything below it, and so is a chain whose text and tokens disagree at the
- *   boundary (L196), so the next persist rewrites it. */
+ *   boundary (L196), so the next persist rewrites it.
+ *
+ * L281: a chain carries IMAGE rows.  An image block renders as its family's placeholder text (so a request carrying
+ * the image finds the chain by the text it was rendered with), and each segment's payload carries the records of the
+ * blocks inside it (image_identity.cpp): persist goes past a block only when the session records its image, and
+ * restore loads past a block only when the request brings the same image there -- by content, in order -- stopping,
+ * said by name, at the last segment below the first block that differs.  Every rank's copy carries the records. */
 
 #include "pulsar.h"
 #include "pulsar_segstore.h"
@@ -42,28 +48,21 @@ typedef struct {
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
 
-/** How far a chain may extend over `toks`: the first image block's start, or
- *  the history's length when it holds none.  A sentinel id renders as no text,
- *  so a chain over a block would be found by a prompt that never carried the
- *  image and restore rows that prompt cannot describe (L261): the chain ends at
- *  the deepest checkpoint at or before this position, wherever persist was
- *  called from.  -1 when the history's blocks are malformed (nothing may be
- *  persisted from it). */
-int pulsar_kvchain_persist_end(const pulsar_tokens *toks);
-
 /** Persist the installed bank's history (see above), never past
- *  pulsar_kvchain_persist_end.  Nothing is written when its deepest grid
+ *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  Nothing is written
+ *  when its deepest grid
  *  checkpoint is below `min_tokens`.  Returns `written`. */
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out);
 
 /** Restore the deepest stored chain for `text` into the installed bank (see
- *  above), at most `cap` segments reported in `chain` (*n_out of them).
- *  Returns the position it stands at, 0 when nothing was loaded (`err` says why
- *  when a stored chain was refused).  A chain ending below `min_tokens` is not
- *  loaded.  The chain is touched on success. */
+ *  above), at most `cap` segments reported in `chain` (*n_out of them).  `image_hashes` are the content hashes
+ *  (pulsar_image_hash) of the images the history must hold, in order -- a request's images, or a spilled bank's own
+ *  records (pulsar_session_image_hashes); NULL / 0 for none: the chain loads only as far as its records match them.
+ *  Returns the position it stands at, 0 when nothing was loaded; `err` says why when a stored chain was refused or
+ *  stopped short of its end.  A chain ending below `min_tokens` is not loaded.  The chain is touched on success. */
 int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                           size_t text_len, int min_tokens, pulsar_segstore_seg *chain, int cap, int *n_out,
-                           char *err, size_t errlen);
+                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
+                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen);
 
 #endif

@@ -1032,6 +1032,220 @@ static void test_image_conversation_reuse_matches_cold(void) {
 
 
 
+/* L281 (b): an image prefill interrupted at every chunk boundary and resumed through sync_mm with the same images
+ * equals the cold prefill, byte for byte -- the server's quantum loop with a slot yielding after each chunk.  Each
+ * interrupted quantum records the blocks it completed (pulsar_session::live_images) and the planner honours a stop
+ * only at a grid point outside every block, so no resumed quantum may start from 0 (the failure this guards: a stop
+ * right after a block resumed from the grid point inside it, i.e. from 0).
+ *
+ * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
+struct test_quantum {
+    int start;    /* the position the quantum began at: the planner's first event (-1 until it arrives) */
+    int chunks;   /* chunks landed past it */
+};
+static void test_quantum_progress(void *ud, const char *event, int current, int) {
+    test_quantum *q = (test_quantum *)ud;
+    if (strcmp(event, "prefill_chunk") != 0) return;
+    if (q->start < 0) q->start = current;   /* the walk announces where it starts before any chunk runs */
+    else if (current > q->start) q->chunks++;
+}
+static bool test_quantum_cancel(void *ud) { return ((test_quantum *)ud)->chunks >= 1; }
+
+static void test_image_prefill_interrupt_resumes(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    pulsar_image_ref img = {0};
+    img.bytes = (uint8_t *)test_reuse_png;
+    img.len = sizeof test_reuse_png;
+    /* ~600 tokens of text, the image, then a tail long enough for several prefill chunks after it */
+    pulsar_tokens raw = {0};
+    {
+        enum { TEXT_MAX = 96 * 1024 };
+        char *text = (char *)xmalloc(TEXT_MAX);
+        size_t n = 0;
+        for (int r = 0; r < 60; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Earlier context line %d. ", r);
+        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Look at " PULSAR_IMAGE_PLACEHOLDER " and then read on. ");
+        for (int r = 0; r < 900 && n < TEXT_MAX - 128; r++)
+            n += (size_t)snprintf(text + n, TEXT_MAX - n, "The quick brown fox jumps over the lazy dog %d. ", r);
+        pulsar_tokenize_rendered_chat(engine, text, &raw);
+        free(text);
+    }
+    char err[256] = {0};
+    pulsar_tokens prompt = {0};
+    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+        fprintf(stderr, "image-interrupt gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
+        pulsar_tokens_free(&raw);
+        return;
+    }
+    const int vocab = pulsar_engine_logits_width(engine);
+    float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
+    float *resumed = (float *)xmalloc((size_t)vocab * sizeof(float));
+    const int ctx = prompt.len + 1024;
+
+    pulsar_session *sc = NULL;
+    TEST_ASSERT(pulsar_session_create(&sc, engine, ctx) == 0);
+    pulsar_image_ref im = img;
+    bool okc = sc && pulsar_session_sync_mm(sc, &prompt, &im, 1, err, sizeof err) == 0 &&
+               pulsar_session_copy_logits(sc, cold, vocab) == vocab;
+    TEST_ASSERT(okc);
+    if (sc) pulsar_session_free(sc);
+
+    pulsar_session *sr = NULL;
+    TEST_ASSERT(pulsar_session_create(&sr, engine, ctx) == 0);
+    test_quantum q = {0};
+    int quanta = 0, rc = PULSAR_SESSION_SYNC_INTERRUPTED, restarts = 0;
+    if (sr) {
+        pulsar_session_set_progress(sr, test_quantum_progress, &q);
+        pulsar_session_set_cancel(sr, test_quantum_cancel, &q);
+    }
+    while (sr && rc == PULSAR_SESSION_SYNC_INTERRUPTED && quanta < 64) {
+        q.chunks = 0;
+        q.start = -1;
+        pulsar_image_ref again = img;
+        rc = pulsar_session_sync_mm(sr, &prompt, &again, 1, err, sizeof err);
+        quanta++;
+        if (quanta > 1 && pulsar_session_resume_origin(sr) == 0) restarts++;   /* a resumed quantum started cold */
+    }
+    TEST_ASSERT(rc == 0);
+    if (rc != 0) fprintf(stderr, "  the quantum loop ended rc %d: %s\n", rc, err);
+    const bool okr = rc == 0 && pulsar_session_copy_logits(sr, resumed, vocab) == vocab;
+    TEST_ASSERT(okr);
+    if (sr) pulsar_session_free(sr);
+
+    fprintf(stderr, "image-interrupt gate: %d-token prompt, image block at %d, %d quanta, %d restarted from 0\n",
+            prompt.len, img.start_pos, quanta, restarts);
+    TEST_ASSERT(quanta >= 3);      /* the prompt spans several chunks: it was interrupted */
+    TEST_ASSERT(restarts == 0);
+    if (okc && okr) {
+        int differing = 0;
+        for (int i = 0; i < vocab; i++) differing += memcmp(&cold[i], &resumed[i], sizeof(float)) != 0;
+        fprintf(stderr, "image-interrupt gate: %d/%d logits differ from the cold prefill\n", differing, vocab);
+        TEST_ASSERT(differing == 0);
+    }
+    free(cold);
+    free(resumed);
+    pulsar_tokens_free(&prompt);
+    pulsar_tokens_free(&raw);
+}
+
+
+
+/* L281 (c): a disk chain carries an image conversation's rows past the image, with the image's record, and a restore
+ * loads past the block only for the same image.  Persist the prompt's chain into a scratch store, restore it into a
+ * fresh session with the image's hash -- it stands past the block, and the licence reuses it: extending it equals the
+ * cold prefill byte for byte -- then restore with another hash: the chain stops before the block (it is in the first
+ * segment, so nothing loads), said by name.
+ *
+ * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
+static void test_image_chain_round_trip(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    pulsar_image_ref img = {0};
+    img.bytes = (uint8_t *)test_reuse_png;
+    img.len = sizeof test_reuse_png;
+    pulsar_tokens raw = {0};
+    {
+        enum { TEXT_MAX = 64 * 1024 };
+        char *text = (char *)xmalloc(TEXT_MAX);
+        size_t n = 0;
+        for (int r = 0; r < 40; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Background note %d. ", r);
+        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Here is " PULSAR_IMAGE_PLACEHOLDER " to discuss. ");
+        for (int r = 0; r < 700 && n < TEXT_MAX - 128; r++)
+            n += (size_t)snprintf(text + n, TEXT_MAX - n, "A sentence about the picture, number %d. ", r);
+        pulsar_tokenize_rendered_chat(engine, text, &raw);
+        free(text);
+    }
+    char err[384] = {0};
+    pulsar_tokens prompt = {0};
+    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+        fprintf(stderr, "image-chain gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
+        pulsar_tokens_free(&raw);
+        return;
+    }
+    pulsar_tokens longer = {0};
+    pulsar_tokens_copy(&longer, &prompt);
+    for (int t = 700; t < 740; t++) pulsar_tokens_push(&longer, t);
+    const int vocab = pulsar_engine_logits_width(engine), ctx = longer.len + 1024;
+    char tmpl[] = "/tmp/pulsar-image-chain.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    pulsar_segstore *st = dir ? pulsar_segstore_open(dir, 0, 7, NULL, NULL) : NULL;
+    TEST_ASSERT(st != NULL);
+
+    /* A: prefill the prompt and persist its chain */
+    pulsar_session *sa = NULL;
+    TEST_ASSERT(pulsar_session_create(&sa, engine, ctx) == 0);
+    pulsar_image_ref ia = img;
+    bool ok = sa && st && pulsar_session_sync_mm(sa, &prompt, &ia, 1, err, sizeof err) == 0;
+    TEST_ASSERT(ok);
+    pulsar_kvchain_persist_result pr;
+    memset(&pr, 0, sizeof pr);
+    if (ok) pulsar_kvchain_persist(st, engine, sa, 0, NULL, &pr);
+    fprintf(stderr, "image-chain gate: %d-token prompt, block at %d; persisted %d segment(s) to %d%s%s\n", prompt.len,
+            img.start_pos, pr.written, pr.end, pr.err[0] ? " -- " : "", pr.err);
+    TEST_ASSERT(pr.written > 0 && pr.end > img.start_pos);   /* the chain goes past the image */
+    if (sa) pulsar_session_free(sa);
+
+    size_t tlen = 0;
+    char *text = pulsar_kvtext_render_tokens_text(engine, &longer, &tlen);
+    const uint64_t right = pulsar_image_hash(&img), wrong = right ^ 1u;
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    int nseg = 0;
+
+    /* B: restore with the image's hash, extend through sync_mm; C: the cold prefill of the same tokens */
+    float *reused = (float *)xmalloc((size_t)vocab * sizeof(float));
+    float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
+    pulsar_session *sb = NULL;
+    TEST_ASSERT(pulsar_session_create(&sb, engine, ctx) == 0);
+    const int G = sb && text ? pulsar_kvchain_restore(st, engine, sb, text, tlen, &right, 1, 0, chain, PULSAR_KVCHAIN_MAX,
+                                                       &nseg, err, sizeof err) : 0;
+    fprintf(stderr, "image-chain gate: restore with the image stands at %d (%d segment(s))%s%s\n", G, nseg,
+            err[0] ? " -- " : "", err);
+    TEST_ASSERT(G == pr.end);
+    pulsar_image_ref ib = img;
+    bool okb = G > 0 && pulsar_session_sync_mm(sb, &longer, &ib, 1, err, sizeof err) == 0 &&
+               pulsar_session_copy_logits(sb, reused, vocab) == vocab;
+    TEST_ASSERT(okb);
+    TEST_ASSERT(okb && pulsar_session_resume_origin(sb) > img.start_pos);   /* resumed past the block, not rebuilt */
+    if (sb) pulsar_session_free(sb);
+    pulsar_session *sc = NULL;
+    TEST_ASSERT(pulsar_session_create(&sc, engine, ctx) == 0);
+    pulsar_image_ref ic = img;
+    bool okc = sc && pulsar_session_sync_mm(sc, &longer, &ic, 1, err, sizeof err) == 0 &&
+               pulsar_session_copy_logits(sc, cold, vocab) == vocab;
+    TEST_ASSERT(okc);
+    if (sc) pulsar_session_free(sc);
+    if (okb && okc) {
+        int differing = 0;
+        for (int i = 0; i < vocab; i++) differing += memcmp(&reused[i], &cold[i], sizeof(float)) != 0;
+        fprintf(stderr, "image-chain gate: restored + extended vs cold: %d/%d logits differ\n", differing, vocab);
+        TEST_ASSERT(differing == 0);
+    }
+
+    /* D: another image's hash -- the chain stops before the block, said by name */
+    pulsar_session *sd = NULL;
+    TEST_ASSERT(pulsar_session_create(&sd, engine, ctx) == 0);
+    err[0] = '\0';
+    const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, 0, chain,
+                                                        PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err) : -1;
+    fprintf(stderr, "image-chain gate: restore with another image stands at %d -- %s\n", Gd, err);
+    TEST_ASSERT(Gd >= 0 && Gd <= img.start_pos && strstr(err, "a different image"));
+    if (sd) pulsar_session_free(sd);
+
+    free(text);
+    free(reused);
+    free(cold);
+    if (st) pulsar_segstore_close(st);
+    if (dir) {
+        char cmd[512];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        if (system(cmd) != 0) fprintf(stderr, "image-chain gate: could not remove %s\n", dir);
+    }
+    pulsar_tokens_free(&longer);
+    pulsar_tokens_free(&prompt);
+    pulsar_tokens_free(&raw);
+}
+
 static bool test_mpp_capture_logits_only(pulsar_engine *engine,
                                          const test_mpp_eq_case *tc,
                                          float *logits) {
@@ -4239,29 +4453,51 @@ static void test_spec_cost_fit(void) {
     TEST_ASSERT(f.valid && f.flat_us > 29000 && f.flat_us < 31500 && f.row_us > 4800 && f.row_us < 5200);
 }
 
-/* L261: a chain never holds an image row.  The rule has ONE statement,
- * pulsar_kvchain_persist_end: the first block's start, the history's length
- * without one, -1 for a malformed block (nothing persisted). */
-static void test_lib_kvchain_persist_end(void) {
+/* L281: the core image identity (image_identity.cpp) over DeepSeek's sentinel geometry -- records per block, a
+ * rewind keeps the survivors, a chain persists past a block only with its record, -1 for a malformed block. */
+static bool test_ds_sentinel(const pulsar_engine *, int32_t id) { return id >= (int32_t)PULSAR_N_VOCAB; }
+static bool test_ds_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
+    return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
+}
+static void test_lib_image_identity(void) {
+    const pulsar_family_vision v = { test_ds_sentinel, test_ds_extent };
     const int V = (int)PULSAR_N_VOCAB;
     const int PAD = V + PULSAR_VISION_ROLE_IMAGE_PAD, START = V + PULSAR_VISION_ROLE_IMAGE_START,
-                  END = V + PULSAR_VISION_ROLE_IMAGE_END;
+              END = V + PULSAR_VISION_ROLE_IMAGE_END;
+    /* text, block A [3,8), text, block B [9,12), text */
+    int ids[] = {5, 6, 7, PAD, START, 9, 9, END, 10, START, 9, END, 11, 12};
+    const int n = 14;
+    uint8_t a_bytes[] = {1, 2, 3}, b_bytes[] = {4, 5, 6}, c_bytes[] = {7, 8, 9};
+    pulsar_image_ref imgs[2] = {{a_bytes, sizeof a_bytes, 3}, {b_bytes, sizeof b_bytes, 9}};
+    pulsar_image_identity all, upto8, none;
+    TEST_ASSERT(pulsar_image_identity_build(&v, NULL, ids, n, imgs, 2, (uint32_t)n, &all));
+    TEST_ASSERT(all.n == 2 && all.b[0].start == 3 && all.b[0].end == 8 && all.b[1].start == 9 && all.b[1].end == 12);
+    TEST_ASSERT(all.b[0].content == pulsar_image_content_hash(&imgs[0]) && all.b[0].content != all.b[1].content);
+    TEST_ASSERT(pulsar_image_identity_build(&v, NULL, ids, n, imgs, 2, 8, &upto8) && upto8.n == 1);
+    TEST_ASSERT(pulsar_image_identity_end(&all) == 12 && pulsar_image_identity_end(&upto8) == 8);
+    /* a rewind keeps the blocks that end at or below it */
+    pulsar_image_identity t = all;
+    pulsar_image_identity_trim(&t, 10);
+    TEST_ASSERT(pulsar_image_identity_equal(&t, &upto8));
+    pulsar_image_identity_trim(&t, 5);
+    TEST_ASSERT(t.n == 0);
+    /* the same geometry with other bytes is another identity */
+    pulsar_image_ref other[2] = {{c_bytes, sizeof c_bytes, 3}, imgs[1]};
+    pulsar_image_identity swapped;
+    TEST_ASSERT(pulsar_image_identity_build(&v, NULL, ids, n, other, 2, (uint32_t)n, &swapped));
+    TEST_ASSERT(!pulsar_image_identity_equal(&swapped, &all));
+    /* persist end: everything with both records; the first unrecorded block's start without */
+    TEST_ASSERT(pulsar_image_persist_end(&v, NULL, ids, n, &all) == n);
+    TEST_ASSERT(pulsar_image_persist_end(&v, NULL, ids, n, &upto8) == 9);
+    none.n = 0;
+    TEST_ASSERT(pulsar_image_persist_end(&v, NULL, ids, n, &none) == 3);
     int text_only[] = {5, 6, 7, 8};
-    pulsar_tokens t = {text_only, 4, 4};
-    TEST_ASSERT(pulsar_kvchain_persist_end(&t) == 4);
-    int one_block[] = {5, 6, 7, PAD, START, 9, 9, END, 10, 11};
-    pulsar_tokens b = {one_block, 10, 10};
-    TEST_ASSERT(pulsar_kvchain_persist_end(&b) == 3);
-    int two_blocks[] = {5, START, 9, END, 10, PAD, START, 9, END};
-    pulsar_tokens b2 = {two_blocks, 9, 9};
-    TEST_ASSERT(pulsar_kvchain_persist_end(&b2) == 1);
-    int leading[] = {START, 9, END, 10};
-    pulsar_tokens b3 = {leading, 4, 4};
-    TEST_ASSERT(pulsar_kvchain_persist_end(&b3) == 0);
+    TEST_ASSERT(pulsar_image_persist_end(&v, NULL, text_only, 4, &none) == 4);
     int unterminated[] = {5, 6, START, 9, 9};
-    pulsar_tokens m = {unterminated, 5, 5};
-    TEST_ASSERT(pulsar_kvchain_persist_end(&m) == -1);
-    TEST_ASSERT(pulsar_kvchain_persist_end(NULL) == 0);
+    TEST_ASSERT(pulsar_image_persist_end(&v, NULL, unterminated, 5, &none) == -1);
+    /* a family with no image geometry: no id is a sentinel (Qwen's ids above DeepSeek's vocab are text) */
+    int qwen_like[] = {248046, 5, 248044};
+    TEST_ASSERT(pulsar_image_persist_end(NULL, NULL, qwen_like, 3, &none) == 3);
 }
 
 static void test_context_memory_shape(void) {
@@ -4326,6 +4562,8 @@ static const pulsar_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--image-reuse", "image-reuse", "an image conversation's reused continuation equals its cold prefill, byte for byte (L226)", test_image_conversation_reuse_matches_cold},
+    {"--image-chain", "image-chain", "an image conversation's disk chain carries its rows past the image and restores them only for the same image (L281)", test_image_chain_round_trip},
+    {"--image-interrupt", "image-interrupt", "an image prefill interrupted at every chunk and resumed equals its cold prefill, byte for byte, never restarting from 0 (L281)", test_image_prefill_interrupt_resumes},
     {"--image-span-cache", "image-span-cache", "the encoded-span cache is transparent: cached == freshly encoded, byte for byte (L226)", test_image_span_cache_is_transparent},
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
@@ -4335,7 +4573,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--spec-cost", "spec-cost", "spec cost fit: a round's measured cost to its terms, or no price at all (L263)", test_spec_cost_fit},
-    {"--lib-kvchain", "lib-kvchain", "shared chain rule: a chain ends before the first image block, one statement (L261)", test_lib_kvchain_persist_end},
+    {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},
