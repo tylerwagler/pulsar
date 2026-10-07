@@ -68,7 +68,13 @@ bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_eng
                     s, out->b[out->n - 1].start);
             return false;
         }
-        out->b[out->n++] = (pulsar_image_block){ s, end, pulsar_image_content_hash(&images[i]) };
+        uint32_t gh = 0, gw = 0;
+        if (v && v->grid && (!v->grid(e, &images[i], &gh, &gw) || (uint64_t)gh * gw != (uint64_t)len)) {
+            fprintf(stderr, "pulsar: image identity: image %d's grid %ux%u does not tile its %d-row block\n", i, gh, gw,
+                    len);
+            return false;
+        }
+        out->b[out->n++] = (pulsar_image_block){ s, end, pulsar_image_content_hash(&images[i]), gh, gw };
     }
     return true;
 }
@@ -80,13 +86,42 @@ void pulsar_image_identity_trim(pulsar_image_identity *id, uint32_t pos) {
 bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_image_identity *b) {
     if (a->n != b->n) return false;
     for (uint32_t i = 0; i < a->n; i++)
-        if (a->b[i].start != b->b[i].start || a->b[i].end != b->b[i].end || a->b[i].content != b->b[i].content)
+        if (a->b[i].start != b->b[i].start || a->b[i].end != b->b[i].end || a->b[i].content != b->b[i].content ||
+            a->b[i].grid_h != b->b[i].grid_h || a->b[i].grid_w != b->b[i].grid_w)
             return false;
     return true;
 }
 
 uint32_t pulsar_image_identity_end(const pulsar_image_identity *id) {
     return id->n ? id->b[id->n - 1].end : 0u;
+}
+
+/* L268: interleaved multi-axis rope positions (HF get_rope_index), a pure function of the KV row and the blocks
+ * before it.  Text advances every axis by one per row; a block with a 2D grid (h x w rows, raster) at text position
+ * p puts row (r, c) at (p, p + r, p + c) and moves the text position on by max(h, w) rather than by its h * w rows;
+ * a block with no grid is text.  So a text row's position is its row plus the shift of every gridded block before
+ * it, and the KV row stays the row. */
+void pulsar_image_rope3(const pulsar_image_identity *id, uint32_t row, uint32_t out[3]) {
+    int64_t shift = 0;   /* position - row, accumulated over the blocks that end at or before `row` */
+    for (uint32_t i = 0; id && i < id->n; i++) {
+        const pulsar_image_block *b = &id->b[i];
+        if (!b->grid_h || !b->grid_w) continue;
+        if (row >= b->end) {
+            const uint32_t span = b->grid_h > b->grid_w ? b->grid_h : b->grid_w;
+            shift += (int64_t)span - (int64_t)(b->end - b->start);
+            continue;
+        }
+        if (row >= b->start) {
+            const uint32_t k = row - b->start, p = (uint32_t)((int64_t)b->start + shift);
+            out[0] = p;
+            out[1] = p + k / b->grid_w;
+            out[2] = p + k % b->grid_w;
+            return;
+        }
+        break;   /* the records are in position order: nothing past `row` moves it */
+    }
+    const uint32_t p = (uint32_t)((int64_t)row + shift);
+    out[0] = out[1] = out[2] = p;
 }
 
 int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,

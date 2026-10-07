@@ -2175,6 +2175,9 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s);
 typedef struct {
     uint32_t start, end;
     uint64_t content;
+    /** L268: the block's 2D layout in rows (the family's pulsar_family_vision::grid, e.g. Qwen's merged patch grid,
+     *  rows = grid_h * grid_w) -- what multi-axis rope positions follow; 0 x 0 = a block with no 2D layout. */
+    uint32_t grid_h, grid_w;
 } pulsar_image_block;
 #define PULSAR_IMAGE_BLOCKS_MAX 64
 /** The blocks a KV holds, in position order (image_identity.cpp). */
@@ -2197,6 +2200,10 @@ void pulsar_image_identity_trim(pulsar_image_identity *id, uint32_t pos);
 bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_image_identity *b);
 /** The exclusive end of the last block, 0 when none. */
 uint32_t pulsar_image_identity_end(const pulsar_image_identity *id);
+/** L268: the interleaved multi-axis rope position (T, H, W) of KV row `row` after the blocks `id` records (HF
+ *  get_rope_index; a block without a grid is text).  Text rows have T = H = W; with no gridded block before them
+ *  that is the row itself. */
+void pulsar_image_rope3(const pulsar_image_identity *id, uint32_t row, uint32_t out[3]);
 /** How much of `ids` a disk chain may hold: everything, or up to the first image block `id` does not record
  *  (its rows' image is unknown).  -1 = a malformed block. */
 int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,

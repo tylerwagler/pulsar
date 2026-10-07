@@ -2750,6 +2750,12 @@ typedef struct {
      *  KV head and its 12 query heads: qg [n_rows][6144], k / v [n_rows][256], KV records of
      *  pulsar_qsa_kv_token_bytes(2) per token, an o_proj input [n_rows][3072]; the indexer whole. */
     int tp_ranks;
+    /** L268: interleaved multi-axis RoPE.  NULL = text positions (the row's position on every axis -- what the
+     *  three mRoPE axes are without images).  Else HOST [n_rows][6]: the row's (T, H, W) and the (T, H, W) of the
+     *  first token of its indexer block (pos - 3; read when the row completes the block -- that token may be an
+     *  earlier call's).  Rotary pair j takes H when j % 3 == 1, W when j % 3 == 2, else T (HF's
+     *  apply_interleaved_mrope over mrope_section [11, 11, 10]).  The KV row is still `row_pos`. */
+    const uint32_t *row_rope;
 } pulsar_qsa_io;
 
 /** Bytes of one token's KV record for one rank at the tensor-parallel degree tp_ranks (0 / 1: 1056). */

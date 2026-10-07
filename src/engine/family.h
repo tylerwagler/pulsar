@@ -91,6 +91,9 @@ typedef struct pulsar_family_vision {
     bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
                        const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out,
                        char *err, size_t errlen);
+    /** Optional (NULL = blocks have no 2D layout): the block's grid in rows, *h x *w = its length -- what
+     *  multi-axis rope positions follow (pulsar_image_rope3).  false = the image cannot be read. */
+    bool (*grid)(const pulsar_engine *e, const pulsar_image_ref *img, uint32_t *h, uint32_t *w);
 } pulsar_family_vision;
 
 /** L272 P4c: how a family's forward hands its linears their activation -- the backend's MX slot (DeepSeek) or raw

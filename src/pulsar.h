@@ -1170,7 +1170,7 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * extend the frontier restores, exact by construction where v12's ring replay
  * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
  * the checkpoint's grid point (0 = none).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(14)   /* v14 (L281): the image block records after the tokens */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(15)   /* v14 (L281): the image block records after the tokens; v15 (L268): with each block's 2D grid */
 /** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
@@ -1192,7 +1192,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(3)   /* v3 (L281): the span's image block records */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(4)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid */
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and
