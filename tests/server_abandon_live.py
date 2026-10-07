@@ -84,7 +84,17 @@ for _ in range(120):
 else:
     stop(1, "two decodes never ran together: %s" % phases())
 
-big = " ".join("filler%d" % i for i in range(9000))
+def count_tokens(text):
+    r = urllib.request.urlopen(urllib.request.Request(B + "/v1/messages/count_tokens", json.dumps(
+        {"model": "m", "messages": [{"role": "user", "content": text}]}).encode(),
+        {"content-type": "application/json"}), timeout=60)
+    return json.loads(r.read())["input_tokens"]
+
+
+# ~16k tokens in THIS model's tokenizer (half the context: long enough to be caught mid-prefill, and it fits)
+n_words = 2000
+n_words = int(n_words * 16000 / max(1, count_tokens(" ".join("filler%d" % i for i in range(n_words)))))
+big = " ".join("filler%d" % i for i in range(n_words))
 body = json.dumps({"model": "m", "max_tokens": 50, "messages": [{"role": "user", "content": big}]}).encode()
 s = socket.create_connection(("127.0.0.1", a.port))
 s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
@@ -95,7 +105,12 @@ while True:   # hang up the moment the prompt is prefilling (a fixed delay misse
     if before.get("prefill_main", 0) + before.get("prefill_cold", 0) >= 1:
         break
     if time.time() - t0 > 120:
-        stop(1, "the long prompt never reached prefill beside the decodes (phases %s)" % before)
+        s.settimeout(2)
+        try:
+            reply = s.recv(400).decode("utf-8", "replace")
+        except OSError:
+            reply = "(no reply)"
+        stop(1, "the long prompt never reached prefill beside the decodes (phases %s; server: %r)" % (before, reply))
     time.sleep(0.2)
 s.close()
 held = []
