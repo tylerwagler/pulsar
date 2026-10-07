@@ -1040,10 +1040,14 @@ static void test_image_conversation_reuse_matches_cold(void) {
  *
  * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
 struct test_quantum {
-    int chunks;   /* prefill_chunk events since the quantum began */
+    int start;    /* the position the quantum began at: the planner's first event (-1 until it arrives) */
+    int chunks;   /* chunks landed past it */
 };
-static void test_quantum_progress(void *ud, const char *event, int, int) {
-    if (!strcmp(event, "prefill_chunk")) ((test_quantum *)ud)->chunks++;
+static void test_quantum_progress(void *ud, const char *event, int current, int) {
+    test_quantum *q = (test_quantum *)ud;
+    if (strcmp(event, "prefill_chunk") != 0) return;
+    if (q->start < 0) q->start = current;   /* the walk announces where it starts before any chunk runs */
+    else if (current > q->start) q->chunks++;
 }
 static bool test_quantum_cancel(void *ud) { return ((test_quantum *)ud)->chunks >= 1; }
 
@@ -1096,6 +1100,7 @@ static void test_image_prefill_interrupt_resumes(void) {
     }
     while (sr && rc == PULSAR_SESSION_SYNC_INTERRUPTED && quanta < 64) {
         q.chunks = 0;
+        q.start = -1;
         pulsar_image_ref again = img;
         rc = pulsar_session_sync_mm(sr, &prompt, &again, 1, err, sizeof err);
         quanta++;
