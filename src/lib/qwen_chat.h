@@ -94,6 +94,11 @@ struct qwen_msg_in {
      * tool memory, L272 P3): written verbatim after the template's separator in place of rendering
      * `calls`, so a replayed turn byte-matches the live KV.  NULL = render `calls`. */
     const char *raw_calls;
+    /** L268: the byte offsets in `content` (ascending) where the message's images sit -- the template's
+     *  render_content writes each as <|vision_start|><|image_pad|><|vision_end|> there, outside client data.
+     *  NULL / 0 = none.  An image in a system or assistant message is refused, as the template refuses it. */
+    const uint32_t *image_at;
+    int n_images;
 };
 
 struct qwen_render_in {

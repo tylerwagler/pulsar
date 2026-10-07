@@ -108,10 +108,8 @@ uint32_t cp_at(const unsigned char *p, int n) {
     }
 }
 
-/* Jinja |trim on UTF-8 bytes; invalid bytes are never whitespace. */
-std::string py_strip(const char *s) {
-    if (!s) return std::string();
-    const size_t n = strlen(s);
+/* Jinja |trim on UTF-8 bytes -- the kept range [*lo, *hi) of s[0, n); invalid bytes are never whitespace. */
+void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     const unsigned char *u = (const unsigned char *)s;
     size_t lo = 0;
     while (lo < n) {
@@ -127,6 +125,14 @@ std::string py_strip(const char *s) {
         if (!k || b + (size_t)k != hi || !qwen_py_isspace(cp_at(u + b, k))) break;
         hi = b;
     }
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
+std::string py_strip(const char *s) {
+    if (!s) return std::string();
+    size_t lo = 0, hi = 0;
+    py_strip_bounds(s, strlen(s), &lo, &hi);
     return std::string(s + lo, hi - lo);
 }
 
@@ -227,6 +233,37 @@ bool render_calls(writer &w, const qwen_msg_in &m, bool content_empty, int i, ch
     return true;
 }
 
+/* L268: a message's content as the template's render_content writes it -- the text between images client data,
+ * each image the template's vision literal (no `Picture N: ` prefix: add_vision_id is off) -- then |trim over the
+ * whole rendered content, as the template trims it.  The literal has no whitespace at either end, so the trim can
+ * only reach text. */
+const char kVisionLiteral[] = "<|vision_start|><|image_pad|><|vision_end|>";
+
+void content_with_images(writer &w, const qwen_msg_in &m) {
+    const char *c = m.content ? m.content : "";
+    const size_t n = strlen(c);
+    std::string r;
+    std::vector<std::pair<size_t, size_t>> lits;   /* the literals' ranges in r */
+    size_t at = 0;
+    for (int k = 0; k < m.n_images; k++) {
+        const size_t off = m.image_at[k] < n ? m.image_at[k] : n;
+        r.append(c + at, off - at);
+        lits.push_back({r.size(), r.size() + sizeof kVisionLiteral - 1});
+        r += kVisionLiteral;
+        at = off;
+    }
+    r.append(c + at, n - at);
+    size_t lo = 0, hi = 0;
+    py_strip_bounds(r.data(), r.size(), &lo, &hi);
+    size_t p = lo;
+    for (const auto &l : lits) {
+        if (l.first > p) w.client(r.substr(p, l.first - p));
+        w.lit(r.substr(l.first, l.second - l.first));
+        p = l.second;
+    }
+    if (hi > p) w.client(r.substr(p, hi - p));
+}
+
 /* One message's turn as the template's loop body writes it.  `prev` / `next` are the neighbouring
  * roles (NULL at either end): a tool result opens the user turn after a non-tool message and closes
  * it before one.  `first`: the conversation's first message -- the only place a system message may
@@ -235,11 +272,14 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
                 size_t errlen) {
     const char *role = m.role ? m.role : "";
     const std::string content = py_strip(m.content);
+    if (m.n_images > 0 && strcmp(role, "user") && strcmp(role, "tool"))
+        return refuse(err, errlen, "image_position", "Message %d (%s) cannot contain images.", i, role);
     if (!strcmp(role, "system")) {
         if (!first) return refuse(err, errlen, "system_not_first", "System message must be at the beginning.");
     } else if (!strcmp(role, "user")) {
         w.lit("<|im_start|>user\n");
-        w.client(content);
+        if (m.n_images > 0) content_with_images(w, m);
+        else w.client(content);
         w.lit("<|im_end|>\n");
     } else if (!strcmp(role, "assistant")) {
         /* preserve_thinking is left at the template's default (true):
@@ -253,7 +293,8 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
     } else if (!strcmp(role, "tool")) {
         if (prev && strcmp(prev, "tool")) w.lit("<|im_start|>user");
         w.lit("\n<tool_response>\n");
-        w.client(content);
+        if (m.n_images > 0) content_with_images(w, m);
+        else w.client(content);
         w.lit("\n</tool_response>");
         if (!next || strcmp(next, "tool")) w.lit("<|im_end|>\n");
     } else {
@@ -282,6 +323,8 @@ bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err,
     const std::string instructions = effort_line(in.effort);
     const qwen_msg_in &first = in.msgs[0];
     const bool first_system = first.role && !strcmp(first.role, "system");
+    if (first_system && first.n_images > 0)
+        return refuse(err, errlen, "image_position", "System message cannot contain images.");
 
     if (has_tools) {
         w.lit("<|im_start|>system\n");

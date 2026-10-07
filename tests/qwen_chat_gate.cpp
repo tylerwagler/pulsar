@@ -133,6 +133,7 @@ static std::string first_diff(const std::vector<int> &a, const std::vector<int> 
 struct conv {
     std::vector<qwen_msg_in> msgs;
     std::vector<std::vector<qwen_tool_call_in>> calls;
+    std::vector<std::vector<uint32_t>> image_at;   /* L268: per message, where its images sit in its content */
     std::vector<std::string> store;   /* owned strings; reserved up front so c_str() stays put */
     std::string tools;
     bool has_tools = false;
@@ -152,6 +153,7 @@ static void build_conv(const pyjson_value &messages, const pyjson_value *tools, 
     c->store.reserve(strings);
     c->msgs.resize(messages.a.size());
     c->calls.resize(messages.a.size());
+    c->image_at.resize(messages.a.size());
     for (size_t i = 0; i < messages.a.size(); i++) {
         const pyjson_value &m = messages.a[i];
         qwen_msg_in &q = c->msgs[i];
@@ -160,6 +162,21 @@ static void build_conv(const pyjson_value &messages, const pyjson_value *tools, 
         q.role = keep(c, role ? role->s : "");
         const pyjson_value *content = m.get("content");
         q.content = content && content->kind == pyjson_value::STR ? keep(c, content->s) : NULL;
+        if (content && content->kind == pyjson_value::ARR) {
+            /* L268: content parts -- the text concatenated, each image's offset in it */
+            std::string text;
+            for (const auto &part : content->a) {
+                const pyjson_value *type = part.get("type");
+                if (type && type->s == "image") {
+                    c->image_at[i].push_back((uint32_t)text.size());
+                } else if (const pyjson_value *t = part.get("text")) {
+                    text += t->s;
+                }
+            }
+            q.content = keep(c, text);
+            q.image_at = c->image_at[i].empty() ? NULL : c->image_at[i].data();
+            q.n_images = (int)c->image_at[i].size();
+        }
         const pyjson_value *reasoning = m.get("reasoning_content");
         q.reasoning = reasoning && reasoning->kind == pyjson_value::STR ? keep(c, reasoning->s) : NULL;
         if (const pyjson_value *tcs = m.get("tool_calls")) {

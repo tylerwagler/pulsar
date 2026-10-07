@@ -378,6 +378,31 @@ static char *qwen_tools_openai_shape(const chat_conversation *c, api_style api, 
     return buf_take(&out);
 }
 
+/* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
+ * offsets, not the spelling, are the authority) and where each image sits in what is left. */
+struct qwen_msg_images {
+    std::string content;
+    std::vector<uint32_t> at;
+};
+
+static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, char *err, size_t errlen) {
+    const char *c = m->content ? m->content : "";
+    const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
+    size_t at = 0;
+    for (int k = 0; k < m->images_len; k++) {
+        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
+        if (off < at || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
+            snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
+            return false;
+        }
+        out->content.append(c + at, off - at);
+        out->at.push_back((uint32_t)out->content.size());
+        at = off + ph;
+    }
+    out->content.append(c + at, n - at);
+    return true;
+}
+
 /* chat_msgs[start..) as the renderer's messages; the pointers borrow `msgs` and `notes`.  The system
  * FIELD renders first (the parser appends it to the array); a system message that is not the
  * conversation's first turns into a user <system-reminder> turn (the template has no in-place system
@@ -386,18 +411,22 @@ static char *qwen_tools_openai_shape(const chat_conversation *c, api_style api, 
  * part of one.  false + err: an image (the family renders none). */
 static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vector<qwen_msg_in> *qm,
                           std::vector<std::vector<qwen_tool_call_in>> *qc, std::vector<std::string> *notes,
-                          char *err, size_t errlen) {
+                          std::vector<qwen_msg_images> *imgs, char *err, size_t errlen) {
     qc->assign((size_t)msgs->len, {});
     notes->assign((size_t)msgs->len, std::string());
+    imgs->assign((size_t)msgs->len, qwen_msg_images());
     for (int pass = 0; pass < 2; pass++) {
         for (int i = start; i < msgs->len; i++) {
             const chat_msg *m = &msgs->v[i];
             if (m->system_field != (pass == 0)) continue;
             if (tail && m->system_field) continue;
-            if (m->images_len > 0) {
-                snprintf(err, errlen, "message %d: image content is not served for the Qwen family", i);
+            /* L268: a tail continues the live KV with text only -- an image makes it no tail, and the request takes
+             * the full render (which serves the image under the core's reuse licence) */
+            if (m->images_len > 0 && tail) {
+                snprintf(err, errlen, "message %d: an image ends the live continuation", i);
                 return false;
             }
+            if (m->images_len > 0 && !qwen_strip_image_markers(m, &(*imgs)[(size_t)i], err, errlen)) return false;
             for (int k = 0; k < m->calls.len; k++)
                 (*qc)[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
             if (!strcmp(m->role, "system") && (tail || !qm->empty())) {
@@ -406,9 +435,10 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
                 qm->push_back({"user", (*notes)[(size_t)i].c_str(), NULL, NULL, 0, NULL});
                 continue;
             }
-            qm->push_back({m->role, m->content, m->reasoning,
+            const qwen_msg_images &mi = (*imgs)[(size_t)i];
+            qm->push_back({m->role, m->images_len > 0 ? mi.content.c_str() : m->content, m->reasoning,
                            (*qc)[(size_t)i].empty() ? NULL : (*qc)[(size_t)i].data(), m->calls.len,
-                           m->calls.raw_dsml});
+                           m->calls.raw_dsml, mi.at.empty() ? NULL : mi.at.data(), (int)mi.at.size()});
         }
     }
     return true;
@@ -431,8 +461,9 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
 /* HF's apply_chat_template byte for byte (qwen_chat_render, with the L223 client-span map), tokenised
  * with the family's markers; the tools in the template's shape, typed for the output parser.  A forced
  * tool_choice prefills the turn into an open <tool_call> (qwen_forced_call_prefill); a tool-result-only
- * request continues the live KV with the family's tail (render_prelude).  Refused by name: an image,
- * tools loaded by tool_search (the template renders one tools array). */
+ * request continues the live KV with the family's tail (render_prelude).  Images are the template's vision
+ * literal in place (L268), expanded by the core's walk.  Refused by name: tools loaded by tool_search (the
+ * template renders one tools array). */
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
     if (c->loaded_tool_schemas.len) {
@@ -449,7 +480,8 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     std::vector<qwen_msg_in> qm;
     std::vector<std::vector<qwen_tool_call_in>> qc;
     std::vector<std::string> notes;
-    if (!qwen_messages(&c->msgs, 0, false, &qm, &qc, &notes, err, errlen)) return false;
+    std::vector<qwen_msg_images> imgs;
+    if (!qwen_messages(&c->msgs, 0, false, &qm, &qc, &notes, &imgs, err, errlen)) return false;
     qwen_render_out out;
     if (!qwen_chat_render({qm.data(), (int)qm.size(), r->qwen_tools_json, qe, true}, &out, err, errlen)) return false;
     free(r->prompt_spans);
@@ -462,7 +494,12 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
         r->force_tool_call = true;
         if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
-    if (e) pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+    /* With an engine: tokenise the rendered text, then the core's expansion puts each image's block where its
+     * placeholder token sits (request_prepare_images, DeepSeek's path too) */
+    if (e) {
+        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
+    }
     return true;
 }
 
@@ -493,11 +530,11 @@ static char *qwen_tool_result_tail(const request *r, const chat_msgs *msgs, int 
     std::vector<qwen_msg_in> qm;
     std::vector<std::vector<qwen_tool_call_in>> qc;
     std::vector<std::string> notes;
+    std::vector<qwen_msg_images> imgs;
     char err[200];
     qwen_render_out out;
-    /* a tail the template cannot render (an image) is no tail: the render that follows refuses the
-     * request by name */
-    if (!qwen_messages(msgs, start, true, &qm, &qc, &notes, err, sizeof err) ||
+    /* a tail with an image is no tail: the request takes the full render, which serves the image (L268) */
+    if (!qwen_messages(msgs, start, true, &qm, &qc, &notes, &imgs, err, sizeof err) ||
         !qwen_chat_render_tail(qm.data(), (int)qm.size(), (qwen_effort)r->family_effort, &out, err, sizeof err))
         return NULL;
     return qwen_take_render(&out, spans_out, n_spans_out);

@@ -15,10 +15,12 @@ the undeclared-tool hole), here with its own server so it is reproducible.
   5. OpenAI tool_choice="required" with one tool: a call to the declared tool
   6. OpenAI named tool_choice for an UNDECLARED tool: refused 400 by name
   7. "required" with two tools, 5 sampled turns: every call names a declared tool
+  8. (L268) an image: OpenAI image_url -- the model names the shape's colour
+  9. (L268) an image inside an Anthropic tool_result (an agent's screenshot) -- the same answer
 
 Not in `make gates` (one server load per family): `make server-live-gate` runs it on FRONTIER_MODEL and the
 hosted Qwen model.  Exit 0 only when every check passed."""
-import argparse, json, os, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, json, os, shutil, struct, subprocess, sys, tempfile, time, urllib.error, urllib.request, zlib
 
 ap = argparse.ArgumentParser()
 ap.add_argument("model")
@@ -93,6 +95,22 @@ def guarded(name, fn):
         check(False, "%s raised %s: %s" % (name, type(e).__name__, e))
 
 
+def red_circle_png(w=320, h=240):
+    """A red disc on white, as a PNG (zlib only) -- an image whose content a sane vision model cannot miss."""
+    rows = []
+    for y in range(h):
+        row = bytearray([0])
+        for x in range(w):
+            inside = (x - w / 2) ** 2 + (y - h / 2) ** 2 < (min(w, h) * 0.35) ** 2
+            row += bytes((220, 20, 20) if inside else (255, 255, 255))
+        rows.append(bytes(row))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+IMG_B64 = base64.b64encode(red_circle_png()).decode()
 TOOLS = [{"name": "get_weather", "description": "Current weather for a city",
           "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
 OT = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
@@ -181,8 +199,31 @@ def c7():
     check(all(n in ("get_weather", "search") for n in names), "required, two tools, 5 sampled turns -> %s" % names)
 
 
+def c8():
+    d, dt = post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "temperature": 0, "messages": [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG_B64}},
+            {"type": "text", "text": "What color is the circle in this image? Answer with one word."}]}]})
+    txt = json.loads(d)["choices"][0]["message"].get("content") or ""
+    check("red" in txt.lower(), "openai image_url -> %r (%.1fs)" % (txt[:80], dt))
+
+
+def c9():
+    shot_tool = [{"name": "screenshot", "description": "Take a screenshot",
+                  "input_schema": {"type": "object", "properties": {}}}]
+    msgs9 = [{"role": "user", "content": "Take a screenshot and tell me the colour of the circle in one word."},
+             {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_shot1", "name": "screenshot",
+                                                "input": {}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_shot1", "content": [
+                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG_B64}}]}]}]
+    d, dt = post("/v1/messages", {"model": "m", "max_tokens": 200, "tools": shot_tool, "messages": msgs9})
+    j = json.loads(d)
+    txt = "".join(b.get("text", "") for b in j["content"] if b["type"] == "text")
+    check("red" in txt.lower(), "anthropic tool_result screenshot -> %r (%.1fs)" % (txt[:80], dt))
+
+
 for n, f in (("plain", c1), ("forced", c2), ("forced-stream", c3), ("continuation", c4), ("required", c5),
-             ("undeclared", c6), ("required-two", c7)):
+             ("undeclared", c6), ("required-two", c7), ("image", c8), ("image-tool-result", c9)):
     guarded(n, f)
 print("SERVER LIVE GATE: " + ("PASS" if ok else "FAIL"))
 stop(0 if ok else 1)
