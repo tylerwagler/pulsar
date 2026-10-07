@@ -327,7 +327,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
                     (unsigned long long)n);
             return true;
         }
-        return pulsar_qwen_weight_ptr(tensor_map_base(m, t), t->abs_offset + rel, n, "TP expert range") != NULL;
+        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset + rel, n, "TP expert range") != NULL;
     }
     case PULSAR_TP_OP_NONE: break;
     }

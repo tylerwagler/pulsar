@@ -95,10 +95,11 @@ typedef struct {
     bool prompt;
 } pulsar_qwen_lowrank;
 
-/** A dense Linear in the EXL3 format: one [trellis | suh | svh] slice in
- *  exl3_expert_layout's byte model (so an exllamav3 checkpoint's tensors copy
- *  in verbatim), run by the EXL3 dense arm (mmq/ds4_exl3_dense.cuh). */
-typedef struct {
+/** L272 P4c: the bf16-ROWS dense linear's reference (family-neutral; built by the core's front door,
+ *  pulsar_linear_rows_ref in linear.cpp, from the format table): an mxfp8_lt weight (the W8A16 arm) or an
+ *  EXL3 one -- one [trellis | suh | svh] slice in exl3_expert_layout's byte model, so an exllamav3
+ *  checkpoint's tensors copy in verbatim (mmq/ds4_exl3_dense.cuh). */
+typedef struct pulsar_rows_linear {
     const void *w;
     const uint8_t *sf;   /**< the mxfp8_lt E8M0 plane (NULL for EXL3): the
                           *  recipe's dense tier is MIXED, so the arm follows
@@ -109,7 +110,7 @@ typedef struct {
      *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
     bool prompt;
-} pulsar_qwen_linear;
+} pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
 typedef struct {
@@ -147,7 +148,7 @@ int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, const int32_t *rows, int out, i
 
 /** A weight's device pointer: the engine's model-range cache for the span
  *  [offset, offset + bytes) of `model_map` (cuda_model_range_ptr). */
-const void *pulsar_qwen_weight_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+const void *pulsar_gpu_weight_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 
 /** The device table of [trellis, scales] pointer pairs over an EXL3 expert
  *  stack (exl3_expert_table): n_expert slices of `stride` bytes, the scales
@@ -159,10 +160,10 @@ const void *const *pulsar_qwen_expert_table(const void *stack, uint32_t n_expert
 int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
                              cudaStream_t stream);
 
-/** Workspace bytes pulsar_qwen_linear_launch needs for `rows` rows. */
-size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l, int rows);
+/** Workspace bytes pulsar_rows_linear_launch needs for `rows` rows. */
+size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows);
 /** y [rows][out] f32 = the complete Linear of the bf16 rows in `x_bf16`. */
-int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const uint16_t *x_bf16, int rows, float *y,
+int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
                               void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /* ======================================================================== */
@@ -192,7 +193,7 @@ typedef struct {
      *  (gate_table, up_table) is set; the artifact decides, the launcher refuses anything else. */
     const void *const *gate_table, *const *up_table;
     int k2_gate_up, k2_down;         /**< routed rates (half-bit units); k2_gate_up is the pair's rate in the split form */
-    pulsar_qwen_linear shared_gate, shared_up, shared_down;
+    pulsar_rows_linear shared_gate, shared_up, shared_down;
     /** L266 step 7: expert parallelism.  ep_ranks 2: this rank owns experts [ep_rank * 256, +256) and its
      *  tables hold exactly those (entry 0 = its first); a token's picks of the other rank's experts are
      *  dropped here and summed there (the all-reduce after the block), and the shared expert is rank 0's.
@@ -254,8 +255,8 @@ int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, const float
 /* PLE at layer index 1 (Qwen4ExpTextPLELayer)                               */
 
 typedef struct {
-    pulsar_qwen_linear key_proj;     /**< 2560 -> 10240 */
-    pulsar_qwen_linear value_proj;   /**< 2560 -> 2560 */
+    pulsar_rows_linear key_proj;     /**< 2560 -> 10240 */
+    pulsar_rows_linear value_proj;   /**< 2560 -> 2560 */
     const uint16_t *norm_key;        /**< bf16 [10240], (1 + w) */
     const uint16_t *norm_query;      /**< bf16 [10240] */
     const uint16_t *norm_conv;       /**< bf16 [10240] */

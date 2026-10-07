@@ -230,8 +230,8 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16
     /* L251 / ac69748f: the gathered rows ARE bf16, so the key/value projections read them directly
      * and the E4M3 emit step (which existed only to build the A8 slot) is gone.  The bf16 row is the
      * one activation encoding, emitted by whatever produced `emb` (rule 3). */
-    int rc = pulsar_qwen_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_qwen_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
+    int rc = pulsar_rows_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
+    if (!rc) rc = pulsar_rows_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     qwen_ple_gate_kernel<<<dim3(kS, T), kThreads, 0, stream>>>(
         m.key, m.value, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_key,

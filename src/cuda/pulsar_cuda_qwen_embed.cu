@@ -29,7 +29,7 @@ qwen_embed_kernel(const uint4 *__restrict__ table, const int32_t *__restrict__ t
 
 } // namespace
 
-extern "C" const void *pulsar_qwen_weight_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+extern "C" const void *pulsar_gpu_weight_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     return cuda_model_range_ptr(model_map, offset, bytes, what);
 }
 

@@ -256,12 +256,12 @@ static bool launch_ok(const char *what) {
 
 } // namespace
 
-extern "C" size_t pulsar_qwen_linear_workspace_bytes(const pulsar_qwen_linear *l, int rows) {
+extern "C" size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows) {
     if (!l || rows <= 0) return 0;
     return ds4_exl3_dense_workspace_bytes(rows, l->in, l->out);
 }
 
-extern "C" int pulsar_qwen_linear_launch(const pulsar_qwen_linear *l, const uint16_t *x_bf16, int rows, float *y,
+extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
                                          void *ws, size_t ws_bytes, cudaStream_t stream) {
     /* L251 / ac69748f: the reader takes the block input's bf16 row.  There is no E4M3 activation slot in
      * this family, so a missing activation is an error -- never a reason to reach for another format. */
@@ -429,12 +429,12 @@ extern "C" int pulsar_qwen_moe_launch(const pulsar_qwen_moe_dev *w, const uint16
 
     /* shared: gate + up on the same slot, the SwiGLU producer, down -- under EP, rank 0's alone */
     if (ep && w->ep_rank != 0) return 0;
-    rc = pulsar_qwen_linear_launch(&w->shared_gate, x_bf16, T, m.yg, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_qwen_linear_launch(&w->shared_up, x_bf16, T, m.yu, m.lin, m.lin_bytes, stream);
+    rc = pulsar_rows_linear_launch(&w->shared_gate, x_bf16, T, m.yg, m.lin, m.lin_bytes, stream);
+    if (!rc) rc = pulsar_rows_linear_launch(&w->shared_up, x_bf16, T, m.yu, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     qwen_swiglu_emit_kernel<<<T, 256, 0, stream>>>(m.yg, m.yu, smid, (__nv_bfloat16 *)m.h_x);
     if (!launch_ok("shared swiglu")) return -3;
-    rc = pulsar_qwen_linear_launch(&w->shared_down, (const uint16_t *)m.h_x, T, m.ys, m.lin, m.lin_bytes, stream);
+    rc = pulsar_rows_linear_launch(&w->shared_down, (const uint16_t *)m.h_x, T, m.ys, m.lin, m.lin_bytes, stream);
     if (rc) return rc;
     const size_t n = (size_t)T * kH;
     qwen_shared_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, m.ys, m.sgate, T);

@@ -177,8 +177,7 @@ static bool gpu_graph_csa2_emit_rows(
      * projection of the kv source's latent at all -- and gpu_graph_index_comp_*
      * has already written it into the same pool by the time this runs. */
     if (ok && !g_pulsar_shape.indexer_own_compressor) {
-        if (ok) ok = gpu_graph_matmul_plain_tensor(idx, model, layer->indexer_k,
-                                                   PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, latent, n_rows) != 0;
+        if (ok) ok = pulsar_linear_slot(idx, model, layer->indexer_k, PULSAR_N_HEAD_DIM, 0, PULSAR_N_INDEXER_HEAD_DIM, latent, n_rows);
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(idx, idx, tensor_map_base(model, layer->indexer_k_norm), tensor_map_size(model, layer->indexer_k_norm),
                                                             layer->indexer_k_norm->abs_offset,
                                                             PULSAR_N_INDEXER_HEAD_DIM, n_rows, PULSAR_RMS_EPS, NULL,
@@ -908,13 +907,7 @@ bool gpu_graph_warmup_prefill_kernels(
                                                       (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
     if (ok) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
     if (ok) {
-        ok = gpu_graph_matmul_plain_tensor(g->batch_hc_mix,
-                                             model,
-                                             weights->layer[0].hc_attn_fn,
-                                         hc_dim,
-                                         mix_hc,
-                                         g->batch_flat_hc,
-                                         n_tokens) != 0;
+        ok = pulsar_linear_slot(g->batch_hc_mix, model, weights->layer[0].hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
     }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     if (!ok) {
@@ -1252,8 +1245,7 @@ static bool gpu_graph_indexed_attention_span(
  * prefill keeps the duplicated GEMMs -- an extra bulk exchange per layer would
  * cost more than the halves save there. */
 static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
-                                const pulsar_layer_weights *layer, uint32_t il, uint32_t pos0,
-                                uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
+                                const pulsar_layer_weights *layer, uint32_t il, uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
                                 const pulsar_layer_attn *attn) {
     struct item { const pulsar_tensor *w; uint64_t out_full; pulsar_gpu_tensor *dst; const char *name; };
     item it[PULSAR_TP_GATHER_BLOCKS_MAX];
@@ -1305,23 +1297,8 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
                                                          (uint64_t)n_tokens * half * sizeof(float));
         ok = view != NULL;
         if (ok) {
-            if (w->type == PULSAR_TENSOR_MXFP8_LT)
-                ok = gpu_graph_matmul_mxfp8_rows_named_tensor(it[k].name, il, pos0, view, model, w,
-                                                              PULSAR_N_EMBD, it[k].out_full, lo, hi,
-                                                              g->batch_attn_norm, n_tokens);
-            else if (w->type == PULSAR_TENSOR_BF16)
-                ok = pulsar_gpu_matmul_bf16_tensor(view, tensor_map_base(model, w), tensor_map_size(model, w),
-                                                   w->abs_offset + (uint64_t)lo * PULSAR_N_EMBD * sizeof(uint16_t),
-                                                   PULSAR_N_EMBD, half, g->batch_attn_norm, n_tokens) != 0;
-            else if (w->type == PULSAR_TENSOR_F32)
-                ok = pulsar_gpu_matmul_f32_tensor(view, tensor_map_base(model, w), tensor_map_size(model, w),
-                                                  w->abs_offset + (uint64_t)lo * PULSAR_N_EMBD * sizeof(float),
-                                                  PULSAR_N_EMBD, half, g->batch_attn_norm, n_tokens) != 0;
-            else {
-                fprintf(stderr, "pulsar: layer %u: %s has a storage type the row split does not slice "
-                                "(%u) -- refusing\n", il, it[k].name, w->type);
-                ok = false;
-            }
+            /* the arm by w's format (linear.cpp): MXFP8's row slice registered at open, a plain one by offset */
+            ok = pulsar_linear_slot(view, model, w, PULSAR_N_EMBD, lo, hi, g->batch_attn_norm, n_tokens);
         }
         pulsar_gpu_tensor_free(view);
         blocks[k] = { it[k].dst, elem0, half, it[k].out_full, lo, plo };
@@ -1395,7 +1372,6 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t n_head = n_groups * group_heads;
     const uint32_t h_lo = g_lo * group_heads;
     const uint64_t q_dim = (uint64_t)n_head * PULSAR_N_HEAD_DIM;
-    const uint64_t q_dim_full = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
     const uint64_t sinks_off = layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float);
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
@@ -1552,13 +1528,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     n_tokens, (double)n_tokens * hc_dim * sizeof(float) / (1024.0 * 1024.0));
         }
     }
-    if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
-                                              model,
-                                              layer->hc_attn_fn,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    if (ok) ok = pulsar_linear_slot(hc_mix_view, model, layer->hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
     /* L183 census taps: the carrier the layer starts from, the mix GEMM's
      * rows, and (below) the split coefficients -- the three per-row inputs of
      * hc_attn_post that had no dump. */
@@ -1655,32 +1625,14 @@ bool gpu_graph_encode_layer_attention_batch(
      * calls below are skipped (tp_attn_input_split). */
     const bool tp_ain = g->tp && n_tokens <= PULSAR_TP_BATCH_MAX_ROWS && pulsar_tp_row_lane(g->tp) &&
                         g->tp_ain_own && g->tp_slab_dev && g->tp_stage_ticket;
-    if (ok && tp_ain) ok = tp_attn_input_split(g, model, layer, il, pos0, n_tokens, q_rank, ratio, attn);
-    if (ok && !tp_ain) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
-                                                      il,
-                                                      pos0,
-                                                      g->batch_qr,
-                                                      model,
-                                                      layer->attn_q_a,
-                                                      PULSAR_N_EMBD,
-                                                      q_rank,
-                                                      g->batch_attn_norm,
-                                                      n_tokens);
+    if (ok && tp_ain) ok = tp_attn_input_split(g, model, layer, il, n_tokens, q_rank, ratio, attn);
+    if (ok && !tp_ain) ok = pulsar_linear_slot(g->batch_qr, model, layer->attn_q_a, PULSAR_N_EMBD, 0, q_rank, g->batch_attn_norm, n_tokens);
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     {
-        if (ok && !tp_ain) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
-                                                          il,
-                                                          pos0,
-                                                          g->batch_kv_raw,
-                                                          model,
-                                                          layer->attn_kv,
-                                                          PULSAR_N_EMBD,
-                                                          PULSAR_N_HEAD_DIM,
-                                                          g->batch_attn_norm,
-                                                          n_tokens);
+        if (ok && !tp_ain) ok = pulsar_linear_slot(g->batch_kv_raw, model, layer->attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->batch_attn_norm, n_tokens);
         if (ok) {
             gpu_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -1747,18 +1699,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
     {
-        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("attn_q_b",
-                                                               il,
-                                                               pos0,
-                                                               g->batch_q,
-                                                               model,
-                                                               layer->attn_q_b,
-                                                               q_rank,
-                                                               q_dim_full,
-                                                               (uint64_t)h_lo * PULSAR_N_HEAD_DIM,
-                                                               (uint64_t)(h_lo + n_head) * PULSAR_N_HEAD_DIM,
-                                                               g->batch_qr_norm,
-                                                               n_tokens);
+        if (ok) ok = pulsar_linear_slot(g->batch_q, model, layer->attn_q_b, q_rank, (uint64_t)h_lo * PULSAR_N_HEAD_DIM, (uint64_t)(h_lo + n_head) * PULSAR_N_HEAD_DIM, g->batch_qr_norm, n_tokens);
         if (ok) {
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
@@ -2019,20 +1960,16 @@ bool gpu_graph_encode_layer_attention_batch(
             }
             const uint32_t comp_width = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
             const uint32_t index_width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
-            if (ok && !tp_ain) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->attn_compressor_kv,
-                                                       PULSAR_N_EMBD, comp_width, g->batch_attn_norm, n_tokens) != 0;
-            if (ok && !tp_ain && ratio > 1u) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->attn_compressor_gate,
-                                                                     PULSAR_N_EMBD, comp_width, g->batch_attn_norm, n_tokens) != 0;
+            if (ok && !tp_ain) ok = pulsar_linear_slot(g->batch_comp_kv, model, layer->attn_compressor_kv, PULSAR_N_EMBD, 0, comp_width, g->batch_attn_norm, n_tokens);
+            if (ok && !tp_ain && ratio > 1u) ok = pulsar_linear_slot(g->batch_comp_sc, model, layer->attn_compressor_gate, PULSAR_N_EMBD, 0, comp_width, g->batch_attn_norm, n_tokens);
             if (ok) gpu_graph_debug_dump_tensor("attn_comp_kv_raw", g->batch_comp_kv,
                                                 (uint64_t)comp_width * n_tokens, il, pos0);
             if (ok && ratio > 1u) gpu_graph_debug_dump_tensor("attn_comp_score_raw", g->batch_comp_sc,
                                                               (uint64_t)comp_width * n_tokens, il, pos0);
             /* The indexer's own projections, at its own head dim: a separate
              * compression of the same rows, over the same normed activation. */
-            if (ok && !tp_ain && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_kv, model, layer->indexer_compressor_kv,
-                                                              PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
-            if (ok && !tp_ain && own) ok = gpu_graph_matmul_plain_tensor(g->batch_index_comp_sc, model, layer->indexer_compressor_gate,
-                                                              PULSAR_N_EMBD, index_width, g->batch_attn_norm, n_tokens) != 0;
+            if (ok && !tp_ain && own) ok = pulsar_linear_slot(g->batch_index_comp_kv, model, layer->indexer_compressor_kv, PULSAR_N_EMBD, 0, index_width, g->batch_attn_norm, n_tokens);
+            if (ok && !tp_ain && own) ok = pulsar_linear_slot(g->batch_index_comp_sc, model, layer->indexer_compressor_gate, PULSAR_N_EMBD, 0, index_width, g->batch_attn_norm, n_tokens);
             if (ok) ok = gpu_graph_csa2_produce(g, model, layer, il, pos0, n_tokens, mseq, comp_counts);
         } else {
             /* The source ran earlier in this same layer sweep (S < il), so its
@@ -2059,13 +1996,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 fprintf(stderr, "pulsar: index source %u is missing indexer query weights -- refusing\n", il);
                 ok = false;
             }
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_q,
-                                                          model,
-                                                          layer->indexer_attn_q_b,
-                                                          q_rank,
-                                                          (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM,
-                                                          g->batch_qr_norm,
-                                                          n_tokens);
+            if (ok) ok = pulsar_linear_slot(g->batch_indexer_q, model, layer->indexer_attn_q_b, q_rank, 0, (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM, g->batch_qr_norm, n_tokens);
             /* Fused rope + FP4 pack: one launch over batch_indexer_q instead of
              * a rope_tail + pack pair (bit-exact, see the kernel note).  V4's
              * Indexer is built `rotate=True`, so the reference rotates q with the
@@ -2091,13 +2022,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                     PULSAR_ROPE_YARN_BETA_FAST,
                                                     PULSAR_ROPE_YARN_BETA_SLOW,
                                                     mseq ? g->batch_positions : NULL) != 0;
-            if (ok && !tp_ain) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_weights,
-                                              model,
-                                              layer->indexer_proj,
-                                                     PULSAR_N_EMBD,
-                                                     PULSAR_N_INDEXER_HEAD,
-                                                     g->batch_attn_norm,
-                                                     n_tokens) != 0;
+            if (ok && !tp_ain) ok = pulsar_linear_slot(g->batch_indexer_weights, model, layer->indexer_proj, PULSAR_N_EMBD, 0, PULSAR_N_INDEXER_HEAD, g->batch_attn_norm, n_tokens);
         }
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
@@ -2747,13 +2672,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       (uint64_t)hc_dim);
     if (ok && flat_skip_f32_ffn)
         pulsar_gpu_act_note_f32_skipped_for(g->batch_flat_hc, n_tokens, (uint64_t)hc_dim, 0u);
-    if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
-                                              model,
-                                              layer->hc_ffn_fn,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    if (ok) ok = pulsar_linear_slot(hc_mix_view, model, layer->hc_ffn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
     {
         /* Same E4M3 epilogue as the attention norm above: batch_ffn_norm feeds
          * the router-logits and shared-expert MXFP8 GEMMs, which would otherwise
@@ -2835,13 +2754,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     if (ok && ffn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && ffn_norm_b) pulsar_gpu_bf16_act_note(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && ffn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(ffn_norm_keep_from);
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_router_logits,
-                                              model,
-                                              layer->ffn_gate_inp,
-                                             PULSAR_N_EMBD,
-                                             layer->n_expert,
-                                             g->batch_ffn_norm,
-                                             n_tokens) != 0;
+    if (ok) ok = pulsar_linear_slot(g->batch_router_logits, model, layer->ffn_gate_inp, PULSAR_N_EMBD, 0, layer->n_expert, g->batch_ffn_norm, n_tokens);
 
     /* All three router offsets below are offsets WITHIN THE LAYER, so the
      * mapping the kernel resolves them against must be the layer's own.  It
@@ -2906,25 +2819,19 @@ bool gpu_graph_encode_layer_ffn_batch(
     const uint64_t shared_own = (uint64_t)(shx_hi - shx_lo);
 
 #define PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT() do { \
-        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_gate", \
-                                                          il, \
-                                                          pos0, \
+        if (ok) ok = pulsar_linear_slot(\
                                                           g->batch_shared_gate, \
                                                           model, \
                                                           layer->ffn_gate_shexp, \
                                                           PULSAR_N_EMBD, \
-                                                          shared_dim, \
                                                           shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
-        if (ok) ok = gpu_graph_matmul_mxfp8_rows_named_tensor("shared_up", \
-                                                          il, \
-                                                          pos0, \
+        if (ok) ok = pulsar_linear_slot(\
                                                           g->batch_shared_up, \
                                                           model, \
                                                           layer->ffn_up_shexp, \
                                                           PULSAR_N_EMBD, \
-                                                          shared_dim, \
                                                           shx_lo, shx_hi, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
@@ -2970,13 +2877,11 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, shared_own); \
         if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
         if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n_tokens); \
-        if (ok && !g->tp) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
-                                                                              il, \
-                                                                              pos0, \
+        if (ok && !g->tp) ok = pulsar_linear_slot(\
                                                                               g->batch_shared_out, \
                                                                               model, \
                                                                               layer->ffn_down_shexp, \
-                                                                              shared_dim, \
+                                                                              shared_dim, 0, \
                                                                               PULSAR_N_EMBD, \
                                                                               g->batch_shared_mid, \
                                                                               n_tokens); \

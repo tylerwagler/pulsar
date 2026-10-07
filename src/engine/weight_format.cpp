@@ -26,12 +26,27 @@ static bool exl3_arm(uint32_t type, int arm) {
     return k2 != 0 && exl3_arm_has_rate(arm, k2);
 }
 
+/* L272 P4c: the dense arm for (format, activation) -- what admission asks at load and what the launcher runs
+ * (linear.cpp), one table.  (The F32 label is the slot's bf16 plane keyed on an f32 buffer; BF16 is raw rows.) */
+pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act) {
+    switch (act) {
+    case PULSAR_ACT_F32:
+        return type == PULSAR_TENSOR_F32 ? PULSAR_DENSE_ARM_F32_PLANE
+             : type == PULSAR_TENSOR_BF16 ? PULSAR_DENSE_ARM_BF16_PLANE : PULSAR_DENSE_ARM_NONE;
+    case PULSAR_ACT_E4M3:
+        return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_SLOT : PULSAR_DENSE_ARM_NONE;
+    case PULSAR_ACT_BF16:
+        return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_ROWS
+             : exl3_arm(type, EXL3_ARM_DENSE) ? PULSAR_DENSE_ARM_EXL3_ROWS : PULSAR_DENSE_ARM_NONE;
+    case PULSAR_ACT_COUNT: break;
+    }
+    return PULSAR_DENSE_ARM_NONE;
+}
+
 bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_format act) {
     switch (role) {
     case PULSAR_ROLE_DENSE:
-        if (act == PULSAR_ACT_F32) return type == PULSAR_TENSOR_F32 || type == PULSAR_TENSOR_BF16;
-        if (act == PULSAR_ACT_E4M3) return type == PULSAR_TENSOR_MXFP8_LT;
-        return type == PULSAR_TENSOR_MXFP8_LT || exl3_arm(type, EXL3_ARM_DENSE);
+        return pulsar_dense_arm_for(type, act) != PULSAR_DENSE_ARM_NONE;
     case PULSAR_ROLE_EXPERT_GATE_UP:
         if (act == PULSAR_ACT_E4M3)
             return type == PULSAR_TENSOR_CUTLASS_MXFP4 || type == PULSAR_TENSOR_IQ2_XXS_MMQ_K || exl3_arm(type, EXL3_ARM_PAIR);

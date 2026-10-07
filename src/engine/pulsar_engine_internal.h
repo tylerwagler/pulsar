@@ -642,25 +642,6 @@ typedef struct {
     uint64_t value_pos; ///< byte offset of the value within the file
 } pulsar_kv;
 
-/** THE accept set for gpu_graph_matmul_plain_tensor -- ONE definition.
- *
- * This lived as three parallel lists: the dispatcher's arms, the load
- * validator's accept set, and a decode-time predicate, each with a comment
- * telling the next person to keep it in step with the other two. They drifted
- * exactly as you would expect -- the validator's comment said "the four arms"
- * while there were three -- and the failure mode is nasty: a type accepted by
- * the validator but missing an arm passes load and dies at runtime on a tensor
- * the artifact was told was fine.
- *
- * The dispatcher still switches, because it must MAP a type to an arm. What it
- * may not do is disagree about membership, so it asserts against this instead
- * of restating it. */
-static inline bool pulsar_weight_is_plain_or_mxfp8(uint32_t type) {
-    return type == PULSAR_TENSOR_BF16 ||
-           type == PULSAR_TENSOR_F32 ||
-           type == PULSAR_TENSOR_MXFP8_LT;
-}
-
 /** One entry of the tensor directory: where a tensor lives and how to read
  * it. Describes bytes inside a mapped shard; owns nothing. */
 typedef struct {
@@ -3058,6 +3039,29 @@ typedef enum {
 /** The activation a family's forward emits at a site. */
 typedef enum { PULSAR_ACT_F32 = 0, PULSAR_ACT_BF16 = 1, PULSAR_ACT_E4M3 = 2, PULSAR_ACT_COUNT = 3 } pulsar_act_format;
 #define PULSAR_ACTS(a) (1u << (a))
+/** L272 P4c: the kernel arm a dense linear takes for (stored format, activation) -- admission (pulsar_format_serves)
+ *  and the launcher (linear.cpp) read this one table. */
+typedef enum {
+    PULSAR_DENSE_ARM_NONE = 0,
+    PULSAR_DENSE_ARM_F32_PLANE,    ///< f32 weight (converted once to bf16), the slot's bf16 plane (cuBLAS)
+    PULSAR_DENSE_ARM_BF16_PLANE,   ///< bf16 weight, the slot's bf16 plane (cuBLAS)
+    PULSAR_DENSE_ARM_MXFP8_SLOT,   ///< mxfp8_lt, the slot's E4M3 (cuBLASLt)
+    PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
+    PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
+} pulsar_dense_arm;
+pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
+/** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the
+ *  mapped range (NULL = said). */
+const void *pulsar_weight_device_ptr(const pulsar_model *m, const pulsar_tensor *t, const char *what);
+/** out [n_tok][row_hi - row_lo] = rows [row_lo, row_hi) of w [in_dim -> dim[1]] times the activation armed in the
+ *  backend's MX slot for `x` -- the arm by w's format (E4M3 for mxfp8_lt, the bf16 plane for bf16 / f32). */
+bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pulsar_tensor *w, uint64_t in_dim,
+                        uint64_t row_lo, uint64_t row_hi, const pulsar_gpu_tensor *x, uint64_t n_tok);
+/** The bf16-rows launcher's reference to t (pulsar_rows_linear_launch, and the composite ops that take one): the
+ *  arm by t's format, refused by name when the table has none. */
+struct pulsar_rows_linear;
+bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int in, int out, bool prompt,
+                            const char *what, struct pulsar_rows_linear *l);
 /** Whether stored format `type` has a kernel for `role` at activation `act` -- the one table (weight_format.cpp). */
 bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_format act);
 /** Admission by role: t's format serves `role` at one of the activations in the mask `acts`; a refusal names the
@@ -3713,29 +3717,6 @@ bool gpu_graph_dspark_draft_forward_banks(
         const uint32_t          *row_bank,
         const uint32_t         (*bank_n_raw)[3],
         const uint32_t          *bank_n_draft);
-bool gpu_graph_matmul_plain_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
-bool gpu_graph_matmul_mxfp8_named_tensor(
-        const char             *module,
-        uint32_t                il,
-        uint32_t                pos0,
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
-/* The same GEMM over the OUTPUT-ROW range [row_lo, row_hi) of `w` (slice 4g):
- * the whole tensor when the range is [0, out_full), otherwise the row slice the
- * engine registered at open (pulsar_gpu_register_fp8_lt_row_slice), which the
- * backend resolves by its own offset.  Writes row_hi - row_lo columns per row. */
 /* The pair's all-reduce of `n_tokens` n_embd-wide f32 rows of `t` (gpu_prefill.cpp):
  * the row lane at decode/verify width, the bulk lane above it, the host big gate
  * on transports without either.  `addend` (optional) is folded in first and
@@ -3779,19 +3760,6 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *x, uint32_t n_rows, const pul
 bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                                  pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                                  const char *what);
-bool gpu_graph_matmul_mxfp8_rows_named_tensor(
-        const char             *module,
-        uint32_t                il,
-        uint32_t                pos0,
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_full,
-        uint64_t                row_lo,
-        uint64_t                row_hi,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,

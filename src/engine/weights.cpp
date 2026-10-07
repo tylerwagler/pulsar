@@ -135,18 +135,12 @@ static void tensor_expect_plain_or_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    /* Membership comes from pulsar_weight_is_plain_or_mxfp8 -- see the note on
-     * it. This function used to restate the set, and drifted from the
-     * dispatcher it is supposed to mirror.
-     *
-     * MXFP8_LT was rejected here until 2026-08-17, deliberately and correctly:
-     * gpu_graph_matmul_plain_tensor had no type-41 branch, so such a tensor
-     * would have passed load and dispatched into nothing. The guard did its job
-     * -- a repacked artifact was tried that day and died HERE, at load, instead
-     * of misbehaving. The arm exists now, so the type is in the set. */
+    /* Membership is the dense arm table's (pulsar_dense_arm_for, weight_format.cpp), the one the launcher runs
+     * (pulsar_linear_slot, linear.cpp): a type admitted here has an arm there by construction.  (Three parallel
+     * lists once drifted -- MXFP8_LT passed load with no dispatcher arm until 2026-08-17.) */
     if (t == &g_ds4_absent) return;
-    /* L272 P4: the plain dispatcher feeds f32 rows to the F32 / BF16 arms and the E4M3 slot to MXFP8 -- the
-     * registry's dense kernels at those two activations, which is pulsar_weight_is_plain_or_mxfp8's set */
+    /* L272 P4: the slot's bf16 plane for the F32 / BF16 arms, its E4M3 for MXFP8 -- the registry's dense kernels at
+     * those two activations */
     if (!pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE,
                                   PULSAR_ACTS(PULSAR_ACT_F32) | PULSAR_ACTS(PULSAR_ACT_E4M3))) {
         pulsar_load_refuse();
@@ -184,7 +178,7 @@ static void tensor_expect_plain_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    /* Accepts the three NON-fp8 arms of gpu_graph_matmul_plain_tensor, which is
+    /* Accepts the two NON-fp8 arms of pulsar_linear_slot (the slot's bf16 plane), which is
      * what every caller here feeds. BF16 was missing until 2026-08-16 and the
      * drafter's router is bf16 now, so an otherwise-correct artifact died at
      * load with "expected F16 or F32". The main model's router is checked by

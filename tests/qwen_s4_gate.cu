@@ -85,8 +85,8 @@ static linear make_linear(int in, int out, int k2) {
     l.dequant();
     return l;
 }
-static pulsar_qwen_linear dev_linear(const linear &l) {
-    pulsar_qwen_linear d;
+static pulsar_rows_linear dev_linear(const linear &l) {
+    pulsar_rows_linear d;
     d.w = up(l.bytes); d.k2 = l.k2; d.in = l.in; d.out = l.out;
     return d;
 }
