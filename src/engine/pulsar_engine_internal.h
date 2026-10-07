@@ -2186,10 +2186,12 @@ uint64_t pulsar_image_content_hash(const pulsar_image_ref *img);
 /** The family's geometry (pulsar_family::vision); false / no sentinel on a family without images. */
 bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id);
 bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
-/** The records of `images` (in prompt order, each naming its block in `ids`) whose blocks end at or below `limit`.
- *  false = an image names no block, blocks out of order, or more than PULSAR_IMAGE_BLOCKS_MAX (said). */
-bool pulsar_image_identity_build(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_ref *images,
-                                 int n_images, uint32_t limit, pulsar_image_identity *out);
+/** The records of `images` (in prompt order, each naming its block in `ids` by the geometry `v` -- the family's,
+ *  e->family->vision; `e` is the hook's argument) whose blocks end at or below `limit`.  false = an image names no
+ *  block, blocks out of order, or more than PULSAR_IMAGE_BLOCKS_MAX (said). */
+bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                                 const pulsar_image_ref *images, int n_images, uint32_t limit,
+                                 pulsar_image_identity *out);
 /** Keep the records of the blocks that end at or below `pos` (a rewind's survivors). */
 void pulsar_image_identity_trim(pulsar_image_identity *id, uint32_t pos);
 bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_image_identity *b);
@@ -2197,7 +2199,8 @@ bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_im
 uint32_t pulsar_image_identity_end(const pulsar_image_identity *id);
 /** How much of `ids` a disk chain may hold: everything, or up to the first image block `id` does not record
  *  (its rows' image is unknown).  -1 = a malformed block. */
-int pulsar_image_persist_end(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_identity *id);
+int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                             const pulsar_image_identity *id);
 
 /** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host

@@ -562,12 +562,23 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen);
-/** The image BLOCKS already present in tokens [0, len): writes each block's
- *  first slot (the start_pos an expanded image carries) to `starts`, in order, up
- *  to `cap`.  Returns how many blocks there are (which may exceed `cap`), or -1
- *  when a sentinel id there belongs to no well-formed block.  The server uses it
- *  to place a live continuation's held images (L261). */
-int pulsar_image_block_starts(const pulsar_tokens *tokens, int len, int *starts, int cap);
+/** The image BLOCKS already present in tokens [0, len), by the engine's family's geometry: writes each block's
+ *  first slot (the start_pos an expanded image carries) to `starts`, in order, up to `cap`.  Returns how many blocks
+ *  there are (which may exceed `cap`), or -1 when a sentinel id there belongs to no well-formed block.  The server
+ *  uses it to place a live continuation's held images (L261). */
+int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap);
+/** L281: the hash an image's bytes are known by in the KV's image records (what a disk chain's segment carries and a
+ *  restore compares; never 0). */
+uint64_t pulsar_image_hash(const pulsar_image_ref *img);
+/** L281: the content hashes of the image blocks the session's KV holds, in order, up to `cap`; returns how many it
+ *  holds. */
+int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap);
+/** L281: how much of the session's history a disk chain may hold -- all of it, or up to the first image block whose
+ *  image the session does not record.  -1 when its image blocks are malformed. */
+int pulsar_session_persist_end(pulsar_session *s);
+/** L281: the image records a stored segment carries (`fp` at its payload, `bytes` long), read without loading it:
+ *  their content hashes, in order, up to `cap` (*n_out of them; a v2 segment carries none).  0 on success. */
+int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, -1 when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a
@@ -1155,7 +1166,7 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * extend the frontier restores, exact by construction where v12's ring replay
  * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
  * the checkpoint's grid point (0 = none).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(13)
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(14)   /* v14 (L281): the image block records after the tokens */
 /** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
@@ -1177,7 +1188,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(2)
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(3)   /* v3 (L281): the span's image block records */
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and

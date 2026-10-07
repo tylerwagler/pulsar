@@ -320,7 +320,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         char *path = NULL;
         pulsar_tokens effective = {0};
         int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
-                                            rendered.spans, rendered.n_spans,
+                                            rendered.spans, rendered.n_spans, NULL, 0,
                                             &effective, &path, false);
         if (loaded == 0) pulsar_session_invalidate(s->sess);
 
@@ -599,7 +599,7 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
                                      char *why, size_t whylen) {
     enum { HELD_MAX = 64 };
     int starts[HELD_MAX];
-    const int held = pulsar_image_block_starts(eff, live_len, starts, HELD_MAX);
+    const int held = pulsar_image_block_starts(e, eff, live_len, starts, HELD_MAX);
     if (held < 0 || held > HELD_MAX || held > n_images) {
         snprintf(why, whylen, "the live history carries %d image block(s) for %d image(s)", held, n_images);
         return false;

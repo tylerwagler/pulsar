@@ -1380,10 +1380,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * straddles the checkpoint, an edited history -- clears checkpoint_valid and
          * the cold pass merges every image from token 0.
          *
-         * No sentinel id can reach a cache surface this way: a chain never holds
-         * an image row (pulsar_kvchain_persist_end), the server's cold store for
-         * an image request covers the sys-prefix only, and a LATER prompt whose
-         * sentinel ids outlive their images is still refused by the scan below. */
+         * L281: a disk chain holds an image's rows only with that image's record, and a restore loads past a block
+         * only when the request brings the same image there (pulsar_kvchain_restore), so a restored history's
+         * records are what this licence compares; a LATER prompt whose sentinel ids outlive their images is still
+         * refused by the scan below. */
         /* The live history this prompt can keep: its common token prefix with the
          * checkpoint (an echo that stops short of the live tail -- stripped
          * reasoning, a rollback -- shares a prefix without extending it). */
@@ -1424,7 +1424,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         /* L281: the held images' records -- each block's rows and the bytes merged there -- must be exactly the
          * live ones (image_identity.cpp) */
         pulsar_image_identity held;
-        const bool held_ok = pulsar_image_identity_build(e, prompt->v, prompt->len, images, n_images, ck, &held);
+        const bool held_ok = pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
+                                                         n_images, ck, &held);
         const int n_held = held_ok ? (int)held.n : 0;
         const int held_end = held_ok ? (int)pulsar_image_identity_end(&held) : 0;
         /* The one image-specific constraint on the resume below: the grid
@@ -1493,8 +1494,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
     /* L281: what the KV holds of this request's images -- the blocks that end at or below `limit` (the checkpoint
      * after a prefill, interrupted or not).  A text sync leaves the records alone: its prefix keeps its blocks. */
     auto note_images = [&](uint32_t limit) {
-        if (n_images > 0 && !pulsar_image_identity_build(e, prompt->v, prompt->len, images, n_images, limit,
-                                                         &s->live_images))
+        if (n_images > 0 && !pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
+                                                         n_images, limit, &s->live_images))
             s->live_images.n = 0;
     };
 
@@ -1703,7 +1704,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             bool placed_ok = n_images <= STITCH_IMAGES_MAX;
             if (placed_ok && n_images > 0) {
                 int starts[STITCH_IMAGES_MAX];
-                const int nb = pulsar_image_block_starts(&stitched, stitched.len, starts, STITCH_IMAGES_MAX);
+                const int nb = pulsar_image_block_starts(e, &stitched, stitched.len, starts, STITCH_IMAGES_MAX);
                 placed_ok = nb == n_images;
                 for (int i = 0; placed_ok && i < n_images; i++) {
                     placed[i] = images[i];

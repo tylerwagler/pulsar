@@ -30,23 +30,30 @@ uint64_t pulsar_image_content_hash(const pulsar_image_ref *img) {
     return h ? h : 1u;
 }
 
-bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id) {
-    const pulsar_family_vision *v = e && e->family ? e->family->vision : NULL;
+static bool is_sentinel(const pulsar_family_vision *v, const pulsar_engine *e, int32_t id) {
     return v && v->is_sentinel(e, id);
 }
-
-bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
-    const pulsar_family_vision *v = e && e->family ? e->family->vision : NULL;
+static bool block_extent(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n, int start,
+                         int *len) {
     *len = 0;
     return v && v->block_extent(e, ids, n, start, len) && *len > 0;
 }
 
-bool pulsar_image_identity_build(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_ref *images,
-                                 int n_images, uint32_t limit, pulsar_image_identity *out) {
+bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id) {
+    return is_sentinel(e && e->family ? e->family->vision : NULL, e, id);
+}
+
+bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
+    return block_extent(e && e->family ? e->family->vision : NULL, e, ids, n, start, len);
+}
+
+bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                                 const pulsar_image_ref *images, int n_images, uint32_t limit,
+                                 pulsar_image_identity *out) {
     out->n = 0;
     for (int i = 0; i < n_images; i++) {
         int len = 0;
-        if (!pulsar_image_block_extent(e, ids, n, images[i].start_pos, &len)) {
+        if (!block_extent(v, e, ids, n, images[i].start_pos, &len)) {
             fprintf(stderr, "pulsar: image identity: image %d at %d names no image block\n", i, images[i].start_pos);
             return false;
         }
@@ -82,12 +89,13 @@ uint32_t pulsar_image_identity_end(const pulsar_image_identity *id) {
     return id->n ? id->b[id->n - 1].end : 0u;
 }
 
-int pulsar_image_persist_end(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_identity *id) {
+int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+                             const pulsar_image_identity *id) {
     uint32_t k = 0;   /* the next record the walk expects */
     for (int i = 0; i < n; i++) {
-        if (!pulsar_image_is_sentinel(e, ids[i])) continue;
+        if (!is_sentinel(v, e, ids[i])) continue;
         int len = 0;
-        if (!pulsar_image_block_extent(e, ids, n, i, &len)) return -1;   /* a malformed block: persist nothing */
+        if (!block_extent(v, e, ids, n, i, &len)) return -1;   /* a malformed block: persist nothing */
         /* a block the identity records (in order, at this place) may be persisted; the first one it does not --
          * rows whose image no record names -- ends the persistable prefix at its start */
         if (k < id->n && id->b[k].start == (uint32_t)i && id->b[k].end == (uint32_t)(i + len)) {

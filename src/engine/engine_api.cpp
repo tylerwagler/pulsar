@@ -707,18 +707,32 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
-int pulsar_image_block_starts(const pulsar_tokens *tokens, int len, int *starts, int cap) {
-    if (!tokens || len < 0 || len > tokens->len) return -1;
+int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap) {
+    if (!e || !tokens || len < 0 || len > tokens->len) return -1;
     int n = 0;
     for (int i = 0; i < len; ) {
-        if (tokens->v[i] < (int)PULSAR_N_VOCAB) { i++; continue; }
+        if (!pulsar_image_is_sentinel(e, tokens->v[i])) { i++; continue; }   /* L281: the family's geometry */
         int blk = 0;
-        if (!vision_span_extent(tokens->v, len, (int)PULSAR_N_VOCAB, i, &blk) || blk <= 0) return -1;
+        if (!pulsar_image_block_extent(e, tokens->v, len, i, &blk)) return -1;
         if (n < cap && starts) starts[n] = i;
         n++;
         i += blk;
     }
     return n;
+}
+
+uint64_t pulsar_image_hash(const pulsar_image_ref *img) { return pulsar_image_content_hash(img); }
+
+int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap) {
+    if (!s) return 0;
+    for (uint32_t i = 0; i < s->live_images.n && (int)i < cap; i++) hashes[i] = s->live_images.b[i].content;
+    return (int)s->live_images.n;
+}
+
+int pulsar_session_persist_end(pulsar_session *s) {
+    if (!s || !s->checkpoint_valid) return 0;
+    return pulsar_image_persist_end(s->engine->family->vision, s->engine, s->checkpoint.v, s->checkpoint.len,
+                                    &s->live_images);
 }
 
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,

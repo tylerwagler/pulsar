@@ -1785,6 +1785,7 @@ struct server {
      * @return tokens restored, 0 for a miss. */
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
+                               const uint64_t *image_hashes, int n_images,
                                pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
     /** kv_cache_try_load_text() for a request's prompt. */
     int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_key_out);
