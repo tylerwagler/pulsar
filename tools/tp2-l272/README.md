@@ -35,6 +35,10 @@ still grades.
 | Qwen td405 | `~/models/qwen38fn-td405` (`Q405=`) | fits one Spark: TP=2 == TP=1 |
 | Qwen td605 | `~/models/qwen38fn-td605` (`Q605=`) | the pair-only pack |
 
+DeepSeek is required. The two Qwen packs are optional: one absent on a node skips its legs by name (`SKIPPED (no
+... pack)` in the verdict), and the DeepSeek proof still grades. The reference tree predates `tests/tp_plan_test`:
+build it with `pulsar-server tests/qwen_generate` only (the plan golden is checked on the new build).
+
 ## 3. Run on the head
 
 ```sh

@@ -90,10 +90,14 @@ note "L272 TP2 validation: new $NEW, reference ${REF:-none}, worker $WORKER, Dee
 # ---- 0. preflight: one tree per build on both nodes; the models whole on both -------------------------------
 for D in $NEW ${REF:+$REF}; do preflight; done
 D=$NEW
-for m in "$DS" "$Q405" "$Q605"; do
-    { [ -e "$m/model.safetensors.index.json" ] && ssh "$WORKER" "test -e $m/model.safetensors.index.json"; } ||
-        { verdict "model $(basename "$m")" "FAIL (missing on a node)"; exit 1; }
-done
+{ [ -e "$DS/model.safetensors.index.json" ] && ssh "$WORKER" "test -e $DS/model.safetensors.index.json"; } ||
+    { verdict "model $(basename "$DS")" "FAIL (missing on a node)"; exit 1; }
+# The Qwen packs are optional (turboderp's 4.05 / 6.05 repacked, L266; not yet on the pair everywhere the kit runs):
+# a pack absent on a node skips its legs by name, and the DeepSeek proof still grades.
+have_pack() { [ -e "$1/model.safetensors.index.json" ] && ssh "$WORKER" "test -e $1/model.safetensors.index.json"; }
+HAVE_Q405=0; HAVE_Q605=0
+have_pack "$Q405" && HAVE_Q405=1 || verdict "model $(basename "$Q405")" "SKIPPED (absent on a node)"
+have_pack "$Q605" && HAVE_Q605=1 || verdict "model $(basename "$Q605")" "SKIPPED (absent on a node)"
 verdict models PASS
 
 # ---- 1. host: the TP host tests, and DeepSeek's plan on the pair's own copy == the committed golden -----------
@@ -114,16 +118,24 @@ if [ -n "$REF" ]; then D=$REF; serve_leg ds-ref; D=$NEW; fi
 ab ds-new ds-ref
 
 # ---- 3. Qwen 4.05: expert parallelism through the plan; TP=2 == TP=1 -----------------------------------------
-reclaim
-generate single "$Q405" single && reclaim && generate pair "$Q405" pair
-stop_pair
-if cmp -s "$OUT/ids-single.bin" "$OUT/ids-pair.bin"; then verdict "Qwen TP=2 == TP=1 (32 tokens)" PASS
-else verdict "Qwen TP=2 == TP=1 (32 tokens)" "FAIL (cmp $OUT/ids-single.bin $OUT/ids-pair.bin; generate-*.log)"; fi
+if [ $HAVE_Q405 = 1 ]; then
+    reclaim
+    generate single "$Q405" single && reclaim && generate pair "$Q405" pair
+    stop_pair
+    if cmp -s "$OUT/ids-single.bin" "$OUT/ids-pair.bin"; then verdict "Qwen TP=2 == TP=1 (32 tokens)" PASS
+    else verdict "Qwen TP=2 == TP=1 (32 tokens)" "FAIL (cmp $OUT/ids-single.bin $OUT/ids-pair.bin; generate-*.log)"; fi
+else
+    verdict "Qwen TP=2 == TP=1 (32 tokens)" "SKIPPED (no $(basename "$Q405") pack)"
+fi
 
 # ---- 4. Qwen 6.05 (does not fit one Spark) on the pair, A/B -------------------------------------------------
-MODEL=$Q605
-D=$NEW; serve_leg q605-new
-if [ -n "$REF" ]; then D=$REF; serve_leg q605-ref; D=$NEW; fi
-ab q605-new q605-ref
+if [ $HAVE_Q605 = 1 ]; then
+    MODEL=$Q605
+    D=$NEW; serve_leg q605-new
+    if [ -n "$REF" ]; then D=$REF; serve_leg q605-ref; D=$NEW; fi
+    ab q605-new q605-ref
+else
+    verdict "Qwen 6.05 on the pair" "SKIPPED (no $(basename "$Q605") pack)"
+fi
 
 final_verdict "L272 TP2"
