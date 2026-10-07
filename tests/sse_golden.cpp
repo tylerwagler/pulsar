@@ -6,7 +6,12 @@
  *
  *   ./tests/sse_golden > out.txt; diff tests/sse-golden/golden.txt out.txt
  *
- * The golden was recorded from the streamers before L267 moved the walk. */
+ * The golden was recorded from the streamers before L267 moved the walk.
+ *
+ * L278 (contract 6): a QWEN leg after it -- raw Qwen generations driven through the server's own sequence for any
+ * family (gen_state + the request's family output parser: create, feed per piece, finish, the final feed, then the
+ * protocol's finish with the turn's calls; server_jobs.cpp gen_finish), on a request the Qwen renderer prepared
+ * (its tools JSON types the arguments).  The DeepSeek cases above keep their recorded bytes. */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -179,6 +184,150 @@ static std::string run(const gcase &c, proto p, size_t piece) {
     return normalise(out);
 }
 
+
+/* ---- L278: the Qwen leg ---------------------------------------------------------------------------- */
+
+#define QCALL(name, params) "<tool_call>\n<function=" name ">\n" params "</function>\n</tool_call>"
+#define QPARAM(k, v) "<parameter=" k ">\n" v "\n</parameter>\n"
+
+/* A Qwen generation is the text after the rendered prompt: with thinking on the prompt ended in "<think>\n", so
+ * the turn opens in reasoning. */
+static const gcase QCASES[] = {
+    {"q-think-answer", true, false, "Let me compute 17*23.\n</think>\n\nThe answer is 391.", "stop"},
+    {"q-think-unclosed", true, false, "thinking on and on, never closing", "length"},
+    {"q-no-think", false, false, "Plain answer with <angle> and </think> text.", "stop"},
+    {"q-utf8", true, false, "naïve 日本語\n</think>\n\n🌞 ok — done", "stop"},
+    {"q-partial-lt", true, true, "a\n</think>\n\nx < y and <b>bold</b> and <tool_ca not a call", "stop"},
+    {"q-tool-after-think", true, true, "plan the call\n</think>\n\n" QCALL("bash", QPARAM("command", "ls -l /var/log")),
+     "stop"},
+    {"q-text-then-tool", true, true, "plan\n</think>\n\nLet me look.\n\n" QCALL("bash", QPARAM("command", "pwd")),
+     "stop"},
+    {"q-two-calls", true, true,
+     "x\n</think>\n\n" QCALL("bash", QPARAM("command", "a")) "\n"
+     QCALL("bash", QPARAM("command", "b & c") QPARAM("description", "two")), "stop"},
+    {"q-no-think-tool", false, true, "Sure.\n\n" QCALL("bash", QPARAM("command", "uname -a")), "stop"},
+    {"q-tool-unclosed", true, true, "go\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nsleep", "length"},
+    {"q-tool-undeclared", true, true, "hm\n</think>\n\n" QCALL("rm_rf", QPARAM("path", "/")), "stop"},
+};
+
+/* the one tool, in each protocol's declaration shape (the renderer reads the request's) */
+#define QSCHEMA "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}"
+static const char *qtools_for(proto p) {
+    switch (p) {
+    case P_OPENAI: return "[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":" QSCHEMA "}}]";
+    case P_ANTHROPIC: return "[{\"name\":\"bash\",\"input_schema\":" QSCHEMA "}]";
+    default: return "[{\"type\":\"function\",\"name\":\"bash\",\"parameters\":" QSCHEMA "}]";
+    }
+}
+
+static std::string run_family(const gcase &c, proto p, size_t piece) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return "(socketpair failed)\n";
+    fcntl(sv[1], F_SETFL, O_NONBLOCK);
+    int big = 1 << 22;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = sv[0];
+    request *r = &j.req;
+    request_init(r, REQ_CHAT, 256);
+    free(r->model);
+    r->model = xstrdup("m");
+    r->api = p == P_OPENAI ? API_OPENAI : p == P_ANTHROPIC ? API_ANTHROPIC : API_RESPONSES;
+    r->reasoning_summary_emit = p == P_RESPONSES_SUMMARY;
+    /* the request as the server has it after rendering: the Qwen renderer sets the family, the think mode, the
+     * tools JSON the parser types arguments with, and the declared tools a call is checked against */
+    chat_conversation conv = {};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("Go.");
+    chat_msgs_push(&conv.msgs, u);
+    if (c.tools) {
+        conv.tools_raw = xstrdup(qtools_for(p));
+        tool_schema_orders_add_json(&r->tool_orders,
+            "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+            "\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}}");
+    }
+    if (!c.think) chat_conversation_control(&conv, "enable_thinking", xstrdup("false"));
+    char err[256] = "";
+    if (!render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &conv, r, err, sizeof err)) {
+        chat_conversation_free(&conv);
+        request_free(r);
+        close(sv[0]);
+        close(sv[1]);
+        return std::string("(render failed: ") + err + ")\n";
+    }
+    chat_conversation_free(&conv);
+    r->stream = true;
+
+    server srv;
+    memset(&srv, 0, sizeof srv);
+    pthread_mutex_init(&srv.tool_mu, NULL);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    streams st;
+    memset(&st, 0, sizeof(st));
+    std::string out;
+    bool ok = true;
+    if (p == P_OPENAI) {
+        openai_stream_start(r, &st.oa);
+        openai_sink_init(&g.sink, sv[0], NULL, r, "chatcmpl-X", &st.oa);
+    } else if (p == P_ANTHROPIC) {
+        ok = anthropic_sse_start_live(sv[0], r, "msg_X", 10, &st.an);
+        anthropic_sink_init(&g.sink, sv[0], NULL, r, "msg_X", &st.an);
+    } else {
+        responses_stream_init(r, &st.rs);
+        st.rs.active = true;
+        ok = responses_sse_created(sv[0], r, &st.rs, 1700000000L);
+        responses_sink_init(&g.sink, sv[0], NULL, r, "resp_X", &st.rs);
+    }
+    const server_output_parser_ops *ops = r->family->output;
+    void *ps = ops->create(&srv, &g, err, sizeof err);
+    if (!ps) {
+        out = std::string("(parser create failed: ") + err + ")\n";
+        ok = false;
+    }
+    const size_t n = strlen(c.raw);
+    for (size_t at = 0; ok && at < n;) {
+        const size_t to = piece ? std::min(n, at + piece) : n;
+        buf_append(&g.text, c.raw + at, to - at);
+        at = to;
+        ok = ops->feed(ps, &srv, &g, g.text.len, false);
+        drain(sv[1], &out);
+    }
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    if (ps) {
+        g.finish = c.finish;
+        turn.finish = g.finish;
+        const bool stream_ok = ops->finish(ps, &srv, NULL, &g, &turn);
+        if (ok) ok = stream_ok && ops->feed(ps, &srv, &g, g.text.len, true);
+        if (ok) {
+            switch (p) {
+            case P_OPENAI: ok = openai_sse_finish(&g.sink, &turn.calls, turn.finish, 10, 20); break;
+            case P_ANTHROPIC: ok = anthropic_sse_finish(&g.sink, &turn.calls, turn.finish, NULL, 20); break;
+            default:
+                ok = responses_sse_finish(sv[0], r, &st.rs, turn.tail, turn.tail_len, &turn.calls, turn.finish, 10, 20,
+                                          1700000000L);
+            }
+        }
+        ops->destroy(ps);
+    }
+    drain(sv[1], &out);
+    if (!ok) out += "(a write failed)\n";
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    buf_free(&g.text);
+    responses_stream_free(&st.rs);
+    request_free(r);
+    pthread_mutex_destroy(&srv.tool_mu);
+    close(sv[0]);
+    close(sv[1]);
+    return normalise(out);
+}
+
 int main(void) {
     int n = 0;
     for (const gcase &c : CASES) {
@@ -186,6 +335,15 @@ int main(void) {
             for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
                 printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
                 fputs(run(c, (proto)p, piece).c_str(), stdout);
+                n++;
+            }
+        }
+    }
+    for (const gcase &c : QCASES) {
+        for (int p = P_OPENAI; p <= P_RESPONSES_SUMMARY; p++) {
+            for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
+                printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
+                fputs(run_family(c, (proto)p, piece).c_str(), stdout);
                 n++;
             }
         }

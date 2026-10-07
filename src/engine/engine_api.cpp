@@ -321,6 +321,7 @@ bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->draf
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
 bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
+bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }

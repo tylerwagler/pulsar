@@ -1074,6 +1074,10 @@ bool pulsar_engine_can_rewind(const pulsar_engine *e);
 /** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
  * front end without it runs greedy through the session lane (Qwen). */
 bool pulsar_engine_has_argmax(const pulsar_engine *e);
+/** Does the loaded family save and load whole-session snapshots and disk-KV payloads
+ * (pulsar_session_save_snapshot / _load_snapshot)?  A caller that needs a session back at a known state
+ * without one re-syncs the tokens instead. */
+bool pulsar_engine_has_snapshots(const pulsar_engine *e);
 /** The speculative drafter the OPENED engine actually carries -- the family's answer
  *  (pulsar_family::drafter): DSPARK when DeepSeek's dspark.* drafter loaded, MTP when a Qwen artifact
  *  carries the mtp.* layer (the sidecar shard; served by the family's own

@@ -265,15 +265,19 @@ pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
+# L278: the family kernel gates that need a GPU and no model run here, for every family -- Qwen's GDN, QSA and
+# S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
                  tests/exl3_dense_gate \
-                 tests/gdn_gate
+                 tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
 	./tests/exl3_gemv_gate
 	./tests/exl3_dense_gate
 	./tests/gdn_gate
+	./tests/qsa_attn_gate
+	./tests/qwen_s4_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -654,7 +658,7 @@ exl3-dequant-gate: tests/exl3_dequant_gate
 # headers and config (tests/qwen_family_container.py: sparse files, no weight
 # byte is read), plus four mutants the loader must refuse by name.
 # qwen-family-gate-device adds a real session on the GPU (the battery's entry).
-QWEN_HF_DIR   ?= /srv/models/qwen38fn-bf16
+QWEN_HF_DIR   ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 # The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
 .PHONY: spec-depth-gate
@@ -680,7 +684,27 @@ qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
 # L272 P5: the session contract every family meets, on REAL weights (tests/session_contract_gate.cpp: chunk
 # neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
 # zero-weight family gate above proves wiring only.  A new family adds one line here.
-QWEN_GATE_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp   # the served quant, MTP sidecar included (B6 needs a drafter)
+# the served quant, MTP sidecar included (B6 needs a drafter)
+QWEN_GATE_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp
+# L278 contract 4: Qwen's reference anchors, graded by the runner's cuda-reference-gate-* on the hosted Qwen model.
+# The capture is the CONTAINER's (HF qwen4_exp modules on these quantized weights, layer-streamed; L251
+# 2026-09-28) -- matched precision, as DeepSeek's B300 capture is, so a KL here is OUR arithmetic's divergence,
+# not the quantization's.  (~/ref-qwen38fn beside it is the BF16 source: a quant-quality reading, qwen-ref-gate.)
+# No quotes in these values: gates-dev passes them through a shell variable.
+QWEN_REF_ANCHOR_DIR ?= /mnt/models/sparky-parked/home-claude/ref-qwen38fn-q
+# Measured 2026-10-07 at e21a0868 (sparky, report-only; the budgets below are that run's `--dump-kl`):
+#   story  512 2.2e-4 | 2048 0.90 FLIP (ref 710, ours <|im_end|>; ref margin 2.14 -- L251's documented mismatch)
+#          4096 1.97 | 4102 1.34 | 6144 0.54 | 16388 1.1e-5 | 31183 1.4e-6        top-1 6/7
+#   code   512 0.076 | 2048 3.0e-4 | 3957 0.041                                      top-1 3/3
+# The high rows are the positions L251 traced to the model's own sensitivity (a random 0.67%-norm nudge of the
+# REFERENCE's own state flips story 4096 three times in four) -- known-high: top-1 enforced, KL informational and
+# graded for DIRECTION by the budgets.  The tolerance holds the confident rows with 3-5x headroom.
+QWEN_REF_TOL ?= 1e-3
+QWEN_KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-qwen-story.txt
+QWEN_KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-qwen-code.txt
+QWEN_REF_ANCHORS = --ref-dir $(QWEN_REF_ANCHOR_DIR) --ref-tol $(QWEN_REF_TOL) \
+	--kl-story $(QWEN_KL_BUDGET_STORY) --kl-code $(QWEN_KL_BUDGET_CODE) \
+	--story-known-high 2048,4096,4102,6144 --story-known-flip 2048 --code-known-high 512,3957
 .PHONY: session-contract-gate-qwen session-contract-gate-ds
 session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
@@ -700,6 +724,14 @@ tp-plan-gate: tests/tp_plan_test
 	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 2>/dev/null | diff -u $$g - >/dev/null \
 	    || { echo "TP-PLAN GATE FAIL: $$g"; exit 1; }; \
 	  echo "tp-plan: $$g ($$(grep -vc '^#' $$g) slices)"; done; done; echo "TP-PLAN GATE PASS"
+# L278 contract 2, the loader, for every family: each served container's sparse HEADER CLONE must open, and each
+# mutant of it (unknown arch, a missing key / tensor, a transposed shape, a dtype no reader takes, a stack layout no
+# arm reads) must be REFUSED BY NAME with the open returning -- never an exit (tests/loader_contract.py,
+# tests/loader_open.cpp).  Host-only: headers and zeros, no weight byte read, no GPU.
+LOADER_CONTRACT_WORK ?= /var/tmp/pulsar-loader-contract
+.PHONY: loader-contract-gate
+loader-contract-gate: tests/loader_open
+	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
 tp-plan-golden: tests/tp_plan_test
 	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
 	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
@@ -846,6 +878,7 @@ host-checks: attn-layout-check engram-hash-check compressor-pool-check \
              indexer-score-check attn-pack-fixture-check tp-core-test
 	./pulsar-eval --self-test-extractors
 	cd tools/container && python3 test_exl3_rates.py   # L272 P4a: the builder's EXL3 rate table == the engine's
+	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
 # ORDER cost bandwidth?  Model-free and standalone -- it allocates one real IQ2
@@ -1448,6 +1481,17 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 cuda-chat-smoke-gate: pulsar
 	python3 tests/chat_smoke_gate.py $(FRONTIER_MODEL) ./pulsar
 
+# L278 contract 6: the live server tier -- a real pulsar-server per family on a scratch port, driven over HTTP
+# (tests/server_live.py: plain answer, forced / streamed / required tool calls, the tool_result continuation, the
+# undeclared-tool refusal).  Not in GATE_TARGETS: one server load per family.  SERVER_LIVE_MODELS to choose.
+SERVER_LIVE_MODELS ?= $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
+.PHONY: server-live-gate
+server-live-gate: pulsar-server
+	@rc=0; for m in $(SERVER_LIVE_MODELS); do \
+	  sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	  python3 tests/server_live.py $$m --binary ./pulsar-server || rc=1; \
+	done; exit $$rc
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
@@ -1539,6 +1583,14 @@ KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # FAIL in the runner, never a skip -- stage the capture or override with an
 # empty value to skip deliberately (PULSAR_REF_DIR=).
 PULSAR_REF_DIR ?= /home/claude/ref-vexp
+# The capture's documented depths, passed to the runner as this model's data (L278: the runner holds none).  The
+# anchors are the SERVED model's (Vision-Exp, L240, 2026-09-23): the story blob's documented argmax flip is the
+# file-end row 30464 (ours 6712 at 24.06 over 915 at 23.54; the source had them 0.125 apart at a 2.4-nat
+# position) -- the 0731 artifact flipped at 512 instead, and that row MATCHES for Vision-Exp.  Known-high rows keep
+# top-1 and lose only the KL ceiling (L080).  The gate says "drop it" by name when an exemption stops being needed.
+PULSAR_REF_ANCHORS = --ref-dir "$(PULSAR_REF_DIR)" --ref-tol $(PULSAR_REF_TOL) \
+	--kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
+	--story-known-high 512,30464 --story-known-flip 30464 --code-known-high 3840
 # ⚠ ONE SHELL, DELIBERATELY.  Each make recipe LINE gets its own shell, so an
 # `exit 0` in a guard on the first line exits only that line and make runs the
 # rest anyway -- which is exactly how the first version of this target failed
@@ -1554,9 +1606,7 @@ cuda-reference-gate: tests/gates_runner
 	@./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-		--ref-dir "$(PULSAR_REF_DIR)" --ref-tol $(PULSAR_REF_TOL) \
-		--kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
-		--only=cuda-reference-gate-story,cuda-reference-gate-code
+		$(PULSAR_REF_ANCHORS) --only=cuda-reference-gate-story,cuda-reference-gate-code
 
 # Re-record the KL budgets from the CURRENT tree.  Same discipline as
 # PREFILL_BASELINE_REF: do this only when a change has been GRADED CLOSER to the
@@ -1574,8 +1624,8 @@ cuda-reference-gate-budget:
 		echo "REFUSING: set PULSAR_REF_DIR to the reference-capture dir"; exit 1; fi
 #
 # Report-only on purpose (no KL_TOL, no outlier anchors): a record run measures,
-# it does not grade, so the documented outlier depths keep their ONE home in
-# tests/gates_runner.cpp and a row that would fail the grade still gets recorded.
+# it does not grade, so the documented outlier depths keep their ONE home beside
+# the capture (PULSAR_REF_ANCHORS) and a row that would fail the grade still gets recorded.
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
@@ -1660,13 +1710,13 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate session_payload_gate tp_head_split_gate \
-               decode_reference_gate
+               decode_reference_gate session_contract_gate chat_decode_smoke
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
-tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
+tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
 	@mkdir -p tests/runner
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
-tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
+tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
 tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -1676,13 +1726,17 @@ tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o sr
 # GATE_RUNNER_FLAGS carries the battery-invisible diagnostics (--shape prints
 # each gate's prefill/step work shape); it is empty for `make gates`.
 GATE_RUNNER_FLAGS ?=
+# L278: the runner is a family host -- each model here runs after FRONTIER_MODEL through the same table, every
+# gate whose needs it lacks skipped by name (session-contract and row-neutrality run on every family).  A new
+# family adds its served model here.
+# Each entry is `--model PATH` and that model's reference anchors; it must follow the primary's anchors (an option
+# binds to the last --model before it).
+RUNNER_HOSTED_ARGS ?= --model $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHORS)
 cuda-runner-gate: tests/gates_runner
 	./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-		--ref-dir "$(PULSAR_REF_DIR)" \
-		--ref-tol $(PULSAR_REF_TOL) --kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
-		$(GATE_RUNNER_FLAGS)
+		$(PULSAR_REF_ANCHORS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
 
 # Every release-blocking gate, in one command.
 #
@@ -1724,7 +1778,8 @@ agent-test-gate: pulsar_agent_test
 # for the corpus); no model is loaded.  RENDER_GATE_CASES names JSON case
 # files or directories in the L216 corpus layout (default: the reference's
 # goldens only).
-V41_REFERENCE_ENCODING ?= /home/claude/v41/encoding
+# L278: the V4.1 checkpoint's own encoding/ in the shared hub (sparky mounts it at /mnt/models; 120 KB, no model)
+V41_REFERENCE_ENCODING ?= /mnt/models/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/encoding
 RENDER_GATE_CASES ?=
 .PHONY: render-gate
 render-gate: pulsar_test
@@ -1741,7 +1796,6 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
-	session-contract-gate-qwen session-contract-gate-ds \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1750,9 +1804,15 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # it.  The runner is the only target after them, and every gate binary and
 # CORE_OBJS is built by the targets above, so the background sub-makes only
 # RUN -- they do not race the runner's build (which reads the same objects).
+# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens), the server
+# goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
+# the speculation depth rule both drafters share, and render-gate (the V4.1 reference encoder's goldens, pinned in the
+# shared hub) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
+# DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check \
-	exl3-dequant-gate host-checks
+	exl3-dequant-gate host-checks qwen-chat-gate api-golden-gate sse-golden-gate spec-depth-gate \
+	loader-contract-gate render-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
@@ -1822,7 +1882,8 @@ gates-preflight:
 	if [ $$bad -ne 0 ]; then echo "gates-preflight: REFUSING"; exit 1; fi; \
 	echo "gates-preflight: ok ($${avail} GiB available, /tmp $${tmp:-0} GiB in tmpfs)"
 
-gates: tests/gates_runner pulsar-eval
+gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/api_golden tests/sse_golden tests/spec_depth_gate \
+       tests/loader_open
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
 	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
@@ -1871,8 +1932,8 @@ gates: tests/gates_runner pulsar-eval
 
 # ---- gates-dev: the ITERATION tier (L220 phase 4) --------------------------
 #
-# `make gates` is the PRE-MERGE instrument: every release-blocking gate, ~18
-# minutes, one engine open per configuration.  `make gates-dev` is the ITERATION
+# `make gates` is the PRE-MERGE instrument: every release-blocking gate, ~44
+# minutes measured (2,612 s on 2026-10-06; L278 is cutting it), one engine open per configuration.  `make gates-dev` is the ITERATION
 # tier: a fast subset chosen from what the working tree actually touches, so the
 # loop between an edit and a numeric answer is one-to-two minutes.
 #
@@ -1937,7 +1998,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/session*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
@@ -1959,6 +2020,7 @@ gates-dev:
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
+	    if [ $$family -eq 1 ]; then add session-contract-gate; add cuda-row-neutrality-gate; fi; \
 	  fi; \
 	  sel=$$(echo $$sel); \
 	fi; \
@@ -1997,13 +2059,14 @@ gates-dev:
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory session-contract-gate-qwen session-contract-gate-ds CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory loader-contract-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
+	  hosted=''; if [ $$family -eq 1 ]; then hosted='$(RUNNER_HOSTED_ARGS)'; fi; \
 	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
 	      --prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 	      --decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-	      --only=$$(echo $$sel | tr ' ' ',') || rc=1; \
+	      $$hosted --only=$$(echo $$sel | tr ' ' ',') || rc=1; \
 	fi; \
 	printf '\n  gates-dev total: %s s\n' "$$(( $$(date +%s) - t0 ))"; \
 	if [ $$rc -eq 0 ]; then printf '\nDEV TIER PASS -- the landing tier for a delta that cannot move a number; a numeric-path change gets ONE `make gates` per landing series (ENGINEERING-RULES section 10)\n'; \
@@ -2306,6 +2369,10 @@ tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/loader_open.o: tests/loader_open.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
+tests/loader_open: tests/loader_open.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -2313,6 +2380,12 @@ tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 tests/session_contract_gate.o: tests/session_contract_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/session_contract_gate: tests/session_contract_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L278 contract 6: the chat-decode smoke on the public text API -- a runner gate on every hosted model
+# (chat-smoke-gate); the standalone binary is for iterating on one model.
+tests/chat_decode_smoke.o: tests/chat_decode_smoke.cpp tests/gate_entry.h tests/gate_util.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/chat_decode_smoke: tests/chat_decode_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 .PHONY: qwen-generate
 qwen-generate: tests/qwen_generate

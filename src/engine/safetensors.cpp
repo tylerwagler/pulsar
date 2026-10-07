@@ -36,6 +36,21 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <setjmp.h>
+
+/* L278 (the loader contract): while safetensors_open runs, a container the reader cannot accept is a REFUSAL, not
+ * an exit -- said by name, counted (the loader's one failure policy, pulsar_load_refuse), and the open returns
+ * false at its stage boundary, so a server handed a broken artifact keeps running.  The reader is plain C (no
+ * object with a destructor between the open and any refusal), so the refusal returns by longjmp to the open.
+ * Outside an open -- nothing calls the reader then -- a fault is still fatal. */
+static thread_local jmp_buf *g_st_refuse;
+
+static void st_refuse_or_die(const char *msg) {
+    if (!g_st_refuse) pulsar_die(msg);
+    fprintf(stderr, "pulsar: %s\n", msg);
+    pulsar_load_refuse();
+    longjmp(*g_st_refuse, 1);
+}
 
 static void st_die(const char *fmt, ...) {
     char buf[512];
@@ -43,7 +58,13 @@ static void st_die(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    pulsar_die(buf);
+    st_refuse_or_die(buf);
+}
+
+static void st_die_errno(const char *what, const char *path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s '%s': %s", what, path, strerror(errno));
+    st_refuse_or_die(buf);
 }
 
 /** Allocations tied to the model's lifetime: the engine keeps the tensor
@@ -420,7 +441,8 @@ static void st_parse_header(st_shard *s) {
     }
 }
 
-static uint32_t st_layout_type(const char *layout, const char *dtype) {
+/* `what` names the tensor in a refusal (L278: every loader refusal says which tensor). */
+static uint32_t st_layout_type(const char *layout, const char *dtype, const char *what) {
     /* "native" is the one layout whose id depends on something other than its
      * name -- the payload is the file's own dtype, needing no interpretation --
      * which is why it is handled here rather than in the name table. */
@@ -428,7 +450,7 @@ static uint32_t st_layout_type(const char *layout, const char *dtype) {
         if (!strcmp(dtype, "F32")) return PULSAR_TENSOR_F32;
         if (!strcmp(dtype, "I32")) return PULSAR_TENSOR_I32;
         if (!strcmp(dtype, "BF16")) return PULSAR_TENSOR_BF16;
-        st_die("safetensors: native tensor with unsupported dtype '%s'", dtype);
+        st_die("safetensors: %s: native tensor with unsupported dtype '%s'", what, dtype);
     }
     if (!strcmp(layout, "fp8_e4m3")) {
         /* Legacy interleaved MXFP8.  The runtime used to convert this at first
@@ -436,11 +458,11 @@ static uint32_t st_layout_type(const char *layout, const char *dtype) {
          * resident copy of every such weight beside the mapping -- and that
          * path is gone, so a checkpoint declaring it is refused by NAME rather
          * than loaded into a layout nothing reads. */
-        st_die("safetensors: '%s' is the legacy interleaved MXFP8 layout; this "
-               "build serves the pre-stored 'mxfp8_lt' only", layout);
+        st_die("safetensors: %s: '%s' is the legacy interleaved MXFP8 layout; this "
+               "build serves the pre-stored 'mxfp8_lt' only", what, layout);
     }
     const int id = tensor_type_from_name(layout);
-    if (id < 0) st_die("safetensors: unknown layout id '%s'", layout);
+    if (id < 0) st_die("safetensors: %s: unknown layout id '%s'", what, layout);
     return (uint32_t)id;
 }
 
@@ -562,7 +584,18 @@ static void st_add_declared(st_dir *d, st_shard *s) {
         const st_tensor *ft = st_tensor_find(s, hf);
         if (!ft) st_die("safetensors: %s declares '%s' but the file does not contain it",
                         s->name, hf);
-        uint32_t type = st_layout_type(layout, ft->dtype);
+        uint32_t type = st_layout_type(layout, ft->dtype, hf);
+        /* L278 (the loader contract): the header dtype must be the one the layout is stored as -- the builder's
+         * table (tools/container/build.py NATIVE_DTYPES): the typed layouts bf16 / f32 / i32 as BF16 / F32 / I32,
+         * `native` as whatever it says (st_layout_type reads it), every packed layout as U8 [nbytes].  A header that
+         * says otherwise is a container that disagrees with itself; it loaded anyway, the layout silently winning. */
+        if (strcmp(layout, "native") != 0) {
+            const char *want_dtype = !strcmp(layout, "bf16") ? "BF16" : !strcmp(layout, "f32") ? "F32"
+                                   : !strcmp(layout, "i32") ? "I32" : "U8";
+            if (strcmp(ft->dtype, want_dtype) != 0)
+                st_die("safetensors: %s: %s is layout %s but stored as %s, not %s -- the container disagrees with itself",
+                       s->name, hf, layout, ft->dtype, want_dtype);
+        }
         uint64_t want = st_bytes_for(type, dim, nd);
         if (want != ft->off1 - ft->off0) {
             st_die("safetensors: %s: %s declares %llu bytes but holds %llu",
@@ -675,7 +708,7 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         dim[0] = dim2[0];
         dim[1] = dim2[1];
         dim[2] = n_experts;
-        uint32_t type = st_layout_type(layout, "U8");
+        uint32_t type = st_layout_type(layout, "U8", gguf_name);
         /* The declared expert_bytes must be the layout's own byte model for
          * these dims (the same authority the kernels' strides come from); a
          * stack that merely tiles the file is not enough -- a wrong stride
@@ -767,12 +800,12 @@ static bool st_is_shard(const char *n) {
     return l >= e && strcmp(n + l - e, kExt) == 0;
 }
 
-void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
+static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     /* Two shapes, one loader: a DIRECTORY of shards, or a single file that IS
      * the whole checkpoint.  The engine does not care which -- the tensor table
      * records each tensor's mapping either way. */
     struct stat pst;
-    if (stat(path, &pst) == -1) pulsar_die_errno("cannot stat model", path);
+    if (stat(path, &pst) == -1) st_die_errno("cannot stat model", path);
     const bool single_file = S_ISREG(pst.st_mode);
 
     char **names = NULL;
@@ -783,7 +816,7 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         names[n++] = st_strdup(slash ? slash + 1 : path);
     } else {
         DIR *dir = opendir(path);
-        if (!dir) pulsar_die_errno("cannot open model directory", path);
+        if (!dir) st_die_errno("cannot open model directory", path);
         for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
             if (!st_is_shard(de->d_name)) continue;
             if (n == cap) {
@@ -802,6 +835,7 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     m->shard_fd = (int *)st_alloc((size_t)n * sizeof(*m->shard_fd));
     m->shard_map = (const uint8_t **)st_alloc((size_t)n * sizeof(*m->shard_map));
     m->shard_size = (uint64_t *)st_alloc((size_t)n * sizeof(*m->shard_size));
+    for (uint64_t i = 0; i < n; i++) m->shard_fd[i] = -1;   /* model_close releases only what was opened */
     st_shard *shards = (st_shard *)st_alloc((size_t)n * sizeof(*shards));
 
     const int mmap_flags = gpu_mapping ? MAP_SHARED : MAP_PRIVATE;
@@ -813,18 +847,20 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         st_shard *s = &shards[i];
         s->name = names[i];
         s->fd = open(full, O_RDONLY);
-        if (s->fd == -1) pulsar_die_errno("cannot open shard", full);
+        if (s->fd == -1) st_die_errno("cannot open shard", full);
+        m->shard_fd[i] = s->fd;
         struct stat st;
-        if (fstat(s->fd, &st) == -1) pulsar_die_errno("cannot stat shard", full);
+        if (fstat(s->fd, &st) == -1) st_die_errno("cannot stat shard", full);
         if (st.st_size < 32) st_die("safetensors: %s is too small", full);
         void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, s->fd, 0);
-        if (map == MAP_FAILED) pulsar_die_errno("cannot mmap shard", full);
+        if (map == MAP_FAILED) st_die_errno("cannot mmap shard", full);
         s->map = (const uint8_t *)map;
         s->size = (uint64_t)st.st_size;
-        st_parse_header(s);
+        /* the model owns the shard from here: a refusal below leaves it for model_close */
         m->shard_fd[i] = s->fd;
         m->shard_map[i] = s->map;
         m->shard_size[i] = s->size;
+        st_parse_header(s);
         /* PULSAR_VERIFY_RANGES: name each mapping, so the device-range hashes
          * printed by the runtime can be attributed to a file. */
         if (getenv("PULSAR_VERIFY_RANGES")) {
@@ -895,4 +931,16 @@ void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         }
         fflush(stdout);
     }
+}
+
+bool safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping) {
+    jmp_buf refused;
+    if (setjmp(refused)) {   /* a refusal: said and counted where it was found */
+        g_st_refuse = NULL;
+        return false;
+    }
+    g_st_refuse = &refused;
+    st_open(m, path, gpu_mapping);
+    g_st_refuse = NULL;
+    return true;
 }

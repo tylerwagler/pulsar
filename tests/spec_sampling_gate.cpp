@@ -112,22 +112,35 @@ typedef struct { int id; long a, b; } bucket;
 #endif
 #define SAMPLED_ROWS_MAX    16
 
-/* Put bank `b` at the snapshot: repoint the device views (gpu_graph_bank_repoint
+/* The state every trajectory starts from (L278: family-generic).  A family with snapshots
+ * (pulsar_engine_has_snapshots) loads the one taken after the prompt's sync; one without re-syncs the prompt
+ * into a cleared session -- the same deterministic prefill, so the same state, at the cost of a short prefill
+ * per reset (the prompt is a few dozen tokens). */
+typedef struct {
+    const pulsar_session_snapshot *snap;   /* NULL: re-sync `prompt` */
+    const pulsar_tokens *prompt;
+} start_state;
+
+static int start_reset(pulsar_session *s, const start_state *st, char *err, size_t errlen) {
+    pulsar_session_invalidate(s);
+    if (st->snap) return pulsar_session_load_snapshot(s, st->snap, err, errlen);
+    return pulsar_session_sync(s, st->prompt, err, errlen);
+}
+
+/* Put bank `b` at the start state: repoint the device views (gpu_graph_bank_repoint
  * swaps the raw ring, the compressed caches and the compressor state to the
- * bank's storage), drop the live bookkeeping, load the payload into that bank,
+ * bank's storage), drop the live bookkeeping, load the start state into that bank,
  * persist it as the bank's carry.  The same reset for every bank and every
  * trajectory -- no "first time" path.  Measured 2026-09-04 (L160): at one bank
  * per forward this reproduces the serial gate's 10,000 tokens byte for byte;
  * a rewind-based reset came within 92% but not to identity (compressor state,
- * drafter window), so the payload load is the reset. */
-static int bank_reset(pulsar_session *s, uint32_t b, const pulsar_session_snapshot *snap,
-                      char *err, size_t errlen) {
+ * drafter window), so the payload load is the reset where the family has one. */
+static int bank_reset(pulsar_session *s, uint32_t b, const start_state *st, char *err, size_t errlen) {
     if (pulsar_session_bank_repoint(s, b) != 0) {
         snprintf(err, errlen, "bank %u repoint failed", b);
         return -1;
     }
-    pulsar_session_invalidate(s);
-    if (pulsar_session_load_snapshot(s, snap, err, errlen) != 0) return -1;
+    if (start_reset(s, st, err, errlen) != 0) return -1;
     pulsar_session_bank_state_save(s, b);
     return 0;
 }
@@ -139,10 +152,10 @@ static uint64_t traj_seed(int t, int mode) {
 }
 
 /* Mode 0, one batch of up to SAMPLED_BANKS_PLAIN trajectories: position 0 is
- * drawn from the snapshot's logits (every bank was just loaded from the same
- * snapshot, so the live logits ARE that distribution), positions 1.. from the
+ * drawn from the start state's logits (every bank was just put at the same
+ * state, so the live logits ARE that distribution), positions 1.. from the
  * decode_mixed row of the bank's own token.  Returns 0, or -1 with err. */
-static int sampled_plain_batch(pulsar_session *s, const pulsar_session_snapshot *snap,
+static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
                                int t0, int nb, float temp, float top_p, float min_p,
                                int eos, int vocab, float *logits, int (*seq)[DEPTH],
                                char *err, size_t errlen) {
@@ -195,7 +208,7 @@ static int sampled_plain_batch(pulsar_session *s, const pulsar_session_snapshot 
  * under its restore, round_end; then ONE redraft_batch over the banks that
  * continue, committed per bank.  A base draw of EOS ends the trajectory
  * without a forward, as generate_speculative does. */
-static int sampled_spec_batch(pulsar_session *s, const pulsar_session_snapshot *snap,
+static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                               int t0, int nb, float temp, float top_p, float min_p,
                               int eos, int vocab, float *logits, int (*seq)[DEPTH],
                               pulsar_spec_round **r, char *err, size_t errlen) {
@@ -299,6 +312,8 @@ static int bucket_cmp(const void *x, const void *y) {
 /* alpha over a window of the engine's cumulative spec counters */
 typedef struct { uint64_t drafted, accepted, rounds, gen; } spec_snap;
 
+static bool g_counter_broken = false;   /* the contract below failed: the gate FAILS (never exit(): runner gate) */
+
 static spec_snap spec_take(pulsar_engine *e) {
     pulsar_spec_metrics m;
     memset(&m, 0, sizeof(m));
@@ -320,7 +335,7 @@ static spec_snap spec_take(pulsar_engine *e) {
                         "sum accepted %llu != accepted %llu\n",
                 (unsigned long long)vsum, (unsigned long long)m.draft_tokens,
                 (unsigned long long)asum, (unsigned long long)m.accepted_tokens);
-        exit(1);
+        g_counter_broken = true;
     }
     spec_snap s = { m.draft_tokens, m.accepted_tokens, m.num_drafts, m.gen_tokens };
     return s;
@@ -428,15 +443,22 @@ int GATE_ENTRY(int argc, char **argv) {
     int (*seqA)[DEPTH] = NULL, (*seqB)[DEPTH] = NULL;
     int rc = 1;
     {
+    g_counter_broken = false;
     if (!pulsar_engine_has_spec_rounds(engine)) {
         fprintf(stderr, "spec sampling gate: the model has no drafter -- nothing to gate\n");
         goto done;
     }
     const int ctx = filler > 0 ? 16384 : 2048;
     if (pulsar_session_create(&session, engine, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
-    if (pulsar_session_bank_count(session) < SAMPLED_BANKS_PLAIN) {
-        fprintf(stderr, "spec sampling gate: pool has %d banks, need %d\n",
-                pulsar_session_bank_count(session), SAMPLED_BANKS_PLAIN);
+    /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm up
+     * to the banks one shared verify forward carries (pulsar_engine_spec_banks_max: DSpark 16, Qwen's MTP 2). */
+    const int width_plain = pulsar_session_bank_count(session) < SAMPLED_BANKS_PLAIN
+                          ? pulsar_session_bank_count(session) : SAMPLED_BANKS_PLAIN;
+    const int width_spec = (int)pulsar_engine_spec_banks_max(engine) < SAMPLED_BANKS_SPEC
+                         ? (int)pulsar_engine_spec_banks_max(engine) : SAMPLED_BANKS_SPEC;
+    if (width_plain < 1 || width_spec < 1) {
+        fprintf(stderr, "spec sampling gate: pool has %d banks, spec verify carries %u -- need 1 each\n",
+                pulsar_session_bank_count(session), pulsar_engine_spec_banks_max(engine));
         goto done;
     }
 
@@ -451,9 +473,8 @@ int GATE_ENTRY(int argc, char **argv) {
         snprintf(user + off, cap - off, "%s", PROMPT);
     }
 
-    pulsar_chat_begin(engine, &prompt);
-    pulsar_chat_append_message(engine, &prompt, "user", user ? user : PROMPT);
-    pulsar_chat_append_assistant_prefix(engine, &prompt, PULSAR_THINK_NONE);
+    /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+    pulsar_encode_chat_prompt(engine, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
     char err[256];
     if (pulsar_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         fprintf(stderr, "sync failed: %s\n", err);
@@ -462,10 +483,24 @@ int GATE_ENTRY(int argc, char **argv) {
     printf("model=%s temp=%.2f top_p=%.2f min_p=%.2f ctx_depth=%d traj=%d\n",
            model, (double)TEMP, (double)TOP_P, (double)MIN_P,
            pulsar_session_pos(session), traj);
-    if (pulsar_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+    const bool snapshots = pulsar_engine_has_snapshots(engine);
+    if (snapshots && pulsar_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot failed: %s\n", err);
         goto done;
     }
+    const start_state start = { snapshots ? &snap : NULL, &prompt };
+    /* L278: without snapshots every trajectory's reset is a prefill, so the sampled arms draw a fifth of the
+     * trajectories (never under 250) -- measured on Qwen at 1250: 212 s + 267 s of the battery for an INFORMATIONAL
+     * chi-square; the hard grades (emissions == committed context, no decisive greedy flip, non-degenerate) do not
+     * depend on the count.  Deterministic, and printed. */
+    if (!snapshots && traj > 250) {
+        const int reduced = traj / 5 > 250 ? traj / 5 : 250;
+        printf("trajectories: %d of the %d asked (no snapshots: each reset is a prefill)\n", reduced, traj);
+        traj = reduced;
+    }
+    printf("start state: %s; widths: plain %d, spec %d banks per forward\n",
+           snapshots ? "a session snapshot" : "the prompt re-synced (the family has no snapshots)",
+           width_plain, width_spec);
     const int eos = pulsar_token_eos(engine);
     /* Mode 0 stays PLAIN DECODE by default: spec-vs-plain is the question a
      * reader of this gate actually has, and the 1-row batch arm below buys no
@@ -563,7 +598,7 @@ int GATE_ENTRY(int argc, char **argv) {
         free(lg);
         const spec_snap g0 = spec_take(engine);
         for (int rep = 0; rep < 2; rep++) {
-            if (pulsar_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) goto done;
+            if (start_reset(session, &start, err, sizeof(err)) != 0) { fprintf(stderr, "reset: %s\n", err); goto done; }
             int *dst = rep == 0 ? got : got2;
             int *n = rep == 0 ? &ngot : &ngot2;
             rng = 7;
@@ -650,14 +685,14 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int mode = 0; mode < 2; mode++) {
             if (mode == 1) s0 = spec_take(engine);
             const time_t mode_t0 = time(NULL);
-            const int width = mode == 0 ? SAMPLED_BANKS_PLAIN : SAMPLED_BANKS_SPEC;
+            const int width = mode == 0 ? width_plain : width_spec;
             int next_report = 250;
             for (int t0 = 0; t0 < traj; t0 += width) {
                 const int nb = traj - t0 < width ? traj - t0 : width;
                 const int rc = mode == 0
-                    ? sampled_plain_batch(session, &snap, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
+                    ? sampled_plain_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
                                           logits, seqA, err, sizeof(err))
-                    : sampled_spec_batch(session, &snap, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
+                    : sampled_spec_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
                                          logits, seqB, rounds, err, sizeof(err));
                 if (rc != 0) {
                     fprintf(stderr, "mode %d batch at %d: %s\n", mode, t0, err);
@@ -755,6 +790,10 @@ int GATE_ENTRY(int argc, char **argv) {
                posn, chi, df, crit, nb, chi <= crit ? "ok" : "HIGH (informational, cross-path)",
                nb < 2 ? "  [DEGENERATE: point mass, test is vacuous]" : "");
         if (nb < 2) degenerate++;
+    }
+    if (g_counter_broken) {
+        printf("spec sampling oracle FAIL: the spec counter contract was violated (above)\n");
+        fail = 1;
     }
     if (degenerate == DEPTH) {
         printf("spec sampling oracle VACUOUS: every position is a point mass at "

@@ -161,3 +161,8 @@ tests/sse-golden/out.txt
 /tests/comp_state_gate
 /tests/vision_image_gate
 /tests/vision_image_sync_gate
+/tests/chat_decode_smoke
+/tests/chunk_neutrality_gate
+/tests/decode_reference_gate
+/tests/loader_open
+/tests/prefill_chunk_census_probe

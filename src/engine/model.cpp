@@ -233,10 +233,19 @@ uint64_t pulsar_model_release_host_pages(pulsar_model *m) {
 
 void model_close(pulsar_model *m) {
     if (!m) return;
+    /* the shards (L278: a refused open leaves what it mapped here, so a server that refuses an artifact keeps no
+     * mapping or descriptor of it) */
+    for (uint64_t i = 0; i < m->n_shards; i++) {
+        if (m->shard_map && m->shard_map[i]) munmap((void *)m->shard_map[i], (size_t)m->shard_size[i]);
+        if (m->shard_fd && m->shard_fd[i] >= 0) close(m->shard_fd[i]);
+    }
+    free(m->shard_fd);
+    free(m->shard_map);
+    free(m->shard_size);
     free(m->kv);
     free(m->tensors);
     free(m->tp_unstaged);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->map && m->n_shards == 0) munmap((void *)m->map, (size_t)m->size);   /* with shards it aliases shard 0 */
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -251,7 +260,7 @@ void model_close(pulsar_model *m) {
  * per-layer shards, or one file carrying the same declaration.  Everything the
  * engine reads -- metadata values, tensor layouts, offsets, shapes -- is
  * declared inside it. */
-void model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
+bool model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -259,24 +268,39 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
      * ONLY so that the refusal names the file's real format and says what to do
      * about it, instead of surfacing as a JSON parse error from the reader
      * below.  Nothing here reads a GGUF. */
+    /* L278: every refusal here is said and returned (the loader contract), never an exit */
     struct stat pst;
-    if (stat(path, &pst) == -1) pulsar_die_errno("cannot stat model", path);
+    if (stat(path, &pst) == -1) {
+        fprintf(stderr, "pulsar: cannot stat model '%s': %s\n", path, strerror(errno));
+        pulsar_load_refuse();
+        return false;
+    }
     if (!S_ISDIR(pst.st_mode)) {
-        if (pst.st_size < (off_t)sizeof(uint32_t)) pulsar_die("model file is too small");
+        if (pst.st_size < (off_t)sizeof(uint32_t)) {
+            fprintf(stderr, "pulsar: model file '%s' is too small\n", path);
+            pulsar_load_refuse();
+            return false;
+        }
         int probe = open(path, O_RDONLY);
-        if (probe == -1) pulsar_die_errno("cannot open model", path);
+        if (probe == -1) {
+            fprintf(stderr, "pulsar: cannot open model '%s': %s\n", path, strerror(errno));
+            pulsar_load_refuse();
+            return false;
+        }
         uint32_t magic = 0;
         const ssize_t got = read(probe, &magic, sizeof(magic));
         (void)close(probe);
         if (got == (ssize_t)sizeof(magic) && magic == PULSAR_GGUF_MAGIC) {
-            pulsar_die("this is a GGUF file, and pulsar reads safetensors "
-                       "checkpoints only -- either a directory of per-layer "
-                       "shards or a single file carrying the same declaration. "
-                       "The GGUF container was retired in favour of the "
-                       "declared-layout safetensors artifact.");
+            fprintf(stderr, "pulsar: %s is a GGUF file, and pulsar reads safetensors "
+                            "checkpoints only -- either a directory of per-layer "
+                            "shards or a single file carrying the same declaration. "
+                            "The GGUF container was retired in favour of the "
+                            "declared-layout safetensors artifact.\n", path);
+            pulsar_load_refuse();
+            return false;
         }
     }
-    safetensors_open(m, path, gpu_mapping);
+    return safetensors_open(m, path, gpu_mapping);
 }
 
 

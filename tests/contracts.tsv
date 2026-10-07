@@ -1,0 +1,46 @@
+# L278: every gate's CONTRACT and FAMILY -- the coverage matrix's one source (tools/coverage_matrix.py checks it
+# against the Makefile in host-checks).  A gate is a make target (or a runner sub-gate, `runner:<name>`).
+#
+#   contract   session | loader | spec (greedy == spec, multi-bank verify) | spec-dist (the sampled distribution)
+#              | reference | chat | server | tp | kernel:<name>; a gate checking several lists them, comma-separated
+#   family     deepseek4 | qwen4_exp | all (family-neutral: runs for every family, or needs no model)
+#   tier       battery (make gates) | dev (gates-dev only) | manual (neither; say why in the note)
+#
+# A contract x family cell with no battery gate must appear as a `gap` row naming the ledger row that closes it --
+# the check fails on an undeclared hole, so a gap is written down, not remembered.
+#
+# target	contract	family	tier	note
+runner:session-contract-gate	session,spec	all	battery	every hosted model; B6: multi-bank verify == single
+runner:cuda-row-neutrality-gate	session	all	battery	1-row == N-row decode, ~100 / ~2.2k / ~10k tokens, every hosted model
+runner:cuda-chunk-neutrality-gate	session	deepseek4	battery	schedules A-P/X through internals
+runner:cuda-frontier-gate	session	deepseek4	battery
+runner:cuda-rewind-gate	session	deepseek4	battery
+runner:cuda-seam-gate	session	deepseek4	battery
+runner:cuda-multiseq-gate	session	deepseek4	battery
+runner:cuda-accounting-gate	session	deepseek4	battery
+runner:cuda-evict-restore-gate	session	deepseek4	battery
+runner:cuda-session-payload-gate	session	deepseek4	battery
+loader-contract-gate	loader	all	battery	header clones + named mutants, both families
+qwen-family-gate-device	loader	qwen4_exp	battery	zero-weight wiring
+runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
+runner:cuda-bank-spec-gate	spec	deepseek4	battery
+runner:cuda-dspark-batch-gate	spec	deepseek4	battery
+spec-depth-gate	spec	all	battery	the depth rule both drafters share
+runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors: DeepSeek B300, Qwen container capture; KL budgets
+runner:cuda-decode-reference-gate-story	reference	deepseek4	battery
+qwen-ref-gate	reference	qwen4_exp	manual	vs the BF16 source: a quant-quality reading, not a regression grade
+qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens
+render-gate	chat	deepseek4	battery	bytes vs the V4.1 reference encoder's goldens (shared hub)
+unit-test-gate	server	all	battery	pulsar_test incl. --server (Qwen hooks: 4 tests)
+api-golden-gate	server	all	battery	DeepSeek and Qwen request rows
+sse-golden-gate	server	all	battery	DeepSeek walk + the Qwen leg through the family parser ops, 4 protocol shapes
+cuda-chat-smoke-gate	server	deepseek4	battery	through the CLI binary (the primary model)
+server-live-gate	server	all	manual	a live pulsar-server per family over HTTP (tool contract); one server load each, so not in the battery
+runner:chat-smoke-gate	server	all	battery	greedy chat answer on the public text API, every hosted model
+runner:cuda-tp-head-split-gate	tp	deepseek4	battery	one box
+tp-plan-gate	tp	all	manual	cold NFS scan; outside the runner overlap -- L278 contract 7
+cuda-regression	kernel:gdn,exl3,qsa,s4,moe-route,expert-table	all	battery
+cuda-attn-gates	kernel:attn-f16,hc,vision	deepseek4	battery
+#
+# gaps: a contract x family cell with no battery gate, and the row that closes it
+gap	tp	qwen4_exp	L278	contract 7: the pair (tools/tp2-l272); tp-plan host-side

@@ -1,0 +1,4 @@
+# depth kl   (recorded /mnt/models/sparky-parked/home-claude/ref-qwen38fn-q/code.ref.bin)
+512 0.075535434435839433
+2048 0.00029944499472696362
+3957 0.041377863995990596

@@ -71,13 +71,6 @@ int GATE_ENTRY(int argc, char **argv) {
     float *C = NULL, *A = NULL, *B = NULL, *D = NULL;
     int rc = 1;
     {
-        /* Filler words are ~2-3 tokens each; size the context so the deep
-         * entries (L170: 1100 -> ~2217 tokens; L175: 4200 -> ~10k) fit. */
-        int ctx = 4096;
-        while (ctx < filler * 3 + 512) ctx *= 2;
-        if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed (ctx %d)\n", ctx); goto done; }
-        if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "pool has %d banks\n", pulsar_session_bank_count(s)); goto done; }
-
         if (filler > 0) {
             const size_t cap = (size_t)filler * 8u + strlen(PROMPT) + 64u;
             user = (char *)malloc(cap);
@@ -86,9 +79,14 @@ int GATE_ENTRY(int argc, char **argv) {
                 off += (size_t)snprintf(user + off, cap - off, "port%d ", i % 997);
             snprintf(user + off, cap - off, "%s", PROMPT);
         }
-        pulsar_chat_begin(e, &prompt);
-        pulsar_chat_append_message(e, &prompt, "user", user ? user : PROMPT);
-        pulsar_chat_append_assistant_prefix(e, &prompt, PULSAR_THINK_NONE);
+        /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+        pulsar_encode_chat_prompt(e, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
+        /* The context from the rendered prompt (L278: the filler's tokens per word are the family's tokenizer's --
+         * DeepSeek 1100 -> ~2217 tokens, Qwen 1100 -> 4205), so the deep entries (L170, L175) fit on every family. */
+        int ctx = 4096;
+        while (ctx < prompt.len + 512) ctx *= 2;
+        if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed (ctx %d)\n", ctx); goto done; }
+        if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "pool has %d banks\n", pulsar_session_bank_count(s)); goto done; }
 
         char err[256];
         const int vw = pulsar_engine_logits_width(e);

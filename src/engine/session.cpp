@@ -36,7 +36,10 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false);
+    if (!model_open(&model, model_path, false)) {
+        model_close(&model);
+        return 1;
+    }
     vocab.vocab_load(&model);
     vocab.tokenize_rendered_chat_vocab(text ? text : "", &tokens);
 
@@ -378,7 +381,11 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         }
         memcpy(overlay_path, opt->expert_overlay, path_len);
         overlay_path[path_len] = '\0';
-        model_open(&e->overlay_model, overlay_path, pulsar_backend_uses_graph(opt->backend));
+        if (!model_open(&e->overlay_model, overlay_path, pulsar_backend_uses_graph(opt->backend))) {
+            model_close(&e->overlay_model);
+            fprintf(stderr, "pulsar: the --expert-overlay donor %s does not open -- refusing\n", overlay_path);
+            return false;
+        }
         e->overlay_ready = true;
         /* PREFIX is a comma-separated list so several layers can be swapped
          * in one run (e.g. compose "anchor + candidate" from a cheap base
@@ -646,7 +653,11 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend);
+    if (!model_open(&e->model, opt->model_path, graph_backend)) {   /* L278: refused by name, never an exit */
+        e->destroy();
+        *out = NULL;
+        return 1;
+    }
     /* Slice 4f: the model knows the rank it is loaded for from here on; the
      * merged drafter aliases e->model by value below and inherits it. */
     e->model.tp_rank = tp_rank_at_load;

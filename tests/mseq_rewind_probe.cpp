@@ -62,11 +62,9 @@ static void show(pulsar_session *s, const char *when, int pos) {
 int GATE_ENTRY(int argc, char **argv) {
     g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
-    /* The served shape is a bank pool.  Set BEFORE anything opens an engine or
-     * reads the pool size -- that read is cached on first use, and the
-     * engine-open path gets there first.  overwrite=0, so an explicit caller
-     * value still wins. */
-    setenv("PULSAR_MSEQ_BANKS", "4", 0);
+    /* The served shape is a bank pool.  L278: sized through the API after the open, as gate_entry.h's contract
+     * says -- the engine parses PULSAR_MSEQ_BANKS once per process, so in the runner (which had opened the engine
+     * long before) the setenv this used to do came too late and the gate ran on the classic 1-bank layout. */
     pulsar_engine *e = NULL;
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -75,9 +73,15 @@ int GATE_ENTRY(int argc, char **argv) {
     if (gate_engine_open(&e, &opt) != 0 || !e) {
         fprintf(stderr, "engine open failed\n"); return 2;
     }
+    pulsar_engine_set_bank_pool(4u);
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, 4096) != 0) {
         fprintf(stderr, "session create failed\n"); gate_engine_close(e); return 2;
+    }
+    if (pulsar_session_bank_count(s) < 2) {
+        fprintf(stderr, "mseq-rewind: the pool has %d bank(s) -- the served shape needs a pool\n",
+                pulsar_session_bank_count(s));
+        pulsar_session_free(s); gate_engine_close(e); return 2;
     }
 
     /* deterministic token stream */

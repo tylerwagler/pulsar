@@ -23,9 +23,12 @@
  *       quantum is priced; a per-bank physical eviction either refuses or leaves the bank holding nothing
  *   B6  a verify step over several banks' runs (the speculation lane's) gives each bank its run's rows verified
  *       alone, byte for byte (L272 P1 S4)
- * In the battery for every family (`make session-contract-gate-qwen` / `-ds`).  Replaces L266's
+ * In the battery for every family as a runner gate (L278: tests/gates_runner.cpp hosts each family's model); the
+ * standalone `make session-contract-gate-qwen` / `-ds` remain for iterating.  Replaces L266's
  * qwen_chunk_neutrality_gate and qwen_banks_gate. */
 #include "pulsar.h"
+#include "gate_entry.h"
+#include "gate_util.h"
 
 #include <algorithm>
 #include <math.h>
@@ -36,7 +39,7 @@
 #include <vector>
 
 static int n_fail = 0;
-#define CHECK(c, ...) do { const bool ok_ = (c); printf("  %s  ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) n_fail++; } while (0)
+#define CHECK(c, ...) GATE_CHECK(n_fail, c, __VA_ARGS__)
 
 static std::vector<float> logits_of(pulsar_session *s, int W) {
     std::vector<float> v((size_t)W);
@@ -480,7 +483,8 @@ static void part_banks(pulsar_engine *e, int W) {
     pulsar_tokens_free(&B);
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    n_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s <model> [prefill_chunk]\n", argv[0]); return 2; }
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -488,11 +492,11 @@ int main(int argc, char **argv) {
     opt.backend = PULSAR_BACKEND_CUDA;
     if (argc > 2) opt.prefill_chunk = (uint32_t)atoi(argv[2]);
     pulsar_engine *e = NULL;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "session-contract: %s did not open\n", argv[1]); return 2; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "session-contract: %s did not open\n", argv[1]); return 2; }
     const int W = pulsar_engine_logits_width(e);
     part_chunks(e, W, argc > 2);
     part_banks(e, W);
-    pulsar_engine_close(e);
+    gate_engine_close(e);
     printf(n_fail ? "SESSION-CONTRACT GATE FAIL (%d)\n" : "SESSION-CONTRACT GATE PASS\n", n_fail);
     return n_fail != 0;
 }

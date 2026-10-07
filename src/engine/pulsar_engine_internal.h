@@ -2892,7 +2892,8 @@ void model_close(pulsar_model *m);
  * no-copy GPU buffers; tokenizer/inspection opens use a private read-only
  * mapping instead.
  */
-void model_open(pulsar_model *m, const char *path, bool gpu_mapping);
+/** false = refused (said and counted); model_close releases whatever the refused open mapped. */
+bool model_open(pulsar_model *m, const char *path, bool gpu_mapping);
 
 /** Open a safetensors checkpoint DIRECTORY: mmap every shard, re-encode the
  * JSON __metadata__ into the one GGUF-typed KV blob the rest of the engine
@@ -2900,7 +2901,8 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping);
  * builds -- including ONE stacked tensor per routed-expert projection, because
  * a projection's per-expert tensors are contiguous and gap-free.  That is why
  * nothing downstream of model_open changes. */
-void safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping);
+/** false = refused (said and counted: pulsar_load_refuse); the model holds what was mapped -- model_close it. */
+bool safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping);
 void model_summary(const pulsar_model *m);
 pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name);
 bool accelerator_cache_model_tensors(pulsar_backend backend,
