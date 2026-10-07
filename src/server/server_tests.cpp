@@ -3208,6 +3208,65 @@ static void test_qwen_hooks_compose_to_the_full_render(void) {
     }
 }
 
+/* L268: a tool result carrying an image continues the live KV on Qwen as on DeepSeek -- the tail writes the
+ * template's vision literal where the image sits (outside client data), and prefix + turn + tail is still the
+ * full render byte for byte.  The server places the tail's image on the live history (image_continuation_place). */
+static chat_msg qwen_test_image_msg(const char *role, const char *before, const char *after) {
+    std::string c = std::string(before) + PULSAR_IMAGE_PLACEHOLDER + after;
+    chat_msg m = qwen_test_msg(role, c.c_str());
+    m.images = (chat_image *)calloc(1, sizeof(chat_image));
+    m.image_ph_off = (size_t *)malloc(sizeof(size_t));
+    m.image_ph_off[0] = strlen(before);
+    m.images_len = m.images_cap = 1;
+    return m;
+}
+
+static void test_qwen_tail_carries_a_tool_result_image(void) {
+    chat_msgs prefix = {0}, full = {0};
+    chat_msgs_push(&prefix, qwen_test_msg("user", "Screenshot the build page."));
+    chat_msgs_push(&full, qwen_test_msg("user", "Screenshot the build page."));
+    chat_msg a = qwen_test_msg("assistant", "");
+    a.reasoning = xstrdup("Take it.\n");
+    qwen_test_call(&a, "call_1", "screenshot", "{}");
+    chat_msgs_push(&full, a);
+    chat_msgs_push(&full, qwen_test_image_msg("tool", "Captured: ", " (1920x1080)"));
+    full.v[2].tool_call_id = xstrdup("call_1");
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.family = server_family_for_format(PULSAR_CHAT_QWEN);
+    r.family_effort = QWEN_EFFORT_XHIGH;
+    r.think_mode = PULSAR_THINK_DEFAULT;
+    chat_text_span *tail_spans = NULL;
+    uint32_t tail_n = 0;
+    char *turn = r.family->assistant_turn_sampled(&r, true, "Take it.\n", "", &full.v[1].calls, NULL, NULL);
+    char *tail = r.family->tool_result_tail(&r, &full, 2, &tail_spans, &tail_n);
+    TEST_ASSERT(turn && tail);
+    if (tail) {
+        const char *lit = strstr(tail, "<|vision_start|><|image_pad|><|vision_end|>");
+        TEST_ASSERT(lit != NULL && strstr(tail, PULSAR_IMAGE_PLACEHOLDER) == NULL);
+        /* the literal is the template's, not the client's: no client range covers it */
+        for (uint32_t k = 0; lit && k < tail_n; k++)
+            TEST_ASSERT(tail + tail_spans[k].hi <= lit ||
+                        tail + tail_spans[k].lo >= lit + strlen("<|vision_start|><|image_pad|><|vision_end|>"));
+    }
+    char *full_text = qwen_test_full_render(&full, false);
+    char *prefix_text = qwen_test_full_render(&prefix, false);
+    buf composed = {0};
+    buf_puts(&composed, prefix_text);
+    buf_puts(&composed, turn ? turn : "");
+    buf_puts(&composed, tail ? tail : "");
+    TEST_ASSERT(!strcmp(composed.ptr, full_text));
+    buf_free(&composed);
+    free(full_text);
+    free(prefix_text);
+    free(turn);
+    free(tail);
+    free(tail_spans);
+    request_free(&r);
+}
+
 /* Tool memory on Qwen: the parser records the turn's calls as sampled (whitespace and spelling the
  * template would normalise), the renderer replays them verbatim, and the block finder keys the run. */
 static void test_qwen_raw_calls_replay_verbatim(void) {
@@ -8245,6 +8304,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
     test_qwen_hooks_compose_to_the_full_render();
+    test_qwen_tail_carries_a_tool_result_image();
     test_qwen_raw_calls_replay_verbatim();
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();

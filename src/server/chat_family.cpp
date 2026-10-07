@@ -408,7 +408,7 @@ static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, ch
  * conversation's first turns into a user <system-reminder> turn (the template has no in-place system
  * turn; `notes` owns that text); a replayed call carries its sampled bytes when tool memory found them.
  * `tail`: a continuation tail -- no entry is the conversation's first, and the system field is not
- * part of one.  false + err: an image (the family renders none). */
+ * part of one.  false + err: an image whose parser marker is not at its offset. */
 static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vector<qwen_msg_in> *qm,
                           std::vector<std::vector<qwen_tool_call_in>> *qc, std::vector<std::string> *notes,
                           std::vector<qwen_msg_images> *imgs, char *err, size_t errlen) {
@@ -420,12 +420,8 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
             const chat_msg *m = &msgs->v[i];
             if (m->system_field != (pass == 0)) continue;
             if (tail && m->system_field) continue;
-            /* L268: a tail continues the live KV with text only -- an image makes it no tail, and the request takes
-             * the full render (which serves the image under the core's reuse licence) */
-            if (m->images_len > 0 && tail) {
-                snprintf(err, errlen, "message %d: an image ends the live continuation", i);
-                return false;
-            }
+            /* L268: images render as the template's vision literal here and in a live tail alike; the server places a
+             * tail's new images on the live history (image_continuation_place, every family) */
             if (m->images_len > 0 && !qwen_strip_image_markers(m, &(*imgs)[(size_t)i], err, errlen)) return false;
             for (int k = 0; k < m->calls.len; k++)
                 (*qc)[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
@@ -533,7 +529,6 @@ static char *qwen_tool_result_tail(const request *r, const chat_msgs *msgs, int 
     std::vector<qwen_msg_images> imgs;
     char err[200];
     qwen_render_out out;
-    /* a tail with an image is no tail: the request takes the full render, which serves the image (L268) */
     if (!qwen_messages(msgs, start, true, &qm, &qc, &notes, &imgs, err, sizeof err) ||
         !qwen_chat_render_tail(qm.data(), (int)qm.size(), (qwen_effort)r->family_effort, &out, err, sizeof err))
         return NULL;
