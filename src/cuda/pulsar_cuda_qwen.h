@@ -261,9 +261,9 @@ int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, const float
 /* ======================================================================== */
 /* PLE at layer index 1 (Qwen4ExpTextPLELayer)                               */
 
+/** The layer's weights the launcher reads.  key_proj (2560 -> 10240) and value_proj (2560 -> 2560) are not
+ *  here: the caller runs them (L284 #2: through its row-kind segments) and hands in their f32 rows. */
 typedef struct {
-    pulsar_rows_linear key_proj;     /**< 2560 -> 10240 */
-    pulsar_rows_linear value_proj;   /**< 2560 -> 2560 */
     const uint16_t *norm_key;        /**< bf16 [10240], (1 + w) */
     const uint16_t *norm_query;      /**< bf16 [10240] */
     const uint16_t *norm_conv;       /**< bf16 [10240] */
@@ -288,15 +288,15 @@ typedef struct {
 /** Workspace bytes for T rows: a function of the shape alone. */
 size_t pulsar_qwen_ple_workspace_bytes(int T);
 
-/** The PLE injection for T rows: `emb` bf16 [T][2560] = the 16 gathered table
- *  rows per token (head order); streams bf16 [T][4][2560] updated in place:
- *    k = norm_key(key_proj e), q_s = norm_query(stream_s), v = value_proj e,
+/** The PLE injection for T rows, from key f32 [T][10240] = key_proj e and value f32 [T][2560] = value_proj e,
+ *  e the 16 gathered bf16 table rows per token (head order); streams bf16 [T][4][2560] updated in place:
+ *    k = norm_key(key), q_s = norm_query(stream_s), v = value,
  *    gate_s = signed-sqrt(<k_s, q_s> / sqrt(2560)), gv_s = sigmoid(gate_s) v,
  *    stream_s += gv_s + silu(conv_dil3(norm_conv(gv)))
  *  conv_state f32 [banks][9][10240] (oldest first; slot seq_bank[q] for
  *  sequence q) is read for taps before the batch and advanced by it. */
-int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16_t *emb, uint16_t *streams, int T,
-                           const pulsar_qwen_rows *rows, float *conv_state,
+int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const float *key, const float *value, uint16_t *streams,
+                           int T, const pulsar_qwen_rows *rows, float *conv_state,
                            void *ws, size_t ws_bytes, cudaStream_t stream);
 
 #ifdef __cplusplus

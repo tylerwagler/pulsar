@@ -109,11 +109,23 @@ namespace {
 
 uint64_t a256(uint64_t x) { return (x + 255u) & ~(uint64_t)255u; }
 
-struct ple_scratch { uint64_t emb, row_seq, row_j, seq_first, seq_rows, seq_bank, ws, ws_bytes, total; };
+/* key / value: the op's f32 projections the launcher reads (L284 #2: run through the row-kind segments);
+ * lin_ws the dense-arm workspace the two share (they serialize on the stream) */
+struct ple_scratch { uint64_t emb, key, value, lin_ws, lin_ws_bytes, row_seq, row_j, seq_first, seq_rows, seq_bank, ws,
+                     ws_bytes, total; };
 ple_scratch ple_layout(uint32_t rows) {
     ple_scratch p{};
     uint64_t o = 0;
     p.emb = o;       o += a256((uint64_t)rows * PULSAR_QWEN_HIDDEN * 2u);
+    p.key = o;       o += a256((uint64_t)rows * PULSAR_QWEN_HC_HIDDEN * sizeof(float));
+    p.value = o;     o += a256((uint64_t)rows * PULSAR_QWEN_HIDDEN * sizeof(float));
+    for (const int out : {PULSAR_QWEN_HC_HIDDEN, PULSAR_QWEN_HIDDEN}) {
+        pulsar_rows_linear l{};
+        l.in = PULSAR_QWEN_HIDDEN; l.out = out;
+        const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&l, (int)rows));
+        if (b > p.lin_ws_bytes) p.lin_ws_bytes = b;
+    }
+    p.lin_ws = o;    o += p.lin_ws_bytes;
     p.row_seq = o;   o += a256((uint64_t)rows * 4u);
     p.row_j = o;     o += a256((uint64_t)rows * 4u);
     p.seq_first = o; o += a256((uint64_t)rows * 4u);
@@ -165,15 +177,20 @@ bool fail(const char *what) {
     return false;
 }
 
-/* L266: a PROMPT chunk -- a prefill step that is not an MTP verify.  Its ops take the prefill arms at
- * every row count, so a prompt cut anywhere (a checkpoint resume) is byte-identical to one prefilled
- * whole; a verify keeps the decode rule its rows are graded against. */
-static bool step_is_prompt(const pulsar_qwen_step *st) {
-    return st->mode == PULSAR_QWEN_STEP_PREFILL && !st->verify;
+/* L284 #2: the row-kind boundary (pulsar_qwen_step::n_dec).  Rows [lo, hi) of an arm-sensitive launch, cut at
+ * n_dec: `launch(prompt, r0, m)` runs [lo, min(hi, n_dec)) with the decode arms (prompt = false), then
+ * [max(lo, n_dec), hi) with the prompt arms; an empty segment is skipped.  The launch builds its descriptor
+ * with `prompt` and offsets its row pointers by r0 -- every kernel behind one is row-independent (a row's
+ * bytes depend on its own input rows alone), so a segment's rows are the bytes the whole launch gives them.
+ * The ONE place an op learns which arm a row takes. */
+template <class Launch>
+bool arm_segments(const pulsar_qwen_step *st, uint32_t lo, uint32_t hi, Launch &&launch) {
+    const uint32_t cut = st->n_dec < lo ? lo : st->n_dec > hi ? hi : st->n_dec;
+    return (cut == lo || launch(false, lo, cut - lo)) && (cut == hi || launch(true, cut, hi - cut));
 }
 
-/* The GR weights of one site, as the launcher takes them. */
-bool gr_dev(const pulsar_qwen_step *st, const pulsar_qwen_gr_weights &g, pulsar_qwen_gr_dev *d) {
+/* The GR weights of one site, as the launcher takes them, at one arm. */
+bool gr_dev(const pulsar_qwen_step *st, const pulsar_qwen_gr_weights &g, bool prompt, pulsar_qwen_gr_dev *d) {
     const uint64_t R = st->shape->n_hc_lowrank, HC = pulsar_qwen_hc_dim(st->shape);
     const uint8_t *down = (const uint8_t *)wptr(st, g.mix_down, "qwen GR W_down");
     const uint8_t *up = (const uint8_t *)wptr(st, g.mix_up, "qwen GR W_up");
@@ -183,16 +200,27 @@ bool gr_dev(const pulsar_qwen_step *st, const pulsar_qwen_gr_weights &g, pulsar_
     /* mxfp8_lt: E4M3 [out][in] then the swizzled E8M0 plane; bf16: [out][in] (the
      * mixer in the graded recipe).  Admission made both the same format. */
     const bool w8 = g.mix_down->type == PULSAR_TENSOR_MXFP8_LT;
-    d->prompt = step_is_prompt(st);
-    d->down = {down, w8 ? down + R * HC : NULL, (int)R, (int)HC, d->prompt};
-    d->up = {up, w8 ? up + HC * R : NULL, (int)HC, (int)R, d->prompt};
+    d->prompt = prompt;
+    d->down = {down, w8 ? down + R * HC : NULL, (int)R, (int)HC, prompt};
+    d->up = {up, w8 ? up + HC * R : NULL, (int)HC, (int)R, prompt};
     return true;
 }
 
-/* L272 P4c: the step's dense linear through the core's front door (the arm by t's format at bf16 rows) */
-bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int out, const char *what,
+/* L272 P4c: a dense linear's reference through the core's front door (the arm by t's format at bf16 rows) */
+bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int out, bool prompt, const char *what,
                 pulsar_rows_linear *l) {
-    return pulsar_linear_rows_ref(st->model, t, in, out, step_is_prompt(st), what, l);
+    return pulsar_linear_rows_ref(st->model, t, in, out, prompt, what, l);
+}
+
+/* The step's dense linear over its rows: y [n_rows][out] f32 = t x, x bf16 [n_rows][in] -- each row-kind segment
+ * through its arm (arm_segments).  `ws` is the dense-arm workspace, sized for the step's rows. */
+bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int out, const char *what,
+                 const uint16_t *x, float *y, void *ws, uint64_t ws_bytes) {
+    return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
+        pulsar_rows_linear l;
+        return linear_dev(st, t, in, out, prompt, what, &l) &&
+               pulsar_rows_linear_launch(&l, x + (size_t)r0 * in, (int)m, y + (size_t)r0 * out, ws, ws_bytes, 0) == 0;
+    });
 }
 
 /* L251 S2: the Gated DeltaNet op's scratch.  qkv/z/a/b hold the four f32
@@ -536,39 +564,49 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
     const int H = (int)st->shape->n_embd, HC = (int)pulsar_qwen_hc_dim(st->shape);
     pulsar_qwen_ple_dev w;
-    ok = linear_dev(st, L.ple_key, H, HC, "qwen PLE key_proj", &w.key_proj) &&
-         linear_dev(st, L.ple_value, H, H, "qwen PLE value_proj", &w.value_proj);
     w.norm_key = (const uint16_t *)wptr(st, L.ple_norm_key, "qwen PLE norm_key");
     w.norm_query = (const uint16_t *)wptr(st, L.ple_norm_query, "qwen PLE norm_query");
     w.norm_conv = (const uint16_t *)wptr(st, L.ple_norm_conv, "qwen PLE norm_conv");
     w.conv_w = (const uint16_t *)wptr(st, L.ple_conv, "qwen PLE conv1d");
-    if (!ok || !w.norm_key || !w.norm_query || !w.norm_conv || !w.conv_w) return false;
+    if (!w.norm_key || !w.norm_query || !w.norm_conv || !w.conv_w) return false;
     uint8_t *base = (uint8_t *)dptr(sc);
+    /* key / value: row-independent Linears of the gathered rows, so they take the row-kind segments; the gate
+     * and the dilated conv that follow read across a sequence's rows and stay one launch */
+    const uint16_t *emb = (const uint16_t *)(base + p.emb);
+    float *key = (float *)(base + p.key), *value = (float *)(base + p.value);
+    if (!step_linear(st, L.ple_key, H, HC, "qwen PLE key_proj", emb, key, base + p.lin_ws, p.lin_ws_bytes) ||
+        !step_linear(st, L.ple_value, H, H, "qwen PLE value_proj", emb, value, base + p.lin_ws, p.lin_ws_bytes))
+        return fail("a PLE projection launch failed");
     const pulsar_qwen_rows rows = {(const int32_t *)(base + p.row_seq), (const int32_t *)(base + p.row_j),
                                    (const int32_t *)(base + p.seq_first), (const int32_t *)(base + p.seq_rows),
                                    (const int32_t *)(base + p.seq_bank), (int)n_seq,
                                    st->verify ? (float *)dptr(st->st->spec.ple) : NULL};
-    return pulsar_qwen_ple_launch(&w, (const uint16_t *)(base + p.emb), (uint16_t *)dptr(st->streams), (int)n,
+    return pulsar_qwen_ple_launch(&w, key, value, (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(st->st->layer[il].ple_conv), base + p.ws, p.ws_bytes, 0) == 0;
 }
 
 bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side) {
-    const uint32_t n = st->n_rows;
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
-    pulsar_qwen_gr_dev w;
-    if (!gr_dev(st, side == PULSAR_QWEN_GR_ATTN ? L.gr_attn : L.gr_mlp, &w)) return false;
+    const pulsar_qwen_gr_weights &gw = side == PULSAR_QWEN_GR_ATTN ? L.gr_attn : L.gr_mlp;
     const gr_scratch g = gr_layout(st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GR_READ];
     if (!sc) return fail("no GR scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
     /* L251 / ac69748f: the block input is bf16 and there is no E4M3 activation slot in this family, so the
      * read emits the bf16 row and nothing else -- no slot, no arming, no notes.  `nullptr` is the read's
-     * documented "no slot" form, so the mxfp8 W_down weights are still read by the same arm. */
-    pulsar_gpu_tensor *x = st->st->x;
-    if (pulsar_qwen_gr_read_launch(&w, (const uint16_t *)dptr(st->streams), (int)n, (uint16_t *)dptr(x),
-                                   (float *)(base + g.inj[side]), base + g.ws, g.ws_bytes, 0))
-        return false;
-    return true;
+     * documented "no slot" form, so the mxfp8 W_down weights are still read by the same arm.
+     * L284 #2: every kernel of the read indexes its row t alone (the workspace's per-row planes from 0), so
+     * a row-kind segment is the launch at its rows' offsets. */
+    const uint16_t *streams = (const uint16_t *)dptr(st->streams);
+    uint16_t *x = (uint16_t *)dptr(st->st->x);
+    float *inj = (float *)(base + g.inj[side]);
+    const uint64_t HC = pulsar_qwen_hc_dim(st->shape), H = st->shape->n_embd;
+    return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
+        pulsar_qwen_gr_dev w;
+        return gr_dev(st, gw, prompt, &w) &&
+               pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, x + r0 * H, inj + (size_t)r0 * PULSAR_QWEN_HC,
+                                          base + g.ws, g.ws_bytes, 0) == 0;
+    });
 }
 
 bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_gr_side side) {
@@ -602,31 +640,41 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
                                   parts.logits, parts.sel, parts.wts, parts.sgate, 0) != 0)
         return false;
     /* the routed experts through the core's front door (moe.cpp): the trunk's gate_up is ONE fused stack, the MTP
-     * layer's gate and up are two; under TP the rank reads its plan's range of whole experts */
+     * layer's gate and up are two; under TP the rank reads its plan's range of whole experts.  L284 #2: the router
+     * above has no arm (one kernel at every row count, each row's logits / picks its own) and stays whole; the
+     * routed part and the shared expert take the row-kind segments -- a row's output reads its own x and picks
+     * alone (the grouped GEMMs, the fold and the sum index each (row, pick)), the workspace is reused from 0 */
+    const uint32_t K = s->n_expert_used;
     pulsar_moe_rows_call rc{};
     rc.m = st->model;
     rc.gate = L.moe_gate_up ? L.moe_gate_up : L.moe_gate;
     rc.up = L.moe_gate_up ? NULL : L.moe_up;
     rc.down = L.moe_down;
-    rc.selected = parts.sel;
-    rc.weights = parts.wts;
-    rc.x_bf16 = x;
-    rc.n_rows = (int)n;
-    rc.out = y;
     rc.ws = parts.routed;
     rc.ws_bytes = parts.routed_bytes;
     rc.nf_flag = (uint32_t *)(base + m.nf);
     rc.nf_code = 0x51000000u | il;
-    rc.prompt = step_is_prompt(st);
-    if (!pulsar_moe_routed_rows(&rc)) return false;
+    if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            rc.selected = parts.sel + (size_t)r0 * K;
+            rc.weights = parts.wts + (size_t)r0 * K;
+            rc.x_bf16 = x + (size_t)r0 * H;
+            rc.n_rows = (int)rows;
+            rc.out = y + (size_t)r0 * H;
+            rc.prompt = prompt;
+            return pulsar_moe_routed_rows(&rc);
+        }))
+        return false;
     /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone */
     if (pulsar_qwen_tp(s) > 1 && s->tp_rank != 0) return true;
-    pulsar_rows_linear sg, su, sd;
-    if (!linear_dev(st, L.sh_gate, H, SMID, "qwen shared gate_proj", &sg) ||
-        !linear_dev(st, L.sh_up, H, SMID, "qwen shared up_proj", &su) ||
-        !linear_dev(st, L.sh_down, SMID, H, "qwen shared down_proj", &sd))
-        return false;
-    return pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x, (int)n, y, &parts, 0) == 0;
+    return arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+        pulsar_rows_linear sg, su, sd;
+        pulsar_qwen_moe_parts p = parts;   /* the gate row-indexed, the shared expert's buffers reused from 0 */
+        p.sgate = parts.sgate + r0;
+        return linear_dev(st, L.sh_gate, H, SMID, prompt, "qwen shared gate_proj", &sg) &&
+               linear_dev(st, L.sh_up, H, SMID, prompt, "qwen shared up_proj", &su) &&
+               linear_dev(st, L.sh_down, SMID, H, prompt, "qwen shared down_proj", &sd) &&
+               pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x + (size_t)r0 * H, (int)rows, y + (size_t)r0 * H, &p, 0) == 0;
+    });
 }
 
 /* L251 MTP: the draft head (pulsar_qwen_weights::draft_head_mx), gathered once from the bf16 head.  With
@@ -675,8 +723,6 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd;
     if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
-    pulsar_qwen_gr_dev w;
-    if (!gr_dev(st, *st->mixer, &w)) return false;
     const head_scratch h = head_layout();
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_HEAD];
     if (!sc) return fail("no head scratch");
@@ -686,8 +732,15 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
     pulsar_gpu_tensor *xkey = scratch_view(st, PULSAR_QWEN_OP_HEAD, h.xkey, (uint64_t)n * H * sizeof(float));
     void *xb = NULL;
     bool ok = xkey && pulsar_gpu_bf16_act_slot(xkey, n, (uint64_t)H, &xb);
-    const uint16_t *streams = (const uint16_t *)dptr(st->streams) + (size_t)row0 * pulsar_qwen_hc_dim(s);
-    ok = ok && pulsar_qwen_gr_read_launch(&w, streams, (int)n, (uint16_t *)xb, NULL, base + h.ws, h.ws_bytes, 0) == 0;
+    /* the mixer's read over rows [row0, row0 + n), each row-kind segment through its arm, into xb's row r - row0 */
+    const uint16_t *streams = (const uint16_t *)dptr(st->streams);
+    const uint64_t HC = pulsar_qwen_hc_dim(s);
+    ok = ok && arm_segments(st, row0, row0 + n, [&](bool prompt, uint32_t r0, uint32_t m) {
+        pulsar_qwen_gr_dev w;
+        return gr_dev(st, *st->mixer, prompt, &w) &&
+               pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, (uint16_t *)xb + (size_t)(r0 - row0) * H, NULL,
+                                          base + h.ws, h.ws_bytes, 0) == 0;
+    });
     if (ok) {
         /* L251: the lm_head in MXFP8, made once on the device from the container's bf16 head (the
          * producers' own encoder) -- half the bytes of the bf16 GEMV that was 5.1 ms of a 33 ms
@@ -836,7 +889,7 @@ bool pulsar_qwen_s4_spec_rollback(const pulsar_qwen_step *v, uint32_t keep) {
 /* ======================================================================== */
 /* L251 S2's op: the Gated DeltaNet block.  On the integration branch it lives
  * in this TU because it needs the weight / scratch helpers above (wptr,
- * linear_dev, dptr, fail, gdn_layout); split into family_qwen_s2.cpp when S2
+ * step_linear, dptr, fail, gdn_layout); split into family_qwen_s2.cpp when S2
  * rebases on the family interface.  The kernel is src/cuda/pulsar_cuda_gdn.cu.
  *
  * x (bf16 + its armed E4M3 slot) -> in_proj_qkv / _z / _a / _b through the EXL3
@@ -855,12 +908,6 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_tensor *gw4[4] = {L.gdn_conv, L.gdn_a_log, L.gdn_dt_bias, L.gdn_norm};
     for (int i = 0; i < 4; i++)
         if (!admit(gw4[i], gw4[i]->type == PULSAR_TENSOR_BF16, "bf16 (the GDN kernel's weight dtype)")) return false;
-    pulsar_rows_linear qkv, zz, aa, bb, out;
-    if (!linear_dev(st, L.gdn_in_qkv, H,  CD, "qwen GDN in_proj_qkv", &qkv) ||
-        !linear_dev(st, L.gdn_in_z,   H,  VT, "qwen GDN in_proj_z",   &zz)  ||
-        !linear_dev(st, L.gdn_in_a,   H,  NVG, "qwen GDN in_proj_a",  &aa)  ||
-        !linear_dev(st, L.gdn_in_b,   H,  NVG, "qwen GDN in_proj_b",  &bb)  ||
-        !linear_dev(st, L.gdn_out,    VT, H,  "qwen GDN out_proj",    &out)) return false;
     /* L251 / ac69748f: the block input is bf16 and there is no E4M3 activation slot in this family, so
      * these projections read the bf16 row its producer emitted (rule 3). */
     const uint16_t *xin = (const uint16_t *)dptr(st->st->x);
@@ -869,10 +916,10 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     const gdn_scratch g = gdn_layout(s, st->st->max_rows);
     void *linws = base + g.lin_ws;
-    if (pulsar_rows_linear_launch(&qkv, xin, (int)n, (float *)(base + g.qkv), linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_rows_linear_launch(&zz,  xin, (int)n, (float *)(base + g.z),   linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_rows_linear_launch(&aa,  xin, (int)n, (float *)(base + g.a),   linws, g.lin_ws_bytes, 0) != 0 ||
-        pulsar_rows_linear_launch(&bb,  xin, (int)n, (float *)(base + g.b),   linws, g.lin_ws_bytes, 0) != 0)
+    if (!step_linear(st, L.gdn_in_qkv, H, CD,  "qwen GDN in_proj_qkv", xin, (float *)(base + g.qkv), linws, g.lin_ws_bytes) ||
+        !step_linear(st, L.gdn_in_z,   H, VT,  "qwen GDN in_proj_z",   xin, (float *)(base + g.z),   linws, g.lin_ws_bytes) ||
+        !step_linear(st, L.gdn_in_a,   H, NVG, "qwen GDN in_proj_a",   xin, (float *)(base + g.a),   linws, g.lin_ws_bytes) ||
+        !step_linear(st, L.gdn_in_b,   H, NVG, "qwen GDN in_proj_b",   xin, (float *)(base + g.b),   linws, g.lin_ws_bytes))
         return fail("a GDN projection launch failed");
     pulsar_gdn_weights gw;
     gw.conv_w  = (const uint16_t *)wptr(st, L.gdn_conv,    "qwen GDN conv1d");
@@ -914,8 +961,8 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
         c.rec_rows  = (float *)dptr(sp.gdn_rec) + slot * (pulsar_qwen_gdn_state_bytes(s) / sizeof(float));
     }
     if (pulsar_gdn_forward(&gw, &c, 0) != 0) return fail("pulsar_gdn_forward failed");
-    return pulsar_rows_linear_launch(&out, (const uint16_t *)(base + g.obf16), (int)n,
-                                     (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+    return step_linear(st, L.gdn_out, VT, H, "qwen GDN out_proj", (const uint16_t *)(base + g.obf16),
+                       (float *)dptr(st->st->y), linws, g.lin_ws_bytes) ||
            fail("the GDN out_proj launch failed");
 }
 
@@ -936,12 +983,6 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     const pulsar_tensor *nrm[4] = {L.attn_q_norm, L.attn_k_norm, L.idx_q_norm, L.idx_k_norm};
     for (int i = 0; i < 4; i++)
         if (!admit(nrm[i], nrm[i]->type == PULSAR_TENSOR_BF16, "bf16 (the QSA kernel's norm dtype)")) return false;
-    pulsar_rows_linear q, k, v, ix, out;
-    if (!linear_dev(st, L.attn_q, H, pulsar_qwen_qsa_q_in(s),   "qwen QSA q_proj", &q) ||
-        !linear_dev(st, L.attn_k, H, pulsar_qwen_qsa_kv_in(s),  "qwen QSA k_proj", &k) ||
-        !linear_dev(st, L.attn_v, H, pulsar_qwen_qsa_kv_in(s),  "qwen QSA v_proj", &v) ||
-        !linear_dev(st, L.idx_qk, H, PULSAR_QSA_IDX_IN, "qwen QSA index_qk_proj", &ix) ||
-        !linear_dev(st, L.attn_o, pulsar_qwen_qsa_out_dim(s), H, "qwen QSA o_proj", &out)) return false;
     /* L251 / ac69748f: bf16, as above -- the QSA projections read the block input directly. */
     const uint16_t *xin = (const uint16_t *)dptr(st->st->x);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_QSA];
@@ -965,10 +1006,12 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
 
     const uint32_t nb = st->st->n_banks;
     if (nv != 4 || nb == 0 || nb > 64) { drop(); return fail("the QSA op needs 4 projection views and 1..64 banks"); }
-    bool ok = pulsar_rows_linear_launch(&q,  xin, (int)n, (float *)dptr(vq), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_rows_linear_launch(&k,  xin, (int)n, (float *)dptr(vk), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_rows_linear_launch(&v,  xin, (int)n, (float *)dptr(vv), linws, g.lin_ws_bytes, 0) == 0 &&
-              pulsar_rows_linear_launch(&ix, xin, (int)n, (float *)dptr(vi), linws, g.lin_ws_bytes, 0) == 0;
+    const int QI = (int)pulsar_qwen_qsa_q_in(s), KVI = (int)pulsar_qwen_qsa_kv_in(s);
+    bool ok = step_linear(st, L.attn_q, H, QI,  "qwen QSA q_proj", xin, (float *)dptr(vq), linws, g.lin_ws_bytes) &&
+              step_linear(st, L.attn_k, H, KVI, "qwen QSA k_proj", xin, (float *)dptr(vk), linws, g.lin_ws_bytes) &&
+              step_linear(st, L.attn_v, H, KVI, "qwen QSA v_proj", xin, (float *)dptr(vv), linws, g.lin_ws_bytes) &&
+              step_linear(st, L.idx_qk, H, PULSAR_QSA_IDX_IN, "qwen QSA index_qk_proj", xin, (float *)dptr(vi), linws,
+                          g.lin_ws_bytes);
     if (!ok) { drop(); return fail("a QSA projection launch failed"); }
 
     /* the per-bank cache views: bank-major, at the sizes family_qwen.h owns */
@@ -1023,7 +1066,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                                                scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes)) : -1;
     drop();
     if (rc != 1) return fail("pulsar_gpu_qsa_forward refused the step");
-    return pulsar_rows_linear_launch(&out, (const uint16_t *)((uint8_t *)dptr(sc) + g.obf16), (int)n,
-                                     (float *)dptr(st->st->y), linws, g.lin_ws_bytes, 0) == 0 ||
+    return step_linear(st, L.attn_o, (int)pulsar_qwen_qsa_out_dim(s), H, "qwen QSA o_proj",
+                       (const uint16_t *)((uint8_t *)dptr(sc) + g.obf16), (float *)dptr(st->st->y), linws,
+                       g.lin_ws_bytes) ||
            fail("the QSA o_proj launch failed");
 }

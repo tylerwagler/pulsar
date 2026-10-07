@@ -376,8 +376,22 @@ static void section_ple(void) {
     printf("C. PLE injection (3 sequences, 2 batches, conv state carried)\n");
     const linear key = make_linear(H, HC, 10), value = make_linear(H, H, 8);
     pulsar_qwen_ple_dev w;
-    w.key_proj = dev_linear(key);
-    w.value_proj = dev_linear(value);
+    const pulsar_rows_linear kp = dev_linear(key), vp = dev_linear(value);
+    /* the op's half (L284 #2: family_qwen_s4.cpp runs the projections, through its row-kind segments): key /
+     * value of the T gathered rows at the decode widths' arm, then the launcher */
+    auto ple = [&](const pulsar_qwen_ple_dev *pw, const uint16_t *de, uint16_t *ds, int T, const pulsar_qwen_rows *pr,
+                   float *state, void *ws, size_t wsb, cudaStream_t stream) {
+        float *dk = (float *)dalloc((size_t)T * HC * 4), *dv = (float *)dalloc((size_t)T * H * 4);
+        const size_t lk = pulsar_rows_linear_workspace_bytes(&kp, T), lv = pulsar_rows_linear_workspace_bytes(&vp, T);
+        const size_t lb = lk > lv ? lk : lv;
+        void *lin = dalloc(lb);
+        int rc = pulsar_rows_linear_launch(&kp, de, T, dk, lin, lb, stream);
+        if (!rc) rc = pulsar_rows_linear_launch(&vp, de, T, dv, lin, lb, stream);
+        if (!rc) rc = pulsar_qwen_ple_launch(pw, dk, dv, ds, T, pr, state, ws, wsb, stream);
+        CK(cudaDeviceSynchronize());
+        cudaFree(dk); cudaFree(dv); cudaFree(lin);
+        return rc;
+    };
     const auto nk = rnd_bf(HC, 0.1), nq = rnd_bf(HC, 0.1), nc = rnd_bf(HC, 0.1), cw = rnd_bf((size_t)HC * 4, 0.4);
     w.norm_key = up(nk); w.norm_query = up(nq); w.norm_conv = up(nc); w.conv_w = up(cw);
     const int n_seq = 3;
@@ -404,7 +418,7 @@ static void section_ple(void) {
         uint16_t *de = up(emb_out), *ds = up(st_out);
         const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
         void *ws = dalloc(wsb);
-        const int rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pr, state, ws, wsb, 0);
+        const int rc = ple(&w, de, ds, T, &pr, state, ws, wsb, 0);
         CHECK(rc == 0, "launch T=%d", T);
         *dev_out = down(ds, (size_t)T * HC);
         if (host) {
@@ -459,7 +473,7 @@ static void section_ple(void) {
     uint16_t *de = up(emb2), *ds = up(st2);
     const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
     void *ws = dalloc(wsb);
-    int rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pr, state, ws, wsb, 0);
+    int rc = ple(&w, de, ds, T, &pr, state, ws, wsb, 0);
     const auto batch_out = down(ds, (size_t)T * HC);
     const auto batch_state = down(state, snap.size());
     CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
@@ -475,7 +489,7 @@ static void section_ple(void) {
             /* a decode step of sequence q alone: one row, one sequence, owning slot q */
             const std::vector<int32_t> zero = {0}, one = {1}, bank = {q};
             pulsar_qwen_rows p1 = {up(zero), up(zero), up(zero), up(one), up(bank), 1};
-            rc |= pulsar_qwen_ple_launch(&w, de + (size_t)row * H, ds + (size_t)row * HC, 1, &p1, state, ws, wsb, 0);
+            rc |= ple(&w, de + (size_t)row * H, ds + (size_t)row * HC, 1, &p1, state, ws, wsb, 0);
         }
     }
     const auto step_out = down(ds, (size_t)T * HC);
@@ -490,7 +504,7 @@ static void section_ple(void) {
     cw2[(size_t)5000 * 4 + 1] = to_bf(bf(cw2[(size_t)5000 * 4 + 1]) + 0.5);
     pulsar_qwen_ple_dev wm = w;
     wm.conv_w = up(cw2);
-    rc = pulsar_qwen_ple_launch(&wm, de, ds, T, &pr, state, ws, wsb, 0);
+    rc = ple(&wm, de, ds, T, &pr, state, ws, wsb, 0);
     const auto mut = down(ds, (size_t)T * HC);
     size_t moved = 0;
     for (size_t i = 0; i < mut.size(); i++) moved += mut[i] != batch_out[i];
@@ -506,7 +520,7 @@ static void section_ple(void) {
         CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
         pulsar_qwen_rows pc = pr;
         pc.state_rows = cap;
-        rc = pulsar_qwen_ple_launch(&w, de, ds, T, &pc, state, ws, wsb, 0);
+        rc = ple(&w, de, ds, T, &pc, state, ws, wsb, 0);
         const auto captured = down(cap, (size_t)T * slot_f);
         bool same_all = rc == 0;
         int compared = 0;
@@ -518,7 +532,7 @@ static void section_ple(void) {
                 for (int i = 0; i <= j; i++) pj[i] = i;
                 const std::vector<int32_t> zero = {0}, len = {j + 1}, bank = {q};
                 pulsar_qwen_rows p1 = {up(pz), up(pj), up(zero), up(len), up(bank), 1};
-                rc |= pulsar_qwen_ple_launch(&w, de + (size_t)sf[q] * H, ds + (size_t)sf[q] * HC, j + 1, &p1, state, ws,
+                rc |= ple(&w, de + (size_t)sf[q] * H, ds + (size_t)sf[q] * HC, j + 1, &p1, state, ws,
                                              wsb, 0);
                 const auto after = down(state, snap.size());
                 same_all = same_all && memcmp(after.data() + (size_t)q * slot_f,

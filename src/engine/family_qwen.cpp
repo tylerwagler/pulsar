@@ -1044,6 +1044,7 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     st.streams = s->qwen->streams;
     st.mixer = &e->qwen_weights->mixer;
     st.verify = verify;
+    st.n_dec = pulsar_qwen_step_n_dec(mode, verify, n_rows);
     std::vector<uint32_t> rope;
     st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
     if (verify && (mode != PULSAR_QWEN_STEP_PREFILL || n_rows > PULSAR_QWEN_SPEC_ROWS || !s->qwen->mtp)) {
@@ -1186,6 +1187,7 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     st.streams = s->qwen->mtp_streams;
     st.mixer = &e->qwen_weights->mtp.mixer;
     st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
+    st.n_dec = pulsar_qwen_step_n_dec(mode, st.verify, n_rows);
     bool ok = pulsar_gpu_tensor_write(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
     if (ok) ok = pulsar_gpu_begin_commands() != 0;

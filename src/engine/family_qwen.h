@@ -519,7 +519,18 @@ typedef struct {
     const uint32_t *run_first;
     /** L251 MTP: the head runs the DRAFT head (pulsar_qwen_weights::draft_head_mx): n_draft logits a row. */
     bool draft_head;
+    /** L284 #2: the row-kind boundary.  Rows [0, n_dec) take the decode arms (what decode / verify rows are
+     *  graded against), rows [n_dec, n_rows) the prompt arms (the same bytes at every row count, L266).  The
+     *  step's builder sets it (pulsar_qwen_step_n_dec); the ops cut their arm-sensitive launches at it. */
+    uint32_t n_dec;
 } pulsar_qwen_step;
+
+/** L284 #2: n_dec for a step of one kind -- a PROMPT chunk (a prefill step that is not an MTP verify) is all
+ *  prompt rows, so a prompt cut anywhere is byte-identical to one prefilled whole; a decode or verify step is
+ *  all decode rows. */
+static inline uint32_t pulsar_qwen_step_n_dec(pulsar_qwen_step_mode mode, bool verify, uint32_t n_rows) {
+    return mode == PULSAR_QWEN_STEP_PREFILL && !verify ? 0u : n_rows;
+}
 
 /** A per-layer op: reads/writes the step's slots for layer il.  Returns false
  * after printing what failed; the driver refuses the step. */
