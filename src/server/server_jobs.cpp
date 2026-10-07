@@ -1236,7 +1236,7 @@ bool gen_tool_name_open(const gen_state *g) {
 }
 
 /* L272: mask `row` (the logits a constrained slot draws its next token from) to the tokens that keep the
- * function name a prefix of a declared tool's name + the family's closer.  The token bytes are built once
+ * function name a prefix of the family's opener + a declared tool's name + its closer.  The token bytes are built once
  * per server.  false = no token is allowed (cannot happen while a declared name is a strict extension of
  * the text; said once if it does), and the row is left as it was. */
 bool gen_mask_tool_name(server *s, gen_state *g, float *row, int width) {
@@ -1256,7 +1256,8 @@ bool gen_mask_tool_name(server *s, gen_state *g, float *row, int width) {
     std::vector<int> keep;
     for (int t = 0; t < width && (size_t)t < bytes.size(); t++) {
         const std::string &b = bytes[(size_t)t];
-        if (tool_name_token_allowed(so_far, n_so_far, b.data(), b.size(), &r->tool_orders, r->family->forced_name_close))
+        if (tool_name_token_allowed(so_far, n_so_far, b.data(), b.size(), r->family->forced_name_open,
+                                    &r->tool_orders, r->family->forced_name_close))
             keep.push_back(t);
     }
     if (keep.empty()) {

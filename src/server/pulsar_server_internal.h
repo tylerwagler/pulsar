@@ -562,11 +562,15 @@ typedef struct server_family_ops {
      *  append, so prompt + output = the family's render of the turn (request_apply_forced_tool_prefill
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
-    /** L272: an UNNAMED forced call's seed ends where the function name starts, and this literal closes
-     *  the name (Qwen: ">").  While the name is open the sampler only draws tokens that keep it a prefix
-     *  of a declared tool's name, so "required" with several tools cannot name an undeclared one (Qwen
-     *  sampled "ask_user").  NULL = the family's seed does not end at the name: no constraint (an
-     *  undeclared name is dropped at the finish instead). */
+    /** L272: an UNNAMED forced call's seed ends where the function name's OPENER starts; the opener, the
+     *  name and the closer (Qwen: "=" and ">") are then sampled under a mask that keeps them a prefix of
+     *  opener + a declared tool's name + closer, so "required" with several tools cannot name an undeclared
+     *  one (Qwen sampled "ask_user").  The seed stops BEFORE the opener (token healing): Qwen's tokenizer
+     *  merges "=" with a name's first piece ("=get"), so a prompt ending in a lone "=" is a state the model
+     *  saw only before names it does not merge ("=", "convert"), and "required" chose convert_currency for
+     *  every question.  forced_name_close NULL = the family's seed does not end at the name: no constraint
+     *  (an undeclared name is dropped at the finish instead); forced_name_open may be "" (no opener). */
+    const char *forced_name_open;
     const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
      *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
@@ -2893,7 +2897,7 @@ bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
 /** L272: whether a token whose bytes are `tok` may follow `so_far` in an unnamed forced call's function
  *  name: the joined bytes stay a prefix of some declared name followed by `close`, or pass it with only
  *  whitespace after (a token may carry the closer and the newline).  An empty token is never allowed. */
-bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok,
+bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok, const char *open,
                              const tool_schema_orders *declared, const char *close);
 /** The slot is sampling an unnamed forced call's function name (the closer has not appeared yet). */
 bool gen_tool_name_open(const struct gen_state *g);

@@ -3314,6 +3314,26 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         TEST_ASSERT(p.calls().size() == 1 && p.calls()[0].name == "search" && p.calls()[0].arguments == "{\"q\": \"pulsars\"}");
         TEST_ASSERT(p.reasoning().empty() && p.content().empty() && p.errors() == 0);
         buf_free(&seed);
+        /* L272: an UNNAMED forced call's seed stops before the name's "=" (token healing: Qwen's tokenizer
+         * joins "=get"); the model's "=search>" completes the tag and the parser reads the call */
+        char *named = r.forced_tool_name;
+        r.forced_tool_name = NULL;
+        buf useed = {0};
+        r.family->forced_call_seed(&r, &useed);
+        TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "<tool_call>\n<function" : "\n</think>\n\n<tool_call>\n<function"));
+        TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
+        qwen_output_parser u;
+        TEST_ASSERT(u.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
+        std::vector<qwen_out_event> uev;
+        u.feed(useed.ptr, useed.len, &uev);
+        TEST_ASSERT(u.in_tool_call() && u.calls().empty());
+        const std::string rest = std::string("=search>\n") + body;
+        u.feed(rest.data(), rest.size(), &uev);
+        u.finish(&uev);
+        TEST_ASSERT(u.calls().size() == 1 && u.calls()[0].name == "search" && u.calls()[0].arguments == "{\"q\": \"pulsars\"}");
+        TEST_ASSERT(u.errors() == 0);
+        r.forced_tool_name = named;
+        buf_free(&useed);
         request_free(&r);
         chat_conversation_free(&c);
     }
@@ -3375,16 +3395,22 @@ static void test_tool_name_token_allowed(void) {
     tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
     tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
     const tool_schema_orders *d = &r.tool_orders;
-    TEST_ASSERT(tool_name_token_allowed("", 0, "get", 3, d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("", 0, "se", 2, d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "ask", 3, d, ">"));          /* Qwen's undeclared ask_user */
-    TEST_ASSERT(tool_name_token_allowed("get_", 4, "weather", 7, d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">", 1, d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">\n", 2, d, ">"));   /* closer + newline in one token */
-    TEST_ASSERT(!tool_name_token_allowed("get_weather", 11, ">x", 2, d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("get", 3, ">", 1, d, ">"));           /* a strict prefix cannot close */
-    TEST_ASSERT(!tool_name_token_allowed("search", 6, "_web", 4, d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "", 0, d, ">"));               /* an empty token: never */
+    TEST_ASSERT(tool_name_token_allowed("", 0, "get", 3, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("", 0, "se", 2, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "ask", 3, "", d, ">"));          /* Qwen's undeclared ask_user */
+    TEST_ASSERT(tool_name_token_allowed("get_", 4, "weather", 7, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">", 1, "", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">\n", 2, "", d, ">"));   /* closer + newline in one token */
+    TEST_ASSERT(!tool_name_token_allowed("get_weather", 11, ">x", 2, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("get", 3, ">", 1, "", d, ">"));           /* a strict prefix cannot close */
+    TEST_ASSERT(!tool_name_token_allowed("search", 6, "_web", 4, "", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "", 0, "", d, ">"));               /* an empty token: never */
+    /* L272: the opener rides the name's first token (Qwen "=get"); a bare opener is a prefix too */
+    TEST_ASSERT(tool_name_token_allowed("", 0, "=get", 4, "=", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("", 0, "=", 1, "=", d, ">"));
+    TEST_ASSERT(tool_name_token_allowed("=", 1, "search", 6, "=", d, ">"));
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "get", 3, "=", d, ">"));        /* the opener is not optional */
+    TEST_ASSERT(!tool_name_token_allowed("", 0, "=ask", 4, "=", d, ">"));
     request_free(&r);
 }
 
