@@ -1630,63 +1630,25 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
      * takes the extend path.  One recursion level by construction (the
      * stitched prompt starts_with the rewound checkpoint). */
     if (s->checkpoint_valid) {
-        pulsar_prefix_match m;
-        s->prefix_match(prompt, &m);
-        const int live_n = m.live_cut, prompt_n = m.prompt_cut;
         /* Fires for every shape that reaches here with reusable live bytes:
-         *   - SEAM: live_n > id-common (sampled vs canonical boundaries);
+         *   - SEAM: live_cut > id-common (sampled vs canonical boundaries);
          *   - SHORTER ECHO: the client strips generated reasoning, so live
-         *     carries a tail the prompt does not (live_n < checkpoint.len)
+         *     carries a tail the prompt does not (live_cut < checkpoint.len)
          *     -- measured 2026-08-28, live 390,258 vs echo 390,018;
          *   - ROLLBACK/COMPACTION: the prompt is a strict prefix of live.
          * All three are the same conversation, so the rewind+stitch below
-         * beats a rebuild; stitching is never worse (prompt_n >= 0).
+         * beats a rebuild; stitching is never worse (prompt_cut >= 0).
          *
          * L226/L273: an IMAGE request takes this route too -- a regular turn after
-         * tool continuations (the live tail is sampled ids, the prompt canonical),
-         * a replayed visible reply (the prompt shorter than live).  The images ride
-         * into the re-entry with their start_pos RE-PLACED on the stitched tokens:
-         * a block below the seam sits at its live position (which the prompt's
-         * canonical ids may have shifted), a block above it moves with the suffix,
-         * and the images arrive in prompt order, so the stitched prompt's sentinel
-         * blocks, walked in order, are their positions.  A stitch that cuts a block
-         * (the walk finds a malformed span) or leaves a block count the request's
-         * images do not match declines, said by name, and the cold rebuild merges
-         * from token 0. */
-        if (live_n > 0) {
-            pulsar_tokens stitched;
-            memset(&stitched, 0, sizeof(stitched));
-            stitched.v = (int *)xmalloc(
-                    (size_t)(live_n + (prompt->len - prompt_n)) * sizeof(int));
-            stitched.cap = live_n + (prompt->len - prompt_n);
-            memcpy(stitched.v, s->checkpoint.v, (size_t)live_n * sizeof(int));
-            memcpy(stitched.v + live_n, prompt->v + prompt_n,
-                   (size_t)(prompt->len - prompt_n) * sizeof(int));
-            stitched.len = stitched.cap;
-            enum { STITCH_IMAGES_MAX = 64 };
-            pulsar_image_ref placed[STITCH_IMAGES_MAX];
-            bool placed_ok = n_images <= STITCH_IMAGES_MAX;
-            if (placed_ok && n_images > 0) {
-                int starts[STITCH_IMAGES_MAX];
-                const int nb = pulsar_image_block_starts(e, &stitched, stitched.len, starts, STITCH_IMAGES_MAX);
-                placed_ok = nb == n_images;
-                for (int i = 0; placed_ok && i < n_images; i++) {
-                    placed[i] = images[i];
-                    placed[i].start_pos = starts[i];
-                }
-                if (!placed_ok)
-                    fprintf(stderr, "pulsar: image request: the stitched prompt (live %d + suffix from %d) carries "
-                                    "%d image block(s) for %d image(s) -- rebuilding cold\n",
-                            live_n, prompt_n, nb, n_images);
-            }
-            if (placed_ok) {
-                s->rewind(live_n);
-                const int rc = s->sync(&stitched, n_images > 0 ? placed : NULL,
-                                       n_images > 0 ? n_images : 0, err, errlen);
-                free(stitched.v);
-                return rc;
-            }
-            free(stitched.v);
+         * tool continuations, a replayed visible reply -- with its images re-placed
+         * on the stitched tokens (pulsar_session_seam_stitch, the core's for every
+         * family, L284); a stitch whose blocks are not the request's declines, said
+         * by name, and the cold rebuild merges from token 0. */
+        pulsar_seam_stitch seam;
+        if (pulsar_session_seam_stitch(s, prompt, images, n_images, 0, &seam)) {
+            s->rewind(seam.live_cut);
+            return s->sync(&seam.tokens, n_images > 0 ? seam.placed : NULL, n_images > 0 ? n_images : 0, err,
+                           errlen);
         }
     }
 

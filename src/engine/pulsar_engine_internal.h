@@ -3259,6 +3259,28 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
  *  rank must poll at the same boundaries. */
 bool pulsar_session_cancelled(pulsar_session *s);
 
+/** L115 token-seam rescue, the family-neutral half (sync_driver.cpp, L284): the prompt re-spells, with canonical
+ *  ids, bytes the live view holds with its sampled ids.  `tokens` is live[0..live_cut) + prompt[prompt_cut..] --
+ *  the live history up to the deepest shared byte boundary, the prompt after it -- and `placed` the request's
+ *  images re-placed on it (L226/L273).  How the session reaches `live_cut` is the family's: a rewind, or the
+ *  resume rule from a grid checkpoint at or below it. */
+struct pulsar_seam_stitch {
+    enum { IMAGES_MAX = 64 };
+    pulsar_tokens tokens = {};                ///< owned; freed with the stitch
+    pulsar_image_ref placed[IMAGES_MAX] = {};  ///< the request's images, start_pos on `tokens`
+    int live_cut = 0;                         ///< live tokens the stitch keeps
+    int prompt_cut = 0;                       ///< prompt tokens the kept live tokens re-spell
+    pulsar_seam_stitch() = default;
+    pulsar_seam_stitch(const pulsar_seam_stitch &) = delete;
+    pulsar_seam_stitch &operator=(const pulsar_seam_stitch &) = delete;
+    ~pulsar_seam_stitch() { free(tokens.v); }
+};
+/** Stitch `prompt` onto the live view when the byte match keeps more than `past` live tokens.  false = no
+ *  stitch: the view is not valid, the match keeps `past` or fewer, or (said) the stitched prompt's image blocks
+ *  are not the request's images (a block cut by the seam, a count that differs). */
+bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                int n_images, int past, pulsar_seam_stitch *out);
+
 /** What a family supplies for the core's default sync (sync_driver.cpp, L272 P2). */
 typedef struct pulsar_sync_ops {
     const char *name;                                  ///< the family's name in messages

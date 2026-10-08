@@ -11,8 +11,15 @@
  *     its last row), else reset the bank and prefill from 0;
  *   - the prefill runs on the core loop: interruptible, with progress, at the session's chunk cap.
  * Qwen (L266, L272 P2) runs on it.  DeepSeek keeps its own sync for what only it has -- the compressor
- * self-heal (L148) and the token-seam rescue (L115) -- over the same shared pieces: the resume rule, the
- * prefill walk, the logits flag, and (L268) the image path.
+ * self-heal (L148) and the rewind -- over the same shared pieces: the resume rule, the prefill walk, the
+ * logits flag, (L268) the image path, and (L284) the token-seam stitch.
+ *
+ * L115/L284 token seam, the core's for every family: a client re-sends sampled turns in canonical spelling
+ * (Claude Code after tool continuations), so the ids part at the first seam while every byte still agrees.
+ * pulsar_session_seam_stitch keeps the live history up to the deepest shared byte boundary and the prompt
+ * after it; what a family does with it is how it reaches that boundary -- DeepSeek rewinds to it, this
+ * driver syncs the stitched prompt (it extends the view, or resumes from the deepest grid checkpoint at or
+ * below the boundary through the one resume rule).
  *
  * L268 images, the core's for every family (image_front.cpp, image_identity.cpp):
  *   - a request's blocks must each fit one chunk; a prompt with no images carries no sentinel;
@@ -54,6 +61,43 @@ static bool sync_images_hold_below(const pulsar_session *s, const pulsar_tokens 
     return pulsar_image_identity_equal(&held, &want);
 }
 
+bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                int n_images, int past, pulsar_seam_stitch *out) {
+    pulsar_prefix_match m;
+    s->prefix_match(prompt, &m);
+    if (m.live_cut <= past) return false;
+    const int live_n = m.live_cut, prompt_n = m.prompt_cut;
+    pulsar_tokens *st = &out->tokens;
+    free(st->v);
+    st->cap = live_n + (prompt->len - prompt_n);
+    st->v = (int *)xmalloc((size_t)st->cap * sizeof(int));
+    memcpy(st->v, s->checkpoint.v, (size_t)live_n * sizeof(int));
+    memcpy(st->v + live_n, prompt->v + prompt_n, (size_t)(prompt->len - prompt_n) * sizeof(int));
+    st->len = st->cap;
+    out->live_cut = live_n;
+    out->prompt_cut = prompt_n;
+    /* L226/L273: a block below the seam sits at its live position (which the prompt's canonical ids may have
+     * shifted), a block above it moves with the suffix, and the images arrive in prompt order, so the stitched
+     * prompt's sentinel blocks, walked in order, are their positions.  A stitch that cuts a block (the walk
+     * finds a malformed span) or leaves a block count the request's images do not match declines. */
+    if (n_images <= 0) return true;
+    bool placed_ok = n_images <= pulsar_seam_stitch::IMAGES_MAX;
+    if (placed_ok) {
+        int starts[pulsar_seam_stitch::IMAGES_MAX];
+        const int nb = pulsar_image_block_starts(s->engine, st, st->len, starts, pulsar_seam_stitch::IMAGES_MAX);
+        placed_ok = nb == n_images;
+        for (int i = 0; placed_ok && i < n_images; i++) {
+            out->placed[i] = images[i];
+            out->placed[i].start_pos = starts[i];
+        }
+        if (!placed_ok)
+            fprintf(stderr, "pulsar: image request: the stitched prompt (live %d + suffix from %d) carries "
+                            "%d image block(s) for %d image(s) -- rebuilding cold\n",
+                    live_n, prompt_n, nb, n_images);
+    }
+    return placed_ok;
+}
+
 int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                 int n_images, const pulsar_sync_ops *ops, char *err, size_t errlen) {
     /* a prompt that fills the context leaves no row for the eval that follows it (L272 B4) */
@@ -77,10 +121,26 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     const uint32_t live = pulsar_session_live_bank(s);
     /* `common` is read before the agreement check: a view the state has moved past can no longer be
      * continued, but its prefix still says which checkpoint the prompt shares */
-    const int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
+    int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
     /* the bank's state is the authority; the view must agree with it to be continued (a batched step on
      * the live bank moves the state, not the view) */
     if (s->checkpoint_valid && !ops->state_agrees(s)) s->checkpoint_valid = false;
+    /* L284 token seam: a prompt that leaves the view by ids may still re-spell it by bytes past `common`; the
+     * stitched prompt keeps those live tokens, and everything below runs on it (its images re-placed) */
+    pulsar_seam_stitch seam;
+    if (s->checkpoint_valid && common < s->checkpoint.len &&
+        pulsar_session_seam_stitch(s, prompt, images, n_images, common, &seam)) {
+        if (seam.tokens.len >= s->ctx_size) {
+            if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d)", ops->name, seam.tokens.len,
+                              s->ctx_size);
+            return 1;
+        }
+        fprintf(stderr, "pulsar: %s: token seam -- keeping %d live tokens for the prompt's first %d (shared by "
+                        "id %d)\n", ops->name, seam.live_cut, seam.prompt_cut, common);
+        prompt = &seam.tokens;
+        if (n_images > 0) images = seam.placed;
+        common = pulsar_tokens_common_prefix(&s->checkpoint, prompt);
+    }
     /* L268: an image request extends the live KV only under the licence */
     if (n_images > 0 && s->checkpoint_valid) {
         pulsar_image_licence lic;
