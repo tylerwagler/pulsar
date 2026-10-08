@@ -510,7 +510,7 @@ struct server;
 struct request;
 /** How a family's generated text is read. */
 typedef enum {
-    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, truncation repair, recovery, tool memory, the canonical rewrite, live tool state
+    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, recovery, tool memory, the canonical rewrite, live tool state
     SERVER_PARSER_QWEN = 1,   ///< ONE qwen_output_parser per generation (gen_state::qwen); the turn ends at the family's stop token
 } server_parser_kind;
 typedef struct server_family_ops {

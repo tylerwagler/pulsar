@@ -1516,7 +1516,7 @@ void server::gen_step_finish(session_slot *sl) {
         snprintf(g->err, sizeof(g->err), "shutdown requested");
     }
 
-    /* L272 P3: the family's final reading of the turn -- its repair of a truncated call, its parse,
+    /* L272 P3: the family's final reading of the turn -- its parse, the shared broken-call rule (L284 P4),
      * its model-visible retry (the generation loops to a fresh attempt), the stream's ids onto the
      * calls, its memory, the finish label. */
     server_turn turn;
