@@ -3474,8 +3474,8 @@ static int test_control_id_for_literal(pulsar_engine *e, const char *literal) {
     return id;
 }
 
-/* L185: the token-level twin (agent/CLI/bench/eval -- pulsar_chat_begin /
- * append_lead_in / append_message / append_assistant_prefix) against the
+/* L185: the token-level twin (agent/CLI/bench/eval -- the DeepSeek family's
+ * chat front: pulsar_chat_open / pulsar_chat_append_turn, L284 P14) against the
  * server's renderer for the SAME conversation.
  *
  * The twin is the `-p`/eval/bench path and the agent's prompt builder; the
@@ -3508,17 +3508,19 @@ static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *m
     pulsar_tokens srv = {0};
     pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
 
+    /* the system FIELD (case 1) is the head's system text; every other message is the turn */
     pulsar_tokens twin = {0};
-    pulsar_chat_begin(e, &twin);
-    pulsar_chat_append_lead_in(e, &twin, has_system, mode);
-    for (int i = 0; i < msgs->len; i++) {
+    const int first = has_system ? 1 : 0;
+    pulsar_chat_open(e, &twin, NULL, has_system ? msgs->v[0].content : NULL, mode);
+    pulsar_chat_message turn[8];
+    TEST_ASSERT(msgs->len - first <= (int)(sizeof turn / sizeof turn[0]));
+    for (int i = first; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         const bool tool = !strcmp(m->role, "tool") || !strcmp(m->role, "function");
         const bool sys = role_is_system(m->role);
-        pulsar_chat_append_message(e, &twin, tool ? "tool" : (sys ? "system" : "user"),
-                                   m->content ? m->content : "");
+        turn[i - first] = {tool ? "tool" : (sys ? "system" : "user"), m->content ? m->content : "", false};
     }
-    pulsar_chat_append_assistant_prefix(e, &twin, mode);
+    pulsar_chat_append_turn(e, &twin, turn, msgs->len - first, true, mode);
 
     int diff = -1, ndiff = 0;
     const int lim = srv.len < twin.len ? srv.len : twin.len;

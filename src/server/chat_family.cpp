@@ -350,8 +350,7 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
             for (int k = 0; k < m->calls.len; k++)
                 (*qc)[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
             if (!strcmp(m->role, "system") && (tail || !qm->empty())) {
-                (*notes)[(size_t)i] = std::string("<system-reminder>\n") + (m->content ? m->content : "") +
-                                      "\n</system-reminder>";
+                (*notes)[(size_t)i] = qwen_system_reminder(m->content);
                 qm->push_back({"user", (*notes)[(size_t)i].c_str(), NULL, NULL, 0, NULL});
                 continue;
             }

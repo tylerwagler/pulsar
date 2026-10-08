@@ -1054,13 +1054,13 @@ typedef struct {
     pulsar_session *session;    ///< KV session backing the transcript
     pulsar_tokens transcript;   ///< the conversation so far, as tokens
     int ctx_size;               ///< context positions available
-    /** Tokens of think-mode prefix currently sitting in the transcript. Tracked
-     * so a mode change can remove exactly the old prefix instead of rebuilding
-     * the whole transcript. */
-    bool has_system;                 ///< a system message follows the lead-in
-    int lead_in_tokens;              ///< System token + effort line currently in the transcript
-    pulsar_think_mode lead_in_mode;  ///< mode whose lead-in is in the transcript
-    bool lead_in_applied;
+    const char *system;         ///< the system prompt the head carries (NULL = none)
+    /** The head (pulsar_chat_open) sits at transcript[0, head_len) and carries the think mode where the
+     *  family's template puts it (DeepSeek's effort line, Qwen's system block); a mode change swaps exactly
+     *  it instead of rebuilding the whole transcript. */
+    int head_len;
+    pulsar_think_mode head_mode;  ///< the mode the head in the transcript was rendered for
+    bool head_applied;
 } repl_chat;
 
 static void tokens_insert(pulsar_tokens *dst, int pos, const pulsar_tokens *src) {
@@ -1090,25 +1090,18 @@ static void tokens_remove(pulsar_tokens *dst, int pos, int n) {
     dst->len -= n;
 }
 
-/* Insert/remove/swap the V4.1 lead-in (System token + reasoning-effort line)
- * inside the existing transcript.  It lives after BOS, before any system
- * text, which mirrors the API rendering path.  Changing it invalidates the
- * session because every later token position would otherwise refer to the
- * wrong prefix. */
-static void repl_chat_apply_lead_in(pulsar_engine *engine, repl_chat *chat,
-                                    pulsar_think_mode mode) {
-    if (chat->lead_in_applied && mode == chat->lead_in_mode) return;
-    if (chat->lead_in_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->lead_in_tokens);
-        chat->lead_in_tokens = 0;
-    }
-    pulsar_tokens prefix = {0};
-    pulsar_chat_append_lead_in(engine, &prefix, chat->has_system, mode);
-    tokens_insert(&chat->transcript, 1, &prefix);
-    chat->lead_in_tokens = prefix.len;
-    chat->lead_in_mode = mode;
-    chat->lead_in_applied = true;
-    pulsar_tokens_free(&prefix);
+/* Swap the head (pulsar_chat_open) at the front of the transcript for the one `mode` renders.  Changing it
+ * invalidates the session because every later token position would otherwise refer to the wrong prefix. */
+static void repl_chat_apply_head(pulsar_engine *engine, repl_chat *chat, pulsar_think_mode mode) {
+    if (chat->head_applied && mode == chat->head_mode) return;
+    tokens_remove(&chat->transcript, 0, chat->head_len);
+    pulsar_tokens head = {0};
+    pulsar_chat_open(engine, &head, NULL, chat->system, mode);
+    tokens_insert(&chat->transcript, 0, &head);
+    chat->head_len = head.len;
+    chat->head_mode = mode;
+    chat->head_applied = true;
+    pulsar_tokens_free(&head);
     if (chat->session) pulsar_session_invalidate(chat->session);
 }
 
@@ -1126,12 +1119,8 @@ static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int 
 
 static int repl_chat_init(pulsar_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
-    pulsar_chat_begin(engine, &chat->transcript);
-    chat->has_system = cfg->gen.system && cfg->gen.system[0];
-    repl_chat_apply_lead_in(engine, chat, cfg->gen.think_mode);
-    if (chat->has_system) {
-        pulsar_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
-    }
+    chat->system = cfg->gen.system && cfg->gen.system[0] ? cfg->gen.system : NULL;
+    repl_chat_apply_head(engine, chat, cfg->gen.think_mode);
     return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
 }
 
@@ -1149,10 +1138,11 @@ static int repl_chat_set_ctx(pulsar_engine *engine, repl_chat *chat, int ctx_siz
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
-/* Run one interactive turn.  The transcript is tentatively extended with user
- * and assistant markers, then pulsar_session_sync() decides whether this is a KV
- * continuation.  If prompt processing fails, the transcript rolls back before
- * returning to the prompt. */
+/* Run one interactive turn.  The transcript is tentatively extended with the
+ * family's turn -- the user message and the opened assistant turn, rendered whole
+ * -- then pulsar_session_sync() decides whether this is a KV continuation.  If
+ * prompt processing fails, the transcript rolls back before returning to the
+ * prompt. */
 static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
     if (!chat->session) {
         fprintf(stderr, "pulsar: no active interactive KV cache\n");
@@ -1160,10 +1150,10 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     }
 
     const pulsar_think_mode think_mode = cfg->gen.think_mode;
-    repl_chat_apply_lead_in(engine, chat, think_mode);
+    repl_chat_apply_head(engine, chat, think_mode);
     const int rollback_len = chat->transcript.len;
-    pulsar_chat_append_message(engine, &chat->transcript, "user", user_text);
-    pulsar_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
+    const pulsar_chat_message user = {"user", user_text, false};
+    pulsar_chat_append_turn(engine, &chat->transcript, &user, 1, true, think_mode);
 
     const int old_pos = pulsar_session_pos(chat->session);
     const int common = pulsar_session_common_prefix(chat->session, &chat->transcript);
@@ -1275,7 +1265,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         chat->transcript.len = rollback_len;
         pulsar_session_invalidate(chat->session);
     } else {
-        pulsar_tokens_push(&chat->transcript, pulsar_token_eos(engine));
+        pulsar_chat_end_assistant(engine, &chat->transcript);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1283,8 +1273,8 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     if (interrupted) cli_interrupt_clear();
     pulsar_log(stderr,
             PULSAR_LOG_TIMING,
-            "pulsar: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
+            "pulsar: prompt %d tokens (%d continued from the KV), prefill: %.2f t/s, generation: %.2f t/s\n",
+            cached + suffix, cached, prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
@@ -1356,12 +1346,12 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "pulsar: /think takes an effort in [1, 100] or -low/-high/-max\n");
             } else {
                 cfg->gen.think_mode = mode;
-                repl_chat_apply_lead_in(engine, &chat, mode);
+                repl_chat_apply_head(engine, &chat, mode);
                 printf("Thinking mode: %s (effort %d).\n", pulsar_think_mode_name(mode), mode);
             }
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = PULSAR_THINK_NONE;
-            repl_chat_apply_lead_in(engine, &chat, PULSAR_THINK_NONE);
+            repl_chat_apply_head(engine, &chat, PULSAR_THINK_NONE);
             puts("Thinking mode: none.");
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
@@ -1708,16 +1698,7 @@ int main(int argc, char **argv) {
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
-        /* L272 B10: the REPL builds DeepSeek's template turn by turn (pulsar_chat_begin and the
-         * append entries); a family that renders its chat whole has no REPL here -- refused by name
-         * at startup, not inside the tokenizer's exit(1). */
-        if (pulsar_engine_chat_format(engine) == PULSAR_CHAT_QWEN) {
-            fprintf(stderr, "pulsar: the interactive REPL renders DeepSeek's chat template; %s takes -p <prompt>\n",
-                    pulsar_engine_family_name(engine));
-            rc = 2;
-        } else {
-            rc = run_repl(engine, &cfg);
-        }
+        rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);
     }

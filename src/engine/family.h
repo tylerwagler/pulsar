@@ -178,9 +178,13 @@ typedef struct pulsar_family_tokenizer {
     /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none). */
     void (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
                             pulsar_tokens *out);
-    /** One system + one user message, rendered and tokenized the family's way (the CLI's one-shot). */
-    void (*encode_chat_prompt)(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
-                               pulsar_tokens *out);
+    /** The chat front turn by turn (pulsar.h pulsar_chat_open / _append_turn / _end_assistant): the head, one
+     *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
+    void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode);
+    void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                      bool generation_prompt, pulsar_think_mode think_mode);
+    void (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     bool (*is_stop)(pulsar_engine *e, int token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
     int (*eos)(pulsar_engine *e);
@@ -191,10 +195,6 @@ typedef struct pulsar_family_tokenizer {
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */
     void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
-    /** The family's chat is DeepSeek's marker template, which the incremental entries
-     *  (pulsar_chat_begin / _append_lead_in / _append_message / _append_assistant_prefix) build; a family
-     *  that renders its chat whole (Qwen: qwen_chat_render) refuses them by name. */
-    bool incremental_ds4_template;
 } pulsar_family_tokenizer;
 
 /** A family's own bank pool (L251): the server's per-bank bookkeeping for a

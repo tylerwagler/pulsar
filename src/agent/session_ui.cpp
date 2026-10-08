@@ -837,6 +837,7 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
     if (ok) {
         pulsar_tokens_free(&w->transcript);
         w->transcript = f.tokens;
+        agent_turn_clear(w);
         memset(&f.tokens, 0, sizeof(f.tokens));
         free(w->session_title);
         w->session_title = f.title && f.title[0] ? xstrdup(f.title) : xstrdup("(no user prompt)");

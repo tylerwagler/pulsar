@@ -222,7 +222,8 @@ bool agent_tool_result_fits_context(agent_worker *w, const char *result,
                                            int *tokens_out) {
     pulsar_tokens tmp = {0};
     pulsar_tokens_copy(&tmp, &w->transcript);
-    pulsar_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
+    const pulsar_chat_message tool = {"tool", result ? result : "", false};
+    agent_turn_render(w, &tmp, &tool, 1, w->cfg->gen.think_mode);
     int tokens = tmp.len;
     pulsar_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;

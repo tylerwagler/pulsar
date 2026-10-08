@@ -473,7 +473,7 @@ int GATE_ENTRY(int argc, char **argv) {
         snprintf(user + off, cap - off, "%s", PROMPT);
     }
 
-    /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+    /* the family's one-turn render (L278) */
     pulsar_encode_chat_prompt(engine, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
     char err[256];
     if (pulsar_session_sync(session, &prompt, err, sizeof(err)) != 0) {

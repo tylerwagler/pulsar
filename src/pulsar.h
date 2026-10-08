@@ -451,24 +451,42 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 size_t pulsar_tool_result_escape(const char *s,
                                  void (*emit)(void *ud, const char *bytes, size_t n),
                                  void *ud);
-/** DeepSeek's chat template, built from marker ids: pulsar_chat_begin, _append_lead_in,
- * _append_message and _append_assistant_prefix end the process on a Qwen engine (its chat is rendered
- * whole).  pulsar_encode_chat_prompt serves both: a Qwen engine renders [system,] user through
- * qwen_chat_render, as the server does; its think_mode is PULSAR_THINK_NONE or PULSAR_THINK_DEFAULT
- * (the template's default effort) -- any other effort ends the process, never a neighbouring one. */
-void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
+/** One message of a chat turn (pulsar_chat_append_turn). */
+typedef struct {
+    const char *role;     ///< "user", "tool" (a tool result), or "system" (a note: the head's region before any
+                          ///< turn, a mid-conversation system note after one)
+    const char *content;  ///< client text (NULL = empty)
+    /** `content` is the front end's own control text, written in the loaded family's markers (the agent's
+     *  DSML tool prompt): DeepSeek tokenizes it as rendered chat; a family whose markers it does not spell
+     *  renders it as text. */
+    bool trusted;
+} pulsar_chat_message;
+
+/** The family's chat front, turn by turn (L284 P14): the CLI REPL and the agent build a live transcript with
+ * these on every family, each piece rendered WHOLE by the family's own renderer (DeepSeek's marker template;
+ * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
+ * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
+ * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.
+ *
+ * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
+ * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
+ * client `system` text (NULL = none).  Appended to `tokens`, which a caller starts empty. */
+void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode);
+/** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
+ * with `generation_prompt`, the assistant turn opened for `think_mode`. */
+void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                             bool generation_prompt, pulsar_think_mode think_mode);
+/** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
+ * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
+void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+/** The one-shot prompt: pulsar_chat_open(system) + a turn of one user message with the generation prompt. */
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out);
-/** The V4.1 lead-in after BOS: the System token when the conversation opens
- * with the effort line (thinking on) or with system text, then the effort line. */
-void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
-                                pulsar_think_mode think_mode);
-void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content);
-void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
 int pulsar_token_eos(pulsar_engine *e);

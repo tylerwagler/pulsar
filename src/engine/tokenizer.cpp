@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
+#include <string>
 
 
 
@@ -592,8 +593,8 @@ void pulsar_vocab::vocab_free() {
  * after the last template marker -- whenever text joins it.  The run's text is
  * recovered from the tokens themselves (vocab_token_text is the inverse the KV
  * keys already rely on), so the twin carries NO state of its own: the rules
- * below are the only authority, and token surgery by a caller (the CLI's
- * lead-in insert, compaction's transcript swap) cannot desynchronise a state
+ * below are the only authority, and token surgery by a caller (the CLI REPL's
+ * head swap, compaction's transcript swap) cannot desynchronise a state
  * copy because there is none.
  *
  * The flush is eager: a run is tokenised as soon as its text is known, and
@@ -754,34 +755,6 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
 
 
 
-/* Build the V4.1 chat prompt: BOS, the lead-in, optional system text, user
- * prompt, assistant marker, and either <think> or </think> depending on the
- * requested mode.  The effort line is only a prompt prefix: the model still
- * enters through <think>. */
-static void encode_chat_prompt(
-        const pulsar_vocab *vocab,
-        const char      *system,
-        const char      *prompt,
-        pulsar_think_mode   think_mode,
-        token_vec       *out) {
-    chat_tmpl_push_marker(out, vocab->bos_id);
-    const bool has_system = system && system[0];
-    encode_chat_lead_in(vocab, has_system, think_mode, out);
-    /* The system FIELD is the leading system region: it joins the effort line's
-     * run with no marker of its own, exactly as the renderer writes it. */
-    chat_tmpl_append_text(vocab, out, system);
-    chat_tmpl_push_marker(out, vocab->user_id);
-    chat_tmpl_append_text(vocab, out, prompt);
-    chat_tmpl_push_marker(out, vocab->assistant_id);
-    if (pulsar_think_mode_enabled(think_mode)) {
-        token_vec_push(out, vocab->think_start_id);
-    } else {
-        token_vec_push(out, vocab->think_end_id);
-    }
-}
-
-
-
 /* The tokenizer and chat entries serve a family that declares a tokenizer
  * (family.h PULSAR_FAMILY_CAP_CHAT).  These entries return no error, so a
  * family without one ends the process here, by name, instead of tokenizing
@@ -790,17 +763,6 @@ static void encode_chat_prompt(
 static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
     if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op) && e->family->tokenizer) return e->family->tokenizer;
     fprintf(stderr, "pulsar: %s has no tokenizer in this build -- exiting\n", e ? e->family->name : "(no engine)");
-    exit(1);
-}
-
-/* The entries below that BUILD DeepSeek's chat template from marker ids (lead-in, message, assistant
- * prefix) serve only a family whose chat IS that template; one that renders its chat whole (Qwen:
- * qwen_chat_render) ends the process here, by name, instead of pushing DeepSeek's markers from a
- * vocabulary it does not have. */
-static void ds4_template_require(const pulsar_engine *e, const char *op) {
-    if (tokenizer_require(e, op)->incremental_ds4_template) return;
-    fprintf(stderr, "pulsar: %s builds DeepSeek's chat template; %s renders its chat whole -- exiting\n", op,
-            e->family->name);
     exit(1);
 }
 
@@ -965,28 +927,25 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 
 
 
-void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens) {
-    ds4_template_require(e, "pulsar_chat_begin");
-    token_vec_push(tokens, e->vocab.bos_id);
+void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode) {
+    tokenizer_require(e, "pulsar_chat_open")->chat_open(e, tokens, trusted, system, think_mode);
 }
 
-
-
-void pulsar_encode_chat_prompt(
-        pulsar_engine *e,
-        const char *system,
-        const char *prompt,
-        pulsar_think_mode think_mode,
-        pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_encode_chat_prompt")->encode_chat_prompt(e, system, prompt, think_mode, out);
+void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                             bool generation_prompt, pulsar_think_mode think_mode) {
+    tokenizer_require(e, "pulsar_chat_append_turn")->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
 }
 
+void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    tokenizer_require(e, "pulsar_chat_end_assistant")->chat_end_assistant(e, tokens);
+}
 
-
-void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
-                                pulsar_think_mode think_mode) {
-    ds4_template_require(e, "pulsar_chat_append_lead_in");
-    encode_chat_lead_in(&e->vocab, has_system, think_mode, tokens);
+void pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
+                               pulsar_tokens *out) {
+    pulsar_chat_open(e, out, NULL, system, think_mode);
+    const pulsar_chat_message user = {"user", prompt ? prompt : "", false};
+    pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
 }
 
 
@@ -1027,8 +986,15 @@ size_t pulsar_tool_result_escape(const char *s,
 
 
 
-void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content) {
-    ds4_template_require(e, "pulsar_chat_append_message");
+/* Front-end control text in DeepSeek's markers (pulsar_chat_message::trusted), tokenised as rendered chat into a
+ * piece of its own: joining it to the open run would re-tokenise its markers (the DSML ids) as plain text. */
+static void ds4_chat_append_trusted(pulsar_vocab *vocab, pulsar_tokens *tokens, const char *text) {
+    vocab->tokenize_rendered_chat_vocab(text, (token_vec *)tokens);
+}
+
+/* One message of a DeepSeek turn: the renderer's rules, appended to the run they join. */
+static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
+                                    bool trusted) {
     pulsar_vocab *vocab = &e->vocab;
     const bool v41 = pulsar_engine_chat_v41(e);
     if (!role) role = "user";
@@ -1040,16 +1006,25 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
          * lead-in's run); after one it is a mid-conversation note -- V4.1 marks
          * it in place with the System token, V4 wraps it in a user turn. */
         if (!chat_tmpl_saw_turn(vocab, tokens)) {
-            chat_tmpl_append_text(vocab, tokens, content);
+            if (trusted) ds4_chat_append_trusted(vocab, tokens, content);
+            else chat_tmpl_append_text(vocab, tokens, content);
         } else if (v41) {
             chat_tmpl_push_system_marker(vocab, tokens);
-            chat_tmpl_append_text(vocab, tokens, content);
+            if (trusted) ds4_chat_append_trusted(vocab, tokens, content);
+            else chat_tmpl_append_text(vocab, tokens, content);
         } else {
             chat_tmpl_push_marker(tokens, vocab->user_id);
-            chat_tmpl_append_text(vocab, tokens, "<system-reminder>\n");
-            chat_tmpl_append_text(vocab, tokens, content);
-            chat_tmpl_append_text(vocab, tokens, "\n</system-reminder>");
+            if (trusted) {
+                std::string note = std::string("<system-reminder>\n") + content + "\n</system-reminder>";
+                ds4_chat_append_trusted(vocab, tokens, note.c_str());
+            } else {
+                chat_tmpl_append_text(vocab, tokens, "<system-reminder>\n");
+                chat_tmpl_append_text(vocab, tokens, content);
+                chat_tmpl_append_text(vocab, tokens, "\n</system-reminder>");
+            }
         }
+    } else if (trusted) {
+        pulsar_die("pulsar_chat_append_turn: only a system message carries trusted control text");
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         /* V4.1 joins consecutive user-SIDE messages (user text and tool results in
          * any order) into one turn; V4 opens a fresh turn for each user message
@@ -1066,7 +1041,7 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
          * and the CLI append a SAMPLED turn's tokens, and the server owns the
          * replay rules).  The old branch guessed a stripped replay and could not
          * be right; refuse instead of guessing. */
-        pulsar_die("pulsar_chat_append_message: an assistant turn cannot be "
+        pulsar_die("pulsar_chat_append_turn: an assistant turn cannot be "
                    "appended here -- append the sampled tokens, or render it "
                    "through the server's renderer (L185)");
     } else {
@@ -1079,11 +1054,35 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
 
 
 
-void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    ds4_template_require(e, "pulsar_chat_append_assistant_prefix");
+/* ---- the DeepSeek family's chat front, turn by turn (pulsar.h pulsar_chat_open, L284 P14) ---------------- */
+
+/* BOS, the lead-in (the System marker and effort line), then the leading system region: trusted control text
+ * as a rendered piece of its own, and client text joining the open run (the effort line's, when there is no
+ * trusted text -- as the renderer writes it). */
+static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                          pulsar_think_mode think_mode) {
+    pulsar_vocab *vocab = &e->vocab;
+    const bool has_system = system && system[0];
+    chat_tmpl_push_marker(tokens, vocab->bos_id);
+    encode_chat_lead_in(vocab, has_system, think_mode, (token_vec *)tokens);
+    if (trusted && trusted[0]) ds4_chat_append_trusted(vocab, tokens, trusted);
+    if (!has_system) return;
+    if (trusted && trusted[0]) vocab->tokenize_span(system, strlen(system), (token_vec *)tokens);
+    else chat_tmpl_append_text(vocab, tokens, system);
+}
+
+static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                          bool generation_prompt, pulsar_think_mode think_mode) {
+    for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
+    if (!generation_prompt) return;
     chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
     chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
                           e->vocab.think_start_id : e->vocab.think_end_id);
+}
+
+/* the sampled turn's stop token is the template's turn end */
+static void ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    chat_tmpl_push_marker(tokens, e->vocab.eos_id);
 }
 
 
@@ -2076,11 +2075,6 @@ static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pu
     else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
 }
 
-static void ds4_tok_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt,
-                                       pulsar_think_mode think_mode, pulsar_tokens *out) {
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
-}
-
 static bool ds4_tok_is_stop(pulsar_engine *e, int token) { return token == e->vocab.eos_id; }
 static int ds4_tok_eos(pulsar_engine *e) { return e->vocab.eos_id; }
 static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { return vocab_token_text(&e->vocab, token, len); }
@@ -2100,12 +2094,13 @@ static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens
 const pulsar_family_tokenizer k_ds4_tokenizer = {
     /* .encode_text              = */ ds4_tok_encode_text,
     /* .encode_rendered          = */ ds4_tok_encode_rendered,
-    /* .encode_chat_prompt       = */ ds4_tok_encode_chat_prompt,
+    /* .chat_open                = */ ds4_chat_open,
+    /* .chat_turn                = */ ds4_chat_turn,
+    /* .chat_end_assistant       = */ ds4_chat_end_assistant,
     /* .is_stop                  = */ ds4_tok_is_stop,
     /* .eos                      = */ ds4_tok_eos,
     /* .token_text               = */ ds4_tok_token_text,
     /* .think_close              = */ ds4_tok_think_close,
     /* .turn_markers             = */ ds4_tok_turn_markers,
     /* .dump                     = */ ds4_tok_dump,
-    /* .incremental_ds4_template = */ true,
 };
