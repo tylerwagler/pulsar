@@ -173,9 +173,6 @@ typedef struct {
     const char *tp_kv_dir;
 } pulsar_engine_options;
 
-typedef void (*pulsar_token_emit_fn)(void *ud, int token);
-typedef void (*pulsar_generation_done_fn)(void *ud);
-
 /** GPU byte breakdown of one bank's context buffers at a given context size,
  * in the stored KV row formats (packed NVFP4 attention rows, MXFP4 indexer
  * rows).
@@ -210,9 +207,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
  * pulsar_session_* operation on a worker is refused by name. */
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
 /** Any rank of a TP group (leader included).  Generation on such an engine
- * rides the session lane, whose operations the group mirrors (slice 4e); the
- * raw whole-graph path (pulsar_engine_generate_argmax) has no transport and
- * refuses by name. */
+ * rides the session lane, whose operations the group mirrors (slice 4e). */
 bool pulsar_engine_is_tp(const pulsar_engine *e);
 /** The engine's TP transport, or NULL when it is not tensor-parallel.  For
  * read-only operator views (pulsar-server's /health tp block) that read the
@@ -403,13 +398,6 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e);
 bool pulsar_log_is_tty(FILE *fp);
 void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...);
-int pulsar_engine_generate_argmax(pulsar_engine *e, const pulsar_tokens *prompt,
-                               int n_predict, int ctx_size,
-                               pulsar_token_emit_fn emit,
-                               pulsar_generation_done_fn done,
-                               void *emit_ud,
-                               pulsar_session_progress_fn progress,
-                               void *progress_ud);
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -1099,9 +1087,6 @@ bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e);
 /** Can the loaded family rewind a live session to an earlier position (pulsar_session_rewind)?  A
  *  recurrent family cannot; a caller with committed tokens the client never saw invalidates instead. */
 bool pulsar_engine_can_rewind(const pulsar_engine *e);
-/** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
- * front end without it runs greedy through the session lane (Qwen). */
-bool pulsar_engine_has_argmax(const pulsar_engine *e);
 /** Does the loaded family save and load whole-session snapshots and disk-KV payloads
  * (pulsar_session_save_snapshot / _load_snapshot)?  A caller that needs a session back at a known state
  * without one re-syncs the tokens instead. */

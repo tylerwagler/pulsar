@@ -248,52 +248,6 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 }
 
 
-int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
-        int                n_predict,
-        int                ctx_size,
-        pulsar_token_emit_fn  emit,
-        pulsar_generation_done_fn done,
-        void              *emit_ud,
-        pulsar_session_progress_fn progress,
-        void              *progress_ud) {
-    auto *e = this;
-    const pulsar_model *model = &e->model;
-    const pulsar_vocab *vocab = &e->vocab;
-    const pulsar_weights *weights = &e->weights;
-
-    /* The raw whole-graph pipeline builds its own graph with no TP transport
-     * and no owned head-group span: under a pair it cannot gather the
-     * attention `low` rows, big-gate the FFN or all-reduce the expert halves,
-     * and the first layer's guard refuses with a message about the GRAPH.
-     * Say it here, once, by name (rule 9): generation under TP rides the
-     * session lane, whose operations the group mirrors (slice 4e). */
-    if (e->tp) {
-        fprintf(stderr, "pulsar: raw whole-graph generation refused under tensor parallelism "
-                        "(rank %d/%u): the path has no TP transport -- generation on a TP "
-                        "engine rides the session lane\n",
-                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
-        return 1;
-    }
-
-    if (pulsar_backend_uses_graph(e->backend)) {
-        if (!e->gpu_ready) {
-            fprintf(stderr, "pulsar: %s generation requested but the graph backend is unavailable\n",
-                    pulsar_backend_name(e->backend));
-            return 1;
-        }
-        return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size,
-                                            e->prefill_chunk,
-                                            e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale,
-                                            emit, done, emit_ud,
-                                            progress, progress_ud);
-    }
-    return 1;
-}
-
-
 /* Register every mapping of a model with the staged-fd route -- the only route
  * onto the GPU here, since cudaHostRegister reports "operation not supported" on
  * GB10.  A GGUF has one mapping; a safetensors checkpoint has one per layer, and

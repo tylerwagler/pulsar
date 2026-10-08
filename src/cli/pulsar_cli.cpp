@@ -249,14 +249,6 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
     }
 }
 
-static void print_generated_token(void *ud, int token) {
-    token_printer *p = (token_printer *)ud;
-    size_t len = 0;
-    char *text = pulsar_token_text(p->engine, token, &len);
-    token_printer_write_text(p, text, len);
-    fflush(p->fp);
-    free(text);
-}
 
 static void build_prompt(pulsar_engine *engine, const cli_generation_options *gen, pulsar_tokens *out) {
     if (is_rendered_chat_prompt(gen->prompt)) {
@@ -267,10 +259,10 @@ static void build_prompt(pulsar_engine *engine, const cli_generation_options *ge
     }
 }
 
-static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
+static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "pulsar: sampled CLI generation requires a session backend\n");
+        fprintf(stderr, "pulsar: CLI generation requires a session backend\n");
         return 1;
     }
 
@@ -1021,35 +1013,11 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
                     pulsar_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_spec_rounds(engine) ||
-               pulsar_engine_is_tp(engine) || !pulsar_engine_has_argmax(engine)) {
-        /* Sampled, drafted, tensor-parallel, OR a family without the whole-graph
-         * path (Qwen): the session lane.  A TP engine cannot take the raw
-         * whole-graph path below (no transport; the engine refuses it by name),
-         * and the session lane at temperature 0 is the same greedy argmax,
-         * mirrored across the group frame by frame. */
-        rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
-        token_printer printer = {
-            .engine = engine,
-            .fp = stdout,
-            .format_thinking = pulsar_think_mode_enabled(cfg->gen.think_mode),
-            .think = {.in_think = pulsar_think_mode_enabled(cfg->gen.think_mode)},
-            .use_color = isatty(fileno(stdout)) != 0,
-            .last_output_newline = true,
-        };
-        cli_prefill_progress progress = {
-            .base_tokens = 0,
-            .input_tokens = prompt.len,
-            .use_color = pulsar_log_is_tty(stderr),
-        };
-        rc = pulsar_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
-                                        cfg->gen.ctx_size,
-                                        print_generated_token,
-                                        generation_done,
-                                        &printer,
-                                        cli_prefill_progress_cb,
-                                        &progress);
+        /* Every generation rides the session lane -- greedy (temperature 0), sampled, drafted and
+         * tensor-parallel alike, on every family (L284 P15: the session-less whole-graph argmax path
+         * and its family cap were a second lane giving the same tokens, deleted). */
+        rc = run_session_generation(engine, cfg, &prompt);
     }
 
     pulsar_tokens_free(&prompt);

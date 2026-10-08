@@ -156,7 +156,7 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .name         = */ "DeepSeek V4",
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_PAYLOAD |
                           PULSAR_FAMILY_CAP_REWIND | PULSAR_FAMILY_CAP_VISION | PULSAR_FAMILY_CAP_TP |
-                          PULSAR_FAMILY_CAP_IMATRIX | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_GENERATE |
+                          PULSAR_FAMILY_CAP_IMATRIX | PULSAR_FAMILY_CAP_CHAT |
                           PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_MIXED_PREFILL,
     /* .load         = */ pulsar_ds4_family_load,
     /* .after_gpu    = */ pulsar_ds4_family_after_gpu,

@@ -1899,17 +1899,6 @@ struct pulsar_engine {
     uint64_t demand_paged_bytes_per_bank(int ctx_size);
     /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
-    /** One-shot greedy generation: prefill `prompt`, then decode argmax until
-     * `n_predict` tokens or EOS, delivering each through `emit`. The
-     * self-contained path the CLI and the diagnostics use, with no session
-     * management for the caller to do. @return 0 on success. */
-    int generate_argmax(const pulsar_tokens *prompt,
-                        int n_predict, int ctx_size,
-                        pulsar_token_emit_fn emit,
-                        pulsar_generation_done_fn done,
-                        void *emit_ud,
-                        pulsar_session_progress_fn progress,
-                        void *progress_ud);
     /** Run the dataset through the model accumulating per-tensor activation
      * magnitudes, and write the importance matrix used to steer quantisation.
      * @return 0 on success. */
@@ -4229,22 +4218,6 @@ int sample_top_p_min_p(
         float        min_p,
         uint64_t    *rng,
         pulsar_sample_scratch *scratch);
-int generate_gpu_graph_raw_swa(
-        const pulsar_model   * model,
-        const pulsar_vocab   * vocab,
-        const pulsar_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        uint32_t            prefill_chunk,
-        const char        * directional_steering_file,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        pulsar_token_emit_fn   emit,
-        pulsar_generation_done_fn done,
-        void              * emit_ud,
-        pulsar_session_progress_fn progress,
-        void              * progress_ud);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
 /** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
