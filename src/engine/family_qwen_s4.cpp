@@ -577,10 +577,13 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     if (!step_linear(st, L.ple_key, H, HC, "qwen PLE key_proj", emb, key, base + p.lin_ws, p.lin_ws_bytes) ||
         !step_linear(st, L.ple_value, H, H, "qwen PLE value_proj", emb, value, base + p.lin_ws, p.lin_ws_bytes))
         return fail("a PLE projection launch failed");
+    /* every kernel of the launch reads a row's own sequence alone, so the prompt run behind a fused step's verify
+     * shares it; the capture covers the verify rows [0, n_dec) only (L284 #2) */
     const pulsar_qwen_rows rows = {(const int32_t *)(base + p.row_seq), (const int32_t *)(base + p.row_j),
                                    (const int32_t *)(base + p.seq_first), (const int32_t *)(base + p.seq_rows),
                                    (const int32_t *)(base + p.seq_bank), (int)n_seq,
-                                   st->verify ? (float *)dptr(st->st->spec.ple) : NULL};
+                                   st->verify ? (float *)dptr(st->st->spec.ple) : NULL,
+                                   st->verify ? (int)st->n_dec : 0};
     return pulsar_qwen_ple_launch(&w, key, value, (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(st->st->layer[il].ple_conv), base + p.ws, p.ws_bytes, 0) == 0;
 }
@@ -719,10 +722,10 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
     return true;
 }
 
-bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) {
+bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, uint32_t out0) {
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd;
-    if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
+    if (n == 0 || out0 + n > PULSAR_QWEN_HEAD_ROWS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
     const head_scratch h = head_layout();
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_HEAD];
     if (!sc) return fail("no head scratch");
@@ -763,6 +766,10 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
         }
         if (ok && st->draft_head && !wm->draft_ids) ok = build_draft_head(st, wm);
+        /* logits rows [out0, out0 + n) of the slab (the draft head's rows are n_draft wide) */
+        const uint64_t row_bytes = (uint64_t)(st->draft_head ? wm->n_draft : s->n_vocab) * sizeof(float);
+        pulsar_gpu_tensor *dst = ok ? pulsar_gpu_tensor_view(st->st->logits, out0 * row_bytes, n * row_bytes) : NULL;
+        ok = ok && dst;
         if (ok) {
             const bool dh = st->draft_head;
             const uint32_t rows = dh ? wm->n_draft : Vl;
@@ -776,16 +783,15 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n) 
                                                        0) == 0;
             };
             if (tp == 1 || dh) {
-                ok = head(0, rows, st->st->logits);
+                ok = head(0, rows, dst);
             } else {
                 pulsar_qwen_state *q = st->st;
                 const pulsar_tp_vocab x = {q->tp, q->tp_slab_dev, q->tp_ticket, q->tp_vocab_own, &q->tp_vocab_seq,
                                            s->n_vocab, PULSAR_QWEN_HEAD_ROWS_MAX};
-                pulsar_gpu_tensor *out = pulsar_gpu_tensor_view(q->logits, 0, (uint64_t)n * s->n_vocab * sizeof(float));
-                ok = out && pulsar_tp_vocab_gather(&x, n, head, out);
-                pulsar_gpu_tensor_free(out);
+                ok = pulsar_tp_vocab_gather(&x, n, head, dst);
             }
         }
+        pulsar_gpu_tensor_free(dst);
     }
     if (xkey) {
         pulsar_gpu_act_slot_drop(xkey);
@@ -929,20 +935,13 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     if (gw.dt_bias) gw.dt_bias += hv0;
     gw.norm_w  = (const uint16_t *)wptr(st, L.gdn_norm,    "qwen GDN norm");
     if (!gw.conv_w || !gw.A_log || !gw.dt_bias || !gw.norm_w) return false;
+    /* the out_proj over every row of the step (its row-kind segments) */
+    auto gdn_out = [&]() {
+        return step_linear(st, L.gdn_out, VT, H, "qwen GDN out_proj", (const uint16_t *)(base + g.obf16),
+                           (float *)dptr(st->st->y), linws, g.lin_ws_bytes) ||
+               fail("the GDN out_proj launch failed");
+    };
     pulsar_gdn_call c{};
-    const bool prefill = st->mode == PULSAR_QWEN_STEP_PREFILL;
-    if (prefill && st->n_runs > 1) {                /* L272 P1 S4: a verify of several banks -- one ragged run each */
-        uint32_t longest = 0;
-        for (uint32_t k = 0; k < st->n_runs; k++)
-            longest = st->run_first[k + 1] - st->run_first[k] > longest ? st->run_first[k + 1] - st->run_first[k] : longest;
-        c.n_seq = (int)st->n_runs;
-        c.seq_rows = (int)longest;
-        c.seq_first = (const int32_t *)dptr(st->st->run_first_dev);
-        c.n_rows = (int)n;
-    } else {
-        c.n_seq = prefill ? 1 : (int)n;             /* DECODE: one row per bank; PREFILL: one sequence */
-        c.seq_rows = prefill ? (int)n : 1;
-    }
     c.row_slot = (const int32_t *)dptr(st->st->row_bank);
     c.conv_state = (float *)dptr(st->st->layer[il].gdn_conv);
     c.rec_state  = (float *)dptr(st->st->layer[il].gdn_state);
@@ -954,16 +953,52 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
     c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */
-    if (st->verify) {                               /* L251 MTP: the per-row states a rollback copies back */
-        const pulsar_qwen_spec_capture &sp = st->st->spec;
-        const size_t slot = (size_t)sp.ord[il] * PULSAR_QWEN_SPEC_ROWS;   /* row r of the step at slot + r */
-        c.conv_rows = (float *)dptr(sp.gdn_conv) + slot * (pulsar_qwen_gdn_conv_bytes(s) / sizeof(float));
-        c.rec_rows  = (float *)dptr(sp.gdn_rec) + slot * (pulsar_qwen_gdn_state_bytes(s) / sizeof(float));
+    if (st->mode == PULSAR_QWEN_STEP_DECODE) {      /* one row per bank */
+        c.n_seq = (int)n;
+        c.seq_rows = 1;
+        return (pulsar_gdn_forward(&gw, &c, 0) == 0 || fail("pulsar_gdn_forward failed")) && gdn_out();
     }
-    if (pulsar_gdn_forward(&gw, &c, 0) != 0) return fail("pulsar_gdn_forward failed");
-    return step_linear(st, L.gdn_out, VT, H, "qwen GDN out_proj", (const uint16_t *)(base + g.obf16),
-                       (float *)dptr(st->st->y), linws, g.lin_ws_bytes) ||
-           fail("the GDN out_proj launch failed");
+    /* PREFILL: the verify's rows [0, n_dec) -- one sequence, or (L272 P1 S4) one ragged run a bank, each row's
+     * state captured for the rollback -- then (L284 #2) the prompt run [n_dec, n) as its own call, uncaptured:
+     * the call a classic chunk of the same rows makes, at the run's row offset */
+    const uint32_t nvr = pulsar_qwen_step_verify_runs(st);
+    if (st->n_dec > 0) {
+        pulsar_gdn_call v = c;
+        if (nvr > 1) {
+            uint32_t longest = 0;
+            for (uint32_t k = 0; k < nvr; k++)
+                longest = st->run_first[k + 1] - st->run_first[k] > longest ? st->run_first[k + 1] - st->run_first[k] : longest;
+            v.n_seq = (int)nvr;
+            v.seq_rows = (int)longest;
+            v.seq_first = (const int32_t *)dptr(st->st->run_first_dev);
+            v.n_rows = (int)st->n_dec;
+        } else {
+            v.n_seq = 1;
+            v.seq_rows = (int)st->n_dec;
+        }
+        if (st->verify) {                           /* L251 MTP: the per-row states a rollback copies back */
+            const pulsar_qwen_spec_capture &sp = st->st->spec;
+            const size_t slot = (size_t)sp.ord[il] * PULSAR_QWEN_SPEC_ROWS;   /* row r of the step at slot + r */
+            v.conv_rows = (float *)dptr(sp.gdn_conv) + slot * (pulsar_qwen_gdn_conv_bytes(s) / sizeof(float));
+            v.rec_rows  = (float *)dptr(sp.gdn_rec) + slot * (pulsar_qwen_gdn_state_bytes(s) / sizeof(float));
+        }
+        if (pulsar_gdn_forward(&gw, &v, 0) != 0) return fail("pulsar_gdn_forward failed (the verify rows)");
+    }
+    if (st->n_dec < n) {
+        if (st->n_runs != nvr + 1u) return fail("a GDN step carries one prompt run");
+        const uint32_t r0 = st->n_dec;
+        pulsar_gdn_call p = c;
+        p.n_seq = 1;
+        p.seq_rows = (int)(n - r0);
+        p.row_slot += r0;
+        p.qkv += (size_t)r0 * CD;
+        p.z += (size_t)r0 * VT;
+        p.a += (size_t)r0 * NVG;
+        p.b += (size_t)r0 * NVG;
+        p.out_bf16 = (uint16_t *)p.out_bf16 + (size_t)r0 * VT;
+        if (pulsar_gdn_forward(&gw, &p, 0) != 0) return fail("pulsar_gdn_forward failed (the prompt run)");
+    }
+    return gdn_out();
 }
 
 /* ======================================================================== */
@@ -1034,12 +1069,13 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
          * key rides in each), for pulsar_qwen_s4_spec_rollback */
         const pulsar_qwen_spec_capture &sp = st->st->spec;
         const uint64_t o = sp.ord[il];
-        /* each run's bank stage, at the run's slot (L272 P1 S4); the step's rows' keys, at their row */
+        /* each verify run's bank stage, at the run's slot (L272 P1 S4); the verify rows' keys, at their row (L284
+         * #2: a fused step's prompt run behind them is not captured) */
         for (uint32_t k = 0; ok && k < sp.n_runs; k++)
             ok = pulsar_gpu_tensor_copy_async(sp.qsa_stage, (o * PULSAR_QWEN_SPEC_ROWS + k) * itb, st->st->layer[il].idx_tail,
                                               (uint64_t)sp.run_bank[k] * itb, itb) != 0;
         ok = ok && pulsar_gpu_tensor_copy_async(sp.qsa_keys, o * PULSAR_QWEN_SPEC_ROWS * PULSAR_QSA_IDX_IN * 4u,
-                                                vi, 0, (uint64_t)n * PULSAR_QSA_IDX_IN * 4u) != 0;
+                                                vi, 0, (uint64_t)st->n_dec * PULSAR_QSA_IDX_IN * 4u) != 0;
         if (!ok) { drop(); return fail("the verify capture of a QSA layer failed"); }
     }
 
@@ -1047,25 +1083,40 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                                     (const uint16_t *)wptr(st, L.attn_k_norm,  "qwen QSA k_norm"),
                                     (const uint16_t *)wptr(st, L.idx_q_norm,   "qwen QSA idx_q_norm"),
                                     (const uint16_t *)wptr(st, L.idx_k_norm,   "qwen QSA idx_k_norm")};
-    pulsar_qsa_io io{};
-    io.qg = vq; io.k = vk; io.v = vv; io.idx = vi;
-    io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16;      /* L251 / ac69748f: bf16, not the A8 slot */
-    io.out_e4m3 = NULL;
-    io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
-    io.out_sf_pitch = pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s));
-    io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
-    io.tp_ranks = (int)pulsar_qwen_tp(s);
-    io.row_rope = st->rope;   /* L268: multi-axis rope positions, NULL for a text step */
-    /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
-     * the host to build its row list.  The step already carries them as `bank` /
-     * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing
-     * the device row_bank here segfaulted the host walk, 18:56.) */
-    const int rc = ok ? pulsar_gpu_qsa_forward(&layer, seqs, nb,
-                                               (const uint32_t *)st->bank,
-                                               (const uint32_t *)st->pos, n, &io,
-                                               scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes)) : -1;
+    /* L284 #2: the attention picks its schedule by the call's row count (the CTA fold from QSA_FOLD_ROWS rows, the
+     * split + combine below it -- not the same bytes), so each row-kind segment is its own call: a verify row
+     * attends as the verify alone does, a prompt row as its classic chunk does.  Every other kernel of the call is
+     * per row, and a bank's rows lie in one segment. */
+    const uint64_t OD = pulsar_qwen_qsa_out_dim(s);
+    pulsar_gpu_tensor *ws_view = scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes);
+    ok = ok && ws_view && arm_segments(st, 0, n, [&](bool, uint32_t r0, uint32_t m) {
+        pulsar_gpu_tensor *sq = pulsar_gpu_tensor_view(vq, (uint64_t)r0 * QI * 4u, (uint64_t)m * QI * 4u);
+        pulsar_gpu_tensor *sk = pulsar_gpu_tensor_view(vk, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);
+        pulsar_gpu_tensor *sv = pulsar_gpu_tensor_view(vv, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);
+        pulsar_gpu_tensor *si = pulsar_gpu_tensor_view(vi, (uint64_t)r0 * PULSAR_QSA_IDX_IN * 4u,
+                                                       (uint64_t)m * PULSAR_QSA_IDX_IN * 4u);
+        pulsar_qsa_io io{};
+        io.qg = sq; io.k = sk; io.v = sv; io.idx = si;
+        io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16 + (uint64_t)r0 * OD * 2u;   /* L251 / ac69748f: bf16, not A8 */
+        io.out_e4m3 = NULL;
+        io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
+        io.out_sf_pitch = pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s));
+        io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
+        io.tp_ranks = (int)pulsar_qwen_tp(s);
+        io.row_rope = st->rope ? st->rope + (size_t)r0 * 6u : NULL;   /* L268: multi-axis rope, NULL for text */
+        /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
+         * the host to build its row list.  The step already carries them as `bank` /
+         * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing
+         * the device row_bank here segfaulted the host walk, 18:56.) */
+        const bool done = sq && sk && sv && si &&
+                          pulsar_gpu_qsa_forward(&layer, seqs, nb, (const uint32_t *)st->bank + r0,
+                                                 (const uint32_t *)st->pos + r0, m, &io, ws_view) == 1;
+        for (pulsar_gpu_tensor *t : {sq, sk, sv, si}) pulsar_gpu_tensor_free(t);
+        return done;
+    });
+    pulsar_gpu_tensor_free(ws_view);
     drop();
-    if (rc != 1) return fail("pulsar_gpu_qsa_forward refused the step");
+    if (!ok) return fail("pulsar_gpu_qsa_forward refused the step");
     return step_linear(st, L.attn_o, (int)pulsar_qwen_qsa_out_dim(s), H, "qwen QSA o_proj",
                        (const uint16_t *)((uint8_t *)dptr(sc) + g.obf16), (float *)dptr(st->st->y), linws,
                        g.lin_ws_bytes) ||

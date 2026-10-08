@@ -217,8 +217,12 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const float 
     qwen_ple_conv_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
         m.gvn, value, m.sig, (const __nv_bfloat16 *)w->conv_w, conv_state, rows->row_seq, rows->row_j,
         rows->seq_bank, (__nv_bfloat16 *)streams);
-    if (rows->state_rows && T > 1)
-        qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
+    if (rows->state_rows && (rows->n_state_rows < 0 || rows->n_state_rows > T)) {
+        fprintf(stderr, "pulsar: qwen PLE: a capture of %d rows in a %d-row batch -- refusing\n", rows->n_state_rows, T);
+        return -1;
+    }
+    if (rows->state_rows && rows->n_state_rows > 1)
+        qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, rows->n_state_rows), kThreads, 0, stream>>>(
             m.gvn, rows->row_seq, rows->row_j, rows->seq_first, rows->seq_rows, rows->seq_bank, conv_state,
             rows->state_rows);
     qwen_ple_state_kernel<<<dim3(kHC / kThreads, rows->n_seq), kThreads, 0, stream>>>(

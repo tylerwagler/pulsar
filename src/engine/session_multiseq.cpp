@@ -186,14 +186,11 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
                                  uint32_t *out_n_rows, char *err, size_t errlen) {
     auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
-    s->fused_logits = nullptr;
-    s->fused_n_dec = s->fused_heads = 0;
     if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->graph->prefill_cap) {
         PULSAR_MIXED_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph->prefill_cap);
         return 1;
     }
-    uint32_t heads = 0;
-    for (uint32_t r = 0; r < shape->n_pf && r < PULSAR_MSEQ_MAX; r++) heads += shape->head_last[r] ? 1u : 0u;
+    const uint32_t heads = pulsar_fused_shape_heads(shape);
     if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(shape->n_dec + heads) * PULSAR_N_VOCAB) {
         PULSAR_MIXED_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, shape->n_dec + heads,
                          (unsigned)PULSAR_N_VOCAB);
@@ -219,13 +216,23 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
     s->checkpoint_valid = false;
     s->mseq_dirty = true;
     s->spec.spec_carry_valid = false;
-    if (rc == 1) {
-        s->fused_logits = logits;
-        s->fused_n_dec = shape->n_dec;
-        s->fused_heads = heads;
-        return 0;
-    }
+    if (rc == 1) return 0;
     PULSAR_MIXED_ERR("fused step failed mid-sweep (session state fatal)");
     return -1;
 }
 #undef PULSAR_MIXED_ERR
+
+int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen) {
+    s->fused_logits = nullptr;
+    s->fused_n_dec = s->fused_heads = 0;
+    const int rc = s->engine->family->session->decode_fused(s, reqs, n_rows, shape, logits, logits_cap, out_n_rows,
+                                                            err, errlen);
+    if (rc == 0) {
+        s->fused_logits = logits;
+        s->fused_n_dec = shape->n_dec;
+        s->fused_heads = pulsar_fused_shape_heads(shape);
+    }
+    return rc;
+}

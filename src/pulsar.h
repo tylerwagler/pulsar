@@ -1080,10 +1080,14 @@ bool pulsar_engine_has_spec_rounds(const pulsar_engine *e);
  *  server runs its spec-batched lane up to this many decoders and the plain batched lane past it. */
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e);
 /** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round)?  The
- *  DeepSeek graph pool does; a family bank pool (Qwen) runs its own mixed decode and has none.  The server arms
- *  fusion on this, and pulsar_session_decode_fused refuses on its negation -- one statement (L282: the server armed
- *  it on "a bank pool exists", and two concurrent Qwen requests failed "no fused step"). */
+ *  family's decode_fused op is present (DeepSeek; Qwen since L284 #2 increment 3).  pulsar_session_decode_fused
+ *  refuses on its negation (L282: the server once armed fusion on "a bank pool exists", and two concurrent Qwen
+ *  requests failed "no fused step"). */
 bool pulsar_engine_has_fused_step(const pulsar_engine *e);
+/** Can the server put a prompt on the fused step: the step exists AND the family records a fused chunk in the
+ *  bank's history (pulsar_session_note_prefilled -- the DeepSeek graph pool's; Qwen's lands in L284 #2 increment
+ *  5, which turns this on for it).  The server's fusion and mixed lanes arm on this, never on the step alone. */
+bool pulsar_engine_fused_prompts_servable(const pulsar_engine *e);
 /** Can the loaded family rewind a live session to an earlier position (pulsar_session_rewind)?  A
  *  recurrent family cannot; a caller with committed tokens the client never saw invalidates instead. */
 bool pulsar_engine_can_rewind(const pulsar_engine *e);

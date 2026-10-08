@@ -323,6 +323,13 @@ bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->draf
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
+/* pulsar_session_note_prefilled -- the record of a fused chunk in the bank's history, without which a served
+ * prompt cannot ride a fused step -- is the DeepSeek graph pool's; a family bank pool has none until it brings
+ * its own (L284 #2 increment 5).  The one statement both readers below take. */
+static bool engine_notes_prefilled(const pulsar_engine *e) { return !e->family->banks; }
+bool pulsar_engine_fused_prompts_servable(const pulsar_engine *e) {
+    return pulsar_engine_has_fused_step(e) && engine_notes_prefilled(e);
+}
 bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
@@ -941,7 +948,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
-    const auto fused = s->engine->family->session->decode_fused;
+    const auto fused = pulsar_session_fused_local;
     if (!tp) return fused(s, reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "the fused step", err, errlen)) return 1;
     if (tp_mirror_dead(tp, err, errlen)) return 1;
@@ -1161,7 +1168,7 @@ void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pu
 int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
-    if (FAMILY_BANKS(s)) return 1;   /* the fused lanes are the DeepSeek graph pool's */
+    if (!engine_notes_prefilled(s->engine)) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->note_prefilled(toks, n, head);
     char err[256];

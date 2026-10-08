@@ -85,7 +85,7 @@ static bool qwen_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_s
     }
     int32_t tok[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bank[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
     qwen_verify_rows(s, r, tok, pos, bank);
-    if (!qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bank, R, 0, R, q->spec_logits, true)) {
+    if (!qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bank, R, qwen_heads_span(0, R), q->spec_logits, R)) {
         snprintf(err, errlen, "%s: the verify step refused (see the log for the op)", PULSAR_QWEN_ARCH);
         return false;
     }

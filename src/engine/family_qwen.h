@@ -510,11 +510,13 @@ typedef struct {
     pulsar_gpu_tensor *streams;
     /** The mixer the head reads through: the trunk's, or mtp.mixer for the MTP head. */
     const pulsar_qwen_gr_weights *mixer;
-    /** L251 MTP: a VERIFY step (PREFILL mode, <= SPEC_ROWS rows): the recurrent ops also write their per-row
-     *  states and the QSA ops their stages + raw keys into st->spec. */
+    /** L251 MTP: the step's rows [0, n_dec) are a VERIFY (PREFILL mode, <= SPEC_ROWS rows): the recurrent ops
+     *  also write those rows' per-row states and the QSA ops their stages + raw keys into st->spec.  L284 #2:
+     *  rows [n_dec, n_rows) of the same step are a prompt run, never captured. */
     bool verify;
     /** L272 P1 S4: PREFILL rows as runs -- run k is rows [run_first[k], run_first[k + 1]) of one bank at
-     *  consecutive positions (a verify of several banks: one run each).  n_runs 1 = the classic one-bank chunk. */
+     *  consecutive positions: the verify's runs (one a bank) first, then (L284 #2, the fused step) at most one
+     *  prompt run from row n_dec.  n_runs 1 = the classic one-bank chunk, or a one-bank verify. */
     uint32_t n_runs;
     const uint32_t *run_first;
     /** L251 MTP: the head runs the DRAFT head (pulsar_qwen_weights::draft_head_mx): n_draft logits a row. */
@@ -525,11 +527,17 @@ typedef struct {
     uint32_t n_dec;
 } pulsar_qwen_step;
 
-/** L284 #2: n_dec for a step of one kind -- a PROMPT chunk (a prefill step that is not an MTP verify) is all
- *  prompt rows, so a prompt cut anywhere is byte-identical to one prefilled whole; a decode or verify step is
- *  all decode rows. */
-static inline uint32_t pulsar_qwen_step_n_dec(pulsar_qwen_step_mode mode, bool verify, uint32_t n_rows) {
-    return mode == PULSAR_QWEN_STEP_PREFILL && !verify ? 0u : n_rows;
+/** L284 #2: n_dec for a step -- a DECODE step is all decode rows; a PREFILL step's decode rows are its verify
+ *  rows [0, n_verify) and the rest are prompt rows, so a prompt cut anywhere (or behind a verify, the fused
+ *  step) is byte-identical to one prefilled whole. */
+static inline uint32_t pulsar_qwen_step_n_dec(pulsar_qwen_step_mode mode, uint32_t n_verify, uint32_t n_rows) {
+    return mode == PULSAR_QWEN_STEP_PREFILL ? n_verify : n_rows;
+}
+/** L284 #2: the verify runs of a PREFILL step -- its runs that start before n_dec (each lies wholly inside). */
+static inline uint32_t pulsar_qwen_step_verify_runs(const pulsar_qwen_step *st) {
+    uint32_t k = 0;
+    while (k < st->n_runs && st->run_first[k] < st->n_dec) k++;
+    return k;
 }
 
 /** A per-layer op: reads/writes the step's slots for layer il.  Returns false
@@ -554,10 +562,10 @@ typedef struct {
     bool (*gr_write)(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
     /** x -> y, router + routed experts + gated shared expert.  [S4] */
     pulsar_qwen_layer_fn moe;
-    /** Step rows [row0, row0 + n) of streams -> logits rows [0, n): mixer read
-     * + lm_head, n <= PULSAR_QWEN_HEAD_ROWS_MAX.  The driver heads every row of
-     * a DECODE step (row0 0) and the last row of a PREFILL chunk.  [S4] */
-    bool (*head)(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
+    /** Step rows [row0, row0 + n) of streams -> logits rows [out0, out0 + n): mixer read + lm_head, out0 + n <=
+     * PULSAR_QWEN_HEAD_ROWS_MAX.  The driver calls it once per span of its head list (consecutive rows of one
+     * row kind): every row of a DECODE step or a verify, the last row of a PREFILL chunk.  [S4] */
+    bool (*head)(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, uint32_t out0);
     /** Bytes of scratch op `op` needs at max_rows rows (0 = none).  Called
      * once per session create; NULL = the op needs none. */
     uint64_t (*scratch_bytes)(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx);
@@ -577,7 +585,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il);
 bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
 bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
 bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
-bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n);
+bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, uint32_t out0);
 /** L251 MTP: the input combine into st->streams (the MTP streams) from the trunk stack rows `h`
  *  (device, [n_rows][n_hc][n_embd] bf16) and st->tokens (x_{p+1} per row). */
 bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h);

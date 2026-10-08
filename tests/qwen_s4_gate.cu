@@ -520,6 +520,7 @@ static void section_ple(void) {
         CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
         pulsar_qwen_rows pc = pr;
         pc.state_rows = cap;
+        pc.n_state_rows = T;   /* every row of the batch is a verify's */
         rc = ple(&w, de, ds, T, &pc, state, ws, wsb, 0);
         const auto captured = down(cap, (size_t)T * slot_f);
         bool same_all = rc == 0;

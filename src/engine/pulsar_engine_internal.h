@@ -4121,6 +4121,20 @@ uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uin
  *  logits rows after the decode rows' block). */
 uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
                                      uint32_t n_heads);
+/** L284 #2: the prompt runs a fused step heads (head_last[r] set, r < n_pf) -- THE count every reader of a
+ *  shape uses. */
+static inline uint32_t pulsar_fused_shape_heads(const pulsar_fused_shape *sh) {
+    uint32_t h = 0;
+    for (uint32_t r = 0; r < sh->n_pf && r < (uint32_t)sizeof(sh->head_last); r++) h += sh->head_last[r] ? 1u : 0u;
+    return h;
+}
+/** L284 #2: the fused step on THIS rank (session_multiseq.cpp) -- the family's decode_fused op with the session's
+ *  bookkeeping around it, for every family: the last fused step's block (fused_logits / fused_n_dec /
+ *  fused_heads) is cleared before the op and recorded when it succeeds.  The C entry (both ranks' leader side)
+ *  and the TP worker call this, never the op directly.  The caller has checked pulsar_engine_has_fused_step. */
+int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
     int *ids;      ///< candidate token ids

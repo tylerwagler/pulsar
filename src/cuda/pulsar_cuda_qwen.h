@@ -283,6 +283,9 @@ typedef struct {
      *  each sequence's last-row slot unused -- so a rejected draft rolls back by copying a row's back.
      *  The arithmetic is unchanged. */
     float *state_rows;
+    /** L284 #2: the batch rows [0, n_state_rows) state_rows captures -- a fused step's verify rows; the prompt
+     *  run behind them is not a verify's (state_rows holds SPEC_ROWS rows). */
+    int n_state_rows;
 } pulsar_qwen_rows;
 
 /** Workspace bytes for T rows: a function of the shape alone. */

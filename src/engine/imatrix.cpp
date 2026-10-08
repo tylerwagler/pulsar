@@ -1173,12 +1173,11 @@ int gpu_graph_decode_multiseq_batch(
     /* L260 fusion: a fused step's layout -- n_dec decode / verify rows, then
      * fused->n_pf prefill runs -- is the caller's; refuse a shape that does not
      * match the rows before anything is armed (recoverable). */
-    uint32_t fused_heads = 0;
+    const uint32_t fused_heads = fused ? pulsar_fused_shape_heads(fused) : 0u;
     if (fused) {
         uint32_t runs = 0;
         for (uint32_t t = fused->n_dec; t < n_active; t++)
             if (t == fused->n_dec || bank[t] != bank[t - 1]) runs++;
-        for (uint32_t r = 0; r < fused->n_pf && r < PULSAR_MSEQ_MAX; r++) fused_heads += fused->head_last[r] ? 1u : 0u;
         if (fused->n_dec == 0 || fused->n_dec >= n_active || fused->n_pf == 0 || fused->n_pf > PULSAR_MSEQ_MAX ||
             runs != fused->n_pf || fused->n_dec > PULSAR_SPEC_ROW_BUDGET ||
             fused->n_dec + fused_heads > PULSAR_SPEC_LOGITS_ROWS) {

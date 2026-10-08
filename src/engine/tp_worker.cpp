@@ -446,14 +446,11 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             worker_rows(c, rows);
             /* The block holds the decode rows and the headed runs, not every
              * row: a prompt chunk's rows are not headed. */
-            uint32_t heads = 0;
-            for (uint32_t r = 0; r < shape->n_pf && r < (uint32_t)sizeof(shape->head_last); r++)
-                heads += shape->head_last[r] ? 1u : 0u;
             int cap = 0;
-            logits = worker_logits(e, slot, shape->n_dec + heads, &cap);
+            logits = worker_logits(e, slot, shape->n_dec + pulsar_fused_shape_heads(shape), &cap);
             rc = pulsar_engine_has_fused_step(slot->s->engine)
-                     ? slot->s->engine->family->session->decode_fused(slot->s, rows, c->n_items, shape, logits, cap,
-                                                                     &out_rows, ferr, sizeof(ferr))
+                     ? pulsar_session_fused_local(slot->s, rows, c->n_items, shape, logits, cap, &out_rows, ferr,
+                                                  sizeof(ferr))
                      : (snprintf(ferr, sizeof ferr, "%s: no fused step", slot->s->engine->family->name), 1);
             free(rows);
         }
