@@ -80,6 +80,7 @@ int gate_spec_sampling_gate_main(int, char **);
 int gate_mseq_short_ctx_probe_main(int, char **);
 int gate_comp_state_gate_main(int, char **);
 int gate_chunk_neutrality_gate_main(int, char **);
+int gate_vision_chunk_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
 int gate_session_payload_gate_main(int, char **);
 int gate_tp_head_split_gate_main(int, char **);
@@ -177,6 +178,7 @@ enum {
     NEED_DSPARK        = 1u << 3,   /* the DSpark drafter and its depth knob: pulsar_engine_drafter */
     NEED_REWIND        = 1u << 4,   /* pulsar_session_rewind: pulsar_engine_can_rewind */
     NEED_FIXTURES      = 1u << 5,   /* the blobs on the command line, which are the PRIMARY model's */
+    NEED_VISION        = 1u << 6,   /* images: pulsar_engine_has_vision */
 };
 #define DS4 NEED_DS4_INTERNALS
 
@@ -188,6 +190,7 @@ static const char *need_name(uint32_t bit) {
     case NEED_DSPARK:        return "the DSpark drafter";
     case NEED_REWIND:        return "session rewind";
     case NEED_FIXTURES:      return "the command line's fixture blobs (captured from the primary model)";
+    case NEED_VISION:        return "a vision tower (images)";
     }
     return "?";
 }
@@ -331,11 +334,12 @@ static int host_model(hosted_model *hm, const char *path, bool primary) {
     if (pulsar_engine_has_spec_rounds(e)) hm->has |= NEED_SPEC;
     if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_DSPARK) hm->has |= NEED_DSPARK;
     if (pulsar_engine_can_rewind(e)) hm->has |= NEED_REWIND;
+    if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
     if (primary) hm->has |= NEED_FIXTURES;
-    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
            hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
            hm->has & NEED_DSPARK ? " dspark" : "", hm->has & NEED_REWIND ? " rewind" : "",
-           hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
+           hm->has & NEED_VISION ? " vision" : "", hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
     fflush(stdout);
     return 0;
 }
@@ -551,6 +555,10 @@ int main(int argc, char **argv) {
      * drafter off), so it runs beside it. */
     const gate_spec chunk_neutrality = {"cuda-chunk-neutrality-gate", gate_chunk_neutrality_gate_main, 1, NULL, NULL,
                                         {NULL}, NEED_TOKENIZER};
+    /* L283: the same for an image block -- its logits do not depend on where its chunk starts.  The chunk-neutrality
+     * gate's engine (chunk 4096, drafter off), so it runs beside it on every model that serves images. */
+    const gate_spec vision_chunk = {"cuda-vision-chunk-gate", gate_vision_chunk_gate_main, 1, NULL, NULL,
+                                    {"tests/test-vectors/vision-image-goldens.bin", NULL}, NEED_VISION};
     /* The reference gates are built per model, from its anchors (the hosted-model loop below); their names are
      * fixed here for the selection. */
     static const char *const ref_names[4] = {"cuda-reference-gate-story", "cuda-reference-gate-code",
@@ -566,7 +574,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) KNOWN(group_default[i]);
     for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) KNOWN(group_depth1[i]);
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) KNOWN(group_nodspark[i]);
-    KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality);
+    KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality); KNOWN(vision_chunk);
 #undef KNOWN
     for (int i = 0; i < 4; i++) known[n_known++] = ref_names[i];
     if (validate_names(g_only, "--only", known, n_known) ||
@@ -646,7 +654,7 @@ int main(int argc, char **argv) {
         }
         for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) RUN(group_depth1[i]);
         for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
-        RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality);
+        RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality); RUN(vision_chunk);
         bool ref_selected = false;
         for (int i = 0; i < 4; i++) ref_selected = ref_selected || gate_selected(ref_names[i]);
         if (have_ref) {

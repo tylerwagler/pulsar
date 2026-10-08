@@ -1372,8 +1372,13 @@ bool gpu_graph_encode_layer_attention_batch(
      * no span (vision_visible_tokens == 0 -- every text chunk).  The two halves
      * live in one tensor, left at 0 and right at prefill_cap counts.  The views
      * are passed to every whole-chunk attention launch below; the indexed span
-     * path offsets its own from these in gpu_graph_indexed_attention_span. */
-    const bool chunk_vis = g->vision_visible_tokens == n_tokens && n_tokens != 0u;
+     * path offsets its own from these in gpu_graph_indexed_attention_span.
+     * L283: "every" includes the chunk-past-0 arms (the raw ring and the
+     * visible-prefix mixed launch), which until then passed NULL and ran an
+     * image block causally whenever its chunk did not start at 0.  A banked
+     * multiseq batch never carries an image span (its rows are seeded by no
+     * upload, so a count left by the last classic chunk is not its own). */
+    const bool chunk_vis = !mseq && g->vision_visible_tokens == n_tokens && n_tokens != 0u;
     pulsar_gpu_tensor *vis_left_view = chunk_vis
             ? pulsar_gpu_tensor_view(g->vision_visible, 0,
                                      (uint64_t)n_tokens * sizeof(int32_t)) : NULL;
@@ -1836,7 +1841,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     mseq ? g->batch_seq_id : NULL,
                                                                     0,
                                                                     mseq ? nb : 1,
-                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
+                                          g->q_prep_active ? &g->q_prep : NULL,
+                                          vis_left_view, vis_right_view) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && compressed) {
@@ -2064,6 +2070,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           mseq ? g->layer_comp_cap[src] : 0,
                                                                           mseq ? nb : 1,
                                           g->q_prep_active ? &g->q_prep : NULL,
+                                          vis_left_view, vis_right_view,
                                           gact_data, gact_scale, gact_kbp, (uint32_t)gact_slab, n_groups,
                                           PULSAR_N_HEAD_DIM - PULSAR_N_ROT) != 0;
             }
@@ -2208,6 +2215,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                           vis_left_view, vis_right_view) != 0;
         }
         if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
+        if (ok && raw_prefix_tokens < n_tokens && chunk_vis) {
+            /* L283: one row at a time cannot reach FORWARD into the rest of an image span -- refuse, never run the
+             * block causally (no sync reaches this: a chunk past 0 fits the raw ring, the batched arms above) */
+            fprintf(stderr, "pulsar: layer %u: an image span in a %u-row chunk at %u would take the per-token arm, "
+                            "which has no span visibility -- refusing\n", il, n_tokens, pos0);
+            ok = false;
+        }
         if (raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
                 const uint32_t pos = pos0 + t;

@@ -197,10 +197,9 @@ int main(int argc, char **argv) {
             if (ok4) {
                 step = "the cold prefill of the same prompt";
                 ok4 = pulsar_session_copy_logits(sess, resumed.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
-                /* the cold prefill with the resume's chunk boundary: [0, origin) as text, then the rest in one
-                 * chunk.  NOT the one-chunk prefill: an image block's rows depend on where its chunk starts (L283,
-                 * found here 2026-10-07: relL2 ~0.47 between the two, text chunk-invariant) -- that is graded
-                 * against the reference there, not here */
+                /* the cold prefill with the resume's chunk boundary: [0, origin) as text, then the rest.  (That the
+                 * boundary does not matter -- an image block's rows are the same wherever its chunk starts -- is
+                 * cuda-vision-chunk-gate's, L283, found here 2026-10-07.) */
                 pulsar_session_invalidate(sess);
                 pulsar_tokens head = {};
                 for (int i = 0; i < origin && i < turn.len; i++) pulsar_tokens_push(&head, turn.v[i]);

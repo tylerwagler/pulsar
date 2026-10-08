@@ -1723,6 +1723,11 @@ cuda-comp-state-gate: tests/comp_state_gate
 # makes it hold; a split-K pick fails it from layer 0.
 cuda-chunk-neutrality-gate: tests/chunk_neutrality_gate
 	./tests/chunk_neutrality_gate $(FRONTIER_MODEL)
+# L283: an image block's logits do not depend on where its prefill chunk starts (before, at, straddling the grid,
+# continued after) -- byte-identical to the one-chunk prefill, the bar text meets above.  In the runner on every
+# hosted model that serves images (NEED_VISION).
+cuda-vision-chunk-gate: tests/vision_chunk_gate
+	./tests/vision_chunk_gate $(FRONTIER_MODEL) $(VISION_IMAGE_GOLDENS)
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
 # L182: teacher-forced drafter acceptance -- E[accept] = sum min(p, q) over a fixed
@@ -1741,7 +1746,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
-               comp_state_gate chunk_neutrality_gate session_payload_gate tp_head_split_gate \
+               comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
                decode_reference_gate session_contract_gate chat_decode_smoke
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
@@ -1849,7 +1854,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-mseq-rewind-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
+.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-mseq-rewind-gate cuda-vision-chunk-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- every target in GATE_TARGETS, each loading the model,
@@ -1993,15 +1998,15 @@ GATES_DEV_UNIT ?= --ctxmem --sampler --sampler-prefilter --spec-math --lib-utf8 
 GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
 # attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
 # which is where an attention/compressor row change shows up as a logits delta.
-GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
 GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
 # engine lanes: the batched driver, the spec lane, the bank pool.
 GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
 GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
-# vision: the host gates below do the real work (they need no model); the two
-# sub-gates pin the prefill lane an image span rides.
-GATES_DEV_VISION = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+# vision: the host gates below do the real work (they need no model); the runner
+# sub-gates pin the prefill lane an image span rides and (L283) its chunk-start invariance.
+GATES_DEV_VISION = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
 # Nothing recognizable changed (or a clean tree): the conservative core -- the
 # dispatch/neutrality gates that fail on the widest class of numerics breaks.
 GATES_DEV_DEFAULT= cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-row-neutrality-gate-deep cuda-multiseq-gate
@@ -2197,6 +2202,8 @@ tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_inte
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
 tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
+tests/vision_chunk_gate.o: tests/vision_chunk_gate.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_chunk_gate.cpp
 
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
@@ -2354,6 +2361,8 @@ tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/vision_chunk_gate: tests/vision_chunk_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/comp_state_gate: tests/comp_state_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -2710,7 +2719,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate tests/payload_frontier_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate tests/payload_frontier_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

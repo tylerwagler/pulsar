@@ -322,6 +322,7 @@ bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e) {
     return e && (e->family->caps & PULSAR_FAMILY_CAP_MIXED_PREFILL) != 0;
 }
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
+bool pulsar_engine_has_vision(const pulsar_engine *e) { return e && e->family->vision && e->vision_ready; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }

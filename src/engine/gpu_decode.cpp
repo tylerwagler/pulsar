@@ -736,7 +736,7 @@ bool gpu_graph_dspark_draft_forward_banks(
                     own_heads, PULSAR_N_HEAD_DIM,
                     1,
                     meta_vis[li], meta_seq, 0, g->banks.n_banks,
-                    NULL /* q pre-normed */) != 0;
+                    NULL /* q pre-normed */, NULL, NULL /* a draft carries no image span */) != 0;
             else
                 ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                     g->batch_heads,
@@ -749,7 +749,7 @@ bool gpu_graph_dspark_draft_forward_banks(
                     own_heads, PULSAR_N_HEAD_DIM,
                     1,
                     NULL, NULL, 0, 1,
-                    NULL /* q pre-normed */) != 0;
+                    NULL /* q pre-normed */, NULL, NULL /* a draft carries no image span */) != 0;
         }
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,

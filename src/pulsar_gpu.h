@@ -1775,7 +1775,12 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
  * before its own position; nonzero = every ring row up to the last one (the
  * drafter's raw-window forward, whose queries all see the whole draft).
  * Both rules run on the same fp16 tensor-core kernel (L166); the flag
- * changes which rows are visible, never how a visible row is folded. */
+ * changes which rows are visible, never how a visible row is folded.
+ * vis_left/vis_right (L283): a prefill chunk past position 0 runs this launcher
+ * too, and an image span it owns keeps the visibility the zero-prefix
+ * launchers give it -- int32 [n_tokens] DEVICE slices of get_image_visible()'s
+ * counts, or NULL/NULL for text and for every decode row (see
+ * pulsar_gpu_attention_prefill_raw_heads_mx_tensor). */
 int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
@@ -1796,7 +1801,9 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         const pulsar_gpu_tensor *seq_id,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        const pulsar_gpu_q_prep *q_prep);
+        const pulsar_gpu_q_prep *q_prep,
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right);
 
 int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
@@ -1851,6 +1858,9 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks,
         const pulsar_gpu_q_prep *q_prep,
+        /* L283: the chunk's image-span visibility, as for the raw batch launcher above (NULL/NULL: text) */
+        const pulsar_gpu_tensor *vis_left,
+        const pulsar_gpu_tensor *vis_right,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope);
 

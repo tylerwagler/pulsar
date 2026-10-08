@@ -538,12 +538,13 @@ int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *er
 /** pulsar_session_sync() with images.  `n_images == 0` is the text-only path and
  * is exactly what pulsar_session_sync() calls.
  *
- * An image request is a COLD prefill from token 0: the reference merges an
- * image only on the start_pos == 0 pass and asserts that no sentinel id
- * survives into a continuation, so a cached prefix is never reused for one.
- * Every span must also fit inside a single prefill chunk -- a request that would
- * split one is refused loudly rather than prefilled with sentinels whose
- * embeddings were never merged. */
+ * The reference merges an image only on its start_pos == 0 pass; here an image
+ * request resumes from the session's KV like any sync (never from inside an
+ * image block), and each block is merged by the prefill chunk that owns it,
+ * wherever that chunk starts -- the block's rows are the one-pass prefill's,
+ * byte for byte (L283, cuda-vision-chunk-gate).  Every span must fit inside a
+ * single prefill chunk -- a request that would split one is refused loudly
+ * rather than prefilled with sentinels whose embeddings were never merged. */
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images,
                            char *err, size_t errlen);
@@ -1105,6 +1106,9 @@ bool pulsar_engine_can_rewind(const pulsar_engine *e);
  * (pulsar_session_save_snapshot / _load_snapshot)?  A caller that needs a session back at a known state
  * without one re-syncs the tokens instead. */
 bool pulsar_engine_has_snapshots(const pulsar_engine *e);
+/** Does the OPENED artifact serve images (its family has an image front and the artifact a bound, layout-validated
+ *  vision tower)?  An image request on an engine without one is refused by name. */
+bool pulsar_engine_has_vision(const pulsar_engine *e);
 /** The speculative drafter the OPENED engine actually carries -- the family's answer
  *  (pulsar_family::drafter): DSPARK when DeepSeek's dspark.* drafter loaded, MTP when a Qwen artifact
  *  carries the mtp.* layer (the sidecar shard; served by the family's own

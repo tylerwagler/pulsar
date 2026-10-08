@@ -342,7 +342,7 @@ static int check_dspark_non_causal_attention(void) {
                                                                     n_raw, raw_cap, 0,
                                                                     0, n_head, head_dim, 0,
                                                                     NULL, NULL, 0, 1,
-                                          NULL /* q pre-normed */);
+                                          NULL /* q pre-normed */, NULL, NULL);
         int ok_nc = pulsar_gpu_attention_decode_raw_batch_heads_tensor(heads_nc,
                                                                      sinks,
                                                                      n_head * sizeof(float),
@@ -353,7 +353,7 @@ static int check_dspark_non_causal_attention(void) {
                                                                      n_raw, raw_cap, 0,
                                                                      0, n_head, head_dim, 1,
                                                                      NULL, NULL, 0, 1,
-                                          NULL /* q pre-normed */);
+                                          NULL /* q pre-normed */, NULL, NULL);
         if (ok_c && ok_nc && pulsar_gpu_synchronize() &&
             pulsar_gpu_tensor_read_f32(heads_c, 0, heads_causal, heads_count) &&
             pulsar_gpu_tensor_read_f32(heads_nc, 0, heads_non_causal, heads_count)) {
