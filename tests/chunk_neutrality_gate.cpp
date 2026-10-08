@@ -375,7 +375,7 @@ int GATE_ENTRY(int argc, char **argv) {
             {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 4100, 0, 0, 1, NEED_REWIND | NEED_SNAPSHOT},
             /* L264: resumes from the grid checkpoints the prefills captured */
             {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, 4096, false, 0, 4096, 0, 0, NEED_RESTORE},
-            {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 3968, 0, 2, NEED_SNAPSHOT},
+            {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 3968, 0, 2, NEED_SNAPSHOT | NEED_RESTORE},
             {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 8576, 0, 0, NEED_RESTORE},
             /* L264 S4: the same resumes through disk segments */
             {"O: sync 8600, segment chain to 8576 through disk, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 0, 8576, 0, 0},
@@ -412,12 +412,13 @@ int GATE_ENTRY(int argc, char **argv) {
                                                : "a standalone checkpoint restore (the family restores one only inside a sync)");
                 continue;
             }
-            if (sched[k].share == 2 && !have_shared) {
-                fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s shares a decode no earlier schedule kept\n", sched[k].label);
-                fails++;
-                continue;
-            }
-            if (sched[k].share == 2)
+            /* L284: a share-2 schedule whose share-1 owner the family skips (K needs rewind on Qwen) runs the shared
+             * sync + decode itself and keeps it -- the owner's own path, so the later share-2 schedules start from it */
+            const bool owns = sched[k].share == 1 || (sched[k].share == 2 && !have_shared);
+            if (sched[k].share == 2 && !have_shared)
+                printf("  [shared] %s runs the shared sync %d + decode %d itself (its owner was skipped)\n",
+                       sched[k].label, sched[k].first, sched[k].evals);
+            else if (sched[k].share == 2)
                 printf("  [shared] %s starts from the payload of the shared sync %d + decode %d\n", sched[k].label,
                        sched[k].first, sched[k].evals);
             if (run_schedule(e, &toks, sched[k].first, sched[k].evals,
@@ -425,7 +426,7 @@ int GATE_ENTRY(int argc, char **argv) {
                              sched[k].restore, sched[k].segments, width,
                              rows + (size_t)(2 * k) * width,
                              rows + (size_t)(2 * k + 1) * width,
-                             sched[k].share == 2 ? &shared : NULL, sched[k].share == 1 ? &shared : NULL,
+                             sched[k].share == 2 && !owns ? &shared : NULL, owns ? &shared : NULL,
                              err, sizeof err) != 0) {
                 fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s failed: %s\n", sched[k].label, err);
                 printf("  %-50s FAILED TO RUN: %s\n", sched[k].label, err);
@@ -434,7 +435,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 continue;
             }
             ran[k] = true;
-            have_shared |= sched[k].share == 1;
+            have_shared |= owns;
         }
         pulsar_session_snapshot_free(&shared);
         for (int k = 1; ran[0] && k < GATE_SCHEDULES; k++) {
