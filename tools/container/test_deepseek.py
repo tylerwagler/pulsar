@@ -164,12 +164,14 @@ def make_hf(root, rng):
 
 
 def make_exl3(root, rng, words):
-    """layers.L.ffn.experts.E.wP.{trellis,suh,svh,mul1} for each (layer, part) in `words`."""
+    """<block>.L.ffn.experts.E.wP.{trellis,suh,svh,mul1} for each (layer, part) (block layers) or (block, layer,
+    part) in `words`."""
     t = {}
-    for (layer, part), w in words.items():
+    for key0, w in words.items():
+        block, layer, part = key0 if len(key0) == 3 else ("layers", *key0)
         k, n = (FF, H) if part == "w2" else (H, FF)
         for e in range(E):
-            key = f"layers.{layer}.ffn.experts.{e}.{part}"
+            key = f"{block}.{layer}.ffn.experts.{e}.{part}"
             t[key + ".trellis"] = ("I16", [k // 16, n // 16, w],
                                    rng.integers(-32768, 32767, (k // 16) * (n // 16) * w, dtype=np.int16).tobytes())
             t[key + ".suh"] = ("F16", [k], rng.standard_normal(k).astype(np.float16).tobytes())
@@ -302,6 +304,30 @@ def main():
                 [r for r in rows if r.get("source") != "exl3"]
                 + [{"role": r, "layers": [2], "format": "cutlass_mxfp4"} for r in ("expert_gate", "expert_up", "expert_down")],
                 "--exl3: given, but no row")
+
+        # the drafter's routed experts from an EXL3 checkpoint (L285 E4: the engine admits them at the slot,
+        # weights.cpp tensor_expect_routed_expert; before L279 the builder sourced EXL3 for layers.* only), at K4 --
+        # a rate the pair / down arms read, which the per-family list refused
+        print("drafter experts from EXL3:")
+        exm = os.path.join(tmp, "exl3-mtp")
+        make_exl3(exm, np.random.default_rng(281), {("mtp", 0, p): 64 for p in ("w1", "w3", "w2")})
+        ok, out = run("recipe", "--hf", hf)
+        rows_m = [r for r in json.loads(out)["rows"] if not r.get("role", "").startswith("expert_")]
+        for role in ("expert_gate", "expert_up", "expert_down"):
+            rows_m += [{"role": role, "block": "layers", "format": "cutlass_mxfp4"},
+                       {"role": role, "block": "mtp", "format": "exl3m_k4", "source": "exl3"}]
+        mp = os.path.join(tmp, "mtp.recipe.json")
+        json.dump(dict(sel, rows=rows_m), open(mp, "w"))
+        om = os.path.join(tmp, "mtp-exl3")
+        ok, out = run("emit", "--hf", hf, "--exl3", exm, "--recipe", mp, "--out", om, "--all")
+        check(ok, "emit with the drafter's experts at exl3m_k4")
+        ok, out = run("verify", "--hf", hf, "--exl3", exm, "--recipe", mp, "--out", om, "--all")
+        check(ok and "failing: 0" in out, "verify PASS (the drafter's EXL3 slices equal their source ranges)")
+        with open(os.path.join(om, "model-00006-of-00006.safetensors"), "rb") as f:     # mtp.0
+            (n,) = struct.unpack("<Q", f.read(8))
+            h = json.loads(f.read(n))
+        fams = {x["part"]: x["layout"] for x in json.loads(h["__metadata__"]["pulsar.experts"])}
+        check(fams == {"w1": "exl3m_k4", "w3": "exl3m_k4", "w2": "exl3m_k4"}, f"mtp.0 families {fams}")
     finally:
         shutil.rmtree(tmp)
     print(f"test_deepseek: {'PASS' if not FAILS else 'FAIL'} ({len(FAILS)} failing)")
