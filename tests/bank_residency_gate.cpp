@@ -6,9 +6,8 @@
  * Bank 1 and bank 2 prefill the same G tokens of the story prompt (G a multiple of 128, so a checkpoint stands at
  * the prompt's end).  Bank 1 is persisted as a segment [0, G), bank 0 installed, then:
  *   R1  free_physical(live bank 0) refuses; free_physical(1) releases bank 1: is_evicted, its touched KV 0, the
- *       session's touched KV drops by exactly what bank 1 held, and MemAvailable rises by at least half of it
- *       within 5 s (a cudaFree of demand-paged pages on GB10 returns them asynchronously; the rest is the
- *       kernel's own accounting noise)
+ *       session's touched KV drops by exactly what bank 1 held, and MemAvailable rises by at least 3/4 of it
+ *       within 60 s (GB10 hands a cudaFree'd managed range back to the kernel asynchronously, at ~10 MiB/s)
  *   R2  alloc_physical(1) re-backs it, twice (idempotent): not evicted; the segment loads it back to G and its
  *       touched KV is what it was
  *   R3  bank 1 (freed and restored) and bank 2 (never freed) each sync the same extension Q of the prompt and
@@ -149,10 +148,12 @@ int GATE_ENTRY(int argc, char **argv) {
           "R1 free_physical refuses the live bank 0 and frees nothing");
     const long long ma0 = mem_available_kb();
     const bool freed = ok && pulsar_session_bank_free_physical(s, 1);
-    /* the driver hands the pages back to the kernel asynchronously: watch MemAvailable for up to 5 s */
+    /* GB10 returns a cudaFree'd managed range to the kernel ASYNCHRONOUSLY and slowly (measured 2026-10-07: +0 at
+     * once, +50 MiB at 5 s, +223 MiB of 227.5 at 30 s): watch MemAvailable for up to 60 s */
     long long ma1 = mem_available_kb();
-    for (int i = 0; i < 100 && ma0 >= 0 && (double)(ma1 - ma0) * 1024.0 < 0.5 * (double)t1; i++) {
-        usleep(50 * 1000);
+    int waited_ms = 0;
+    for (; waited_ms < 60000 && ma0 >= 0 && (double)(ma1 - ma0) * 1024.0 < 0.75 * (double)t1; waited_ms += 250) {
+        usleep(250 * 1000);
         const long long m = mem_available_kb();
         if (m > ma1) ma1 = m;
     }
@@ -161,8 +162,9 @@ int GATE_ENTRY(int argc, char **argv) {
           "R1 bank 1 freed: evicted, touched %.1f -> %.1f MiB, session %.1f -> %.1f MiB", t1 / 1048576.0,
           t1_after / 1048576.0, all0 / 1048576.0, all1 / 1048576.0);
     const double rise_mib = (double)(ma1 - ma0) / 1024.0;
-    CHECK(ma0 >= 0 && rise_mib >= 0.5 * (double)t1 / 1048576.0,
-          "R1 MemAvailable rose %.1f MiB (bank 1's touched KV %.1f MiB)", rise_mib, t1 / 1048576.0);
+    CHECK(ma0 >= 0 && rise_mib >= 0.75 * (double)t1 / 1048576.0,
+          "R1 MemAvailable rose %.1f MiB within %.2f s (bank 1's touched KV %.1f MiB)", rise_mib, waited_ms / 1000.0,
+          t1 / 1048576.0);
     CHECK(!pulsar_session_bank_is_evicted(s, 2), "R1 bank 2 untouched by bank 1's eviction");
 
     /* R2: the restore -- re-back, install, load the chain */
