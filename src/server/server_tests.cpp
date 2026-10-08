@@ -6742,6 +6742,40 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
 }
 
 
+/* L284 -- worker_main's batch leave (server_batch_may_leave). Invariant: decoders in the plain batch leave it
+ * exactly when the lane pick would then take lane 3 -- the drafter runs, they number no more than the family's spec
+ * banks, and each speculates -- so a pair that a third stream pushed to the plain batch rejoins speculation when it
+ * finishes (before, only a lone decoder left), and a leave is never undone by the next pick. */
+static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
+    gen_state g[3];
+    memset(g, 0, sizeof g);
+    session_slot slots[3];
+    memset(slots, 0, sizeof slots);
+    session_slot *dec[3];
+    for (int i = 0; i < 3; i++) {
+        slots[i].gen = &g[i];
+        g[i].spec_enabled = true;
+        g[i].batch_active = true;
+        dec[i] = &slots[i];
+    }
+    /* Qwen's two spec banks: three decoders stay plain, the pair left behind leaves */
+    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 3, 3));
+    TEST_ASSERT(server_batch_may_leave(true, 2u, dec, 2, 2));
+    /* the L271 lone decoder */
+    TEST_ASSERT(server_batch_may_leave(true, 2u, dec, 1, 1));
+    /* nothing in the plain batch: nothing to leave */
+    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 2, 0));
+    /* no drafter */
+    TEST_ASSERT(!server_batch_may_leave(false, 2u, dec, 2, 2));
+    /* a decoder that does not speculate (logprobs) holds the batch */
+    g[1].spec_enabled = false;
+    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 2, 2));
+    g[1].spec_enabled = true;
+    /* every leave lands in lane 3 once the batch is empty */
+    for (int i = 0; i < 2; i++) g[i].batch_active = false;
+    TEST_ASSERT(server_pick_decode_lane(4, true, 2u, dec, 2, 0) == 3);
+}
+
 /* Geometric survival for one bank: np pendings at per-position confidence c,
  * surv[j] = c^(j+1) -- the cumprod spec_alloc_rows' caller derives from the
  * drafter carry. */
@@ -8437,6 +8471,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
+    test_l284_batch_leave_when_spec_lane_carries_all();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

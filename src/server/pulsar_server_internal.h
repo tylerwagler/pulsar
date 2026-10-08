@@ -2515,15 +2515,17 @@ struct gen_state {
      * reconciled onto the checkpoint when the slot returns to a classic op
      * (finish/store). */
     bool batch_active;      ///< this slot is in the shared multiseq lane (it leaves at finish, or for the family's
-                            ///< speculation once it decodes alone: server::batch_leave, L271)
+                            ///< speculation once that lane can carry every decoder: server::batch_leave, L271/L284)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
     int  batch_feed_token;  ///< next token to commit
     int  batch_feed_pos;    ///< position to commit it at (the bank's KV frontier)
     pulsar_tokens batch_pending;  ///< tokens committed via multiseq since the bank's last host checkpoint
-    /** plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
-     * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
-     * once by the fused quantum on giveup; the classic path handles it correctly. */
-    bool no_fuse;
+    /** plan-34 inc 5: why this prefill slot is not fusable (NULL: it may fuse) -- a
+     * fused step rejected its run as not-position-true, or fuse_prepare found its bank
+     * needs a rewind / a resume below the frontier / a fresh compressor group; route it
+     * CLASSIC.  Set once; the classic path handles it correctly.  The reason is what
+     * the spec quantum's rider verdict prints (L284). */
+    const char *no_fuse;
     /** L260 fusion: this prompt rides the spec lane's fused steps -- its bank was
      * installed once and found an exact extension point (or invalidated for a fresh
      * conversation).  A prompt that is not an extension of its bank's history is

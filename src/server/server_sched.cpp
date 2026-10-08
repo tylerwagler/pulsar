@@ -1422,12 +1422,26 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * (pulsar_engine_has_spec_rounds), every decoder speculates (spec_enabled: a
  * logprobs request does not), none sits in the plain multiseq batch, and the
  * decoders are no more than one shared verify forward carries
- * (pulsar_engine_spec_banks_max: the pool on DeepSeek; one on Qwen until its GDN
- * and PLE kernels take N banks x R rows, L272 P1 S4); the plain batched lane (2)
- * otherwise; the classic lane (1) with no pool.  Lane 3 keeps the spec_decode
- * counters advancing; lane 2 does not.  A lone decoder left in the plain batch
- * rejoins lane 3 through server::batch_leave before this pick (L271, every
- * family since L272 P1). */
+ * (pulsar_engine_spec_banks_max: the pool on DeepSeek; two on Qwen, L272 P1 S4);
+ * the plain batched lane (2) otherwise; the classic lane (1) with no pool.  Lane 3
+ * keeps the spec_decode counters advancing; lane 2 does not.  Decoders left in the
+ * plain batch rejoin lane 3 through server::batch_leave before this pick once it
+ * can carry them all (server_batch_may_leave: L271, L284). */
+/* L271 / L284: when decoders sitting in the plain multiseq batch leave it (server::batch_leave) for the spec
+ * lane -- as soon as that lane can take every decoder: the drafter runs behind the round API, they are no more
+ * than one verify forward carries, and each speculates with no constrained tool name open (the lane pick's own
+ * conditions, so a leave is never undone by the next pick).  Before, only a LONE decoder left: decoders that had
+ * once outnumbered the family's spec banks stayed plain for the rest of their lives. */
+static bool server_batch_may_leave(bool spec_rounds, uint32_t banks_max, session_slot *const *dec, int n_dec,
+                                   int n_batched) {
+    if (!spec_rounds || n_batched <= 0 || n_dec <= 0 || (uint32_t)n_dec > banks_max) return false;
+    for (int i = 0; i < n_dec; i++) {
+        const gen_state *dg = dec[i]->gen;
+        if (!dg || !dg->spec_enabled || gen_tool_name_open(dg)) return false;
+    }
+    return true;
+}
+
 static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t banks_max,
                                    session_slot *const *dec, int n_dec, int n_batched) {
     bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= banks_max && n_batched == 0;
@@ -1967,6 +1981,11 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
  * prompt may still add rows (see fuse_rows in the spec quantum). */
 #define PULSAR_SERVER_FUSED_CONT_ROWS 2048u
 
+static bool slot_prefilling(const session_slot *c) {
+    return c->active_job && c->gen &&
+           (c->gen->phase == GEN_PREFILL_COLD || c->gen->phase == GEN_PREFILL_MAIN);
+}
+
 static bool slot_fusable_prefill(const session_slot *c) {
     const gen_state *g = c->gen;
     return c->active_job && g && g->phase == GEN_PREFILL_MAIN && !g->no_fuse &&
@@ -1991,17 +2010,17 @@ bool server::fuse_prepare(session_slot *sl) {
     if (pos == 0) {
         pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
     } else if (pulsar_session_common_prefix(pool, g->prompt_for_sync) != pos) {
-        g->no_fuse = true;                   /* needs a rewind / stitch: the classic sync owns that */
+        g->no_fuse = "needs a rewind/stitch";   /* the classic sync owns that */
     } else if (const int at = pulsar_session_bank_resume_at(pool, (uint32_t)sl->bank, g->prompt_for_sync);
                at >= 0 && at != pos) {
         /* L284: a bank-pool family's sync would not continue this history where it stands (decode rows past
          * its prefill: it resumes from a checkpoint below); a fused chunk starts only where the sync would */
-        g->no_fuse = true;
+        g->no_fuse = "resumes below the bank frontier";
     } else if (pulsar_session_bank_comp_stale(pool, (uint32_t)sl->bank)) {
         /* A fused round would extend the stale compressor group at the frontier
          * and fail the step on both ranks (the pair 2026-10-02 17:11:55); the
          * classic sync's resume starts at a grid point, a group boundary. */
-        g->no_fuse = true;
+        g->no_fuse = "stale compressor state";
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: bank %d compressor state is stale at %d: "
                    "the prompt takes the classic sync (grid-point resume), not a fused round",
                    sl->bank, pos);
@@ -2092,6 +2111,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     const uint32_t heads_max = fuse_on ? pulsar_engine_fused_heads_max(s->engine) : (uint32_t)PULSAR_SPEC_ROW_BUDGET;
     const uint32_t cont_rows = fuse_rows < PULSAR_SERVER_FUSED_CONT_ROWS ? fuse_rows : PULSAR_SERVER_FUSED_CONT_ROWS;
     pulsar_multiseq_req *fused_reqs = NULL;
+    /* rule 5 (L284): each prefilling prompt's verdict over this quantum -- the rows it rode in how many
+     * rounds, and why it last did not ride -- printed once at the quantum's end */
+    struct rider_verdict { int rounds, rows; const char *why; };
+    rider_verdict rv[PULSAR_SESSION_POOL_CAP];
+    memset(rv, 0, sizeof rv);
     int round_ix = 0;
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
@@ -2169,10 +2193,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         fused_run fr[PULSAR_SESSION_POOL_CAP];
         int n_fr = 0, n_fin = 0;
         uint32_t pf_rows = 0;
-        for (int k = 0; fuse_on && k < s->n_slots && n_fr < PULSAR_SESSION_POOL_CAP && pf_rows < fuse_rows; k++) {
+        for (int k = 0; k < s->n_slots; k++) {
             session_slot *c = &s->slots[k];
-            if (!slot_fusable_prefill(c)) continue;
+            if (!slot_prefilling(c)) continue;
             gen_state *pg = c->gen;
+            const char *why = NULL;   /* rule 5: the verdict the quantum prints for this prompt */
+            if (!fuse_on) why = "fusion off";
+            else if (pg->phase != GEN_PREFILL_MAIN) why = "cold-store phase";
+            else if (pg->j->req.n_images > 0) why = "image prompt";
+            else if (pg->no_fuse) why = pg->no_fuse;
+            else if (n_fr >= PULSAR_SESSION_POOL_CAP || pf_rows >= fuse_rows) why = "round full";
+            if (why) { rv[k].why = why; continue; }
             if (gen_client_disconnected(pg->j->fd)) {
                 server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
                 snprintf(pg->err, sizeof pg->err, "client disconnected");
@@ -2180,16 +2211,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 s->worker_finish_slot(c);   /* L282: released where abandoned (nothing in this quantum steps it) */
                 continue;
             }
-            if (!pg->fuse_ready && !s->fuse_prepare(c)) continue;
+            if (!pg->fuse_ready && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
             const int p0 = pulsar_session_bank_pos(pool, (uint32_t)c->bank);
             const int left = pg->prompt_for_sync->len - p0;
-            if (left <= 0) continue;
+            if (left <= 0) { rv[k].why = "nothing left"; continue; }
             int kk = left < (int)(fuse_rows - pf_rows) ? left : (int)(fuse_rows - pf_rows);
             if (kk < left) {
-                if (!long_ok || pf_rows >= cont_rows) continue;
+                if (!long_ok) { rv[k].why = "continuation waits for a full quantum's first round"; continue; }
+                if (pf_rows >= cont_rows) { rv[k].why = "continuation rows full"; continue; }
                 if (kk > (int)(cont_rows - pf_rows)) kk = (int)(cont_rows - pf_rows);
                 kk = (p0 + kk) / PULSAR_SERVER_FUSED_CHUNK_ALIGN * PULSAR_SERVER_FUSED_CHUNK_ALIGN - p0;
-                if (kk <= 0) continue;
+                if (kk <= 0) { rv[k].why = "continuation below the chunk alignment"; continue; }
             } else {
                 /* L264: the final chunk stops at the last grid point inside it,
                  * which the bank keeps as a checkpoint (note_prefilled); the
@@ -2199,7 +2231,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 if (grid_end > p0 && grid_end < p0 + kk) kk = grid_end - p0;
             }
             const bool fin = p0 + kk == pg->prompt_for_sync->len;
-            if (fin && (uint32_t)(n_fin + 1 + n) > heads_max) continue;   /* no head row left this round */
+            if (fin && (uint32_t)(n_fin + 1 + n) > heads_max) { rv[k].why = "no head row left"; continue; }
             fr[n_fr].sl = c;
             fr[n_fr].p0 = p0;
             fr[n_fr].k = kk;
@@ -2417,6 +2449,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                  * the per-slot watermark. */
                 gen_prefill_progress_cb(pg, "prefill_chunk", fr[r].p0 + fr[r].k,
                                         pg->prompt_for_sync->len);
+                rider_verdict *v = &rv[c - s->slots];
+                v->rounds++;
+                v->rows += fr[r].k;
                 if (fr[r].fin) {
                     slot_writer_install(&pg->writer);
                     s->gen_stream_begin(c);
@@ -2603,6 +2638,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         if (n_fin > 0) break;
     }
     free(fused_reqs);
+    for (int k = 0; k < s->n_slots; k++) {
+        if (!rv[k].rounds && !rv[k].why) continue;
+        const session_slot *c = &s->slots[k];
+        const int len = c->gen && c->gen->prompt_for_sync ? c->gen->prompt_for_sync->len : -1;
+        server_log(PULSAR_LOG_PREFILL, "pulsar-server: fuse: bank %d at %d/%d rode %d rows in %d of %d rounds%s%s",
+                   c->bank, pulsar_session_bank_pos(pool, (uint32_t)c->bank), len, rv[k].rows, rv[k].rounds,
+                   round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
+    }
     if (emitted_total > 0) {
         const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
                                          (double)emitted_total);
@@ -2616,7 +2659,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     }
 }
 
-/* L271 / L272 P1: a lone decoder leaves the plain multiseq batch to rejoin the spec-batched lane.  The
+/* L271 / L272 P1 / L284: a decoder leaves the plain multiseq batch to rejoin the spec-batched lane.  The
  * bank is made live again (bank_state_restore clears the multiseq poison), the host checkpoint catches up
  * to what multiseq committed, and the token the batch sampled (its logprob already captured) is fed,
  * counted and emitted as the batch's next step would have -- so the session's logits are fresh for the
@@ -2899,7 +2942,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             /* RECOVERABLE reject charged to the PREFILL run (see
              * mixed_prefill_giveup): stop folding this prefill (classic via
              * no_fuse); the co-scheduled decode banks retry this step alone. */
-            pf_giveup = true; pg->no_fuse = true;
+            pf_giveup = true; pg->no_fuse = "fused step gave up";
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
                        "from now on; the %d decode bank(s) retry this step alone", err, m);
@@ -3012,11 +3055,6 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
  * -- what a chunked-prefill step with decode rows riding along gives them --
  * and a long multi-chunk prompt still alternates with full quanta, so it
  * cannot starve decode (the 214 s stall). */
-static bool slot_prefilling(const session_slot *c) {
-    return c->active_job && c->gen &&
-           (c->gen->phase == GEN_PREFILL_COLD || c->gen->phase == GEN_PREFILL_MAIN);
-}
-
 static int worker_decode_budget(server *s) {
     const int cap = pulsar_session_prefill_cap(s->sess);
     for (int i = 0; i < s->n_slots; i++) {
@@ -3153,15 +3191,23 @@ void *worker_main(void *arg) {
          * loop, so this is what tells a scraper whether the spec_decode_*
          * counters describe the present or some earlier single-request stretch. */
         /* L271: a lone decoder still in the plain batch (it shared it with a request that has since
-         * finished -- Claude Code's side calls) rejoins speculation (L272 P1: every family) */
-        if (n_dec == 1 && n_batched == 1 && dec[0]->gen->spec_enabled && dec[0]->gen->batch_active &&
-            pulsar_engine_has_spec_rounds(s->engine)) {
-            s->batch_leave(dec[0]);
+         * finished -- Claude Code's side calls) rejoins speculation (L272 P1: every family).
+         * L284: and so do decoders the spec lane can carry again -- a third stream beside Qwen's pair (spec
+         * banks 2) moved all three to the plain batch, and the pair stayed there after it finished: every later
+         * prompt took the classic sync, none rode a fused step */
+        if (server_batch_may_leave(pulsar_engine_has_spec_rounds(s->engine), pulsar_engine_spec_banks_max(s->engine),
+                                   dec, n_dec, n_batched)) {
+            for (int i = 0; i < n_dec; i++)
+                if (dec[i]->gen->batch_active) s->batch_leave(dec[i]);
             n_batched = 0;
         }
-        s->w_decode_lane = server_pick_decode_lane(s->pool_banks,
-                                                   pulsar_engine_has_spec_rounds(s->engine),
-                                                   pulsar_engine_spec_banks_max(s->engine), dec, n_dec, n_batched);
+        const int lane = server_pick_decode_lane(s->pool_banks, pulsar_engine_has_spec_rounds(s->engine),
+                                                 pulsar_engine_spec_banks_max(s->engine), dec, n_dec, n_batched);
+        /* rule 5: the lane a decode sweep runs is announced when it changes (only lane 3 fuses prompts) */
+        if (lane != s->w_decode_lane && lane >= 2)
+            server_log(PULSAR_LOG_GENERATION, "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch)",
+                       s->w_decode_lane, lane, n_dec, n_batched);
+        s->w_decode_lane = lane;
         const bool use_spec_batched = s->w_decode_lane == 3;
         const bool use_batched = s->w_decode_lane >= 2;
 
