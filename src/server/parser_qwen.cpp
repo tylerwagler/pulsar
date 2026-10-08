@@ -42,7 +42,8 @@ static void *qwen_parser_create(server *, gen_state *g, char *err, size_t errlen
 static void qwen_parser_destroy(void *st) { delete (qwen_gen *)st; }
 
 static bool qwen_parser_in_tool_call(const void *st, const gen_state *) {
-    return ((const qwen_gen *)st)->parser.in_tool_call();
+    const qwen_output_parser &p = ((const qwen_gen *)st)->parser;
+    return p.in_tool_call() && !p.in_payload();
 }
 
 static bool qwen_parser_turn_complete(const void *, const gen_state *) { return false; }

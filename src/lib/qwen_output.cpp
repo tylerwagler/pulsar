@@ -212,6 +212,61 @@ void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
     index_++;
 }
 
+/* Advance pay_ over block_'s new bytes (the open call's body so far; hold_ keeps a partial
+ * "</tool_call>" out of it).  A parameter value starts past "<parameter=KEY>" and ends at the first
+ * "</parameter>" -- close_call's reading. */
+void qwen_output_parser::scan_payload() {
+    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
+    payload_scan &ps = pay_;
+    const std::string &b = block_;
+    for (;;) {
+        if (!ps.value) {
+            const size_t at = b.find(kParam, ps.pos);
+            if (at == std::string::npos) {
+                ps.pos = b.size() > strlen(kParam) ? std::max(ps.pos, b.size() - strlen(kParam)) : ps.pos;
+                break;
+            }
+            const size_t gt = b.find('>', at);
+            if (gt == std::string::npos) {
+                ps.pos = at;
+                break;
+            }
+            const char *type = param_type(fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
+            ps.value = true;
+            ps.is_string = type && !strcmp(type, "string");
+            ps.json_str = ps.esc = false;
+            ps.pos = ps.vstart = gt + 1;
+            continue;
+        }
+        bool closed = false;
+        while (ps.pos < b.size()) {
+            if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
+                ps.pos += strlen(kParamEnd);
+                ps.value = false;
+                closed = true;
+                break;
+            }
+            if (b[ps.pos] == '<' && b.size() - ps.pos < strlen(kParamEnd) &&
+                !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
+                break;   /* a partial closer waits for its next bytes */
+            const char c = b[ps.pos++];
+            if (ps.is_string) continue;
+            if (ps.json_str) {
+                if (ps.esc) ps.esc = false;
+                else if (c == '\\') ps.esc = true;
+                else if (c == '"') ps.json_str = false;
+            } else if (c == '"') {
+                ps.json_str = true;
+            }
+        }
+        if (!closed) break;
+    }
+    /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
+     * "</" of a closer (this block's or the held "</tool_call>") */
+    const size_t pending = b.size() - std::min(ps.pos, b.size());
+    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && hold_.size() < 2;
+}
+
 bool qwen_output_parser::raw_span(size_t *lo, size_t *hi) const {
     if (calls_.empty()) return false;
     *lo = raw_lo_;
@@ -254,6 +309,8 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
             hold_.erase(0, at + strlen(kCallOpen));
             block_.clear();
             began_ = false;
+            fn_.clear();
+            pay_ = payload_scan();
             mode_ = M_TOOL;
             continue;
         }
@@ -274,6 +331,7 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
                     ev_begin.kind = qwen_out_event::TOOL_BEGIN;
                     ev_begin.index = index_;
                     ev_begin.name = block_.substr(i + 10, e - i - 10);
+                    fn_ = ev_begin.name;
                     ev->push_back(std::move(ev_begin));
                     began_ = true;
                 }
@@ -281,6 +339,7 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
         }
         if (at == std::string::npos) {
             hold_.erase(0, take);
+            if (began_) scan_payload();
             return;
         }
         raw_hi_ = fed_ - hold_.size() + at + strlen(kCallClose);

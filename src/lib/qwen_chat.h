@@ -200,8 +200,13 @@ public:
     const std::string &content() const { return content_; }
     const std::vector<qwen_out_call> &calls() const { return calls_; }
     int errors() const { return errors_; }
-    /** The parser sits inside an open \<tool_call\> block: its arguments decode greedily (L272 B8). */
+    /** The parser sits inside an open \<tool_call\> block. */
     bool in_tool_call() const { return mode_ == M_TOOL; }
+    /** L284 P6: the next byte is a call's PAYLOAD -- inside a parameter value the schema declares a
+     * string, or inside a JSON string literal of any other value -- past the value's leading newline
+     * (the template's) and not on a partial closer ("</" onward).  The shared decode rule: a call's
+     * structure decodes greedily, its payload is sampled (DeepSeek's DSML tracker draws the same line). */
+    bool in_payload() const { return mode_ == M_TOOL && pay_.value && pay_.payload; }
     /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from the first "<tool_call>" to the
      * last "</tool_call>" that closed (a malformed block among them included -- these are the bytes
      * the live KV holds; qwen_msg_in::raw_calls replays them).  false until a call was read. */
@@ -217,6 +222,7 @@ private:
     void emit_text(bool reasoning, const char *p, size_t n, std::vector<qwen_out_event> *ev);
     void end_section(bool reasoning);
     void close_call(std::vector<qwen_out_event> *ev);
+    void scan_payload();
     const char *param_type(const std::string &fn, const std::string &key) const;
 
     mode_t mode_ = M_CONTENT;
@@ -228,6 +234,16 @@ private:
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open tool-call block body
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
+    std::string fn_;           ///< the open call's function name, once complete
+    struct payload_scan {      ///< where the open block's decode is (in_payload), scanned incrementally
+        size_t pos = 0;        ///< bytes of block_ classified
+        bool value = false;    ///< inside a parameter value
+        size_t vstart = 0;     ///< where its text starts (past the tag)
+        bool is_string = false;///< the schema declares it a string
+        bool json_str = false; ///< inside a JSON string literal of a non-string value
+        bool esc = false;      ///< the previous byte was a backslash in that literal
+        bool payload = false;  ///< the result for the next byte
+    } pay_;
     int index_ = 0;
     int errors_ = 0;
     std::string reasoning_, content_;

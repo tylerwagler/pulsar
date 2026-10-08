@@ -1321,11 +1321,11 @@ void gen_resolve_sampling(const request *req, float *temperature,
 
 
 
-/* Decode-lane sampling resolution: gen_resolve_sampling plus the tool-payload
- * greedy override (temperature=0 while the decode sits inside a tool call: the
- * DSML tracker's region outside a payload-sampling span for DeepSeek, the Qwen
- * parser's open <tool_call> block for Qwen -- L272 B8; a Qwen argument is the
- * JSON text itself, with no payload-sampling region). L116: ONE authority for
+/* Decode-lane sampling resolution: gen_resolve_sampling plus the tool-call
+ * greedy override (temperature=0 while the decode sits on a call's structure;
+ * its payload -- a string-typed value or a JSON string inside another value --
+ * samples normally: the DSML tracker's payload spans for DeepSeek, the Qwen
+ * parser's in_payload for Qwen -- L284 P6, one rule). L116: ONE authority for
  * every decode lane — classic, plain-batched, spec-batched, mixed — so a tool
  * request samples the same wherever the scheduler routes it. Granularity is
  * one resolution per spec block / batched round in every lane (the classic

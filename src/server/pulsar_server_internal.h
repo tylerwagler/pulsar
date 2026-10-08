@@ -614,7 +614,8 @@ typedef struct server_output_parser_ops {
      *  projected into the sink (final = false); at the finish, `final` flushes what the projection held.
      *  false = a client write failed. */
     bool (*feed)(void *st, server *s, struct gen_state *g, size_t upto, bool final);
-    /** The decode sits inside a tool call's structured region: its arguments decode greedily. */
+    /** The decode sits on a tool call's STRUCTURE: greedy.  A call's payload -- a string-typed value, or a
+     *  JSON string inside any other value -- is sampled (L284 P6: one rule, every family). */
     bool (*in_tool_call)(const void *st, const struct gen_state *g);
     /** The turn is complete before the stop token (DeepSeek: a closed DSML block). */
     bool (*turn_complete)(const void *st, const struct gen_state *g);

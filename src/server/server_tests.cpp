@@ -3501,6 +3501,44 @@ static void test_forced_call_names_a_declared_tool(void) {
     request_free(&r);
 }
 
+/* L284 P6: one decode rule for a call, every family -- greedy on structure, sampled on the payload (a
+ * string-typed value, a JSON string inside another value).  Qwen's parser marks the payload byte by
+ * byte, as DeepSeek's DSML tracker does its string bodies. */
+static void test_qwen_payload_is_sampled_structure_greedy(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\","
+                        "\"properties\":{\"s\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"},"
+                        "\"o\":{\"type\":\"object\"}}}}}]";
+    qwen_output_parser p;
+    char err[160];
+    TEST_ASSERT(p.init(false, tools, err, sizeof err));
+    std::vector<qwen_out_event> ev;
+    /* each step: bytes fed, then whether the NEXT byte is payload */
+    struct step { const char *bytes; bool tool; bool payload; };
+    static const step steps[] = {
+        {"Sure.\n", false, false},
+        {"<tool_call>\n<function=f>\n", true, false},
+        {"<parameter=s>", true, false},        /* the template's leading newline is structure */
+        {"\n", true, true},
+        {"hello </b", true, true},              /* tag-looking text is payload */
+        {"\n<", true, true},
+        {"/", true, false},                     /* "</" -- a closer may be starting */
+        {"parameter>\n<parameter=n>\n", true, false},
+        {"42", true, false},                    /* a non-string value is structure ... */
+        {"\n</parameter>\n<parameter=o>\n{\"k\": \"", true, true},   /* ... except its JSON strings */
+        {"v \\\" still", true, true},
+        {"\"", true, false},
+        {"}\n</parameter>\n</function>\n</tool_call>", false, false},
+    };
+    for (const step &st : steps) {
+        p.feed(st.bytes, strlen(st.bytes), &ev);
+        TEST_ASSERT(p.in_tool_call() == st.tool);
+        TEST_ASSERT(p.in_payload() == st.payload);
+    }
+    p.finish(&ev);
+    TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
+    TEST_ASSERT(p.calls()[0].arguments == "{\"s\": \"hello </b\", \"n\": 42, \"o\": {\"k\": \"v \\\" still\"}}");
+}
+
 /* L272: the declared-name mask's token rule -- a token is allowed while the joined bytes stay a prefix of
  * a declared name + the closer, or pass the closer with only whitespace after. */
 static void test_tool_name_token_allowed(void) {
@@ -8491,6 +8529,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();
     test_tool_name_token_allowed();
+    test_qwen_payload_is_sampled_structure_greedy();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
