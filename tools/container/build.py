@@ -28,7 +28,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hf_source import HFCheckpoint, Exl3Checkpoint, EXL3_LAYOUT  # noqa: E402
+from hf_source import HFCheckpoint, Exl3Checkpoint  # noqa: E402
 import names as N          # noqa: E402
 import policy as P         # noqa: E402
 import producers as PR     # noqa: E402
@@ -124,9 +124,9 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         dims_ne = [inp, out]
         use_exl3 = exl3 is not None and shard.startswith('layers.') and layer in exl3_layers
         if use_exl3:
-            _, words = exl3.expert(layer, 0, part, inp, out)
-            layout = EXL3_LAYOUT[words]
-            per = [EN.exl3_ranges(exl3, f'layers.{layer}.ffn.experts.{e}.{part}', layout, inp, out, EXL3_LAYOUT)[0]
+            _, words = exl3.linear(N.exl3_expert_key(layer, 0, part), inp, out, P.EXL3_WORDS)
+            layout = P.EXL3_WORDS[words]
+            per = [EN.exl3_ranges(exl3, N.exl3_expert_key(layer, e, part), layout, inp, out, P.EXL3_WORDS)[0]
                    for e in range(n_exp)]
         else:
             layout = P.layout_for(m0, dtype, hshape, overrides)
@@ -304,7 +304,7 @@ def load_sources(args):
     exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
     layers = set()
     if exl3:
-        have = set(exl3.layers())
+        have = set(N.exl3_layers(exl3.names()))
         layers = parse_layers(args.exl3_layers) if args.exl3_layers else have
         missing = sorted(layers - have)
         if missing:

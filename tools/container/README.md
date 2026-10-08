@@ -16,7 +16,7 @@ for the file:line evidence behind every statement here.
 hf_source.py
   class HFCheckpoint(hf_dir)            # shard headers only; .names(), .shape(n), .dtype(n), .raw(n) -> bytes,
                                         #  .config (text_config merged), .generation_config
-  class Exl3Checkpoint(dir)             # moved from the lane: .layers(), .expert(layer, e, part, k, n) -> (ranges, words)
+  class Exl3Checkpoint(dir)             # family-neutral: .names(), .linear(key, k, n, rates) -> (ranges, words); the family names the key
 
 names.py
   @dataclass Mapped:

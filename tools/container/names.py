@@ -262,6 +262,23 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
                   shard=shard, layer=idx, expert=None, part=None, is_scale=companion, emit=emit)
 
 
+# ---------------------------------------------------------------------------
+# The EXL3 expert source's naming (an exllamav3 checkpoint of DeepSeek: MiaAI's V4.1, our L245 / L247 splices):
+# the routed expert-projection layers.L.ffn.experts.E.wP is the Linear key its trellis / suh / svh / mul1 hang
+# off.  hf_source.Exl3Checkpoint answers by key; these are the DeepSeek hooks that name them.
+# ---------------------------------------------------------------------------
+_EXL3_FIRST_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.0\.w1\.trellis$")
+
+
+def exl3_expert_key(layer: int, e: int, part: str) -> str:
+    return f"layers.{layer}.ffn.experts.{e}.{part}"
+
+
+def exl3_layers(names) -> list[int]:
+    """The main layers whose routed experts an EXL3 checkpoint holds (by its expert 0 gate trellis)."""
+    return sorted({int(m.group(1)) for m in map(_EXL3_FIRST_EXPERT.match, names) if m})
+
+
 def map_hf(hf_name: str, shape: ModelShape) -> Mapped | None:
     if hf_name.startswith(VISION_PREFIX) or hf_name in VISION_TOP:
         return Mapped(hf_name, hf_name, "vision", "vision", None, None, None, False)

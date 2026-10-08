@@ -58,7 +58,7 @@ format anywhere in the builder.
 
 | file | role | proven by |
 |---|---|---|
-| `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw`, `config` with `text_config` merged), `Exl3Checkpoint` (`layers`, `expert(layer, e, part, k, n)` with every refusal the format allows) | used by every test below |
+| `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw`, `config` with `text_config` merged), `Exl3Checkpoint` (`names`, `linear(key, k, n, rates)` with every refusal the format allows; the family names the key -- `names.exl3_expert_key` / `exl3_layers` for DeepSeek) | used by every test below |
 | `names.py` | HF name -> container entry (`Mapped`: container name, `gguf_name`, family, shard, expert/part, `emit`); `ModelShape.from_config`; the shard plan | `test_names.py` |
 | `policy.py` | the five decisions: `layout_for`, `declared_shape`, `rekey_format_map` | `test_names.py` |
 | `kv.py` | the `pulsar.kv` block from `config.json` + tokenizer files, in the engine's spelling | `test_kv.py` |

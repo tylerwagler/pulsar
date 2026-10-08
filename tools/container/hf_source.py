@@ -11,7 +11,6 @@ import json
 import os
 import struct
 
-import exl3_rates
 
 
 class HFCheckpoint:
@@ -98,7 +97,6 @@ class HFCheckpoint:
 # with that model, so this and the header are checked against each other at
 # every load.
 # ---------------------------------------------------------------------------
-EXL3_LAYOUT = exl3_rates.rates(exl3_rates.DEEPSEEK_EXPERT)   # words per tile -> layout, DeepSeek's expert arms
 # exllamav3's mul1 codebook multiplier (exl3_lib/quantize.py codebook_mul1_mult; the device decode's
 # EXL3_MUL1_MULTIPLIER): the `.mul1` marker a tensor carries names the codebook it was encoded with.
 EXL3_MUL1 = 0x83DCD12D
@@ -114,7 +112,9 @@ def exl3_expert_bytes(k, n, words):
 class Exl3Checkpoint:
     """name -> (shard path, absolute byte offset, byte count, dtype, shape) from
     every model-*.safetensors header in the directory (a partial download of the
-    layers under test is enough; the index is not required)."""
+    layers under test is enough; the index is not required).  Family-neutral: it
+    answers for the Linear KEY a family names (`linear`); which keys a family's
+    tensors live under is the family's naming (names.exl3_expert_key / qwen)."""
 
     def __init__(self, hf_dir):
         self.dir = hf_dir
@@ -134,16 +134,8 @@ class Exl3Checkpoint:
                 o0, o1 = h['data_offsets']
                 self.entries[name] = (path, 8 + n + o0, o1 - o0, h['dtype'], h['shape'])
 
-    def layers(self):
-        import re
-        return sorted({int(m.group(1)) for m in
-                       (re.match(r'^layers\.(\d+)\.ffn\.experts\.0\.w1\.trellis$', k)
-                        for k in self.entries) if m})
-
-    def expert(self, layer, e, part, k, n):
-        """The three source ranges of one expert-projection and the words per
-        tile, after every refusal the format allows."""
-        return self.linear(f'layers.{layer}.ffn.experts.{e}.{part}', k, n, EXL3_LAYOUT)
+    def names(self):
+        return sorted(self.entries)
 
     def has_linear(self, key):
         return f'{key}.trellis' in self.entries
@@ -171,7 +163,9 @@ class Exl3Checkpoint:
             raise SystemExit(f'{key}.mul1: {mdt} {msh}, expected one I32 marker')
         fh = self._fh.get(mp)
         if fh is None:
-            fh = self._fh[mp] = open(mp, 'rb')
+            # unbuffered: a buffered 4-byte read pulls a whole st_blksize block (1 MiB on the NFS share), which
+            # made planning a full EXL3 checkpoint read ~30 GB for ~30k markers
+            fh = self._fh[mp] = open(mp, 'rb', buffering=0)
         fh.seek(mo)
         (mul1,) = struct.unpack('<I', fh.read(4))
         if mul1 != EXL3_MUL1:
