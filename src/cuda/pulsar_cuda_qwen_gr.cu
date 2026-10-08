@@ -327,11 +327,6 @@ __device__ __forceinline__ void gr_ldsm_x2(uint32_t &r0, uint32_t &r1, const voi
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(s));
 }
 
-__device__ __forceinline__ void gr_cp_async16(void *smem, const void *gmem, int src_bytes) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
-}
-
 /* The GR operands of the NORM and GATE forms (3'): the read's streams, hc_norm, the norm's rstd, and
  * (GATE) the bf16 row out. */
 struct gr_gate_args {
@@ -367,57 +362,83 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
 #pragma unroll
         for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
 
-    for (int b0 = b_lo; b0 < b_hi; b0 += kMmaStage) {
+    /* The staging is register-prefetched: a stage's raw x chunks and W codes are loaded into registers
+     * while the previous stage's MMAs run, then converted into shared memory -- the same values the
+     * MMAs read, only issued earlier.  Thread tid takes x chunks tid + 128 i and W chunks tid + 128 i. */
+    constexpr int kXT = kMmaTok * kMmaStage * 4 / 128, kWT = kMmaOut * kMmaStage * 4 / 128;
+    static_assert(kXT * 128 == kMmaTok * kMmaStage * 4 && kWT * 128 == kMmaOut * kMmaStage * 4, "whole passes");
+    uint4 xr[kXT];
+    uint2 wc[kWT];
+    unsigned ws[kWT];
+    auto load = [&](int b0) {
         const int nbs = min(kMmaStage, b_hi - b0);
-        /* x: kMmaTok rows x nbs blocks of 32 bf16 = 4 16-byte chunks a block; rows past T read zero */
-        for (int c = tid; c < kMmaTok * kMmaStage * 4; c += 128) {
-            const int tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
+#pragma unroll
+        for (int i = 0; i < kXT; ++i) {
+            const int c = tid + 128 * i, tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
+            xr[i] = t < T && ch < nbs * 4 ? *reinterpret_cast<const uint4 *>(x + (size_t)t * in + (size_t)b0 * 32 + ch * 8)
+                                          : make_uint4(0u, 0u, 0u, 0u);
+        }
+#pragma unroll
+        for (int i = 0; i < kWT; ++i) {
+            const int c = tid + 128 * i, wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4);
+            const int row = GATE ? (wr >> 3) * kH + c0 + (wr & 7) : r0 + wr;
+            const bool ok = row < out && ch < nbs * 4;
+            wc[i] = ok ? *reinterpret_cast<const uint2 *>(wq + (size_t)row * in + (size_t)b0 * 32 + ch * 8) : make_uint2(0u, 0u);
+            ws[i] = ok ? wsf[pulsar_mx_sfoff(row, b0 + (ch >> 2), w_kbp)] : 0u;
+        }
+    };
+    auto store = [&](int b0) {
+        const int nbs = min(kMmaStage, b_hi - b0);
+        /* x: kMmaTok rows x nbs blocks of 32 bf16 = 4 16-byte chunks a block; rows past T are zero */
+#pragma unroll
+        for (int i = 0; i < kXT; ++i) {
+            const int c = tid + 128 * i, tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
             if (ch >= nbs * 4) continue;
-            const bool ok = t < T;
+            uint4 v = xr[i];
             if constexpr (FORM == GR_NORM) {
-                uint32_t o[4] = {0u, 0u, 0u, 0u};
-                if (ok) {
+                if (t < T) {
                     const int k = b0 * 32 + ch * 8, s = k / kH;
                     float xf[8], wf[8];
-                    bf16x8(*reinterpret_cast<const uint4 *>(x + (size_t)t * in + k), xf);
+                    bf16x8(xr[i], xf);
                     bf16x8(*reinterpret_cast<const uint4 *>(ga.norm_w + k), wf);
                     const float r = ga.rstd[t * kS + s];
+                    uint32_t o[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        const __nv_bfloat162 v = __halves2bfloat162(__float2bfloat16(xf[2 * e] * r * (1.0f + wf[2 * e])),
+                        const __nv_bfloat162 h = __halves2bfloat162(__float2bfloat16(xf[2 * e] * r * (1.0f + wf[2 * e])),
                                                                     __float2bfloat16(xf[2 * e + 1] * r * (1.0f + wf[2 * e + 1])));
-                        o[e] = *reinterpret_cast<const uint32_t *>(&v);
+                        o[e] = *reinterpret_cast<const uint32_t *>(&h);
                     }
+                    v = make_uint4(o[0], o[1], o[2], o[3]);
                 }
-                *reinterpret_cast<uint4 *>(&sx[tr][ch * 8]) = make_uint4(o[0], o[1], o[2], o[3]);
-            } else {
-                gr_cp_async16(&sx[tr][ch * 8], x + (size_t)(ok ? t : 0) * in + (size_t)b0 * 32 + ch * 8, ok ? 16 : 0);
             }
+            *reinterpret_cast<uint4 *>(&sx[tr][ch * 8]) = v;
         }
         /* W: kMmaOut rows x nbs blocks, 8 codes a thread-task, dequantized exactly into bf16 */
-        for (int c = tid; c < kMmaOut * kMmaStage * 4; c += 128) {
-            const int wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4);
-            const int row = GATE ? (wr >> 3) * kH + c0 + (wr & 7) : r0 + wr;
-            if (ch >= nbs * 4) continue;
-            uint32_t o[4] = {0u, 0u, 0u, 0u};
-            if (row < out) {
-                const int b = b0 + (ch >> 2);
-                const uint2 codes = *reinterpret_cast<const uint2 *>(wq + (size_t)row * in + (size_t)b0 * 32 + ch * 8);
-                const float s = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
-                const uint8_t *cb = reinterpret_cast<const uint8_t *>(&codes);
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    __nv_fp8_e4m3 q0, q1;
-                    q0.__x = cb[2 * e];
-                    q1.__x = cb[2 * e + 1];
-                    const __nv_bfloat162 v = __floats2bfloat162_rn(float(q0) * s, float(q1) * s);
-                    o[e] = *reinterpret_cast<const uint32_t *>(&v);
-                }
+        for (int i = 0; i < kWT; ++i) {
+            const int c = tid + 128 * i, wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4);
+            if (ch >= nbs * 4) continue;
+            const float s = mx_scale1(ws[i]);
+            const uint8_t *cb = reinterpret_cast<const uint8_t *>(&wc[i]);
+            uint32_t o[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                __nv_fp8_e4m3 q0, q1;
+                q0.__x = cb[2 * e];
+                q1.__x = cb[2 * e + 1];
+                const __nv_bfloat162 v = __floats2bfloat162_rn(float(q0) * s, float(q1) * s);
+                o[e] = *reinterpret_cast<const uint32_t *>(&v);
             }
             *reinterpret_cast<uint4 *>(&sw[wr][ch * 8]) = make_uint4(o[0], o[1], o[2], o[3]);
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    };
+    load(b_lo);
+    for (int b0 = b_lo; b0 < b_hi; b0 += kMmaStage) {
+        const int nbs = min(kMmaStage, b_hi - b0);
+        store(b0);
         __syncthreads();
+        if (b0 + kMmaStage < b_hi) load(b0 + kMmaStage);
         for (int kk = 0; kk < nbs * 32; kk += 16) {
             uint32_t a[4];
             gr_ldsm_x4(a, &sx[warp * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
@@ -444,20 +465,19 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
         for (int h = 0; h < 2; ++h) {
             const int t = t0 + warp * 16 + g + 8 * h, c = c0 + c2;
             if (t >= T) continue;
+            float p[2][kS];
+#pragma unroll
+            for (int s = 0; s < kS; ++s) {
+                const int row = s * kH + c;                 /* channels c, c + 1: one bf16 pair */
+                const float2 xs = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(ga.streams + (size_t)t * kHC + row));
+                const float2 nw = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(ga.norm_w + row));
+                const float r = ga.rstd[t * kS + s];
+                p[0][s] = 1.0f / (1.0f + expf(-acc[s][2 * h])) * (xs.x * r * (1.0f + nw.x));
+                p[1][s] = 1.0f / (1.0f + expf(-acc[s][2 * h + 1])) * (xs.y * r * (1.0f + nw.y));
+            }
             float v[2];
 #pragma unroll
-            for (int e = 0; e < 2; ++e) {
-                float p[kS];
-#pragma unroll
-                for (int s = 0; s < kS; ++s) {
-                    const int row = s * kH + c + e;
-                    const float gt = 1.0f / (1.0f + expf(-acc[s][2 * h + e]));
-                    const float xn = bf2f(ga.streams[(size_t)t * kHC + row]) * ga.rstd[t * kS + s] *
-                                     (1.0f + bf2f(ga.norm_w[row]));
-                    p[s] = gt * xn;
-                }
-                v[e] = (((p[0] + p[1]) + p[2]) + p[3]) * (1.0f / kS);
-            }
+            for (int e = 0; e < 2; ++e) v[e] = (((p[e][0] + p[e][1]) + p[e][2]) + p[e][3]) * (1.0f / kS);
             *reinterpret_cast<__nv_bfloat162 *>(ga.x_out + (size_t)t * kH + c) = __floats2bfloat162_rn(v[0], v[1]);
         }
     } else {
