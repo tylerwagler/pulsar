@@ -249,7 +249,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 return -1;
             }
             row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, first[b], reqs + rows);
+            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
             pulsar_session_bank_state_save(s, (uint32_t)b);
             any = 1;
         }

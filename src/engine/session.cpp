@@ -17,8 +17,8 @@ bool pulsar_engine::has_dspark() {
     return e && e->dspark_ready;
 }
 
-int pulsar_engine_dspark_draft_tokens(pulsar_engine *e) {
-    return e->has_dspark() ? e->dspark_draft_tokens : 0;
+int pulsar_engine_spec_depth(pulsar_engine *e) {
+    return (int)pulsar_spec_depth_start(e);
 }
 
 
@@ -341,8 +341,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         e->dspark_external = false;
         e->dspark_ready = true;
         e->drafter_ops = &k_dspark_drafter;   /* L272 P1: the drafter behind the round API */
-        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
-                e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%u, markov_w2 %s)\n",
+                pulsar_spec_depth_start(e), tensor_type_name(e->dspark_weights.markov_w2->type));
     }
     /* Vision-Exp tower: bound and layout-validated here so a wrong or
      * half-present vision stack refuses at load rather than at first image.
@@ -538,19 +538,19 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
-     * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
-     * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
-     * to +32% prose served decode; distribution-preserving (exact verify) —
-     * byte-identical on structured, near-tie-equivalent on greedy prose (the
-     * verify-width change flips ~1-ULP argmax ties, same class as yield-quench).
-     * The DSpark drafter forward is autoregressive, so its cost scales with the
-     * chain length ON TOP of the verify rows — ms/accepted-token stays flat
-     * ~41-46 ms across k, i.e. depth never amortizes, so shallower wins.
-     * The prior default 5 was a compact-model figure (2026-07-09, conf3 head,
-     * tau 0.35) that does not hold on shipped v5mx at the tau=0.25 default. */
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
-    if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
+    /* The draft schedule's overrides (the numbers are the drafter's, spec_ops.h): the options, else the
+     * environment pair, else 0 = the drafter's own. */
+    e->spec_depth = opt->spec_depth;
+    if (e->spec_depth <= 0) {
+        const char *v = getenv("PULSAR_SPEC_DEPTH");
+        e->spec_depth = v && v[0] ? atoi(v) : 0;
+    }
+    if (e->spec_depth > 16) e->spec_depth = 16;
+    e->spec_tau = opt->spec_tau;
+    if (e->spec_tau == 0.0f) {
+        const char *v = getenv("PULSAR_SPEC_TAU");
+        e->spec_tau = !v || !v[0] ? 0.0f : !strcmp(v, "off") ? -1.0f : (float)atof(v);
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -873,8 +873,10 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
     out->gen_tokens = e->spec_gen_tokens;
     for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
     for (int i = 0; i < 16; i++) out->verified_per_pos[i] = e->spec_verified_per_pos[i];
-    out->max_draft = e->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
-                         ? e->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;   /* L107: waterfall covers the adaptive range */
+    /* L107: the waterfall covers every position the adaptive controller can reach */
+    const uint32_t start = pulsar_spec_depth_start(e);
+    const pulsar_spec_depth_policy *adapt = e->drafter_ops ? e->drafter_ops->adapt : NULL;
+    out->max_draft = (int)(adapt && (uint32_t)adapt->max > start ? (uint32_t)adapt->max : start);
     out->has_drafter = e->drafter_ops != NULL;
 }
 

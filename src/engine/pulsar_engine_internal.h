@@ -1792,7 +1792,8 @@ struct pulsar_engine {
     pulsar_weights weights;     ///< resolved target tensors, per layer
     pulsar_dspark_weights dspark_weights;  ///< resolved drafter tensors
     pulsar_backend backend;     ///< CPU or CUDA
-    int dspark_draft_tokens;    ///< configured draft depth k
+    int spec_depth;             ///< configured starting draft depth (options / PULSAR_SPEC_DEPTH); 0 = the drafter's
+    float spec_tau;             ///< configured draft stop threshold (options / PULSAR_SPEC_TAU); 0 = the drafter's, < 0 = none
     /** L263: the spec lane's measured step cost (pulsar_engine_spec_cost).
      * Written by the leader's observations (the server's round loop, or the
      * single lane off TP) or, on a TP worker, by the leader's values riding
@@ -1864,9 +1865,7 @@ struct pulsar_engine {
      * engine_api.cpp); engine internals call these members directly.  Members
      * stay public and the struct stays trivially constructible: lifetime is
      * managed exactly as before via open()/destroy() (xcalloc/free), NOT
-     * constructors/destructors.
-     * NOTE: pulsar_engine_dspark_draft_tokens stays a free function — a member
-     * would collide with the data member of the same name. */
+     * constructors/destructors. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
     void destroy();  ///< was pulsar_engine_close
     /** Print a human-readable model summary (shape, quantisation, memory) to
@@ -2060,10 +2059,10 @@ typedef struct pulsar_spec_carry_state {
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first
-     * draft reads the engine's --dspark-draft value, which is thereby the
-     * STARTING depth, not a fixed width). Persists across requests in a
-     * session on purpose: a client's workload regime usually does too. */
-    int spec_adaptive_depth;  ///< bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct
+     * draft reads pulsar_spec_depth_start, which is thereby the STARTING
+     * depth, not a fixed width). Persists across requests in a session on
+     * purpose: a client's workload regime usually does too. */
+    int spec_adaptive_depth;  ///< bounds: the drafter's adaptive policy (pulsar_drafter_ops::adapt)
     bool spec_depth_down_forgiven;  ///< L107 v2: one down-signal was vetoed on a still-confident tail; a second consecutive one backs off regardless
     uint8_t spec_depth_rounds_since_up;  ///< L107 v5: rounds since the last UP, saturating at 255; a down within 2 of an up is a FAILED EXCURSION and triggers the cooldown; a down after a sustained ride carries no penalty (v4's blanket cooldown cost ~0.9 t/s on BOTH server workloads by suppressing profitable climbs).
     uint8_t spec_depth_climb_cooldown;  ///< L107 v4: rounds remaining in which UP is suppressed after a failed excursion. Raw-completion prose oscillated 2->3->4-> crash forever (29 transitions/192 tok, -14%): each failed excursion burns a deep round, and tail conf does NOT separate good climbs from bad (a 0.93 tail climbed into commit=0). Cooldown makes excursions rare after they fail; structured's downs are rare (and v3-forgiven rounds are not downs), so its climb is untouched.
@@ -4300,17 +4299,9 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 
-/** L107 adaptive draft depth bounds (controller in session_spec.cpp). MAX is
- * the drafter's TRAINED BLOCK (0731 DSpark metadata: stages=3 block=5):
- * position 6 is out of distribution, and the sweep measured depth 6 DOMINATED
- * everywhere -- accepted/step falls (3.31 -> 3.20 structured) while drafting
- * cost jumps, so even transient controller excursions there are purchased
- * losses (Tyler's catch, 2026-08-25 evening; the earlier ceiling of 6 was a
- * "probe step" rationale that predates knowing the block width). Re-tune MAX
- * only with a drafter retrained at a wider block (L092). The /metrics
- * max_draft reports at least MAX so the per-position waterfall covers every
- * position the controller can reach. */
-enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
+/** The depth a fresh session drafts at: the configured spec_depth or the drafter's, clamped to the drafter's
+ *  depth_max; 0 = no drafter (session_spec.cpp). */
+uint32_t pulsar_spec_depth_start(const pulsar_engine *e);
 /* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
  * object's address, unique per tensor per engine -- abs_offsets repeat across
  * safetensors shards.  One authority for registration and lookup. */

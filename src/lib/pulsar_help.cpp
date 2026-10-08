@@ -162,7 +162,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool != PULSAR_HELP_BENCH) {
             opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the checkpoint.");
-            opt(fp, c, "--dspark-draft N", "STARTING draft depth for the adaptive controller (default 3). Depth then walks 2..5 per session from realized acceptance; 5 is the drafter's trained block.");
+            opt(fp, c, "--spec-depth N", "Draft depth a session starts at (default: the drafter's -- DSpark 3, then its adaptive controller walks 2..5; MTP 4, fixed). Env PULSAR_SPEC_DEPTH.");
+            opt(fp, c, "--spec-tau F|off", "Draft stop threshold: a chain ends at its first draft whose confidence is under F, that draft not verified (default: the drafter's -- DSpark 0.25, MTP 0.7). Env PULSAR_SPEC_TAU.");
             opt(fp, c, "--expert-overlay PATH:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor checkpoint PATH (quant-format measurement).");
         }
     }

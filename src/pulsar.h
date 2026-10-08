@@ -142,7 +142,8 @@ typedef struct {
     const char *expert_overlay;
     pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
     uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default (PULSAR_PREFILL_CHUNK_DEFAULT for prompts longer than it, else the whole prompt)
-    int dspark_draft_tokens;     ///< drafter depth k; 0 = model/engine default
+    int spec_depth;              ///< the drafter's starting draft depth (--spec-depth); 0 = PULSAR_SPEC_DEPTH, else the drafter's
+    float spec_tau;              ///< the draft stop threshold (--spec-tau); 0 = PULSAR_SPEC_TAU, else the drafter's; < 0 = no stop
     const char *directional_steering_file;  ///< steering-vector file, or NULL
     float directional_steering_attn;        ///< steering scale on the attention stream
     float directional_steering_ffn;         ///< steering scale on the FFN stream
@@ -277,7 +278,7 @@ typedef struct {
     uint64_t gen_tokens;            ///< tokens emitted by the spec loop
     uint64_t accepted_per_pos[16];  ///< accepted count per draft position
     uint64_t verified_per_pos[16];  ///< count of rounds verifying position i; rate[i] = accepted_per_pos[i]/verified_per_pos[i]
-    int      max_draft;             ///< configured draft depth (pulsar_engine_options::dspark_draft_tokens)
+    int      max_draft;             ///< the deepest draft position a round can verify (the start depth, or the adaptive controller's ceiling)
     bool     has_drafter;           ///< a drafter is loaded behind the round API (the counters above can move)
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
@@ -867,11 +868,11 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
  * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
  * entries unconditionally. */
 uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
-/** Rows this round contributes to the shared forward: n_batch reqs
- * (first_token at the pre-round frontier, then the pending drafts). Returns
- * the row count written. */
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
-                                  int first_token, pulsar_multiseq_req *out);
+/** Rows this round contributes to the shared forward: n_batch reqs (the
+ * round's base token at the pre-round frontier, then the pending drafts) --
+ * every verify's rows, the single lane's included.  Returns the row count
+ * written. */
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out);
 /** Finish the round against the shared forward's logits block: `rows` points
  * at the block, and this round's rows start at block row `row0` (row stride =
  * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
@@ -1106,7 +1107,8 @@ bool pulsar_engine_has_snapshots(const pulsar_engine *e);
  *  carries the mtp.* layer (the sidecar shard; served by the family's own
  *  pulsar_session_generate_speculative), NONE otherwise. */
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
-int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
+/** The depth a fresh session drafts at (--spec-depth, else the drafter's), 0 = no drafter. */
+int pulsar_engine_spec_depth(pulsar_engine *e);
 /** L263: the spec lane's step cost, MEASURED -- the one authority the yield
  * quench and the server's overflow K-allocator price rows against.  The
  * server reports every decode round it drives (the rows the forward carried,

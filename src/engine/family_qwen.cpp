@@ -1506,8 +1506,8 @@ static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq
 /* A verify's rows reqs[0, n): one run a bank, each run starting at its bank's next position and each further row
  * following the one before -- the speculation lane's verify, alone (decode_mixed) or in front of a fused step's
  * prompt run.  Fills tok / pos / bk; false (nothing moved) names the first row that is not. */
-static bool qwen_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok,
-                             int32_t *pos, int32_t *bk, char *err, size_t errlen) {
+bool qwen_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok, int32_t *pos,
+                      int32_t *bk, char *err, size_t errlen) {
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t b = reqs[i].bank;
         const bool run_start = i == 0 || reqs[i - 1].bank != b;

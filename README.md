@@ -79,7 +79,7 @@ depth is no longer a fixed knob -- a per-session controller walks it between
 2 and 5 (5 = the drafter's trained block) from realized acceptance and the
 confidence head's per-position scores, capturing each workload's measured
 optimum (prose settles shallow, structured/tool output rides the deep end;
-`--dspark-draft` now sets the STARTING depth). **BF16 tensor-core compute for
+`--spec-depth` sets the STARTING depth). **BF16 tensor-core compute for
 the F32-source weight family** (`hc_attn_fn`/`hc_ffn_fn`/`output_hc_fn`/APEs):
 storage stays checkpoint-exact F32, compute runs bf16 -- which is *closer to
 the source model's own numerics* (its residual stream is BF16), confirmed by
@@ -308,7 +308,7 @@ acceptance). A depth sweep measured opposite per-workload optima -- prose
 fastest at depth 2, structured at depth 5 -- and the controller captures both
 in one configuration; 5 is a hard ceiling because it is the drafter's trained
 block width (position 6 is out of distribution and measurably counter-
-productive). `--dspark-draft N` sets the starting depth (default 3). Plain (non-speculative) decode is
+productive). `--spec-depth N` sets the starting depth (default 3) and `--spec-tau F` the draft stop (default 0.25). Plain (non-speculative) decode is
 roughly flat and bandwidth-bound; speculation is a speedup layered on top. On
 shallow, low-acceptance requests speculation can run slightly *slower* than
 plain, so **its downside is capped to a few percent by the yield-quench safety

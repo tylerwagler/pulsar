@@ -114,7 +114,7 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
            same_str(a->expert_overlay, b->expert_overlay) &&
            a->backend == b->backend &&
            prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&
-           a->dspark_draft_tokens == b->dspark_draft_tokens &&
+           a->spec_depth == b->spec_depth && a->spec_tau == b->spec_tau &&
            same_str(a->directional_steering_file, b->directional_steering_file) &&
            a->directional_steering_attn == b->directional_steering_attn &&
            a->directional_steering_ffn == b->directional_steering_ffn &&
@@ -522,7 +522,7 @@ int main(int argc, char **argv) {
         {"chat-smoke-gate",           gate_chat_decode_smoke_main,      1, NULL, NULL, {NULL}, NEED_TOKENIZER},
         {"cuda-tp-head-split-gate",   gate_tp_head_split_gate_main,     1, NULL, NULL, {NULL}, DS4},
     };
-    /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
+    /* Configuration D: drafter depth 1 (the gate sets spec_depth). */
     const gate_spec group_depth1[] = {
         {"cuda-dspark-batch-gate-depth1", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "1", NULL}, DS4 | NEED_DSPARK},
         /* L177: the widest admissible speculative step -- 3 banks x (1 + 4) = 15

@@ -5,30 +5,58 @@
 
 
 
-/* --- L107 adaptive draft depth -------------------------------------------
- * The 2026-08-25 depth sweep measured opposite optima per regime (prose 2,
- * structured 5; the shipped static 3 loses ~5%/~9.5% respectively), and the
- * conf-head calibration run measured the head monotone in both regimes with
- * conf>=0.9 -> 1.000 realized accept. Post-draft conf-sched trimming cannot
- * capture this (draft cost is paid before the trim; the sweep ran WITH the
- * trimmer on), so depth itself moves: +/-1 per round in spec_round_end.
- *   UP:   the whole drafted chain was verified AND accepted (commit == depth,
- *         which implies the trimmer kept everything) and the tail position's
- *         confidence clears SPEC_DEPTH_CONF_UP (calibrated >=0.82 accept) --
- *         the drafter was not the bottleneck this round, so probe deeper.
- *   DOWN: less than half the drafted depth converted (2*commit < depth) --
- *         drafting work is outrunning acceptance, back off.
- * Bounds [SPEC_DEPTH_MIN, SPEC_DEPTH_MAX] are the sweep's measured range;
- * depth 6 lost on BOTH regimes, so probing past it is priced as pure waste.
- * Distribution-preserving by construction (verification is exact at any
- * depth); NOT byte-identical on greedy prose -- verify-batch width shifts
- * accumulation ~1 ULP, the same known-flip class as conf-sched itself. */
+/* --- the draft schedule (L284 P11: one rule, the numbers the drafter's) -----
+ * Depth: a session starts at the configured depth (--spec-depth /
+ * PULSAR_SPEC_DEPTH, engine options spec_depth) or the drafter's, clamped to
+ * the drafter's depth_max; a drafter with an adaptive policy (spec_depth.h,
+ * DSpark's L107 rule and its rationale) moves it +/-1 per round in
+ * spec_round_end.  The stop: pulsar_spec_conf_keep at pulsar_spec_tau. */
+uint32_t pulsar_spec_depth_start(const pulsar_engine *e) {
+    const pulsar_drafter_ops *d = e->drafter_ops;
+    if (!d) return 0;
+    const uint32_t v = e->spec_depth > 0 ? (uint32_t)e->spec_depth : d->depth;
+    return v < 1u ? 1u : v > d->depth_max ? d->depth_max : v;
+}
+
+float pulsar_spec_tau(const pulsar_engine *e) {
+    if (e->spec_tau < 0.0f) return 0.0f;
+    if (e->spec_tau > 0.0f) return e->spec_tau;
+    return e->drafter_ops ? e->drafter_ops->tau : 0.0f;
+}
+
+/* A shadow's depth: the controller's when it has moved it, else the start. */
+static uint32_t spec_shadow_depth(const pulsar_session *s, const pulsar_spec_carry_state *sp) {
+    const int d = sp->spec_adaptive_depth;
+    return d > 0 ? (uint32_t)(d > 16 ? 16 : d) : pulsar_spec_depth_start(s->engine);
+}
+
 uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
-    int d = s->spec.spec_adaptive_depth;
-    if (d <= 0) d = spec_drafter(s) ? (int)spec_drafter(s)->depth_default(s->engine) : 0;
-    if (d < 1) d = 1;
-    if (d > 16) d = 16;
-    return (uint32_t)d;
+    const uint32_t d = spec_shadow_depth(s, &s->spec);
+    return d < 1u ? 1u : d;
+}
+
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+                                float top_p, float min_p) {
+    q->valid = true;
+    q->done = false;
+    q->next_base = (int32_t)next_base;
+    q->n_draft = pulsar_spec_cur_depth(s);
+    q->temperature = temperature;
+    q->top_k = top_k;
+    q->top_p = top_p;
+    q->min_p = min_p;
+    q->sample_drafts = temperature > 0.0f;
+}
+
+bool pulsar_spec_q_record(spec_redraft_req *q, uint32_t pos, const pulsar_sample_dist *qd) {
+    if (!pulsar_spec_q_compact(qd->n)) {
+        q->qn[pos] = 0;
+        return false;
+    }
+    q->qn[pos] = qd->n;
+    memcpy(q->qids[pos], qd->ids, (size_t)qd->n * sizeof(int32_t));
+    memcpy(q->qprobs[pos], qd->probs, (size_t)qd->n * sizeof(float));
+    return true;
 }
 
 /* The target's undo of a round: the snapshot back on the installed bank, then released. */
@@ -576,20 +604,20 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         s->spec.spec_num_drafts += 1u;
     }
 
-    /* L107 adaptive draft depth (constants + rationale at spec_cur_depth).
+    /* L107 adaptive draft depth (spec_depth.h: the rule and its rationale).
      * Runs BEFORE the redraft below so the next chain is drafted at the new
-     * depth. commit == depth implies the trimmer kept the whole chain AND the
+     * depth. commit == depth implies the stop kept the whole chain AND the
      * target accepted all of it (commit <= K <= depth always). A tail conf of
-     * -1 (head didn't run, e.g. conf-sched disabled) passes the UP check: the
+     * -1 (no confidence, e.g. --spec-tau off) passes the UP check: the
      * full-accept signal alone then drives the climb. Counts-only decision,
      * deterministic for a fixed stream, same property as yield-quench. */
-    if (K > 0 && spec_target(s)->depth) {
-        /* the rule is spec_depth.h's; the numbers are the target's (pulsar_spec_target_ops::depth; a
-         * NULL policy = a fixed depth) */
+    if (K > 0 && spec_drafter(s)->adapt) {
+        /* the rule is spec_depth.h's; the numbers are the drafter's (pulsar_drafter_ops::adapt; NULL = a
+         * fixed depth) */
         const uint32_t depth = pulsar_spec_cur_depth(s);
         pulsar_spec_depth_state ds = {s->spec.spec_depth_down_forgiven, s->spec.spec_depth_rounds_since_up,
                                       s->spec.spec_depth_climb_cooldown};
-        const int next = pulsar_spec_depth_next(spec_target(s)->depth, &ds, depth, K, commit, pend_conf);
+        const int next = pulsar_spec_depth_next(spec_drafter(s)->adapt, &ds, depth, K, commit, pend_conf);
         s->spec.spec_depth_down_forgiven = ds.down_forgiven;
         s->spec.spec_depth_rounds_since_up = ds.rounds_since_up;
         s->spec.spec_depth_climb_cooldown = ds.climb_cooldown;
@@ -740,9 +768,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    uint32_t n_draft = pulsar_spec_cur_depth(s);   /* L107: session depth, not the static engine width */
-    if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || n_draft == 0 || s->spec.spec_quenched) {
+    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain.  (After an
@@ -760,16 +786,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * cannot serve simply takes a plain n=1 step next round. */
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
+        pulsar_spec_draft_req_init(s, q, next_base, temperature, top_k, top_p, min_p);
         q->valid = features_ready;
-        q->done = false;
-        q->next_base = (int32_t)next_base;
-        q->n_draft = n_draft;
         q->n_batch = n_batch;
         q->commit = commit;
-        q->temperature = temperature;
-        q->top_k = top_k;
-        q->top_p = top_p;
-        q->min_p = min_p;
         return n_accept;
     }
     const uint32_t keep = spec_drafter(s)->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
@@ -969,12 +989,11 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
     return r->n_batch;
 }
 
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
-                                  int first_token, pulsar_multiseq_req *out) {
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank;
         out[i].pos = r->saved_len + (int32_t)i;
-        out[i].token = i == 0 ? first_token : (int)r->pend[i - 1];
+        out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
     }
     return r->n_batch;
 }
@@ -1204,7 +1223,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 st->status = PULSAR_SPEC_STEP_SKIPPED;
             } else {
                 /* The worker has no reqs: its rows ride the mixed-batch frame. */
-                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, first, reqs + rows)
+                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
                                   : pulsar_spec_round_n_rows(st->round);
                 st->row0 = rows;
                 rows += st->n_rows;
@@ -1345,12 +1364,7 @@ const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32
 int pulsar_spec_bank_depth(pulsar_session *s, uint32_t bank) {
     if (!s || !spec_drafter(s)) return 0;
     const pulsar_spec_carry_state *sp = pulsar_spec_bank_shadow(s, bank);
-    if (!sp) return 0;
-    int d = sp->spec_adaptive_depth;
-    if (d <= 0) d = (int)spec_drafter(s)->depth_default(s->engine);
-    if (d < 1) d = 1;
-    if (d > 16) d = 16;
-    return d;
+    return sp ? (int)spec_shadow_depth(s, sp) : 0;
 }
 
 /* The session's speculative shadow into / out of a bank carry: s->spec by value, plus the full q rows

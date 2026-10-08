@@ -70,18 +70,29 @@ typedef struct pulsar_spec_target_ops {
     /** The L155 trim: the bank's history ends at `pos`, below what the round committed (DeepSeek: rewind;
      *  a recurrent family invalidates or restores a grid checkpoint). */
     void (*cut)(struct pulsar_session *s, int pos);
-    /** The adaptive depth controller's constants, or NULL = a fixed depth (the drafter's default). */
-    const pulsar_spec_depth_policy *depth;
     /** How many banks one shared verify forward may carry (DeepSeek: the pool; Qwen: 1 until the GDN and
      *  PLE kernels take N banks x R rows, L272 P1 S4).  The server's lane choice reads it. */
     uint32_t banks_max;
 } pulsar_spec_target_ops;
 
-/** A DRAFTER: its own weights and per-bank context, behind the round API. */
+/** A DRAFTER: its own weights and per-bank context, behind the round API.
+ *
+ *  The draft schedule is one rule for every drafter (L284 P11), its numbers declared per drafter below:
+ *  a chain is at most the session's depth long and ENDS AT ITS FIRST DRAFT WHOSE CONFIDENCE IS UNDER tau,
+ *  that draft EXCLUDED (pulsar_spec_conf_keep).  A draft's confidence is known before the draft is drawn
+ *  (DSpark: its confidence head, scored from the prefix; MTP: the head's top probability), so the stop is
+ *  a stopping time and a sampled chain's kept drafts are still draws from q.  How a drafter reaches the
+ *  stop is its own: DSpark drafts the whole chain in one forward and trims after; MTP drafts token by
+ *  token and stops there.  --spec-depth / --spec-tau (PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU) override the
+ *  numbers for whichever drafter the model carries. */
 typedef struct pulsar_drafter_ops {
     const char *name;
-    /** The depth a fresh session drafts at (the adaptive controller moves it from here). */
-    uint32_t (*depth_default)(const struct pulsar_engine *e);
+    uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)
+    uint32_t depth_max;   ///< the deepest chain the drafter can draft (<= 16); a configured depth is clamped to it
+    float tau;            ///< the stop threshold; 0 = every drafted position is kept
+    /** The adaptive depth controller's constants (spec_depth.h), or NULL = a fixed depth.  Opt-in per drafter:
+     *  it measured slower on the MTP drafter, whose in-round stop already adapts. */
+    const pulsar_spec_depth_policy *adapt;
     /** Optional.  A fresh context: prime it from the prompt's captured features before the first draft.
      *  0 = done or nothing to do, -1 with `err` = refuse the round. */
     int (*prime)(struct pulsar_session *s, char *err, size_t errlen);
@@ -93,10 +104,10 @@ typedef struct pulsar_drafter_ops {
     /** Every deferred row in one pass, no bank switch: rows[i] of banks[i], followed by next[i]. */
     bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const uint32_t *banks,
                           const int32_t *next, uint32_t n);
-    /** Draft the installed bank's next chain after `next_base`: up to the session's depth, each draft with
-     *  a confidence (or -1), sampled drafts (temperature > 0) drawn from the request-filtered proposal q
-     *  with q(id) and q's support recorded -- stamped into the bank's pendings.  Returns the pending
-     *  count kept.  `features_ready` = the drafter's conditioning features are those of the last
+    /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
+     *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
+     *  request-filtered proposal q with q(id) and q's support recorded -- stamped into the bank's pendings.
+     *  Returns the pending count kept.  `features_ready` = the drafter's conditioning features are those of the last
      *  committed row. */
     uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);

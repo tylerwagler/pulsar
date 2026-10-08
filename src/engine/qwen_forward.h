@@ -8,7 +8,9 @@
  * trunk stacks staged in mtp_h, `head_n` rows through the draft head (n_draft logits a row).
  * qwen_mtp_argmax: the draft-vocabulary argmax of one MTP row, mapped to the vocabulary (*prob: its
  * softmax, the draft's confidence); qwen_mtp_dist: the sampled q over the draft vocabulary, ids mapped;
- * qwen_argmax: the argmax of a row of n floats. */
+ * qwen_argmax: the argmax of a row of n floats.  qwen_verify_rows: a verify's rows (one run a bank, each at its bank's
+ * next position) as the forward's token / position / bank arrays, false with `err` naming the first row that is
+ * not. */
 #ifndef PULSAR_QWEN_FORWARD_H
 #define PULSAR_QWEN_FORWARD_H
 
@@ -32,5 +34,7 @@ int32_t qwen_mtp_argmax(const pulsar_engine *e, const float *row, float *prob = 
 bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
                    pulsar_sample_dist *q);
 uint32_t qwen_argmax(const float *v, uint32_t n);
+bool qwen_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok, int32_t *pos,
+                      int32_t *bk, char *err, size_t errlen);
 
 #endif /* PULSAR_QWEN_FORWARD_H */

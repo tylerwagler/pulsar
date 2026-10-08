@@ -1489,12 +1489,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
-        } else if (!strcmp(arg, "--dspark-draft")) {
-            /* STARTING draft depth (L107): the per-session adaptive
-             * controller moves depth +/-1 per round within [2,6] from realized
-             * accepts + tail confidence; this sets where it starts. Same name
-             * and semantics as the server flag; engine clamps to 16. */
-            c.engine.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-depth")) {
+            c.engine.spec_depth = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-tau")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            const float t = strcmp(v, "off") ? parse_float_range(v, arg, 0.0f, 1.0f) : 0.0f;
+            c.engine.spec_tau = t > 0.0f ? t : -1.0f;   /* 0 / off: no stop */
         } else if (!strcmp(arg, "--expert-overlay")) {
             c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tp-role")) {

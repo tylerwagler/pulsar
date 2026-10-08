@@ -170,7 +170,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 return 1;
             }
             row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, first[b], reqs + rows);
+            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
             timed_save(s, (uint32_t)b);
         }
         ph_us[0] += now_us() - t0;

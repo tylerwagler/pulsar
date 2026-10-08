@@ -180,7 +180,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 goto done;
             }
             pulsar_multiseq_req reqs[17];
-            const uint32_t rows = pulsar_spec_round_fill_reqs(r, bank0, first, reqs);
+            const uint32_t rows = pulsar_spec_round_fill_reqs(r, bank0, reqs);
             pulsar_session_bank_state_save(s, bank0);
             pulsar_session_spec_arm_capture(s, rows);
             uint32_t out_rows = 0;

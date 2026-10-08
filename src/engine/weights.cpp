@@ -1483,7 +1483,7 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
      * PULSAR_DSPARK_NOISE_TOKEN_ID directly rather than reading it from a file.
      * The one fact that is no longer checked anywhere is the depth the drafter
      * was TRAINED for; the artifact never carried it either, and the depth
-     * controller's ceiling stays the compiled PULSAR_SPEC_DEPTH_MAX. */
+     * controller's ceiling stays the compiled one (k_dspark_depth). */
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 

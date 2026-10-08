@@ -451,8 +451,12 @@ static server_config parse_options(int argc, char **argv) {
             defaulted_model_path = false;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
-        } else if (!strcmp(arg, "--dspark-draft")) {
-            c.engine.dspark_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-depth")) {
+            c.engine.spec_depth = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-tau")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            const float t = strcmp(v, "off") ? parse_float_arg(v, arg, 0.0f, 1.0f) : 0.0f;
+            c.engine.spec_tau = t > 0.0f ? t : -1.0f;   /* 0 / off: no stop */
         } else if (!strcmp(arg, "--tp-role")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!strcmp(v, "leader")) c.engine.tp_role = 1;
@@ -579,7 +583,7 @@ int main(int argc, char **argv) {
     if (pulsar_engine_drafter(engine) == PULSAR_DRAFTER_DSPARK) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
-                   pulsar_engine_dspark_draft_tokens(engine));
+                   pulsar_engine_spec_depth(engine));
     } else if (pulsar_engine_has_spec_rounds(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u decoder(s) a round)",
