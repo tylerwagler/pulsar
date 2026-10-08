@@ -18,12 +18,10 @@ bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, vo
         ops->resume_grid == 0u) return false;
     st->ops = ops;
     st->state = state;
-    uint64_t slot = 0, front = 0;
+    uint64_t slot = 0;
     (void)ops->walk(state, -1, false, NULL, 0, ops->min_checkpoint(state), &slot);
-    (void)ops->walk(state, -1, true, NULL, 0, ops->min_checkpoint(state), &front);
     /* The batched copies want 256-B aligned starts; keep every slot on one. */
     st->slot_bytes = (slot + 255u) & ~(uint64_t)255u;
-    st->frontier_bytes = (front + 255u) & ~(uint64_t)255u;
     memset(st->pos, 0, sizeof(st->pos));
     for (uint32_t b = 0; b < n_banks; b++) {
         st->slab[b] = pulsar_gpu_tensor_alloc((uint64_t)ops->ckpt_slots * st->slot_bytes);

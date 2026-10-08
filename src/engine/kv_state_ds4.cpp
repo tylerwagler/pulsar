@@ -10,7 +10,8 @@
  *   - a coff-1 (ratio 128) lane: canonical-empty at a 128 boundary (every slot is rewritten before
  *     the next emit reads it), so it is reset, not stored.
  * A session payload's FRONTIER T (L284, the kv-state payload) is the same state at any position: the
- * frontier walk adds the coff-1 lanes, which hold T's open group off a 128 boundary.
+ * frontier walk adds the coff-1 lanes, which hold T's open group off a 128 boundary, and the drafter's rings
+ * (a restored session speculates on as the saved one would).
  * Nothing else carries across a position: the HC residual is per token, logits are not kept (a
  * resume always evaluates at least one token past G), and the drafter rings are rebuilt from the
  * prompt the way every rewind already does.
@@ -48,6 +49,14 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     const uint32_t W = g->raw_window;
     uint64_t off = slot_off;
     bool ok = true;
+    /* one device lane, whole */
+    auto lane = [&](pulsar_gpu_tensor *t) {
+        if (!t || !ok) return;
+        const uint64_t lb = pulsar_gpu_tensor_bytes(t);
+        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, 0, lb) != 0;
+        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, 0, slab, off, lb) != 0;
+        off += lb;
+    };
     /* The window's positions [G - n, G): the first one's slot in the ring, and how many run before the wrap. */
     const uint32_t n = G < W ? G : W, skip = W - n;
     const uint32_t first = n ? (G - n) % g->raw_cap : 0u;
@@ -68,17 +77,29 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!frontier && (ratio <= 1u || pulsar_compress_coff(ratio) == 1u)) continue;
-        pulsar_gpu_tensor *lanes[4] = {
-            g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
-            g->layer_index_state_kv[il], g->layer_index_state_score[il],
-        };
-        for (int k = 0; k < 4 && ok; k++) {
-            if (!lanes[k]) continue;
-            const uint64_t lb = pulsar_gpu_tensor_bytes(lanes[k]);
-            if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, lanes[k], 0, lb) != 0;
-            else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(lanes[k], 0, slab, off, lb) != 0;
-            off += lb;
+        lane(g->layer_attn_state_kv[il]);
+        lane(g->layer_attn_state_score[il]);
+        lane(g->layer_index_state_kv[il]);
+        lane(g->layer_index_state_score[il]);
+    }
+    /* The frontier's drafter (DSpark, when loaded): its raw KV ring and prompt-window ring, the installed bank's
+     * views, and their counters as a host tail -- the state the next speculative round drafts from (Qwen's MTP
+     * stage and pending row are its slot's).  A grid checkpoint does not carry it: a resume re-captures the
+     * prompt window as its prefill runs. */
+    if (frontier && g->dspark_raw_cache[0]) {
+        for (int i = 0; i < 3; i++) {
+            lane(g->dspark_raw_cache[i]);
+            lane(g->dspark_prompt_h[i]);
         }
+        uint32_t c[5] = { g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2], g->dspark_prompt_n,
+                          g->dspark_prompt_lo };
+        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, c, sizeof(c)) != 0;
+        else if (ok && dir > 0) {
+            ok = pulsar_gpu_tensor_read(slab, off, c, sizeof(c)) != 0;
+            for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[i] = c[i];
+            if (ok) { g->dspark_prompt_n = c[3]; g->dspark_prompt_lo = c[4]; }
+        }
+        off += sizeof(c);
     }
     if (bytes_out) *bytes_out = off - slot_off;
     return ok;

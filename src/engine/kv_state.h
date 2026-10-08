@@ -76,9 +76,9 @@ typedef struct pulsar_kv_state_ops {
     /** The ONE slot layout, walked identically by sizing, capture and restore: `dir` < 0 sizes
      *  only (*bytes = the slot's size), 0 copies the installed bank's state -> slot, > 0 copies
      *  slot -> state.  `frontier`: the state at ANY position G (a payload's frontier), not at a grid
-     *  point -- a superset of the grid slot where the model holds lanes a grid point has canonical
-     *  (DeepSeek's coff-1 lanes); its size is pulsar_ckpt_store::frontier_bytes.  Device copies on the
-     *  session stream; false on a failed copy. */
+     *  point -- a superset of the grid slot where the model holds state a grid point has canonical or
+     *  rebuilds (DeepSeek: its coff-1 lanes and its drafter's rings).  Sized when a payload is (a
+     *  drafter may load after the store).  Device copies on the session stream; false on a failed copy. */
     bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, uint64_t off, uint32_t G,
                  uint64_t *bytes);
     /** The smallest G a checkpoint can describe (DeepSeek: the raw window). */
@@ -130,7 +130,6 @@ typedef struct pulsar_ckpt_store {
     uint64_t artifact;
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
     uint64_t slot_bytes;
-    uint64_t frontier_bytes;   ///< the frontier walk's size (a payload's frontier slot), aligned as slot_bytes
     uint32_t pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS_MAX];
 } pulsar_ckpt_store;
 

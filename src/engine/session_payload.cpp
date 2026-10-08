@@ -580,6 +580,13 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
 /* L284: DeepSeek's retired graph-format payload (v3..v15, "DSV4"), refused by name */
 #define KVP_RETIRED_DSV4_MAGIC UINT32_C(0x34565344)
 
+/* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */
+static uint64_t kvp_frontier_bytes(const pulsar_ckpt_store *st) {
+    uint64_t bytes = 0;
+    (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &bytes);
+    return (bytes + 255u) & ~(uint64_t)255u;
+}
+
 /* every pool, then every trailing pool; false past the bound */
 static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
     const uint32_t a = st->ops->pools(st->state, out, PULSAR_KV_POOLS_MAX);
@@ -597,7 +604,7 @@ static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *p
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     mix(n);
     for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row); mix(pools[i].row_bytes); mix(pools[i].whole_rows); }
-    mix(st->frontier_bytes);
+    mix(kvp_frontier_bytes(st));
     mix(width);
     return h;
 }
@@ -608,7 +615,7 @@ static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool 
     bytes += (uint64_t)T * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_img * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += (uint64_t)width * sizeof(float);
-    bytes += (G ? st->slot_bytes : 0u) + st->frontier_bytes;   /* the resume checkpoint, the frontier */
+    bytes += (G ? st->slot_bytes : 0u) + kvp_frontier_bytes(st);   /* the resume checkpoint, the frontier */
     bytes += pools_span_bytes(pools, n, 0u, T);
     return bytes + sizeof(uint64_t);   /* the trailing digest */
 }
@@ -679,8 +686,9 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     /* the frontier's slot, staged: the state model's frontier walk at T, over zeros (the slot's alignment tail
      * -- and DeepSeek's window head below its first raw_window positions -- is written too, so the same state
      * always saves the same bytes) */
-    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(st->frontier_bytes);
-    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, st->frontier_bytes / sizeof(float)) == 0 ||
+    const uint64_t fb = kvp_frontier_bytes(st);
+    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(fb);
+    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb / sizeof(float)) == 0 ||
         !st->ops->walk(st->state, 0, true, front, 0, p.T, NULL) || pulsar_gpu_synchronize() == 0) {
         pulsar_gpu_tensor_free(front);
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
@@ -703,7 +711,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     if (rc == 0 && p.G)
         rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
-    if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, st->frontier_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, p.pools, p.n_pools, 0u, p.T, true, buf, NULL, err, errlen);
     free(buf);
     pulsar_gpu_tensor_free(front);
@@ -806,7 +814,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "session payload: no grid-checkpoint slot");
         return fail();
     }
-    front = pulsar_gpu_tensor_alloc(st->frontier_bytes);
+    const uint64_t fb = kvp_frontier_bytes(st);
+    front = pulsar_gpu_tensor_alloc(fb);
     if (!front) {
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return fail();
@@ -815,7 +824,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     int rc = 0;
     if (G) rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining,
                                          err, errlen);
-    if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, st->frontier_bytes, buf, PULSAR_SESSION_IO_CHUNK,
+    if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK,
                                                &remaining, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, pools, n, 0u, T, false, buf, &remaining, err, errlen);
     free(buf);
