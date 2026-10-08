@@ -6717,10 +6717,11 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
 }
 
 
-/* L284 -- worker_main's batch leave (server_batch_may_leave). Invariant: decoders in the plain batch leave it
- * exactly when the lane pick would then take lane 3 -- the drafter runs, they number no more than the family's verify
- * rows (one base row each), and each speculates -- so decoders a wider load pushed to the plain batch rejoin
- * speculation once it ends (before, only a lone decoder left), and a leave is never undone by the next pick. */
+/* L284 -- worker_main's spec-lane eligibility (server_spec_lane_carries), the gate on the priced choice and the
+ * batch leave. Invariant: the spec lane could carry the decoders exactly when the lane pick would then take lane 3
+ * once they leave the plain batch -- the drafter runs, they number no more than the family's verify rows (one base
+ * row each), and each speculates -- so decoders a wider load pushed to the plain batch may rejoin speculation once
+ * it ends (before, only a lone decoder left), and a leave is never undone by the next pick. */
 static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
     gen_state g[3];
     memset(g, 0, sizeof g);
@@ -6733,22 +6734,108 @@ static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
         g[i].batch_active = true;
         dec[i] = &slots[i];
     }
-    /* a verify width of two rows (two decoders, one base row each): three decoders stay plain, a pair leaves */
-    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 3, 3));
-    TEST_ASSERT(server_batch_may_leave(true, 2u, dec, 2, 2));
+    /* a verify width of two rows (two decoders, one base row each): three decoders stay plain, a pair may leave */
+    TEST_ASSERT(!server_spec_lane_carries(true, 2u, dec, 3));
+    TEST_ASSERT(server_spec_lane_carries(true, 2u, dec, 2));
     /* the L271 lone decoder */
-    TEST_ASSERT(server_batch_may_leave(true, 2u, dec, 1, 1));
-    /* nothing in the plain batch: nothing to leave */
-    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 2, 0));
+    TEST_ASSERT(server_spec_lane_carries(true, 2u, dec, 1));
+    /* no decoders: nothing to carry */
+    TEST_ASSERT(!server_spec_lane_carries(true, 2u, dec, 0));
     /* no drafter */
-    TEST_ASSERT(!server_batch_may_leave(false, 2u, dec, 2, 2));
+    TEST_ASSERT(!server_spec_lane_carries(false, 2u, dec, 2));
     /* a decoder that does not speculate (logprobs) holds the batch */
     g[1].spec_enabled = false;
-    TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 2, 2));
+    TEST_ASSERT(!server_spec_lane_carries(true, 2u, dec, 2));
     g[1].spec_enabled = true;
     /* every leave lands in lane 3 once the batch is empty */
     for (int i = 0; i < 2; i++) g[i].batch_active = false;
     TEST_ASSERT(server_pick_decode_lane(4, true, 2u, dec, 2, 0) == 3);
+}
+
+/* L284 lane cost -- the priced plain/spec choice (lane_price_pick), on Qwen-shaped numbers (L284 specrows: a round
+ * 25 + 7.7 ms/row; a plain step ~20 + 7.7 ms/row; ~0.55 acceptance) and DeepSeek's N8 case.  Invariants: no
+ * number, no decision (at a new N the better-predicted lane is measured before anything is weighed); a PREDICTED
+ * price otherwise only starts a probe, the decoders move on MEASURED prices at their N; a switch needs the margin AND the hold; the lane
+ * in force is re-measured against the other every LANE_PRICE_REPROBE_STEPS of its steps. */
+static pulsar_lane_cost l284_cost(int32_t flat_us, int32_t row_us, bool valid, uint32_t n, float mr, float mms) {
+    pulsar_lane_cost c;
+    memset(&c, 0, sizeof c);
+    c.flat_us = flat_us;
+    c.row_us = row_us;
+    c.valid = valid;
+    c.n = n;
+    c.mean_rows = mr;
+    c.mean_ms = mms;
+    return c;
+}
+/* `k` steps on one lane at `n` decoders, each committing `tokens` over `rows` rows in `ms`, into lp and the fit */
+static void l284_steps(lane_price *lp, pulsar_lane_cost *fit, int li, uint32_t k, int n, int tokens, int rows,
+                       double ms) {
+    for (uint32_t i = 0; i < k; i++) {
+        if (li == PULSAR_LANE_SPEC) lane_price_observe_spec(lp, tokens, rows, n, ms);
+        else lane_price_observe_plain(lp, n, ms);
+        fit->n++;
+    }
+}
+static void test_l284_lane_price_pick(void) {
+    lane_price lp;
+    memset(&lp, 0, sizeof lp);
+    pulsar_lane_cost spec = l284_cost(25000, 7700, true, 400u, 4.0f, 55.8f);
+    pulsar_lane_cost plain = l284_cost(20000, 7700, true, 400u, 3.0f, 43.1f);
+    /* nothing measured: the spec lane runs, measuring itself, whatever plain predicts */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.t_spec == 0.0 && lp.t_plain > 0.0);
+    TEST_ASSERT(lp.held_n0 == 400u && !lp.meas_spec && !lp.meas_plain);
+    /* one decoder, 32 rounds of 2 tokens over 4 rows in 50 ms: spec measured 40 tok/s against plain predicted
+     * 1 / 27.7 ms = 36.1 -- spec holds, nothing to measure */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 2, 4, 50.0);
+    TEST_ASSERT(fabsf(lp.tau - 2.0f) < 1e-4f && fabsf(lp.rho - 4.0f) < 1e-4f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(fabs(lp.t_spec - 40.0) < 1e-6 && lp.t_plain > 36.0 && lp.t_plain < 36.3 && lp.probe == 0);
+    /* six decoders, nothing measured at six: plain PREDICTED 6 / 66.2 ms = 90.6 tok/s against spec predicted 63.0
+     * (24 rows rationed to 16: 9.3 tokens a 148 ms round) -- the better-predicted lane is measured there first */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(!lp.meas_spec && !lp.meas_plain && lp.t_spec > 62.5 && lp.t_spec < 63.5 && lp.held_n0 == 400u);
+    /* plain measured at six: 6 tokens a 80 ms step = 75 tok/s (its fit overpriced it); spec's 63.0 is no faster */
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 6, 6, 6, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(lp.meas_plain && !lp.meas_spec && fabs(lp.t_plain - 75.0) < 1e-6);
+    /* ...until the plain lane has run LANE_PRICE_REPROBE_STEPS steps: the spec lane is measured */
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS - LANE_PRICE_PROBE_STEPS - 1u, 6, 6, 6, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.probe == 0);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 6, 6, 6, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 3 && lp.lane == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 3);   /* its steps are not in */
+    /* measured at 13 tokens a 148 ms round (87.8 tok/s), past the margin over 75: the decoders move */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 6, 13, 16, 148.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(lp.meas_plain && lp.meas_spec && lp.t_spec > 87.0 && lp.t_spec < 88.5 && lp.held_n0 == spec.n);
+    /* held, then priced on both measured numbers: no flap */
+    for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
+        l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 6, 13, 16, 148.0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 0);
+    }
+    /* DeepSeek at N8: the fits, extrapolated past the rows they saw, predict plain 8 / 72 ms = 111 tok/s against
+     * the spec lane's measured 99.5 -- the probe measures plain at 80 and the decoders stay */
+    memset(&lp, 0, sizeof lp);
+    spec = l284_cost(53700, 5570, true, 1000u, 8.0f, 98.3f);
+    plain = l284_cost(16000, 7000, true, 1000u, 3.0f, 37.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.held_n0 == 1000u);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.5);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 2 && lp.probe == 2 && lp.t_plain > 110.0);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 100.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(fabs(lp.t_plain - 80.0) < 1e-6 && lp.t_spec > 99.0 && lp.t_spec < 100.0);
+    /* and a probe whose lane measures inside the margin hands the decoders back too, without re-probing until the
+     * re-probe is due (both measured: no prediction left to chase) */
+    for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
+        l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 8, 10, 16, 100.5);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.probe == 0);
+    }
+    /* a new decoder count drops what was measured: nothing is measured at nine, and the better-predicted lane (plain
+     * 9 / 79 ms = 114 against spec 11.25 tokens a 154 ms round = 73) is measured there first */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 9, 32u) == 2 && lp.lane == 2 && !lp.meas_spec && !lp.meas_plain);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 9, 11, 18, 105.0);
+    TEST_ASSERT(lp.meas_n == 9 && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.meas_steps[PULSAR_LANE_SPEC] == 1u);
 }
 
 /* Geometric survival for one bank: np pendings at per-position confidence c,
@@ -8445,6 +8532,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
     test_l284_batch_leave_when_spec_lane_carries_all();
+    test_l284_lane_price_pick();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

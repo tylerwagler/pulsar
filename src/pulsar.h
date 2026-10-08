@@ -1106,27 +1106,35 @@ bool pulsar_engine_has_snapshots(const pulsar_engine *e);
  *  pulsar_session_generate_speculative), NONE otherwise. */
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
-/** L263: the spec lane's step cost, MEASURED -- the one authority the yield
- * quench and the server's overflow K-allocator price rows against.  The
- * server reports every decode round it drives (the rows the forward carried,
- * the round's wall time, redraft included) and the engine keeps one
- * exponentially weighted least-squares fit round_ms = flat + row * rows.
- * Nothing is compiled in: a kernel landing, a different quantization, a
- * second rank or a deeper context moves the fit, not a table.  `valid` is
- * false until the fit has evidence (enough rounds over spread row counts,
- * positive terms); until then the quench stays disarmed and the allocator
- * admits by the row cap alone -- no number, no decision.  The terms are held
- * in microseconds so a TP group's ranks compute the same guard from the same
- * integers (the leader's fit crosses the wire with each round's end). */
+/** The two batched decode lanes a server prices against each other (L284 lane cost): the plain lane steps every
+ *  decoder one token a forward; the spec lane runs one speculative round a forward (base + verify rows). */
+typedef enum { PULSAR_LANE_PLAIN = 0, PULSAR_LANE_SPEC = 1, PULSAR_LANE_COUNT = 2 } pulsar_decode_lane;
+/** L263 / L284: a decode lane's step cost, MEASURED -- one fit structure for both lanes.  The spec lane's is the
+ * one authority the yield quench and the server's overflow K-allocator price rows against; both lanes' are what
+ * the server's lane choice weighs (server_sched.cpp lane_price_pick).  The server reports every decode step it
+ * drives (the rows the forward carried, the step's wall time; a spec round's redraft included) and the engine
+ * keeps, per lane, one exponentially weighted least-squares fit step_ms = flat + row * rows.  Nothing is compiled
+ * in: a kernel landing, a different quantization, a second rank or a deeper context moves the fit, not a table.
+ * `valid` is false until the fit has evidence (enough steps over spread row counts, positive terms); until then
+ * the quench stays disarmed and the allocator admits by the row cap alone -- no number, no decision.  The terms
+ * are held in microseconds so a TP group's ranks compute the same guard from the same integers (the leader's spec
+ * fit crosses the wire with each round's end).  mean_rows / mean_ms are the fit's weighted centre: the cost AT the
+ * centre needs no slope (pulsar_lane_cost_ms). */
 typedef struct {
-    int32_t flat_us;    ///< the round's fixed cost (drafting, launch, the base row), us
-    int32_t row_us;     ///< the marginal verify row, us
-    uint32_t n;         ///< rounds observed
+    int32_t flat_us;    ///< the step's fixed cost (drafting, launch, the base row), us
+    int32_t row_us;     ///< the marginal row, us
+    uint32_t n;         ///< steps observed
     bool valid;         ///< the terms may be used
-} pulsar_spec_cost;
-/** One decode round's observation: `rows` the forward carried, `ms` its wall. */
-void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms);
-pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e);
+    float mean_rows;    ///< weighted mean rows of the observed steps (0: none)
+    float mean_ms;      ///< weighted mean wall of the observed steps
+} pulsar_lane_cost;
+/** One decode step's observation on `lane`: `rows` the forward carried, `ms` its wall. */
+void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms);
+pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane);
+/** The lane's predicted step wall at `rows`, ms: flat + row * rows when the fit is valid; else the observed mean
+ *  when `rows` sits at the fit's centre (within half a row, 16+ steps: the slope does not enter); else 0 -- no
+ *  number. */
+double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
