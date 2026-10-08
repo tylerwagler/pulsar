@@ -169,7 +169,7 @@ typedef struct {
 } pulsar_qwen_gr_weights;
 
 /** L255: one Tessera projection stack's kernel-ready planes (src/cuda/mmq/pulsar_tessera.h), in this order,
- *  each the tensor mlp.experts.tessera.<proj>.<plane> (plane names in family_qwen.cpp). */
+ *  each the tensor mlp.experts.tessera.\<proj\>.\<plane\> (plane names in family_qwen.cpp). */
 enum {
     PULSAR_QWEN_TESS_WORDS = 0,   ///< I32  [n_expert][words_stride]
     PULSAR_QWEN_TESS_TABLE,       ///< BF16 [n_expert][16384] composed table
