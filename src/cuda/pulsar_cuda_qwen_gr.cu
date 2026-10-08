@@ -599,11 +599,26 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
 
 __global__ void qwen_gr_write_kernel(__nv_bfloat16 *__restrict__ streams, const float *__restrict__ out,
                                      const float *__restrict__ inj, int T) {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    /* 8 consecutive elements a thread (one 16-byte chunk, inside one stream: kH % 8 == 0) */
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i >= (size_t)T * kHC) return;
     const size_t t = i / kHC;
     const int s = (int)((i / kH) % kS), c = (int)(i % kH);
-    streams[i] = __float2bfloat16(bf2f(streams[i]) + out[t * kH + c] * inj[t * kS + s]);
+    uint4 *sp = reinterpret_cast<uint4 *>(streams + i);
+    float x[8];
+    bf16x8(*sp, x);
+    const float4 *op = reinterpret_cast<const float4 *>(out + t * kH + c);
+    const float4 o0 = op[0], o1 = op[1];
+    const float o[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
+    const float g = inj[t * kS + s];
+    uint32_t r[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const __nv_bfloat162 v = __halves2bfloat162(__float2bfloat16(x[2 * e] + o[2 * e] * g),
+                                                    __float2bfloat16(x[2 * e + 1] + o[2 * e + 1] * g));
+        r[e] = *reinterpret_cast<const uint32_t *>(&v);
+    }
+    *sp = make_uint4(r[0], r[1], r[2], r[3]);
 }
 
 /* 3'. PREFILL (W8, T > kDecodeRowsMax): the up as a tensor-core GEMM.  The up kernel above reads its
@@ -792,8 +807,12 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
         fprintf(stderr, "pulsar: qwen GR write: a null input -- refusing\n");
         return -1;
     }
-    const size_t n = (size_t)T * kHC;
-    qwen_gr_write_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((__nv_bfloat16 *)streams, out, inj, T);
+    if (((uintptr_t)streams | (uintptr_t)out) & 15u) {
+        fprintf(stderr, "pulsar: qwen GR write: streams and out must be 16-byte aligned -- refusing\n");
+        return -1;
+    }
+    const size_t n8 = (size_t)T * kHC / 8;
+    qwen_gr_write_kernel<<<(unsigned)((n8 + 255) / 256), 256, 0, stream>>>((__nv_bfloat16 *)streams, out, inj, T);
     return launch_ok("write") ? 0 : -3;
 }
 
