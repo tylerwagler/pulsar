@@ -279,6 +279,59 @@ char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
     return suffix;
 }
 
+/* L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call --
+ * malformed, unterminated (the cap cut it; no tag is ever repaired), or naming an undeclared tool.  Its
+ * valid calls are kept and the broken ones dropped.  With none kept it loops ONCE through the
+ * model-visible tool error -- non-streaming (a stream already carried the text), a chat with tools,
+ * forced or not (the retry re-opens a forced call: continue_after_invalid_dsml) -- otherwise the turn
+ * is TEXT (turn_as_text) with a truthful finish (turn_finish). */
+bool turn_tool_retry_allowed(const gen_state *g) {
+    const request *r = &g->j->req;
+    return r->kind == REQ_CHAT && r->has_tools && !r->stream && !g->recovery_attempted && strcmp(g->finish, "error");
+}
+
+bool turn_tool_retry(server *s, session_slot *sl, gen_state *g, const char *detail, server_turn *out) {
+    int recovery_tokens = 0;
+    char recovery_err[160] = {0};
+    server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s continuing with model-visible tool error",
+               g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags);
+    s->trace_event(g->trace_id, "continuing with model-visible tool error");
+    tool_calls_free(&out->calls);
+    if (!s->continue_after_invalid_dsml(sl, &g->j->req, &g->thinking, detail, &recovery_tokens, recovery_err,
+                                        sizeof(recovery_err))) {
+        g->finish = "error";
+        out->finish = g->finish;
+        snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
+                 recovery_err[0] ? recovery_err : "unknown error");
+        return false;
+    }
+    server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+               g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, recovery_tokens);
+    s->trace_event(g->trace_id, "tool-error continuation appended %d tokens", recovery_tokens);
+    out->retry = true;
+    return true;
+}
+
+void turn_as_text(const gen_state *g, server_turn *out) {
+    const char *t = g->text.ptr ? g->text.ptr : "";
+    const char *close = pulsar_think_mode_enabled(g->j->req.think_mode) ? strstr(t, "</think>") : NULL;
+    size_t answer = 0;
+    if (close) {
+        const size_t lo = strncmp(t, "<think>", 7) ? 0 : 7;
+        if ((size_t)(close - t) > lo) out->reasoning = xstrndup(t + lo, (size_t)(close - t) - lo);
+        answer = (size_t)(close - t) + strlen("</think>");
+    }
+    out->content = xstrndup(t + answer, g->text.len - answer);
+    out->calls.len = 0;
+    out->parse_failed = true;
+    out->finish = turn_finish(g, 0);
+}
+
+const char *turn_finish(const gen_state *g, int n_calls) {
+    if (!strcmp(g->finish, "error") || !strcmp(g->finish, "length")) return g->finish;
+    return n_calls ? "tool_calls" : "stop";
+}
+
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {

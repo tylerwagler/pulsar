@@ -146,6 +146,8 @@ struct qwen_out_event {
         REASONING,   ///< `text` is a reasoning delta
         CONTENT,     ///< `text` is a content delta
         TOOL_BEGIN,  ///< call `index` named `name` opened
+        TOOL_ARGS,   ///< `text` is the next fragment of call `index`'s arguments (one closed parameter:
+                     ///< `{"key": value` first, `, "key": value` after; the object's "}" is the caller's)
         TOOL_END,    ///< call `index` complete: `name`, `arguments` (a JSON object's text)
         ERROR,       ///< `text` says what was malformed; the call it concerns is dropped
     } kind;
@@ -185,7 +187,13 @@ struct qwen_out_call {
  * replay); whitespace is held back until the next non-space proves it
  * interior.  Text after a tool call is content again (the prompt forbids it;
  * the client still sees it).  A malformed or unterminated call is an ERROR
- * event naming the fault, and is not reported as a call. */
+ * event naming the fault, and is not reported as a call.
+ *
+ * L284 P5: a call streams as it is read -- TOOL_BEGIN when its name is
+ * complete, TOOL_ARGS as each parameter CLOSES (a value's JSON spelling is
+ * known only then: the schema and the whole text decide it), TOOL_END (or
+ * ERROR) at its close.  The fragments plus "}" are the arguments; a repeated
+ * key streams twice (a JSON reader keeps the last, as `arguments` does). */
 class qwen_output_parser {
 public:
     /** `thinking`: the generation prompt opened a think block.  `tools_json`:
@@ -223,6 +231,9 @@ private:
     void end_section(bool reasoning);
     void close_call(std::vector<qwen_out_event> *ev);
     void scan_payload();
+    int read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key, pyjson_value *v,
+                   const char **why) const;
+    void stream_params(std::vector<qwen_out_event> *ev);
     const char *param_type(const std::string &fn, const std::string &key) const;
 
     mode_t mode_ = M_CONTENT;
@@ -235,6 +246,9 @@ private:
     std::string block_;        ///< the open tool-call block body
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
     std::string fn_;           ///< the open call's function name, once complete
+    size_t arg_pos_ = 0;       ///< block_ offset past the last parameter streamed (TOOL_ARGS)
+    int arg_n_ = 0;            ///< parameters streamed for the open call
+    bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
     struct payload_scan {      ///< where the open block's decode is (in_payload), scanned incrementally
         size_t pos = 0;        ///< bytes of block_ classified
         bool value = false;    ///< inside a parameter value

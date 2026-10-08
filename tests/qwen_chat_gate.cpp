@@ -501,12 +501,25 @@ static parse_result run_parser(const std::string &out, bool thinking, const char
     }
     p.feed(out.data() + at, out.size() - at, &ev);
     p.finish(&ev);
+    std::string streamed;   /* L284 P5: the call's TOOL_ARGS fragments, one per closed parameter */
+    int fragments = 0;
     for (const auto &e : ev) {
         switch (e.kind) {
         case qwen_out_event::REASONING: r.ev_reasoning += e.text; break;
         case qwen_out_event::CONTENT: r.ev_content += e.text; break;
-        case qwen_out_event::TOOL_BEGIN: r.begins++; break;
-        case qwen_out_event::TOOL_END: r.calls += std::to_string(e.index) + ":" + e.name + ":" + e.arguments + "\n"; break;
+        case qwen_out_event::TOOL_BEGIN: r.begins++; streamed.clear(); fragments = 0; break;
+        case qwen_out_event::TOOL_ARGS: streamed += e.text; fragments++; break;
+        case qwen_out_event::TOOL_END: {
+            r.calls += std::to_string(e.index) + ":" + e.name + ":" + e.arguments + "\n";
+            /* the fragments + "}" are the arguments, byte for byte, unless a key repeated (streamed twice) */
+            pyjson_value a;
+            char jerr[8];
+            if (pyjson_parse(e.arguments.data(), e.arguments.size(), &a, jerr, sizeof jerr) &&
+                (int)a.o.size() == fragments)
+                CHECK((fragments ? streamed + "}" : std::string("{}")) == e.arguments,
+                      "parser: TOOL_ARGS fragments do not add up to the arguments");
+            break;
+        }
         case qwen_out_event::ERROR: r.errors += e.text + "\n"; break;
         }
     }

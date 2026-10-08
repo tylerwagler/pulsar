@@ -951,34 +951,14 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
 
 
-/* A truncated generation often ends MID-closing-tag.  Repair used to append
- * fresh closing tags after the fragment, baking "</｜DSML｜"-style debris into
- * the parsed parameter value (and into the streamed args, since the final
- * flush parses repaired text).  The repair must trim the partial tag first. */
-static void test_repair_dsml_trims_partial_closing_tag(void) {
-    buf fixed = {0};
-    buf in = {0};
-    buf_puts(&in, "<think>go</think>" PULSAR_TOOL_CALLS_START "\n");
-    buf_puts(&in, PULSAR_INVOKE_START " name=\"bash\">\n");
-    buf_puts(&in, PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -l /var/log</｜DSML｜");
-    TEST_ASSERT(try_repair_dsml(in.ptr, in.len, &fixed));
-    TEST_ASSERT(fixed.ptr != NULL);
-    /* value ends at the real content; the partial tag is gone and exactly one
-     * full closing sequence follows */
-    TEST_ASSERT(strstr(fixed.ptr, "/var/log" PULSAR_PARAM_END) != NULL);
-    TEST_ASSERT(strstr(fixed.ptr, "</｜DSML｜" PULSAR_PARAM_END) == NULL);
-    buf_free(&in);
-    buf_free(&fixed);
-}
 
 /* A generation cut mid-argument (finish=length) used to leave the streamed
  * tool call's arguments as UNTERMINATED JSON on the wire: the header and a
  * string-value prefix had been emitted, then nothing.  The finalize path
- * (upstream ds4 0ead8a8's problem, solved pulsar-shaped: our non-stream side
- * already repairs via try_repair_dsml; the stream now closes the open string
- * and args object so the wire JSON is well-formed and byte-consistent with
- * that repair).  The value stays visibly truncated; finish_reason=length
- * still marks the cut. */
+ * (upstream ds4 0ead8a8's problem, solved pulsar-shaped: the stream closes
+ * the open string and args object so the wire JSON is well-formed -- an
+ * announced call is closed as sent, L284 P4).  The value stays visibly
+ * truncated; finish_reason=length still marks the cut. */
 static void test_openai_tool_stream_truncated_call_closes_args(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -2497,220 +2477,102 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
 
 
 
-/* Verify that try_repair_dsml + parse_generated_message produces structurally
-   valid tool calls for all three DSML styles and multiple truncation scenarios.
-   Balanced but malformed DSML is not repaired: the model must retry it.
-   This tests repair ACCURACY, not just that it doesn't crash. */
-static void test_dsml_repair_produces_parseable_calls(void) {
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    buf repaired = {0};
 
-    /* === TEST 1: Full DSML - missing </tool_calls> === */
-    {
-        const char *broken =
-            "thinking done\n\n"
-            PULSAR_TOOL_CALLS_START "\n"
-            PULSAR_INVOKE_START " name=\"bash\">\n"
-            PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la" PULSAR_PARAM_END "\n"
-            PULSAR_INVOKE_END "\n";
-        /* Missing: PULSAR_TOOL_CALLS_END */
 
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
+
+/* L284 P4: ONE rule for a broken tool call, every family -- no tag repair; a turn with no valid call retries
+ * when allowed (once, non-streaming, tools, forced or not), else it is TEXT: the reasoning, the answer's
+ * raw bytes (the broken call included), no call, a truthful finish (length when the cap cut it). */
+static void test_broken_call_one_rule_every_family(void) {
+    struct fcase { pulsar_chat_format fmt; const char *raw; const char *gen_finish; const char *finish; int calls;
+                   const char *content_has; };
+    static const fcase cases[] = {
+        /* DeepSeek: a cut block (no repair), a malformed block, an undeclared tool, a valid call */
+        {PULSAR_CHAT_DS4_V41, "go</think>" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                              PULSAR_PARAM_START " name=\"command\" string=\"true\">sleep", "length", "length", 0,
+         "string=\"true\">sleep"},
+        {PULSAR_CHAT_DS4_V41, "go</think>" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START ">\n" PULSAR_TOOL_CALLS_END,
+         "tool_calls", "stop", 0, PULSAR_INVOKE_START},
+        {PULSAR_CHAT_DS4_V41, "go</think>" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"rm\">\n"
+                              PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END, "tool_calls", "stop", 0, "name=\"rm\""},
+        {PULSAR_CHAT_DS4_V41, "go</think>" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                              PULSAR_PARAM_START " name=\"command\" string=\"true\">ls" PULSAR_PARAM_END "\n"
+                              PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END, "tool_calls", "tool_calls", 1, NULL},
+        /* Qwen: the same four */
+        {PULSAR_CHAT_QWEN, "go\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nsleep", "length",
+         "length", 0, "<parameter=command>\nsleep"},
+        {PULSAR_CHAT_QWEN, "go\n</think>\n\n<tool_call>\nbroken\n</tool_call>", "stop", "stop", 0, "broken"},
+        {PULSAR_CHAT_QWEN, "go\n</think>\n\n<tool_call>\n<function=rm>\n</function>\n</tool_call>", "stop", "stop", 0,
+         "<function=rm>"},
+        {PULSAR_CHAT_QWEN, "go\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+                           "</function>\n</tool_call>", "stop", "tool_calls", 1, NULL},
+    };
+    for (const fcase &c : cases) {
+        server srv;
+        memset(&srv, 0, sizeof srv);
+        pthread_mutex_init(&srv.tool_mu, NULL);
+        job j;
+        memset(&j, 0, sizeof j);
+        request *r = &j.req;
+        request_init(r, REQ_CHAT, 64);
+        r->family = server_family_for_format(c.fmt);
+        r->think_mode = PULSAR_THINK_DEFAULT;
+        r->has_tools = true;
+        r->stream = true;   /* a stream: no retry, the turn is text */
+        r->tool_orders = make_bash_order();
+        if (c.fmt == PULSAR_CHAT_QWEN)
+            r->qwen_tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+                                         "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}}]");
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        g.j = &j;
+        g.thinking = thinking_state_from_prompt(r);
+        char err[200] = "";
+        void *ps = r->family->output->create(&srv, &g, err, sizeof err);
+        TEST_ASSERT(ps != NULL);
+        if (!ps) continue;
+        for (const char *p = c.raw; *p; p++) {   /* a token at a time */
+            buf_append(&g.text, p, 1);
+            g.thinking.feed(p, 1);
+            r->family->output->feed(ps, &srv, &g, g.text.len, false);
+        }
+        g.finish = c.gen_finish;
+        server_turn turn;
+        memset(&turn, 0, sizeof turn);
+        turn.finish = g.finish;
+        TEST_ASSERT(r->family->output->finish(ps, &srv, NULL, &g, &turn));
+        TEST_ASSERT(!turn.retry);
+        TEST_ASSERT(!strcmp(turn.finish, c.finish));
+        TEST_ASSERT(turn.calls.len == c.calls);
+        if (c.content_has) {
+            TEST_ASSERT(turn.content && strstr(turn.content, c.content_has));
+            TEST_ASSERT(turn.reasoning && !strncmp(turn.reasoning, "go", 2));
+        }
+        r->family->output->destroy(ps);
+        free(turn.content);
+        free(turn.reasoning);
+        tool_calls_free(&turn.calls);
+        buf_free(&g.text);
+        request_free(r);
+        pthread_mutex_destroy(&srv.tool_mu);
     }
-
-    /* === TEST 2: Full DSML - missing </invoke> and </tool_calls> === */
-    {
-        const char *broken =
-            "\n\n"
-            PULSAR_TOOL_CALLS_START "\n"
-            PULSAR_INVOKE_START " name=\"edit\">\n"
-            PULSAR_PARAM_START " name=\"path\" string=\"true\">/tmp/test.c" PULSAR_PARAM_END "\n";
-        /* Missing: PULSAR_INVOKE_END, PULSAR_TOOL_CALLS_END */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 3: Full DSML - missing </parameter> === */
-    {
-        const char *broken =
-            "\n\n"
-            PULSAR_TOOL_CALLS_START "\n"
-            PULSAR_INVOKE_START " name=\"bash\">\n"
-            PULSAR_PARAM_START " name=\"command\" string=\"true\">echo hello";
-        /* Missing: PULSAR_PARAM_END, PULSAR_INVOKE_END, PULSAR_TOOL_CALLS_END */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 4: Short DSML - missing closing tags === */
-    {
-        const char *broken =
-            "\n\n"
-            PULSAR_TOOL_CALLS_START_SHORT "\n"
-            PULSAR_INVOKE_START_SHORT " name=\"write_file\">\n"
-            PULSAR_PARAM_START_SHORT " name=\"path\" string=\"true\">/tmp/out.txt" PULSAR_PARAM_END_SHORT "\n"
-            PULSAR_PARAM_START_SHORT " name=\"content\" string=\"true\">hello world" PULSAR_PARAM_END_SHORT "\n"
-            PULSAR_INVOKE_END_SHORT "\n";
-        /* Missing: PULSAR_TOOL_CALLS_END_SHORT */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write_file"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/out.txt\"") != NULL);
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"content\": \"hello world\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 6: Balanced text should NOT be modified === */
-    {
-        const char *balanced =
-            "\n\n"
-            PULSAR_TOOL_CALLS_START "\n"
-            PULSAR_INVOKE_START " name=\"bash\">\n"
-            PULSAR_PARAM_START " name=\"command\" string=\"true\">ls" PULSAR_PARAM_END "\n"
-            PULSAR_INVOKE_END "\n"
-            PULSAR_TOOL_CALLS_END;
-
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced, strlen(balanced), &repaired));
-        /* No repair needed */
-    }
-
-    /* === TEST 7: No DSML tags should return false === */
-    {
-        const char *no_dsml = "just plain text, no tools";
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(no_dsml, strlen(no_dsml), &repaired));
-    }
-
-    /* === TEST 8: Balanced DSML with no invoke is not repaired === */
-    {
-        const char *balanced_no_invoke =
-            "Let me analyze this.\n\n"
-            PULSAR_TOOL_CALLS_START
-            "The write tool truncates this too, at what looks like the same content location."
-            PULSAR_TOOL_CALLS_END;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced_no_invoke, strlen(balanced_no_invoke), &repaired));
-    }
-
-    /* === TEST 9: Balanced short DSML with no invoke is not repaired === */
-    {
-        const char *balanced_short_no_invoke =
-            "thinking...\n\n"
-            PULSAR_TOOL_CALLS_START_SHORT
-            "some content here"
-            PULSAR_TOOL_CALLS_END_SHORT;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced_short_no_invoke, strlen(balanced_short_no_invoke), &repaired));
-    }
-
-    /* === TEST 11: DSML mentioned inside thinking is not repaired === */
-    {
-        const char *thinking_quote =
-            "<think>The protocol uses "
-            PULSAR_TOOL_CALLS_START
-            "some explanatory text"
-            PULSAR_TOOL_CALLS_END
-            ", but this is only a quote.</think>\nFinal answer.";
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(thinking_quote, strlen(thinking_quote), &repaired));
-    }
-
-    /* === TEST 12: Extra closing tags are unrecoverable, not truncation === */
-    {
-        const char *orphan_close =
-            "done\n\n"
-            PULSAR_TOOL_CALLS_START
-            PULSAR_TOOL_CALLS_END
-            PULSAR_TOOL_CALLS_END;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(orphan_close, strlen(orphan_close), &repaired));
-    }
-
-    /* === TEST 13: Real DSML after thinking still repairs normally === */
-    {
-        const char *broken_after_think =
-            "<think>"
-            PULSAR_TOOL_CALLS_START
-            "quoted DSML, not executable"
-            PULSAR_TOOL_CALLS_END
-            "</think>\n\n"
-            PULSAR_TOOL_CALLS_START "\n"
-            PULSAR_INVOKE_START " name=\"bash\">\n"
-            PULSAR_PARAM_START " name=\"command\" string=\"true\">date" PULSAR_PARAM_END "\n"
-            PULSAR_INVOKE_END "\n";
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken_after_think, strlen(broken_after_think), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"date\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    buf_free(&repaired);
-}
-
-
-
-static void test_tool_parse_failure_returns_recoverable_finish(void) {
-    const char *generated =
-        "trying a tool\n\n"
-        PULSAR_TOOL_CALLS_START "\n"
-        PULSAR_INVOKE_START ">\n"
-        PULSAR_TOOL_CALLS_END;
-
-    char err[128] = {0};
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    const char *finish = "tool_calls";
-    bool recovered = false;
-
-    TEST_ASSERT(!parse_generated_message_for_response(generated,
-                                                       true,
-                                                       true,
-                                                       false,
-                                                       &finish,
-                                                       err,
-                                                       sizeof(err),
-                                                       &content,
-                                                       &reasoning,
-                                                       &calls,
-                                                       &recovered));
-    TEST_ASSERT(recovered);
-    TEST_ASSERT(!strcmp(finish, "stop"));
-    TEST_ASSERT(!strcmp(err, "invalid tool call"));
-    TEST_ASSERT(content && strstr(content, PULSAR_TOOL_CALLS_START) != NULL);
-    TEST_ASSERT(reasoning == NULL);
-    TEST_ASSERT(calls.len == 0);
-
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
+    /* the retry rule: once, non-streaming, a chat with tools -- a forced call too */
+    job j;
+    memset(&j, 0, sizeof j);
+    request_init(&j.req, REQ_CHAT, 16);
+    j.req.has_tools = true;
+    j.req.force_tool_call = true;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    g.finish = "stop";
+    TEST_ASSERT(turn_tool_retry_allowed(&g));
+    g.recovery_attempted = true;
+    TEST_ASSERT(!turn_tool_retry_allowed(&g));
+    g.recovery_attempted = false;
+    j.req.stream = true;
+    TEST_ASSERT(!turn_tool_retry_allowed(&g));
+    request_free(&j.req);
 }
 
 
@@ -8496,7 +8358,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_tool_stream_truncated_call_closes_args();
-    test_repair_dsml_trims_partial_closing_tag();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
@@ -8513,8 +8374,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_checkpoint_key_ends_where_sampled_tokens_end();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
-    test_dsml_repair_produces_parseable_calls();
-    test_tool_parse_failure_returns_recoverable_finish();
+    test_broken_call_one_rule_every_family();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();

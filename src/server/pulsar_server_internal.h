@@ -2400,6 +2400,11 @@ struct qwen_gen {
     bool stream_ok = true;           ///< no client write failed while projecting
     std::string last_error;          ///< the last malformed-call report (the retry's detail)
     int undeclared = 0;              ///< calls dropped for naming an undeclared tool (L272)
+    std::vector<qwen_out_event> pending;   ///< a forced seed's announcement, sent by the first feed
+    bool open = false;               ///< the last of `calls` is announced and still being read (L284 P5)
+    bool open_args = false;          ///< its argument object's "{" went out
+    int wire_open = -1;              ///< its index on the stream
+    int wire_n = 0;                  ///< calls announced on the stream (a broken one keeps its index)
     ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
 };
 
@@ -2886,18 +2891,14 @@ const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_
 bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls);
-bool try_repair_dsml(const char *s, size_t len, buf *out);
-bool parse_generated_message_for_response(const char *text,
-                                                 bool has_tools,
-                                                 bool saw_tool_start,
-                                                 bool require_thinking_closed,
-                                                 const char **finish_io,
-                                                 char *err,
-                                                 size_t errlen,
-                                                 char **content_out,
-                                                 char **reasoning_out,
-                                                 tool_calls *calls,
-                                                 bool *recovered_out);
+/** L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call
+ *  (generate.cpp): retry allowed -- once, non-streaming, a chat with tools, forced or not; the retry; the
+ *  turn as text (reasoning, then the answer's raw bytes, no call); the finish label (error / length as
+ *  the generation ended, else tool_calls with calls, else stop). */
+bool turn_tool_retry_allowed(const struct gen_state *g);
+bool turn_tool_retry(server *s, struct session_slot *sl, struct gen_state *g, const char *detail, server_turn *out);
+void turn_as_text(const struct gen_state *g, server_turn *out);
+const char *turn_finish(const struct gen_state *g, int n_calls);
 void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders);

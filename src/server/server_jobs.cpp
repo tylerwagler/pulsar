@@ -77,6 +77,27 @@ bool server::continue_after_invalid_dsml(session_slot *sl,
         return false;
     }
     char *suffix = r->family->tool_error_suffix(r, thinking, detail, &spans, &n_spans);
+    if (r->force_tool_call && suffix) {
+        /* L284 P4: a forced call's retry is forced too -- the tail's generation prompt re-opens the call the
+         * way the prompt did (the family's forced_call_prefill), so the next attempt's seed is what the KV holds */
+        size_t keep = strlen(suffix);
+        buf add = {0};
+        r->family->forced_call_prefill(r, suffix, &keep, &add);
+        buf re = {0};
+        buf_append(&re, suffix, keep);
+        if (add.len) buf_append(&re, add.ptr, add.len);
+        buf_free(&add);
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n_spans; i++) {
+            if (spans[i].lo >= keep) continue;
+            spans[k] = spans[i];
+            if (spans[k].hi > keep) spans[k].hi = (uint32_t)keep;
+            k++;
+        }
+        n_spans = k;
+        free(suffix);
+        suffix = buf_take(&re);
+    }
     bool ok = s->append_rendered_suffix_to_live_session(sl, suffix,
                                                      spans, n_spans,
                                                      tokens_appended,
