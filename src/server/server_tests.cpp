@@ -5075,23 +5075,6 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
 
 
 
-static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
-    /* Regression for the first canonical-KV rewrite attempt: replacing a small
-     * live suffix looks tempting because the raw SWA ring may still contain the
-     * needed rows, but compressed KV counters and compressor/indexer frontiers
-     * are already past the shared prefix.  Until those graph frontiers can be
-     * restored exactly, every rewrite behind the live end must rebuild or load a
-     * disk checkpoint. */
-    TEST_ASSERT(pulsar_session_rewrite_requires_rebuild(19296, 19290, 19081));
-    TEST_ASSERT(pulsar_session_rewrite_requires_rebuild(1024, 1030, 1000));
-    TEST_ASSERT(pulsar_session_rewrite_requires_rebuild(1024, 900, 900));
-
-    TEST_ASSERT(!pulsar_session_rewrite_requires_rebuild(1024, 1024, 1024));
-    TEST_ASSERT(!pulsar_session_rewrite_requires_rebuild(1024, 1100, 1024));
-}
-
-
-
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -8453,7 +8436,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_tool_marker_state_ignores_orphan_end();
-    test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();

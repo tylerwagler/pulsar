@@ -386,14 +386,9 @@ static uint64_t kvp_payload_bytes(pulsar_session *s);
 static int kvp_save(pulsar_session *s, FILE *fp, char *err, size_t errlen);
 static int kvp_load(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 
-/* A restore replaces the state every speculative lookahead was conditioned on: the carry token, the
- * pre-drafted pendings, the quench.  Dropped up front (a restore failing midway may already have
- * overwritten what they read) and again at the commit. */
-static void payload_drop_lookahead(pulsar_session *s) {
-    s->spec.spec_carry_valid = false;
-    pulsar_spec_drop_pendings(&s->spec);
-    spec_quench_reset(s);
-}
+/* A restore replaces the state every speculative lookahead was conditioned on (spec_lookahead_reset):
+ * dropped up front (a restore failing midway may already have overwritten what they read) and again at the
+ * commit. */
 
 uint64_t pulsar_session::payload_bytes() {
     auto *s = this;
@@ -567,7 +562,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return 1;
     }
     if (kvp_model(s)) return kvp_load(s, fp, payload_bytes, err, errlen);
-    payload_drop_lookahead(s);
+    spec_lookahead_reset(s);
     /* L264: same argument for the bank's grid checkpoints -- they reference the
      * rows this load overwrites. */
     pulsar_ckpt_drop_bank(&s->graph->ckpt, gpu_graph_cur_bank(s->graph));
@@ -789,7 +784,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * were all conditioned on the replaced state. Leaving the ring makes the
      * next drafts (and therefore the verify batch shapes) depend on whatever
      * ran before the restore — the source of run-to-run tie flips. */
-    payload_drop_lookahead(s);
+    spec_lookahead_reset(s);
     for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
     g->dspark_prompt_n = 0;
     return 0;
@@ -825,17 +820,14 @@ static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_
     return n;
 }
 
-/* The bank holds nothing: a chain's root replaces its history, a failed load leaves it empty.  A
- * bank-pool family's lanes are written by the chain's last restore and its counters by
- * set_frontier_stale, so its host view and its checkpoints are all there is to clear. */
+/* The bank holds nothing: a chain's root replaces its history, a failed load leaves it empty.  The
+ * session's invalidate forgets the view (a family whose invalidate leaves the device state alone has its
+ * lanes written by the chain's last restore and its counters by set_frontier_stale), and the bank's
+ * checkpoints go with the history they described. */
 static void segment_clear(pulsar_session *s, pulsar_ckpt_store *st, uint32_t bank) {
     s->live_images.n = 0;   /* L281: the bank holds no block */
-    if (FAMILY_BANKS(s)) {
-        s->engine->family->session->invalidate(s);
-        pulsar_ckpt_drop_bank(st, bank);
-    } else {
-        s->invalidate();
-    }
+    pulsar_session_family_invalidate(s);
+    pulsar_ckpt_drop_bank(st, bank);
 }
 
 static uint32_t segment_pools(pulsar_ckpt_store *st, pulsar_kv_pool *pools) {
@@ -1263,7 +1255,7 @@ static int kvp_load(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *e
         payload_set_err(err, errlen, "session payload: a tensor-parallel session's payload is not mirrored");
         return 1;
     }
-    payload_drop_lookahead(s);
+    spec_lookahead_reset(s);
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const uint32_t bank = pulsar_session_live_bank(s);
     const uint32_t width = (uint32_t)pulsar_engine_logits_width(s->engine);
@@ -1376,7 +1368,7 @@ static int kvp_load(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *e
     free(logits);
     s->checkpoint_valid = true;
     s->logits_stale = false;
-    payload_drop_lookahead(s);
+    spec_lookahead_reset(s);
     return 0;
 }
 

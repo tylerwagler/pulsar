@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
         const double t0 = now_s();
         int n = 0, rounds = 0;
         while (n < generated) {
-            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n, 248046,
+            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
             if (k < 0) {
                 fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
@@ -266,7 +266,7 @@ int main(int argc, char **argv) {
             if (k == 0) break;
             n += k;
             rounds++;
-            if (out[n - 1] == 248046) break;
+            if (pulsar_token_is_stop(e, out[n - 1])) break;
         }
         const double dt = now_s() - t0;
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);

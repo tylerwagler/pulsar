@@ -44,8 +44,7 @@ static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->logits_stale = true;
-    pulsar_spec_drop_pendings(&s->spec);   /* no shadow was saved: the fresh bank has no pendings or carry */
-    s->spec.spec_carry_valid = false;
+    spec_lookahead_reset(s);   /* no shadow was saved: the fresh bank has no pendings, carry or quench */
     return true;
 }
 

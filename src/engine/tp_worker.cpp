@@ -345,7 +345,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             borrowed.v = c->tokens;
             borrowed.len = (int)c->n_tokens;
             borrowed.cap = (int)c->n_tokens;
-            rc = e->family->session->sync(slot->s, &borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr,
+            rc = pulsar_session_family_sync(slot->s, &borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr,
                                          sizeof(ferr));
         }
         /* INTERRUPTED is the leader's chunk verdict (v15), taken at the same
@@ -390,7 +390,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
-                rc = e->family->session->eval(slot->s, c->value, ferr, sizeof(ferr));
+                rc = pulsar_session_family_eval(slot->s, c->value, ferr, sizeof(ferr));
             }
         }
         if (rc != 0) {
@@ -475,7 +475,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             return 1;
         }
         if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->rewind(c->value);
-        else                                   e->family->session->invalidate(slot->s);
+        else                                   pulsar_session_family_invalidate(slot->s);
         return 1;
     }
 
@@ -504,25 +504,6 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             if (status < 0) status = 1;
         } else {
             fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
-        }
-        return worker_ack(e, c->session_id, status, err, errlen);
-    }
-
-    case PULSAR_TP_FRAME_REWRITE_FROM_COMMON: {
-        /* A verdict frame whose enum includes -1: the wire status is result + 1
-         * so that a negative wire status stays this rank's refusal. */
-        int status = -1;
-        if (!worker_refused(e, c, "rewrite from common", &slot, ferr, sizeof(ferr))) {
-            pulsar_tokens borrowed;
-            borrowed.v = c->tokens;
-            borrowed.len = (int)c->n_tokens;
-            borrowed.cap = (int)c->n_tokens;
-            const pulsar_session_rewrite_result rr =
-                slot->s->rewrite_from_common(&borrowed, c->value, ferr, sizeof(ferr));
-            status = (int)rr + 1;
-            if (status < 0) status = 0;   /* an unknown negative result reads as ERROR */
-        } else {
-            fprintf(stderr, "pulsar: tp worker: rewrite from common refused: %s\n", ferr);
         }
         return worker_ack(e, c->session_id, status, err, errlen);
     }
@@ -600,7 +581,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             } else {
                 uint64_t rng = c->spec.rng;
                 int *acc = worker_accepted(slot, c->spec.i2);
-                const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0, c->spec.i1,
+                const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
                                                                    c->spec.min_p, &rng, slot->logits, (uint32_t)c->spec.i3,
                                                                    acc, c->spec.i2, ferr, sizeof(ferr));
@@ -697,14 +678,14 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
             } else if (c->type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH) {
                 uint32_t rows = 0;
-                pulsar_session_spec_assemble_batch_local(slot->s, steps, n, c->spec.i0, (uint32_t)c->spec.i1,
+                pulsar_session_spec_assemble_batch_local(slot->s, steps, n, (uint32_t)c->spec.i1,
                                                          NULL, &rows);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, rows);
             } else if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH) {
                 /* v24: the leader's measured spec cost, the one every rank
                  * prices this round's quench from (L263). */
                 pulsar_engine_spec_cost_set(e, c->spec.i1, c->spec.i2, c->spec.i3 != 0);
-                pulsar_session_spec_round_end_batch_local(slot->s, steps, n, c->spec.i0, slot->logits);
+                pulsar_session_spec_round_end_batch_local(slot->s, steps, n, slot->logits);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
             } else {
                 pulsar_session_spec_redraft_commit_batch_local(slot->s, steps, n);
@@ -726,7 +707,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             uint64_t rng = c->spec.rng;
             int *acc = worker_accepted(slot, c->spec.i2);
             const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
-                                                        &rng, c->spec.i0, c->spec.i1, acc, c->spec.i2, ferr, sizeof(ferr));
+                                                        &rng, c->spec.i0, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;
             if (status < 0) status = 0;
             if (n < 0) {

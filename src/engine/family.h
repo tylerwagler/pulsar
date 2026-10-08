@@ -118,7 +118,7 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_BANKS   = 1u << 0,  ///< a bank pool > 1: repoint, fork, physical residency, bank state save/restore, per-bank KV spill
     PULSAR_FAMILY_CAP_SPEC    = 1u << 1,  ///< speculative decoding: the family provides pulsar_family::spec (the verify hooks) for whichever drafter is loaded
     PULSAR_FAMILY_CAP_PAYLOAD = 1u << 2,  ///< disk-KV payloads and snapshots (save/load/stage/mirror)
-    PULSAR_FAMILY_CAP_REWIND  = 1u << 3,  ///< rewind / rewrite-from-common to an earlier position of a live session
+    PULSAR_FAMILY_CAP_REWIND  = 1u << 3,  ///< rewind to an earlier position of a live session
     PULSAR_FAMILY_CAP_VISION  = 1u << 4,  ///< image spans in a prompt
     PULSAR_FAMILY_CAP_TP      = 1u << 5,  ///< tensor parallelism across a pair / mesh
     PULSAR_FAMILY_CAP_IMATRIX = 1u << 6,  ///< importance-matrix collection

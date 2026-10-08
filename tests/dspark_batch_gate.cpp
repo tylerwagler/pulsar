@@ -127,7 +127,6 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
     char err[256];
     pulsar_multiseq_req reqs[ROWS];
     uint32_t rows = 0;
-    const int eos = pulsar_token_eos(g_e);
     for (int b = 0; b < g_nb; b++) {
         if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) return -1;
         const int first = pulsar_session_spec_next_base(s, temps[b], 0, 1.0f, 0.05f, &rngs[b]);
@@ -183,7 +182,7 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
     for (int b = 0; b < g_nb; b++) {
         if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) return -1;
         int accepted[17];
-        const int na = pulsar_session_spec_round_end(s, r[b], first_tok[b], eos, temps[b], 0, 1.0f,
+        const int na = pulsar_session_spec_round_end(s, r[b], first_tok[b], temps[b], 0, 1.0f,
                                                      0.05f, &rngs[b], logits, row0[b], accepted, 17,
                                                      err, sizeof(err));
         if (na < 0) { fprintf(stderr, "round_end bank %d: %s\n", b, err); return -1; }

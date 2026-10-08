@@ -37,12 +37,17 @@
  * a 130-row continuation and a dirty bank's 2048 rows from 0 behind 3 verify rows in both bank orders, the decode
  * after, the runs without the verify, and the core's record of each chunk (note_prefilled: history, next-token
  * logits, the grid checkpoint a divergent sync then resumes from == cold).
+ * Speculation (L284):
+ *   S1  a request boundary re-arms it: a bank whose yield quench latched (forced by its field -- the one reach past
+ *       the public API) carries the latch across a bank switch, and the next request's sync on that bank speculates
+ *       again; an invalidate drops the lookahead and re-arms too
  * In the battery for every family as a runner gate (L278: tests/gates_runner.cpp hosts each family's model); the
  * standalone `make session-contract-gate-qwen` / `-ds` remain for iterating.  Replaces L266's
  * qwen_chunk_neutrality_gate and qwen_banks_gate. */
 #include "pulsar.h"
 #include "gate_entry.h"
 #include "gate_util.h"
+#include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field */
 
 #include <algorithm>
 #include <math.h>
@@ -874,6 +879,80 @@ static void part_fused_runs(pulsar_engine *e, int W) {
     pulsar_tokens_free(&D);
 }
 
+/* S1 (L284): a request boundary is the core's, for every family -- a sync (and an invalidate) drops the speculative
+ * lookahead and re-arms the yield quench.  Before, only DeepSeek's sync did: a Qwen bank whose quench latched
+ * kept the latch in its shadow (the bank carry saves the whole speculative state) and served every later request
+ * plain.  The latch is forced by its field -- the controller's own trigger needs a stream the drafter loses on --
+ * then carried across a bank switch, and the next request on that bank must speculate again. */
+static uint64_t spec_drafted(pulsar_engine *e) {
+    pulsar_spec_metrics m;
+    memset(&m, 0, sizeof m);
+    pulsar_engine_spec_metrics(e, &m);
+    return m.draft_tokens;
+}
+
+static bool spec_generate(pulsar_session *s, int n, char *err, size_t errlen) {
+    uint64_t rng = 7;
+    for (int got = 0; got < n;) {
+        int buf[17];
+        const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, buf, 17, err,
+                                                          errlen);
+        if (k <= 0) return k == 0;
+        got += k;
+    }
+    return true;
+}
+
+static void part_spec_lookahead(pulsar_engine *e) {
+    CHECK(pulsar_engine_has_spec_rounds(e), "S1 the family speculates (a drafter behind the round API)");
+    if (!pulsar_engine_has_spec_rounds(e)) return;
+    pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
+    pulsar_tokens B = text_tokens(e, "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return");
+    pulsar_tokens more = text_tokens(e, " book. One night a ship came in without a name, and he wrote");
+    pulsar_engine_set_bank_pool(2);
+    pulsar_session *s = NULL;
+    char err[256] = "";
+    CHECK(pulsar_session_create(&s, e, 4096) == 0 && s, "S1 a 2-bank session");
+    if (s) {
+        CHECK(pulsar_session_bank_state_restore(s, 0) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0,
+              "S1 bank 0 prefills A: %s", err);
+        uint64_t d0 = spec_drafted(e);
+        CHECK(spec_generate(s, 24, err, sizeof(err)) && spec_drafted(e) > d0,
+              "S1 bank 0 speculates (%llu draft tokens): %s", (unsigned long long)(spec_drafted(e) - d0), err);
+        s->spec.spec_quenched = true;   /* the latch, as the yield quench sets it */
+        d0 = spec_drafted(e);
+        CHECK(spec_generate(s, 8, err, sizeof(err)) && spec_drafted(e) == d0,
+              "S1 a latched bank decodes plain (%llu draft tokens): %s", (unsigned long long)(spec_drafted(e) - d0),
+              err);
+        pulsar_session_bank_state_save(s, 0);
+        CHECK(pulsar_session_bank_state_restore(s, 1) && pulsar_session_sync(s, &B, err, sizeof(err)) == 0,
+              "S1 bank 1 prefills B: %s", err);
+        pulsar_session_bank_state_save(s, 1);
+        CHECK(pulsar_session_bank_state_restore(s, 0) && s->spec.spec_quenched,
+              "S1 bank 0's shadow carries the latch across the switch");
+        /* the next request on bank 0: its history and a new turn */
+        pulsar_tokens next = {0};
+        pulsar_tokens_copy(&next, pulsar_session_tokens(s));
+        for (int i = 0; i < more.len; i++) pulsar_tokens_push(&next, more.v[i]);
+        err[0] = '\0';
+        CHECK(pulsar_session_sync(s, &next, err, sizeof(err)) == 0 && !s->spec.spec_quenched,
+              "S1 the next request's sync re-arms the quench: %s", err);
+        d0 = spec_drafted(e);
+        CHECK(spec_generate(s, 24, err, sizeof(err)) && spec_drafted(e) > d0,
+              "S1 the next request on the latched bank speculates again (%llu draft tokens): %s",
+              (unsigned long long)(spec_drafted(e) - d0), err);
+        s->spec.spec_quenched = true;
+        pulsar_session_invalidate(s);
+        CHECK(!s->spec.spec_quenched && !s->spec.spec_carry_valid && s->spec.n_pend == 0,
+              "S1 an invalidate drops the lookahead and re-arms the quench");
+        pulsar_tokens_free(&next);
+        pulsar_session_free(s);
+    }
+    pulsar_tokens_free(&A);
+    pulsar_tokens_free(&B);
+    pulsar_tokens_free(&more);
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s <model> [prefill_chunk]\n", argv[0]); return 2; }
@@ -889,6 +968,7 @@ int GATE_ENTRY(int argc, char **argv) {
     part_banks(e, W);
     part_fused(e, W);
     part_fused_runs(e, W);
+    part_spec_lookahead(e);
     gate_engine_close(e);
     printf(n_fail ? "SESSION-CONTRACT GATE FAIL (%d)\n" : "SESSION-CONTRACT GATE PASS\n", n_fail);
     return n_fail != 0;
