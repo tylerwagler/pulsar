@@ -103,6 +103,12 @@ static inline long gate_first_diff(const float *a, const float *b, long n) {
 #define GATE_REF_WIDTH_KL_FRACTION 0.5
 #define GATE_REF_WIDTH_KL_FLOOR 1e-4
 
+/* Top-2 logit margin above which a top-1 flip cannot be quantization noise (spec_sampling_gate's greedy
+ * gate; cuda-decode-reference-gate's every-row leg).  Calibrated on the shipped type-43 artifact, where
+ * decisive positions measure 6.0-14.8 and ambiguous ones 0.19-1.94; 2.0 sits in the empty band with ~3x
+ * headroom either side. */
+#define GATE_DECISIVE_MARGIN 2.0f
+
 /* KL(ref || cur) over the softmax of two logit rows, in double. */
 static inline double gate_row_kl(const float *ref, const float *cur, long n) {
     double mr = -INFINITY, mc = -INFINITY;

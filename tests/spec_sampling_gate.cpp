@@ -90,6 +90,7 @@
 
 #include "pulsar.h"
 #include "gate_entry.h"
+#include "gate_util.h"
 
 #define TRAJ 2500
 #define DEPTH 4
@@ -552,12 +553,9 @@ int GATE_ENTRY(int argc, char **argv) {
      * Temperature-matched draft sampling must leave this path untouched: at
      * temp <= 0 no q is built, no rng is drawn, and the argmax-equality accept
      * walk runs exactly as before. */
-    /* Top-2 logit margin above which a greedy flip cannot be quantization
-     * noise. Calibrated on the shipped type-43 artifact, where decisive
-     * positions measure 6.0-14.8 and ambiguous ones 0.19-1.94; 2.0 sits in the
-     * empty band with ~3x headroom either side. Retune with the margin table
+    /* GATE_DECISIVE_MARGIN (gate_util.h): the top-2 logit margin above which a
+     * greedy flip cannot be quantization noise.  Retune with the margin table
      * this gate prints if the artifact's quantization mix changes. */
-    #define SPEC_GREEDY_DECISIVE_MARGIN 2.0f
     {
         int ref[24], got[24], got2[24];
         float ref_gap[24];
@@ -652,7 +650,7 @@ int GATE_ENTRY(int argc, char **argv) {
         printf("\n");
         int decisive_flip = 0;
         if (prefix < nref) {
-            decisive_flip = ref_gap[prefix] > SPEC_GREEDY_DECISIVE_MARGIN;
+            decisive_flip = ref_gap[prefix] > GATE_DECISIVE_MARGIN;
             printf("first divergence at %d: plain=%d spec=%d plain-margin=%.6g "
                    "(%s)\n",
                    prefix, ref[prefix], prefix < ngot ? got[prefix] : -1,
