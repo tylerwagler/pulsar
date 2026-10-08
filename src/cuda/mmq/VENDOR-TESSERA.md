@@ -4,7 +4,14 @@
 
 `tessera_routed_fused_window.cuh` is Tessera's fused window kernel,
 `src/tessera/serving/csrc/routed_fused_window.cu`, copied from upstream
-**`1381c3b7`** (2026-09-29; file sha256 `5892fd19…8da6b`). Tessera is
+**`37742e0f`** (2026-10-08, contract v64; file sha256 `4e93959a2a26…`).
+First vendored from `1381c3b7` (2026-09-29); re-vendored 2026-10-08 -- the upstream
+file grew from 1,520 to 3,778 lines (four families: value, E4M3, E4M3-MMA, E2M1;
+dense rates 9-14; the piece-major E4M3 layout; the paired-K32 schedule), the value
+family's `Params` gained `piece_major`, `fixup`, `tile_sem`, `roles` (all zero here:
+pulsar never requests piece-major and launches no multi-role dense), and `table0/1`
+became `const void*`.  Byte parity with Tessera's own build at this revision is
+**NOT YET re-run** (the gate needs sparky); the 1381c3b7 gate was 17/17. Tessera is
 licensed **MIT + Attribution Addendum 1.0** (`LicenseRef-Tessera-Attribution-1.0`);
 the full text is `LICENSE-TESSERA` in this directory, verbatim (addendum A3
 requires it to travel with every copy).
@@ -24,13 +31,16 @@ requires it to travel with every copy).
 Every device function is upstream byte for byte. The header's own banner
 lists the edits; in short:
 
-| upstream | here |
+| upstream (37742e0f) | here |
 | --- | --- |
-| lines 58-61, the torch / c10 `#include`s | dropped |
-| `C10_CUDA_CHECK` in `max_dynamic_smem_bytes`, `launch_pair`; `C10_CUDA_KERNEL_LAUNCH_CHECK` in `launch_pair` | `TESSERA_HOST_CUDA(expr)`, defined by the includer |
-| `TORCH_CHECK(false, …)` at the end of `launch` | `TESSERA_HOST_REFUSE_PAIR(…)`, defined by the includer |
-| lines 1158-1177 and 1208-1520: the torch host entries and the PYBIND module | dropped; `pulsar_tessera.cu` replaces them |
-| lines 1178-1206, `dense_reduce_kernel` | kept verbatim |
+| lines 68-72, the torch / c10 / ATen `#include`s | dropped |
+| `C10_CUDA_CHECK` in `max_dynamic_smem_bytes`, `launch_variant`; `C10_CUDA_KERNEL_LAUNCH_CHECK` in `launch_variant` | `TESSERA_HOST_CUDA(expr)`, defined by the includer |
+| the three piece-major `TORCH_CHECK(cond, msg)` in `launch` | `TESSERA_HOST_CHECK(cond, msg)`, defined by the includer |
+| `TORCH_CHECK(false, …)` at the end of `launch` (the run-pair refusal) | `TESSERA_HOST_REFUSE_PAIR(…)`, defined by the includer |
+| lines 2063-2080 and 2110-2131: `check_words`, `check_slot`, `i32_ptr`, `f32_ptr`, `TABLE_DTYPE`, `check_run_tables` (torch::Tensor) | dropped |
+| lines 2081-2109, `dense_reduce_kernel` | kept verbatim |
+| lines 2132-3048, the E2M1 family (`#if TESSERA_ROUTED_FUSED_FP4`, which we build at 0) | dropped |
+| lines 3051-end: the torch host entries and the PYBIND module | dropped; `pulsar_tessera.cu` replaces them |
 
 `pulsar_tessera.cu` fills `Params` exactly as upstream's `dense_forward` /
 `routed_fused_forward` do, replaces `token_sum`'s host entry, and replaces the
