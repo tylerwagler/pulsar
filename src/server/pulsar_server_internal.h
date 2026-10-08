@@ -523,9 +523,10 @@ typedef struct server_family_ops {
      *  about which template produced the bytes (L218 s123).  Meaningless to another family. */
     bool v41;
     server_parser_kind parser;
-    /** Resolve the request's thinking controls (c->controls, the model alias) into r->think_mode and
-     *  the family's own effort; refuse by name a control the template cannot express. */
-    bool (*resolve)(pulsar_engine *e, const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
+    /** Thinking is ON (the shared rule, chat_family.cpp): the level the template has nearest the asked
+     *  effort (a row of the one effort-name table, an integer, or nothing sent: the template's default),
+     *  into r->think_mode and the family's own r->family_effort. */
+    void (*effort)(pulsar_engine *e, const struct chat_effort_ask *a, struct request *r);
     /** Render the conversation into r->prompt_text / prompt_spans / prompt; refuse by name what the
      *  template cannot express (a forced tool call, a live tool continuation, ...). */
     bool (*render)(pulsar_engine *e, struct server *s, struct chat_conversation *c, struct request *r, char *err,
@@ -2636,13 +2637,7 @@ const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *order
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
-pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort);
-bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out);
-bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled);
-bool parse_output_config_effort(const char **p, pulsar_think_mode *effort);
-bool model_alias_disables_thinking(const char *model);
-bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(pulsar_engine *engine);
 /* Advertised model id ("id"/"root"/metrics): the built-in id derived from the
  * loaded GGUF shape. */
@@ -2750,11 +2745,6 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
 char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
                                   pulsar_think_mode think_mode, bool v41,
                                   chat_text_span **spans_out, uint32_t *n_spans_out);
-/** The legacy /v1/completions template: a fixed system line and the prompt
- * as the one user turn, through the same renderer. */
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode, bool v41);
-char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode, bool v41,
-                                          chat_text_span **spans_out, uint32_t *n_spans_out);
 /** As render_chat_prompt_text, but also hands back the rendered text's
  * CLIENT-DATA ranges (see buf's span fields) so pulsar_tokenize_rendered_chat_spans
  * can keep a client from injecting a control token.  `spans_out`/`n_spans_out` may
@@ -2785,6 +2775,21 @@ typedef struct {
                        ///< "reasoning.effort" (Responses) or "chat_template_kwargs"; static
     char *raw;         ///< the value's JSON text, owned
 } chat_control;
+
+/** L284 P3: the thinking controls as sent, read by the ONE rule every family and protocol shares
+ *  (chat_family.cpp): the switch, and the effort -- a row of the effort-name table or an integer. */
+typedef struct chat_effort_ask {
+    int thinking;   ///< -1 not sent, 0 off, 1 on (thinking / think / enable_thinking / the kwargs)
+    int level;      ///< -1 no name sent; else the row of the effort-name table
+    int value;      ///< an integer effort 1..100 (level -1 then); 0 = none sent
+} chat_effort_ask;
+/** Read the controls in arrival order (a later one replaces an earlier one's value).  false + err:
+ *  a name outside the table, an integer outside 1..100, a chat_template_kwargs key no template takes. */
+bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *a, char *err, size_t errlen);
+/** Thinking on or off: the explicit switch; else effort "none" is off; else model "deepseek-chat" (the
+ *  DeepSeek API's non-thinking name, on any family) is off; else on.  The switch on with effort none
+ *  contradicts itself: false + err. */
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen);
 
 /** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
  * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's

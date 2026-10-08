@@ -68,13 +68,11 @@ qwen_effort qwen_effort_default(void);
  * (the template raises on any other name; "none" is thinking-off). */
 bool qwen_effort_parse(const char *name, qwen_effort *out);
 const char *qwen_effort_name(qwen_effort e);
-/** THE resolution every front end uses for a Qwen request.  `name` is the
- * client's reasoning_effort (NULL = not sent); `thinking` its thinking switch
- * (enable_thinking / think / thinking: -1 not sent, 0 off, 1 on).  Thinking
- * off is QWEN_EFFORT_NONE whatever the name (the template ignores the effort
- * then); otherwise an unsent name is qwen_effort_default() and a sent one must
- * be a name the template knows -- "high", "max", "minimal" or a number are
- * refused with the list, never mapped to a neighbour. */
+/** The template's own variables resolved (the CLI tools and the engine's default prompt; the server maps
+ * every protocol's effort names onto these first -- chat_family.cpp's one effort table).  `name` is a
+ * template name (NULL = not sent); `thinking` the switch (-1 not sent, 0 off, 1 on).  Thinking off is
+ * QWEN_EFFORT_NONE whatever the name; otherwise an unsent name is qwen_effort_default() and a sent one
+ * must be one the template knows; thinking on with "none" is refused. */
 bool qwen_effort_resolve(const char *name, int thinking, qwen_effort *out, char *err, size_t errlen);
 
 /** One tool call of an assistant message, as the API carries it. */

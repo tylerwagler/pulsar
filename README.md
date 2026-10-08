@@ -540,7 +540,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/{id}`
 - `POST /v1/chat/completions` — OpenAI-compatible
-- `POST /v1/completions` — OpenAI-compatible
+- `POST /v1/completions` — OpenAI-compatible: the prompt is continued raw (no chat template, no thinking), on every family
 - `POST /v1/responses` — OpenAI Responses (Codex CLI)
 - `POST /v1/messages` — Anthropic-compatible (Claude Code style clients)
 - `GET /metrics` — Prometheus counters (spec-decode acceptance, token totals,

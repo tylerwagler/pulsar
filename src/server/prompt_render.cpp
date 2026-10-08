@@ -727,28 +727,6 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
 
 
 
-char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode, bool v41,
-                                          chat_text_span **spans_out, uint32_t *n_spans_out) {
-    chat_msgs msgs = {0};
-    chat_msg system = {0};
-    system.role = xstrdup("system");
-    system.content = xstrdup("You are a helpful assistant");
-    chat_msgs_push(&msgs, system);
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup(prompt ? prompt : "");
-    chat_msgs_push(&msgs, user);
-    /* The loaded model's family, as every other render: a 0731 model served
-     * through /v1/completions rendered as V4.1 here (L239). */
-    char *text = render_chat_prompt_text_spans(&msgs, NULL, NULL, think_mode, v41,
-                                              spans_out, n_spans_out);
-    chat_msgs_free(&msgs);
-    return text;
-}
-
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode, bool v41) {
-    return render_completion_prompt_text_spans(prompt, think_mode, v41, NULL, NULL);
-}
 
 
 

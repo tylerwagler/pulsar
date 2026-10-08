@@ -1454,14 +1454,11 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     r->family = server_family_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    char why[160];
     int skr = 0;
-    /* The default effort is the loaded family's: V4.1 defaults to high (the
-     * reference's default); the V4 (0731) encoder's default is low, which
-     * renders no effort line at all (L239). */
-    pulsar_think_mode reasoning_effort = pulsar_engine_think_default(e);
+    /* the thinking controls as sent, read by the chat endpoints' one rule (a raw continuation refuses them) */
+    chat_control controls[8];
+    int n_controls = 0;
+    chat_effort_ask ask;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1509,26 +1506,18 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+        } else if (!strcmp(key, "thinking") || !strcmp(key, "think") || !strcmp(key, "enable_thinking") ||
+                   !strcmp(key, "reasoning_effort")) {
+            static const char *const kc[] = {"thinking", "think", "enable_thinking", "reasoning_effort"};
+            const char *k = NULL;
+            for (const char *c : kc)
+                if (!strcmp(key, c)) k = c;
+            char *raw = NULL;
+            if (n_controls == (int)(sizeof controls / sizeof controls[0]) || !json_raw_value(&p, &raw)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
-        } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
-            /* enable_thinking is the Qwen/vLLM spelling; accept it as a bool
-             * alias for our existing `think` field. Both remain additive to the
-             * Anthropic-style `thinking` object handled above. */
-            if (!json_bool(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
-            got_thinking = true;
+            controls[n_controls++] = {k, raw};
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
                 free(key);
@@ -1568,43 +1557,43 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         request_free(r);
         return false;
     }
-    if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
-        /* L251: a Qwen completion is a RAW continuation (vLLM's /v1/completions): no template and
-         * no thinking block; the whole prompt is client text, so no added token matches in it */
-        r->think_mode = think_mode_from_enabled(false, reasoning_effort);
-        free(r->prompt_spans);
-        r->prompt_n_spans = 0;
-        r->prompt_spans = NULL;
-        r->prompt_text = prompt;
-        prompt = NULL;
-        const size_t plen = strlen(r->prompt_text);
-        if (plen) {
-            r->prompt_spans = (pulsar_text_span *)malloc(sizeof(pulsar_text_span));
-            if (!r->prompt_spans) { if (err && errlen) snprintf(err, errlen, "out of memory"); return false; }
-            r->prompt_spans[0].lo = 0;
-            r->prompt_spans[0].hi = (uint32_t)plen;
-            r->prompt_n_spans = 1;
+    /* L284 P2: a completion is a RAW continuation on every family (OpenAI's and vLLM's /v1/completions): no
+     * chat template, no thinking block, and nothing before the prompt (neither family's HF tokenizer adds a
+     * BOS on encode).  All of it is client text, so no added token matches in it.  A thinking control has
+     * nothing to act on: thinking on or an effort is refused. */
+    {
+        const bool read = chat_effort_ask_read(controls, n_controls, &ask, err, errlen);
+        for (int i = 0; i < n_controls; i++) free(controls[i].raw);
+        n_controls = 0;
+        if (!read) {
+            free(prompt);
+            request_free(r);
+            return false;
         }
-        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
-        return true;
+        if (ask.thinking == 1 || ask.level > 0 || ask.value) {
+            snprintf(err, errlen, "/v1/completions continues the prompt raw (no chat template): it has no thinking "
+                                  "to switch on or set an effort for -- use /v1/chat/completions");
+            free(prompt);
+            request_free(r);
+            return false;
+        }
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    if (thinking_enabled && !pulsar_engine_think_mode_supported(e, reasoning_effort, why, sizeof why)) {
-        if (err && errlen) snprintf(err, errlen, "reasoning_effort: %s", why);
-        goto bad;
-    }
-    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
+    r->think_mode = PULSAR_THINK_NONE;
     free(r->prompt_spans);
     r->prompt_spans = NULL;
     r->prompt_n_spans = 0;
-    r->prompt_text = render_completion_prompt_text_spans(prompt, r->think_mode, r->family->v41,
-                                                         &r->prompt_spans, &r->prompt_n_spans);
-    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans,
-                                        r->prompt_n_spans, &r->prompt);
-    free(prompt);
+    r->prompt_text = prompt;
+    prompt = NULL;
+    if (r->prompt_text[0]) {
+        r->prompt_spans = (pulsar_text_span *)server_xmalloc(sizeof(pulsar_text_span));
+        r->prompt_spans[0].lo = 0;
+        r->prompt_spans[0].hi = (uint32_t)strlen(r->prompt_text);
+        r->prompt_n_spans = 1;
+    }
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
     return true;
 bad:
+    for (int i = 0; i < n_controls; i++) free(controls[i].raw);
     free(prompt);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);

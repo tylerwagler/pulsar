@@ -1885,14 +1885,6 @@ static void test_anthropic_server_tool_entry_dropped(void) {
 
 
 static void test_reasoning_effort_mapping(void) {
-    pulsar_think_mode mode = PULSAR_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == PULSAR_THINK_LOW);
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == PULSAR_THINK_LOW);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == PULSAR_THINK_LOW);
-    TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == PULSAR_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == PULSAR_THINK_MAX);
-    TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == PULSAR_THINK_MAX);
-    TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
     /* V4.1: the presets are points on the 1..100 axis and every thinking
      * mode renders the effort line, byte-identical to encoding.py's
      * REASONING_EFFORT_TEMPLATE; thinking-off renders nothing. */
@@ -1931,13 +1923,84 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(pulsar_think_effort_prefix_len("Reasoning Effort: 0 (range 1-100, the higher the value, the more thorough the reasoning)\n\n") == 0);
     TEST_ASSERT(pulsar_think_effort_prefix_len("Reasoning Effort: high\n") == 0);
     TEST_ASSERT(pulsar_think_effort_prefix_len("") == 0);
-    /* a JSON integer is an effort; out of range or fractional is refused */
-    const char *int_effort = "37";
-    TEST_ASSERT(parse_reasoning_effort_value(&int_effort, &mode) && mode == 37);
-    const char *big_effort = "101";
-    TEST_ASSERT(!parse_reasoning_effort_value(&big_effort, &mode));
-    const char *frac_effort = "7.5";
-    TEST_ASSERT(!parse_reasoning_effort_value(&frac_effort, &mode));
+}
+
+
+
+/* L284 P3: one chat request through the protocol parser and the loaded family's resolve + render, as the
+ * server does it (no engine: the renderer gate's shape) */
+static bool effort_case(pulsar_chat_format fmt, const char *body, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, 16);
+    chat_conversation c;
+    memset(&c, 0, sizeof c);
+    err[0] = 0;
+    const bool ok = parse_chat_conversation_openai(body, &c, r, err, errlen) &&
+                    render_chat_conversation(NULL, fmt, NULL, &c, r, err, errlen);
+    chat_conversation_free(&c);
+    return ok;
+}
+
+#define EFFORT_BODY(extra) "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" extra "}"
+
+/* L284 P3: ONE effort-name table for every protocol and family -- each name (and an integer) reaches the
+ * nearest level the template has -- and ONE thinking rule: the switch, else effort none is off, else
+ * model deepseek-chat is off, else on; the switch on with effort none is refused, on every family. */
+static void test_effort_names_one_table(void) {
+    struct row { const char *effort; pulsar_think_mode ds; qwen_effort qw; };
+    static const row rows[] = {
+        {"\"none\"", PULSAR_THINK_NONE, QWEN_EFFORT_NONE},  {"\"minimal\"", PULSAR_THINK_LOW, QWEN_EFFORT_LOW},
+        {"\"low\"", PULSAR_THINK_LOW, QWEN_EFFORT_LOW},     {"\"medium\"", PULSAR_THINK_LOW, QWEN_EFFORT_MEDIUM},
+        {"\"high\"", PULSAR_THINK_HIGH, QWEN_EFFORT_XHIGH}, {"\"xhigh\"", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},
+        {"\"max\"", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},   {"37", 37, QWEN_EFFORT_LOW},
+        {"80", 80, QWEN_EFFORT_XHIGH},                      {"null", PULSAR_THINK_DEFAULT, QWEN_EFFORT_XHIGH},
+    };
+    TEST_ASSERT(!strcmp(k_effort_names[k_effort_row_none].name, "none") &&
+                !strcmp(k_effort_names[k_effort_row_low].name, "low") &&
+                !strcmp(k_effort_names[k_effort_row_high].name, "high") &&
+                !strcmp(k_effort_names[k_effort_row_max].name, "max"));
+    char body[256], err[256];
+    request r;
+    for (const row &w : rows) {
+        snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), w.effort);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_DS4_V41, body, &r, err, sizeof err));
+        TEST_ASSERT(r.think_mode == w.ds);
+        request_free(&r);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_QWEN, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == (int)w.qw);
+        TEST_ASSERT(r.think_mode == (w.qw == QWEN_EFFORT_NONE ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT));
+        request_free(&r);
+    }
+    /* V4 (0731) has three levels: an integer reaches the nearest preset */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_DS4_V4, EFFORT_BODY(",\"reasoning_effort\":70"), &r, err, sizeof err));
+    TEST_ASSERT(r.think_mode == PULSAR_THINK_HIGH);
+    request_free(&r);
+    /* the same names on every key: chat_template_kwargs too */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_DS4_V41, EFFORT_BODY(",\"chat_template_kwargs\":{\"reasoning_effort\":\"max\"}"),
+                            &r, err, sizeof err));
+    TEST_ASSERT(r.think_mode == PULSAR_THINK_MAX);
+    request_free(&r);
+    const pulsar_chat_format fams[] = {PULSAR_CHAT_DS4_V41, PULSAR_CHAT_QWEN};
+    for (pulsar_chat_format f : fams) {
+        static const char *const refused[] = {
+            EFFORT_BODY(",\"reasoning_effort\":\"banana\""),
+            EFFORT_BODY(",\"reasoning_effort\":101"),
+            EFFORT_BODY(",\"reasoning_effort\":7.5"),
+            EFFORT_BODY(",\"think\":true,\"reasoning_effort\":\"none\""),
+            EFFORT_BODY(",\"chat_template_kwargs\":{\"foo\":1}"),
+        };
+        for (const char *b : refused) {
+            TEST_ASSERT(!effort_case(f, b, &r, err, sizeof err));
+            TEST_ASSERT(err[0] != 0);
+            request_free(&r);
+        }
+        /* deepseek-chat: thinking off by default on any family; an explicit switch wins */
+        TEST_ASSERT(effort_case(f, EFFORT_BODY(",\"model\":\"deepseek-chat\""), &r, err, sizeof err));
+        TEST_ASSERT(r.think_mode == PULSAR_THINK_NONE);
+        request_free(&r);
+        TEST_ASSERT(effort_case(f, EFFORT_BODY(",\"model\":\"deepseek-chat\",\"think\":true"), &r, err, sizeof err));
+        TEST_ASSERT(r.think_mode != PULSAR_THINK_NONE);
+        request_free(&r);
+    }
 }
 
 
@@ -1951,20 +2014,12 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
-    pulsar_think_mode mode = PULSAR_THINK_HIGH;
-    const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
-    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
-    TEST_ASSERT(mode == PULSAR_THINK_MAX);
-
-    const char *openai_effort = "\"xhigh\"";
-    mode = PULSAR_THINK_HIGH;
-    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
-    TEST_ASSERT(mode == PULSAR_THINK_MAX);
-
-    const char *low_effort = "\"low\"";
-    mode = PULSAR_THINK_HIGH;
-    TEST_ASSERT(parse_reasoning_effort_value(&low_effort, &mode));
-    TEST_ASSERT(mode == PULSAR_THINK_LOW);
+    chat_control oc = {"output_config", xstrdup("{\"effort\":\"max\",\"other\":true}")};
+    chat_effort_ask a;
+    char err[160];
+    TEST_ASSERT(chat_effort_ask_read(&oc, 1, &a, err, sizeof err));
+    TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level].name, "max"));
+    free(oc.raw);
 }
 
 
@@ -4090,6 +4145,15 @@ static void test_parse_completion_request_refuses_logprobs(void) {
     err[0] = '\0';
     TEST_ASSERT(!parse_completion_request(NULL, top, 16, &r, err, sizeof err));
     TEST_ASSERT(strstr(err, "not supported on /v1/completions") != NULL);
+    /* L284 P2: a raw continuation has no thinking -- switching it on or asking an effort is refused */
+    static const char *const thinking[] = {"{\"prompt\": \"hi\", \"think\": true}",
+                                           "{\"prompt\": \"hi\", \"reasoning_effort\": \"high\"}",
+                                           "{\"prompt\": \"hi\", \"thinking\": {\"type\": \"enabled\"}}"};
+    for (const char *b : thinking) {
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL, b, 16, &r, err, sizeof err));
+        TEST_ASSERT(strstr(err, "continues the prompt raw") != NULL);
+    }
 }
 
 /* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
@@ -7409,21 +7473,6 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         request_free(&r);
     }
 
-    /* 8. the legacy /v1/completions template, pinned and through the renderer */
-    {
-        char *legacy = render_completion_prompt_text("hi", PULSAR_THINK_HIGH, true);
-        buf want = {0};
-        buf_puts(&want, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM);
-        buf_puts(&want, pulsar_think_effort_prefix(PULSAR_THINK_HIGH));
-        buf_puts(&want, "You are a helpful assistant<｜User｜>hi<｜Assistant｜><think>");
-        TEST_ASSERT(!strcmp(legacy, want.ptr));
-        buf_free(&want);
-        free(legacy);
-        legacy = render_completion_prompt_text("hi", PULSAR_THINK_NONE, true);
-        TEST_ASSERT(!strcmp(legacy, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM "You are a helpful assistant<｜User｜>hi<｜Assistant｜></think>"));
-        free(legacy);
-    }
-
     free(full);
     chat_msgs_free(&msgs);
 }
@@ -8346,6 +8395,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_decode_sampling_tool_payload_forcing();
     test_anthropic_server_tool_entry_dropped();
     test_reasoning_effort_mapping();
+    test_effort_names_one_table();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
