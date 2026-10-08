@@ -1055,8 +1055,9 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
  * match the bank's history to `limit` tokens resumes there from this position. */
 int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the tokens the bank's state serves.  A
- *  bank-pool family (Qwen) serves an exact extension of the bank's history, else its deepest grid
- *  checkpoint within the shared prefix, the prefill-only history and prompt->len - 1, else nothing.
+ *  bank-pool family (Qwen) serves an exact extension of a history the bank prefilled whole (L284: one
+ *  holding decode rows is recomputed from a checkpoint), else its deepest grid checkpoint within the shared
+ *  prefix, the prefill-only history and prompt->len - 1, else nothing.
  *  -1 = DeepSeek's graph pool, whose live KV serves any byte-matched prefix (pulsar_session_bank_prefix_match). */
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
