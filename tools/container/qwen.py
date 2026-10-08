@@ -31,7 +31,8 @@ What the container holds (the loader's contract, published in pulsar-notes resea
   * layouts: bf16 (native), mxfp8_lt (U8, E4M3 [out][in] + swizzled E8M0, padded per bytes_for), exl3m_k4 /
     k5 / k6 / k8 (U8 [trellis | suh | svh], dims_ne [in, out]; K6 / K8 are turboderp's packs, L266).  Declared shapes are the SOURCE shapes (no reshapes).
   * shards: `vision` (primary: pulsar.kv + the vision tower, BF16 native), `layers.0..47`, `top` (embed, head,
-    top-level mixer).  MTP is omitted by the recipe (no lane yet); pulsar.kv says so.
+    top-level mixer), and `mtp` (the drafter's mtp.* tensors, its expert families marked "block": "mtp") when the
+    recipe writes them (L279; the L251 sidecar's rows) -- pulsar.mtp_present says which.
 """
 from __future__ import annotations
 
@@ -134,11 +135,18 @@ def expert_names(m: Mapped, part: str) -> tuple[str, str]:
 
 
 def shape(hf, ctx):
-    return {"family": FAMILY, "n_layer": int(hf.config["num_hidden_layers"]), "recipe": ctx.recipe.name}
+    """n_layer, the recipe, and whether the recipe writes the MTP drafter (an `mtp` shard after `top`)."""
+    if ctx.recipe is None:
+        default_recipe(hf, None, ctx)
+    out = {"family": FAMILY, "n_layer": int(hf.config["num_hidden_layers"]), "recipe": ctx.recipe.name}
+    res = ctx.recipe.resolve({n: map_hf(n) for n in hf.names()})
+    if any(f not in R.CONSUMED for n, (f, _s) in res.items() if map_hf(n).shard == "mtp"):
+        out["mtp"] = True
+    return out
 
 
 def shard_order(shape):
-    return ["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"]
+    return ["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"] + (["mtp"] if shape.get("mtp") else [])
 
 
 def declared_shape(m, hshape):
@@ -182,7 +190,8 @@ def stack_families(hf, m, fmt, ctx):
         names = [entry_name.replace("{e}", str(e)) for e in range(E)]
         srcs = [("ranges", EN.exl3_ranges(ctx.sources[src], x[:-len(".weight")], layout, inp, n)[0]) for x in names]
         fams.append(dict(gguf_name=fam_name, part=part, role=PART_ROLE[part], layout=layout, inp=inp, n=n,
-                         entry_names=names, srcs=srcs, extras={"entry_name": entry_name, "layer": m.layer}))
+                         entry_names=names, srcs=srcs, extras={"entry_name": entry_name, "layer": m.layer,
+                                                               **({"block": "mtp"} if m.shard == "mtp" else {})}))
     return fams
 
 
@@ -276,7 +285,7 @@ def build_kv(hf, ctx):
         ("pulsar.recipe", "string", recipe.name),
         ("pulsar.recipe.sha256", "string", recipe.sha256),
         ("pulsar.expert_gate_up", "string", recipe.settings["expert_gate_up"]),
-        ("pulsar.mtp_present", "bool", False),
+        ("pulsar.mtp_present", "bool", bool(ctx.shape.get("mtp"))),
         ("pulsar.vision_present", "bool", "vision_config" in top),
         ("pulsar.ple_rows.file", "string", os.path.basename(ple_manifest)[:-len(".json")] + ".rows"),
         ("pulsar.ple_rows.layer", "u32", man["layer"]),

@@ -400,6 +400,27 @@ def main():
                       expect_fail=True, contains="a recipe for 'deepseek_v4'")
         check(ok, "a recipe for another model_type -> refused")
 
+        print("the MTP drafter as recipe rows:")
+        rm = dict(r, rows=[x for x in r["rows"] if x[0] != "mtp.*"] + [["mtp.*", "mxfp8_lt"]])
+        rp = os.path.join(tmp, "recipe-mtp.json")
+        json.dump(rm, open(rp, "w"))
+        o4 = os.path.join(tmp, "out-mtp")
+        ok, out = run("build.py", "emit", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      "--out", o4, "--all")
+        check(ok, "emit with the mtp.* rows written")
+        shard_files = sorted(f for f in os.listdir(o4) if f.endswith(".safetensors"))
+        with open(os.path.join(o4, shard_files[0]), "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            kv4 = {e["key"]: e["value"] for e in json.loads(json.loads(f.read(n))["__metadata__"]["pulsar.kv"])}
+        with open(os.path.join(o4, shard_files[-1]), "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            h4 = json.loads(f.read(n))
+        check(len(shard_files) == L + 3 and kv4["pulsar.mtp_present"] is True and h4["__metadata__"]["pulsar.shard_key"]
+              == "mtp" and "mtp.fc_embedding.weight" in h4, "an `mtp` shard after `top`; pulsar.mtp_present true")
+        ok, out = run("build.py", "verify", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      "--out", o4, "--all")
+        check(ok and "failing: 0" in out, "verify PASS (with the mtp shard)")
+
         print("split gate/up (turboderp's layout):")
         ex_s = os.path.join(tmp, "exl3-split")
         make_exl3(ex_s, hf_t, np.random.default_rng(9), fused=False)

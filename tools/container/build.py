@@ -137,7 +137,7 @@ def resolve(hf, fam, mapped, ctx):
 
 
 def plan(hf, fam, ctx):
-    shape = fam.shape(hf, ctx)
+    shape = ctx.shape = fam.shape(hf, ctx)
     order = fam.shard_order(shape)
     files = {s: shard_file(order, s) for s in order}
     shards = {s: {'entries': [], 'tensors': {}, 'experts': []} for s in order}
