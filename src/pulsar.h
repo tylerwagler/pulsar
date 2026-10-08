@@ -576,7 +576,7 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
 int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap);
 /** The bytes a token history was rendered from: each token's text, and each image block ONCE as the text of the
  *  placeholder token its expansion replaced (the family's geometry and placeholder_id -- DeepSeek's
- *  <｜deepseek_image｜>, Qwen's one <|image_pad|>), so a disk chain over an image is found by the request text that
+ *  `<｜deepseek_image｜>`, Qwen's one `<|image_pad|>`), so a disk chain over an image is found by the request text that
  *  brings it; which image it is, the segment's records say (L281).  malloc'd; NULL when a sentinel id belongs to no
  *  well-formed block. */
 char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len);
