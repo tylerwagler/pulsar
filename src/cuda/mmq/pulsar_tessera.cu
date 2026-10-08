@@ -43,7 +43,15 @@ void tessera_host_check(bool ok, const char *msg) {
 #define TESSERA_HOST_CUDA(expr) tessera_host_cuda((expr), #expr)
 #define TESSERA_HOST_CHECK(cond, msg) tessera_host_check((cond), (msg))
 #define TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K) tessera_host_refuse_pair((mode), (r_lo), (two), (tile_words), (K))
+/* nvcc #549-D "cm_nxt is used before its value is set" fires inside the vendored header (upstream 37742e0f
+ * routed_fused_window.cu, the producer loop's advance_micro; present since 1381c3b7): the last chunk's advance
+ * copies a next-chunk ColMap that was never loaded, and the copy is dead -- the next work item reloads cm_cur
+ * (load_prev at kc0) before any read.  Upstream's own build carries the same copy; patching it would break the
+ * byte-for-byte device code the gate holds to Tessera's build, so the one diagnostic is silenced for this one
+ * include and restored after it. */
+#pragma nv_diag_suppress 549
 #include "tessera_routed_fused_window.cuh"
+#pragma nv_diag_default 549
 
 namespace {
 

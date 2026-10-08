@@ -52,6 +52,13 @@ only (`TESSERA_ROUTED_FUSED_FP8=0`): the Qwen lane's activations are BF16.
 the SwiGLU epilogue calls `expf` and divides. The Makefile compiles
 `pulsar_tessera.o` with pulsar's flags minus `--use_fast_math`.
 
+**One diagnostic is silenced, at the include only.** nvcc warns #549-D
+(`cm_nxt` used before set) in upstream's producer loop: the last chunk's
+`advance_micro` copies a never-loaded next `ColMap`, a dead copy (the next item
+reloads `cm_cur` first).  `pulsar_tessera.cu` wraps the one `#include` in
+`nv_diag_suppress 549` / `nv_diag_default 549` instead of patching the header,
+so the device code stays upstream's byte for byte.  Re-check at each re-sync.
+
 ## The gate
 
 `make tessera-kernel-gate TESSERA_FIXTURE=…` runs `tests/tessera_kernel_gate`
