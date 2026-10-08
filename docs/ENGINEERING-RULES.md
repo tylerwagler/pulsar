@@ -227,8 +227,8 @@ byte-identical to cold).
    `src/engine/session.cpp` and resolved by `pulsar_spec_tau`; each drafter's
    default in its `pulsar_drafter_ops::tau`; set by `tools/confhead/bench.sh`,
    `collect.sh`, `smoke.sh`): a draft-schedule knob.  The one stop rule
-   (`pulsar_spec_conf_keep`) trims a chain to the drafts before the first one
-   under tau, which changes WHICH rows are drafted and verified -- never a committed row's numerics: verify
+   (`pulsar_spec_conf_keep`) ends a chain at its first draft under tau, which
+   changes WHICH rows are drafted and verified -- never a committed row's numerics: verify
    rows are decode rows, and every decode row takes the M-independent kernels
    whatever the batch width (row kind chooses the arm, `src/pulsar_gpu.h`,
    `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend

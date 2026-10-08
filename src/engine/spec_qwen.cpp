@@ -14,8 +14,8 @@
  *            row's stack parked in mtp_pend for the next draft.
  *   draft    the lockstep row (pending stack at p - 1, the carry) headed gives d_1; each further step
  *            feeds the MTP's own streams with d_j; the chain is the shared stop rule (spec_ops.h) run token
- *            by token: it ends at the depth or at the first position whose head is unsure (top probability
- *            under tau), that position not drafted.  Sampled drafts are draws from the MTP's q, recorded for
+ *            by token: it ends at the depth or at the first draft whose head was unsure (top probability
+ *            under tau), that draft still verified.  Sampled drafts are draws from the MTP's q, recorded for
  *            the core's accept walk.
  *
  * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed,
@@ -162,8 +162,8 @@ static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
 /* The chain for bank `b` after the record's carry x at the bank's next position, into the record:
  * refined[0] = x, refined[1..keep] = the drafts, conf[] the head's top probability at each position, and for
  * sampled drafts q(d) with q's support (compact, or the MTP logits scattered to the vocabulary for the walk to
- * rebuild q under the same params).  The stop rule runs position by position: a position whose confidence is
- * under tau ends the chain undrafted (no draw), so the chain costs at most one MTP step past its last draft. */
+ * rebuild q under the same params).  The stop rule runs position by position: the first draft whose confidence
+ * is under tau is the chain's last, so no MTP step is spent past it. */
 static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_redraft_req *q, char *err,
                              size_t errlen) {
     pulsar_engine *e = s->engine;
@@ -208,17 +208,14 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
                                           (uint64_t)b * itb, itb) != 0;
         st->mtp_stage_dirty[b] = true;
     }
-    /* position j from the MTP row in L: its confidence, then -- unless the stop rule ends the chain there -- its
-     * draft: the argmax (greedy) or a draw from q (sampled) */
+    /* position j from the MTP row in L: its confidence (whether it is the chain's last), then its draft: the
+     * argmax (greedy) or a draw from q (sampled) */
     bool stop = false;
     auto draft = [&](uint32_t j) -> bool {
         float conf;
         const int32_t top = qwen_mtp_argmax(e, L, &conf);
         q->conf[j - 1] = conf;
-        if (pulsar_spec_conf_keep(&conf, 1u, tau) == 0u) {
-            stop = true;
-            return true;
-        }
+        stop = pulsar_spec_conf_stops(conf, tau);   /* the stop rule: this draft is the chain's last */
         q->qn[j - 1] = 0;
         if (!sampled) {
             q->refined[j] = top;
@@ -244,13 +241,13 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
     };
     uint32_t k = 0;
     if (ok) ok = draft(1);
-    if (ok && !stop) k = 1;
+    if (ok) k = 1;
     for (uint32_t j = 2; ok && !stop && j <= K; j++) {
         tp = (int32_t)p + (int32_t)j - 2;
         ok = pulsar_gpu_tensor_copy_async(st->mtp_h, 0, st->mtp_streams, 0, hc) != 0 &&
              qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &q->refined[j - 1], &tp, &bb, 1, 0, 1, L);
         if (ok) ok = draft(j);
-        if (ok && !stop) k = j;
+        if (ok) k = j;
     }
     if (!ok) {
         snprintf(err, errlen, "%s: the MTP draft chain failed (see the log)", PULSAR_QWEN_ARCH);
@@ -301,7 +298,10 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * confidence stop at 0.7 gave 58.7 / 58.9 / 59.2 tok/s vs 53.4 for a fixed 3; TensorFold's own 6 / 0.6 was 53.6
  * here -- a verify row costs more on this engine (4 rows read up to 40 distinct experts).  The adaptive depth
  * controller (spec_depth.h) LOST to the fixed depth (52-59 vs 59.5-60.4 tok/s at tau 0.6-0.8): the in-round stop
- * already adapts inside every round, and the rule's down-signal fires on chains that stopped early by design. */
+ * already adapts inside every round, and the rule's down-signal fires on chains that stopped early by design.
+ * L284: dropping the stopping draft instead of verifying it cost 4-11% here (code greedy / chat greedy / chat
+ * T0.7, 3 reps median: 49.1 / 49.8 / 45.6 tok/s at 0.7, 50.9 / 50.6 / 47.4 at 0.5, vs 54.9 / 52.2 / 50.6
+ * verified), which is why the shared rule verifies it. */
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
     /* .depth         = */ 4u,

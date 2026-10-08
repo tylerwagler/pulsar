@@ -69,13 +69,14 @@ static inline uint32_t spec_vocab(const pulsar_session *s) { return (uint32_t)s-
 uint32_t pulsar_spec_cur_depth(const pulsar_session *s);
 /** The draft stop threshold in force: --spec-tau / PULSAR_SPEC_TAU, else the drafter's; 0 = no stop. */
 float pulsar_spec_tau(const pulsar_engine *e);
-/** THE stop rule (spec_ops.h): how many of a chain's n drafts are kept -- every draft up to, and not
- *  including, the first whose confidence is under tau (tau <= 0: all n). */
+/** THE stop rule (spec_ops.h): a draft whose confidence is under tau is its chain's last (tau <= 0: none is). */
+static inline bool pulsar_spec_conf_stops(float conf, float tau) { return tau > 0.0f && conf < tau; }
+/** The stop rule over a drafted chain: how many of its n drafts are kept -- up to and including the first that
+ *  stops it. */
 static inline uint32_t pulsar_spec_conf_keep(const float *conf, uint32_t n, float tau) {
-    uint32_t k = 0;
-    if (tau <= 0.0f) return n;
-    while (k < n && conf[k] >= tau) k++;
-    return k;
+    for (uint32_t k = 0; k < n; k++)
+        if (pulsar_spec_conf_stops(conf[k], tau)) return k + 1u;
+    return n;
 }
 /** A draft record for the installed bank's next chain after `next_base` at the session's depth and these
  *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */

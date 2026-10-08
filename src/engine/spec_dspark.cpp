@@ -969,17 +969,20 @@ static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8
  * scales with the chain ON TOP of the verify rows -- ms / accepted token stays flat ~41-46 ms across k, depth
  * never amortizes, shallower wins (the prior 5 was a compact-model figure).  The controller moves it from
  * there.  Depth cap 16: the drafter's row arrays.
- * The stop at 0.25: at depth 3 the 2026-07-17 tau sweep found tau barely moves GREEDY throughput (3 positions
- * to trim: within 1-3%, the peak inside noise), but 0.25 clearly wins under T = 1.0 SAMPLING (+25% structured,
- * +10% prose vs verify-all), where the low-confidence tail is real; adaptive tau is not worth building at
- * k = 3 (payoff ~2-6%).  The stop is a SCHEDULE knob: it decides which drafts are verified, never a verified
- * row's numerics (verify rows are decode rows; cuda-mixed-neutrality-gate GATE 5/5R) -- a named exception in
- * docs/ENGINEERING-RULES.md; tools/confhead sets --spec-tau off to collect unbiased labels. */
+ * The stop at 0.55: under the shared rule (the first draft under tau is the chain's LAST, still verified;
+ * L284) 0.55 matched what the old rule (that draft dropped) did at 0.25 -- single-stream decode, 3 reps
+ * median, code greedy / chat greedy / chat T0.7: 31.72 / 30.11 / 31.74 tok/s vs 31.16 / 30.18 / 32.34 (0.40:
+ * 31.34 / 30.00 / 31.44; 0.25: 31.08 / 29.97 / 30.61).  The 2026-07-17 sweep under the old rule: tau barely
+ * moves GREEDY throughput at depth 3, but clearly wins under T = 1.0 SAMPLING (+25% structured, +10% prose vs
+ * verify-all), where the low-confidence tail is real.  The stop is a SCHEDULE knob: it decides which drafts
+ * are verified, never a verified row's numerics (verify rows are decode rows; cuda-mixed-neutrality-gate
+ * GATE 5/5R) -- a named exception in docs/ENGINEERING-RULES.md; tools/confhead sets --spec-tau off to collect
+ * unbiased labels. */
 const pulsar_drafter_ops k_dspark_drafter = {
     /* .name          = */ "DSpark",
     /* .depth         = */ 3u,
     /* .depth_max     = */ 16u,
-    /* .tau           = */ 0.25f,
+    /* .tau           = */ 0.55f,
     /* .adapt         = */ &k_dspark_depth,
     /* .prime         = */ dspark_prime,
     /* .absorb        = */ dspark_absorb,

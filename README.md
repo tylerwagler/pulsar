@@ -308,7 +308,7 @@ acceptance). A depth sweep measured opposite per-workload optima -- prose
 fastest at depth 2, structured at depth 5 -- and the controller captures both
 in one configuration; 5 is a hard ceiling because it is the drafter's trained
 block width (position 6 is out of distribution and measurably counter-
-productive). `--spec-depth N` sets the starting depth (default 3) and `--spec-tau F` the draft stop (default 0.25). Plain (non-speculative) decode is
+productive). `--spec-depth N` sets the starting depth (default 3) and `--spec-tau F` the draft stop (default 0.55). Plain (non-speculative) decode is
 roughly flat and bandwidth-bound; speculation is a speedup layered on top. On
 shallow, low-acceptance requests speculation can run slightly *slower* than
 plain, so **its downside is capped to a few percent by the yield-quench safety

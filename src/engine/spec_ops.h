@@ -79,12 +79,15 @@ typedef struct pulsar_spec_target_ops {
  *
  *  The draft schedule is one rule for every drafter (L284 P11), its numbers declared per drafter below:
  *  a chain is at most the session's depth long and ENDS AT ITS FIRST DRAFT WHOSE CONFIDENCE IS UNDER tau,
- *  that draft EXCLUDED (pulsar_spec_conf_keep).  A draft's confidence is known before the draft is drawn
- *  (DSpark: its confidence head, scored from the prefix; MTP: the head's top probability), so the stop is
- *  a stopping time and a sampled chain's kept drafts are still draws from q.  How a drafter reaches the
- *  stop is its own: DSpark drafts the whole chain in one forward and trims after; MTP drafts token by
- *  token and stops there.  --spec-depth / --spec-tau (PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU) override the
- *  numbers for whichever drafter the model carries. */
+ *  that draft still verified (pulsar_spec_conf_stops / pulsar_spec_conf_keep).  L284 measured this against
+ *  excluding that draft, on both families: including it won on Qwen (+4..+11% decode) and tied DeepSeek
+ *  once DSpark's tau moved from 0.25 to 0.55.  A draft's confidence is known before the draft is drawn
+ *  (DSpark: its confidence head, scored from the prefix; MTP: the head's top probability), and whether a
+ *  draft is verified depends only on the confidences before it, so the stop is a stopping time and a
+ *  sampled chain's kept drafts are still draws from q.  How a drafter reaches the stop is its own: DSpark
+ *  drafts the whole chain in one forward and trims after; MTP drafts token by token and stops there.
+ *  --spec-depth / --spec-tau (PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU) override the numbers for whichever
+ *  drafter the model carries. */
 typedef struct pulsar_drafter_ops {
     const char *name;
     uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)
