@@ -78,6 +78,7 @@ __pycache__/
 /tests/bank_evict_restore_gate
 /tests/session_payload_gate
 /tests/payload_frontier_gate
+/tests/bank_residency_gate
 /tests/kv4_pack_gate
 /tests/rewind_frontier_gate
 /tests/algo_stability_gate

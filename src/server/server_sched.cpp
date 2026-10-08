@@ -1538,8 +1538,13 @@ bool server::spill_bank(session_slot *victim) {
      * freed, bank still live).  A true return means the bank IS evicted (slabs
      * freed), so mark it spilled unconditionally -- no half-evicted state. */
     if (!pulsar_session_bank_free_physical(pool, vb)) {
+        /* free_physical refuses only the installed bank or one past the pool (and then frees nothing) */
+        const int n_banks = pulsar_session_bank_count(pool);
         server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
+                   "pulsar-server: guard: free_physical bank %u refused (%s) -- spill aborted, its KV stays resident",
+                   vb, (int)vb == s->live_bank    ? "it is still the installed bank"
+                       : vb >= (uint32_t)n_banks ? "the bank is past the pool"
+                                                 : "the engine refused an idle bank; see its log line above");
         return false;
     }
     victim->spilled = true;

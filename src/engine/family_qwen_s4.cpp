@@ -1031,7 +1031,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     pulsar_gpu_tensor *vk = scratch_view(st, PULSAR_QWEN_OP_QSA, g.k, (uint64_t)n * pulsar_qwen_qsa_kv_in(s) * 4);
     pulsar_gpu_tensor *vv = scratch_view(st, PULSAR_QWEN_OP_QSA, g.v, (uint64_t)n * pulsar_qwen_qsa_kv_in(s) * 4);
     pulsar_gpu_tensor *vi = scratch_view(st, PULSAR_QWEN_OP_QSA, g.idx, (uint64_t)n * PULSAR_QSA_IDX_IN * 4);
-    pulsar_gpu_tensor *views[64 * 3 + 4];
+    pulsar_gpu_tensor *views[64 + 4];
     int nv = 0;
     if (vq) views[nv++] = vq;
     if (vk) views[nv++] = vk;
@@ -1049,19 +1049,18 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                           g.lin_ws_bytes);
     if (!ok) { drop(); return fail("a QSA projection launch failed"); }
 
-    /* the per-bank cache views: bank-major, at the sizes family_qwen.h owns */
-    const uint64_t kvb = pulsar_qwen_kv_row_bytes(s);
-    const uint64_t ikb = pulsar_qwen_index_row_bytes(s);
+    /* the per-bank caches: each bank's own KV and pooled-key tensors (L284 #3), its slice of the bank-major
+     * index stage.  An evicted bank's are absent; the kernel refuses a row of it ("a sequence's cache is
+     * missing"), and the server restores a bank before stepping it. */
     const uint64_t itb = pulsar_qwen_index_tail_bytes(s);
-    const uint64_t nblk = ((uint64_t)st->st->ctx + s->idx_block - 1u) / s->idx_block;
     pulsar_qsa_seq seqs[64];
     for (uint32_t b = 0; ok && b < nb; b++) {
-        seqs[b].kv    = pulsar_gpu_tensor_view(st->st->layer[il].kv,       b * st->st->ctx * kvb, st->st->ctx * kvb);
-        seqs[b].bkey  = pulsar_gpu_tensor_view(st->st->layer[il].idx_keys, b * nblk * ikb, nblk * ikb);
+        seqs[b].kv    = st->st->layer[il].kv[b];
+        seqs[b].bkey  = st->st->layer[il].idx_keys[b];
         seqs[b].stage = pulsar_gpu_tensor_view(st->st->layer[il].idx_tail, b * itb, itb);
         seqs[b].cap   = st->st->ctx;
-        views[nv++] = seqs[b].kv; views[nv++] = seqs[b].bkey; views[nv++] = seqs[b].stage;
-        ok = seqs[b].kv && seqs[b].bkey && seqs[b].stage;
+        views[nv++] = seqs[b].stage;
+        ok = seqs[b].stage != NULL;
     }
     if (!ok) { drop(); return fail("a QSA bank cache view failed"); }
     if (st->verify) {

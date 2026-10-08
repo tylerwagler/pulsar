@@ -683,14 +683,60 @@ static uint64_t qwen_trained_context(const pulsar_engine *) { return g_qwen_shap
 
 static uint64_t qwen_ceil_div(uint64_t a, uint64_t b) { return (a + b - 1u) / b; }
 
+/* L284 #3: one bank's demand-paged tensors on QSA layer il, each made where it is missing.  The sizes are the
+ * op's per-bank views' (st->ctx is the block-rounded capacity; pulsar_qwen_qsa_cap). */
+static bool qwen_layer_bank_alloc(pulsar_qwen_state *st, uint32_t il, uint32_t bank) {
+    const pulsar_qwen_shape *s = &g_qwen_shape;
+    pulsar_qwen_layer_state *L = &st->layer[il];
+    if (!L->kv[bank]) L->kv[bank] = pulsar_gpu_tensor_alloc_managed((uint64_t)st->ctx * pulsar_qwen_kv_row_bytes(s));
+    if (!L->idx_keys[bank])
+        L->idx_keys[bank] = pulsar_gpu_tensor_alloc_managed(qwen_ceil_div(st->ctx, s->idx_block) *
+                                                            pulsar_qwen_index_row_bytes(s));
+    return L->kv[bank] && L->idx_keys[bank];
+}
+
+static void qwen_layer_bank_free(pulsar_qwen_state *st, uint32_t il, uint32_t bank) {
+    pulsar_qwen_layer_state *L = &st->layer[il];
+    pulsar_gpu_tensor_free(L->kv[bank]);
+    pulsar_gpu_tensor_free(L->idx_keys[bank]);
+    L->kv[bank] = NULL;
+    L->idx_keys[bank] = NULL;
+}
+
+void qwen_bank_kv_free(pulsar_qwen_state *st, uint32_t bank) {
+    for (uint32_t il = 0; il < st->n_trunk_layers; il++)
+        if (st->layer[il].kv) qwen_layer_bank_free(st, il, bank);
+    st->kv_hw[bank] = 0;   /* its pages are gone; the restore's loads raise it again */
+}
+
+bool qwen_bank_kv_alloc(pulsar_qwen_state *st, uint32_t bank) {
+    for (uint32_t il = 0; il < st->n_trunk_layers; il++) {
+        if (st->layer[il].kv && !qwen_layer_bank_alloc(st, il, bank)) {
+            qwen_bank_kv_free(st, bank);   /* never half-backed */
+            return false;
+        }
+    }
+    return true;
+}
+
+bool qwen_bank_kv_evicted(const pulsar_qwen_state *st, uint32_t bank) {
+    for (uint32_t il = 0; il < st->n_trunk_layers; il++) {
+        const pulsar_qwen_layer_state *L = &st->layer[il];
+        if (L->kv && (!L->kv[bank] || !L->idx_keys[bank])) return true;
+    }
+    return false;
+}
+
 static void qwen_state_free(pulsar_qwen_state *st) {
     if (!st) return;
     for (uint32_t il = 0; il < PULSAR_FAMILY_MAX_LAYER; il++) {
         pulsar_qwen_layer_state *L = &st->layer[il];
         pulsar_gpu_tensor_free(L->gdn_state);
         pulsar_gpu_tensor_free(L->gdn_conv);
-        pulsar_gpu_tensor_free(L->kv);
-        pulsar_gpu_tensor_free(L->idx_keys);
+        if (L->kv)
+            for (uint32_t b = 0; b < st->n_banks; b++) qwen_layer_bank_free(st, il, b);
+        free(L->kv);
+        free(L->idx_keys);
         pulsar_gpu_tensor_free(L->idx_tail);
         pulsar_gpu_tensor_free(L->ple_conv);
     }
@@ -756,12 +802,13 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
             /* Demand-paged: a bank pays for the KV it touches.  Sized from st->ctx, NOT the raw
              * parameter: st->ctx is the block-rounded QSA capacity (see pulsar_qwen_qsa_cap), and
              * the op views exactly st->ctx tokens per bank -- allocating the raw ctx made the KV
-             * view overshoot its tensor and the op refused with "a QSA bank cache view failed". */
-            L->kv       = pulsar_gpu_tensor_alloc_managed(nb * st->ctx * pulsar_qwen_kv_row_bytes(s));
-            L->idx_keys = pulsar_gpu_tensor_alloc_managed(nb * qwen_ceil_div(st->ctx, s->idx_block) *
-                                                          pulsar_qwen_index_row_bytes(s));
-            L->idx_tail = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(s));
-            ok = L->kv && L->idx_keys && L->idx_tail;
+             * view overshoot its tensor and the op refused with "a QSA bank cache view failed".  One
+             * tensor per bank (L284 #3), so a bank's pages can be returned (qwen_bank_kv_free). */
+            L->kv       = (pulsar_gpu_tensor **)xcalloc(n_banks, sizeof(*L->kv));
+            L->idx_keys = (pulsar_gpu_tensor **)xcalloc(n_banks, sizeof(*L->idx_keys));
+            for (uint32_t b = 0; ok && b < n_banks; b++) ok = qwen_layer_bank_alloc(st, il, b);
+            L->idx_tail = ok ? pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(s)) : NULL;
+            ok = ok && L->idx_tail;
         }
         if (ok && il == s->ple_layer) {
             L->ple_conv = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_ple_conv_bytes(s));

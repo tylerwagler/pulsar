@@ -380,7 +380,10 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
  * history as segments) and repointed away from it.
  * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
  * the base-pointer table; the caller then reloads its KV (the server from its
- * segment chain).
+ * segment chain).  A family pool (Qwen, L284 #3) frees and re-backs its bank's own
+ * demand-paged KV + index tensors the same way (its always-resident state stays).
+ * free_physical returns false ONLY when it refuses (the live/installed bank, a bank
+ * out of range) and then frees nothing.
  * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
  * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);

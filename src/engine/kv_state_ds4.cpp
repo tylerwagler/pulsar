@@ -137,10 +137,10 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t r = pulsar_layer_compress_ratio(il);
-        if (n < cap) out[n] = { g->layer_attn_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), 0 };
+        if (n < cap) out[n] = { g->layer_attn_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP) };
         n++;
         if (!gpu_graph_layer_has_index_pool(il)) continue;
-        if (n < cap) out[n] = { g->layer_index_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), 0 };
+        if (n < cap) out[n] = { g->layer_index_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX) };
         n++;
     }
     return n;

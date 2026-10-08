@@ -342,12 +342,15 @@ static inline uint64_t pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
 
 /** One layer's persistent state across all banks.  A GDN layer owns gdn_*;
  * a QSA layer owns kv/idx_*; the PLE layer additionally owns ple_conv.
- * Bank b's slice is at offset b * <per-bank bytes> (bank-major). */
+ * Bank b's slice of a pooled tensor is at offset b * <per-bank bytes> (bank-major).
+ * L284 #3: the two demand-paged ones are a tensor PER BANK -- on GB10 only a cudaFree returns physical, so
+ * a bank's touched pages come back only when its own tensors go (qwen_bank_kv_free).  The arrays are
+ * present exactly on a QSA layer; an entry is NULL while its bank is evicted. */
 typedef struct {
     pulsar_gpu_tensor *gdn_state;   ///< [n_banks] x pulsar_qwen_gdn_state_bytes
     pulsar_gpu_tensor *gdn_conv;    ///< [n_banks] x pulsar_qwen_gdn_conv_bytes
-    pulsar_gpu_tensor *kv;          ///< [n_banks][ctx] x pulsar_qwen_kv_row_bytes (managed)
-    pulsar_gpu_tensor *idx_keys;    ///< [n_banks][ceil(ctx / idx_block)] x pulsar_qwen_index_row_bytes (managed)
+    pulsar_gpu_tensor **kv;         ///< [n_banks] each [ctx] x pulsar_qwen_kv_row_bytes (managed)
+    pulsar_gpu_tensor **idx_keys;   ///< [n_banks] each [ceil(ctx / idx_block)] x pulsar_qwen_index_row_bytes (managed)
     pulsar_gpu_tensor *idx_tail;    ///< [n_banks] x pulsar_qwen_index_tail_bytes
     pulsar_gpu_tensor *ple_conv;    ///< [n_banks] x pulsar_qwen_ple_conv_bytes (ple_layer only)
 } pulsar_qwen_layer_state;
@@ -432,8 +435,8 @@ typedef struct pulsar_qwen_state {
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
     uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds (written by qwen_bank_set_pos)
-    /** L270: [n_banks] the most tokens each bank has held -- its KV pages up to here are resident (the
-     * demand-paged tensors are shared by the banks, so a rewind or a reset frees none of them). */
+    /** L270: [n_banks] the most tokens each bank has held -- its KV pages up to here are resident (a rewind
+     * or a reset frees none of them; only qwen_bank_kv_free does, and it zeroes this). */
     uint32_t *kv_hw;
     /* The bank pool (L251, family_qwen_banks.cpp): the session's host view (checkpoint,
      * logits) describes `live_bank`; every other bank's view waits in its carry. */
@@ -475,6 +478,14 @@ static inline void qwen_bank_set_pos(pulsar_qwen_state *st, uint32_t bank, uint3
 /** L270: the demand-paged KV bytes `rows` positions take in one bank (every QSA layer's KV + pooled
  * indexer keys, the MTP layer's included) -- the allocation's own row functions. */
 uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows);
+/** L284 #3: bank `bank`'s physical residency -- its own KV + pooled-index tensors on every TRUNK QSA layer.
+ *  The MTP layer's stay resident: a segment chain does not carry them (kv_state_qwen.cpp qwen_pools), so a
+ *  restore could not bring them back.  _free releases them (cudaFree) and zeroes the bank's KV high-water;
+ *  _alloc re-backs whichever are missing (idempotent), and on a failure frees what it made (the bank is
+ *  whole or wholly evicted); _evicted is true when any is missing. */
+void qwen_bank_kv_free(pulsar_qwen_state *st, uint32_t bank);
+bool qwen_bank_kv_alloc(pulsar_qwen_state *st, uint32_t bank);
+bool qwen_bank_kv_evicted(const pulsar_qwen_state *st, uint32_t bank);
 
 /* ---- 5. The step and the op table ------------------------------------------ */
 
