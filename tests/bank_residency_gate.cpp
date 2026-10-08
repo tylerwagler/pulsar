@@ -7,7 +7,8 @@
  * the prompt's end).  Bank 1 is persisted as a segment [0, G), bank 0 installed, then:
  *   R1  free_physical(live bank 0) refuses; free_physical(1) releases bank 1: is_evicted, its touched KV 0, the
  *       session's touched KV drops by exactly what bank 1 held, and MemAvailable rises by at least half of it
- *       (a cudaFree of demand-paged pages on GB10; the rest is the kernel's own accounting noise)
+ *       within 5 s (a cudaFree of demand-paged pages on GB10 returns them asynchronously; the rest is the
+ *       kernel's own accounting noise)
  *   R2  alloc_physical(1) re-backs it, twice (idempotent): not evicted; the segment loads it back to G and its
  *       touched KV is what it was
  *   R3  bank 1 (freed and restored) and bank 2 (never freed) each sync the same extension Q of the prompt and
@@ -22,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <vector>
 
 static int n_fail = 0;
@@ -147,7 +149,13 @@ int GATE_ENTRY(int argc, char **argv) {
           "R1 free_physical refuses the live bank 0 and frees nothing");
     const long long ma0 = mem_available_kb();
     const bool freed = ok && pulsar_session_bank_free_physical(s, 1);
-    const long long ma1 = mem_available_kb();
+    /* the driver hands the pages back to the kernel asynchronously: watch MemAvailable for up to 5 s */
+    long long ma1 = mem_available_kb();
+    for (int i = 0; i < 100 && ma0 >= 0 && (double)(ma1 - ma0) * 1024.0 < 0.5 * (double)t1; i++) {
+        usleep(50 * 1000);
+        const long long m = mem_available_kb();
+        if (m > ma1) ma1 = m;
+    }
     const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1), all1 = pulsar_session_touched_kv_bytes(s);
     CHECK(freed && pulsar_session_bank_is_evicted(s, 1) && t1_after == 0 && all0 - all1 == t1 && t1 > 0,
           "R1 bank 1 freed: evicted, touched %.1f -> %.1f MiB, session %.1f -> %.1f MiB", t1 / 1048576.0,
