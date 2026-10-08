@@ -216,12 +216,11 @@ typedef struct pulsar_family_tokenizer {
     void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
 } pulsar_family_tokenizer;
 
-/** A family's own bank pool (L251): the server's per-bank bookkeeping for a
- * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
- * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
- * entries call these, and the operations a family cannot do -- forks, per-bank
- * KV spill -- refuse with each entry's own failure value (the server has a path
- * for every one of them).  The demand-paged KV accounting (L270) and the physical
+/** A family's bank pool (L251; every family's since L284 dd-banks -- DeepSeek's is its graph pool,
+ * session_banks.cpp k_ds4_bank_ops): the server's per-bank bookkeeping.  engine_api.cpp's bank entries,
+ * the TP worker's bank frames and the round core call these and nothing else, and the operations a
+ * family cannot do refuse with each entry's own failure value (the server has a path for every one of
+ * them).  pulsar_family_for_model refuses a family without them.  The demand-paged KV accounting (L270) and the physical
  * residency (L284 #3) are the same contract as DeepSeek's (admission prices the
  * touched share, the 2b guard keeps touched KV under budget by spilling a bank to
  * its segment chain and freeing its physical; the always-resident state stays). */
@@ -257,6 +256,23 @@ typedef struct {
     bool (*alloc_physical)(pulsar_session *s, uint32_t bank);
     /** L284 #3: true while any of the bank's demand-paged KV is missing. */
     bool (*is_evicted)(const pulsar_session *s, uint32_t bank);
+    /** Optional.  Point the device views at `bank` without its host carry (0 = done, 1 = refused).
+     *  NULL = the family's repoint IS a restore (Qwen: nothing on the device to point). */
+    int (*repoint)(pulsar_session *s, uint32_t bank);
+    /** Optional, present exactly when the family declares PULSAR_FAMILY_CAP_REWIND (pulsar_family_for_model
+     *  asserts it): trim the live bank's history to `pos` (pulsar.h pulsar_session_rewind). */
+    void (*rewind)(pulsar_session *s, int pos);
+    /** Optional.  A standalone restore of the live bank to its grid checkpoint at G, history trimmed to G
+     *  (pulsar_session_restore_checkpoint).  NULL = the family restores a checkpoint only as its sync resumes
+     *  from it, and a segment chain's last restore is the store's alone (L272 B1). */
+    bool (*restore_checkpoint)(pulsar_session *s, uint32_t G);
+    /** The shortest prefill suffix an interrupted sync resumes bit-exactly from; 0 = never interrupt
+     *  (pulsar.h pulsar_session_prefill_quantum_min_suffix). */
+    uint32_t (*quantum_min_suffix)(const pulsar_session *s);
+    /** Are the session's banks a pool -- per-bank device state the batched lanes address by bank?  (DeepSeek:
+     *  false with the pool disabled, where bank 0 is the classic tensors though count() says 1.)  The round
+     *  core defers its drafter seeds to one banked pass only on a pool (seed_defer, L260). */
+    bool (*pooled)(const pulsar_session *s);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family
@@ -310,7 +326,7 @@ struct pulsar_family {
     pulsar_act_kind act_kind;
     /** L281: the family's image geometry (image_identity.cpp), or NULL = no images. */
     const pulsar_family_vision *vision;
-    /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
+    /** The bank pool (never NULL). */
     const pulsar_family_bank_ops *banks;
     /** The family's importance-matrix collection (PULSAR_FAMILY_CAP_IMATRIX), or NULL. */
     const pulsar_family_imatrix *imatrix;

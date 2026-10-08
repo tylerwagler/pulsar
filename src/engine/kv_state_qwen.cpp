@@ -111,6 +111,11 @@ static void qwen_set_frontier_stale(void *state, uint32_t G) {
     st->frontier_stale[bank] = true;
 }
 
+static bool qwen_stale(void *state, uint32_t bank) {
+    const pulsar_qwen_state *st = Q_(state);
+    return bank < st->n_banks && st->frontier_stale[bank];
+}
+
 /* QSA layer il's two pools at out[n], out[n + 1] (where they fit): its KV (one token a row) and pooled
  * indexer keys (idx_block a row), the installed bank's own tensors (L284 #3).  Returns n + 2. */
 static uint32_t qwen_layer_pools(pulsar_qwen_state *st, uint32_t il, pulsar_kv_pool *out, uint32_t n, uint32_t cap) {
@@ -195,6 +200,7 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN = {
     /* .prepare_restore    = */ qwen_prepare_restore,
     /* .restored           = */ qwen_restored,
     /* .set_frontier_stale = */ qwen_set_frontier_stale,
+    /* .stale              = */ qwen_stale,
     /* .pools              = */ qwen_pools,
     /* .frontier_at        = */ qwen_frontier_at,
     /* .install_frontier   = */ qwen_install_frontier,

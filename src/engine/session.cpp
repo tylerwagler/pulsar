@@ -1142,12 +1142,6 @@ uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
     return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
 }
 
-uint64_t pulsar_session::touched_kv_bytes() const {
-    auto *s = this;
-    if (!s) return 0;
-    return gpu_graph_touched_kv_bytes(s->graph);
-}
-
 
 /* L272 P2: the family frees its state, the core the session's own -- one host half for every family
  * (Qwen's destroy had kept its own copy of it, without the speculation scratch the round API allocates). */

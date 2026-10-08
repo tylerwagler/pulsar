@@ -729,8 +729,6 @@ typedef struct {
  * and the Qwen4-exp family's shape/weights/state/op contract. */
 #include "family.h"
 #include "family_qwen.h"
-/** The session family's own bank pool ops (L251), NULL on DeepSeek's graph pool. */
-#define FAMILY_BANKS(s) ((s) && (s)->engine->family->banks ? (s)->engine->family->banks : nullptr)
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
 
@@ -2539,29 +2537,6 @@ struct pulsar_session {
     /** Install the cooperative cancellation hook, checked only at safe
      * boundaries. Behind pulsar_session_set_cancel(). */
     void set_cancel(pulsar_session_cancel_fn fn, void *ud);
-    /** Copy out the cumulative speculative-decode counters. */
-    /** Resident KV bytes actually touched by the CURRENT bank -- the demand-paged
-     * figure, which is below the reserved capacity on a short session. */
-    uint64_t touched_kv_bytes() const;
-
-    /* ---- Tier-2 bank pool: physical residency, spill --------------------- */
-
-    /** Release one idle bank's ctx-scaled physical pages (cudaFree on its managed
-     * comp/index allocations). The only reclaim primitive that actually returns
-     * memory on GB10. The bank keeps its logical identity and can be re-armed
-     * with bank_alloc_physical(). @return false if the bank is live or pinned. */
-    bool bank_free_physical(uint32_t bank);
-    /** Re-allocate physical for a previously freed bank, before installing it. */
-    bool bank_alloc_physical(uint32_t bank);
-    /** True when the bank's physical has been released and its KV must be
-     * reloaded from disk before use. */
-    bool bank_is_evicted(uint32_t bank) const;
-    /** touched_kv_bytes() for an arbitrary bank, live or idle. */
-    uint64_t bank_touched_kv_bytes(uint32_t bank);
-    /** Extra bytes ONE bank would demand-page in if the context grew to quantum
-     * `q` -- the admission question "can this session take another step" priced
-     * before committing to it. */
-    uint64_t quantum_growth_bytes_per_bank(uint32_t q);
     /** Bring the session's KV in line with `prompt`: reuse the common prefix and
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
@@ -2626,19 +2601,6 @@ struct pulsar_session {
                      uint32_t *out_n_rows, char *err, size_t errlen);
     /** Release the host-side per-bank carry (checkpoints, logits, pendings). */
     void bank_carry_free();
-    /** Number of banks in the pool; 1 when the pool is disabled. */
-    int bank_count();
-    /** Point the graph's device views at `bank` and set cur_bank. Does NOT move
-     * host state -- bank_state_restore() is the full hand-off. */
-    int bank_repoint(uint32_t bank);
-    /** Publish the live host+frontier state into `bank`'s slots. Callers pass the
-     * bank that is currently installed; the server does this when switching AWAY,
-     * which is what keeps idle banks' carry readable. */
-    void bank_state_save(uint32_t bank);
-    /** Install `bank`: repoint device views, then restore its host carry. Clears
-     * the multiseq-poison flag. @return false if the bank cannot be installed. */
-    bool bank_state_restore(uint32_t bank);
-    int bank_prefill_frontier(uint32_t bank);
     /** Append tokens to the session's checkpoint WITHOUT decoding them: for
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
@@ -3087,6 +3049,8 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 
 /** The families' tokenizer tables (L272 P2: tokenizer.cpp, tokenizer_qwen.cpp). */
 extern const pulsar_family_tokenizer k_ds4_tokenizer;
+/** DeepSeek's bank pool: its graph's (session_banks.cpp). */
+extern const pulsar_family_bank_ops k_ds4_bank_ops;
 extern const pulsar_family_tokenizer k_qwen_tokenizer;
 /** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
 void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
@@ -3618,11 +3582,8 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank);
  * the pool is disabled (the classic tensors act as bank 0). */
 uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
 /** Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
- * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
- * touched (physically resident) demand-paged KV summed over the whole pool from
- * the per-bank compressor frontier. See the definitions in gpu_diag.cpp. */
+ * a context (the overcommit-reserved, physical-on-touch part).  See gpu_diag.cpp. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
-uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
 /** Compressed rows a layer of compress ratio `ratio` (non-zero) holds at
  * ctx_size: the one capacity formula, read by gpu_graph_compute_dims (the
  * allocator's per-layer caps) and the KV sizing in steering.cpp. */

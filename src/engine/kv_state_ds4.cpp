@@ -159,6 +159,12 @@ static void ds4_set_frontier_stale(void *state, uint32_t G) {
 }
 
 /* Every pool's rows are WHOLE: an emit writes a row when its group closes, and the open group is the lanes'. */
+
+static bool ds4_stale(void *state, uint32_t bank) {
+    const pulsar_gpu_graph *g = G_(state);
+    return bank < gpu_graph_bank_pool_count(g) && bank < PULSAR_MSEQ_MAX && g->ms_comp_state_stale[bank];
+}
+
 static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     pulsar_gpu_graph *g = G_(state);
     uint32_t n = 0;
@@ -215,6 +221,7 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .prepare_restore    = */ ds4_prepare_restore,
     /* .restored           = */ ds4_restored,
     /* .set_frontier_stale = */ ds4_set_frontier_stale,
+    /* .stale              = */ ds4_stale,
     /* .pools              = */ ds4_pools,
     /* .frontier_at        = */ ds4_frontier_at,
     /* .install_frontier   = */ ds4_install_frontier,

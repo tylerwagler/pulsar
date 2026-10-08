@@ -74,6 +74,10 @@ typedef struct pulsar_spec_target_ops {
     const pulsar_spec_depth_policy *depth;
     /* The rows one shared verify forward carries -- and so the decoders it carries, one base row each -- are the
      * family's session fact pulsar_family_session_ops::fused_heads_max (L284), not a field here. */
+    /** Optional.  The readback the last batched forward took INSTEAD of its full logits rows (what round_note
+     *  chose): its host rows, row count and row width in 4-byte words; false = the full rows (the caller's
+     *  block).  The cross-rank digest of a batched step reads it (pulsar_session_batch_digest). */
+    bool (*readback)(struct pulsar_session *s, const void **rows, uint32_t *n_rows, uint32_t *width);
 } pulsar_spec_target_ops;
 
 /** A DRAFTER: its own weights and per-bank context, behind the round API. */

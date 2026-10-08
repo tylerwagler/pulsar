@@ -96,6 +96,9 @@ typedef struct pulsar_kv_state_ops {
     /** A segment load wrote the pools' rows to G without the lanes: mark the bank stale until the
      *  chain's last checkpoint is restored. */
     void (*set_frontier_stale)(void *state, uint32_t G);
+    /** Is `bank` (any bank, installed or not) stale -- its lanes describing no position until a restore
+     *  (set_frontier_stale; DeepSeek also a rewind off the grid)?  Out of range = false. */
+    bool (*stale)(void *state, uint32_t bank);
     /** The installed bank's append-only pools, in a fixed order; returns how many. */
     uint32_t (*pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
     /* ---- L284: the session payload, every model's (session_payload.cpp, "the kv-state payload"). */
