@@ -642,18 +642,47 @@ int pulsar_session_family_sync(pulsar_session *s, const pulsar_tokens *prompt, c
      * request's.  Before L284 only DeepSeek's sync dropped them, and a Qwen bank whose quench latched served
      * every later request plain (the per-bank shadow kept the latch). */
     spec_lookahead_reset(s);
-    return s->engine->family->session->sync(s, prompt, images, n_images, err, errlen);
+    return pulsar_session_sync_default(s, prompt, images, n_images, s->engine->family->session->sync, err, errlen);
 }
 int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t errlen) {
-    const int rc = s->engine->family->session->eval(s, token, err, errlen);
+    const pulsar_family_session_ops *ops = s->engine->family->session;
+    int rc = 1;
+    if (s->checkpoint.len >= s->ctx_size) {
+        if (err) snprintf(err, errlen, "eval: the context is full (%d of %d tokens)", s->checkpoint.len, s->ctx_size);
+    } else if (!pulsar_session_token_is_id(s, token, err, errlen)) {
+        /* L188: a refused sample (-1) must fail the request, not be clamped to token 0 by the embed kernel */
+    } else if (!ops->sync->state_agrees(s)) {
+        /* the bank's state is the authority (the sync's rule): a batched step, a multiseq step or a rewind moved
+         * it off the view, and a row decoded here would land at the wrong position or attend another state */
+        if (err) snprintf(err, errlen, "eval: bank %u's state is not the session's %d-token history; re-sync the "
+                                       "session first", pulsar_session_live_bank(s), s->checkpoint.len);
+    } else if (ops->eval_row(s, token, err, errlen) != 0) {
+        s->checkpoint_valid = false;   /* the row's state is no position's */
+    } else {
+        token_vec_push(&s->checkpoint, token);
+        s->logits_stale = false;
+        rc = 0;
+    }
     /* a token evaluated outside the speculative round (tool injection, a quenched request's plain step)
      * advances the state past any in-flight carry */
     s->spec.spec_carry_valid = false;
     return rc;
 }
 void pulsar_session_family_invalidate(pulsar_session *s) {
-    s->engine->family->session->invalidate(s);
+    if (s->engine->family->session->invalidate) s->engine->family->session->invalidate(s);
+    s->checkpoint_valid = false;
+    s->checkpoint.len = 0;
+    s->logits_stale = true;
+    s->live_images.n = 0;      /* the forgotten history's image records go with it (a run from 0 reads them) */
     spec_lookahead_reset(s);   /* the history the lookahead was conditioned on is gone */
+}
+void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n) {
+    if (!toks || n <= 0) return;
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
+    /* the rows were decoded into the batched lane's buffer, not s->logits; whether the view now describes the
+     * state is the state's to say */
+    s->logits_stale = true;
+    s->checkpoint_valid = s->engine->family->session->sync->state_agrees(s);
 }
 
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
@@ -1141,6 +1170,10 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops ? st->ops->resume_grid : 0u;
 }
+bool pulsar_session_split_invariant(const pulsar_session *s) {
+    const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
+    return st && st->ops && st->ops->split_invariant;
+}
 int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     if (s && FAMILY_BANKS(s)) return (int)FAMILY_BANKS(s)->prefill_frontier(s, bank);
     return s ? s->bank_prefill_frontier(bank) : 0; }
@@ -1186,12 +1219,8 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", (void)0);
     if (!s) return;
-    auto local = [&]() {
-        if (FAMILY_BANKS(s)) FAMILY_BANKS(s)->note_committed(s, toks, n);
-        else s->note_committed_tokens(toks, n);
-    };
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) { local(); return; }
+    if (!tp) { pulsar_session_note_committed(s, toks, n); return; }
     char err[256];
     if (tp_mirror_worker_drives_nothing(tp, "note committed tokens", err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, "note committed tokens", err);
@@ -1200,7 +1229,7 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
     if (n < 0 || (n > 0 && !toks)) return;
     if (!tp_mirror_sent(tp, "note committed tokens",
                         pulsar_tp_send_note_committed(tp, s->tp_session_id, toks, (uint32_t)n), NULL, 0)) return;
-    local();
+    pulsar_session_note_committed(s, toks, n);
 }
 /* ---- The speculative round family (increment 4).  Each public entry point
  * ships a frame carrying every input the call reads INCLUDING the rng state
@@ -1599,7 +1628,19 @@ void pulsar_session_rewind(pulsar_session *s, int pos) {
 }
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
-uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the prefill quantum", 0); if (FAMILY_BANKS(s)) return 1; /* L272 P2: the family's prefill runs the core loop, and a cut anywhere is the cold bytes (session_contract_gate C1, C5) -- any interrupted sync resumes exactly */ return s ? s->prefill_quantum_min_suffix() : 0; }
+/* Multi-session serving: is interrupting a sync at a chunk boundary (the cancel hook) and re-issuing it bit-identical
+ * to letting it run?  Every family's prefill is the core loop over one cut rule (prefill_loop.cpp), a pure function
+ * of the chunk's start, and a stop is honoured only where the resume continues exactly (L281 (b)), so the resumed
+ * walk cuts where the cold one did -- provided a resumed walk's chunks are as wide as the cold pass's (cap <=
+ * resumed_cap) and the cold pass's cap-grid ends are aligned ones (cap % align == 0).  0 = never interrupt;
+ * otherwise any positive suffix resumes exactly (L131: no single-token tail path). */
+uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the prefill quantum", 0);
+    if (!s) return 0;
+    pulsar_prefill_shape sh = {};
+    s->engine->family->session->sync->prefill_shape(const_cast<pulsar_session *>(s), &sh);
+    return sh.cap != 0u && sh.align != 0u && sh.cap <= sh.resumed_cap && sh.cap % sh.align == 0u ? 1u : 0u;
+}
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->tokens() : NULL; }
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }

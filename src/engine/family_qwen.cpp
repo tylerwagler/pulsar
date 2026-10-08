@@ -1387,15 +1387,16 @@ static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
-    const int rc = pulsar_prefill_loop(s, prompt, start, s->prefill_cap, s->qwen->ckpt, c.live, qwen_prefill_chunk, &c);
+    const int rc = pulsar_prefill_loop(s, prompt, start, qwen_prefill_chunk, &c);
     free(c.pos);
     free(c.bank);
     return rc;
 }
 
-/* The family's sync is the core's default (sync_driver.cpp, L272 P2) over three ops: the bank's
- * position is the state's authority, a reset clears the bank's recurrent and attention state, and the
- * prefill is qwen_prefill (the core loop, with Qwen's capture on its prefill-only history). */
+/* The family's sync is the core's (sync_driver.cpp, L272 P2) over its ops: the bank's position is the state's
+ * authority, a reset clears the bank's recurrent and attention state, the prefill is qwen_prefill (the core loop,
+ * with Qwen's capture on its prefill-only history), and the shape is the session's cap with no alignment (a cut
+ * anywhere is the cold bytes: split_invariant). */
 static bool qwen_sync_state_agrees(pulsar_session *s) {
     return s->qwen->bank_pos[s->qwen->live_bank] == (uint32_t)s->checkpoint.len;
 }
@@ -1404,30 +1405,24 @@ static bool qwen_sync_reset_bank(pulsar_session *s) {
     return qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, s->qwen->live_bank);
 }
 
-static const pulsar_sync_ops k_qwen_sync = {
-    /* .name         = */ PULSAR_QWEN_ARCH,
-    /* .state_agrees = */ qwen_sync_state_agrees,
-    /* .reset_bank   = */ qwen_sync_reset_bank,
-    /* .prefill      = */ qwen_prefill,
-};
-
-static int qwen_session_sync(pulsar_session *s, const pulsar_tokens *prompt,
-                             const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
-    return pulsar_session_sync_default(s, prompt, images, n_images, &k_qwen_sync, err, errlen);
+static void qwen_sync_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out) {
+    out->cap = s->prefill_cap;
+    out->resumed_cap = s->prefill_cap;
+    out->align = 1u;
 }
 
-static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
-    if (!s->checkpoint_valid || s->checkpoint.len >= s->ctx_size) {
-        if (err) snprintf(err, errlen, "%s: eval needs a synced session with room left", PULSAR_QWEN_ARCH);
-        return 1;
-    }
-    if (!pulsar_session_token_is_id(s, token, err, errlen)) return 1;   /* L188 (L272 B2) */
+static const pulsar_sync_ops k_qwen_sync = {
+    /* .name          = */ PULSAR_QWEN_ARCH,
+    /* .state_agrees  = */ qwen_sync_state_agrees,
+    /* .reset_bank    = */ qwen_sync_reset_bank,
+    /* .prefill       = */ qwen_prefill,
+    /* .prefill_shape = */ qwen_sync_prefill_shape,
+};
+
+/* The row (the core's eval checked the context, the id, and the bank standing at the view's end): the trunk's
+ * decode step, the MTP layer's absorb, and the bank's position advanced. */
+static int qwen_session_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
     const uint32_t live = s->qwen->live_bank;
-    if (s->qwen->bank_pos[live] != (uint32_t)s->checkpoint.len) {
-        if (err) snprintf(err, errlen, "%s: eval: bank %u holds %u tokens, the checkpoint %d", PULSAR_QWEN_ARCH, live,
-                          s->qwen->bank_pos[live], s->checkpoint.len);
-        return 1;
-    }
     const int32_t tok = token, pos = s->checkpoint.len, bank = (int32_t)live;
     if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, &tok, &pos, &bank, 1, qwen_heads_span(0, 1), s->logits)) {
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
@@ -1453,9 +1448,7 @@ static int qwen_session_eval(pulsar_session *s, int token, char *err, size_t err
             return 1;
         }
     }
-    token_vec_push(&s->checkpoint, token);
-    qwen_bank_set_pos(s->qwen, live, (uint32_t)s->checkpoint.len);
-    s->logits_stale = false;
+    qwen_bank_set_pos(s->qwen, live, (uint32_t)pos + 1u);
     return 0;
 }
 
@@ -1687,17 +1680,6 @@ static int qwen_session_decode_fused(pulsar_session *s, const pulsar_multiseq_re
     return 0;
 }
 
-/* The HOST view forgets the live bank's history; its device state is left alone.  The next sync
- * of that bank finds the checkpoint invalid and resets the bank before it prefills, so a stale
- * state is never decoded -- and the server's invalidate (a bank provision, an eviction, a stop
- * string mid-batch) cannot wipe OTHER banks' conversations, which resetting every bank did. */
-static void qwen_session_invalidate(pulsar_session *s) {
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    s->logits_stale = true;
-    s->live_images.n = 0;   /* the forgotten history's image records go with it (a fused run from 0 reads them) */
-}
-
 uint32_t qwen_argmax(const float *v, uint32_t n) {
     uint32_t a = 0;
     for (uint32_t i = 1; i < n; i++) if (v[i] > v[a]) a = i;
@@ -1717,11 +1699,14 @@ static const pulsar_family_session_ops k_qwen_session_ops = {
     /* .create          = */ qwen_session_create,
     /* .destroy         = */ qwen_session_destroy,
     /* .cost_bytes      = */ qwen_session_cost_bytes,
-    /* .sync            = */ qwen_session_sync,
-    /* .eval            = */ qwen_session_eval,
+    /* .sync            = */ &k_qwen_sync,
+    /* .eval_row        = */ qwen_session_eval_row,
     /* .decode_multiseq = */ qwen_session_decode_multiseq,
     /* .decode_mixed    = */ qwen_session_decode_mixed,
-    /* .invalidate      = */ qwen_session_invalidate,
+    /* the core's invalidate forgets the HOST view; the device state is left alone: the next sync of that bank finds
+     * the view invalid and resets the bank before it prefills, so a stale state is never decoded -- and the server's
+     * invalidate (a bank provision, an eviction, a stop string mid-batch) cannot wipe OTHER banks' conversations */
+    /* .invalidate      = */ NULL,
     /* .decode_fused    = */ qwen_session_decode_fused,
     /* .fused_heads_max = */ PULSAR_QWEN_HEAD_ROWS_MAX,   /* the logits slab's rows */
 };

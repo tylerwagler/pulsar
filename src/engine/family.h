@@ -159,11 +159,13 @@ typedef struct {
     /** GPU bytes create() takes at (ctx_size, n_banks): the allocation run dry,
      * so the price and the allocation are one function.  0 = cannot create. */
     uint64_t (*cost_bytes)(pulsar_engine *e, int ctx_size, int n_banks);
-    /** Make the session's state hold exactly `prompt` (prefill what is new). */
-    int (*sync)(pulsar_session *s, const pulsar_tokens *prompt,
-                const pulsar_image_ref *images, int n_images, char *err, size_t errlen);
-    /** Append one token and decode the next logits row. */
-    int (*eval)(pulsar_session *s, int token, char *err, size_t errlen);
+    /** Make the session's state hold exactly `prompt` (prefill what is new): the core's sync driver
+     *  (pulsar_session_sync_default, L284 every family's) over the family's state, reset and prefill chunk. */
+    const struct pulsar_sync_ops *sync;
+    /** Decode `token` at the view's end (position checkpoint.len) on the live bank, its next-token row into
+     *  s->logits -- the family's forward only: the core's eval (pulsar_session_family_eval) checks the context, the
+     *  id and the state's agreement with the view before, and records the token after.  0 = decoded. */
+    int (*eval_row)(pulsar_session *s, int token, char *err, size_t errlen);
     /** One decode row per request (each on its own bank). */
     int (*decode_multiseq)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n,
                            float *logits, int logits_cap, char *err, size_t errlen);
@@ -171,7 +173,9 @@ typedef struct {
     int (*decode_mixed)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                         float *logits, int logits_cap, uint32_t *out_n_rows,
                         uint32_t max_head_runs, char *err, size_t errlen);
-    /** Forget the session's state (the next sync prefills cold). */
+    /** Forget the session's state, the device half (DeepSeek: the bank back to position 0); NULL = nothing on the
+     *  device to forget (the next sync's reset clears it).  The core (pulsar_session_family_invalidate) clears the
+     *  view, the logits and the image records for every family. */
     void (*invalidate)(pulsar_session *s);
     /** The fused step (pulsar_session_decode_fused, contract in pulsar.h): decode rows and prompt runs in one
      *  forward, each run's last row headed on request.  NULL = the family has none; pulsar_engine_has_fused_step
@@ -232,8 +236,6 @@ typedef struct {
     /** Make `bank` live: the core's pulsar_bank_carry_restore_view, and what a bank with no carry means.
      *  false = refused. */
     bool (*restore)(pulsar_session *s, uint32_t bank);
-    /** Tokens the batched lane fed that the host view has not recorded yet. */
-    void (*note_committed)(pulsar_session *s, const int *toks, int n);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
     /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit). */

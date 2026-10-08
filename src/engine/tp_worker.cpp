@@ -513,8 +513,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
             return 1;
         }
-        if (FAMILY_BANKS(slot->s)) FAMILY_BANKS(slot->s)->note_committed(slot->s, c->tokens, (int)c->n_tokens);
-        else                       slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
+        pulsar_session_note_committed(slot->s, c->tokens, (int)c->n_tokens);
         return 1;
 
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {

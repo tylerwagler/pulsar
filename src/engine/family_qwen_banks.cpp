@@ -48,16 +48,6 @@ static bool qwen_bank_restore(pulsar_session *s, uint32_t bank) {
     return true;
 }
 
-/* The batched lane fed `toks` to the live bank's device state; the host view records them.  The
- * logits are no longer the next-token row (the lane kept its own), and the view is valid exactly
- * when it agrees with what the bank's state holds. */
-static void qwen_bank_note_committed(pulsar_session *s, const int *toks, int n) {
-    if (!s || !s->qwen || !toks || n <= 0) return;
-    for (int i = 0; i < n; i++) pulsar_tokens_push(&s->checkpoint, toks[i]);
-    s->logits_stale = true;
-    s->checkpoint_valid = s->qwen->bank_pos[s->qwen->live_bank] == (uint32_t)s->checkpoint.len;
-}
-
 static pulsar_ckpt_store *qwen_bank_kv_store(pulsar_session *s) { return s && s->qwen ? s->qwen->ckpt : NULL; }
 
 static uint32_t qwen_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
@@ -106,7 +96,6 @@ const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .count          = */ qwen_bank_count,
     /* .save           = */ qwen_bank_save,
     /* .restore        = */ qwen_bank_restore,
-    /* .note_committed = */ qwen_bank_note_committed,
     /* .kv_store         = */ qwen_bank_kv_store,
     /* .prefill_frontier = */ qwen_bank_prefill_frontier,
     /* .live             = */ qwen_bank_live,

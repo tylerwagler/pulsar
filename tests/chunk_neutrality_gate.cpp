@@ -66,8 +66,8 @@
  * L284: every family.  The schedules use the public session API only; one that
  * needs a whole-session payload (H, I, and K's shared decode for M and P), a
  * rewind (J, K) or a standalone checkpoint restore (L, N) is skipped by name on a
- * family without it, and the expected resume origin is the family's sync
- * planner's column (see the table).  F and G resume from the prefill grid point on
+ * family without it, and the expected resume origin is the column of the
+ * model's split invariance (see the table).  F and G resume from the prefill grid point on
  * both: decode rows are never continued (L284).
  *
  *   ./tests/chunk_neutrality_gate MODEL
@@ -336,20 +336,22 @@ int GATE_ENTRY(int argc, char **argv) {
         if (!rows) goto done;
         /* L284: the gate runs on every hosted model.  What a schedule NEEDS of the family (a whole-session payload,
          * a rewind) is a column; a schedule whose need the family lacks is skipped by name and compared to nothing.
-         * Where it resumes from is the family's sync planner's fact, so the expected origin is a column per planner:
-         *   origin      DeepSeek's sync (L183/L195): every resume re-prefills from the last PREFILL grid point at or
+         * Where it resumes from is the core sync driver's rule (sync_driver.cpp, every family's since L284) over the
+         * model's one fact, pulsar_session_split_invariant, so the expected origin is a column per answer:
+         *   origin      not split-invariant (DeepSeek, L183/L195): a view the bank prefilled whole continues only
+         *               from a grid point; every other resume re-prefills from the last PREFILL grid point at or
          *               below the view, so a resume is the cold prefill's chunking;
-         *   origin_ext  the core sync driver (sync_driver.cpp; Qwen): a prompt that extends a view the bank
-         *               prefilled whole continues it from the view's end (0 = a fresh session prefills from 0);
-         *               anything else -- a view holding decode rows included (L284) -- resumes from the deepest
-         *               grid checkpoint at or below the shared prefix and the prefill frontier.
+         *   origin_ext  split-invariant (Qwen): a prompt that extends a view the bank prefilled whole continues it
+         *               from the view's end wherever that is;
+         *   both        0 = a fresh session prefills from 0; a view holding decode rows (L284) resumes from the
+         *               deepest grid checkpoint at or below the shared prefix and the prefill frontier.
          * The bytes are graded the same way on both: every schedule == A, frontier row and one decode step. */
         constexpr unsigned NEED_SNAPSHOT = 1u, NEED_REWIND = 2u, NEED_RESTORE = 4u;
         struct { const char *label; int first; int evals; int origin; int origin_ext; bool via_snapshot; int cut; int restore; int segments; int share; unsigned needs; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
              * every crossing; a prompt under 128 tokens has none (cold) */
-            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, 0, false, 0, 0, 0, 0, 0},   /* a fresh session: the sync is a rebuild, not a resume */
+            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, 0, 0, false, 0, 0, 0, 0, 0},   /* a fresh session: the sync prefills from 0 */
             {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, 6, false, 0, 0, 0, 0, 0},
             {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, 2048, false, 0, 0, 0, 0, 0},
             {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, 4000, false, 0, 0, 0, 0, 0},
@@ -387,17 +389,24 @@ int GATE_ENTRY(int argc, char **argv) {
                     pulsar_engine_family_name(e));
             goto done;
         }
-        const bool grid_planner = fam == PULSAR_FAMILY_ID_DEEPSEEK4;
-        /* a standalone restore (pulsar_session_restore_checkpoint) is the grid planner's: the core sync driver
-         * restores a grid checkpoint only as a sync resumes from it (engine_api.cpp, L272 B1) */
+        bool grid_planner = true;
+        {
+            pulsar_session *probe = NULL;
+            if (pulsar_session_create(&probe, e, GATE_CTX) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
+            grid_planner = !pulsar_session_split_invariant(probe);
+            pulsar_session_free(probe);
+        }
+        /* a standalone restore (pulsar_session_restore_checkpoint) is DeepSeek's: a bank-pool family restores a grid
+         * checkpoint only as a sync resumes from it (engine_api.cpp, L272 B1) */
         const unsigned has = (pulsar_engine_has_snapshots(e) ? NEED_SNAPSHOT : 0u) |
-                             (pulsar_engine_can_rewind(e) ? NEED_REWIND : 0u) | (grid_planner ? NEED_RESTORE : 0u);
+                             (pulsar_engine_can_rewind(e) ? NEED_REWIND : 0u) |
+                             (fam == PULSAR_FAMILY_ID_DEEPSEEK4 ? NEED_RESTORE : 0u);
         bool ran[GATE_SCHEDULES] = {false};
         char err[256];
         printf("chunk-neutrality gate [%s]: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step "
                "each; origins: %s\n", pulsar_engine_family_name(e), GATE_N, opt.prefill_chunk, GATE_SCHEDULES,
-               grid_planner ? "the grid planner's (every resume from a prefill grid point)"
-                            : "the core sync driver's (an extending prompt continues the view)");
+               grid_planner ? "not split-invariant (a view continues only from a prefill grid point)"
+                            : "split-invariant (an extending prompt continues the view wherever it ends)");
         /* share 1: the schedule whose sync + decode the share-2 schedules start from (L278: K's 4600-row decode
          * past the ring, once instead of three times) */
         pulsar_session_snapshot shared; memset(&shared, 0, sizeof shared);

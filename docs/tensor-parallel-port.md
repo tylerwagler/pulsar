@@ -159,8 +159,8 @@ The paragraphs below describe the first cut's mechanics; where they say the
 worker "blocks in the wrapper", read "the loop applies the frame".
 
 - The mirror lives at the **public API boundary** (`pulsar_session_sync_mm` and
-  `pulsar_session_eval` in `engine_api.cpp`), *not* on the member
-  `pulsar_session::sync`/`eval`. Those members are re-entered from inside a
+  `pulsar_session_eval` in `engine_api.cpp`), *not* on
+  the family sync / eval (`pulsar_session_family_sync` / `_eval`). Those are re-entered from inside a
   running operation (the image stitch on sync's resume path, `rewrite_from_common`,
   the speculative walk); a mirrored frame there would be a second, unbalanced half
   of an operation the peer is not expecting.

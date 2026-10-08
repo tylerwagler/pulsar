@@ -1,4 +1,4 @@
-/* sync_driver.cpp -- L272 P2: the core's default sync, the one a family gets by supplying three ops.
+/* sync_driver.cpp -- L272 P2: the core's sync, the one every family runs (L284) by supplying its sync ops.
  *
  * A sync makes the live bank hold exactly `prompt`.  For a family whose state is restored from grid
  * checkpoints (kv_state.h) and prefilled by the core loop (prefill_loop.cpp), the decision is the same
@@ -10,17 +10,17 @@
  *   - otherwise resume from the deepest grid checkpoint the prompt still shares (the one resume rule,
  *     pulsar_session_resume_point -- one token short of the prompt, so the stale-logits case re-evaluates
  *     its last row), else reset the bank and prefill from 0;
- *   - the prefill runs on the core loop: interruptible, with progress, at the session's chunk cap.
- * Qwen (L266, L272 P2) runs on it.  DeepSeek keeps its own sync for what only it has -- the compressor
- * self-heal (L148) and the rewind -- over the same shared pieces: the resume rule, the prefill walk, the
- * logits flag, (L268) the image path, and (L284) the token-seam stitch.
+ *   - the prefill runs on the core loop: interruptible, with progress, cut by the one rule over the family's
+ *     prefill shape (prefill_loop.cpp).
+ * Qwen (L266, L272 P2) and DeepSeek (L284; its L148 self-heal is its state_agrees: a stale compressor or a
+ * frontier ahead of the view is a view the state does not agree with) both run on it.
  *
  * L115/L284 token seam, the core's for every family: a client re-sends sampled turns in canonical spelling
  * (Claude Code after tool continuations), so the ids part at the first seam while every byte still agrees.
  * pulsar_session_seam_stitch keeps the live history up to the deepest shared byte boundary and the prompt
- * after it; what a family does with it is how it reaches that boundary -- DeepSeek rewinds to it, this
- * driver syncs the stitched prompt (it extends the view, or resumes from the deepest grid checkpoint at or
- * below the boundary through the one resume rule).
+ * after it; the driver syncs the stitched prompt (it extends the view, or resumes from the deepest grid
+ * checkpoint at or below the boundary through the one resume rule).  The stitch is read BEFORE the agreement
+ * check, so a bank whose state moved past its view (a stop's rewind left it stale) keeps the rescue.
  *
  * L268 images, the core's for every family (image_front.cpp, image_identity.cpp):
  *   - a request's blocks must each fit one chunk; a prompt with no images carries no sentinel;
@@ -120,12 +120,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         return 1;
     }
     const uint32_t live = pulsar_session_live_bank(s);
-    /* `common` is read before the agreement check: a view the state has moved past can no longer be
-     * continued, but its prefix still says which checkpoint the prompt shares */
+    /* `common` and the seam are read before the agreement check: a view the state has moved past can no longer
+     * be continued, but its prefix (and the live bytes it re-spells) still say which checkpoint the prompt shares */
     int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
-    /* the bank's state is the authority; the view must agree with it to be continued (a batched step on
-     * the live bank moves the state, not the view) */
-    if (s->checkpoint_valid && !ops->state_agrees(s)) s->checkpoint_valid = false;
     /* L284 token seam: a prompt that leaves the view by ids may still re-spell it by bytes past `common`; the
      * stitched prompt keeps those live tokens, and everything below runs on it (its images re-placed) */
     pulsar_seam_stitch seam;
@@ -142,6 +139,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         if (n_images > 0) images = seam.placed;
         common = pulsar_tokens_common_prefix(&s->checkpoint, prompt);
     }
+    /* the bank's state is the authority; the view must agree with it to be continued (a batched step on the live
+     * bank moves the state, not the view; DeepSeek: a stale compressor or a frontier ahead of the view, L148) */
+    if (s->checkpoint_valid && !ops->state_agrees(s)) s->checkpoint_valid = false;
     /* L268: an image request extends the live KV only under the licence */
     if (n_images > 0 && s->checkpoint_valid) {
         pulsar_image_licence lic;

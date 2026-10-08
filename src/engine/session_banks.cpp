@@ -219,7 +219,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     /* a prompt chunk is a request's, as a sync's prefill is: the lookahead and a latched quench are the
      * previous request's (pulsar_session_family_sync does the same for the classic lane) */
     spec_lookahead_reset(s);
-    s->note_committed_tokens(toks, n);
+    pulsar_session_note_committed(s, toks, n);
     s->checkpoint_valid = true;
     s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
     if (head >= 0) {
