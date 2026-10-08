@@ -103,6 +103,12 @@ static inline long gate_first_diff(const float *a, const float *b, long n) {
 #define GATE_REF_WIDTH_KL_FRACTION 0.5
 #define GATE_REF_WIDTH_KL_FLOOR 1e-4
 
+/* Top-2 logit margin above which a top-1 flip cannot be quantization noise (spec_sampling_gate's greedy
+ * gate; cuda-decode-reference-gate's every-row leg).  Calibrated on the shipped type-43 artifact, where
+ * decisive positions measure 6.0-14.8 and ambiguous ones 0.19-1.94; 2.0 sits in the empty band with ~3x
+ * headroom either side. */
+#define GATE_DECISIVE_MARGIN 2.0f
+
 /* KL(ref || cur) over the softmax of two logit rows, in double. */
 static inline double gate_row_kl(const float *ref, const float *cur, long n) {
     double mr = -INFINITY, mc = -INFINITY;
@@ -120,3 +126,34 @@ static inline double gate_row_kl(const float *ref, const float *cur, long n) {
 
 /* True when a decode step of `rows` rows takes width-dependent arithmetic. */
 static inline bool gate_width_inexact(int rows) { return rows > pulsar_gpu_matmul_decode_exact_rows(); }
+
+/* L284: populate bank `bank` of session s from the token view [v, v+len) through the PUBLIC bank API -- repoint
+ * the session at the bank, invalidate (no prefix reuse across banks), sync the prompt, save the bank's state (its
+ * frontier counters and host carry) -- and hand back the next token (argmax) through *argtok when asked.  The
+ * family-generic twin of gate_fixture.h's gate_populate_bank (which reaches DeepSeek's session graph directly);
+ * on DeepSeek the two leave the same device state.  The session does not take ownership of v. */
+static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const int *v, int len, int *argtok,
+                                  const char *what) {
+    char err[256] = "";
+    if (pulsar_session_bank_repoint(s, bank) != 0) {
+        fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
+        return false;
+    }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p = { .v = (int *)v, .len = len, .cap = len };
+    if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+        fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
+        return false;
+    }
+    pulsar_session_bank_state_save(s, bank);
+    if (argtok) *argtok = pulsar_session_argmax(s);
+    return true;
+}
+
+/* The session's bank pool holds at least `need` banks; false + a message otherwise (public API). */
+static inline bool gate_bank_pool_fits(pulsar_session *s, int need) {
+    const int have = pulsar_session_bank_count(s);
+    if (have >= need) return true;
+    fprintf(stderr, "bank pool too small: %d < %d (size it through pulsar_engine_set_bank_pool)\n", have, need);
+    return false;
+}

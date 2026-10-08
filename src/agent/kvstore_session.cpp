@@ -227,11 +227,57 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
 
 
 
+/* The transcript's head, through the family's chat front: the built-in tool prompt is trusted control text
+ * (DeepSeek keeps its DSML markers native); the -sys text is client text after it. */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
-    pulsar_chat_begin(w->engine, out);
-    pulsar_chat_append_lead_in(w->engine, out, w->cfg->gen.system && w->cfg->gen.system[0],
-                               w->cfg->gen.think_mode);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    char *tools_prompt = agent_build_tools_prompt();
+    const char *extra = w->cfg->gen.system;
+    char *system = NULL;
+    if (extra && extra[0]) {
+        const size_t n = strlen(extra);
+        system = (char *)agent_xmalloc(n + 3);
+        memcpy(system, "\n\n", 2);
+        memcpy(system + 2, extra, n + 1);
+    }
+    pulsar_chat_open(w->engine, out, tools_prompt, system, w->cfg->gen.think_mode);
+    free(system);
+    free(tools_prompt);
+}
+
+
+
+void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted) {
+    if (w->turn_len == w->turn_cap) {
+        w->turn_cap = w->turn_cap ? w->turn_cap * 2 : 4;
+        w->turn = (pulsar_chat_message *)agent_xrealloc(w->turn, (size_t)w->turn_cap * sizeof(w->turn[0]));
+    }
+    w->turn[w->turn_len++] = {role, xstrdup(content ? content : ""), trusted};
+}
+
+
+
+void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+                       pulsar_think_mode think_mode) {
+    const int n = w->turn_len + n_extra;
+    pulsar_chat_message *msgs = (pulsar_chat_message *)agent_xmalloc((size_t)(n > 0 ? n : 1) * sizeof(msgs[0]));
+    for (int i = 0; i < w->turn_len; i++) msgs[i] = w->turn[i];
+    for (int i = 0; i < n_extra; i++) msgs[w->turn_len + i] = extra[i];
+    pulsar_chat_append_turn(w->engine, tokens, msgs, n, true, think_mode);
+    free(msgs);
+}
+
+
+
+void agent_turn_clear(agent_worker *w) {
+    for (int i = 0; i < w->turn_len; i++) free((char *)w->turn[i].content);
+    w->turn_len = 0;
+}
+
+
+
+void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
+    agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
+    agent_turn_clear(w);
 }
 
 
@@ -359,6 +405,7 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
     pulsar_tokens_free(&w->transcript);
     pulsar_tokens_copy(&w->transcript, &sys);
     pulsar_tokens_free(&sys);
+    agent_turn_clear(w);
     const int cached = agent_kv_load(w, &w->transcript);
     agent_trace(w, "sysprompt kv restored=%d of %d tokens", cached, w->transcript.len);
     if (w->kv && cached == 0) agent_publish_system_status(w, "Updating system prompt cache...");

@@ -22,7 +22,7 @@
  *
  *   A. sync / eval / batched decode / mixed / fused step for an unknown session
  *      -> refused by name, and the refusal ACKED so the leader reads it at once;
- *      the verdict frames (bank restore, rewrite, ...) answer a NEGATIVE status that
+ *      the verdict frames (bank restore, note prefilled, ...) answer a NEGATIVE status that
  *      the verdict collector reads as a refusal, never as a result
  *   B. a void frame (rewind) for an unknown session -> the worker marks the
  *      pair failed with NO ack; the NEXT acked frame carries the refusal back
@@ -187,11 +187,6 @@ static int run_leader(pulsar_tp *tp) {
               std::strstr(err, "refused") != NULL,
               "an unknown-session restore must come back as a refusal, not a verdict: %s", err);
         const int t3[3] = { 1, 2, 3 };
-        CHECK(pulsar_tp_send_rewrite_from_common(tp, SID, t3, 3u, 1) != 0, "send_rewrite must report success");
-        err[0] = 0;
-        CHECK(!pulsar_tp_wait_command_status(tp, SID, "rewrite from common", &status, err, sizeof(err)) &&
-              std::strstr(err, "refused") != NULL,
-              "an unknown-session rewrite must come back as a refusal: %s", err);
         const float lg[4] = { 0.f, 1.f, 2.f, 3.f };
         CHECK(pulsar_tp_send_note_prefilled(tp, SID, t3, 3u, 0) != 0, "send_note_prefilled must report success");
         err[0] = 0;

@@ -5,30 +5,58 @@
 
 
 
-/* --- L107 adaptive draft depth -------------------------------------------
- * The 2026-08-25 depth sweep measured opposite optima per regime (prose 2,
- * structured 5; the shipped static 3 loses ~5%/~9.5% respectively), and the
- * conf-head calibration run measured the head monotone in both regimes with
- * conf>=0.9 -> 1.000 realized accept. Post-draft conf-sched trimming cannot
- * capture this (draft cost is paid before the trim; the sweep ran WITH the
- * trimmer on), so depth itself moves: +/-1 per round in spec_round_end.
- *   UP:   the whole drafted chain was verified AND accepted (commit == depth,
- *         which implies the trimmer kept everything) and the tail position's
- *         confidence clears SPEC_DEPTH_CONF_UP (calibrated >=0.82 accept) --
- *         the drafter was not the bottleneck this round, so probe deeper.
- *   DOWN: less than half the drafted depth converted (2*commit < depth) --
- *         drafting work is outrunning acceptance, back off.
- * Bounds [SPEC_DEPTH_MIN, SPEC_DEPTH_MAX] are the sweep's measured range;
- * depth 6 lost on BOTH regimes, so probing past it is priced as pure waste.
- * Distribution-preserving by construction (verification is exact at any
- * depth); NOT byte-identical on greedy prose -- verify-batch width shifts
- * accumulation ~1 ULP, the same known-flip class as conf-sched itself. */
+/* --- the draft schedule (L284 P11: one rule, the numbers the drafter's) -----
+ * Depth: a session starts at the configured depth (--spec-depth /
+ * PULSAR_SPEC_DEPTH, engine options spec_depth) or the drafter's, clamped to
+ * the drafter's depth_max; a drafter with an adaptive policy (spec_depth.h,
+ * DSpark's L107 rule and its rationale) moves it +/-1 per round in
+ * spec_round_end.  The stop: pulsar_spec_conf_keep at pulsar_spec_tau. */
+uint32_t pulsar_spec_depth_start(const pulsar_engine *e) {
+    const pulsar_drafter_ops *d = e->drafter_ops;
+    if (!d) return 0;
+    const uint32_t v = e->spec_depth > 0 ? (uint32_t)e->spec_depth : d->depth;
+    return v < 1u ? 1u : v > d->depth_max ? d->depth_max : v;
+}
+
+float pulsar_spec_tau(const pulsar_engine *e) {
+    if (e->spec_tau < 0.0f) return 0.0f;
+    if (e->spec_tau > 0.0f) return e->spec_tau;
+    return e->drafter_ops ? e->drafter_ops->tau : 0.0f;
+}
+
+/* A shadow's depth: the controller's when it has moved it, else the start. */
+static uint32_t spec_shadow_depth(const pulsar_session *s, const pulsar_spec_carry_state *sp) {
+    const int d = sp->spec_adaptive_depth;
+    return d > 0 ? (uint32_t)(d > 16 ? 16 : d) : pulsar_spec_depth_start(s->engine);
+}
+
 uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
-    int d = s->spec.spec_adaptive_depth;
-    if (d <= 0) d = spec_drafter(s) ? (int)spec_drafter(s)->depth_default(s->engine) : 0;
-    if (d < 1) d = 1;
-    if (d > 16) d = 16;
-    return (uint32_t)d;
+    const uint32_t d = spec_shadow_depth(s, &s->spec);
+    return d < 1u ? 1u : d;
+}
+
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+                                float top_p, float min_p) {
+    q->valid = true;
+    q->done = false;
+    q->next_base = (int32_t)next_base;
+    q->n_draft = pulsar_spec_cur_depth(s);
+    q->temperature = temperature;
+    q->top_k = top_k;
+    q->top_p = top_p;
+    q->min_p = min_p;
+    q->sample_drafts = temperature > 0.0f;
+}
+
+bool pulsar_spec_q_record(spec_redraft_req *q, uint32_t pos, const pulsar_sample_dist *qd) {
+    if (!pulsar_spec_q_compact(qd->n)) {
+        q->qn[pos] = 0;
+        return false;
+    }
+    q->qn[pos] = qd->n;
+    memcpy(q->qids[pos], qd->ids, (size_t)qd->n * sizeof(int32_t));
+    memcpy(q->qprobs[pos], qd->probs, (size_t)qd->n * sizeof(float));
+    return true;
 }
 
 /* The target's undo of a round: the snapshot back on the installed bank, then released. */
@@ -137,7 +165,7 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
  * conditions), small enough that a 400-token losing request recovers nearly
  * all of the loss.
  *
- * The step side of the guard is MEASURED (L263): pulsar_engine::spec_cost is
+ * The step side of the guard is MEASURED (L263): pulsar_engine::lane_cost[PULSAR_LANE_SPEC] is
  * an exponentially weighted least-squares fit of a decode round's wall time
  * on the rows its forward carried, round = flat + row * rows, fed by the
  * server's round loop (the single lane off TP feeds its own steps).  Nothing
@@ -163,23 +191,23 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
 /* The break-even yield for a bank with `n_batch` rows in a round shared by
  * `banks` banks (see above).  Integer microseconds in, so every rank of a TP
  * group computes the same value from the same wire terms. */
-static float spec_quench_guard(const pulsar_spec_cost_fit *c, int banks, uint32_t n_batch) {
+static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_t n_batch) {
     const float share = (float)c->flat_us / (float)(banks > 0 ? banks : 1);
     const float row = (float)c->row_us;
     return (share + row * (float)n_batch) / (share + row);
 }
 
-/* L263: one observation into the fit.  Decay 255/256 per round (a window of
- * ~256 rounds, 15-25 s of decode: at c1 the rows spread only 2..6, so a
- * 64-round window let the slope swing 1..6 ms/row between adjacent windows
- * -- the pair, 2026-10-05); valid once 16 rounds are in, the row counts have
- * spread (an EW variance of at least 1/4: adaptive depth and concurrency
- * move them every few rounds) and both terms are positive -- anything else
- * is noise, not a price. */
+/* L263: one observation into the fit (L284: either lane's -- the plain lane's
+ * steps feed the same structure).  Decay 255/256 per step (a window of ~256
+ * steps, 15-25 s of decode: at c1 the rows spread only 2..6, so a 64-round
+ * window let the slope swing 1..6 ms/row between adjacent windows -- the pair,
+ * 2026-10-05); valid once 16 steps are in, the row counts have spread (an EW
+ * variance of at least 1/4: adaptive depth and concurrency move them every few
+ * rounds) and both terms are positive -- anything else is noise, not a price. */
 #define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
 #define SPEC_COST_MIN_OBS 16u
 #define SPEC_COST_MIN_VAR 0.25
-void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
+void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
     if (!f || rows == 0 || !(ms > 0.0)) return;
     const double x = (double)rows, y = ms;
     f->w   = f->w   * SPEC_COST_DECAY + 1.0;
@@ -200,13 +228,43 @@ void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
     f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
-/* Re-arm at request boundaries (the same sites that drop the carry and
- * pendings). All-zero == armed, matching the xcalloc'd session. */
+pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
+    pulsar_lane_cost c;
+    memset(&c, 0, sizeof c);
+    c.flat_us = f->flat_us;
+    c.row_us = f->row_us;
+    c.n = f->n;
+    c.valid = f->valid;
+    if (f->w > 0.0) {
+        c.mean_rows = (float)(f->sx / f->w);
+        c.mean_ms = (float)(f->sy / f->w);
+    }
+    return c;
+}
+
+/* L284: the slope is needed only AWAY from the fit's centre -- a fit whose rows
+ * never spread (a steady N on the plain lane) still knows its cost at N. */
+double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows) {
+    if (!c || !(rows > 0.0)) return 0.0;
+    if (c->valid) return ((double)c->flat_us + (double)c->row_us * rows) / 1000.0;
+    if (c->n >= SPEC_COST_MIN_OBS && c->mean_ms > 0.0f && fabs(rows - (double)c->mean_rows) <= 0.5)
+        return (double)c->mean_ms;
+    return 0.0;
+}
+
+/* All-zero == armed, matching the xcalloc'd session. */
 void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quench_debt = 0.0f;
     s->spec.spec_quench_ewma = 0.0f;
     s->spec.spec_quench_steps = 0;
     s->spec.spec_quenched = false;
+}
+
+/* A request boundary: the lookahead goes, the quench re-arms. */
+void spec_lookahead_reset(pulsar_session *s) {
+    s->spec.spec_carry_valid = false;
+    pulsar_spec_drop_pendings(&s->spec);
+    spec_quench_reset(s);
 }
 
 
@@ -466,7 +524,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
  * capture/comp-save buffers (classic: 0). Owns r->frontier's lifetime on
  * every path. Returns tokens emitted, or -1 (session poisoned). */
 static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                          int first_token, int eos_token,
+                          int first_token,
                           float temperature, int top_k, float top_p, float min_p,
                           uint64_t *rng,
                           const pulsar_spec_rows *src, uint32_t row0,
@@ -537,12 +595,15 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * thinking-live continuation embeds the ghosts into the next prompt. The
      * EOS row itself stays committed (it was evaluated in the batch, matching
      * the batched lane's convention); hit_eos below invalidates the carry, so
-     * nothing ever samples from a post-EOS row. */
-    if ((int)first_token == (int)eos_token) {
+     * nothing ever samples from a post-EOS row.  "EOS" is the family's whole
+     * stop set (pulsar_token_is_stop; L284: the round cut only at the one eos
+     * id, so a Qwen draft of <|endoftext|> committed past it and the server
+     * invalidated the bank for the ghost tail). */
+    if (pulsar_token_is_stop(e, first_token)) {
         commit = 0;
     } else {
         for (int i = 0; i < commit; i++) {
-            if (pend[i] == (int32_t)eos_token) { commit = i + 1; break; }
+            if (pulsar_token_is_stop(e, (int)pend[i])) { commit = i + 1; break; }
         }
     }
 
@@ -567,20 +628,20 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         s->spec.spec_num_drafts += 1u;
     }
 
-    /* L107 adaptive draft depth (constants + rationale at spec_cur_depth).
+    /* L107 adaptive draft depth (spec_depth.h: the rule and its rationale).
      * Runs BEFORE the redraft below so the next chain is drafted at the new
-     * depth. commit == depth implies the trimmer kept the whole chain AND the
+     * depth. commit == depth implies the stop kept the whole chain AND the
      * target accepted all of it (commit <= K <= depth always). A tail conf of
-     * -1 (head didn't run, e.g. conf-sched disabled) passes the UP check: the
+     * -1 (no confidence, e.g. --spec-tau off) passes the UP check: the
      * full-accept signal alone then drives the climb. Counts-only decision,
      * deterministic for a fixed stream, same property as yield-quench. */
-    if (K > 0 && spec_target(s)->depth) {
-        /* the rule is spec_depth.h's; the numbers are the target's (pulsar_spec_target_ops::depth; a
-         * NULL policy = a fixed depth) */
+    if (K > 0 && spec_drafter(s)->adapt) {
+        /* the rule is spec_depth.h's; the numbers are the drafter's (pulsar_drafter_ops::adapt; NULL = a
+         * fixed depth) */
         const uint32_t depth = pulsar_spec_cur_depth(s);
         pulsar_spec_depth_state ds = {s->spec.spec_depth_down_forgiven, s->spec.spec_depth_rounds_since_up,
                                       s->spec.spec_depth_climb_cooldown};
-        const int next = pulsar_spec_depth_next(spec_target(s)->depth, &ds, depth, K, commit, pend_conf);
+        const int next = pulsar_spec_depth_next(spec_drafter(s)->adapt, &ds, depth, K, commit, pend_conf);
         s->spec.spec_depth_down_forgiven = ds.down_forgiven;
         s->spec.spec_depth_rounds_since_up = ds.rounds_since_up;
         s->spec.spec_depth_climb_cooldown = ds.climb_cooldown;
@@ -600,9 +661,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (!s->spec.spec_quenched) {
         s->spec.spec_quench_steps++;
         bool fire = false;
-        if (e->spec_cost.valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
+        const pulsar_lane_cost_fit *cost = &e->lane_cost[PULSAR_LANE_SPEC];
+        if (cost->valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(&e->spec_cost, s->spec.spec_round_banks, n_batch);
+                                 spec_quench_guard(cost, s->spec.spec_round_banks, n_batch);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
@@ -613,7 +675,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         if (fire) {
             s->spec.spec_quenched = true;
             fprintf(stderr,
-                    "pulsar: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
+                    "pulsar: spec yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
                     saved_len + 1 + commit, s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
@@ -681,10 +743,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
     /* Emit first_token + accepted drafts. */
     accepted[n_accept++] = first_token;
-    bool hit_eos = first_token == eos_token;
+    bool hit_eos = pulsar_token_is_stop(e, first_token);
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
         accepted[n_accept++] = (int)pend[i];
-        if (pend[i] == (int32_t)eos_token) hit_eos = true;
+        if (pulsar_token_is_stop(e, (int)pend[i])) hit_eos = true;
     }
 
     /* L155 guard: the committed frontier (saved_len + 1 + commit) must equal
@@ -731,9 +793,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    uint32_t n_draft = pulsar_spec_cur_depth(s);   /* L107: session depth, not the static engine width */
-    if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || trimmed || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
+    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain.  (After an
@@ -751,16 +811,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * cannot serve simply takes a plain n=1 step next round. */
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
+        pulsar_spec_draft_req_init(s, q, next_base, temperature, top_k, top_p, min_p);
         q->valid = features_ready;
-        q->done = false;
-        q->next_base = (int32_t)next_base;
-        q->n_draft = n_draft;
         q->n_batch = n_batch;
         q->commit = commit;
-        q->temperature = temperature;
-        q->top_k = top_k;
-        q->top_p = top_p;
-        q->min_p = min_p;
         return n_accept;
     }
     const uint32_t keep = spec_drafter(s)->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
@@ -776,7 +830,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 /* The single lane (the classic API: CLI, eval, warmup): begin, the target's own verify forward over
  * the round's rows, end -- the batched lane runs the same begin and end around a shared forward. */
 static int spec_single_round(pulsar_session *s, int first_token,
-                             int max_tokens, int eos_token,
+                             int max_tokens,
                              float temperature, int top_k,
                              float top_p, float min_p,
                              uint64_t *rng,
@@ -803,7 +857,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
     }
     const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
     s->spec.spec_round_banks = 1;
-    const int na = spec_round_end(s, &r, first_token, eos_token,
+    const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, rng,
                                   &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
     free(r.snap);
@@ -811,7 +865,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
      * included.  Off TP only: a group's ranks must hold the same fit, and this
      * lane has no frame to carry one, so on a group neither rank observes
      * here (the batched lane ships the leader's with every round's end). */
-    if (na >= 0 && !e->tp) pulsar_engine_spec_cost_observe(e, n_rows, (now_sec() - t0) * 1e3);
+    if (na >= 0 && !e->tp) pulsar_engine_lane_cost_observe(e, PULSAR_LANE_SPEC, n_rows, (now_sec() - t0) * 1e3);
     return na;
 }
 
@@ -823,7 +877,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
  * eval_speculative_block behavior). Returns the number of tokens emitted. */
 int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
-                                     int max_tokens, int eos_token,
+                                     int max_tokens,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     auto *s = this;
@@ -859,7 +913,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
             return -1;
         }
     }
-    if (first == eos_token) {
+    if (pulsar_token_is_stop(s->engine, first)) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
         accepted[0] = first;
@@ -869,11 +923,11 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
     if (!spec_drafter(s) || s->spec.spec_quenched) {
-        if (s->engine->family->session->eval(s, first, err, errlen) != 0) return -1;
+        if (pulsar_session_family_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
     }
-    return spec_single_round(s, first, max_tokens, eos_token,
+    return spec_single_round(s, first, max_tokens,
                                               temperature, top_k, top_p, min_p, rng,
                                               accepted, accepted_cap, err, errlen);
 }
@@ -881,7 +935,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
 
 
 int pulsar_session::eval_speculative_block(int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     auto *s = this;
@@ -895,7 +949,7 @@ int pulsar_session::eval_speculative_block(int first_token,
         return -1;
     }
     if (!spec_drafter(s) || s->spec.spec_quenched) {
-        if (s->engine->family->session->eval(s, first_token, err, errlen) != 0) return -1;
+        if (pulsar_session_family_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
@@ -906,7 +960,7 @@ int pulsar_session::eval_speculative_block(int first_token,
      * setter anywhere and so could never have restored it. */
     /* an externally chosen first_token invalidates any pending carry */
     s->spec.spec_carry_valid = false;
-    return spec_single_round(s, first_token, max_tokens, eos_token,
+    return spec_single_round(s, first_token, max_tokens,
                                                  0.0f, 0, 1.0f, 0.0f, NULL,
                                                  accepted, accepted_cap, err, errlen);
 }
@@ -960,12 +1014,11 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
     return r->n_batch;
 }
 
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
-                                  int first_token, pulsar_multiseq_req *out) {
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank;
         out[i].pos = r->saved_len + (int32_t)i;
-        out[i].token = i == 0 ? first_token : (int)r->pend[i - 1];
+        out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
     }
     return r->n_batch;
 }
@@ -985,7 +1038,7 @@ bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out) {
 /* The batched lane's round end: the target reads this round's rows out of the last shared forward
  * (its own readback or the caller's block), then the one round_end runs. */
 static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
-                                int first_token, int eos_token,
+                                int first_token,
                                 float temperature, int top_k, float top_p,
                                 float min_p, uint64_t *rng,
                                 const float *rows, uint32_t row0,
@@ -1007,7 +1060,7 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
         src.block.row0 = row0;
         src.block.vocab = spec_vocab(s);
     }
-    return spec_round_end(s, r, first_token, eos_token,
+    return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, rng,
                           &src, row0,
                           true /* L150: redraft deferred to the batch */,
@@ -1018,19 +1071,19 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
 
 
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token, int eos_token,
+                               int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
-    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
                                 min_p, rng, rows, row0, NULL, accepted, accepted_cap,
                                 err, errlen);
 }
 
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token, int eos_token,
+                                      int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       const float *rows, uint32_t row0,
@@ -1041,7 +1094,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         snprintf(err, errlen, "spec round_end_forced: no truth");
         return -1;
     }
-    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
                                 min_p, rng, rows, row0, truth, accepted, accepted_cap,
                                 err, errlen);
 }
@@ -1151,7 +1204,7 @@ static void spec_step_reset(pulsar_spec_step *st) {
 }
 
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              int eos_token, uint32_t row_budget,
+                                              uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     uint32_t rows = 0;
     for (int i = 0; i < n; i++) {
@@ -1180,7 +1233,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
-            } else if (first == eos_token) {
+            } else if (pulsar_token_is_stop(s->engine, first)) {
                 st->status = PULSAR_SPEC_STEP_EOS;
             } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
                                                              st->accepted_cap, st->temperature,
@@ -1195,7 +1248,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 st->status = PULSAR_SPEC_STEP_SKIPPED;
             } else {
                 /* The worker has no reqs: its rows ride the mixed-batch frame. */
-                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, first, reqs + rows)
+                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
                                   : pulsar_spec_round_n_rows(st->round);
                 st->row0 = rows;
                 rows += st->n_rows;
@@ -1207,11 +1260,11 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
 }
 
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               int eos_token, const float *rows) {
+                                               const float *rows) {
     /* L260: each bank's walk records its committed capture rows; one banked seed
      * after the loop shares the drafter's main_proj / attn_kv reads across every
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
-    s->seed_defer.active = FAMILY_BANKS(s) ? FAMILY_BANKS(s)->count(s) > 0 : s->graph->banks.n_banks > 0;
+    s->seed_defer.active = s->engine->family->banks->pooled(s);
     s->seed_defer.n = 0;
     s->spec.spec_round_banks = n;   /* L263: the round's flat cost is shared n ways */
     for (int i = 0; i < n; i++) {
@@ -1223,7 +1276,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
-        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token, eos_token,
+        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token,
                                                            st->temperature, st->top_k, st->top_p,
                                                            st->min_p, st->rng, rows, st->row0,
                                                            st->accepted, st->accepted_cap,
@@ -1336,12 +1389,7 @@ const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32
 int pulsar_spec_bank_depth(pulsar_session *s, uint32_t bank) {
     if (!s || !spec_drafter(s)) return 0;
     const pulsar_spec_carry_state *sp = pulsar_spec_bank_shadow(s, bank);
-    if (!sp) return 0;
-    int d = sp->spec_adaptive_depth;
-    if (d <= 0) d = (int)spec_drafter(s)->depth_default(s->engine);
-    if (d < 1) d = 1;
-    if (d > 16) d = 16;
-    return d;
+    return sp ? (int)spec_shadow_depth(s, sp) : 0;
 }
 
 /* The session's speculative shadow into / out of a bank carry: s->spec by value, plus the full q rows

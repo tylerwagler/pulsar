@@ -1,7 +1,7 @@
 /* Tier-2 ACCOUNTING-EXACTNESS gate (task #55 overcommit/preemption, increment 1).
  *
  * Proves the touched-KV number (pulsar_session_touched_kv_bytes /
- * gpu_graph_touched_kv_bytes: each bank's RESIDENT high-water rows) that the
+ * the per-bank sum of the family's touched_kv_bytes: each bank's RESIDENT high-water rows) that the
  * increment-2 eviction guard TRIGGERS on and the server budgets with can be
  * trusted: it must track the REAL physical footprint of the demand-paged
  * comp/index caches, measured independently via cudaMemGetInfo

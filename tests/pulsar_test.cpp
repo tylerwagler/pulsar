@@ -3474,8 +3474,8 @@ static int test_control_id_for_literal(pulsar_engine *e, const char *literal) {
     return id;
 }
 
-/* L185: the token-level twin (agent/CLI/bench/eval -- pulsar_chat_begin /
- * append_lead_in / append_message / append_assistant_prefix) against the
+/* L185: the token-level twin (agent/CLI/bench/eval -- the DeepSeek family's
+ * chat front: pulsar_chat_open / pulsar_chat_append_turn, L284 P14) against the
  * server's renderer for the SAME conversation.
  *
  * The twin is the `-p`/eval/bench path and the agent's prompt builder; the
@@ -3508,17 +3508,19 @@ static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *m
     pulsar_tokens srv = {0};
     pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
 
+    /* the system FIELD (case 1) is the head's system text; every other message is the turn */
     pulsar_tokens twin = {0};
-    pulsar_chat_begin(e, &twin);
-    pulsar_chat_append_lead_in(e, &twin, has_system, mode);
-    for (int i = 0; i < msgs->len; i++) {
+    const int first = has_system ? 1 : 0;
+    pulsar_chat_open(e, &twin, NULL, has_system ? msgs->v[0].content : NULL, mode);
+    pulsar_chat_message turn[8];
+    TEST_ASSERT(msgs->len - first <= (int)(sizeof turn / sizeof turn[0]));
+    for (int i = first; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         const bool tool = !strcmp(m->role, "tool") || !strcmp(m->role, "function");
         const bool sys = role_is_system(m->role);
-        pulsar_chat_append_message(e, &twin, tool ? "tool" : (sys ? "system" : "user"),
-                                   m->content ? m->content : "");
+        turn[i - first] = {tool ? "tool" : (sys ? "system" : "user"), m->content ? m->content : "", false};
     }
-    pulsar_chat_append_assistant_prefix(e, &twin, mode);
+    pulsar_chat_append_turn(e, &twin, turn, msgs->len - first, true, mode);
 
     int diff = -1, ndiff = 0;
     const int lim = srv.len < twin.len ? srv.len : twin.len;
@@ -4418,38 +4420,59 @@ static void test_attn_layout_table(void) {
  * the indexer_scores scratch.  The unit process has no model, so the loader
  * installs no layout and the comp/idx term would be 0 (a gate that measures
  * nothing); the test installs the profile's V4.1 layout first. */
-/* L263: the spec cost fit.  A linear round cost with spread row counts fits
- * to its terms; too few rounds, one row count, or a non-positive term is not
- * a price (valid stays false). */
-static void test_spec_cost_fit(void) {
-    pulsar_spec_cost_fit f;
+/* L263 / L284: the lane cost fit (both decode lanes').  A linear step cost with
+ * spread row counts fits to its terms; too few steps, one row count, or a
+ * non-positive term is not a price (valid stays false) -- though one row count
+ * still prices that row count (pulsar_lane_cost_ms at the centre). */
+static void test_lane_cost_fit(void) {
+    pulsar_lane_cost_fit f;
     memset(&f, 0, sizeof f);
     /* rows 2..6 cycling, round = 40 + 7 * rows ms with +-0.4 ms of noise */
     for (uint32_t i = 0; i < 64; i++) {
         const uint32_t rows = 2u + i % 5u;
-        spec_cost_fit_observe(&f, rows, 40.0 + 7.0 * rows + ((i & 1u) ? 0.4 : -0.4));
+        lane_cost_fit_observe(&f, rows, 40.0 + 7.0 * rows + ((i & 1u) ? 0.4 : -0.4));
         if (i + 1 < 16) TEST_ASSERT(!f.valid);
     }
     TEST_ASSERT(f.valid && f.n == 64);
     TEST_ASSERT(f.flat_us > 39000 && f.flat_us < 41000);
     TEST_ASSERT(f.row_us > 6800 && f.row_us < 7200);
+    {   /* a valid fit prices any width from its terms, the centre included */
+        const pulsar_lane_cost v = lane_cost_fit_view(&f);
+        TEST_ASSERT(fabs(pulsar_lane_cost_ms(&v, 10.0) - 110.0) < 2.0);
+        TEST_ASSERT(v.mean_rows > 3.5f && v.mean_rows < 4.5f);
+        TEST_ASSERT(pulsar_lane_cost_ms(&v, 0.0) == 0.0);
+    }
+    /* too few steps: no number even at the centre */
+    memset(&f, 0, sizeof f);
+    for (uint32_t i = 0; i < 8; i++) lane_cost_fit_observe(&f, 3u, 61.0);
+    {
+        const pulsar_lane_cost v = lane_cost_fit_view(&f);
+        TEST_ASSERT(pulsar_lane_cost_ms(&v, 3.0) == 0.0);
+    }
     /* one row count only: no slope to measure */
     memset(&f, 0, sizeof f);
-    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 3u, 61.0 + ((i & 1u) ? 0.4 : -0.4));
+    for (uint32_t i = 0; i < 64; i++) lane_cost_fit_observe(&f, 3u, 61.0 + ((i & 1u) ? 0.4 : -0.4));
     TEST_ASSERT(!f.valid && f.n == 64);
+    /* L284: ...but its cost AT that row count is known (the lane choice's plain price at a steady N); one row away
+     * it is not -- no number */
+    {
+        const pulsar_lane_cost v = lane_cost_fit_view(&f);
+        TEST_ASSERT(fabs(pulsar_lane_cost_ms(&v, 3.0) - 61.0) < 0.5);
+        TEST_ASSERT(pulsar_lane_cost_ms(&v, 4.0) == 0.0 && pulsar_lane_cost_ms(&v, 2.0) == 0.0);
+    }
     /* a falling cost in rows is noise, not a price */
     memset(&f, 0, sizeof f);
-    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 80.0 - 3.0 * (double)(2u + i % 5u));
+    for (uint32_t i = 0; i < 64; i++) lane_cost_fit_observe(&f, 2u + i % 5u, 80.0 - 3.0 * (double)(2u + i % 5u));
     TEST_ASSERT(!f.valid);
     /* a zero-row or non-positive observation is ignored */
     memset(&f, 0, sizeof f);
-    spec_cost_fit_observe(&f, 0u, 50.0);
-    spec_cost_fit_observe(&f, 3u, 0.0);
+    lane_cost_fit_observe(&f, 0u, 50.0);
+    lane_cost_fit_observe(&f, 3u, 0.0);
     TEST_ASSERT(f.n == 0);
     /* the fit tracks a step change: the window forgets the old machine */
     memset(&f, 0, sizeof f);
-    for (uint32_t i = 0; i < 64; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 40.0 + 7.0 * (2u + i % 5u));
-    for (uint32_t i = 0; i < 1024; i++) spec_cost_fit_observe(&f, 2u + i % 5u, 30.0 + 5.0 * (2u + i % 5u));
+    for (uint32_t i = 0; i < 64; i++) lane_cost_fit_observe(&f, 2u + i % 5u, 40.0 + 7.0 * (2u + i % 5u));
+    for (uint32_t i = 0; i < 1024; i++) lane_cost_fit_observe(&f, 2u + i % 5u, 30.0 + 5.0 * (2u + i % 5u));
     TEST_ASSERT(f.valid && f.flat_us > 29000 && f.flat_us < 31500 && f.row_us > 4800 && f.row_us < 5200);
 }
 
@@ -4610,7 +4633,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
-    {"--spec-cost", "spec-cost", "spec cost fit: a round's measured cost to its terms, or no price at all (L263)", test_spec_cost_fit},
+    {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},

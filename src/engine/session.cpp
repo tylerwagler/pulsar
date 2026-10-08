@@ -17,8 +17,8 @@ bool pulsar_engine::has_dspark() {
     return e && e->dspark_ready;
 }
 
-int pulsar_engine_dspark_draft_tokens(pulsar_engine *e) {
-    return e->has_dspark() ? e->dspark_draft_tokens : 0;
+int pulsar_engine_spec_depth(pulsar_engine *e) {
+    return (int)pulsar_spec_depth_start(e);
 }
 
 
@@ -127,33 +127,14 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    const pulsar_model *model = &e->model;
-    const pulsar_weights *weights = &e->weights;
-    const uint32_t prefill_cap =
-        gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-
-    pulsar_gpu_graph g;
-    bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
-                                        gpu_graph_bank_pool_n(), false);
-    if (!ok) {
-        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
+    /* L284 P15: the dataset walk and the caps are the core's; the family runs one prompt through its forward */
+    const pulsar_family_imatrix *fi = e->family->imatrix;
+    void *collection = fi->begin(e, dataset_path, ctx_size);
+    if (!collection) {
         free(dataset);
         return 1;
     }
-
-    pulsar_imatrix_collector collector;
-    if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
-        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
-        gpu_graph_free(&g);
-        free(dataset);
-        return 1;
-    }
-
-    fprintf(stderr,
-            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
-            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
+    bool ok = true;
 
     int prompts_done = 0;
     int tokens_done = 0;
@@ -182,26 +163,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
                 prompt.len = max_tokens - tokens_done;
             }
             if (prompt.len > 0) {
-                if (!gpu_graph_reset_prefill_state(&g)) {
-                    fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
-                    ok = false;
-                } else if ((uint32_t)prompt.len > prefill_cap) {
-                    ok = gpu_graph_prefill_chunked_range(&g, model, weights,
-                                                           &prompt, 0,
-                                                           (uint32_t)prompt.len,
-                                                           NULL, false,
-                                                           NULL, NULL,
-                                                           NULL, NULL,
-                                                           &collector,
-                                                           NULL, NULL, NULL);
-                } else {
-                    ok = gpu_graph_prefill_layer_major(&g, model, weights,
-                                                         &prompt, 0,
-                                                         (uint32_t)prompt.len,
-                                                         NULL, false,
-                                                         &collector,
-                                                         NULL, NULL);
-                }
+                ok = fi->prompt(e, collection, &prompt);
                 if (!ok) {
                     fprintf(stderr, "pulsar: imatrix prefill failed at prompt %d\n", prompts_done + 1);
                     token_vec_free(&prompt);
@@ -215,7 +177,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
                             "pulsar: imatrix prompts=%d tokens=%d routes=%llu\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)fi->routes(collection));
                     fflush(stderr);
                 }
             }
@@ -230,67 +192,20 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     fputc('\n', stderr);
 
     if (ok) {
-        ok = imatrix_collector_save(&collector, weights, output_path);
+        ok = fi->save(e, collection, output_path);
         if (ok) {
             fprintf(stderr,
                     "pulsar: wrote imatrix %s from %d prompts, %d tokens, %llu routed expert observations\n",
                     output_path,
                     prompts_done,
                     tokens_done,
-                    (unsigned long long)collector.observed_routes);
+                    (unsigned long long)fi->routes(collection));
         }
     }
 
-    imatrix_collector_free(&collector);
-    gpu_graph_free(&g);
+    fi->end(e, collection);
     free(dataset);
     return ok ? 0 : 1;
-}
-
-
-int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
-        int                n_predict,
-        int                ctx_size,
-        pulsar_token_emit_fn  emit,
-        pulsar_generation_done_fn done,
-        void              *emit_ud,
-        pulsar_session_progress_fn progress,
-        void              *progress_ud) {
-    auto *e = this;
-    const pulsar_model *model = &e->model;
-    const pulsar_vocab *vocab = &e->vocab;
-    const pulsar_weights *weights = &e->weights;
-
-    /* The raw whole-graph pipeline builds its own graph with no TP transport
-     * and no owned head-group span: under a pair it cannot gather the
-     * attention `low` rows, big-gate the FFN or all-reduce the expert halves,
-     * and the first layer's guard refuses with a message about the GRAPH.
-     * Say it here, once, by name (rule 9): generation under TP rides the
-     * session lane, whose operations the group mirrors (slice 4e). */
-    if (e->tp) {
-        fprintf(stderr, "pulsar: raw whole-graph generation refused under tensor parallelism "
-                        "(rank %d/%u): the path has no TP transport -- generation on a TP "
-                        "engine rides the session lane\n",
-                pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
-        return 1;
-    }
-
-    if (pulsar_backend_uses_graph(e->backend)) {
-        if (!e->gpu_ready) {
-            fprintf(stderr, "pulsar: %s generation requested but the graph backend is unavailable\n",
-                    pulsar_backend_name(e->backend));
-            return 1;
-        }
-        return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size,
-                                            e->prefill_chunk,
-                                            e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale,
-                                            emit, done, emit_ud,
-                                            progress, progress_ud);
-    }
-    return 1;
 }
 
 
@@ -426,8 +341,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         e->dspark_external = false;
         e->dspark_ready = true;
         e->drafter_ops = &k_dspark_drafter;   /* L272 P1: the drafter behind the round API */
-        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
-                e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%u, markov_w2 %s)\n",
+                pulsar_spec_depth_start(e), tensor_type_name(e->dspark_weights.markov_w2->type));
     }
     /* Vision-Exp tower: bound and layout-validated here so a wrong or
      * half-present vision stack refuses at load rather than at first image.
@@ -623,19 +538,19 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
-     * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
-     * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
-     * to +32% prose served decode; distribution-preserving (exact verify) —
-     * byte-identical on structured, near-tie-equivalent on greedy prose (the
-     * verify-width change flips ~1-ULP argmax ties, same class as yield-quench).
-     * The DSpark drafter forward is autoregressive, so its cost scales with the
-     * chain length ON TOP of the verify rows — ms/accepted-token stays flat
-     * ~41-46 ms across k, i.e. depth never amortizes, so shallower wins.
-     * The prior default 5 was a compact-model figure (2026-07-09, conf3 head,
-     * tau 0.35) that does not hold on shipped v5mx at the tau=0.25 default. */
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
-    if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
+    /* The draft schedule's overrides (the numbers are the drafter's, spec_ops.h): the options, else the
+     * environment pair, else 0 = the drafter's own. */
+    e->spec_depth = opt->spec_depth;
+    if (e->spec_depth <= 0) {
+        const char *v = getenv("PULSAR_SPEC_DEPTH");
+        e->spec_depth = v && v[0] ? atoi(v) : 0;
+    }
+    if (e->spec_depth > 16) e->spec_depth = 16;
+    e->spec_tau = opt->spec_tau;
+    if (e->spec_tau == 0.0f) {
+        const char *v = getenv("PULSAR_SPEC_TAU");
+        e->spec_tau = !v || !v[0] ? 0.0f : !strcmp(v, "off") ? -1.0f : (float)atof(v);
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -958,8 +873,10 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
     out->gen_tokens = e->spec_gen_tokens;
     for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
     for (int i = 0; i < 16; i++) out->verified_per_pos[i] = e->spec_verified_per_pos[i];
-    out->max_draft = e->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
-                         ? e->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;   /* L107: waterfall covers the adaptive range */
+    /* L107: the waterfall covers every position the adaptive controller can reach */
+    const uint32_t start = pulsar_spec_depth_start(e);
+    const pulsar_spec_depth_policy *adapt = e->drafter_ops ? e->drafter_ops->adapt : NULL;
+    out->max_draft = (int)(adapt && (uint32_t)adapt->max > start ? (uint32_t)adapt->max : start);
     out->has_drafter = e->drafter_ops != NULL;
 }
 
@@ -1058,10 +975,9 @@ void pulsar_engine::destroy() {
 /* The per-session tensor-parallel scratch (4g-2): the vocab gather's own-slice
  * buffer (pulsar_gpu_graph::tp_vocab_own) -- PULSAR_SPEC_LOGITS_ROWS rows at
  * the widest rank range, rounded up to whole row-lane messages -- and the row
- * lane's stage+publish ticket (tp_stage_ticket, zeroed).  One helper for
- * create AND the admission price (session_cost_bytes_banked), which dry-runs
- * the same steps: a buffer allocated in only one of them is the SESSION COST
- * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
+ * lane's stage+publish ticket (tp_stage_ticket, zeroed).  Part of the create,
+ * so the admission price (session_cost_bytes_banked: the create run dry)
+ * carries it.  Nothing on a box with no row-lane pair. */
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
@@ -1088,26 +1004,33 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 
 
 
-/* Every session is created by its engine's family (family.h). */
-/* L272 P2: every family's session begins here -- the core allocates the session and its own state (the
- * view, the prefill cap, the logits row at the family's width), the family builds its state into it, and
- * the core measures what that allocated on the GPU (the allocator's delta across the create, so callers
- * can reconcile admission estimates against reality). */
-int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
-    if (!out || !e || ctx_size <= 0) return 1;
-    *out = NULL;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+/* Every session is created by its engine's family (family.h).  The ONE build both the create and the price
+ * run: the core allocates the session and its own state (the prefill cap, the logits row at the family's
+ * width), the family builds its state for n_banks into it.  NULL when the family refused. */
+static pulsar_session *session_build(pulsar_engine *e, int ctx_size, uint32_t n_banks) {
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
     s->logits = (float *)xmalloc((size_t)e->logits_width() * sizeof(s->logits[0]));
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
-    if (e->family->session->create(s) != 0) {
+    if (e->family->session->create(s, n_banks) != 0) {
         free(s->logits);
         free(s);
-        return 1;
+        return NULL;
     }
+    return s;
+}
+
+/* L272 P2: every family's session begins here -- session_build at the engine's bank pool, and the core
+ * measures what that allocated on the GPU (the allocator's delta across the create, so callers can
+ * reconcile admission estimates against reality). */
+int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    if (!out || !e || ctx_size <= 0) return 1;
+    *out = NULL;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
+    if (!s) return 1;
     s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
     /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
      * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
@@ -1121,7 +1044,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
 /* The DeepSeek family's session state: the pulsar_gpu_graph (SWA rings, compressed KV and frontiers, bank
  * slabs), steering, the TP scratch and the drafter's buffers, built into a session the core allocated.
  * pulsar_session::create's body until L251. */
-int pulsar_ds4_session_create(pulsar_session *s) {
+int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const int ctx_size = s->ctx_size;
     s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
@@ -1134,7 +1057,7 @@ int pulsar_ds4_session_create(pulsar_session *s) {
     s->graph = (pulsar_gpu_graph *)xcalloc(1, sizeof(*s->graph));   /* L272 P6: the family's own */
     if (!gpu_graph_alloc_raw_cap(s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
-                                   gpu_graph_bank_pool_n(), e->dspark_ready))
+                                   n_banks, e->dspark_ready))
     {
         free(s->graph);
         s->graph = NULL;
@@ -1176,43 +1099,25 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
 }
 
 
-/* The price of pulsar_session::create at this context size IS the create: the
- * same three allocation steps run with the tensor primitives in dry mode
- * (pulsar_gpu_tensor_dry_begin), so the number admission control charges and
- * the number the allocator commits come from one piece of code -- the server
- * checks them equal after every create.  Not in the price, on either side:
- * allocations made on demand after create (gpu_graph_ensure_batch_ffn_out,
- * the multiseq descriptors, the batched-copy descriptor tables); the server's
- * memory floor absorbs those. */
-uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
+/* The price of pulsar_session::create at (ctx_size, n_banks) IS the create: session_build run with the
+ * tensor primitives in dry mode (pulsar_gpu_tensor_dry_begin) and torn down, so the number admission
+ * control charges and the number the allocator commits come from one piece of code for every family --
+ * the server checks them equal after every create.  *managed_bytes (optional) is the demand-paged
+ * (cudaMallocManaged) subset.  Not in the price, on either side: allocations made on demand after create
+ * (gpu_graph_ensure_batch_ffn_out, the multiseq descriptors, the batched-copy descriptor tables); the
+ * server's memory floor absorbs those. */
+uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes) {
     auto *e = this;
-    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
-    return e->family->session->cost_bytes(e, ctx_size, n_banks);
-}
-
-uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
+    if (managed_bytes) *managed_bytes = 0;
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
-    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
-                                                                  e->prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
-    if (!shape_layer) return 0;
-    pulsar_gpu_graph g;
     pulsar_gpu_tensor_dry_begin();
-    const bool ok =
-        gpu_graph_alloc_raw_cap(&g, &e->weights, shape_layer, raw_cap,
-                                (uint32_t)ctx_size, prefill_cap, (uint32_t)n_banks,
-                                e->dspark_ready) &&
-        gpu_graph_load_directional_steering(&g, e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale) &&
-        (!e->dspark_ready ||
-         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids)) &&
-        session_alloc_tp_scratch(&g, e->tp);
-    uint64_t bytes = 0;
-    pulsar_gpu_tensor_dry_end(&bytes, NULL);
-    gpu_graph_release(&g);
+    pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
+    const bool ok = s != NULL;
+    if (s) s->destroy();
+    uint64_t bytes = 0, managed = 0;
+    pulsar_gpu_tensor_dry_end(&bytes, &managed);
+    if (managed_bytes && ok) *managed_bytes = managed;
     return ok ? bytes : 0;
 }
 
@@ -1225,12 +1130,6 @@ uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
     if (!e || ctx_size <= 0) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
     return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
-}
-
-uint64_t pulsar_session::touched_kv_bytes() const {
-    auto *s = this;
-    if (!s) return 0;
-    return gpu_graph_touched_kv_bytes(s->graph);
 }
 
 
@@ -1252,7 +1151,10 @@ void pulsar_session::destroy() {
 
 void pulsar_ds4_session_destroy(pulsar_session *s) {
     if (!s->graph) return;
-    gpu_graph_free(s->graph);
+    /* a priced (dry) session never ran: its placeholders go without resetting the live session's
+     * segment graph */
+    if (pulsar_gpu_tensor_dry_active()) gpu_graph_release(s->graph);
+    else gpu_graph_free(s->graph);
     free(s->graph);
     s->graph = NULL;
 }
@@ -1312,507 +1214,6 @@ bool pulsar_session_cancelled(pulsar_session *s) {
         return stop != 0;
     }
     return s->cancel && s->cancel(s->cancel_ud);
-}
-
-
-static bool pulsar_session_cancelled_cb(void *ud) {
-    return pulsar_session_cancelled((pulsar_session *)ud);
-}
-
-
-
-
-
-static void pulsar_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
-    pulsar_sync_progress *p = (pulsar_sync_progress *)ud;
-    if (!p || !p->session || !p->prompt) return;
-    if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
-        p->session->checkpoint.len = 0;
-        for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
-        p->session->checkpoint_valid = true;
-        p->session->prefill_frontier = current;   /* L195: a prefill wrote up to here */
-    }
-    if (p->user) p->user(p->user_ud, event, current, total);
-}
-
-
-/* Bring the live backend state to exactly the supplied token prefix.
- *
- * pulsar-server and the REPL are stateless at the text/API layer but stateful here:
- * they resend or rebuild the full transcript, and this function decides whether
- * the live checkpoint is a prefix.  A matching prefix is extended in one of two
- * ways:
- *
- *   - long suffix: batched layer-major prefill, aligned to absolute chunk
- *     boundaries so compressor/indexer rows finalize in the same order as a
- *     cold prompt;
- *   - short suffix: ordinary one-token decode, which is faster below the
- *     measured crossover and preserves exact autoregressive semantics.
- *
- * A non-matching prompt discards the checkpoint and prefills from token zero.
- */
-int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *images,
-                         int n_images, char *err, size_t errlen) {
-    auto *s = this;
-    s->resume_origin = -1;
-    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
-        snprintf(err, errlen, "prompt exceeds context");
-        return 1;
-    }
-    if (pulsar_session_cancelled(s)) {
-        snprintf(err, errlen, "interrupted");
-        return PULSAR_SESSION_SYNC_INTERRUPTED;
-    }
-    pulsar_engine *e = s->engine;
-    const char *backend_name = pulsar_backend_name(e->backend);
-
-    /* The image path is refused until the artifact actually carries a bound,
-     * layout-validated tower -- which is what vision_ready has always meant.
-     * An image request is then a COLD prefill from token 0: the reference merges
-     * only on the start_pos == 0 pass and asserts that no sentinel id survives a
-     * continuation, so neither cache-reuse path may run (the extend path and the
-     * L115 seam rescue are both gated on checkpoint_valid). */
-    uint32_t resume_floor = 0;   /* the grid point a licensed image reuse must start from */
-    if (n_images > 0) {
-        if (!e->vision_ready) {
-            snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
-            return 1;
-        }
-        /* Before any state moves: a block that cannot sit whole in one chunk is
-         * refused here (and by the TP leader before it mirrors anything). */
-        if (!pulsar_image_spans_fit(e, prompt->v, prompt->len, images, n_images, s->graph->prefill_cap, NULL, err,
-                                    errlen))
-            return 1;
-        /* L226 + L261: reuse the live KV across an image request.  The images the
-         * checkpoint already holds must be exactly the live set -- the fingerprint
-         * is the pixels, since block ids are only geometry (image_set_fingerprint)
-         * -- and every other image must begin at or after the checkpoint, so the
-         * resumed prefill merges it in the chunk that owns it (the planner never
-         * splits a block).  Anything else -- a different image, a block that
-         * straddles the checkpoint, an edited history -- clears checkpoint_valid and
-         * the cold pass merges every image from token 0.
-         *
-         * L281: a disk chain holds an image's rows only with that image's record, and a restore loads past a block
-         * only when the request brings the same image there (pulsar_kvchain_restore), so a restored history's
-         * records are what this licence compares; a LATER prompt whose sentinel ids outlive their images is still
-         * refused by the scan below. */
-        /* L268: the licence is the core's (image_front.cpp, pulsar_image_licence_decide) -- the common prefix with
-         * the live tokens, whether the prompt EXTENDS them, the blocks that straddle it, and whether the held
-         * images' records are exactly the live ones.  A prompt that stops short of the live tokens or diverges -- a
-         * seam (sampled vs canonical ids below the live tail: every tool-continuation turn appends its reply as
-         * sampled ids and a regular turn re-sends the history canonically tokenized; the pair 2026-10-06 20:47, bytes
-         * matched to 222,215, ids to ~155,700, and the licence's own restore re-prefilled 66k tokens where a text turn
-         * pays ~1k), a shorter echo, a rollback -- is the seam rescue's below: it rewinds to the byte-matched live
-         * token, re-places every image block on the stitched tokens and re-enters, and this licence then decides on an
-         * extension.  checkpoint_valid stays for it; an empty bank falls through to the cold rebuild unannounced. */
-        pulsar_image_licence lic;
-        pulsar_image_licence_decide(s, prompt, images, n_images, &lic);
-        if (s->checkpoint_valid && !lic.extends_live)
-            fprintf(stderr, "pulsar: image request: the prompt leaves the live history at token %u of %u "
-                            "-- taking the seam rescue\n", lic.common, lic.live_len);
-        if (lic.extends_live) {
-            /* The one image-specific constraint on the resume below: the grid checkpoint it restores must lie at or
-             * above the end of the last HELD block, so no merged row is re-evaluated (a B below the floor prefills
-             * from 0).  Everything else is the text path's and runs below unchanged: a bank whose compressor state
-             * is stale resumes from its grid checkpoint (L264; before, the licence declined it and rebuilt from 0 --
-             * the pair 2026-10-06 17:58, 581k tokens), a prompt short of the live tail takes the seam rescue's
-             * rewind+stitch, and a history this bank does not hold rebuilds cold. */
-            resume_floor = lic.held_end > 0
-                ? pulsar_ckpt_grid_floor(&s->graph->ckpt, lic.held_end + s->graph->ckpt.ops->resume_grid - 1u)
-                : 0u;
-            if (!lic.keep) {
-                fprintf(stderr, "pulsar: image request: the live history's images are not this prompt's (%s) "
-                                "-- rebuilding cold\n",
-                        lic.straddles ? "a block straddles the common prefix" : "different images or blocks");
-                s->checkpoint_valid = false;
-            } else {
-                fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
-                                "(merged where their blocks fall) -- reuse licensed\n",
-                        lic.n_held, lic.live_len, lic.n_new);
-            }
-        }
-    } else {
-        /* A prompt carrying sentinel ids with no image to fill them would prefill rows whose embeddings never
-         * arrived (the embedder zero-masks an out-of-vocab id, and only the merge puts anything there), so refuse it
-         * here instead of silently serving a wrong answer (L268: the core's scan, pulsar_image_refuse_orphans). */
-        if (!pulsar_image_refuse_orphans(e, prompt, err, errlen)) return 1;
-    }
-
-    /* The images are BORROWED for exactly this sync's prefill -- the resume
-     * below as well as the cold rebuild: a licensed resume merges the NEW images
-     * in the chunks that own their blocks (L261; before, only the cold path set
-     * the borrow and a resumed image prefilled its sentinels zero-masked).  The
-     * driver reads them off the graph so that four prefill signatures do not
-     * grow a parameter that only this caller can ever fill; the scope clears the
-     * borrow on every exit, including the interrupted ones and the seam rescue's
-     * re-entry, so no later decode can see it. */
-    struct vision_scope {
-        pulsar_gpu_graph *g;
-        const pulsar_vision_request *prev;
-        vision_scope(pulsar_gpu_graph *g_, const pulsar_vision_request *r)
-            : g(g_), prev(g_->vision_req) { g->vision_req = r; }
-        ~vision_scope() { g->vision_req = prev; }
-    };
-    pulsar_vision_request vreq = { images, n_images, e };
-    vision_scope vscope(s->graph, n_images > 0 ? &vreq : NULL);
-    /* L281: what the KV holds of this request's images -- the blocks that end at or below `limit` (the checkpoint
-     * after a prefill, interrupted or not).  A text sync leaves the records alone: its prefix keeps its blocks. */
-    auto note_images = [&](uint32_t limit) {
-        if (n_images > 0 && !pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
-                                                         n_images, limit, &s->live_images))
-            s->live_images.n = 0;
-    };
-
-    /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
-     * carry path re-prefills from a grid point at or above the salvage floor and
-     * the rebuild path prefills from 0 -- so a decode is legal again once it
-     * returns.  Cleared here rather than in either arm because BOTH make the
-     * session decodable again (and the carry path returns early). */
-    /* a sync begins a new request: any carry left by a max-tokens/stop-string
-     * truncated generation belongs to the previous request's distribution.
-     * (position stamping alone misses a same-length full rebuild.) */
-    s->spec.spec_carry_valid = false;
-    /* Same argument, same blind spot: the pendings' position stamp cannot see a
-     * rebuild that lands on the same length, and a sampled draft's q belongs to
-     * the previous request's distribution. Dropping them here costs one draft
-     * round at the start of a request and is the only guard that covers it. */
-    pulsar_spec_drop_pendings(&s->spec);
-    /* A sync begins a new request: re-arm the terminal yield quench. */
-    spec_quench_reset(s);
-
-    if (s->checkpoint_valid &&
-        prompt->len >= s->checkpoint.len &&
-        pulsar_tokens_starts_with(prompt, &s->checkpoint))
-    {
-        /* L148 self-heal.  The checkpoint says the installed bank holds
-         * checkpoint.len tokens; the bank's compressed frontier says how far
-         * its KV actually reached.  A frontier AHEAD of the checkpoint means
-         * the bank kept decoding after this checkpoint was recorded and the
-         * history was never folded back (the plain batched lane keeps
-         * generated tokens server-side and folds them late; the spec lane
-         * appends per round).  Trusting the checkpoint then either returns
-         * early (suffix 0 -- the L148 repro: a 32-token repeat prompt on a
-         * bank at 288, "frontier not position-true ... n_comp 72 want 8") or
-         * prefills a suffix onto rows the frontier already counts.  A counter
-         * can only be AHEAD of a position it must be rewound to, so rewind to
-         * the checkpoint first: L120's clamp, applied where the stale copy is
-         * consumed.  Cost: one host loop over the layers per sync. */
-        {
-            const uint32_t bank = gpu_graph_cur_bank(s->graph);
-            bool ahead = false;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER && !ahead; il++) {
-                if (!gpu_graph_layer_is_kv_source(il)) continue;
-                if (gpu_graph_n_comp(s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
-                    ahead = true;
-            }
-            if (ahead) s->rewind(s->checkpoint.len);
-        }
-        /* A cut -- a rewind (ours just above, the seam rescue's that re-entered
-         * here, a stop's ghost tail) or a restore to a grid checkpoint (a disk
-         * chain's load, L264) -- leaves s->logits describing some other position
-         * (logits_stale).  With
-         * rows still to evaluate the prefill below refreshes them; with none
-         * (the prompt is exactly the cut: a retried or regenerated request on a
-         * bank that went on to answer it) they would be a finished answer's
-         * distribution, and the request sampled EOS and returned nothing
-         * (2026-09-30, the pair: the same 16-token prompt twice, the second
-         * 0 tokens).  Owe one row: step back one token, and the resume below
-         * re-prefills from its grid point, byte for byte the cold prefill. */
-        if (s->logits_stale && prompt->len == s->checkpoint.len) s->rewind(prompt->len - 1);
-        /* L183/L194/L195/L264: a resume is a COLD PREFILL FROM A GRID POINT.  A
-         * prefill chunk's bytes depend on the chunk's row count and on a row's
-         * offset within the call (L183), so a suffix evaluated from an off-grid
-         * position is a different computation from the cold prefill of the same
-         * tokens.  The rule: G = the last multiple of the resume grid (kv_state.h) at or
-         * below the PREFILL frontier (decode rows are the decode kernels'; the
-         * tokens generated since are recomputed); restore the deepest grid
-         * checkpoint at or below G, which the prefill that reached G captured
-         * (L264); evaluate from there: every chunk boundary and every kernel call
-         * is the cold prefill's.  A bank already standing at G with its state
-         * live has nothing to redo; a bank with no checkpoint below G prefills
-         * from 0, said once. */
-        if (prompt->len > s->checkpoint.len && s->prefill_cap != 0) {
-            const uint32_t bank = gpu_graph_cur_bank(s->graph);
-            const uint32_t ck = (uint32_t)s->checkpoint.len;
-            uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
-            if (pf > ck) pf = ck;
-            const uint32_t G = pulsar_ckpt_grid_floor(&s->graph->ckpt, pf);
-            /* the one resume rule (L272 P2; Qwen's sync and bank_resume_at read it too): the deepest
-             * checkpoint within the shared prefix (ck: this path extends it) and the prefill frontier --
-             * checkpoints sit on the grid, so that is the deepest at or below G */
-            uint32_t B = pulsar_session_resume_point(s, bank, (int)ck, prompt->len);
-            /* L226: an image request's reuse may not RE-EVALUATE a row inside an
-             * image block: a checkpoint below the floor the licence set (the grid
-             * point above the last held block) is not a resume point, and the
-             * prefill restarts from 0 -- every block merged again. */
-            if (resume_floor > 0 && B < resume_floor) B = 0u;
-            if (G == ck && !s->graph->ms_comp_state_stale[bank]) {
-                s->resume_origin = (int)ck;   /* standing at a prefill grid point: nothing to redo */
-            } else if (B > 0u && s->restore_checkpoint(B)) {
-                s->resume_origin = (int)B;
-                fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
-                        ck, B, bank, ck - B);
-            } else {
-                if (ck >= s->graph->ckpt.ops->resume_grid)
-                    fprintf(stderr, "pulsar: resume at %u on bank %u: no grid checkpoint at or below %u -- "
-                                    "prefilling the prompt from 0\n", ck, bank, G);
-                s->rewind(0);
-                s->checkpoint_valid = true;   /* position 0: the canonical state, whatever the restore left */
-                s->resume_origin = 0;
-            }
-        }
-        const int suffix = prompt->len - s->checkpoint.len;
-        if (suffix > 0) {
-            bool cancelled = false;
-            pulsar_sync_progress progress = {
-                .session = s,
-                .prompt = prompt,
-                .user = s->progress,
-                .user_ud = s->progress_ud,
-            };
-            bool ok = gpu_graph_prefill_chunked_range(s->graph,
-                                                        &e->model,
-                                                        &e->weights,
-                                                        prompt,
-                                                        (uint32_t)s->checkpoint.len,
-                                                        (uint32_t)suffix,
-                                                        s->logits,
-                                                        false,
-                                                        pulsar_session_note_prefill_progress,
-                                                        &progress,
-                                                        s->display_progress,
-                                                        s->display_progress_ud,
-                                                        NULL,
-                                                        pulsar_session_cancelled_cb,
-                                                        s,
-                                                        &cancelled);
-            if (cancelled) {
-                snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = true;
-                /* L281 (b): the blocks this prefill completed are live, so the next quantum's licence holds them */
-                note_images((uint32_t)s->checkpoint.len);
-                return PULSAR_SESSION_SYNC_INTERRUPTED;
-            }
-            if (!ok) {
-                snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
-                s->checkpoint_valid = false;
-                return 1;
-            }
-            pulsar_tokens_copy(&s->checkpoint, prompt);
-            s->checkpoint_valid = true;
-            s->prefill_frontier = prompt->len;   /* L195 */
-            s->logits_stale = false;
-            /* L281: the licence above admitted this prompt's whole image set -- the held blocks
-             * and the NEW ones this extension just merged -- so that set is what is live now.
-             * The identity used to survive an extension unchanged, which was right for a text
-             * extension and wrong for one that merged an image: the next request, even an exact
-             * replay, found a held block the identity did not know and rebuilt cold (the pair
-             * 2026-10-07 13:11, 320k tokens from 0 for a 0-token suffix). */
-            note_images((uint32_t)prompt->len);
-            return 0;
-        }
-
-        /* L131: suffix == 0 means the checkpoint already IS the prompt --
-         * nothing to evaluate.  The single-token fallback that used to live
-         * here is gone with its encoder; every positive suffix takes the
-         * batched branch above. */
-        note_images((uint32_t)prompt->len);   /* L281: the same set, restated (held == live by the licence) */
-        return 0;
-    }
-
-    /* L115 seam rescue: before surrendering to a full rebuild, check whether
-     * the id mismatch is only sampled-vs-canonical TOKEN BOUNDARY drift.
-     * If the prompt's bytes match the live history's bytes up to a shared
-     * boundary past the id divergence, the live KV IS this conversation's
-     * true history (it carries the boundaries the model actually sampled) —
-     * keep it: rewind to the matched live token, stitch
-     * live[0..live_n) + prompt[prompt_n..], and re-enter sync, which now
-     * takes the extend path.  One recursion level by construction (the
-     * stitched prompt starts_with the rewound checkpoint). */
-    if (s->checkpoint_valid) {
-        pulsar_prefix_match m;
-        s->prefix_match(prompt, &m);
-        const int live_n = m.live_cut, prompt_n = m.prompt_cut;
-        /* Fires for every shape that reaches here with reusable live bytes:
-         *   - SEAM: live_n > id-common (sampled vs canonical boundaries);
-         *   - SHORTER ECHO: the client strips generated reasoning, so live
-         *     carries a tail the prompt does not (live_n < checkpoint.len)
-         *     -- measured 2026-08-28, live 390,258 vs echo 390,018;
-         *   - ROLLBACK/COMPACTION: the prompt is a strict prefix of live.
-         * All three are the same conversation, so the rewind+stitch below
-         * beats a rebuild; stitching is never worse (prompt_n >= 0).
-         *
-         * L226/L273: an IMAGE request takes this route too -- a regular turn after
-         * tool continuations (the live tail is sampled ids, the prompt canonical),
-         * a replayed visible reply (the prompt shorter than live).  The images ride
-         * into the re-entry with their start_pos RE-PLACED on the stitched tokens:
-         * a block below the seam sits at its live position (which the prompt's
-         * canonical ids may have shifted), a block above it moves with the suffix,
-         * and the images arrive in prompt order, so the stitched prompt's sentinel
-         * blocks, walked in order, are their positions.  A stitch that cuts a block
-         * (the walk finds a malformed span) or leaves a block count the request's
-         * images do not match declines, said by name, and the cold rebuild merges
-         * from token 0. */
-        if (live_n > 0) {
-            pulsar_tokens stitched;
-            memset(&stitched, 0, sizeof(stitched));
-            stitched.v = (int *)xmalloc(
-                    (size_t)(live_n + (prompt->len - prompt_n)) * sizeof(int));
-            stitched.cap = live_n + (prompt->len - prompt_n);
-            memcpy(stitched.v, s->checkpoint.v, (size_t)live_n * sizeof(int));
-            memcpy(stitched.v + live_n, prompt->v + prompt_n,
-                   (size_t)(prompt->len - prompt_n) * sizeof(int));
-            stitched.len = stitched.cap;
-            enum { STITCH_IMAGES_MAX = 64 };
-            pulsar_image_ref placed[STITCH_IMAGES_MAX];
-            bool placed_ok = n_images <= STITCH_IMAGES_MAX;
-            if (placed_ok && n_images > 0) {
-                int starts[STITCH_IMAGES_MAX];
-                const int nb = pulsar_image_block_starts(e, &stitched, stitched.len, starts, STITCH_IMAGES_MAX);
-                placed_ok = nb == n_images;
-                for (int i = 0; placed_ok && i < n_images; i++) {
-                    placed[i] = images[i];
-                    placed[i].start_pos = starts[i];
-                }
-                if (!placed_ok)
-                    fprintf(stderr, "pulsar: image request: the stitched prompt (live %d + suffix from %d) carries "
-                                    "%d image block(s) for %d image(s) -- rebuilding cold\n",
-                            live_n, prompt_n, nb, n_images);
-            }
-            if (placed_ok) {
-                s->rewind(live_n);
-                const int rc = s->sync(&stitched, n_images > 0 ? placed : NULL,
-                                       n_images > 0 ? n_images : 0, err, errlen);
-                free(stitched.v);
-                return rc;
-            }
-            free(stitched.v);
-        }
-    }
-
-    bool ok;
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    s->live_images.n = 0;   /* L281: a rebuild replaces every row; the old records described them */
-    if (!gpu_graph_reset_prefill_state(s->graph)) {
-        snprintf(err, errlen, "%s prefill state reset failed", backend_name);
-        return 1;
-    }
-    /* The rebuild path is the one place this session's per-bank truth is
-     * legitimately re-established: reset_prefill_state zeroes
-     * ms_n_comp[cur_bank] and the prefill below
-     * refills them from zero against the installed bank.  Other banks hold
-     * other slots' positions and a reset here says nothing about them.
-     *
-     * (Before stage 1b this zeroed the scalar twins, whose second job was
-     * clearing a stale multiseq superset; there is no superset any more, so
-     * that job went with them.  The prefix-resume path above still cannot be
-     * reached while dirty — decode_multiseq clears checkpoint_valid, which
-     * that path gates on.) */
-    s->mseq_dirty = false;
-    /* L264: every cold prompt goes through the chunk loop, short ones included:
-     * it is what splits the final chunk at the last grid point and captures the
-     * checkpoint there, so the next turn resumes instead of re-prefilling.  A
-     * prompt inside one chunk is the same computation either way (chunk
-     * neutrality). */
-    {
-        bool cancelled = false;
-        pulsar_sync_progress progress = {
-            .session = s,
-            .prompt = prompt,
-            .user = s->progress,
-            .user_ud = s->progress_ud,
-        };
-        ok = gpu_graph_prefill_chunked(s->graph, &e->model, &e->weights,
-                                         prompt, prompt->len, s->logits, false,
-                                         pulsar_session_note_prefill_progress, &progress,
-                                         s->display_progress,
-                                         s->display_progress_ud,
-                                         pulsar_session_cancelled_cb,
-                                         s,
-                                         &cancelled);
-        if (cancelled) {
-            snprintf(err, errlen, "interrupted");
-            s->checkpoint_valid = s->checkpoint.len > 0;
-            note_images((uint32_t)s->checkpoint.len);   /* L281 (b) */
-            return PULSAR_SESSION_SYNC_INTERRUPTED;
-        }
-    }
-    if (!ok) {
-        snprintf(err, errlen, "%s prefill failed", backend_name);
-        s->checkpoint_valid = false;
-        return 1;
-    }
-    pulsar_tokens_copy(&s->checkpoint, prompt);
-    s->checkpoint_valid = true;
-    s->prefill_frontier = prompt->len;   /* L195 */
-    s->logits_stale = false;
-    /* A rebuild replaces what the checkpoint describes, so the records go with it: this pass merged THESE images,
-     * or there are none in the prompt at all. */
-    note_images((uint32_t)prompt->len);
-    return 0;
-}
-
-
-/* Return true when canonicalization would replace already-sampled tokens.
- *
- * A DS4 session checkpoint is more than a token vector: the backend state also
- * contains raw SWA rows, compressed KV rows, indexer rows, and compressor
- * frontiers.  Replacing any part of the live tail requires restoring that whole
- * frontier first.  Extending exactly at the live end is safe; rewriting behind
- * it is not an in-place operation. */
-bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
-    if (live_len < 0 || canonical_len < 0 || common < 0) return true;
-    if (common > live_len || common > canonical_len) return true;
-    return common < live_len;
-}
-
-
-/* Replace the live suffix after a shared prefix.
- *
- * This is used after parsing a generated tool call.  The model may have emitted
- * DSML in an order that is semantically valid but not byte-for-byte equal to the
- * canonical prompt we will see on the next request.  Rewriting only the token
- * checkpoint is not enough: the backend still contains raw and compressed rows
- * for the old suffix.  Until we have a real frontier snapshot at the
- * rewrite point, any replacement behind the live end reports that a rebuild is
- * needed without mutating the session.  The server may still find an older disk KV
- * checkpoint before falling back to a full replay. */
-pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_tokens *prompt, int common,
-        char *err, size_t errlen) {
-    auto *s = this;
-    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
-        snprintf(err, errlen, "prompt exceeds context");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    if (!s->checkpoint_valid) {
-        snprintf(err, errlen, "session has no valid checkpoint");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    if (common < 0 || common > s->checkpoint.len || common > prompt->len) {
-        snprintf(err, errlen, "invalid rewrite prefix");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    for (int i = 0; i < common; i++) {
-        if (s->checkpoint.v[i] != prompt->v[i]) {
-            snprintf(err, errlen, "rewrite prefix does not match live checkpoint");
-            return PULSAR_SESSION_REWRITE_ERROR;
-        }
-    }
-
-    if (common == s->checkpoint.len) {
-        return s->sync(prompt, NULL, 0, err, errlen) == 0 ?
-            PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
-    }
-
-    if (pulsar_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
-        snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
-                 common, s->checkpoint.len, prompt->len);
-        return PULSAR_SESSION_REWRITE_REBUILD_NEEDED;
-    }
-
-    snprintf(err, errlen, "unexpected canonical rewrite state");
-    return PULSAR_SESSION_REWRITE_ERROR;
 }
 
 
@@ -2056,148 +1457,6 @@ bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, s
     return false;
 }
 
-int pulsar_session::eval(int token, char *err, size_t errlen) {
-    auto *s = this;
-    if (!s) return 1;
-    /* Fail loud rather than corrupt: after a multiseq step the graph's scalar
-     * frontier counters hold a cross-bank superset, so this decode would emit
-     * its compressor row at the superset index and attend over another bank's
-     * rows — wrong logits, silently.  pulsar_session_sync re-establishes per-bank
-     * state (rebuild path) and clears the flag. */
-    if (s->mseq_dirty) {
-        snprintf(err, errlen,
-                 "session eval after a multiseq decode step: this session's "
-                 "per-bank state needs re-establishing; re-sync the session "
-                 "first");
-        return 1;
-    }
-    /* L264: same shape for a rewind that left the bank stale -- its compressor
-     * lanes and raw window describe a position it no longer stands at.  A sync
-     * restores a grid checkpoint (or rebuilds from 0) and clears this. */
-    if (s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)]) {
-        snprintf(err, errlen,
-                 "session eval after a rewind to %d: the bank's state is only valid at its grid "
-                 "checkpoints; re-sync the session first", s->checkpoint.len);
-        return 1;
-    }
-    pulsar_engine *e = s->engine;
-    /* L188: a refused sample is -1 (PULSAR_SAMPLE_REFUSED); the embed kernel
-     * would clamp it to token 0 and the step would look like a good one.  The
-     * check runs in every family's eval, for every caller that feeds a sampled
-     * token back (server lanes, CLI, agent, eval): a non-id fails the request. */
-    if (!pulsar_session_token_is_id(s, token, err, errlen)) return 1;
-    /* Steady-state decode must reuse preallocated scratch, never touch the host
-     * heap. The guard is a no-op unless PULSAR_ALLOC_GUARD is set, so this is
-     * free in production; armed, it makes any xmalloc/xrealloc inside the decode
-     * fatal. Only the eval is guarded -- token_vec_push below legitimately grows
-     * the checkpoint. */
-    /* ONE LANE.  This used to call gpu_graph_eval_token_raw_swa -- a whole
-     * parallel single-token graph encoder -- while the server decoded through
-     * gpu_graph_decode_multiseq_batch.  Two lanes meant every tool built on the
-     * classic API (pulsar-bench, pulsar-eval, pulsar-cli, several gates) measured
-     * code production never executes, which is how a dead fusion survived and
-     * how five instruments in a row measured nothing (L129).
-     *
-     * A 1-row batch on this session's own bank is the same work: bank 0 maps to
-     * the classic tensors when no pool is allocated (gpu_graph_bank_raw_pool
-     * falls back to layer_raw_cache, gpu_graph_bank_pool_count reports 1), so
-     * this costs no extra slab and no extra memory.
-     *
-     * The classic flags stay untouched deliberately, and that is SOUND rather
-     * than convenient: decode_multiseq must invalidate because its scalar
-     * frontier counters end up holding a cross-bank superset. A superset over
-     * exactly one touched bank IS that bank's truth -- and the mseq_dirty guard
-     * above already establishes that the counters were this bank's truth on
-     * entry. Both conditions are required; neither alone is enough. Nothing
-     * here weakens pulsar_session_decode_mixed's contract for its own callers. */
-    int     ms_tok[1]  = { token };
-    int32_t ms_pos[1]  = { (int32_t)s->checkpoint.len };
-    int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
-    /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep. */
-    const int ms_rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights,
-                                                      ms_tok, ms_pos, ms_bank, 1u,
-                                                      s->logits, NULL, 0u,
-                                                      /*capture_cur=*/true, NULL);
-    const bool decode_ok = (ms_rc == 1);
-    if (!decode_ok) {
-        snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
-        s->checkpoint_valid = false;
-        return 1;
-    }
-    token_vec_push(&s->checkpoint, token);
-    s->logits_stale = false;
-    /* a token evaluated outside the speculative path (tool injection, plain
-     * fallback loops) advances the state past any in-flight carry */
-    s->spec.spec_carry_valid = false;
-    return 0;
-}
-
-
-void pulsar_session::note_committed_tokens(const int *toks, int n) {
-    auto *s = this;
-    if (!s || !toks || n <= 0) return;
-    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
-}
-
-
-int pulsar_session::note_prefilled(const int *toks, int n, int head) {
-    auto *s = this;
-    if (!toks || n <= 0) return 1;
-    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
-        fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
-                head, s->fused_logits ? s->fused_heads : 0u);
-        return 1;
-    }
-    s->note_committed_tokens(toks, n);
-    /* The checkpoint now describes exactly the bank's committed KV, as after a
-     * classic sync: it started empty (an invalidated bank) or as the valid
-     * prefix this prompt extends.  Left invalid, the bank's frontier read 0 and
-     * the next chunk restarted the prompt at position 0 over rows it had already
-     * committed ("frontier not position-true ... n_comp 61 want 0"). */
-    s->checkpoint_valid = true;
-    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
-    /* L264: a fused chunk that ends on the grid leaves the bank exactly where
-     * a prefill to that point leaves it -- a checkpoint, as the chunk loop takes
-     * one at every grid chunk end, so the fused lane's prompts resume like the
-     * classic sync's.  (The server's fused planners end chunks on grid points.) */
-    const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % s->graph->ckpt.ops->resume_grid == 0u && G >= s->graph->ckpt.ops->min_checkpoint(s->graph->ckpt.state) &&
-        !s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)])
-        (void)pulsar_ckpt_capture(&s->graph->ckpt, gpu_graph_cur_bank(s->graph), G);
-    if (head >= 0)
-        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
-               (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
-    return 0;
-}
-
-
-void pulsar_session::invalidate() {
-    auto *s = this;
-    /* L260 (fusion phase A): an invalidated bank is EMPTY on the device too --
-     * its compressed frontier at the position law for 0 and its compressor
-     * group empty -- so any lane may start it at position 0.  The classic
-     * from-zero prefill reset those itself, which left a reused bank's
-     * counters at the dead conversation's frontier until then; a from-zero
-     * run riding a mixed step was refused ("frontier not position-true ...
-     * n_comp 625 want 0", mixed_zero_prefill_gate, dirty bank). */
-    s->rewind(0);
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    pulsar_spec_drop_pendings(&s->spec);
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
-    /* The drafter's context-KV ring must not survive into a new prompt: it was
-     * never reset before, so in the server every request after the first
-     * attended over the PREVIOUS request's window rows for its first ~128
-     * generated tokens (and the drafter is near-useless without a valid
-     * window: masked-window eval 4.7% vs 86% top-1). Positions are
-     * drafter-relative, so restarting at 0 is exact. */
-    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
-    s->graph->dspark_prompt_n = 0;
-    s->prefill_frontier = 0;   /* L195: the history is gone */
-}
-
-
 /* Trim the committed history back to pos WITHOUT touching the KV content
  * below it. The caller owns the invariant that positions >= pos were never
  * exposed to the client (ghost tokens from a mid-block speculative stop);
@@ -2263,9 +1522,7 @@ void pulsar_session::trim_history(int pos) {
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
     pulsar_image_identity_trim(&s->live_images, (uint32_t)(pos < 0 ? 0 : pos));
     s->checkpoint.len = pos;
-    pulsar_spec_drop_pendings(&s->spec);
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
+    spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
@@ -2313,43 +1570,4 @@ int pulsar_session_prefill_cap(pulsar_session *s) {
 }
 
 
-/* Multi-session serving: is interrupting pulsar_session_sync() at a chunk
- * boundary (cancel callback) and re-issuing the sync bit-identical to letting
- * it run to completion?
- *
- * Two conditions must hold, and the return value encodes both:
- *
- *   - gpu_graph_prefill_chunked_range caps resumed (start != 0) chunks at
- *     raw_cap. If this session's cold chunks are larger (prefill_cap >
- *     raw_cap), a resumed prefill would re-chunk on different boundaries,
- *     changing batch shapes and therefore cuBLASLt algo selection; exact
- *     replay is lost. Return 0: the caller must not interrupt at all.
- *
- *   - There USED to be a third condition: below a crossover, sync extended the
- *     checkpoint by single-token decode evals instead of a batched chunk, so
- *     interrupting with less than that left would change which path evaluated
- *     the tail. L131 deleted the single-token encoder, so the tail is always a
- *     batched chunk and the hazard cannot arise. Any positive suffix resumes
- *     exactly; the minimum is simply 1. */
-uint32_t pulsar_session::prefill_quantum_min_suffix() const {
-    auto *s = this;
-    if (!s) return 0;
-    if (s->graph->prefill_cap > s->graph->raw_cap) return 0;
-    /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
-     * compress-ratio LCM, while a resumed (start!=0) loop snaps to absolute
-     * prefill_cap boundaries. The two produce the same chunk ends only when
-     * prefill_cap itself is LCM-aligned (true for the 4096/8192 defaults; a
-     * hand-set --prefill-chunk may not be). */
-    uint32_t align = 1;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t r = pulsar_layer_compress_ratio(il);
-        if (r > 1 && align % r != 0) {
-            uint32_t a = align, b = r;
-            while (b) { const uint32_t t = a % b; a = b; b = t; }
-            align *= r / a;
-        }
-    }
-    if (align > 1 && s->graph->prefill_cap % align != 0) return 0;
-    return 1u;
-}
 

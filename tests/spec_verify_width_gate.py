@@ -92,7 +92,7 @@ def main():
 
     bad = []
     for w in widths:
-        out = run(a.binary, a.model, a.prompt, a.tokens, ["--dspark-draft", str(w)])
+        out = run(a.binary, a.model, a.prompt, a.tokens, ["--spec-depth", str(w)])
         if out is None:
             bad.append((w, "run failed"))
             continue

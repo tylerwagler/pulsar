@@ -142,7 +142,8 @@ typedef struct {
     const char *expert_overlay;
     pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
     uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default (PULSAR_PREFILL_CHUNK_DEFAULT for prompts longer than it, else the whole prompt)
-    int dspark_draft_tokens;     ///< drafter depth k; 0 = model/engine default
+    int spec_depth;              ///< the drafter's starting draft depth (--spec-depth); 0 = PULSAR_SPEC_DEPTH, else the drafter's
+    float spec_tau;              ///< the draft stop threshold (--spec-tau); 0 = PULSAR_SPEC_TAU, else the drafter's; < 0 = no stop
     const char *directional_steering_file;  ///< steering-vector file, or NULL
     float directional_steering_attn;        ///< steering scale on the attention stream
     float directional_steering_ffn;         ///< steering scale on the FFN stream
@@ -172,9 +173,6 @@ typedef struct {
      *  then refused there as misses. */
     const char *tp_kv_dir;
 } pulsar_engine_options;
-
-typedef void (*pulsar_token_emit_fn)(void *ud, int token);
-typedef void (*pulsar_generation_done_fn)(void *ud);
 
 /** GPU byte breakdown of one bank's context buffers at a given context size,
  * in the stored KV row formats (packed NVFP4 attention rows, MXFP4 indexer
@@ -210,9 +208,7 @@ int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
  * pulsar_session_* operation on a worker is refused by name. */
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e);
 /** Any rank of a TP group (leader included).  Generation on such an engine
- * rides the session lane, whose operations the group mirrors (slice 4e); the
- * raw whole-graph path (pulsar_engine_generate_argmax) has no transport and
- * refuses by name. */
+ * rides the session lane, whose operations the group mirrors (slice 4e). */
 bool pulsar_engine_is_tp(const pulsar_engine *e);
 /** The engine's TP transport, or NULL when it is not tensor-parallel.  For
  * read-only operator views (pulsar-server's /health tp block) that read the
@@ -234,6 +230,8 @@ int pulsar_engine_vocab_size(pulsar_engine *e);
  * check it against pulsar_engine_vocab_size. */
 int pulsar_engine_logits_width(const pulsar_engine *e);
 const char *pulsar_engine_model_name(pulsar_engine *e);
+/** The id the API serves the loaded model as -- the family's (L284: was a family switch in the server). */
+const char *pulsar_engine_served_model_id(const pulsar_engine *e);
 /** Does the loaded model use the V4.1 conversation TEMPLATE?  The server's chat
  * renderer needs the fact: V4 (0731) and V4.1 were trained on different
  * templates -- the DSML tag spelling, the tools-prompt text, where the tool
@@ -280,7 +278,7 @@ typedef struct {
     uint64_t gen_tokens;            ///< tokens emitted by the spec loop
     uint64_t accepted_per_pos[16];  ///< accepted count per draft position
     uint64_t verified_per_pos[16];  ///< count of rounds verifying position i; rate[i] = accepted_per_pos[i]/verified_per_pos[i]
-    int      max_draft;             ///< configured draft depth (pulsar_engine_options::dspark_draft_tokens)
+    int      max_draft;             ///< the deepest draft position a round can verify (the start depth, or the adaptive controller's ceiling)
     bool     has_drafter;           ///< a drafter is loaded behind the round API (the counters above can move)
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
@@ -378,7 +376,10 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
  * history as segments) and repointed away from it.
  * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
  * the base-pointer table; the caller then reloads its KV (the server from its
- * segment chain).
+ * segment chain).  A family pool (Qwen, L284 #3) frees and re-backs its bank's own
+ * demand-paged KV + index tensors the same way (its always-resident state stays).
+ * free_physical returns false ONLY when it refuses (the live/installed bank, a bank
+ * out of range) and then frees nothing.
  * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
  * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);
@@ -398,13 +399,6 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e);
 bool pulsar_log_is_tty(FILE *fp);
 void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...);
-int pulsar_engine_generate_argmax(pulsar_engine *e, const pulsar_tokens *prompt,
-                               int n_predict, int ctx_size,
-                               pulsar_token_emit_fn emit,
-                               pulsar_generation_done_fn done,
-                               void *emit_ud,
-                               pulsar_session_progress_fn progress,
-                               void *progress_ud);
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -458,24 +452,42 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 size_t pulsar_tool_result_escape(const char *s,
                                  void (*emit)(void *ud, const char *bytes, size_t n),
                                  void *ud);
-/** DeepSeek's chat template, built from marker ids: pulsar_chat_begin, _append_lead_in,
- * _append_message and _append_assistant_prefix end the process on a Qwen engine (its chat is rendered
- * whole).  pulsar_encode_chat_prompt serves both: a Qwen engine renders [system,] user through
- * qwen_chat_render, as the server does; its think_mode is PULSAR_THINK_NONE or PULSAR_THINK_DEFAULT
- * (the template's default effort) -- any other effort ends the process, never a neighbouring one. */
-void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens);
+/** One message of a chat turn (pulsar_chat_append_turn). */
+typedef struct {
+    const char *role;     ///< "user", "tool" (a tool result), or "system" (a note: the head's region before any
+                          ///< turn, a mid-conversation system note after one)
+    const char *content;  ///< client text (NULL = empty)
+    /** `content` is the front end's own control text, written in the loaded family's markers (the agent's
+     *  DSML tool prompt): DeepSeek tokenizes it as rendered chat; a family whose markers it does not spell
+     *  renders it as text. */
+    bool trusted;
+} pulsar_chat_message;
+
+/** The family's chat front, turn by turn (L284 P14): the CLI REPL and the agent build a live transcript with
+ * these on every family, each piece rendered WHOLE by the family's own renderer (DeepSeek's marker template;
+ * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
+ * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
+ * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.
+ *
+ * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
+ * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
+ * client `system` text (NULL = none).  Appended to `tokens`, which a caller starts empty. */
+void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode);
+/** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
+ * with `generation_prompt`, the assistant turn opened for `think_mode`. */
+void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                             bool generation_prompt, pulsar_think_mode think_mode);
+/** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
+ * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
+void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+/** The one-shot prompt: pulsar_chat_open(system) + a turn of one user message with the generation prompt. */
 void pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out);
-/** The V4.1 lead-in after BOS: the System token when the conversation opens
- * with the effort line (thinking on) or with system text, then the effort line. */
-void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
-                                pulsar_think_mode think_mode);
-void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content);
-void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
 int pulsar_token_eos(pulsar_engine *e);
@@ -514,14 +526,6 @@ void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progr
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns PULSAR_SESSION_SYNC_INTERRUPTED when it stops. */
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud);
-
-typedef enum {
-    PULSAR_SESSION_REWRITE_ERROR = -1,
-    PULSAR_SESSION_REWRITE_OK = 0,
-    /* The live backend state cannot be rewritten safely in place.  The caller should
-     * restore an older checkpoint if it has one, then sync to the prompt. */
-    PULSAR_SESSION_REWRITE_REBUILD_NEEDED = 1,
-} pulsar_session_rewrite_result;
 
 /** Synchronize the live session to a full prompt token prefix.  If the current
  * checkpoint is a prefix, the prompt is evaluated from the bank's latest
@@ -572,7 +576,7 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
 int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap);
 /** The bytes a token history was rendered from: each token's text, and each image block ONCE as the text of the
  *  placeholder token its expansion replaced (the family's geometry and placeholder_id -- DeepSeek's
- *  <｜deepseek_image｜>, Qwen's one <|image_pad|>), so a disk chain over an image is found by the request text that
+ *  `<｜deepseek_image｜>`, Qwen's one `<|image_pad|>`), so a disk chain over an image is found by the request text that
  *  brings it; which image it is, the segment's records say (L281).  malloc'd; NULL when a sentinel id belongs to no
  *  well-formed block. */
 char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len);
@@ -593,10 +597,6 @@ int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, ui
  * call did not resume (nothing to evaluate, or a checkpoint that was not a
  * prefix).  An instrument for the chunk-neutrality gate (L194). */
 int pulsar_session_resume_origin(pulsar_session *s);
-bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
-pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
-        pulsar_session *s, const pulsar_tokens *prompt, int common,
-        char *err, size_t errlen);
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
 
 /** L115 — THE prefix-reuse authority.  Every "can this state serve this
@@ -776,12 +776,14 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
  * into the next logits row after the decode rows, in run order -- the prompt's
  * first-token distribution on its final chunk.  Every prefill run's drafter
  * anchors fill its bank's prompt ring, as a classic prefill chunk does.
- * *out_n_rows = n_dec + the headed runs.  n_dec <= PULSAR_SPEC_ROW_BUDGET and
- * n_dec + headed runs <= PULSAR_SPEC_LOGITS_ROWS. */
+ * *out_n_rows = n_dec + the headed runs.  n_dec + headed runs <=
+ * pulsar_engine_fused_heads_max (the family's cap). */
+/** The most prompt runs one fused step carries (the shape's head_last bound). */
+#define PULSAR_FUSED_PF_MAX 16u
 typedef struct {
     uint32_t n_dec;
     uint32_t n_pf;
-    uint8_t  head_last[16];   /* indexed by prefill run, n_pf <= 16 */
+    uint8_t  head_last[PULSAR_FUSED_PF_MAX];   /* indexed by prefill run, n_pf <= PULSAR_FUSED_PF_MAX */
 } pulsar_fused_shape;
 int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs,
                                 uint32_t n_rows, const pulsar_fused_shape *shape,
@@ -866,18 +868,18 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
  * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
  * entries unconditionally. */
 uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
-/** Rows this round contributes to the shared forward: n_batch reqs
- * (first_token at the pre-round frontier, then the pending drafts). Returns
- * the row count written. */
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
-                                  int first_token, pulsar_multiseq_req *out);
+/** Rows this round contributes to the shared forward: n_batch reqs (the
+ * round's base token at the pre-round frontier, then the pending drafts) --
+ * every verify's rows, the single lane's included.  Returns the row count
+ * written. */
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out);
 /** Finish the round against the shared forward's logits block: `rows` points
  * at the block, and this round's rows start at block row `row0` (row stride =
  * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
  * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
  * computed host-side from the block. */
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token, int eos_token,
+                               int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                const float *rows, uint32_t row0,
@@ -893,7 +895,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
  * teacher-forced acceptance probe (tests/spec_teacher_forced_probe.cpp) reads
  * that proposal against the target's row at fixed positions. */
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token, int eos_token,
+                                      int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       const float *rows, uint32_t row0,
@@ -965,12 +967,12 @@ typedef struct {
  * entries).  *n_rows_out = rows written.  0, or -1 when the pair refused or
  * diverged (every step then counts as failed). */
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                       int eos_token, uint32_t row_budget,
+                                       uint32_t row_budget,
                                        pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
 /** Per step: restore, round_end against the shared forward's block `rows`
  * (the step's row0 / first_token from assemble), save.  0 or -1 as above. */
 int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                        int eos_token, const float *rows);
+                                        const float *rows);
 /** Per step: restore, pulsar_session_spec_redraft_commit, save.  0 or -1. */
 int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** Gate-facing: read a batched redraft's result out of the round before it is
@@ -982,6 +984,10 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
 /** L264/L265: the resume grid of the loaded model (tokens): a resume starts at a multiple of it
  *  and a prefill leaves its checkpoints on it -- the server plans its fused chunks on it. */
 uint32_t pulsar_session_resume_grid(const pulsar_session *s);
+/** L284: true when a prompt cut ANYWHERE is the cold prefill's bytes, so a sync continues a history prefilled whole
+ *  wherever it ends (Qwen); false when only a cut on the resume grid is (DeepSeek), so a sync continues only from a
+ *  grid point and resumes a history that ends off it from the checkpoint below. */
+bool pulsar_session_split_invariant(const pulsar_session *s);
 
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
@@ -1025,13 +1031,16 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
  * intermediate chunk.  An index rather than a pointer so a pair's worker can
  * name the same row of its own step's block.  0 or 1. */
 int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head);
+/** One speculative round (or a plain step when the drafter is quenched or absent); returns the tokens emitted.
+ *  A round -- here, in the round API and in the batched phases -- stops at the family's whole stop set
+ *  (pulsar_token_is_stop): nothing is committed past a stop (L284: the callers' single eos id is gone). */
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
-                                     int max_tokens, int eos_token,
+                                     int max_tokens,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen);
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void pulsar_session_invalidate(pulsar_session *s);
@@ -1052,10 +1061,12 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
  * no device work.  The router's score for a bank (L264 S3): a request whose bytes
  * match the bank's history to `limit` tokens resumes there from this position. */
 int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
-/** L266: where a sync of `prompt` on `bank` starts its prefill -- the tokens the bank's state serves.  A
- *  bank-pool family (Qwen) serves an exact extension of the bank's history, else its deepest grid
- *  checkpoint within the shared prefix, the prefill-only history and prompt->len - 1, else nothing.
- *  -1 = DeepSeek's graph pool, whose live KV serves any byte-matched prefix (pulsar_session_bank_prefix_match). */
+/** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
+ *  every family by one rule (L284; DeepSeek answered -1 before and its callers trusted the byte match).  The
+ *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
+ *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves
+ *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
+ *  and the stitched prompt's length - 1, else nothing (0). */
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);
@@ -1074,20 +1085,22 @@ int pulsar_engine_routed_quant_bits(pulsar_engine *e);
  *  provides the verify hooks (L272 P1).  The server's spec-batched lane and the classic
  *  pulsar_session_generate_speculative key on this; which drafter it is, pulsar_engine_drafter says. */
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e);
-/** How many decoders one shared speculative verify forward may carry (0 without speculation): the
- *  server runs its spec-batched lane up to this many decoders and the plain batched lane past it. */
-uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e);
-/** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round)?  The
- *  DeepSeek graph pool does; a family bank pool (Qwen) runs its own mixed decode and has none.  The server arms
- *  fusion on this, and pulsar_session_decode_fused refuses on its negation -- one statement (L282: the server armed
- *  it on "a bank pool exists", and two concurrent Qwen requests failed "no fused step"). */
+/** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round, each
+ *  recorded in its bank's history by pulsar_session_note_prefilled)?  The family's decode_fused op is present
+ *  (DeepSeek; Qwen since L284 #2).  pulsar_session_decode_fused refuses on its negation (L282: the server once
+ *  armed fusion on "a bank pool exists", and two concurrent Qwen requests failed "no fused step"). */
 bool pulsar_engine_has_fused_step(const pulsar_engine *e);
+/** The most logits rows one fused step heads: its verify rows plus its headed prompt runs (the family's cap; 0
+ *  without a fused step).  L284: the ONE authority for the rows a speculative verify step carries -- the server's
+ *  spec lane takes up to this many decoders (each keeps its base row; past it they ride the plain batched lane)
+ *  and its allocator rations the drafts within this less the round's finishing chunks. */
+uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e);
+/** Does pulsar_session_decode_mixed carry prefill runs beside its decode rows (the plain batched lane's mixed
+ *  quantum)?  A family without it refuses such a step by name; its prompts ride only the fused step. */
+bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e);
 /** Can the loaded family rewind a live session to an earlier position (pulsar_session_rewind)?  A
  *  recurrent family cannot; a caller with committed tokens the client never saw invalidates instead. */
 bool pulsar_engine_can_rewind(const pulsar_engine *e);
-/** Whether the family serves pulsar_engine_generate_argmax (the session-less whole-graph path); a
- * front end without it runs greedy through the session lane (Qwen). */
-bool pulsar_engine_has_argmax(const pulsar_engine *e);
 /** Does the loaded family save and load whole-session snapshots and disk-KV payloads
  * (pulsar_session_save_snapshot / _load_snapshot)?  A caller that needs a session back at a known state
  * without one re-syncs the tokens instead. */
@@ -1097,96 +1110,60 @@ bool pulsar_engine_has_snapshots(const pulsar_engine *e);
  *  carries the mtp.* layer (the sidecar shard; served by the family's own
  *  pulsar_session_generate_speculative), NONE otherwise. */
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e);
-int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
-/** L263: the spec lane's step cost, MEASURED -- the one authority the yield
- * quench and the server's overflow K-allocator price rows against.  The
- * server reports every decode round it drives (the rows the forward carried,
- * the round's wall time, redraft included) and the engine keeps one
- * exponentially weighted least-squares fit round_ms = flat + row * rows.
- * Nothing is compiled in: a kernel landing, a different quantization, a
- * second rank or a deeper context moves the fit, not a table.  `valid` is
- * false until the fit has evidence (enough rounds over spread row counts,
- * positive terms); until then the quench stays disarmed and the allocator
- * admits by the row cap alone -- no number, no decision.  The terms are held
- * in microseconds so a TP group's ranks compute the same guard from the same
- * integers (the leader's fit crosses the wire with each round's end). */
+/** The depth a fresh session drafts at (--spec-depth, else the drafter's), 0 = no drafter. */
+int pulsar_engine_spec_depth(pulsar_engine *e);
+/** The two batched decode lanes a server prices against each other (L284 lane cost): the plain lane steps every
+ *  decoder one token a forward; the spec lane runs one speculative round a forward (base + verify rows). */
+typedef enum { PULSAR_LANE_PLAIN = 0, PULSAR_LANE_SPEC = 1, PULSAR_LANE_COUNT = 2 } pulsar_decode_lane;
+/** L263 / L284: a decode lane's step cost, MEASURED -- one fit structure for both lanes.  The spec lane's is the
+ * one authority the yield quench and the server's overflow K-allocator price rows against; both lanes' are what
+ * the server's lane choice weighs (server_sched.cpp lane_price_pick).  The server reports every decode step it
+ * drives (the rows the forward carried, the step's wall time; a spec round's redraft included) and the engine
+ * keeps, per lane, one exponentially weighted least-squares fit step_ms = flat + row * rows.  Nothing is compiled
+ * in: a kernel landing, a different quantization, a second rank or a deeper context moves the fit, not a table.
+ * `valid` is false until the fit has evidence (enough steps over spread row counts, positive terms); until then
+ * the quench stays disarmed and the allocator admits by the row cap alone -- no number, no decision.  The terms
+ * are held in microseconds so a TP group's ranks compute the same guard from the same integers (the leader's spec
+ * fit crosses the wire with each round's end).  mean_rows / mean_ms are the fit's weighted centre: the cost AT the
+ * centre needs no slope (pulsar_lane_cost_ms). */
 typedef struct {
-    int32_t flat_us;    ///< the round's fixed cost (drafting, launch, the base row), us
-    int32_t row_us;     ///< the marginal verify row, us
-    uint32_t n;         ///< rounds observed
+    int32_t flat_us;    ///< the step's fixed cost (drafting, launch, the base row), us
+    int32_t row_us;     ///< the marginal row, us
+    uint32_t n;         ///< steps observed
     bool valid;         ///< the terms may be used
-} pulsar_spec_cost;
-/** One decode round's observation: `rows` the forward carried, `ms` its wall. */
-void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms);
-pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e);
+    float mean_rows;    ///< weighted mean rows of the observed steps (0: none)
+    float mean_ms;      ///< weighted mean wall of the observed steps
+} pulsar_lane_cost;
+/** One decode step's observation on `lane`: `rows` the forward carried, `ms` its wall. */
+void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms);
+pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane);
+/** The lane's predicted step wall at `rows`, ms: flat + row * rows when the fit is valid; else the observed mean
+ *  when `rows` sits at the fit's centre (within half a row, 16+ steps: the slope does not enter); else 0 -- no
+ *  number. */
+double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
-/** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
- * persistence policy; the engine owns the DS4-specific serialized graph state. */
-#define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-/* v3 (2026-08-11): the packed comp row's rope tail narrowed f32 -> bf16,
- * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
- * old stride, so it MUST be rejected rather than reinterpreted. */
-/** v4 (2026-08-17): the attn comp cache is stored as packed rows
- * rather than dequantised f32. v3 files are refused by the header check --
- * deliberately, since the row stride changed and a v3 file read as v4 would
- * decode noise into a KV cache rather than fail.
- * v5 (2026-08-18): the same for the raw ring (which was still being written as
- * f32-expanded __half rows at the wrong stride) and the indexer comp cache
- * (MXKV-FP4, 68 B/row, previously dequantised to 512 B f32 and re-encoded on
- * load).  Every KV row in a payload is now stored in the format its cache holds
- * it in, so a restore is a byte copy and re-encodes nothing.  Older files are
- * refused for the same reason as before: the strides changed.
- * v6 (2026-08-18): the header carries the KV ROW STRIDES it was written with,
- * so a storage-format change is caught structurally instead of relying on
- * someone remembering to bump the version.  That reliance already failed once:
- * the raw ring went from f32-expanded halves at 1024 B to packed 584 B WITHOUT
- * a bump, and a file straddling that change would have decoded noise into a KV
- * cache rather than refusing to load.  The version still moves on format
- * changes -- this just means forgetting is no longer silent.
- * v7 (L111): unified NVFP4 rows -- raw AND comp strides changed.
- * v8 (L194, 2026-09-06, never landed on a release): carried a per-bank compressor
- * snapshot.  v9 (L195, 2026-09-06): no snapshot -- a restored checkpoint resumes
- * from the grid point below its PREFILL frontier (header field 15) after a
- * 32-token state-only warm-up, so the raw window it carries reaches that far
- * below the checkpoint (raw_window + 127 + 32 rows).
- * v10 (2026-09-10/11) was developed TWICE on two trees, and BOTH parts are in
- * v11: L218's per-layer stream and L219's trailing digest.
- *   - L218, DeepSeek-V4.1 CSA2: compressed rows and index-K rows are carried
- *     per kv SOURCE layer (one frontier count per layer; each source's comp
- *     rows, then its index-K rows, then its pending-group state), no separate
- *     indexer frontier, no warm-up window (raw_window + 127 rows).  The KV rows
- *     are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the raw
- *     ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
- *     header carries both strides (fields 13 and 16) plus the indexer's.
- *   - L219: a trailing 64-bit digest over every byte above; a damaged payload
- *     refuses instead of decoding byte-rot into a live cache.
- * v11 (L218 s122 + the L219 merge, 2026-09-15): the per-layer byte stream is
- * derived from the LOADED PROFILE instead of from V4.1's geometry.  v10 wrote
- * its index-K rows for every kv source, so a 0731 artifact -- whose ratio-128
- * (HCA) sources have no indexer and no index pool -- refused to save at all;
- * and it sized the compressor state at head_dim x ratio, which is a QUARTER of
- * the 32768 B lane a V4 ratio-4 source keeps (coff 2), and omitted 0731's
- * indexer-compressor state lane entirely.  A shorter-than-the-lane span is the
- * dangerous shape: the save succeeds and the restore leaves the tail of a
- * recurrent state primed.  So a payload carries each source's comp rows, its
- * index-K rows only where an indexer runs, then the attention compressor's
- * state, then -- V4 only -- the indexer compressor's, then (v12) the L120
- * committed-projection ring an OVERLAPPING compressor replays to rebuild its
- * carry, plus that ring's covered span once in the counter region.  Earlier
- * files are refused: the per-layer layout differs at the same strides. */
-/* v13 (L264, 2026-10-04): v12 without the projection ring, plus the resume
- * checkpoint.  A payload is the frontier state exactly -- tokens, logits, the
- * prefill frontier, the raw window [ck - raw_window, ck), every compressed and
- * index-K row, every recurrent lane -- so a restored session decodes on as the
- * saved one would; and ONE grid checkpoint, the deepest at or below the prefill
- * frontier (opaque slot bytes, checkpoint.cpp), which a sync that does not
- * extend the frontier restores, exact by construction where v12's ring replay
- * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
- * the checkpoint's grid point (0 = none).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(15)   /* v14 (L281): the image block records after the tokens; v15 (L268): with each block's 2D grid */
-/** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
+/** Session payload helpers.  HTTP/agent code owns the outer file header and
+ * persistence policy; the engine owns the serialized state: the kv-state payload,
+ * every family's (L284).  Built from a segment's parts, read and written by the same
+ * helpers: the header (the segment's layout digest extended by every pool and trailing
+ * pool, the frontier slot's size and the logits width; the token count, the prefill
+ * frontier, the resume grid point, the logits width), the tokens, the image section
+ * (count, records), the session's draft-depth controller, the frontier's logits, the
+ * resume checkpoint's slot (when there is one), the FRONTIER's slot (the state model's frontier walk at the token count), every
+ * pool's and trailing pool's rows to the frontier, and the trailing digest.  A restore
+ * installs the frontier exactly: the session decodes on as the saved one would, and a
+ * sync that does not extend it resumes from the resume checkpoint as the saved one
+ * would.
+ * v2 (L284): DeepSeek's payload is this one -- its own graph format ("DSV4", v3..v15)
+ * is retired and refused by name; the frontier slot is the frontier walk's
+ * (DeepSeek: the grid slot plus its coff-1 lanes) and a whole-row pool carries no open
+ * row.  Disk segments are unchanged.
+ * v3 (L284): the draft-depth controller (depth and its counters, 4 u32) after the image
+ * section, so a restored session speculates as the saved one would; v2 refuses on the
+ * version. */
+#define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(3)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);

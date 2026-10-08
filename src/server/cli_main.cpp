@@ -77,7 +77,7 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
             if (pulsar_engine_has_spec_rounds(engine)) {
                 const int n = pulsar_session_generate_speculative(
                         session, 0.0f, 0, 1.0f, 0.0f, &rng, 12 - emitted,
-                        pulsar_token_eos(engine), toks,
+                        toks,
                         (int)(sizeof(toks) / sizeof(toks[0])),
                         err, sizeof(err));
                 /* Contract (session.cpp): eos arrives as a returned token; 0 means
@@ -451,8 +451,12 @@ static server_config parse_options(int argc, char **argv) {
             defaulted_model_path = false;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
-        } else if (!strcmp(arg, "--dspark-draft")) {
-            c.engine.dspark_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-depth")) {
+            c.engine.spec_depth = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-tau")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            const float t = strcmp(v, "off") ? parse_float_arg(v, arg, 0.0f, 1.0f) : 0.0f;
+            c.engine.spec_tau = t > 0.0f ? t : -1.0f;   /* 0 / off: no stop */
         } else if (!strcmp(arg, "--tp-role")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!strcmp(v, "leader")) c.engine.tp_role = 1;
@@ -570,6 +574,15 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return 1;
     }
+    /* L284: the spec lane lands a verify step's rows in buffers of PULSAR_SPEC_LOGITS_ROWS rows; a family whose
+     * verify width (pulsar_engine_fused_heads_max) passes them is refused here, once, by name. */
+    if (pulsar_engine_has_spec_rounds(engine) && pulsar_engine_fused_heads_max(engine) > PULSAR_SPEC_LOGITS_ROWS) {
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: the %s family verifies %u rows a step; the spec lane holds %u "
+                   "-- refusing to serve", pulsar_engine_family_name(engine), pulsar_engine_fused_heads_max(engine),
+                   (unsigned)PULSAR_SPEC_LOGITS_ROWS);
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
@@ -579,11 +592,11 @@ int main(int argc, char **argv) {
     if (pulsar_engine_drafter(engine) == PULSAR_DRAFTER_DSPARK) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
-                   pulsar_engine_dspark_draft_tokens(engine));
+                   pulsar_engine_spec_depth(engine));
     } else if (pulsar_engine_has_spec_rounds(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u decoder(s) a round)",
-                   pulsar_engine_family_name(engine), pulsar_engine_spec_banks_max(engine));
+                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u verify rows a round)",
+                   pulsar_engine_family_name(engine), pulsar_engine_fused_heads_max(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");
@@ -918,10 +931,9 @@ int main(int argc, char **argv) {
          * PULSAR_MIXED_BATCH=0 still forces the lane fully off;
          * PULSAR_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
         const char *mb = getenv("PULSAR_MIXED_BATCH");
-        /* L251: the fused lane and warm forks are DeepSeek graph-pool features; a family bank pool
-         * (Qwen) refuses fused prefill runs and forks, so the lanes are off there, not flag-dependent */
-        const bool graph_pool = pulsar_engine_family(engine) == PULSAR_FAMILY_ID_DEEPSEEK4;
-        s.mixed_batch_enabled = s.pool_banks > 0 && graph_pool &&
+        /* L251/L284: this lane's prompt rows ride decode_mixed beside the decode rows -- a family whose
+         * decode_mixed carries none (Qwen: its prompts ride the spec lane's fused step) does not run it */
+        s.mixed_batch_enabled = s.pool_banks > 0 && pulsar_engine_has_mixed_prefill(engine) &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
         s.mixed_deep_guard_rows = 16384;

@@ -364,61 +364,6 @@ void request_free(request *r) {
 
 
 
-pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort) {
-    if (!enabled || effort == PULSAR_THINK_NONE) return PULSAR_THINK_NONE;
-    return effort;
-}
-
-
-
-/* The V4.1 reference encoder accepts three names -- low/high/max, the presets
- * 50/75/100 on the effort axis -- or an integer in [1, 100].  OpenAI-style
- * names collapse onto the presets: "minimal"/"medium" join "low", "xhigh"
- * joins "max".  Callers that need *no* reasoning must use "none". */
-bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
-    if (!s) return false;
-    if (!strcmp(s, "max") || !strcmp(s, "xhigh")) {
-        *out = PULSAR_THINK_MAX;
-        return true;
-    }
-    if (!strcmp(s, "high")) {
-        *out = PULSAR_THINK_HIGH;
-        return true;
-    }
-    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
-        *out = PULSAR_THINK_LOW;
-        return true;
-    }
-    if (!strcmp(s, "none")) {
-        *out = PULSAR_THINK_NONE;
-        return true;
-    }
-    return false;
-}
-
-
-
-/* A JSON string names a preset; a JSON integer in [1, 100] is the effort
- * itself (the reference encoder accepts both). */
-bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    if (**p == '"') {
-        char *effort = NULL;
-        if (!json_string(p, &effort)) return false;
-        bool ok = parse_reasoning_effort_name(effort, out);
-        free(effort);
-        return ok;
-    }
-    double v = 0.0;
-    if (!json_number(p, &v)) return false;
-    if (v != (double)(int)v || (int)v < PULSAR_THINK_EFFORT_MIN || (int)v > PULSAR_THINK_EFFORT_MAX) return false;
-    *out = (pulsar_think_mode)(int)v;
-    return true;
-}
-
-
-
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -460,60 +405,10 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
 
 
 
-bool parse_output_config_effort(const char **p, pulsar_think_mode *effort) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    if (**p != '{') return json_skip_value(p);
-    (*p)++;
-    json_ws(p);
-    while (**p && **p != '}') {
-        char *key = NULL;
-        if (!json_string(p, &key)) return false;
-        json_ws(p);
-        if (**p != ':') {
-            free(key);
-            return false;
-        }
-        (*p)++;
-        if (!strcmp(key, "effort")) {
-            if (!parse_reasoning_effort_value(p, effort)) {
-                free(key);
-                return false;
-            }
-        } else if (!json_skip_value(p)) {
-            free(key);
-            return false;
-        }
-        free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
-    }
-    if (**p != '}') return false;
-    (*p)++;
-    return true;
-}
-
-
-
-bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-chat");
-}
-
-
-
-bool model_alias_enables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-reasoner");
-}
-
-
-
 const char *server_model_id_from_engine(pulsar_engine *engine) {
-    /* L251: the family is fixed at load (like the shape id), so this stays a
-     * plain read of immutable engine state on the client threads. */
-    if (pulsar_engine_family(engine) == PULSAR_FAMILY_ID_QWEN4_EXP) return "qwen3.8-flash-next";
-    return pulsar_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads.  No engine
+     * is the host-only harnesses (unit tests, api/sse goldens), which record the default id as before L284. */
+    return engine ? pulsar_engine_served_model_id(engine) : "deepseek-v4-flash";
 }
 
 const char *server_served_model_id(const server *s) {
@@ -1467,6 +1362,53 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
  * already-direct schemas unchanged. Responses can additionally group tools in a
  * namespace item; those are flattened for DSML prompt rendering while preserving
  * their client-facing name and namespace for response output. */
+void conversation_tool_schema_lines(const chat_conversation *c, buf *out) {
+    if (c->tool_schemas && c->tool_schemas[0]) buf_puts(out, c->tool_schemas);
+    if (c->loaded_tool_schemas.len) {
+        if (out->len) buf_putc(out, '\n');
+        buf_append(out, c->loaded_tool_schemas.ptr, c->loaded_tool_schemas.len);
+    }
+}
+
+char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    int n = 0;
+    for (size_t at = 0; at < len;) {
+        const char *nl = (const char *)memchr(lines + at, '\n', len - at);
+        const size_t end = nl ? (size_t)(nl - lines) : len;
+        std::string line(lines + at, end - at);
+        at = end + 1;
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        char *name = json_object_member_raw(line.c_str(), "name");
+        char *desc = json_object_member_raw(line.c_str(), "description");
+        char *params = json_object_member_raw(line.c_str(), "parameters");
+        if (!params) params = json_object_member_raw(line.c_str(), "input_schema");
+        if (!name) {
+            snprintf(err, errlen, "tool %d has no name", n);
+            free(desc);
+            free(params);
+            buf_free(&out);
+            return NULL;
+        }
+        buf_puts(&out, n++ ? ", " : "");
+        buf_puts(&out, "{\"type\": \"function\", \"function\": {\"name\": ");
+        buf_puts(&out, name);
+        if (desc) {
+            buf_puts(&out, ", \"description\": ");
+            buf_puts(&out, desc);
+        }
+        buf_puts(&out, ", \"parameters\": ");
+        buf_puts(&out, params ? params : "{}");
+        buf_puts(&out, "}}");
+        free(name);
+        free(desc);
+        free(params);
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     json_ws(p);
     if (json_lit(p, "null")) {

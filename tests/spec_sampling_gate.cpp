@@ -62,10 +62,13 @@
  * repointed, invalidated and loaded from it) and draws from the SAME per-
  * trajectory rng stream as before, so the emitted tokens and alpha are what the
  * serial loop produced -- 16 plain trajectories or 4 speculative ones per
- * forward instead of one.  Both widths stay inside the 16-row M-neutral range
- * the battery asserts (mixed_neutrality_gate), which is what makes the rows
- * byte-identical to a 1-row step; a round that would exceed 16 rows FAILS the
- * gate, it does not fall back to a narrower batch.  Mode 0 is therefore also
+ * forward instead of one.  Both widths are 16 rows, past the width whose rows are
+ * byte-identical to a 1-row step (10 on DeepSeek, L284 dsgrade): wider steps take
+ * the faster arms (ENGINEERING-RULES rule 7, 2026-10-08), so the deep positions'
+ * chi2 carries that width's numerics on BOTH arms (plain 16-wide vs 8-wide alone:
+ * chi2 147.7 at position 3) -- it is informational, the hard gates are not.  A
+ * round that would exceed 16 rows FAILS the gate, it does not fall back to a
+ * narrower batch.  Mode 0 is therefore also
  * batch-sourced now (the "like-with-like" repair this header asked for above):
  * position 0 samples the snapshot's logits, positions 1+ sample decode_mixed
  * rows.  The greedy hard gates are unchanged and still run serially.
@@ -90,6 +93,7 @@
 
 #include "pulsar.h"
 #include "gate_entry.h"
+#include "gate_util.h"
 
 #define TRAJ 2500
 #define DEPTH 4
@@ -103,7 +107,7 @@ typedef struct { int id; long a, b; } bucket;
 /* L160: banks per forward in the sampled arm.  Plain trajectories are one row
  * each; speculative ones are 1 + K rows with K trimmed to max_tokens - 1 <=
  * DEPTH - 1 by round_begin, so 4 banks are at most 16 rows.  16 is the
- * ALL_ROWS head cap AND the M-neutral range the battery asserts. */
+ * ALL_ROWS head cap. */
 #ifndef SAMPLED_BANKS_PLAIN
 #define SAMPLED_BANKS_PLAIN 16
 #endif
@@ -157,7 +161,7 @@ static uint64_t traj_seed(int t, int mode) {
  * decode_mixed row of the bank's own token.  Returns 0, or -1 with err. */
 static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
                                int t0, int nb, float temp, float top_p, float min_p,
-                               int eos, int vocab, float *logits, int (*seq)[DEPTH],
+                               pulsar_engine *e, int vocab, float *logits, int (*seq)[DEPTH],
                                char *err, size_t errlen) {
     uint64_t rng[SAMPLED_BANKS_PLAIN];
     int got[SAMPLED_BANKS_PLAIN], live[SAMPLED_BANKS_PLAIN];
@@ -172,7 +176,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         const int tok = pulsar_session_sample(s, temp, 0, top_p, min_p, &rng[b]);
         seq[t0 + b][0] = tok;
         got[b] = 1;
-        live[b] = tok != eos && DEPTH > 1;
+        live[b] = !pulsar_token_is_stop(e, tok) && DEPTH > 1;
         reqs[b].bank = (uint32_t)b; reqs[b].pos = pos0; reqs[b].token = tok;
     }
     for (int step = 1; step < DEPTH; step++) {
@@ -194,7 +198,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             const int tok = pulsar_sample_logits(row, vocab, temp, 0, top_p, min_p, &rng[b]);
             seq[t0 + b][got[b]++] = tok;
             reqs[b].pos++; reqs[b].token = tok;
-            if (tok == eos || got[b] >= DEPTH) live[b] = 0;
+            if (pulsar_token_is_stop(e, tok) || got[b] >= DEPTH) live[b] = 0;
         }
     }
     for (int b = 0; b < nb; b++)
@@ -210,7 +214,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
  * without a forward, as generate_speculative does. */
 static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                               int t0, int nb, float temp, float top_p, float min_p,
-                              int eos, int vocab, float *logits, int (*seq)[DEPTH],
+                              pulsar_engine *e, int vocab, float *logits, int (*seq)[DEPTH],
                               pulsar_spec_round **r, char *err, size_t errlen) {
     uint64_t rng[SAMPLED_BANKS_SPEC];
     int got[SAMPLED_BANKS_SPEC], live[SAMPLED_BANKS_SPEC];
@@ -232,8 +236,8 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
             first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]);
-            if (first[b] == eos) {
-                seq[t0 + b][got[b]++] = eos;
+            if (pulsar_token_is_stop(e, first[b])) {
+                seq[t0 + b][got[b]++] = first[b];
                 live[b] = 0;
                 pulsar_session_bank_state_save(s, (uint32_t)b);
                 continue;
@@ -249,7 +253,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 return -1;
             }
             row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, first[b], reqs + rows);
+            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
             pulsar_session_bank_state_save(s, (uint32_t)b);
             any = 1;
         }
@@ -277,12 +281,12 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
             int accepted[17];
-            const int na = pulsar_session_spec_round_end(s, r[b], first[b], eos, temp, 0, top_p, min_p,
+            const int na = pulsar_session_spec_round_end(s, r[b], first[b], temp, 0, top_p, min_p,
                                                          &rng[b], logits, row0[b], accepted, 17,
                                                          err, errlen);
             if (na < 0) return -1;
             for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i];
-            if (got[b] >= DEPTH || (got[b] > 0 && seq[t0 + b][got[b] - 1] == eos)) live[b] = 0;
+            if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, seq[t0 + b][got[b] - 1]))) live[b] = 0;
             pulsar_session_bank_state_save(s, (uint32_t)b);
             if (live[b]) { cont_r[nc] = r[b]; cont_b[nc] = (uint32_t)b; cont_rng[nc] = &rng[b]; nc++; }
         }
@@ -378,10 +382,10 @@ static void spec_report(const char *tag, spec_snap a, spec_snap b) {
  * re-enables the drafter and reintroduces real drafts. Kept as a diagnostic. */
 static int gate_step_batched(pulsar_session *s, float temperature, int top_k,
                              float top_p, float min_p, uint64_t *rng,
-                             int eos, char *err, size_t errlen) {
+                             char *err, size_t errlen) {
     int toks[2];
     int k = pulsar_session_generate_speculative(s, temperature, top_k, top_p, min_p,
-                                                rng, /*max_tokens=*/1, eos,
+                                                rng, /*max_tokens=*/1,
                                                 toks, (int)(sizeof(toks)/sizeof(toks[0])),
                                                 err, errlen);
     if (k <= 0) return -1;
@@ -450,15 +454,17 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     const int ctx = filler > 0 ? 16384 : 2048;
     if (pulsar_session_create(&session, engine, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
-    /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm up
-     * to the banks one shared verify forward carries (pulsar_engine_spec_banks_max: DSpark 16, Qwen's MTP 2). */
+    /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm
+     * SAMPLED_BANKS_SPEC banks at most SAMPLED_ROWS_MAX rows, which the family's verify width must hold (L284:
+     * pulsar_engine_fused_heads_max, DSpark 32, Qwen's MTP 16 -- the one authority the server's lane reads). */
     const int width_plain = pulsar_session_bank_count(session) < SAMPLED_BANKS_PLAIN
                           ? pulsar_session_bank_count(session) : SAMPLED_BANKS_PLAIN;
-    const int width_spec = (int)pulsar_engine_spec_banks_max(engine) < SAMPLED_BANKS_SPEC
-                         ? (int)pulsar_engine_spec_banks_max(engine) : SAMPLED_BANKS_SPEC;
-    if (width_plain < 1 || width_spec < 1) {
-        fprintf(stderr, "spec sampling gate: pool has %d banks, spec verify carries %u -- need 1 each\n",
-                pulsar_session_bank_count(session), pulsar_engine_spec_banks_max(engine));
+    const int width_spec = pulsar_session_bank_count(session) < SAMPLED_BANKS_SPEC
+                         ? pulsar_session_bank_count(session) : SAMPLED_BANKS_SPEC;
+    if (width_plain < 1 || width_spec < 1 || pulsar_engine_fused_heads_max(engine) < SAMPLED_ROWS_MAX) {
+        fprintf(stderr, "spec sampling gate: pool has %d banks, a verify step carries %u rows -- need 1 bank and "
+                "%d rows\n", pulsar_session_bank_count(session), pulsar_engine_fused_heads_max(engine),
+                SAMPLED_ROWS_MAX);
         goto done;
     }
 
@@ -473,7 +479,7 @@ int GATE_ENTRY(int argc, char **argv) {
         snprintf(user + off, cap - off, "%s", PROMPT);
     }
 
-    /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+    /* the family's one-turn render (L278) */
     pulsar_encode_chat_prompt(engine, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
     char err[256];
     if (pulsar_session_sync(session, &prompt, err, sizeof(err)) != 0) {
@@ -501,7 +507,6 @@ int GATE_ENTRY(int argc, char **argv) {
     printf("start state: %s; widths: plain %d, spec %d banks per forward\n",
            snapshots ? "a session snapshot" : "the prompt re-synced (the family has no snapshots)",
            width_plain, width_spec);
-    const int eos = pulsar_token_eos(engine);
     /* Mode 0 stays PLAIN DECODE by default: spec-vs-plain is the question a
      * reader of this gate actually has, and the 1-row batch arm below buys no
      * hard gate (measured -- see gate_step_batched). Set
@@ -553,12 +558,9 @@ int GATE_ENTRY(int argc, char **argv) {
      * Temperature-matched draft sampling must leave this path untouched: at
      * temp <= 0 no q is built, no rng is drawn, and the argmax-equality accept
      * walk runs exactly as before. */
-    /* Top-2 logit margin above which a greedy flip cannot be quantization
-     * noise. Calibrated on the shipped type-43 artifact, where decisive
-     * positions measure 6.0-14.8 and ambiguous ones 0.19-1.94; 2.0 sits in the
-     * empty band with ~3x headroom either side. Retune with the margin table
+    /* GATE_DECISIVE_MARGIN (gate_util.h): the top-2 logit margin above which a
+     * greedy flip cannot be quantization noise.  Retune with the margin table
      * this gate prints if the artifact's quantization mix changes. */
-    #define SPEC_GREEDY_DECISIVE_MARGIN 2.0f
     {
         int ref[24], got[24], got2[24];
         float ref_gap[24];
@@ -583,13 +585,13 @@ int GATE_ENTRY(int argc, char **argv) {
             }
             int tok;
             if (mode0_batched) {
-                tok = gate_step_batched(session, 0.0f, 0, 1.0f, 0.0f, &rng, eos,
+                tok = gate_step_batched(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                         err, sizeof(err));
                 if (tok < 0) { fprintf(stderr, "ref batched step: %s\n", err); free(lg); goto done; }
-                if (tok == eos) break;
+                if (pulsar_token_is_stop(engine, tok)) break;
             } else {
                 tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-                if (tok == eos) break;
+                if (pulsar_token_is_stop(engine, tok)) break;
                 if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) { free(lg); goto done; }
             }
             ref_gap[nref] = g;
@@ -605,7 +607,7 @@ int GATE_ENTRY(int argc, char **argv) {
             while (*n < nref) {
                 int toks[17];
                 int k = pulsar_session_generate_speculative(session, 0.0f, 0, 1.0f, 0.0f, &rng,
-                                                         nref - *n, eos, toks, 17,
+                                                         nref - *n, toks, 17,
                                                          err, sizeof(err));
                 if (k <= 0) { fprintf(stderr, "greedy spec failed: %s\n", err); goto done; }
                 if (k > nref - *n)
@@ -653,7 +655,7 @@ int GATE_ENTRY(int argc, char **argv) {
         printf("\n");
         int decisive_flip = 0;
         if (prefix < nref) {
-            decisive_flip = ref_gap[prefix] > SPEC_GREEDY_DECISIVE_MARGIN;
+            decisive_flip = ref_gap[prefix] > GATE_DECISIVE_MARGIN;
             printf("first divergence at %d: plain=%d spec=%d plain-margin=%.6g "
                    "(%s)\n",
                    prefix, ref[prefix], prefix < ngot ? got[prefix] : -1,
@@ -690,9 +692,9 @@ int GATE_ENTRY(int argc, char **argv) {
             for (int t0 = 0; t0 < traj; t0 += width) {
                 const int nb = traj - t0 < width ? traj - t0 : width;
                 const int rc = mode == 0
-                    ? sampled_plain_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
+                    ? sampled_plain_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, engine, vocab,
                                           logits, seqA, err, sizeof(err))
-                    : sampled_spec_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, eos, vocab,
+                    : sampled_spec_batch(session, &start, t0, nb, TEMP, TOP_P, MIN_P, engine, vocab,
                                          logits, seqB, rounds, err, sizeof(err));
                 if (rc != 0) {
                     fprintf(stderr, "mode %d batch at %d: %s\n", mode, t0, err);

@@ -591,6 +591,17 @@ int main(int argc, char **argv) {
     }
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
+    /* The think mode is the loaded family's, the rule pulsar applies (L284 P14): an unset mode is the family's
+     * default; an effort its template cannot spell is refused here by name rather than rendered. */
+    if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);
+    {
+        char why[200];
+        if (!pulsar_engine_think_mode_supported(engine, cfg.gen.think_mode, why, sizeof why)) {
+            fprintf(stderr, "pulsar-agent: thinking effort %d: %s\n", (int)cfg.gen.think_mode, why);
+            pulsar_engine_close(engine);
+            return 2;
+        }
+    }
     {
         char ctxmem_line[256];
         fprintf(stderr, "%s\n",

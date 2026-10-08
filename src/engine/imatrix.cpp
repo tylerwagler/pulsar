@@ -108,13 +108,44 @@ static bool imatrix_collect_layer_batch(
 
 
 
-static void imatrix_write_i32(FILE *fp, int32_t v) {
+void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
 
 
-static void imatrix_write_entry(
+/* The llama.cpp legacy `.dat` frame every family's collection shares: the entry count, the entries
+ * (imatrix_write_entry), then the chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    imatrix_write_i32(fp, n_entries);
+    return fp;
+}
+
+
+
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path) {
+    imatrix_write_i32(fp, chunks);
+    const char *dataset = dataset_path ? dataset_path : "";
+    const int32_t dataset_len = (int32_t)strlen(dataset);
+    imatrix_write_i32(fp, dataset_len);
+    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
+        pulsar_die("failed to write imatrix dataset name");
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+
+
+void imatrix_write_entry(
         FILE       *fp,
         const char *name,
         const float *sum2,
@@ -150,14 +181,8 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-
-    const int32_t entries = (int32_t)(PULSAR_N_LAYER * 3);
-    imatrix_write_i32(fp, entries);
+    FILE *fp = imatrix_dat_open(path, (int32_t)(PULSAR_N_LAYER * 3));
+    if (!fp) return false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_layer_weights *layer = &weights->layer[il];
         char name[256];
@@ -181,20 +206,7 @@ bool imatrix_collector_save(
                             PULSAR_N_FF_EXP);
     }
 
-    const int32_t chunks = (int32_t)c->chunks;
-    imatrix_write_i32(fp, chunks);
-    const char *dataset = c->dataset_path ? c->dataset_path : "";
-    const int32_t dataset_len = (int32_t)strlen(dataset);
-    imatrix_write_i32(fp, dataset_len);
-    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        pulsar_die("failed to write imatrix dataset name");
-    }
-
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    return true;
+    return imatrix_dat_close(fp, path, (int32_t)c->chunks, c->dataset_path);
 }
 
 
@@ -494,7 +506,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     /* Bulk anchor-hidden capture (drafter retraining): armed per chunk, after
      * warmup so warmup encodes don't pollute the buffers; drained (and cleared)
-     * by gpu_graph_prefill_chunked_range after the chunk syncs. */
+     * by the chunk wrapper (dspark_bulk_drain) after the chunk syncs. */
     g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
 
     /*
@@ -507,7 +519,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     /* Do NOT split (per-layer cudaDeviceSynchronize) just to fire a display
      * progress callback: on this backend end_commands() is a full device sync,
      * so per-layer progress drains the async launch pipeline 43x/chunk. Chunk-
-     * level progress (gpu_graph_prefill_chunked_range) still fires; intra-chunk
+     * level progress (pulsar_prefill_loop) still fires; intra-chunk
      * progress is dropped in favor of throughput. */
     const bool split_commands = n_tokens > 2048 || imatrix != NULL;
 
@@ -663,293 +675,62 @@ static bool gpu_graph_prefill_layer_major_inner(
 
 
 
-/* Prefill a contiguous token range in fixed-size chunks.
- *
- * The common case starts at token zero, but server sessions also use this to
- * extend an existing KV cache with a long suffix.  Resumed chunks are aligned
- * to the same absolute prefill-cap boundaries used by a cold full prompt, so
- * compression windows and row finalization follow the same schedule after the
- * cached prefix.
- */
 static uint32_t gcd_u32(uint32_t a, uint32_t b) {
     while (b) { uint32_t t = a % b; a = b; b = t; }
     return a;
 }
 
-/* DeepSeek's prefill planner as the walk's hooks (L272 P2; prefill_loop.cpp pulsar_prefill_walk_run).
- * The arithmetic below is the planner's, moved verbatim: the walk calls next_end with each chunk's
- * start, and every rule here depends only on that start, the prompt's end and the planner's fixed
- * inputs -- so the cuts are the ones the planner's own loop made. */
-struct ds4_plan {
+pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g) {
+    /* every NON-final chunk end on the compress ratios' LCM (4 for the ratio-4 layers): one unaligned boundary
+     * makes every later chunk's start unaligned, and each of those takes the per-token compressor path instead of
+     * the batched aligned one for the rest of the prompt */
+    uint32_t align = 1;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t r = pulsar_layer_compress_ratio(il);
+        if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
+    }
+    /* a resumed walk's chunks fit the raw window the graph was sized for */
+    return pulsar_prefill_shape{ g->prefill_cap, g->raw_cap, align };
+}
+
+/* The range prefill as the walk's hooks: the chunk (gpu_graph_prefill_layer_major, the last one headed into
+ * `logits`), the landing (the shared capture rule).  No view, no progress, no stop. */
+struct ds4_range {
     pulsar_gpu_graph *g;
     const pulsar_model *model;
     const pulsar_weights *weights;
     const token_vec *prompt;
     float *logits;
-    bool show_progress;
-    pulsar_session_progress_fn progress;
-    void *progress_ud;
-    pulsar_session_progress_fn display_progress;
-    void *display_progress_ud;
     pulsar_imatrix_collector *imatrix;
-    pulsar_session_cancel_fn cancel;
-    void *cancel_ud;
-    bool *cancelled;
-    uint32_t chunk_cap;
-    int n_blk;
-    const int32_t *blk_s, *blk_e;
-    /** L281 (b): the walk stands where a resume is exact -- its start, or a chunk end on the grid outside every
-     *  image block (ds4_plan_landed).  A stop is honoured only there: an image block's end is off the grid, and an
-     *  interrupt there would resume from the grid point below it, inside the block, i.e. from 0. */
-    bool at_resume_point;
 };
 
-static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
-    const ds4_plan *p = (const ds4_plan *)ud;
-    const pulsar_gpu_graph *g = p->g;
-    const uint32_t remaining = end - pos0;
-    uint32_t local_cap = p->chunk_cap;
-    /* Snap to the absolute prefill_cap grid after any unaligned start: a
-     * resume (start != 0) lands on the cold prefill's boundaries, and so does
-     * the chunk after an image cut below -- on the cold pass too, which is
-     * what keeps a resumed image prefill the cold one's chunk for chunk.  A
-     * text-only cold pass starts aligned and never cuts, so it is unchanged. */
-    if (g->prefill_cap != 0) {
-        const uint32_t mod = pos0 % g->prefill_cap;
-        if (mod != 0) {
-            const uint32_t to_boundary = g->prefill_cap - mod;
-            if (to_boundary < local_cap) local_cap = to_boundary;
-        }
-    }
-    uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-    /* Keep every NON-final chunk boundary aligned to the layer compress
-     * ratios (LCM, i.e. 4 for the ratio-4 layers): one unaligned boundary
-     * makes pos0 unaligned for every later chunk, and each of those takes
-     * the per-token compressor fallback instead of the batched aligned
-     * path for the whole rest of the prompt. The final chunk keeps its
-     * exact remainder; an unaligned START (continuation from an arbitrary
-     * position) pays the fallback for its first chunk only, because that
-     * chunk still ENDS on an aligned boundary. */
-    if (chunk < remaining) {
-        uint32_t align = 1;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t r = pulsar_layer_compress_ratio(il);
-            if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
-        }
-        if (align > 1) {
-            const uint32_t aligned_end = ((pos0 + chunk) / align) * align;
-            if (aligned_end > pos0) chunk = aligned_end - pos0;
-        }
-    }
-    /* Never end a chunk inside an image block: cut before a block the chunk
-     * would split, or -- when the chunk STARTS at the block -- carry the whole
-     * block (it fits: pulsar_image_spans_fit).  Positions only, so the cold pass and
-     * any resume over the same prompt cut alike; the cost is the compressor
-     * fallback for one unaligned boundary. */
-    for (int b = 0; b < p->n_blk; b++) {
-        const uint32_t bs = (uint32_t)p->blk_s[b], be = (uint32_t)p->blk_e[b];
-        const uint32_t ce = pos0 + chunk;
-        if (bs < ce && ce < be) {
-            if (bs > pos0) chunk = bs - pos0;
-            else chunk = be - pos0;
-        }
-    }
-    /* L264: the final chunk stops at the last grid point inside it, so the
-     * prefill leaves a checkpoint where the next turn of this conversation
-     * resumes.  A chunk that starts on the 128 grid is exactly the cold
-     * prefill's computation (L195), so the split moves no byte -- the
-     * chunk-neutrality gate's resumes are this same cut.  Not when that grid
-     * point falls inside an image block (the block stays whole). */
-    if (pos0 + chunk == end) {
-        const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
-        bool inside = false;
-        for (int b = 0; b < p->n_blk; b++)
-            if ((uint32_t)p->blk_s[b] < grid_end && grid_end < (uint32_t)p->blk_e[b]) inside = true;
-        if (grid_end > pos0 && grid_end < end && !inside) chunk = grid_end - pos0;
-    }
-    return pos0 + chunk;
+static bool ds4_range_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
+    const ds4_range *r = (const ds4_range *)ud;
+    if (gpu_graph_prefill_layer_major(r->g, r->model, r->weights, r->prompt, pos0, rows, last ? r->logits : NULL,
+                                      false, r->imatrix, NULL, NULL))
+        return true;
+    if (pulsar_gpu_synchronize() == 0) fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
+    return false;
 }
 
-static bool ds4_plan_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
-    const ds4_plan *p = (const ds4_plan *)ud;
-    /* Only the final chunk's logits are consumed (the progress callback below
-     * reports position only, never reads logits). Running the full output
-     * head + vocab GEMM + readback on every non-final chunk is wasted work
-     * whose result is immediately overwritten. */
-    float *chunk_logits = last ? p->logits : NULL;
-    bool ok = gpu_graph_prefill_layer_major(p->g,
-                                              p->model,
-                                              p->weights,
-                                              p->prompt,
-                                              pos0,
-                                              rows,
-                                              chunk_logits,
-                                              p->show_progress,
-                                              p->imatrix,
-                                              p->display_progress,
-                                              p->display_progress_ud);
-    if (!ok) {
-        if (pulsar_gpu_synchronize() == 0) {
-            fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
-        }
+static bool ds4_range_landed(void *ud, uint32_t chunk_end) {
+    pulsar_gpu_graph *g = ((const ds4_range *)ud)->g;
+    return pulsar_ckpt_landed(&g->ckpt, gpu_graph_cur_bank(g), chunk_end);
+}
+
+bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_weights *weights,
+                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens, float *logits,
+                                     pulsar_imatrix_collector *imatrix) {
+    if (n_tokens == 0 || g->prefill_cap == 0 || start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start)
         return false;
-    }
-    return true;
-}
-
-static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
-    ds4_plan *p = (ds4_plan *)ud;
-    pulsar_gpu_graph *g = p->g;
-    /* L264: a chunk that ended on the grid -- every non-final boundary does,
-     * and the final split above makes the last grid point one too -- is a
-     * checkpoint.  Never inside an image block (the planner never ends a
-     * chunk there, L261): a resume may not re-evaluate a merged row (L226). */
-    bool in_block = false;
-    for (int b = 0; b < p->n_blk; b++)
-        if ((uint32_t)p->blk_s[b] < chunk_end && chunk_end < (uint32_t)p->blk_e[b]) in_block = true;
-    p->at_resume_point = chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block;
-    if (p->at_resume_point && !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
-    if (p->progress) {
-        p->progress(p->progress_ud, "prefill_chunk", (int)chunk_end, p->prompt->len);
-    }
-    if (p->display_progress) {
-        p->display_progress(p->display_progress_ud, "prefill_display", (int)chunk_end, p->prompt->len);
-    }
-    return true;
-}
-
-static bool ds4_plan_stop(void *ud) {
-    const ds4_plan *p = (const ds4_plan *)ud;
-    if (!p->at_resume_point) return false;   /* L281 (b): the next grid point honours it */
-    if (!(p->cancel && p->cancel(p->cancel_ud))) return false;
-    if (p->cancelled) *p->cancelled = true;
-    return true;
-}
-
-bool gpu_graph_prefill_chunked_range(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        uint32_t               start,
-        uint32_t               n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn progress,
-        void                  *progress_ud,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_imatrix_collector *imatrix,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled) {
-    if (n_tokens == 0 || g->prefill_cap == 0) return false;
-    if (start > (uint32_t)prompt->len) return false;
-    if (n_tokens > (uint32_t)prompt->len - start) return false;
-
-    uint32_t chunk_cap = g->prefill_cap;
-    if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
-    if (chunk_cap == 0) return false;
-
-    /* Image blocks: each is prefilled WHOLE inside one chunk -- the merge writes
-     * the block's rows after the embedding gather and the block's bidirectional
-     * visibility is computed per chunk -- so the planner below never ends a chunk
-     * inside one.  A block that begins before `start` is already in the KV (the
-     * session licensed this resume only with those images live); one that begins
-     * at or after `start` is merged by the chunk that owns it.  A `start` INSIDE
-     * a block would re-evaluate merged rows as zero-masked sentinels: refused. */
-    enum { VISION_BLOCKS_MAX = 64 };
-    int32_t blk_s[VISION_BLOCKS_MAX], blk_e[VISION_BLOCKS_MAX];
-    int n_blk = 0;
-    if (g->vision_req && g->vision_req->n_images > 0) {
-        char verr[384];
-        if (!pulsar_image_spans_fit(g->vision_req->engine, prompt->v, prompt->len, g->vision_req->images,
-                                    g->vision_req->n_images, chunk_cap, NULL, verr, sizeof(verr))) {
-            fprintf(stderr, "pulsar: %s\n", verr);
-            return false;
-        }
-        if (g->vision_req->n_images > VISION_BLOCKS_MAX) {
-            fprintf(stderr, "pulsar: %d images in one request; the chunk planner holds %d\n",
-                    g->vision_req->n_images, (int)VISION_BLOCKS_MAX);
-            return false;
-        }
-        for (int i = 0; i < g->vision_req->n_images; i++) {
-            int len = 0;
-            const int s0 = g->vision_req->images[i].start_pos;
-            (void)pulsar_image_block_extent(g->vision_req->engine, prompt->v, prompt->len, s0, &len);   /* fit checked it */
-            if ((uint32_t)s0 < start && (uint32_t)(s0 + len) > start) {
-                fprintf(stderr, "pulsar: prefill from %u would start inside image %d's block [%d, %d) -- "
-                                "refusing (its merged rows cannot be re-evaluated)\n", start, i, s0, s0 + len);
-                return false;
-            }
-            blk_s[n_blk] = s0;
-            blk_e[n_blk] = s0 + len;
-            n_blk++;
-        }
-    }
-
-    const uint32_t end = start + n_tokens;
-
-    if (progress) {
-        progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
-    }
-    if (display_progress) {
-        display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
-    }
-
-    /* L272 P2: the walk (prefill_loop.cpp) owns the order -- poll, cut, run, land, poll -- shared with
-     * every family's session loop; this planner is its hooks: the cut (ds4_plan_next_end), the chunk
-     * (gpu_graph_prefill_layer_major), the landing (grid capture + progress). */
-    ds4_plan p;
-    p.g = g; p.model = model; p.weights = weights; p.prompt = prompt; p.logits = logits;
-    p.show_progress = show_progress; p.progress = progress; p.progress_ud = progress_ud;
-    p.display_progress = display_progress; p.display_progress_ud = display_progress_ud; p.imatrix = imatrix;
-    p.cancel = cancel; p.cancel_ud = cancel_ud; p.cancelled = cancelled;
-    p.chunk_cap = chunk_cap; p.n_blk = n_blk; p.blk_s = blk_s; p.blk_e = blk_e;
-    p.at_resume_point = true;   /* the start is where the caller resumed (or 0) */
-    const pulsar_prefill_walk w = { ds4_plan_next_end, ds4_plan_chunk, ds4_plan_landed, ds4_plan_stop, &p };
-    const int rc = pulsar_prefill_walk_run(&w, start, end);
-    if (rc == 1) return false;
-    if (rc == 0 && show_progress) fputc('\n', stderr);
-    return true;
-}
-
-
-
-/* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
- * attention buffers while preserving the same final KV/cache state. */
-bool gpu_graph_prefill_chunked(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        int                    n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn progress,
-        void                  *progress_ud,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled) {
-    if (n_tokens <= 0) return false;
-    return gpu_graph_prefill_chunked_range(g,
-                                             model,
-                                             weights,
-                                             prompt,
-                                             0,
-                                             (uint32_t)n_tokens,
-                                             logits,
-                                             show_progress,
-                                             progress,
-                                             progress_ud,
-                                             display_progress,
-                                             display_progress_ud,
-                                             NULL,
-                                             cancel,
-                                             cancel_ud,
-                                             cancelled);
+    const pulsar_prefill_shape shape = gpu_graph_prefill_shape(g);
+    pulsar_prefill_plan plan;
+    pulsar_prefill_plan_init(&plan, &shape, start, &g->ckpt, NULL, prompt, NULL, 0);
+    if (plan.chunk_cap == 0) return false;
+    ds4_range r = { g, model, weights, prompt, logits, imatrix };
+    const pulsar_prefill_walk w = { &plan, ds4_range_chunk, ds4_range_landed, NULL, &r };
+    return pulsar_prefill_walk_run(&w, start, start + n_tokens) == 0;
 }
 
 
@@ -1117,7 +898,7 @@ int gpu_graph_decode_multiseq_batch(
          * FALSE for genuine multi-bank stepping, where the scalars hold a
          * cross-bank superset. TRUE only for a 1-row step on the session's own
          * bank whose caller has already established that the scalars are that
-         * bank's truth -- pulsar_session::eval, via its mseq_dirty guard. Without
+         * bank's truth -- the family eval (ds4_eval_row, after the core's state_agrees). Without
          * this the per-bank slots are consulted, and a classically-prefilled
          * bank has never populated them (n_comp 0), so the step is rejected. */
         bool                   capture_cur,
@@ -1173,12 +954,11 @@ int gpu_graph_decode_multiseq_batch(
     /* L260 fusion: a fused step's layout -- n_dec decode / verify rows, then
      * fused->n_pf prefill runs -- is the caller's; refuse a shape that does not
      * match the rows before anything is armed (recoverable). */
-    uint32_t fused_heads = 0;
+    const uint32_t fused_heads = fused ? pulsar_fused_shape_heads(fused) : 0u;
     if (fused) {
         uint32_t runs = 0;
         for (uint32_t t = fused->n_dec; t < n_active; t++)
             if (t == fused->n_dec || bank[t] != bank[t - 1]) runs++;
-        for (uint32_t r = 0; r < fused->n_pf && r < PULSAR_MSEQ_MAX; r++) fused_heads += fused->head_last[r] ? 1u : 0u;
         if (fused->n_dec == 0 || fused->n_dec >= n_active || fused->n_pf == 0 || fused->n_pf > PULSAR_MSEQ_MAX ||
             runs != fused->n_pf || fused->n_dec > PULSAR_SPEC_ROW_BUDGET ||
             fused->n_dec + fused_heads > PULSAR_SPEC_LOGITS_ROWS) {
@@ -1504,7 +1284,68 @@ pulsar_context_memory pulsar_context_memory_estimate(
 
 
 
+/* ---- DeepSeek's collection (family.h pulsar_family_imatrix): the layer-major prefill graph, observed -------- */
 
+struct ds4_imatrix_run {
+    pulsar_gpu_graph g;
+    pulsar_imatrix_collector c;
+    uint32_t prefill_cap;
+};
 
+static void *ds4_imatrix_begin(pulsar_engine *e, const char *dataset_path, int ctx_size) {
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    ds4_imatrix_run *r = new ds4_imatrix_run;
+    r->prefill_cap = prefill_cap;
+    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[0], raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                 gpu_graph_bank_pool_n(), false)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
+        delete r;
+        return NULL;
+    }
+    if (!imatrix_collector_init(&r->c, prefill_cap, dataset_path)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
+        gpu_graph_free(&r->g);
+        delete r;
+        return NULL;
+    }
+    fprintf(stderr,
+            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
+            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
+    return r;
+}
 
+static bool ds4_imatrix_prompt(pulsar_engine *e, void *c, const pulsar_tokens *tokens) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    token_vec prompt = *(const token_vec *)tokens;
+    if (!gpu_graph_reset_prefill_state(&r->g)) {
+        fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
+        return false;
+    }
+    if ((uint32_t)prompt.len > r->prefill_cap)
+        return gpu_graph_prefill_chunked_range(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL,
+                                               &r->c);
+    return gpu_graph_prefill_layer_major(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL, false,
+                                         &r->c, NULL, NULL);
+}
 
+static uint64_t ds4_imatrix_routes(const void *c) { return ((const ds4_imatrix_run *)c)->c.observed_routes; }
+
+static bool ds4_imatrix_save(pulsar_engine *e, void *c, const char *path) {
+    return imatrix_collector_save(&((ds4_imatrix_run *)c)->c, &e->weights, path);
+}
+
+static void ds4_imatrix_end(pulsar_engine *, void *c) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    imatrix_collector_free(&r->c);
+    gpu_graph_free(&r->g);
+    delete r;
+}
+
+const pulsar_family_imatrix k_ds4_imatrix = {
+    /* .begin  = */ ds4_imatrix_begin,
+    /* .prompt = */ ds4_imatrix_prompt,
+    /* .routes = */ ds4_imatrix_routes,
+    /* .save   = */ ds4_imatrix_save,
+    /* .end    = */ ds4_imatrix_end,
+};

@@ -7,7 +7,9 @@
  *              (stream, token); xn leaves in the format W_down reads and the
  *              per-stream rstd is kept, so the last kernel recomputes xn with
  *              the same three operations instead of storing it; the inject
- *              dot W_inj . xn is taken here on the f32 xn as per-stream partials
+ *              dot W_inj . xn is taken here on the f32 xn as per-stream partials.
+ *              At prefill widths (3') the down GEMM stages xn from the streams with
+ *              the same three operations, so the norm does not write it there
  *   2. down    d = W_down xn (320 x 10240), split-K in 5 fixed splits
  *   3. up      mid: a = silu(d / 4) in shared memory, in the format W_up reads
  *              (each CTA derives it for its tokens), inj = 2 sigmoid(z / 4) with
@@ -188,7 +190,7 @@ qwen_gr_norm_kernel(const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat
     for (int j = 0; j < kNormPer; ++j) {
         const int c = tid + kNormThreads * j;
         const float xn = x[j] * r * (1.0f + bf2f(norm_w[s * kH + c]));
-        xb[(size_t)t * kHC + s * kH + c] = __float2bfloat16(xn);
+        if (xb) xb[(size_t)t * kHC + s * kH + c] = __float2bfloat16(xn);   /* NULL: the GEMM stages xn itself */
         if (inject) {
 #pragma unroll
             for (int o = 0; o < kS; ++o) io[o] = fmaf(bf2f(inject[(size_t)o * kHC + s * kH + c]), xn, io[o]);
@@ -300,10 +302,14 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * 8 weight rows (40x per call for W_down), which was 22% of a 4096-row prefill.  The two kernels sum in
  * different orders, so a prefilled row and a decoded row agree to rounding, not to the bit (Tyler
  * 2026-09-29: "Don't use a decode kernel for prefill"); within this kernel a row's arithmetic depends
- * on nothing but its own x and W, so the chunk width changes no bit.  CTA = 4 warps = 64 tokens x 32
- * outputs (warp w: tokens 16w..16w+15, four n8 tiles); kMmaStage MX blocks staged per barrier. */
+ * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
+ * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles); a wider
+ * CTA re-stages the activation fewer times.  kMmaStage MX blocks staged per barrier. */
 constexpr int kDecodeRowsMax = 16;               ///< widths at or below take the decode GEMV
-constexpr int kMmaTok = 64, kMmaOut = 32, kMmaStage = 4;
+constexpr int kMmaTok = 64, kMmaStage = 4;
+constexpr int kMmaNJ = 8, kMmaOut = 8 * kMmaNJ;  ///< the plain Linear's CTA output width
+constexpr int kGrNJ = 8, kGrOut = 8 * kGrNJ;     ///< the read's W_up (GATE): 16 channels x 4 streams
+constexpr int kDnNJ = 10, kDnOut = 8 * kDnNJ;    ///< the read's W_down (NORM): 320 outputs in 4 CTAs
 constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
 constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
 
@@ -325,65 +331,126 @@ __device__ __forceinline__ void gr_ldsm_x2(uint32_t &r0, uint32_t &r1, const voi
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(s));
 }
 
-__device__ __forceinline__ void gr_cp_async16(void *smem, const void *gmem, int src_bytes) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
-}
+/* The GR operands of the NORM and GATE forms (3'): the read's streams, hc_norm, the norm's rstd, and
+ * (GATE) the bf16 row out. */
+struct gr_gate_args {
+    const __nv_bfloat16 *streams, *norm_w;
+    const float *rstd;
+    __nv_bfloat16 *x_out;
+};
 
+/* PLAIN: x is the bf16 activation.  NORM (the read's W_down): x is the streams and the staging takes
+ * xn = bf16(x * rstd * (1 + w)) -- the norm kernel's three operations, so the norm never writes xn at
+ * prefill widths.  GATE (the read's W_up): the gate is the epilogue. */
+enum gr_mma_form { GR_PLAIN, GR_NORM, GR_GATE };
+
+template <gr_mma_form FORM, int NJ>
 __global__ void __launch_bounds__(128)
 qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsf,
                       const __nv_bfloat16 *__restrict__ x, int out, int in, int T, int n_split,
-                      float *__restrict__ part) {
+                      float *__restrict__ part, gr_gate_args ga) {
+    constexpr bool GATE = FORM == GR_GATE;
+    constexpr int OUT = 8 * NJ;                  /* W rows per CTA */
+    constexpr int CPS = OUT / kS;                /* GATE: channels per stream in the CTA */
     __shared__ __align__(16) __nv_bfloat16 sx[kMmaTok][kMmaPad];
-    __shared__ __align__(16) __nv_bfloat16 sw[kMmaOut][kMmaPad];
+    __shared__ __align__(16) __nv_bfloat16 sw[OUT][kMmaPad];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int r0 = blockIdx.x * kMmaOut, split = blockIdx.y, t0 = blockIdx.z * kMmaTok;
+    /* GATE: the CTA's W rows are channels c0 .. c0 + CPS - 1 of the four streams (n8 tiles s * CPS / 8 ..
+     * of stream s), so every lane ends holding z for all four streams of its (token, channel) pairs;
+     * otherwise rows r0 .. r0 + OUT - 1 */
+    static_assert(!GATE || (NJ % kS == 0 && CPS % 8 == 0), "the gate tile is whole n8 tiles per stream");
+    static_assert(kH % 8 == 0, "a staged 8-element chunk lies in one stream");
+    const int r0 = blockIdx.x * OUT, c0 = blockIdx.x * CPS, split = blockIdx.y, t0 = blockIdx.z * kMmaTok;
     const int nblk = in / 32, per = nblk / n_split, b_lo = split * per, b_hi = b_lo + per;
     const int w_kbp = pulsar_mx_kbp(in);
-    float acc[4][4];
+    float acc[NJ][4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int j = 0; j < NJ; ++j)
 #pragma unroll
         for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
 
-    for (int b0 = b_lo; b0 < b_hi; b0 += kMmaStage) {
+    /* The staging is register-prefetched: a stage's raw x chunks and W codes are loaded into registers
+     * while the previous stage's MMAs run, then converted into shared memory -- the same values the
+     * MMAs read, only issued earlier.  Thread tid takes x chunks tid + 128 i and W chunks tid + 128 i. */
+    constexpr int kXT = kMmaTok * kMmaStage * 4 / 128, kWT = OUT * kMmaStage * 4 / 128;
+    static_assert(kXT * 128 == kMmaTok * kMmaStage * 4 && kWT * 128 == OUT * kMmaStage * 4, "whole passes");
+    uint4 xr[kXT];
+    uint2 wc[kWT];
+    unsigned ws[kWT];
+    auto load = [&](int b0) {
         const int nbs = min(kMmaStage, b_hi - b0);
-        /* x: kMmaTok rows x nbs blocks of 32 bf16 = 4 16-byte chunks a block; rows past T read zero */
-        for (int c = tid; c < kMmaTok * kMmaStage * 4; c += 128) {
-            const int tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
-            if (ch < nbs * 4) {
-                const bool ok = t < T;
-                gr_cp_async16(&sx[tr][ch * 8], x + (size_t)(ok ? t : 0) * in + (size_t)b0 * 32 + ch * 8, ok ? 16 : 0);
-            }
-        }
-        /* W: kMmaOut rows x nbs blocks, 8 codes a thread-task, dequantized exactly into bf16 */
-        for (int c = tid; c < kMmaOut * kMmaStage * 4; c += 128) {
-            const int wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), row = r0 + wr;
-            if (ch >= nbs * 4) continue;
-            uint32_t o[4] = {0u, 0u, 0u, 0u};
-            if (row < out) {
-                const int b = b0 + (ch >> 2);
-                const uint2 codes = *reinterpret_cast<const uint2 *>(wq + (size_t)row * in + (size_t)b0 * 32 + ch * 8);
-                const float s = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
-                const uint8_t *cb = reinterpret_cast<const uint8_t *>(&codes);
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    __nv_fp8_e4m3 q0, q1;
-                    q0.__x = cb[2 * e];
-                    q1.__x = cb[2 * e + 1];
-                    const __nv_bfloat162 v = __floats2bfloat162_rn(float(q0) * s, float(q1) * s);
-                    o[e] = *reinterpret_cast<const uint32_t *>(&v);
+        for (int i = 0; i < kXT; ++i) {
+            const int c = tid + 128 * i, tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
+            xr[i] = t < T && ch < nbs * 4 ? *reinterpret_cast<const uint4 *>(x + (size_t)t * in + (size_t)b0 * 32 + ch * 8)
+                                          : make_uint4(0u, 0u, 0u, 0u);
+        }
+#pragma unroll
+        for (int i = 0; i < kWT; ++i) {
+            const int c = tid + 128 * i, wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4);
+            const int row = GATE ? (wr / CPS) * kH + c0 + wr % CPS : r0 + wr;
+            const bool ok = row < out && ch < nbs * 4;
+            wc[i] = ok ? *reinterpret_cast<const uint2 *>(wq + (size_t)row * in + (size_t)b0 * 32 + ch * 8) : make_uint2(0u, 0u);
+            ws[i] = ok ? wsf[pulsar_mx_sfoff(row, b0 + (ch >> 2), w_kbp)] : 0u;
+        }
+    };
+    auto store = [&](int b0) {
+        const int nbs = min(kMmaStage, b_hi - b0);
+        /* x: kMmaTok rows x nbs blocks of 32 bf16 = 4 16-byte chunks a block; rows past T are zero */
+#pragma unroll
+        for (int i = 0; i < kXT; ++i) {
+            const int c = tid + 128 * i, tr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4), t = t0 + tr;
+            if (ch >= nbs * 4) continue;
+            uint4 v = xr[i];
+            if constexpr (FORM == GR_NORM) {
+                if (t < T) {
+                    const int k = b0 * 32 + ch * 8, s = k / kH;
+                    float xf[8], wf[8];
+                    bf16x8(xr[i], xf);
+                    bf16x8(*reinterpret_cast<const uint4 *>(ga.norm_w + k), wf);
+                    const float r = ga.rstd[t * kS + s];
+                    uint32_t o[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const __nv_bfloat162 h = __halves2bfloat162(__float2bfloat16(xf[2 * e] * r * (1.0f + wf[2 * e])),
+                                                                    __float2bfloat16(xf[2 * e + 1] * r * (1.0f + wf[2 * e + 1])));
+                        o[e] = *reinterpret_cast<const uint32_t *>(&h);
+                    }
+                    v = make_uint4(o[0], o[1], o[2], o[3]);
                 }
+            }
+            *reinterpret_cast<uint4 *>(&sx[tr][ch * 8]) = v;
+        }
+        /* W: OUT rows x nbs blocks, 8 codes a thread-task, dequantized exactly into bf16 */
+#pragma unroll
+        for (int i = 0; i < kWT; ++i) {
+            const int c = tid + 128 * i, wr = c / (kMmaStage * 4), ch = c % (kMmaStage * 4);
+            if (ch >= nbs * 4) continue;
+            const float s = mx_scale1(ws[i]);
+            const uint8_t *cb = reinterpret_cast<const uint8_t *>(&wc[i]);
+            uint32_t o[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                __nv_fp8_e4m3 q0, q1;
+                q0.__x = cb[2 * e];
+                q1.__x = cb[2 * e + 1];
+                const __nv_bfloat162 v = __floats2bfloat162_rn(float(q0) * s, float(q1) * s);
+                o[e] = *reinterpret_cast<const uint32_t *>(&v);
             }
             *reinterpret_cast<uint4 *>(&sw[wr][ch * 8]) = make_uint4(o[0], o[1], o[2], o[3]);
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    };
+    load(b_lo);
+    for (int b0 = b_lo; b0 < b_hi; b0 += kMmaStage) {
+        const int nbs = min(kMmaStage, b_hi - b0);
+        store(b0);
         __syncthreads();
+        if (b0 + kMmaStage < b_hi) load(b0 + kMmaStage);
         for (int kk = 0; kk < nbs * 32; kk += 16) {
             uint32_t a[4];
             gr_ldsm_x4(a, &sx[warp * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < NJ; ++j) {
                 uint32_t bb0, bb1;
                 gr_ldsm_x2(bb0, bb1, &sw[j * 8 + (lane & 7)][kk + ((lane >> 3) & 1) * 8]);
                 /* a FRESH fragment per 16-k step, added into acc in f32: the tensor core's own
@@ -399,13 +466,39 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
     }
     /* lane (g, c): acc[j][0..1] = token 16w+g, rows 8j+2c, +1; acc[j][2..3] = token 16w+g+8 */
     const int g = lane >> 2, c2 = (lane & 3) * 2;
+    if constexpr (GATE) {
+        /* the up kernel's emit with z_s = acc[s * CPS / 8 + q][e]: x = (g_0 xn_0 + g_1 xn_1 + g_2 xn_2 + g_3 xn_3) / 4 */
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
+        for (int q = 0; q < CPS / 8; ++q)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int t = t0 + warp * 16 + g + 8 * (e >> 1), row = r0 + j * 8 + c2 + (e & 1);
-            if (t < T && row < out) part[((size_t)t * n_split + split) * out + row] = acc[j][e];
+        for (int h = 0; h < 2; ++h) {
+            const int t = t0 + warp * 16 + g + 8 * h, c = c0 + 8 * q + c2;
+            if (t >= T) continue;
+            float p[2][kS];
+#pragma unroll
+            for (int s = 0; s < kS; ++s) {
+                const int row = s * kH + c;                 /* channels c, c + 1: one bf16 pair */
+                const float2 xs = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(ga.streams + (size_t)t * kHC + row));
+                const float2 nw = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(ga.norm_w + row));
+                const float r = ga.rstd[t * kS + s];
+                const int j = s * (CPS / 8) + q;
+                p[0][s] = 1.0f / (1.0f + expf(-acc[j][2 * h])) * (xs.x * r * (1.0f + nw.x));
+                p[1][s] = 1.0f / (1.0f + expf(-acc[j][2 * h + 1])) * (xs.y * r * (1.0f + nw.y));
+            }
+            float v[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) v[e] = (((p[e][0] + p[e][1]) + p[e][2]) + p[e][3]) * (1.0f / kS);
+            *reinterpret_cast<__nv_bfloat162 *>(ga.x_out + (size_t)t * kH + c) = __floats2bfloat162_rn(v[0], v[1]);
         }
+    } else {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = t0 + warp * 16 + g + 8 * (e >> 1), row = r0 + j * 8 + c2 + (e & 1);
+                if (t < T && row < out) part[((size_t)t * n_split + split) * out + row] = acc[j][e];
+            }
+    }
 }
 
 /* 3. mid + up + gate + mean: one warp per stream, lane = channel, TB
@@ -536,20 +629,37 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
 
 __global__ void qwen_gr_write_kernel(__nv_bfloat16 *__restrict__ streams, const float *__restrict__ out,
                                      const float *__restrict__ inj, int T) {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    /* 8 consecutive elements a thread (one 16-byte chunk, inside one stream: kH % 8 == 0) */
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i >= (size_t)T * kHC) return;
     const size_t t = i / kHC;
     const int s = (int)((i / kH) % kS), c = (int)(i % kH);
-    streams[i] = __float2bfloat16(bf2f(streams[i]) + out[t * kH + c] * inj[t * kS + s]);
+    uint4 *sp = reinterpret_cast<uint4 *>(streams + i);
+    float x[8];
+    bf16x8(*sp, x);
+    const float4 *op = reinterpret_cast<const float4 *>(out + t * kH + c);
+    const float4 o0 = op[0], o1 = op[1];
+    const float o[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
+    const float g = inj[t * kS + s];
+    uint32_t r[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const __nv_bfloat162 v = __halves2bfloat162(__float2bfloat16(x[2 * e] + o[2 * e] * g),
+                                                    __float2bfloat16(x[2 * e + 1] + o[2 * e + 1] * g));
+        r[e] = *reinterpret_cast<const uint32_t *>(&v);
+    }
+    *sp = make_uint4(r[0], r[1], r[2], r[3]);
 }
 
 /* 3'. PREFILL (W8, T > kDecodeRowsMax): the up as a tensor-core GEMM.  The up kernel above reads its
  * W_up row once per 16-token CTA on the CUDA cores (0.49 s of a 4096-row prefill); here
  *   mid   a = silu(d / 4) for every (token, rank) into a bf16 [T][kR] buffer, and inj -- the same
  *         three operations as the up kernel's mid, so `a` is bit-identical to its shared copy;
- *   GEMM  z [T][kHC] = W_up a, the W8A16 prefill kernel (2') with one split;
- *   gate  x = (g_0 xn_0 + g_1 xn_1 + g_2 xn_2 + g_3 xn_3) / 4, g_s = sigmoid(z_s), one thread per
- *         (token, channel), the up kernel's emit.
+ *   GEMM  z = W_up a, the W8A16 prefill kernel (2') with one split, in its GATE form: a CTA takes rows
+ *         s * 2560 + c0 .. c0 + 15 of the four streams (n8 tiles 2s, 2s + 1), so each lane holds z_s for all four
+ *         streams of its (token, channel) pairs and the epilogue is the gate -- x = (g_0 xn_0 + g_1 xn_1
+ *         + g_2 xn_2 + g_3 xn_3) / 4, g_s = sigmoid(z_s), the up kernel's emit.  z never reaches memory
+ *         (it was an f32 [T][10240] round trip, 168 MB a 4096-row chunk); a row's k order is unchanged.
  * Only z's summation order differs from the decode kernel, so a prefilled row agrees with a decoded one
  * to rounding (the same contract as 2'). */
 __global__ void __launch_bounds__(256)
@@ -573,29 +683,10 @@ qwen_gr_mid_kernel(const float *__restrict__ part, const float *__restrict__ inj
     }
 }
 
-__global__ void __launch_bounds__(256)
-qwen_gr_gate_kernel(const float *__restrict__ z, const __nv_bfloat16 *__restrict__ streams,
-                    const __nv_bfloat16 *__restrict__ norm_w, const float *__restrict__ rstd, int T,
-                    __nv_bfloat16 *__restrict__ x_out) {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t)T * kH) return;
-    const int t = (int)(i / kH), c = (int)(i % kH);
-    float p[kS];
-#pragma unroll
-    for (int s = 0; s < kS; ++s) {
-        const int row = s * kH + c;
-        const float g = 1.0f / (1.0f + expf(-z[(size_t)t * kHC + row]));
-        const float xn = bf2f(streams[(size_t)t * kHC + row]) * rstd[t * kS + s] * (1.0f + bf2f(norm_w[row]));
-        p[s] = g * xn;
-    }
-    x_out[i] = __float2bfloat16((((p[0] + p[1]) + p[2]) + p[3]) * (1.0f / kS));
-}
-
 struct gr_ws {
     uint8_t *xn;                      /* the norm's bf16 activation row (L251 / ac69748f) */
     float *rstd, *injp, *part;
     __nv_bfloat16 *a;                 /* prefill only: silu(d / 4), [T][kR] */
-    float *z;                         /* prefill only: W_up a, [T][kHC] */
 };
 
 static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
@@ -614,7 +705,6 @@ static size_t gr_ws_layout(int T, void *base, size_t cap, gr_ws *o) {
     m.part  = (float *)take((size_t)T * kDownSplit * kR * 4);
     /* the prefill GEMM's buffers at every T: a prompt chunk of any width takes it (L266) */
     m.a = (__nv_bfloat16 *)take((size_t)T * kR * 2);
-    m.z = (float *)take((size_t)T * kHC * 4);
     if (o) *o = m;
     return failed ? 0 : used;
 }
@@ -645,14 +735,17 @@ static int gr_down_tokens_per_cta(int in, int n_split) {
 template <bool W8>
 static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
                             float *inj, const gr_ws &m, cudaStream_t stream) {
+    /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
+     * tensor cores (2') at prefill widths, where the GEMM's staging takes xn from the streams itself
+     * (GR_NORM), so the norm emits only rstd and the inject partials there. */
+    const bool gemm = W8 && (w->prompt || T > kDecodeRowsMax);
+    const gr_gate_args ga{(const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, m.rstd, (__nv_bfloat16 *)x_bf16};
     qwen_gr_norm_kernel<<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
-        (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
-    /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
-     * tensor cores (2'). */
-    if (W8 && (w->prompt || T > kDecodeRowsMax)) {
-        qwen_w8a16_prefill_kernel<<<dim3((kR + kMmaOut - 1) / kMmaOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
-            (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)m.xn, kR, kHC, T, kDownSplit, m.part);
+        gemm ? nullptr : (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
+    if (gemm) {
+        qwen_w8a16_prefill_kernel<GR_NORM, kDnNJ><<<dim3((kR + kDnOut - 1) / kDnOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
+            (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)streams, kR, kHC, T, kDownSplit, m.part, ga);
     } else {
         const int tb = gr_down_tokens_per_cta(kHC, kDownSplit);
         static_assert(kHC / kDownSplit * 2 * kDownTB <= kDownStageBytes, "W_down stages a whole token tile");
@@ -660,15 +753,14 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
                                          W8 ? (size_t)tb * kHC / kDownSplit * 2 : 0, stream>>>(
             w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, tb, m.part);
     }
-    if (W8 && (w->prompt || T > kDecodeRowsMax)) {
+    if (gemm) {
         const int64_t nm = (int64_t)T * kR;
         qwen_gr_mid_kernel<<<(unsigned)((nm + 255) / 256), 256, 0, stream>>>(m.part, w->inject ? m.injp : nullptr, inj,
                                                                            T, m.a);
-        qwen_w8a16_prefill_kernel<<<dim3((kHC + kMmaOut - 1) / kMmaOut, 1, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
-            (const uint8_t *)w->up.w, w->up.sf, m.a, kHC, kR, T, 1, m.z);
-        const int64_t ng = (int64_t)T * kH;
-        qwen_gr_gate_kernel<<<(unsigned)((ng + 255) / 256), 256, 0, stream>>>(
-            m.z, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, m.rstd, T, (__nv_bfloat16 *)x_bf16);
+        /* the up GEMM with the gate in its epilogue: a CTA per 16 channels x the 4 streams, z stays in registers */
+        static_assert(kH % (kGrOut / kS) == 0, "the gate tiles the channels by kGrOut / 4");
+        qwen_w8a16_prefill_kernel<GR_GATE, kGrNJ><<<dim3(kH / (kGrOut / kS), 1, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
+            (const uint8_t *)w->up.w, w->up.sf, m.a, kHC, kR, T, 1, nullptr, ga);
         return;
     }
     if (W8) {
@@ -745,8 +837,12 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
         fprintf(stderr, "pulsar: qwen GR write: a null input -- refusing\n");
         return -1;
     }
-    const size_t n = (size_t)T * kHC;
-    qwen_gr_write_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((__nv_bfloat16 *)streams, out, inj, T);
+    if (((uintptr_t)streams | (uintptr_t)out) & 15u) {
+        fprintf(stderr, "pulsar: qwen GR write: streams and out must be 16-byte aligned -- refusing\n");
+        return -1;
+    }
+    const size_t n8 = (size_t)T * kHC / 8;
+    qwen_gr_write_kernel<<<(unsigned)((n8 + 255) / 256), 256, 0, stream>>>((__nv_bfloat16 *)streams, out, inj, T);
     return launch_ok("write") ? 0 : -3;
 }
 
@@ -771,8 +867,8 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
      * chunks take the tensor-core GEMM (2'). */
     if (l->prompt || rows > kDecodeRowsMax) {
         const dim3 grid((l->out + kMmaOut - 1) / kMmaOut, 1, (rows + kMmaTok - 1) / kMmaTok);
-        qwen_w8a16_prefill_kernel<<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
-                                                            l->out, l->in, rows, 1, y);
+        qwen_w8a16_prefill_kernel<GR_PLAIN, kMmaNJ><<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
+                                                                   l->out, l->in, rows, 1, y, gr_gate_args{});
     } else {
         const int tb = gr_down_tokens_per_cta(l->in, 1);
         if (tb == 0) {

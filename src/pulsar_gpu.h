@@ -132,7 +132,7 @@
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
  * measured sublinear c4 scaling); the row cost (measured live since L263,
- * pulsar_engine_spec_cost; L214's refit put it at 7.17 ms) has no cliff, so a 32-row slab (+8.3 MB logits) lets the
+ * pulsar_engine_lane_cost; L214's refit put it at 7.17 ms) has no cliff, so a 32-row slab (+8.3 MB logits) lets the
  * ranked allocator keep K near its survival optimum at c4. Every consumer
  * derives from THIS constant (slab alloc, driver reject, lane arrays,
  * dspark batch-capture buffer) -- audited 2026-08-27, rows/L117.md. */
@@ -209,6 +209,9 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
                                   const float *src, uint64_t n);
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/** Copy `bytes` from a raw DEVICE pointer (a slice of a scratch tensor a kernel wrote) to the host, after the
+ *  work queued before it -- the importance-matrix collection's observation (L284 P15).  1 on success. */
+int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes);
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -1180,7 +1183,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * Quantise EXACTLY ONCE (pulsar_cuda_kvrows.cu); every later move is a byte
  * move, and there is no conversion path from any other row format (0731's
  * unified 384 B NVFP4 row refuses through the payload / segment versions).
- * Bumping either layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION and
+ * Bumping either layout MUST bump PULSAR_SESSION_KV_PAYLOAD_VERSION and
  * PULSAR_SESSION_SEGMENT_VERSION. */
 #define PULSAR_WINKV_BLOCK  32u
 #define PULSAR_MAINKV_BLOCK 16u
@@ -2399,13 +2402,6 @@ int pulsar_gpu_dspark_markov_step_banks_model(
 
 /** DSpark Markov + confidence heads */
 
-int pulsar_gpu_dspark_markov_chain_model(
-        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
-        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
-        const void *dspark_model_map, uint64_t dspark_model_size,
-        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
-        uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_fmt);
 int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,

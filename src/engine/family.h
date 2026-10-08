@@ -101,6 +101,24 @@ typedef struct pulsar_family_vision {
  *  slot reader reads slices REGISTERED with the backend, a rows reader slices BUILT and kept on the device). */
 typedef enum { PULSAR_ACT_KIND_SLOT = 0, PULSAR_ACT_KIND_ROWS = 1 } pulsar_act_kind;
 
+/** Importance-matrix collection (L284 P15): the dataset walk, the prompt cap and the llama.cpp `.dat` writer are
+ *  the core's (session.cpp pulsar_engine::collect_imatrix, imatrix.cpp imatrix_write_entry); a family supplies only
+ *  how ONE prompt is run through its forward with its linears observed, and what it observed.  The tensors it
+ *  names are the checkpoint's own (the entry name is the tensor's), `n_expert * n_columns` floats an expert-stacked
+ *  tensor, `n_columns` a dense one. */
+typedef struct {
+    /** Open a collection for prompts of at most `ctx_size` tokens; NULL on failure (reported). */
+    void *(*begin)(pulsar_engine *e, const char *dataset_path, int ctx_size);
+    /** Run one tokenized prompt from position 0 through the forward, observing. */
+    bool (*prompt)(pulsar_engine *e, void *c, const pulsar_tokens *tokens);
+    /** (token, expert) routing decisions observed so far (the progress line). */
+    uint64_t (*routes)(const void *c);
+    /** Write the `.dat`. */
+    bool (*save)(pulsar_engine *e, void *c, const char *path);
+    /** Release the collection. */
+    void (*end)(pulsar_engine *e, void *c);
+} pulsar_family_imatrix;
+
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
@@ -118,34 +136,35 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_BANKS   = 1u << 0,  ///< a bank pool > 1: repoint, fork, physical residency, bank state save/restore, per-bank KV spill
     PULSAR_FAMILY_CAP_SPEC    = 1u << 1,  ///< speculative decoding: the family provides pulsar_family::spec (the verify hooks) for whichever drafter is loaded
     PULSAR_FAMILY_CAP_PAYLOAD = 1u << 2,  ///< disk-KV payloads and snapshots (save/load/stage/mirror)
-    PULSAR_FAMILY_CAP_REWIND  = 1u << 3,  ///< rewind / rewrite-from-common to an earlier position of a live session
+    PULSAR_FAMILY_CAP_REWIND  = 1u << 3,  ///< rewind to an earlier position of a live session
     PULSAR_FAMILY_CAP_VISION  = 1u << 4,  ///< image spans in a prompt
     PULSAR_FAMILY_CAP_TP      = 1u << 5,  ///< tensor parallelism across a pair / mesh
     PULSAR_FAMILY_CAP_IMATRIX = 1u << 6,  ///< importance-matrix collection
     PULSAR_FAMILY_CAP_CHAT    = 1u << 7,  ///< tokenizer + chat renderer (a family without it cannot take text)
-    PULSAR_FAMILY_CAP_GENERATE = 1u << 8, ///< pulsar_engine_generate_argmax (the session-less whole-graph path)
     PULSAR_FAMILY_CAP_SEGMENTS = 1u << 9, ///< disk KV segments: span files of the grid checkpoint store (L264; Qwen L266)
+    PULSAR_FAMILY_CAP_MIXED_PREFILL = 1u << 10, ///< decode_mixed carries prefill runs beside its decode rows (the plain lane's mixed quantum); without it a prompt rides only the fused step
 };
 
 /** The session operations every family implements.  The C API
  * (engine_api.cpp) calls these at step granularity; the TP mirror wraps the
  * same calls on a family with PULSAR_FAMILY_CAP_TP. */
 typedef struct {
-    /** Build the family's state into a session the core allocated (L272 P2: engine, ctx_size, prefill_cap
-     * and the logits row are set; the core measures the GPU bytes this allocates as resident_bytes and
-     * assigns the TP mirror id).  0 on success; on failure the family frees what it built. */
-    int (*create)(pulsar_session *s);
+    /** Build the family's state for `n_banks` banks into a session the core allocated (L272 P2: engine,
+     * ctx_size, prefill_cap and the logits row are set; the core measures the GPU bytes this allocates as
+     * resident_bytes and assigns the TP mirror id).  It is also the session's PRICE: the core runs it with the
+     * tensor allocators dry (pulsar_engine::session_cost_bytes_banked), so it allocates GPU memory only through
+     * them.  0 on success; on failure the family frees what it built. */
+    int (*create)(pulsar_session *s, uint32_t n_banks);
     /** Free the family's state; the core frees the session's own (the view, the carry, the sampler and
      * speculation scratch, the logits) and the session itself. */
     void (*destroy)(pulsar_session *s);
-    /** GPU bytes create() takes at (ctx_size, n_banks): the allocation run dry,
-     * so the price and the allocation are one function.  0 = cannot create. */
-    uint64_t (*cost_bytes)(pulsar_engine *e, int ctx_size, int n_banks);
-    /** Make the session's state hold exactly `prompt` (prefill what is new). */
-    int (*sync)(pulsar_session *s, const pulsar_tokens *prompt,
-                const pulsar_image_ref *images, int n_images, char *err, size_t errlen);
-    /** Append one token and decode the next logits row. */
-    int (*eval)(pulsar_session *s, int token, char *err, size_t errlen);
+    /** Make the session's state hold exactly `prompt` (prefill what is new): the core's sync driver
+     *  (pulsar_session_sync_default, L284 every family's) over the family's state, reset and prefill chunk. */
+    const struct pulsar_sync_ops *sync;
+    /** Decode `token` at the view's end (position checkpoint.len) on the live bank, its next-token row into
+     *  s->logits -- the family's forward only: the core's eval (pulsar_session_family_eval) checks the context, the
+     *  id and the state's agreement with the view before, and records the token after.  0 = decoded. */
+    int (*eval_row)(pulsar_session *s, int token, char *err, size_t errlen);
     /** One decode row per request (each on its own bank). */
     int (*decode_multiseq)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n,
                            float *logits, int logits_cap, char *err, size_t errlen);
@@ -153,8 +172,22 @@ typedef struct {
     int (*decode_mixed)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                         float *logits, int logits_cap, uint32_t *out_n_rows,
                         uint32_t max_head_runs, char *err, size_t errlen);
-    /** Forget the session's state (the next sync prefills cold). */
+    /** Forget the session's state, the device half (DeepSeek: the bank back to position 0); NULL = nothing on the
+     *  device to forget (the next sync's reset clears it).  The core (pulsar_session_family_invalidate) clears the
+     *  view, the logits and the image records for every family. */
     void (*invalidate)(pulsar_session *s);
+    /** The fused step (pulsar_session_decode_fused, contract in pulsar.h): decode rows and prompt runs in one
+     *  forward, each run's last row headed on request.  NULL = the family has none; pulsar_engine_has_fused_step
+     *  is this op's presence.  The core calls it through pulsar_session_fused_local, which keeps the session's
+     *  record of the step's block (fused_logits) for every family. */
+    int (*decode_fused)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                        const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                        char *err, size_t errlen);
+    /** The most logits rows one decode_fused step heads -- its verify rows plus its headed prompt runs (L284 #2:
+     *  the ONE authority the server sizes a round's verify budget by, pulsar_engine_fused_heads_max).  It is also
+     *  the widest verify step a family runs at all (L284: the decoders the spec lane carries, one base row each,
+     *  and the rows its allocator rations the drafts within).  0 with no decode_fused. */
+    uint32_t fused_heads_max;
 } pulsar_family_session_ops;
 
 /** A family's tokenizer and chat front (L272 P2): what the public tokenizer entries (tokenizer.cpp) do on
@@ -167,9 +200,13 @@ typedef struct pulsar_family_tokenizer {
     /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none). */
     void (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
                             pulsar_tokens *out);
-    /** One system + one user message, rendered and tokenized the family's way (the CLI's one-shot). */
-    void (*encode_chat_prompt)(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
-                               pulsar_tokens *out);
+    /** The chat front turn by turn (pulsar.h pulsar_chat_open / _append_turn / _end_assistant): the head, one
+     *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
+    void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode);
+    void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                      bool generation_prompt, pulsar_think_mode think_mode);
+    void (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     bool (*is_stop)(pulsar_engine *e, int token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
     int (*eos)(pulsar_engine *e);
@@ -180,20 +217,16 @@ typedef struct pulsar_family_tokenizer {
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */
     void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
-    /** The family's chat is DeepSeek's marker template, which the incremental entries
-     *  (pulsar_chat_begin / _append_lead_in / _append_message / _append_assistant_prefix) build; a family
-     *  that renders its chat whole (Qwen: qwen_chat_render) refuses them by name. */
-    bool incremental_ds4_template;
 } pulsar_family_tokenizer;
 
-/** A family's own bank pool (L251): the server's per-bank bookkeeping for a
- * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
- * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
- * entries call these, and the operations a family cannot do -- forks, per-bank
- * KV spill, physical eviction -- refuse with each entry's own failure value
- * (the server has a path for every one of them).  The demand-paged KV accounting
- * (L270) is the same contract as DeepSeek's (admission prices the touched share,
- * the 2b guard keeps touched KV under budget). */
+/** A family's bank pool (L251; every family's since L284 dd-banks -- DeepSeek's is its graph pool,
+ * session_banks.cpp k_ds4_bank_ops): the server's per-bank bookkeeping.  engine_api.cpp's bank entries,
+ * the TP worker's bank frames and the round core call these and nothing else, and the operations a
+ * family cannot do refuse with each entry's own failure value (the server has a path for every one of
+ * them).  pulsar_family_for_model refuses a family without them.  The demand-paged KV accounting (L270) and the physical
+ * residency (L284 #3) are the same contract as DeepSeek's (admission prices the
+ * touched share, the 2b guard keeps touched KV under budget by spilling a bank to
+ * its segment chain and freeing its physical; the always-resident state stays). */
 typedef struct {
     int (*count)(pulsar_session *s);
     /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
@@ -202,8 +235,6 @@ typedef struct {
     /** Make `bank` live: the core's pulsar_bank_carry_restore_view, and what a bank with no carry means.
      *  false = refused. */
     bool (*restore)(pulsar_session *s, uint32_t bank);
-    /** Tokens the batched lane fed that the host view has not recorded yet. */
-    void (*note_committed)(pulsar_session *s, const int *toks, int n);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
     /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit). */
@@ -217,6 +248,29 @@ typedef struct {
     uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
     /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
     uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
+    /** L284 #3: return an idle bank's demand-paged KV physical (cudaFree) -- the
+     *  pulsar_session_bank_free_physical contract: false ONLY on a refusal (the live bank, a
+     *  bank out of range) with nothing freed; true = the bank is evicted, its touched KV 0. */
+    bool (*free_physical)(pulsar_session *s, uint32_t bank);
+    /** L284 #3: re-back an evicted bank (fresh managed tensors, physical on touch).  Idempotent;
+     *  on a failure the bank is left wholly evicted.  The caller reloads its KV (segment chain). */
+    bool (*alloc_physical)(pulsar_session *s, uint32_t bank);
+    /** L284 #3: true while any of the bank's demand-paged KV is missing. */
+    bool (*is_evicted)(const pulsar_session *s, uint32_t bank);
+    /** Optional.  Point the device views at `bank` without its host carry (0 = done, 1 = refused).
+     *  NULL = the family's repoint IS a restore (Qwen: nothing on the device to point). */
+    int (*repoint)(pulsar_session *s, uint32_t bank);
+    /** Optional, present exactly when the family declares PULSAR_FAMILY_CAP_REWIND (pulsar_family_for_model
+     *  asserts it): trim the live bank's history to `pos` (pulsar.h pulsar_session_rewind). */
+    void (*rewind)(pulsar_session *s, int pos);
+    /** Optional.  A standalone restore of the live bank to its grid checkpoint at G, history trimmed to G
+     *  (pulsar_session_restore_checkpoint).  NULL = the family restores a checkpoint only as its sync resumes
+     *  from it, and a segment chain's last restore is the store's alone (L272 B1). */
+    bool (*restore_checkpoint)(pulsar_session *s, uint32_t G);
+    /** Are the session's banks a pool -- per-bank device state the batched lanes address by bank?  (DeepSeek:
+     *  false with the pool disabled, where bank 0 is the classic tensors though count() says 1.)  The round
+     *  core defers its drafter seeds to one banked pass only on a pool (seed_defer, L260). */
+    bool (*pooled)(const pulsar_session *s);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family
@@ -236,8 +290,14 @@ struct pulsar_family {
     /** Engine facts that depend on the loaded shape. */
     uint32_t (*logits_width)(const pulsar_engine *e);
     const char *(*model_name)(const pulsar_engine *e);
+    /** The id the API serves the model as (`model` in responses and /v1/models). */
+    const char *(*served_model_id)(const pulsar_engine *e);
     pulsar_chat_format (*chat_format)(const pulsar_engine *e);
     int (*model_id)(const pulsar_engine *e);
+    /** The longest context the loaded model's positions were trained for, with whatever position scaling the
+     *  family implements (DeepSeek: YaRN's original context x factor; Qwen: max_position_embeddings until L280's
+     *  YaRN).  pulsar_session_create refuses a larger one (L284: past it a session ran untrained positions). */
+    uint64_t (*trained_context)(const pulsar_engine *e);
     /** The tensor-parallel transport's shape (L266): exchange slots per step (layers), the row width an
      *  all-reduce moves, and the vocab -- the TP identity and the slab are sized by it. */
     void (*tp_shape)(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab);
@@ -264,8 +324,10 @@ struct pulsar_family {
     pulsar_act_kind act_kind;
     /** L281: the family's image geometry (image_identity.cpp), or NULL = no images. */
     const pulsar_family_vision *vision;
-    /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
+    /** The bank pool (never NULL). */
     const pulsar_family_bank_ops *banks;
+    /** The family's importance-matrix collection (PULSAR_FAMILY_CAP_IMATRIX), or NULL. */
+    const pulsar_family_imatrix *imatrix;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

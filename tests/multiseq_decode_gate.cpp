@@ -61,13 +61,19 @@
  * plain decode by contract at n >= 2 and must not depend on the speculation
  * machinery having been initialized.  Run via `make cuda-multiseq-gate-nodspark`.
  *
+ * FAMILIES (L284): public bank API only, so it runs on every hosted model.  A
+ * family without snapshots re-prefills instead of loading (said in the log); a
+ * family whose steps carry no prompt runs skips assertion 3 by name; a family
+ * whose forward does not feed the engine's step funnel counter is said by
+ * name and its legs' widths are not asserted on it.
+ *
  * usage: PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate MODEL [MAXN] [STEPS]
  *        (from the repo root -- reads tests/long_context_story_prompt.txt;
  *         MAXN >= 2; assertion 1 needs MAXN >= 3)
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
-#include "gate_fixture.h"
+#include "gate_util.h"
 #include "gate_entry.h"
 
 #include <stdio.h>
@@ -104,14 +110,19 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* L284: whether the family snapshots sessions (pulsar_engine_has_snapshots).
+ * Without them every populate is a cold prefill of the prompt into the bank
+ * (gate_bank_sync) -- the same state by the session contract (C1: a prefill
+ * is its tokens' bytes), so the comparisons below keep their meaning. */
+static bool g_snapshots;
+
 /* The cold path, once per prompt: prefill prompt k into bank k through the
- * classic path and snapshot the bank. */
+ * public bank API and snapshot the bank (where the family has snapshots). */
 static bool bank_prefill_and_snapshot(pulsar_session *s, int k) {
-    if (!gate_populate_bank(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k],
-                            &g_first_tok[k], "populate"))
+    if (!gate_bank_sync(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k], &g_first_tok[k], "populate"))
         return false;
     char err[256];
-    if (pulsar_session_save_snapshot(s, &g_snap[k], err, sizeof err) != 0) {
+    if (g_snapshots && pulsar_session_save_snapshot(s, &g_snap[k], err, sizeof err) != 0) {
         fprintf(stderr, "snapshot of prompt %d failed: %s\n", k, err);
         return false;
     }
@@ -119,8 +130,11 @@ static bool bank_prefill_and_snapshot(pulsar_session *s, int k) {
 }
 
 /* Put prompt k into bank `bank` from its snapshot: repoint the device views,
- * drop the live bookkeeping, load, persist as the bank's carry. */
+ * drop the live bookkeeping, load, persist as the bank's carry.  Without
+ * snapshots: prefill it there again. */
 static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what) {
+    if (!g_snapshots)
+        return gate_bank_sync(s, bank, g_toks.v + g_prompt_off[k], g_prompt_len[k], NULL, what);
     char err[256];
     if (pulsar_session_bank_repoint(s, bank) != 0) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
@@ -143,8 +157,8 @@ static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what)
  * first_logits_out (optional, n*vocab floats) receives the STEP-1 logits. */
 static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double *secs,
                       bool use_mixed, float *first_logits_out, bool banks_ready) {
-    if (!gate_pool_fits(s, (uint32_t)n)) return false;
-    const int vocab = (int)PULSAR_N_VOCAB;   /* the engine's logits row width */
+    if (!gate_bank_pool_fits(s, n)) return false;
+    const int vocab = pulsar_engine_logits_width(g_e);
     char err[256];
     for (int k = 0; k < n; k++) {
         if (!banks_ready && !bank_load(s, (uint32_t)k, k, "populate")) return false;
@@ -202,9 +216,8 @@ static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double
 static bool check_stale_classic_fails_loud(void) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = s->graph;
-    if ((int)gpu_graph_bank_pool_count(g) < 2) {
-        printf("STALE-GUARD: skipped (pool %u < 2)\n", gpu_graph_bank_pool_count(g));
+    if (pulsar_session_bank_count(s) < 2) {
+        printf("STALE-GUARD: skipped (pool %d < 2)\n", pulsar_session_bank_count(s));
         pulsar_session_free(s);
         return true;
     }
@@ -256,7 +269,7 @@ static bool check_stale_classic_fails_loud(void) {
 
         err[0] = '\0';
         int acc[4];
-        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, -1, acc,
+        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, acc,
                                                               4, err, sizeof(err));
         CHECK(rcs <= 0,
               "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval_speculative_block "
@@ -294,11 +307,18 @@ static bool check_stale_classic_fails_loud(void) {
  * rows, same head -- the mode only selects which rows are headed).  This is
  * the contract the batched speculative verify's accept walk stands on. */
 static bool check_all_rows_head_mode(pulsar_session *s) {
-    if (gpu_graph_bank_pool_count(s->graph) < 2) {
-        fprintf(stderr, "all-rows gate: pool too small\n");
-        return false;
+    /* L284: the last-of-run call carries bank 0's 3 rows as a K-row run headed
+     * at its last row -- a prompt run inside decode_mixed.  A family whose
+     * decode_mixed carries no prompt runs (pulsar_engine_has_mixed_prefill:
+     * Qwen's prompts ride the fused step instead) has no last-of-run mode to
+     * compare ALL_ROWS against; said by name. */
+    if (!pulsar_engine_has_mixed_prefill(g_e)) {
+        printf("ALL-ROWS HEAD MODE [%s]: skipped -- the family's decode_mixed carries no prompt runs, so "
+               "there is no last-of-run emission to compare\n", pulsar_engine_family_name(g_e));
+        return true;
     }
-    const int vocab = (int)PULSAR_N_VOCAB;
+    if (!gate_bank_pool_fits(s, 2)) return false;
+    const int vocab = pulsar_engine_logits_width(g_e);
     float *rows_lor = (float *)malloc((size_t)2 * vocab * sizeof(float));
     float *rows_all = (float *)malloc((size_t)4 * vocab * sizeof(float));
     if (!rows_lor || !rows_all) { free(rows_lor); free(rows_all); return false; }
@@ -409,25 +429,37 @@ int GATE_ENTRY(int argc, char **argv) {
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     }
     if (!gate_load_story(g_e, &g_toks, need)) goto done;
+    g_snapshots = pulsar_engine_has_snapshots(g_e);
 
     if (pulsar_session_create(&s, g_e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
-    if (!gate_pool_fits(s, (uint32_t)maxn)) goto done;
+    if (!gate_bank_pool_fits(s, maxn)) goto done;
 
-    /* The cold prefills: prompt k into bank k, snapshotted. */
+    /* The cold prefills: prompt k into bank k, snapshotted.  They also say
+     * whether the family's forward feeds the engine's step funnel counter
+     * (DeepSeek's graph: the prefills move it); where it does, every leg's
+     * width is asserted on it below. */
+    bool funnel_fed;
     {
+        pulsar_gate_shape p0; pulsar_gate_shape_read(&p0);
         const double t0 = now_s();
         for (int k = 0; k < maxn; k++) {
             if (!bank_prefill_and_snapshot(s, k)) { fprintf(stderr, "prefill %d failed\n", k); goto done; }
         }
-        printf("prefilled %d prompts (%d tokens) in %.1fs; every later populate is a "
-               "snapshot load\n", maxn, need, now_s() - t0);
+        pulsar_gate_shape p1; pulsar_gate_shape_read(&p1);
+        funnel_fed = p1.prefill_calls != p0.prefill_calls;
+        printf("[%s] prefilled %d prompts (%d tokens) in %.1fs; every later populate is %s\n",
+               pulsar_engine_family_name(g_e), maxn, need, now_s() - t0,
+               g_snapshots ? "a snapshot load" : "a cold prefill (the family has no snapshots)");
+        if (!funnel_fed)
+            printf("[%s] the family's forward does not feed the step funnel counter: each leg's width stands on "
+                   "its steps' own row count (the requests)\n", pulsar_engine_family_name(g_e));
     }
 
     /* Multiseq runs at N = MAXN..2 (the banks already hold the prompts for the
      * first); every stream is kept for the cross-N gate. */
     int *multi[GATE_MAX_N][GATE_MAX_N];   /* [n-1][bank] */
     bool have[GATE_MAX_N];
-    const int vocab_w = (int)PULSAR_N_VOCAB;
+    const int vocab_w = pulsar_engine_logits_width(g_e);
     float *ref_l1[GATE_MAX_N];            /* [n-1] step-1 logits, multiseq entry */
     memset(multi, 0, sizeof(multi));
     memset(have, 0, sizeof(have));
@@ -447,7 +479,7 @@ int GATE_ENTRY(int argc, char **argv) {
          * cross-width comparison below vacuous while still passing. */
         pulsar_gate_shape s1; pulsar_gate_shape_read(&s1);
         const uint64_t dc = s1.step_calls - s0.step_calls, dr = s1.step_rows - s0.step_rows;
-        CHECK(dc == (uint64_t)steps && dr == (uint64_t)n * (uint64_t)steps,
+        CHECK(!funnel_fed || (dc == (uint64_t)steps && dr == (uint64_t)n * (uint64_t)steps),
               "N=%d: the leg ran %llu step call(s) / %llu row(s), want %d of %d -- the "
               "width axis was not exercised", n, (unsigned long long)dc,
               (unsigned long long)dr, steps, n * steps);

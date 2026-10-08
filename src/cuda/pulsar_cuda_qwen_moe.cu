@@ -230,6 +230,11 @@ static size_t routed_ws_layout(int T, void *base, size_t cap, routed_ws *o) {
     return b.failed ? 0 : b.used;
 }
 
+extern "C" const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T) {
+    routed_ws m;
+    return ws && routed_ws_layout(T, ws, ws_bytes, &m) != 0 ? (const uint16_t *)m.mid_x : nullptr;
+}
+
 /* The one layout of the Qwen MoE block's workspace (router, routed region, shared expert): sizing and carving
  * are the same walk. */
 static size_t moe_ws_layout(int T, void *base, size_t cap, pulsar_qwen_moe_parts *o) {

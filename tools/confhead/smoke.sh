@@ -23,7 +23,7 @@ if [ "${avail_gb:-0}" -lt 100 ]; then
     exit 1
 fi
 
-PULSAR_DSPARK_CONF_SCHED="$TAU" ./pulsar-server -m "$MODEL" --dspark-draft 5 \
+PULSAR_SPEC_TAU="$TAU" ./pulsar-server -m "$MODEL" --spec-depth 5 \
     -c 36864 --port "$PORT" > "$OUT/server.log" 2>&1 &
 SRV=$!
 echo "server pid $SRV (tau=$TAU)"

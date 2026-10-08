@@ -28,6 +28,7 @@
 
 #include "pulsar.h"
 #include "gate_entry.h"
+#include "gate_util.h"
 
 static const char *PROMPT =
     "The economic history of the Mediterranean is inseparable from its ports. ";
@@ -43,14 +44,6 @@ static void cmp(const char *label, const float *a, const float *b, int n) {
     printf("%-34s differing=%6d/%d  max|delta|=%.6g  argmax %d vs %d %s\n",
            label, nd, n, (double)md, ia, ib, nd == 0 ? "IDENTICAL" : "DIFFERS");
     if (nd) g_fail = 1;
-}
-
-static int bank_sync(pulsar_session *s, uint32_t b, const pulsar_tokens *p, char *err, size_t errlen) {
-    if (pulsar_session_bank_repoint(s, b) != 0) { snprintf(err, errlen, "repoint %u", b); return 1; }
-    pulsar_session_invalidate(s);
-    if (pulsar_session_sync(s, p, err, errlen) != 0) return 1;
-    pulsar_session_bank_state_save(s, b);
-    return 0;
 }
 
 int GATE_ENTRY(int argc, char **argv) {
@@ -79,7 +72,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 off += (size_t)snprintf(user + off, cap - off, "port%d ", i % 997);
             snprintf(user + off, cap - off, "%s", PROMPT);
         }
-        /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+        /* the family's one-turn render (L278) */
         pulsar_encode_chat_prompt(e, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
         /* The context from the rendered prompt (L278: the filler's tokens per word are the family's tokenizer's --
          * DeepSeek 1100 -> ~2217 tokens, Qwen 1100 -> 4205), so the deep entries (L170, L175) fit on every family. */
@@ -96,7 +89,7 @@ int GATE_ENTRY(int argc, char **argv) {
         D = (float *)malloc((size_t)2 * vw * sizeof(float));
 
         /* C: classic eval on bank 0 */
-        if (bank_sync(s, 0, &prompt, err, sizeof(err))) { fprintf(stderr, "sync: %s\n", err); goto done; }
+        if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         const int pos = pulsar_session_pos(s);
         const int tok = pulsar_session_argmax(s);
         int tok2 = 0;
@@ -117,7 +110,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     fprintf(stderr, "1-row step: %s\n", err); goto done;
                 }
             } else {
-                if (bank_sync(s, 1, &prompt, err, sizeof(err))) goto done;
+                if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
                 pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok } };
                 uint32_t got = 0;
                 if (pulsar_session_decode_mixed(s, r, 2, B, 2 * vw, &got, 0u, err, sizeof(err)) != 0 || got != 2) {
@@ -132,7 +125,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_session_copy_logits(s, C, vw);
 
         /* A: 1-row decode_mixed on bank 0 */
-        if (bank_sync(s, 0, &prompt, err, sizeof(err))) goto done;
+        if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
             pulsar_multiseq_req r = { 0u, pos, tok };
             uint32_t got = 0;
@@ -141,8 +134,8 @@ int GATE_ENTRY(int argc, char **argv) {
             }
         }
         /* B: 2-row step, both banks the same token */
-        if (bank_sync(s, 0, &prompt, err, sizeof(err))) goto done;
-        if (bank_sync(s, 1, &prompt, err, sizeof(err))) goto done;
+        if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
+        if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
             pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok } };
             uint32_t got = 0;
@@ -151,8 +144,8 @@ int GATE_ENTRY(int argc, char **argv) {
             }
         }
         /* D: 2-row step, second bank a different token */
-        if (bank_sync(s, 0, &prompt, err, sizeof(err))) goto done;
-        if (bank_sync(s, 1, &prompt, err, sizeof(err))) goto done;
+        if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
+        if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
             pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok2 } };
             uint32_t got = 0;

@@ -6,7 +6,10 @@ Reads tests/contracts.tsv (every gate's contract, family and tier) and the Makef
     the tier it claims (battery = in GATE_TARGETS / HOST_GATE_TARGETS / the runner; dev = selected by gates-dev);
   - prints the contract x family matrix (battery gates per cell);
   - FAILS on a contract x family cell that has no battery gate and is not a declared `gap` row naming the ledger
-    row that closes it -- and on a `gap` row whose cell is in fact covered (a closed gap must be deleted).
+    row that closes it -- and on a `gap` row whose cell is in fact covered (a closed gap must be deleted);
+  - L284: FAILS on a gate listed for ONE family (not a kernel: gate) that has, for some other family, neither an
+    `na` row (the contract does not apply there, and why) nor a gate-level `gap` row (it applies and is owed, and
+    the ledger row that closes it) -- and on such a row for a gate that already runs for that family.
 
 Exit 0 = the matrix is what the file says.  Run from the engine root (make host-checks does).
 """
@@ -35,11 +38,20 @@ def main():
     if m:
         runner_gates |= set(re.findall(r'"([a-z][a-z0-9-]+)"', m.group(1)))
     rows, gaps, bad = [], [], []
+    per_gate = []   # (line, kind, target, family): the na and gate-level gap rows
     for n, line in enumerate(open('tests/contracts.tsv'), 1):
         line = line.rstrip('\n')
         if not line or line.startswith('#'):
             continue
         f = line.split('\t')
+        if f[0] == 'na' or (f[0] == 'gap' and len(f) > 1 and f[1] not in CONTRACTS):
+            ok = len(f) >= 4 and f[2] in FAMILIES and (f[0] == 'na' or re.match(r'L\d+', f[3]))
+            if not ok or not (f[4] if f[0] == 'gap' and len(f) > 4 else f[3]).strip():
+                bad.append(f'contracts.tsv:{n}: an na row is: na, target, family, reason; a gate-level gap row is: '
+                           f'gap, target, family, Lnnn, note')
+                continue
+            per_gate.append((n, f[0], f[1], f[2]))
+            continue
         if f[0] == 'gap':
             if len(f) < 4 or f[1] not in CONTRACTS or f[2] not in FAMILIES or not re.match(r'L\d+', f[3]):
                 bad.append(f'contracts.tsv:{n}: a gap row is: gap, contract, family, Lnnn, note')
@@ -69,6 +81,26 @@ def main():
             bad.append(f'contracts.tsv:{n}: {target} says {tier} but make gates runs it -- say battery')
         rows.append((target, contracts, family, tier))
 
+    # L284: a one-family gate is a decision written down for every other family
+    fam_of = {t: ff for t, cc, ff, tier in rows}
+    kernel = {t for t, cc, ff, tier in rows if cc[0].startswith('kernel:')}
+    said = {}
+    for n, kind, target, fam in per_gate:
+        if target not in fam_of:
+            bad.append(f'contracts.tsv:{n}: {kind} row for {target}, which has no gate row')
+        elif fam_of[target] in ('all', fam):
+            bad.append(f'contracts.tsv:{n}: {target} runs for {fam} ({fam_of[target]}) -- delete the {kind} row')
+        elif (target, fam) in said:
+            bad.append(f'contracts.tsv:{n}: {target} x {fam} already has a {said[(target, fam)]} row')
+        else:
+            said[(target, fam)] = kind
+    for t, ff in fam_of.items():
+        if ff == 'all' or t in kernel:
+            continue
+        for fam in FAMILIES:
+            if fam != ff and (t, fam) not in said:
+                bad.append(f'{t} runs for {ff} only: give {fam} an na row (why not) or a gap row (the ledger row owing it)')
+
     print(f'  {"":11s}' + ''.join(f'{fam:>28s}' for fam in FAMILIES))
     for c in CONTRACTS:
         cells = []
@@ -83,6 +115,12 @@ def main():
         print(f'  {c:11s}' + ''.join(f'{x:>28s}' for x in cells))
     for g in gaps:
         print(f'  gap: {g[0]} x {g[1]} -- {g[2]}: {g[3]}')
+    n_na = sum(1 for _, kind, _, _ in per_gate if kind == 'na')
+    print(f'  one-family gates: {n_na} na row(s) (the contract does not apply there), '
+          f'{len(per_gate) - n_na} gate-level gap(s):')
+    for n, kind, target, fam in per_gate:
+        if kind == 'gap':
+            print(f'    gap: {target} x {fam}')
     for b in bad:
         print(f'  FAIL  {b}')
     print('COVERAGE MATRIX ' + ('PASS' if not bad else f'FAIL ({len(bad)})'))

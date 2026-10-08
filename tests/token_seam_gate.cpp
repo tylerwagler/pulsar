@@ -38,12 +38,14 @@
  * multi-byte token whose text re-tokenizes as 2+ non-empty-text tokens with
  * identical bytes.  MODEL-DEPENDENT, GPU-resident.  NOT part of `make test`.
  *
+ * L284: public API only, so it runs on every hosted model (the runner's family host); leg 3 needs session
+ * rewind and is skipped by name where the family has none.
+ *
  * usage: ./tests/token_seam_gate MODEL
  */
 #include "pulsar.h"
-#include "pulsar_engine_internal.h"
-#include "pulsar_gpu.h"
 #include "gate_entry.h"
+#include "gate_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,20 +53,6 @@
 
 static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "SEAM FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } } while (0)
-
-static char *read_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long n = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
-    fclose(fp);
-    buf[n] = '\0';
-    if (len_out) *len_out = (size_t)n;
-    return buf;
-}
 
 /* Do these tokens' texts concatenate to exactly (text, len), with every
  * piece non-empty (control tokens must not hide inside a seam)? */
@@ -99,7 +87,7 @@ int GATE_ENTRY(int argc, char **argv) {
     int rc = 1;
     {
     size_t text_len = 0;
-    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
+    char *text = gate_read_file(GATE_STORY_PROMPT, &text_len);
     if (!text) { fprintf(stderr, "prompt file read failed\n"); goto done; }
     pulsar_tokenize_text(e, text, &canon);
     free(text);
@@ -209,8 +197,13 @@ int GATE_ENTRY(int argc, char **argv) {
      * live history, so this shape could never be served warm and fell to a
      * disk snapshot that REPLACED the live session.  Same retention
      * discriminator as leg 2: split ids surviving proves the live KV was
-     * rewound and stitched rather than rebuilt. */
-    {
+     * rewound and stitched rather than rebuilt.
+     * L284: the leg cuts the live tail, so it needs session rewind; a family without it (Qwen: recurrent state)
+     * resumes from a grid checkpoint instead, and the leg is skipped by name. */
+    if (!pulsar_engine_can_rewind(e)) {
+        printf("  skip  leg 3 [%s]: the shorter echo cuts the live tail -- needs session rewind\n",
+               pulsar_engine_family_name(e));
+    } else {
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
         char err[256];
@@ -297,7 +290,13 @@ int GATE_ENTRY(int argc, char **argv) {
         CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 re-sync failed: %s", err);
         CHECK(pulsar_session_pos(s) == n, "leg5 re-sync ended at %d want %d", pulsar_session_pos(s), n);
         CHECK(pulsar_session_sync(cold, &pp, err, sizeof(err)) == 0, "leg5 cold sync failed: %s", err);
-        const bool same = memcmp(s->logits, cold->logits, (size_t)PULSAR_N_VOCAB * sizeof(float)) == 0;
+        const int width = pulsar_engine_logits_width(e);
+        float *got = (float *)malloc((size_t)width * sizeof(float));
+        float *want = (float *)malloc((size_t)width * sizeof(float));
+        const bool same = got && want && gate_logits(s, got, width) && gate_logits(cold, want, width) &&
+                          memcmp(got, want, (size_t)width * sizeof(float)) == 0;
+        free(got);
+        free(want);
         CHECK(same, "leg5 logits after rollback to the prompt differ from its cold prefill -- "
                     "the rescue left the answer's distribution in place");
         printf("leg5 rollback-to-prompt logits: %s\n", same ? "byte-identical to cold" : "STALE");

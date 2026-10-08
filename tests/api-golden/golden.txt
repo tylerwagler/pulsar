@@ -185,7 +185,7 @@
   stops: []
   tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
   qwen_tools_json: null
-  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is 17 * 23?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n"
+  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is 17 * 23?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke"
   prompt_spans: [1018-1386 1497-1513]
   images 0
   responses live tool 0 reasoning 0
@@ -571,7 +571,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-bogus [chat/deepseek] REFUSED
-  error: "invalid JSON request"
+  error: "reasoning_effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
 == chat/effort-50 [chat/deepseek] OK
   kind 0 api 0 chat_v41 1 chat_qwen 0
   model: "deepseek-v4-flash"
@@ -595,7 +595,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/effort-101 [chat/deepseek] REFUSED
-  error: "invalid JSON request"
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
 == chat/effort-None [chat/deepseek] OK
   kind 0 api 0 chat_v41 1 chat_qwen 0
   model: "deepseek-v4-flash"
@@ -646,13 +646,13 @@
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
   logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
   forced_tool_name: null
   stops: []
   tool_orders 0:
   qwen_tools_json: null
-  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>What is 17 * 23?<｜Assistant｜><think>"
-  prompt_spans: [146-162]
+  prompt_text: "<｜begin▁of▁sentence｜><｜User｜>What is 17 * 23?<｜Assistant｜></think>"
+  prompt_spans: [41-57]
   images 0
   responses live tool 0 reasoning 0
   responses_live_call_ids: []
@@ -668,12 +668,12 @@
   model_from_request 0 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
   logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  think_mode 50 has_tools 0 force_tool_call 0 summary 0
   forced_tool_name: null
   stops: []
   tool_orders 0:
   qwen_tools_json: null
-  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>What is 17 * 23?<｜Assistant｜><think>"
+  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>What is 17 * 23?<｜Assistant｜><think>"
   prompt_spans: [146-162]
   images 0
   responses live tool 0 reasoning 0
@@ -684,28 +684,8 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== chat/kwargs-unknown [chat/deepseek] OK
-  kind 0 api 0 chat_v41 1 chat_qwen 0
-  model: "deepseek-v4-flash"
-  model_from_request 0 max_tokens 256
-  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
-  logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
-  forced_tool_name: null
-  stops: []
-  tool_orders 0:
-  qwen_tools_json: null
-  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>What is 17 * 23?<｜Assistant｜><think>"
-  prompt_spans: [146-162]
-  images 0
-  responses live tool 0 reasoning 0
-  responses_live_call_ids: []
-  responses_live_suffix: null
-  responses_live_suffix_spans: []
-  anthropic live tool 0
-  anthropic_live_call_ids: []
-  anthropic_live_suffix: null
-  anthropic_live_suffix_spans: []
+== chat/kwargs-unknown [chat/deepseek] REFUSED
+  error: "chat_template_kwargs.add_vision_id is not a template variable this server renders (enable_thinking, reasoning_effort)"
 == chat/alias-chat [chat/deepseek] OK
   kind 0 api 0 chat_v41 1 chat_qwen 0
   model: "deepseek-chat"
@@ -1398,10 +1378,50 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== chat/effort-high [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got high"
-== chat/effort-max [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got max"
+== chat/effort-high [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-270]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-max [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-270]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == chat/effort-xhigh [chat/qwen] OK
   kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -1446,14 +1466,54 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== chat/effort-minimal [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got minimal"
+== chat/effort-minimal [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [183-199]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == chat/effort-bogus [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got bogus"
-== chat/effort-50 [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes a name -- low, medium, xhigh or none"
+  error: "reasoning_effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
+== chat/effort-50 [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [183-199]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == chat/effort-101 [chat/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes a name -- low, medium, xhigh or none"
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
 == chat/effort-None [chat/qwen] OK
   kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -1543,20 +1603,20 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == chat/kwargs-unknown [chat/qwen] REFUSED
-  error: "chat_template_kwargs.add_vision_id is not a template variable this server renders for the Qwen family (enable_thinking, reasoning_effort)"
+  error: "chat_template_kwargs.add_vision_id is not a template variable this server renders (enable_thinking, reasoning_effort)"
 == chat/alias-chat [chat/qwen] OK
   kind 0 api 0 chat_v41 0 chat_qwen 1
   model: "deepseek-chat"
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
   logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
   forced_tool_name: null
   stops: []
   tool_orders 0:
   qwen_tools_json: null
-  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
-  prompt_spans: [254-270]
+  prompt_text: "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  prompt_spans: [17-33]
   images 0
   responses live tool 0 reasoning 0
   responses_live_call_ids: []
@@ -2027,7 +2087,7 @@
   stops: []
   tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
   qwen_tools_json: null
-  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web <fast>\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is 17 * 23?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n"
+  prompt_text: "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web <fast>\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is 17 * 23?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke"
   prompt_spans: [1018-1390 1501-1517]
   images 0
   responses live tool 0 reasoning 0
@@ -2259,7 +2319,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-bogus [anthropic/deepseek] REFUSED
-  error: "invalid JSON request"
+  error: "output_config.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
 == an/output-format [anthropic/deepseek] OK
   kind 0 api 1 chat_v41 1 chat_qwen 0
   model: "deepseek-v4-flash"
@@ -2795,7 +2855,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == rs/effort-bogus [responses/deepseek] REFUSED
-  error: "invalid JSON request"
+  error: "reasoning.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
 == rs/summary [responses/deepseek] OK
   kind 0 api 2 chat_v41 1 chat_qwen 0
   model: "deepseek-v4-flash"
@@ -3509,7 +3569,7 @@
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
 == an/output-effort-bogus [anthropic/qwen] REFUSED
-  error: "output_config.effort: \"bogus\" has no Qwen3.8-Flash-Next level -- send low, medium, high, xhigh or max"
+  error: "output_config.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
 == an/output-format [anthropic/qwen] OK
   kind 0 api 1 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -3604,13 +3664,13 @@
   model_from_request 1 max_tokens 50
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
   logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
   forced_tool_name: null
   stops: []
   tool_orders 0:
   qwen_tools_json: null
-  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"
-  prompt_spans: [254-270]
+  prompt_text: "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  prompt_spans: [17-33]
   images 0
   responses live tool 0 reasoning 0
   responses_live_call_ids: []
@@ -3842,8 +3902,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== rs/namespace-tools [responses/qwen] REFUSED
-  error: "tools.0: a \"namespace\" tool is not served for the Qwen family (function tools only)"
+== rs/namespace-tools [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 1: {fsread|read|fs|0|path}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"fsread\", \"description\": \"read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}]"
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"fsread\", \"description\": \"read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [290-450 1304-1305]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/tool-choice-auto [responses/qwen] OK
   kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -3936,8 +4016,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== rs/effort-high [responses/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got high"
+== rs/effort-high [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-255]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/effort-xhigh [responses/qwen] OK
   kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -3982,12 +4082,52 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== rs/effort-minimal [responses/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got minimal"
+== rs/effort-minimal [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [183-184]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/effort-bogus [responses/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got bogus"
-== rs/summary [responses/qwen] REFUSED
-  error: "reasoning_effort: this model (Qwen3.8-Flash-Next) takes low, medium or xhigh (default), or none for no thinking; got high"
+  error: "reasoning.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
+== rs/summary [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 1
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-255]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/summary-only [responses/qwen] OK
   kind 0 api 2 chat_v41 0 chat_qwen 1
   model: "deepseek-v4-flash"
@@ -4038,13 +4178,13 @@
   model_from_request 1 max_tokens 256
   sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
   logprobs 0 top 0 stream 0 usage 0
-  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
   forced_tool_name: null
   stops: []
   tool_orders 0:
   qwen_tools_json: null
-  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n"
-  prompt_spans: [254-255]
+  prompt_text: "<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  prompt_spans: [17-18]
   images 0
   responses live tool 0 reasoning 0
   responses_live_call_ids: []

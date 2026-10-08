@@ -35,10 +35,8 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
         snprintf(err, errlen, "classic suffix: checkpoint at %d, suffix starts at %d", s->checkpoint.len, start);
         return false;
     }
-    bool cancelled = false;
     if (!gpu_graph_prefill_chunked_range(s->graph, &s->engine->model, &s->engine->weights, toks,
-                                         (uint32_t)start, (uint32_t)(end - start), s->logits,
-                                         false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &cancelled)) {
+                                         (uint32_t)start, (uint32_t)(end - start), s->logits, NULL)) {
         snprintf(err, errlen, "classic suffix prefill [%d, %d) failed", start, end);
         return false;
     }

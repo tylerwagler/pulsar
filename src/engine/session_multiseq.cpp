@@ -37,6 +37,51 @@
 #define PULSAR_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
+
+/* The step every batched entry below runs once its own arguments are checked: the requests split into the
+ * driver's descriptor (positions / seq ids / tokens, heap scratch sized to n_rows -- no [PULSAR_MSEQ_MAX]
+ * stack ceiling; the driver still bounds rows and banks itself), gpu_graph_decode_multiseq_batch, and the
+ * one reading of its rc.  `what` names the step in the error.  0 = ran, 1 = rejected (recoverable),
+ * -1 = failed mid-sweep (session state fatal). */
+static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits,
+                          uint32_t *out_n_rows, uint32_t max_head_runs, const pulsar_fused_shape *shape,
+                          const char *what, char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
+    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
+    int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
+    for (uint32_t k = 0; k < n_rows; k++) {
+        pos[k]    = reqs[k].pos;
+        bank[k]   = (int32_t)reqs[k].bank;
+        tokens[k] = reqs[k].token;
+    }
+    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, tokens, pos, bank,
+                                                   n_rows, logits, out_n_rows, max_head_runs,
+                                                   /*capture_cur=*/false, shape);
+    /* The batch call consumed the descriptor synchronously (tokens copied to a stack row, pos/seq uploaded
+     * to device in step_begin); the host scratch is dead now regardless of rc. */
+    free(pos); free(bank); free(tokens);
+    if (rc == 0) {
+        /* Recoverable: the driver rejected before arming the step, so nothing
+         * was mutated — the upload writes ahead of it touch scratch only, and
+         * every gpu_graph_multiseq_step_begin rejection point precedes its
+         * first scalar write (the superset refresh) and its cur-bank capture.
+         * The classic view is therefore still true: leave both flags alone so
+         * the caller can fix the batch and retry, or fall back to classic. */
+        PULSAR_MULTISEQ_ERR("%s rejected (recoverable; reason on stderr)", what);
+        return 1;
+    }
+    /* The step was armed: the scalar counters hold a superset on success, and
+     * on a fatal mid-sweep failure their state is unknown.  Both leave the
+     * classic single-bank view stale (see above); only the diagnosis differs. */
+    s->checkpoint_valid = false;
+    s->mseq_dirty = true;
+    s->spec.spec_carry_valid = false;
+    if (rc == 1) return 0;
+    PULSAR_MULTISEQ_ERR("%s failed mid-sweep (session state fatal)", what);
+    return -1;
+}
+
 int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen) {
@@ -54,59 +99,17 @@ int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
                          logits_cap, n, (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
-    pulsar_engine *e = s->engine;
-    int32_t pos[PULSAR_MSEQ_MAX];
-    int32_t bank[PULSAR_MSEQ_MAX];
-    int tokens[PULSAR_MSEQ_MAX];
-    for (uint32_t k = 0; k < n; k++) {
-        pos[k] = reqs[k].pos;
-        bank[k] = (int32_t)reqs[k].bank;
-        tokens[k] = reqs[k].token;
-    }
     /* decode_multiseq is decode-only (1 row per bank), so n_runs == n; no
      * out-param needed (the caller reads n logit rows). max_head_runs = 0 (all). */
-    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model,
-                                                   &e->weights, tokens, pos,
-                                                   bank, n, logits, NULL, 0u,
-                                                   /*capture_cur=*/false, NULL);
-    if (rc == 0) {
-        /* Recoverable: the driver rejected before arming the step, so nothing
-         * was mutated — the upload writes ahead of it touch scratch only, and
-         * every gpu_graph_multiseq_step_begin rejection point precedes its
-         * first scalar write (the superset refresh) and its cur-bank capture.
-         * The classic view is therefore still true: leave both flags alone so
-         * the caller can fix the batch and retry, or fall back to classic. */
-        PULSAR_MULTISEQ_ERR("multiseq decode step rejected (recoverable; "
-                         "reason on stderr)");
-        return 1;
-    }
-    /* The step was armed: the scalar counters hold a superset on success, and
-     * on a fatal mid-sweep failure their state is unknown.  Both leave the
-     * classic single-bank view stale (see above); only the diagnosis differs. */
-    s->checkpoint_valid = false;
-    s->mseq_dirty = true;
-    s->spec.spec_carry_valid = false;
-    if (rc == 1) return 0;
-    PULSAR_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
-                     "(session state fatal)");
-    return -1;
+    return ds4_batch_step(s, reqs, n, logits, NULL, 0u, NULL, "multiseq decode step", err, errlen);
 }
-#undef PULSAR_MULTISEQ_ERR
 
 /* plan-34 phase-2 increment 1 — mixed prefill+decode descriptor entry.
  *
  * BYTE-IDENTICAL to pulsar_session_decode_multiseq for a decode-only (1-row-per-bank)
- * batch: the ONLY difference is that the per-row descriptor scratch
- * (positions / seq_id / tokens) lives on the HEAP, sized to n_rows up to
- * prefill_cap, instead of the fixed [PULSAR_MSEQ_MAX] stack arrays. This establishes
- * the >PULSAR_MSEQ_MAX-row representation the fused mixed-batch step grows into over
- * increments 2-5. The kernel path (gpu_graph_decode_multiseq_batch + step_begin)
- * is UNCHANGED: it still bounds the current ROW count to PULSAR_MSEQ_MAX and keeps
- * PULSAR_MSEQ_MAX as the BANK-count bound. No mixing, no scheduler change, no algo
- * work this increment — the descriptor container is the only thing that moved. */
-#define PULSAR_MIXED_ERR(...) do { \
-        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
-    } while (0)
+ * batch: the same step (ds4_batch_step) with up to prefill_cap rows.  The kernel path
+ * (gpu_graph_decode_multiseq_batch + step_begin) still bounds the current ROW count to
+ * PULSAR_MSEQ_MAX and keeps PULSAR_MSEQ_MAX as the BANK-count bound. */
 int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
@@ -115,7 +118,7 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
         n_rows > s->graph->prefill_cap) {
-        PULSAR_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
+        PULSAR_MULTISEQ_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
                       n_rows, s ? s->graph->prefill_cap : 0u);
         return 1;
     }
@@ -135,97 +138,50 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     const uint32_t head_rows =
         (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) ? n_rows : n_runs;
     if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS && n_rows > PULSAR_SPEC_ROW_BUDGET) {
-        PULSAR_MIXED_ERR("mixed decode: a speculative verify step carries at most %u rows "
+        PULSAR_MULTISEQ_ERR("mixed decode: a speculative verify step carries at most %u rows "
                          "(the M-neutral range; n_rows=%u) -- refusing",
                       (unsigned)PULSAR_SPEC_ROW_BUDGET, n_rows);
         return 1;
     }
     if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)head_rows * PULSAR_N_VOCAB) {
-        PULSAR_MIXED_ERR("mixed decode: logits capacity %d < %u rows x %u",
+        PULSAR_MULTISEQ_ERR("mixed decode: logits capacity %d < %u rows x %u",
                       logits_cap, head_rows, (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
-    pulsar_engine *e = s->engine;
-    /* HEAP descriptor scratch (positions / seq_id / tokens), sized to n_rows —
-     * this is the whole point of the refactor: no [PULSAR_MSEQ_MAX] stack ceiling. */
-    int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
-    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
-    int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
-    for (uint32_t k = 0; k < n_rows; k++) {
-        pos[k]    = reqs[k].pos;
-        bank[k]   = (int32_t)reqs[k].bank;
-        tokens[k] = reqs[k].token;
-    }
-    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model,
-                                                   &e->weights, tokens, pos,
-                                                   bank, n_rows, logits, out_n_rows,
-                                                   max_head_runs,
-                                                   /*capture_cur=*/false, NULL);
-    /* The batch call consumed the descriptor synchronously (tokens copied to a
-     * stack row, pos/seq uploaded to device in step_begin); the host scratch is
-     * dead now regardless of rc. */
-    free(pos); free(bank); free(tokens);
-    if (rc == 0) {
-        /* Recoverable rejection: nothing mutated (see pulsar_session_decode_multiseq
-         * for the precise argument — every step_begin reject precedes its first
-         * scalar write). Leave the classic view flags alone. */
-        PULSAR_MIXED_ERR("mixed decode step rejected (recoverable; reason on stderr)");
-        return 1;
-    }
-    /* Step was armed: scalar counters now hold a cross-bank superset; the classic
-     * single-bank view is stale exactly as after a multiseq step. */
-    s->checkpoint_valid = false;
-    s->mseq_dirty = true;
-    s->spec.spec_carry_valid = false;
-    if (rc == 1) return 0;
-    PULSAR_MIXED_ERR("mixed decode step failed mid-sweep (session state fatal)");
-    return -1;
+    return ds4_batch_step(s, reqs, n_rows, logits, out_n_rows, max_head_runs, NULL, "mixed decode step", err,
+                          errlen);
 }
+
 int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                  const pulsar_fused_shape *shape, float *logits, int logits_cap,
                                  uint32_t *out_n_rows, char *err, size_t errlen) {
     auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
-    s->fused_logits = nullptr;
-    s->fused_n_dec = s->fused_heads = 0;
     if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->graph->prefill_cap) {
-        PULSAR_MIXED_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph->prefill_cap);
+        PULSAR_MULTISEQ_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph->prefill_cap);
         return 1;
     }
-    uint32_t heads = 0;
-    for (uint32_t r = 0; r < shape->n_pf && r < PULSAR_MSEQ_MAX; r++) heads += shape->head_last[r] ? 1u : 0u;
+    const uint32_t heads = pulsar_fused_shape_heads(shape);
     if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(shape->n_dec + heads) * PULSAR_N_VOCAB) {
-        PULSAR_MIXED_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, shape->n_dec + heads,
+        PULSAR_MULTISEQ_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, shape->n_dec + heads,
                          (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
-    pulsar_engine *e = s->engine;
-    int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
-    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
-    int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
-    for (uint32_t k = 0; k < n_rows; k++) {
-        pos[k] = reqs[k].pos;
-        bank[k] = (int32_t)reqs[k].bank;
-        tokens[k] = reqs[k].token;
-    }
-    const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, tokens, pos, bank,
-                                                   n_rows, logits, out_n_rows, 0u,
-                                                   /*capture_cur=*/false, shape);
-    free(pos); free(bank); free(tokens);
+    return ds4_batch_step(s, reqs, n_rows, logits, out_n_rows, 0u, shape, "fused step", err, errlen);
+}
+#undef PULSAR_MULTISEQ_ERR
+
+int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen) {
+    s->fused_logits = nullptr;
+    s->fused_n_dec = s->fused_heads = 0;
+    const int rc = s->engine->family->session->decode_fused(s, reqs, n_rows, shape, logits, logits_cap, out_n_rows,
+                                                            err, errlen);
     if (rc == 0) {
-        PULSAR_MIXED_ERR("fused step rejected (recoverable; reason on stderr)");
-        return 1;
-    }
-    s->checkpoint_valid = false;
-    s->mseq_dirty = true;
-    s->spec.spec_carry_valid = false;
-    if (rc == 1) {
         s->fused_logits = logits;
         s->fused_n_dec = shape->n_dec;
-        s->fused_heads = heads;
-        return 0;
+        s->fused_heads = pulsar_fused_shape_heads(shape);
     }
-    PULSAR_MIXED_ERR("fused step failed mid-sweep (session state fatal)");
-    return -1;
+    return rc;
 }
-#undef PULSAR_MIXED_ERR

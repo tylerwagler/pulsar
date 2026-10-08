@@ -60,8 +60,10 @@ static __global__ void mm_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+        static_assert(n_expert_used == 6 || n_expert_used == 10 || warp_size % n_expert_used == 0, "bad n_expert_used");
+        // Padded to next higher power of 2 (L284: 10 -> 16, Qwen's top-10, which took the one-token-a-step generic
+        // path above: 2.9 ms per 4096-row chunk).
+        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used == 10 ? 16 : n_expert_used;
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
@@ -166,6 +168,9 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
         case  8:
             launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            break;
+        case 10:
+            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case 16:
             launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);

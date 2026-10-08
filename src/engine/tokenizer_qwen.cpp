@@ -1,9 +1,9 @@
 /* tokenizer_qwen.cpp -- the Qwen4-exp family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2).
  *
  * A Qwen engine tokenizes with src/lib/qwen_tokenizer (byte-exact with HF on the checkpoint's own
- * tokenizer.json, make qwen-chat-gate) and renders its chat whole with src/lib/qwen_chat (HF's template,
- * byte for byte), so it has no incremental marker template.  Until L272 these bodies were branches on
- * e->qwen_tok inside every public entry of tokenizer.cpp. */
+ * tokenizer.json, make qwen-chat-gate) and renders its chat with src/lib/qwen_chat (HF's template, byte for
+ * byte) -- whole for the server, head and turn by turn for the CLI REPL and the agent (L284 P14).  Until L272
+ * these bodies were branches on e->qwen_tok inside every public entry of tokenizer.cpp. */
 #include "pulsar_engine_internal.h"
 #include "lib/qwen_chat.h"
 #include "lib/qwen_tokenizer.h"
@@ -37,23 +37,67 @@ static void qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const p
     qwen_encode_into(e, text, spans, n_spans, out);
 }
 
-/* the server's path: render (HF's template, byte for byte), tokenize with its spans */
-static void qwen_tok_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt,
-                                        pulsar_think_mode think_mode, pulsar_tokens *out) {
+/* ---- the chat front, turn by turn (pulsar.h pulsar_chat_open, L284 P14): qwen_chat's head and turn, the
+ * pieces the full render is made of, tokenized with their client spans.  The entries have no error return, so
+ * a refusal (an effort the template has no level for, a role it cannot place) ends the process by name. */
+
+static void qwen_chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s -- exiting\n", op, err);
+    exit(1);
+}
+
+/* the template's effort for a think mode: on (its default effort) or off -- no other level */
+static qwen_effort qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
+    char err[256];
     qwen_effort qe = QWEN_EFFORT_NONE;
-    char err[256] = "";
-    const qwen_msg_in msgs[2] = {{"system", system, NULL, NULL, 0}, {"user", prompt ? prompt : "", NULL, NULL, 0}};
-    const bool has_system = system && system[0];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err) ||
+        !qwen_effort_resolve(NULL, pulsar_think_mode_enabled(think_mode) ? 1 : 0, &qe, err, sizeof err))
+        qwen_chat_refuse(op, err);
+    return qe;
+}
+
+static void qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, pulsar_tokens *tokens) {
+    qwen_encode_into(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
+}
+
+/* The system block: trusted text (the agent's DSML spells no marker of this family's) and the system text, as
+ * the system message's content -- client data both. */
+static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                           pulsar_think_mode think_mode) {
+    const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_open");
+    const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     qwen_render_out r;
-    bool ok = think_mode == PULSAR_THINK_NONE || think_mode == PULSAR_THINK_DEFAULT;
-    if (!ok) snprintf(err, sizeof(err), "thinking effort %d has no Qwen effort (on or off only)", think_mode);
-    ok = ok && qwen_effort_resolve(NULL, pulsar_think_mode_enabled(think_mode) ? 1 : 0, &qe, err, sizeof(err)) &&
-         qwen_chat_render({has_system ? msgs : msgs + 1, has_system ? 2 : 1, NULL, qe, true}, &r, err, sizeof(err));
-    if (!ok) {
-        fprintf(stderr, "pulsar: pulsar_encode_chat_prompt: %s -- exiting\n", err);
-        exit(1);
+    char err[256];
+    if (!qwen_chat_render_head(content.c_str(), qe, &r, err, sizeof err)) qwen_chat_refuse("pulsar_chat_open", err);
+    qwen_chat_append(e, r, tokens);
+}
+
+/* A mid-conversation system message is the user turn of its reminder (qwen_system_reminder), as the server
+ * renders it. */
+static void qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                           bool generation_prompt, pulsar_think_mode think_mode) {
+    const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_append_turn");
+    std::vector<std::string> notes((size_t)(n > 0 ? n : 0));
+    std::vector<qwen_msg_in> qm;
+    for (int i = 0; i < n; i++) {
+        const char *role = msgs[i].role ? msgs[i].role : "user";
+        if (!strcmp(role, "system")) {
+            notes[(size_t)i] = qwen_system_reminder(msgs[i].content);
+            qm.push_back({"user", notes[(size_t)i].c_str(), NULL, NULL, 0, NULL, NULL, 0});
+        } else {
+            qm.push_back({role, msgs[i].content, NULL, NULL, 0, NULL, NULL, 0});
+        }
     }
-    qwen_encode_into(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), out);
+    qwen_render_out r;
+    char err[256];
+    if (!qwen_chat_render_turn(qm.data(), (int)qm.size(), qe, generation_prompt, &r, err, sizeof err))
+        qwen_chat_refuse("pulsar_chat_append_turn", err);
+    qwen_chat_append(e, r, tokens);
+}
+
+/* the turn's end the template writes after a sampled turn (qwen_chat_render_tail's first bytes) */
+static void qwen_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    qwen_encode_into(e, "<|im_end|>\n", NULL, 0u, tokens);
 }
 
 static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
@@ -127,12 +171,13 @@ static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *token
 const pulsar_family_tokenizer k_qwen_tokenizer = {
     /* .encode_text              = */ qwen_tok_encode_text,
     /* .encode_rendered          = */ qwen_tok_encode_rendered,
-    /* .encode_chat_prompt       = */ qwen_tok_encode_chat_prompt,
+    /* .chat_open                = */ qwen_chat_open,
+    /* .chat_turn                = */ qwen_chat_turn,
+    /* .chat_end_assistant       = */ qwen_chat_end_assistant,
     /* .is_stop                  = */ qwen_tok_is_stop,
     /* .eos                      = */ qwen_tok_eos,
     /* .token_text               = */ qwen_tok_token_text,
     /* .think_close              = */ qwen_tok_think_close,
     /* .turn_markers             = */ qwen_tok_turn_markers,
     /* .dump                     = */ qwen_tok_dump,
-    /* .incremental_ds4_template = */ false,
 };

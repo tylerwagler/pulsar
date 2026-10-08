@@ -1,39 +1,22 @@
 #include "pulsar_engine_internal.h"
 #include "spec_internal.h"
 
+/* DeepSeek's bank pool is its graph's (k_ds4_bank_ops, at the end of this file): the per-bank device views,
+ * frontier counters, demand-paged comp/index KV and grid checkpoints all live in pulsar_gpu_graph.  With the
+ * pool disabled (PULSAR_MSEQ_BANKS 1) bank 0 is the classic tensors: count() says 1, pooled() false. */
+
 /* Tier-2 task #55 increment 2b — per-bank physical evict/restore.  The caller
  * (server guard) must have snapshotted the bank's KV to DISK before evict (host
  * RAM reclaims nothing on unified memory) and repointed away from it; and after
  * restore-alloc it reloads the KV H2D from that snapshot. */
-bool pulsar_session::bank_free_physical(uint32_t bank) {
-    auto *s = this;
-    if (!s) return false;
-    return gpu_graph_bank_free_physical(s->graph, bank);
-}
-
-bool pulsar_session::bank_alloc_physical(uint32_t bank) {
-    auto *s = this;
-    if (!s) return false;
-    return gpu_graph_bank_alloc_physical(s->graph, bank);
-}
-
-bool pulsar_session::bank_is_evicted(uint32_t bank) const {
-    auto *s = this;
-    if (!s) return false;
-    return gpu_graph_bank_is_evicted(s->graph, bank);
-}
-
-uint64_t pulsar_session::bank_touched_kv_bytes(uint32_t bank) {
-    auto *s = this;
-    if (!s) return 0;
+static bool ds4_bank_free_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_free_physical(s->graph, bank); }
+static bool ds4_bank_alloc_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_alloc_physical(s->graph, bank); }
+static bool ds4_bank_is_evicted(const pulsar_session *s, uint32_t bank) { return gpu_graph_bank_is_evicted(s->graph, bank); }
+static uint64_t ds4_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     return gpu_graph_bank_touched_kv_bytes(s->graph, bank);
 }
-
-uint64_t pulsar_session::quantum_growth_bytes_per_bank(uint32_t q) {
-    auto *s = this;
-    (void)s;
-    return gpu_graph_quantum_growth_bytes_per_bank(q);
-}
+static uint64_t ds4_bank_growth_bytes(pulsar_session *, uint32_t q) { return gpu_graph_quantum_growth_bytes_per_bank(q); }
+static uint64_t ds4_demand_paged_bytes(pulsar_engine *e, int ctx_size) { return e->demand_paged_bytes_per_bank(ctx_size); }
 
 /* ===== Tier-2 PATH A: per-bank HOST carry (pulsar_bank_carry) ================
  *
@@ -64,10 +47,9 @@ void pulsar_session::bank_carry_free() {
 
 /* L272 P2: the bank carry is the core's, for every family -- one array, one save and one restore of the
  * host view, one live-or-carry reader.  A family adds only its device side around them (DeepSeek: the
- * graph's frontier counters and views; Qwen: which bank is live).  How many banks: the family's pool,
- * or DeepSeek's graph pool. */
+ * graph's frontier counters and views; Qwen: which bank is live).  How many banks: the family's pool. */
 static uint32_t session_bank_n(pulsar_session *s) {
-    return FAMILY_BANKS(s) ? (uint32_t)FAMILY_BANKS(s)->count(s) : gpu_graph_bank_pool_count(s->graph);
+    return (uint32_t)s->engine->family->banks->count(s);
 }
 
 static bool bank_carry_ensure(pulsar_session *s) {
@@ -79,23 +61,20 @@ static bool bank_carry_ensure(pulsar_session *s) {
     return true;
 }
 
-int pulsar_session::bank_count() {
-    auto *s = this;
-    return s ? (int)gpu_graph_bank_pool_count(s->graph) : 0;
+static int ds4_bank_count(pulsar_session *s) {
+    return (int)gpu_graph_bank_pool_count(s->graph);
 }
 
-int pulsar_session::bank_repoint(uint32_t bank) {
-    auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return 1;
+static int ds4_bank_repoint(pulsar_session *s, uint32_t bank) {
+    if (bank >= gpu_graph_bank_pool_count(s->graph)) return 1;
     /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
     if (s->graph->banks.n_banks == 0) return bank == 0 ? 0 : 1;
     return gpu_graph_bank_repoint(s->graph, bank) ? 0 : 1;
 }
 
 
-void pulsar_session::bank_state_save(uint32_t bank) {
-    auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return;
+static void ds4_bank_save(pulsar_session *s, uint32_t bank) {
+    if (bank >= gpu_graph_bank_pool_count(s->graph)) return;
     if (!bank_carry_ensure(s)) return;
     /* Graph frontier counters (attn/index comp; Option F also the drafter ring
      * counters) are captured on the graph side so a later install re-arms this
@@ -128,9 +107,8 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
     c->valid = true;
 }
 
-bool pulsar_session::bank_state_restore(uint32_t bank) {
-    auto *s = this;
-    if (!s || bank >= gpu_graph_bank_pool_count(s->graph)) return false;
+static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
+    if (bank >= gpu_graph_bank_pool_count(s->graph)) return false;
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
      * cheap and safe (per-bank truth is re-established without a re-prefill). */
@@ -184,13 +162,80 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
 
 
 
+/* L260 fusion / L284 #2: the record of a fused step's prompt chunk in the INSTALLED bank's history, for every
+ * family -- what a classic sync of the same tokens leaves behind.  The tokens join the checkpoint (it started
+ * empty, an invalidated bank, or as the valid prefix the prompt extends -- left invalid, the bank's frontier read
+ * 0 and the next chunk restarted the prompt over rows it had already committed: "frontier not position-true ...
+ * n_comp 61 want 0"); the prefill frontier moves to its end (L195); a chunk that ends on the resume grid leaves a
+ * checkpoint, as the chunk loop takes one at every grid chunk end, so the fused lane's prompts resume like the
+ * classic sync's (the server's planners end chunks on grid points) -- when the model's store says the state there
+ * is a prefill's (pulsar_kv_state_ops::noted_at); and the finishing chunk's headed row becomes the session's
+ * next-token logits.  The family's state already moved with the step; a record that disagrees with it refuses
+ * before anything changes. */
+int pulsar_session::note_prefilled(const int *toks, int n, int head) {
+    auto *s = this;
+    if (!toks || n <= 0) return 1;
+    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
+        fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
+                head, s->fused_logits ? s->fused_heads : 0u);
+        return 1;
+    }
+    pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
+    const uint32_t bank = pulsar_session_live_bank(s);
+    const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
+    /* the shared capture rule (P13): the state stands at G or the record is refused, and G on the grid in a
+     * prefill's state is captured -- before the record changes anything */
+    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, G)) {
+        fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) %s -- refusing\n", bank, from, G,
+                ck && ck->ops ? "did not land (above)" : "has no checkpoint store");
+        return 1;
+    }
+    if (from == 0) s->live_images.n = 0;   /* a history from 0 holds no image block (a fused chunk is text) */
+    /* a prompt chunk is a request's, as a sync's prefill is: the lookahead and a latched quench are the
+     * previous request's (pulsar_session_family_sync does the same for the classic lane) */
+    spec_lookahead_reset(s);
+    pulsar_session_note_committed(s, toks, n);
+    s->checkpoint_valid = true;
+    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
+    if (head >= 0) {
+        const size_t w = (size_t)s->engine->logits_width();
+        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * w, w * sizeof(s->logits[0]));
+        s->logits_stale = false;   /* the next-token row of the history, as a sync's last chunk leaves it */
+    }
+    return 0;
+}
+
 /* L264: how far the bank's PREFILL reached (decode rows past it are the decode
  * kernels'; L195) -- the end of the last prompt it served, the same live-vs-
  * carry rule as pulsar_bank_history.  0 when nothing valid. */
-int pulsar_session::bank_prefill_frontier(uint32_t bank) {
-    auto *s = this;
+static uint32_t ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     if (!pulsar_bank_history(s, bank)) return 0;
     const int pf = bank == pulsar_session_live_bank(s) ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
-    return pf > 0 ? pf : 0;
+    return pf > 0 ? (uint32_t)pf : 0u;
 }
+
+static pulsar_ckpt_store *ds4_bank_kv_store(pulsar_session *s) { return &s->graph->ckpt; }
+static uint32_t ds4_bank_live(pulsar_session *s) { return gpu_graph_cur_bank(s->graph); }
+static void ds4_bank_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
+static bool ds4_bank_restore_checkpoint(pulsar_session *s, uint32_t G) { return s->restore_checkpoint(G); }
+static bool ds4_bank_pooled(const pulsar_session *s) { return s->graph->banks.n_banks > 0; }
+
+const pulsar_family_bank_ops k_ds4_bank_ops = {
+    /* .count              = */ ds4_bank_count,
+    /* .save               = */ ds4_bank_save,
+    /* .restore            = */ ds4_bank_restore,
+    /* .kv_store           = */ ds4_bank_kv_store,
+    /* .prefill_frontier   = */ ds4_bank_prefill_frontier,
+    /* .live               = */ ds4_bank_live,
+    /* .demand_paged_bytes = */ ds4_demand_paged_bytes,
+    /* .touched_kv_bytes   = */ ds4_bank_touched_kv_bytes,
+    /* .growth_bytes       = */ ds4_bank_growth_bytes,
+    /* .free_physical      = */ ds4_bank_free_physical,
+    /* .alloc_physical     = */ ds4_bank_alloc_physical,
+    /* .is_evicted         = */ ds4_bank_is_evicted,
+    /* .repoint            = */ ds4_bank_repoint,
+    /* .rewind             = */ ds4_bank_rewind,
+    /* .restore_checkpoint = */ ds4_bank_restore_checkpoint,
+    /* .pooled             = */ ds4_bank_pooled,
+};
 

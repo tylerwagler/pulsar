@@ -1,9 +1,10 @@
 /* spec_depth.h -- the adaptive draft depth (L107), as a rule any drafter can run.
  *
  * One round's update of the draft-depth cap from what the round converted.  The rule is DSpark's
- * (session_spec.cpp's rationale block, the 2026-08-25 sweep and its v2..v5 refinements), moved here in
+ * (spec_dspark.cpp's k_dspark_depth, the 2026-08-25 sweep and its v2..v5 refinements), moved here in
  * L251 so it has one home and a gate (tests/spec_depth_gate.cpp pins DSpark's schedule).  The Qwen MTP
- * drafter measured it and does NOT use it (family_qwen.cpp: its in-round confidence stop wins).  Pure host
+ * drafter measured it and does NOT use it (spec_qwen.cpp: its in-round stop wins); a drafter opts in
+ * through pulsar_drafter_ops::adapt.  Pure host
  * logic: no engine state, no CUDA.
  *
  *   UP:    commit == depth (the whole chain was kept and accepted), no cooldown running, and the tail

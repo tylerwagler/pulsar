@@ -288,7 +288,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     free(ref); free(got); free(base.v);
     printf("SESSION-PAYLOAD GATE: PASS (v%u, %llu B, comp fnv %016llx, logits identical)\n",
-           (unsigned)PULSAR_SESSION_PAYLOAD_VERSION, (unsigned long long)pbytes,
+           (unsigned)PULSAR_SESSION_KV_PAYLOAD_VERSION, (unsigned long long)pbytes,
            (unsigned long long)fnv_a);
     payload_gate_release(e);
     return 0;

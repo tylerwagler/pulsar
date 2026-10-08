@@ -729,8 +729,6 @@ typedef struct {
  * and the Qwen4-exp family's shape/weights/state/op contract. */
 #include "family.h"
 #include "family_qwen.h"
-/** The session family's own bank pool ops (L251), NULL on DeepSeek's graph pool. */
-#define FAMILY_BANKS(s) ((s) && (s)->engine->family->banks ? (s)->engine->family->banks : nullptr)
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
 
@@ -741,9 +739,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
 /* L272 P4b: DeepSeek's TP slices for this rank (the family's tp_slices op) */
 bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan);
-int pulsar_ds4_session_create(pulsar_session *s);
+int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks);
 void pulsar_ds4_session_destroy(pulsar_session *s);
-uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
 
 /** A GGUF metadata array left UNPARSED: its type, length, and where its
  * elements start. Reading an array means walking the file from `data_pos`, and
@@ -1530,7 +1527,7 @@ typedef struct {
     uint32_t batch_multiseq_pf_row0;
     /** Borrowed for ONE prefill: the images to merge and the tower to encode them
      * with, or NULL for the text-only path.  Set and cleared by the prefill's
-     * owner (pulsar_session::sync); nothing else may leave it set. */
+     * owner (the family sync's prefill, ds4_sync_prefill); nothing else may leave it set. */
     const pulsar_vision_request *vision_req;
     /** Borrowed TP transport for the owning session's engine (slice 4b), set
      * from the engine at graph init; NULL when the pair is not armed.  The
@@ -1757,17 +1754,18 @@ struct pulsar_vocab {
  * One engine owns the weights; MANY sessions share it. Everything here is
  * immutable after open() except the cumulative metrics counters -- which is
  * what makes concurrent sessions safe against a single engine. */
-/* L263: the spec lane's self-measured step cost (pulsar.h pulsar_spec_cost is
- * the read-only view).  Exponentially weighted least squares of a round's wall
- * time on the rows its forward carried: round_ms = flat + row * rows. */
+/* L263 / L284: a decode lane's self-measured step cost (pulsar.h pulsar_lane_cost
+ * is the read-only view), one structure for both lanes.  Exponentially weighted
+ * least squares of a step's wall time on the rows its forward carried:
+ * step_ms = flat + row * rows. */
 typedef struct {
     double w, sx, sy, sxx, sxy;  ///< EW sums: weight, rows, ms, rows^2, rows*ms
-    uint32_t n;                  ///< rounds observed
+    uint32_t n;                  ///< steps observed
     int32_t flat_us, row_us;     ///< the fit, in microseconds, when `valid`
-    bool valid;                  ///< enough evidence (spec_cost_fit_observe says what)
+    bool valid;                  ///< enough evidence (lane_cost_fit_observe says what)
     int32_t ann_flat_us, ann_row_us;  ///< the last announced terms (0: never)
     uint32_t ann_n;                   ///< `n` at that announcement
-} pulsar_spec_cost_fit;
+} pulsar_lane_cost_fit;
 
 struct pulsar_engine {
     /** The model family, chosen once at open from `general.architecture`
@@ -1779,6 +1777,9 @@ struct pulsar_engine {
     pulsar_layer_plan plan;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
+    /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
+     *  the trunk's steps note their linears' input rows into it. */
+    struct pulsar_imatrix_tap *imatrix_tap;
     /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
      * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
      * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
@@ -1789,12 +1790,14 @@ struct pulsar_engine {
     pulsar_weights weights;     ///< resolved target tensors, per layer
     pulsar_dspark_weights dspark_weights;  ///< resolved drafter tensors
     pulsar_backend backend;     ///< CPU or CUDA
-    int dspark_draft_tokens;    ///< configured draft depth k
-    /** L263: the spec lane's measured step cost (pulsar_engine_spec_cost).
-     * Written by the leader's observations (the server's round loop, or the
-     * single lane off TP) or, on a TP worker, by the leader's values riding
-     * SPEC_ROUND_END_BATCH; read by the quench guard and the allocator. */
-    pulsar_spec_cost_fit spec_cost;
+    int spec_depth;             ///< configured starting draft depth (options / PULSAR_SPEC_DEPTH); 0 = the drafter's
+    float spec_tau;             ///< configured draft stop threshold (options / PULSAR_SPEC_TAU); 0 = the drafter's, < 0 = none
+    /** L263 / L284: each decode lane's measured step cost (pulsar_engine_lane_cost), indexed by
+     * pulsar_decode_lane.  Written by the leader's observations (the server's step loops, or the
+     * single lane off TP) or, for the spec lane on a TP worker, by the leader's values riding
+     * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
+     * the server's lane choice. */
+    pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -1861,9 +1864,7 @@ struct pulsar_engine {
      * engine_api.cpp); engine internals call these members directly.  Members
      * stay public and the struct stays trivially constructible: lifetime is
      * managed exactly as before via open()/destroy() (xcalloc/free), NOT
-     * constructors/destructors.
-     * NOTE: pulsar_engine_dspark_draft_tokens stays a free function — a member
-     * would collide with the data member of the same name. */
+     * constructors/destructors. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
     void destroy();  ///< was pulsar_engine_close
     /** Print a human-readable model summary (shape, quantisation, memory) to
@@ -1892,24 +1893,14 @@ struct pulsar_engine {
      * evaluate the (banks, ctx) fit table before committing to one.
      * @param ctx_size context size to price
      * @param n_banks  >= 1; 1 is the classic single-session layout
+     * @param managed_bytes optional: the demand-paged (cudaMallocManaged) subset, 0 when none was created
      * @return bytes, or 0 if no session could be created. */
-    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
+    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes = NULL);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
      * `ctx_size` -- the overcommit figure, below the reserved capacity. */
     uint64_t demand_paged_bytes_per_bank(int ctx_size);
     /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
-    /** One-shot greedy generation: prefill `prompt`, then decode argmax until
-     * `n_predict` tokens or EOS, delivering each through `emit`. The
-     * self-contained path the CLI and the diagnostics use, with no session
-     * management for the caller to do. @return 0 on success. */
-    int generate_argmax(const pulsar_tokens *prompt,
-                        int n_predict, int ctx_size,
-                        pulsar_token_emit_fn emit,
-                        pulsar_generation_done_fn done,
-                        void *emit_ud,
-                        pulsar_session_progress_fn progress,
-                        void *progress_ud);
     /** Run the dataset through the model accumulating per-tensor activation
      * magnitudes, and write the importance matrix used to steer quantisation.
      * @return 0 on success. */
@@ -2068,10 +2059,10 @@ typedef struct pulsar_spec_carry_state {
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first
-     * draft reads the engine's --dspark-draft value, which is thereby the
-     * STARTING depth, not a fixed width). Persists across requests in a
-     * session on purpose: a client's workload regime usually does too. */
-    int spec_adaptive_depth;  ///< bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct
+     * draft reads pulsar_spec_depth_start, which is thereby the STARTING
+     * depth, not a fixed width). Persists across requests in a session on
+     * purpose: a client's workload regime usually does too. */
+    int spec_adaptive_depth;  ///< bounds: the drafter's adaptive policy (pulsar_drafter_ops::adapt)
     bool spec_depth_down_forgiven;  ///< L107 v2: one down-signal was vetoed on a still-confident tail; a second consecutive one backs off regardless
     uint8_t spec_depth_rounds_since_up;  ///< L107 v5: rounds since the last UP, saturating at 255; a down within 2 of an up is a FAILED EXCURSION and triggers the cooldown; a down after a sustained ride carries no penalty (v4's blanket cooldown cost ~0.9 t/s on BOTH server workloads by suppressing profitable climbs).
     uint8_t spec_depth_climb_cooldown;  ///< L107 v4: rounds remaining in which UP is suppressed after a failed excursion. Raw-completion prose oscillated 2->3->4-> crash forever (29 transitions/192 tok, -14%): each failed excursion burns a deep round, and tail conf does NOT separate good climbs from bad (a 0.93 tail climbed into commit=0). Cooldown makes excursions rare after they fail; structured's downs are rare (and v3-forgiven rounds are not downs), so its climb is untouched.
@@ -2130,7 +2121,7 @@ typedef struct pulsar_spec_carry_state {
      * plain zeroing. Controller design after Entrpi ds4 v0.1.1 (MIT).
      *
      * The guard prices the step from the engine's MEASURED cost (L263,
-     * pulsar_engine::spec_cost) -- the quench point moves with the machine,
+     * pulsar_engine::lane_cost[PULSAR_LANE_SPEC]) -- the quench point moves with the machine,
      * not with a fixed stream; both paths sample the exact target
      * distribution, so only speed is at stake.  Multiseq note: this state belongs to the classic single-request flow;
      * the dormant multi-bank driver would need per-bank copies (not wired —
@@ -2358,7 +2349,7 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
                                           int max_tokens, int accepted_cap, float temperature,
                                           int top_k, float top_p, float min_p, char *err, size_t errlen);
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
-                                        int eos_token, float temperature, int top_k, float top_p,
+                                        float temperature, int top_k, float top_p,
                                         float min_p, uint64_t *rng, const float *rows, uint32_t row0,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
@@ -2371,10 +2362,10 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
  * pulsar_session_spec_assemble_batch in pulsar.h); reqs may be NULL (the
  * worker's rows ride the mixed-batch frame). */
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              int eos_token, uint32_t row_budget,
+                                              uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               int eos_token, const float *rows);
+                                               const float *rows);
 void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** L260: a batch phase's verdict -- a positive fingerprint of what the phase
  * decided for every step (statuses, base tokens and rows; frontiers and
@@ -2532,8 +2523,8 @@ struct pulsar_session {
      * constructors/destructors.
      * NOTE: pulsar_session_prefill_cap and pulsar_session_resident_bytes stay
      * free functions — members would collide with the same-named data members.
-     * pulsar_session_rewrite_requires_rebuild / _snapshot_free do not take a
-     * session and stay free. */
+     * pulsar_session_snapshot_free does not take a
+     * session and stays free. */
     static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
     /** Tear down the session and release its GPU allocations. Behind pulsar_session_free(). */
     void destroy();
@@ -2545,37 +2536,6 @@ struct pulsar_session {
     /** Install the cooperative cancellation hook, checked only at safe
      * boundaries. Behind pulsar_session_set_cancel(). */
     void set_cancel(pulsar_session_cancel_fn fn, void *ud);
-    /** Copy out the cumulative speculative-decode counters. */
-    /** Resident KV bytes actually touched by the CURRENT bank -- the demand-paged
-     * figure, which is below the reserved capacity on a short session. */
-    uint64_t touched_kv_bytes() const;
-
-    /* ---- Tier-2 bank pool: physical residency, spill --------------------- */
-
-    /** Release one idle bank's ctx-scaled physical pages (cudaFree on its managed
-     * comp/index allocations). The only reclaim primitive that actually returns
-     * memory on GB10. The bank keeps its logical identity and can be re-armed
-     * with bank_alloc_physical(). @return false if the bank is live or pinned. */
-    bool bank_free_physical(uint32_t bank);
-    /** Re-allocate physical for a previously freed bank, before installing it. */
-    bool bank_alloc_physical(uint32_t bank);
-    /** True when the bank's physical has been released and its KV must be
-     * reloaded from disk before use. */
-    bool bank_is_evicted(uint32_t bank) const;
-    /** touched_kv_bytes() for an arbitrary bank, live or idle. */
-    uint64_t bank_touched_kv_bytes(uint32_t bank);
-    /** Extra bytes ONE bank would demand-page in if the context grew to quantum
-     * `q` -- the admission question "can this session take another step" priced
-     * before committing to it. */
-    uint64_t quantum_growth_bytes_per_bank(uint32_t q);
-    /** Bring the session's KV in line with `prompt`: reuse the common prefix and
-     * evaluate the rest. The main prefill entry point. @return 0 on success. */
-    int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
-             char *err, size_t errlen);
-    /** Rewrite the session to `prompt` given an already-computed `common`
-     * prefix length, rather than re-deriving it. */
-    pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
-                                                      char *err, size_t errlen);
     /** Longest common TOKEN prefix between the session's history and `prompt`.
      * For the byte-level, seam-aware answer use prefix_match(). */
     int common_prefix(const pulsar_tokens *prompt);
@@ -2596,14 +2556,6 @@ struct pulsar_session {
     int copy_logits(float *out, int cap);
     /** Overwrite the session's logits row (replay/testing). */
     int set_logits(const float *logits, int n);
-    /** Decode ONE token at the session's current position and update the logits.
-     *
-     * Since L130 this runs the same batched step the server uses, as a 1-row
-     * batch on the session's own bank -- so there is no separate single-token
-     * kernel path any more. Fails loud when the session's per-bank state is
-     * stale (see mseq_dirty) rather than decoding against another bank's rows.
-     * @return 0 on success. */
-    int eval(int token, char *err, size_t errlen);
     /** Decode ONE row per request across `n` banks in a single batched step.
      * Each row lands at its own bank's frontier.
      * @param reqs        one entry per participating bank
@@ -2636,23 +2588,6 @@ struct pulsar_session {
                      uint32_t *out_n_rows, char *err, size_t errlen);
     /** Release the host-side per-bank carry (checkpoints, logits, pendings). */
     void bank_carry_free();
-    /** Number of banks in the pool; 1 when the pool is disabled. */
-    int bank_count();
-    /** Point the graph's device views at `bank` and set cur_bank. Does NOT move
-     * host state -- bank_state_restore() is the full hand-off. */
-    int bank_repoint(uint32_t bank);
-    /** Publish the live host+frontier state into `bank`'s slots. Callers pass the
-     * bank that is currently installed; the server does this when switching AWAY,
-     * which is what keeps idle banks' carry readable. */
-    void bank_state_save(uint32_t bank);
-    /** Install `bank`: repoint device views, then restore its host carry. Clears
-     * the multiseq-poison flag. @return false if the bank cannot be installed. */
-    bool bank_state_restore(uint32_t bank);
-    int bank_prefill_frontier(uint32_t bank);
-    /** Append tokens to the session's checkpoint WITHOUT decoding them: for
-     * callers that committed rows through a batched step and must now bring the
-     * host history back in line with the KV. */
-    void note_committed_tokens(const int *toks, int n);
     /** L260 fusion: pulsar_session_note_prefilled's local body. */
     int note_prefilled(const int *toks, int n, int head);
     /** Generate with the drafter: propose a block, verify it against the target
@@ -2663,31 +2598,27 @@ struct pulsar_session {
      * @param min_p         relative probability floor
      * @param rng           sampler state; advanced by this call
      * @param max_tokens    cap on tokens committed
-     * @param eos_token     stop once this is committed
+     * (a stop -- the family's whole set, pulsar_token_is_stop -- ends the block)
      * @param accepted      receives the committed token ids
      * @param accepted_cap  its capacity
      * @param err           failure message buffer
      * @param errlen        its size
      * @return tokens committed. */
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
-                             uint64_t *rng, int max_tokens, int eos_token,
+                             uint64_t *rng, int max_tokens,
                              int *accepted, int accepted_cap, char *err, size_t errlen);
     /** Speculative generation seeded with a known `first_token` -- the forced-
      * continuation form, where the caller has already chosen the opening token.
      * @param first_token   the opening token, committed as-is
      * @param max_tokens    cap on tokens committed
-     * @param eos_token     stop once this is committed
+     * (a stop -- the family's whole set, pulsar_token_is_stop -- ends the block)
      * @param accepted      receives the committed token ids
      * @param accepted_cap  its capacity
      * @param err           failure message buffer
      * @param errlen        its size
      * @return tokens committed. */
-    int eval_speculative_block(int first_token, int max_tokens, int eos_token,
+    int eval_speculative_block(int first_token, int max_tokens,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
-    /** Discard the conversation: clear the checkpoint, drop spec carry and
-     * pendings, and disarm the rewind rings so a NEXT conversation can never
-     * restore this one's rows. The graph keeps its allocations. */
-    void invalidate();
     /** Undo back to `pos` tokens: trim the checkpoint, drop speculative state,
      * and clamp every compressing layer's frontier to pos/ratio.
      *
@@ -2709,9 +2640,6 @@ struct pulsar_session {
     int pos();
     /** Allocated context length, in tokens. */
     int ctx();
-    /** Smallest suffix worth prefilling as its own chunk: below this the fixed
-     * per-chunk cost dominates and the caller should extend instead. */
-    uint32_t prefill_quantum_min_suffix() const;
     /** Borrowed view of the committed token history. Do not free. */
     const pulsar_tokens *tokens();
     /** Serialized size of this session's payload, in bytes. */
@@ -2732,26 +2660,17 @@ struct pulsar_session {
     int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
 
-/** Userdata wrapping a caller's progress callback during sync().
- *
- * The engine reports absolute positions; the wrapper holds the session and
- * prompt so it can hand the caller's own callback the context it needs without
- * the engine having to know about it. */
-typedef struct {
-    pulsar_session *session;            ///< session being synced
-    const pulsar_tokens *prompt;        ///< prompt being synced to
-    pulsar_session_progress_fn user;    ///< the caller's callback
-    void *user_ud;                      ///< the caller's userdata
-} pulsar_sync_progress;
-
 /** ---- helpers shared across the session_*.cpp TUs ----
- * payload_set_err (session_payload.cpp) is the payload/bank-KV error stamper;
- * spec_quench_reset (session_spec.cpp) re-arms the terminal yield quench at
- * request boundaries (sync/invalidate/rewind/load_payload). */
+ * payload_set_err (session_payload.cpp) is the payload/bank-KV error stamper. */
 void payload_set_err(char *err, size_t errlen, const char *msg);
-/** Re-arm at request boundaries (the same sites that drop the carry and
- * pendings). All-zero == armed, matching the xcalloc'd session.
- */
+/** A request boundary (session_spec.cpp): the speculative lookahead -- the carry token, the pre-drafted
+ *  pendings -- belongs to the previous request's distribution and goes, and the terminal yield quench
+ *  re-arms.  The core runs it for EVERY family wherever a request begins or the history the lookahead was
+ *  conditioned on is replaced: a sync and an invalidate (pulsar_session_family_sync / _invalidate), a fused
+ *  prompt chunk (note_prefilled), a rewind, a payload load.  Before L284 Qwen's sync and invalidate never ran
+ *  it, and the per-bank shadow kept a latched quench for every later request on that bank. */
+void spec_lookahead_reset(pulsar_session *s);
+/** The quench half alone: re-arm the terminal yield quench (the teacher-forced probe re-arms it every round). */
 void spec_quench_reset(pulsar_session *s);
 
 /** How one layer's attention reaches beyond its 128-token window (CSA2, L218).
@@ -2946,7 +2865,9 @@ char *pulsar_strdup(const char *s);
 void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
 
-void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms);
+void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms);
+/** The read-only view of one fit (its terms, count and weighted centre). */
+pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f);
 /** A TP worker takes the leader's terms as they rode the wire. */
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
@@ -3068,6 +2989,11 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
  * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
  * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0. */
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
+/** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
+ * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
+ * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not
+ * stale.  Otherwise the sync resumes from pulsar_session_resume_point. */
+bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen);
@@ -3087,6 +3013,8 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 
 /** The families' tokenizer tables (L272 P2: tokenizer.cpp, tokenizer_qwen.cpp). */
 extern const pulsar_family_tokenizer k_ds4_tokenizer;
+/** DeepSeek's bank pool: its graph's (session_banks.cpp). */
+extern const pulsar_family_bank_ops k_ds4_bank_ops;
 extern const pulsar_family_tokenizer k_qwen_tokenizer;
 /** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
 void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n);
@@ -3259,7 +3187,38 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
  *  rank must poll at the same boundaries. */
 bool pulsar_session_cancelled(pulsar_session *s);
 
-/** What a family supplies for the core's default sync (sync_driver.cpp, L272 P2). */
+/** L115 token-seam rescue, the family-neutral half (sync_driver.cpp, L284): the prompt re-spells, with canonical
+ *  ids, bytes the live view holds with its sampled ids.  `tokens` is live[0..live_cut) + prompt[prompt_cut..] --
+ *  the live history up to the deepest shared byte boundary, the prompt after it -- and `placed` the request's
+ *  images re-placed on it (L226/L273).  How the session reaches `live_cut` is the family's: a rewind, or the
+ *  resume rule from a grid checkpoint at or below it. */
+struct pulsar_seam_stitch {
+    enum { IMAGES_MAX = 64 };
+    pulsar_tokens tokens = {};                ///< owned; freed with the stitch
+    pulsar_image_ref placed[IMAGES_MAX] = {};  ///< the request's images, start_pos on `tokens`
+    int live_cut = 0;                         ///< live tokens the stitch keeps
+    int prompt_cut = 0;                       ///< prompt tokens the kept live tokens re-spell
+    pulsar_seam_stitch() = default;
+    pulsar_seam_stitch(const pulsar_seam_stitch &) = delete;
+    pulsar_seam_stitch &operator=(const pulsar_seam_stitch &) = delete;
+    ~pulsar_seam_stitch() { free(tokens.v); }
+};
+/** Stitch `prompt` onto the live view when the byte match keeps more than `past` live tokens.  false = no
+ *  stitch: the view is not valid, the match keeps `past` or fewer, or (said) the stitched prompt's image blocks
+ *  are not the request's images (a block cut by the seam, a count that differs). */
+bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                int n_images, int past, pulsar_seam_stitch *out);
+
+/** A family's prefill shape (L284): the chunk grid, how wide a resumed walk's chunks may be, and the alignment of
+ *  every non-final chunk end -- the inputs of the one cut rule (pulsar_prefill_plan_next_end).  Qwen: {prefill cap,
+ *  prefill cap, 1}; DeepSeek: {prefill cap, raw window cap, the compress ratios' LCM} (gpu_graph_prefill_shape). */
+typedef struct {
+    uint32_t cap;           ///< chunk ends snap to the absolute multiples of it (the cold pass's chunk width)
+    uint32_t resumed_cap;   ///< a walk that starts past 0 takes chunks of at most min(cap, this)
+    uint32_t align;         ///< a non-final chunk end rounds down to a multiple of it (1 = none)
+} pulsar_prefill_shape;
+
+/** What a family supplies for the core's sync (sync_driver.cpp, L272 P2; every family since L284). */
 typedef struct pulsar_sync_ops {
     const char *name;                                  ///< the family's name in messages
     /** The live bank's state holds exactly what the session's view (checkpoint) says. */
@@ -3269,22 +3228,55 @@ typedef struct pulsar_sync_ops {
     /** Prefill `prompt` on the live bank from `start` -- the core loop's 0 /
      *  PULSAR_SESSION_SYNC_INTERRUPTED / 1 (pulsar_prefill_loop). */
     int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+    /** The session's prefill shape (the core loop and the prefill quantum read it). */
+    void (*prefill_shape)(pulsar_session *s, pulsar_prefill_shape *out);
 } pulsar_sync_ops;
-/** The core's default sync: continue the view, else resume from the shared prefix's deepest grid
- *  checkpoint, else reset and prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2), with the request's
- *  images under the core's licence (L268; n_images 0 = text).  Returns 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
- *  with `err`. */
+/** The core's sync: continue the view, else resume from the shared prefix's deepest grid checkpoint, else reset and
+ *  prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2), with the request's images under the core's licence
+ *  (L268; n_images 0 = text).  Returns 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1 with `err`. */
 int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                 int n_images, const pulsar_sync_ops *ops, char *err, size_t errlen);
 
-/** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
- *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so
- *  DeepSeek's planner and the session loop are one walk.  `next_end` returns the chunk's end in
- *  (pos0, end]; `chunk` runs rows [pos0, pos0 + rows) (`last`: it ends the prompt); `landed` takes the
- *  effects of a chunk that ended at `chunk_end` (captures, the view, progress); `stop` (NULL = never) is
- *  polled before every chunk and after every chunk but the last. */
+/** The family's sync / eval / invalidate as the core runs them (engine_api.cpp, L284) -- every rank, mirrored
+ *  or not, and every in-engine caller: what a family's op does to its state, plus what the session does for
+ *  every family around it.  A sync begins a request and an invalidate forgets the history, so both drop the
+ *  speculative lookahead and re-arm the quench (spec_lookahead_reset); an eval commits a token chosen outside
+ *  the speculative round, so the carry no longer follows the state. */
+int pulsar_session_family_sync(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                               int n_images, char *err, size_t errlen);
+int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t errlen);
+void pulsar_session_family_invalidate(pulsar_session *s);
+/** Tokens the batched lane fed (decoded into its own buffer) that the view has not recorded yet -- every family's
+ *  one rule (L284): the view grows, its logits are stale, and it is valid exactly when the state agrees with it. */
+void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n);
+
+/** THE cut rule (prefill_loop.cpp, L284): a walk's chunk ends, as a pure function of the chunk's start, the
+ *  prompt's end and these fixed inputs.  In order: snap to the absolute grid of `grid_cap` (at most `chunk_cap`
+ *  rows); round a non-final end down to `align`; move an end that would split an image block to the block's start
+ *  (or past its end when the block starts the chunk); then cut the final chunk at the prompt's last resume-grid
+ *  point (pulsar_ckpt_final_cut) unless that lands inside a block. */
+typedef struct {
+    uint32_t grid_cap, chunk_cap, align;
+    const pulsar_ckpt_store *store;          ///< the resume grid the final cut lands on
+    const pulsar_engine *e;                  ///< the image geometry (pulsar_image_block_extent)
+    const pulsar_tokens *prompt;
+    const pulsar_image_ref *images;          ///< the request's blocks (NULL / 0 = text)
+    int n_images;
+} pulsar_prefill_plan;
+/** The plan of a walk from `start` (chunk_cap = the shape's resumed width when start != 0). */
+void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, uint32_t start,
+                              const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
+                              const pulsar_image_ref *images, int n_images);
+/** The end of the chunk that starts at `pos0`, in (pos0, end]. */
+uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos0, uint32_t end);
+
+/** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop hook, cut the
+ *  chunk by the plan, run it, land it, poll again -- with the effects as hooks.  `chunk` runs rows [pos0, pos0 +
+ *  rows) (`last`: it ends the prompt); `landed` (NULL = none) takes the effects of a chunk that ended at `chunk_end`
+ *  (captures, the view, progress); `stop` (NULL = never) is polled before every chunk and after every chunk but the
+ *  last. */
 struct pulsar_prefill_walk {
-    uint32_t (*next_end)(void *ud, uint32_t pos0, uint32_t end);
+    const pulsar_prefill_plan *plan;
     bool (*chunk)(void *ud, uint32_t pos0, uint32_t rows, bool last);
     bool (*landed)(void *ud, uint32_t chunk_end);
     bool (*stop)(void *ud);
@@ -3293,21 +3285,27 @@ struct pulsar_prefill_walk {
 /** Run the walk over [start, end): 0 when it reached `end`, PULSAR_SESSION_SYNC_INTERRUPTED when `stop`
  *  said so at a chunk boundary (the device drained), 1 when a hook failed or a cut was out of range. */
 int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);
+/** Rows from `pos0` to the next ABSOLUTE multiple of `cap` (P13, every walk's chunk rule): a walk that starts
+ *  off the cap grid -- a resume, a continuation, the chunk after an image cut -- lands on the cold prefill's
+ *  chunk ends, which sit on the resume grid where the walk captures (pulsar_ckpt_landed). */
+static inline uint32_t pulsar_prefill_to_boundary(uint32_t pos0, uint32_t cap) {
+    return cap - pos0 % cap;
+}
 
 /** One prefill chunk of the family's forward (L272 P2): rows [pos0, pos0 + rows) of `prompt` on the
  *  live bank; `last` heads the final row into s->logits.  false = the chunk failed (logged). */
 typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0,
                                         uint32_t rows, bool last, void *ud);
 
-/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start`, in chunks of
- *  `cap` rows, a chunk cut at `capture_at` (0 = none) and the state there captured into `ckpt`/`bank`.
- *  After each chunk the session's view advances (checkpoint = the prompt so far), the progress hooks
- *  hear prefill_chunk / prefill_display, and the cancel hook is polled -- before every chunk too.
- *  Returns 0 when the prompt is in, PULSAR_SESSION_SYNC_INTERRUPTED when the hook stopped it at a chunk
- *  boundary (the view stands there, the logits stale), 1 when a chunk failed. */
-int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
-                        uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
-                        pulsar_prefill_chunk_fn chunk, void *ud);
+/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start` on the session's live bank
+ *  and store, cut by the one rule over the family's prefill shape and the sync's borrowed images, every chunk end
+ *  handed to the shared capture rule (pulsar_ckpt_landed).  After each chunk the session's view advances (checkpoint
+ *  = the prompt so far) and the progress hooks hear prefill_chunk / prefill_display; the cancel hook is polled
+ *  before the first chunk and after every chunk that ends where a resume is exact.  Returns 0 when the prompt is in,
+ *  PULSAR_SESSION_SYNC_INTERRUPTED when the hook stopped it at a chunk boundary (the view stands there, the logits
+ *  stale), 1 when a chunk failed. */
+int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, pulsar_prefill_chunk_fn chunk,
+                        void *ud);
 
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,
@@ -3581,11 +3579,8 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank);
  * the pool is disabled (the classic tensors act as bank 0). */
 uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
 /** Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
- * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
- * touched (physically resident) demand-paged KV summed over the whole pool from
- * the per-bank compressor frontier. See the definitions in gpu_diag.cpp. */
+ * a context (the overcommit-reserved, physical-on-touch part).  See gpu_diag.cpp. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
-uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
 /** Compressed rows a layer of compress ratio `ratio` (non-zero) holds at
  * ctx_size: the one capacity formula, read by gpu_graph_compute_dims (the
  * allocator's per-layer caps) and the KV sizing in steering.cpp. */
@@ -4027,6 +4022,15 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path);
+/** The llama.cpp legacy `.dat` writer every family's collection shares (imatrix.cpp): open + entry count, one
+ *  entry per tensor (`n_expert` vectors of `n_col` means; a never-observed expert writes 1.0), then close with the
+ *  chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries);
+void imatrix_write_entry(FILE *fp, const char *name, const float *sum2, const uint32_t *counts, uint32_t n_expert,
+                         uint32_t n_col);
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path);
+extern const pulsar_family_imatrix k_ds4_imatrix;     // imatrix.cpp
+extern const pulsar_family_imatrix k_qwen_imatrix;    // imatrix_qwen.cpp
 bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g);
 bool gpu_graph_prefill_layer_major(
         pulsar_gpu_graph *g,
@@ -4040,38 +4044,15 @@ bool gpu_graph_prefill_layer_major(
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud);
-bool gpu_graph_prefill_chunked_range(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        uint32_t               start,
-        uint32_t               n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn progress,
-        void                  *progress_ud,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_imatrix_collector *imatrix,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled);
-bool gpu_graph_prefill_chunked(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        const token_vec       *prompt,
-        int                    n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        pulsar_session_progress_fn progress,
-        void                  *progress_ud,
-        pulsar_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        pulsar_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled);
+/** DeepSeek's prefill shape (L284): {prefill cap, raw window cap, the compress ratios' LCM} -- the session sync's
+ *  (pulsar_sync_ops::prefill_shape) and the range prefill's one authority. */
+pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g);
+/** Prefill prompt[start, start + n_tokens) on the graph's installed bank outside a session -- the imatrix collector
+ *  and the gates' classic suffix -- by the one cut rule over gpu_graph_prefill_shape (text only), capturing grid
+ *  checkpoints by the shared rule.  `logits` (NULL = none) receives the last row. */
+bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_weights *weights,
+                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens, float *logits,
+                                     pulsar_imatrix_collector *imatrix);
 bool gpu_graph_verify_suffix_tops(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -4121,6 +4102,20 @@ uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uin
  *  logits rows after the decode rows' block). */
 uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
                                      uint32_t n_heads);
+/** L284 #2: the prompt runs a fused step heads (head_last[r] set, r < n_pf) -- THE count every reader of a
+ *  shape uses. */
+static inline uint32_t pulsar_fused_shape_heads(const pulsar_fused_shape *sh) {
+    uint32_t h = 0;
+    for (uint32_t r = 0; r < sh->n_pf && r < (uint32_t)sizeof(sh->head_last); r++) h += sh->head_last[r] ? 1u : 0u;
+    return h;
+}
+/** L284 #2: the fused step on THIS rank (session_multiseq.cpp) -- the family's decode_fused op with the session's
+ *  bookkeeping around it, for every family: the last fused step's block (fused_logits / fused_n_dec /
+ *  fused_heads) is cleared before the op and recorded when it succeeds.  The C entry (both ranks' leader side)
+ *  and the TP worker call this, never the op directly.  The caller has checked pulsar_engine_has_fused_step. */
+int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
     int *ids;      ///< candidate token ids
@@ -4190,22 +4185,6 @@ int sample_top_p_min_p(
         float        min_p,
         uint64_t    *rng,
         pulsar_sample_scratch *scratch);
-int generate_gpu_graph_raw_swa(
-        const pulsar_model   * model,
-        const pulsar_vocab   * vocab,
-        const pulsar_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        uint32_t            prefill_chunk,
-        const char        * directional_steering_file,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        pulsar_token_emit_fn   emit,
-        pulsar_generation_done_fn done,
-        void              * emit_ud,
-        pulsar_session_progress_fn progress,
-        void              * progress_ud);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
 /** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
@@ -4260,17 +4239,9 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 
-/** L107 adaptive draft depth bounds (controller in session_spec.cpp). MAX is
- * the drafter's TRAINED BLOCK (0731 DSpark metadata: stages=3 block=5):
- * position 6 is out of distribution, and the sweep measured depth 6 DOMINATED
- * everywhere -- accepted/step falls (3.31 -> 3.20 structured) while drafting
- * cost jumps, so even transient controller excursions there are purchased
- * losses (Tyler's catch, 2026-08-25 evening; the earlier ceiling of 6 was a
- * "probe step" rationale that predates knowing the block width). Re-tune MAX
- * only with a drafter retrained at a wider block (L092). The /metrics
- * max_draft reports at least MAX so the per-position waterfall covers every
- * position the controller can reach. */
-enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
+/** The depth a fresh session drafts at: the configured spec_depth or the drafter's, clamped to the drafter's
+ *  depth_max; 0 = no drafter (session_spec.cpp). */
+uint32_t pulsar_spec_depth_start(const pulsar_engine *e);
 /* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
  * object's address, unique per tensor per engine -- abs_offsets repeat across
  * safetensors shards.  One authority for registration and lookup. */

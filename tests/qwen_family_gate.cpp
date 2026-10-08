@@ -115,20 +115,6 @@ static void host_part(const char *dir) {
           "then qsa at layer 3");
     probe.qsa = never_layer;
     check(pulsar_qwen_first_missing_op(&probe, p, s, &at) == PULSAR_QWEN_OP_HEAD, "then head");
-
-    /* The session state at Tyler's KV target, priced by the allocator run dry. */
-    struct { uint32_t banks, ctx; } cfgs[] = { {1, 4096}, {1, 1572864}, {1, 2097152}, {8, 262144} };
-    const uint64_t per_tok = 12ull * pulsar_qwen_kv_row_bytes(s);
-    for (size_t i = 0; i < sizeof(cfgs) / sizeof(cfgs[0]); i++) {
-        uint64_t managed = 0;
-        const uint64_t bytes = pulsar_qwen_state_price(s, p, cfgs[i].banks, cfgs[i].ctx, 4096, false, &managed);
-        const uint64_t want_managed = (uint64_t)cfgs[i].banks *
-            (cfgs[i].ctx * per_tok + 12ull * ((cfgs[i].ctx + s->idx_block - 1) / s->idx_block) *
-                                     pulsar_qwen_index_row_bytes(s));
-        check(bytes > 0 && managed == want_managed,
-              "state at %u bank(s) x %u tokens: %.2f GiB (%.2f GiB demand-paged KV + index = the row sizes)",
-              cfgs[i].banks, cfgs[i].ctx, (double)bytes / 1073741824.0, (double)managed / 1073741824.0);
-    }
     pulsar_engine_close(e);
 
     static const char *const mutants[] = { "arch", "shape", "tensor", "layer-type", "s4-format", "ple-rows" };
@@ -157,6 +143,22 @@ static void gpu_part(const char *dir) {
         return;
     }
     e->prefill_chunk = 4096;
+    /* The session at Tyler's KV target, priced by the create run dry (the fixture has no MTP layer). */
+    {
+        const pulsar_qwen_shape *s = &g_qwen_shape;
+        struct { uint32_t banks, ctx; } cfgs[] = { {1, 4096}, {1, 1572864}, {1, 2097152}, {8, 262144} };
+        const uint64_t per_tok = 12ull * pulsar_qwen_kv_row_bytes(s);
+        for (size_t i = 0; i < sizeof(cfgs) / sizeof(cfgs[0]); i++) {
+            uint64_t managed = 0;
+            const uint64_t bytes = e->session_cost_bytes_banked((int)cfgs[i].ctx, (int)cfgs[i].banks, &managed);
+            const uint64_t want_managed = (uint64_t)cfgs[i].banks *
+                (cfgs[i].ctx * per_tok + 12ull * ((cfgs[i].ctx + s->idx_block - 1) / s->idx_block) *
+                                         pulsar_qwen_index_row_bytes(s));
+            check(bytes > 0 && managed == want_managed,
+                  "session at %u bank(s) x %u tokens: %.2f GiB (%.2f GiB demand-paged KV + index = the row sizes)",
+                  cfgs[i].banks, cfgs[i].ctx, (double)bytes / 1073741824.0, (double)managed / 1073741824.0);
+        }
+    }
     const int ctx = 262144;
     const uint64_t price = pulsar_engine_session_cost_bytes_banked(e, ctx, (int)gpu_graph_bank_pool_n());
     pulsar_session *sess = NULL;
@@ -190,8 +192,29 @@ static void gpu_part(const char *dir) {
     err[0] = '\0';
     check(pulsar_session_decode_mixed(sess, &row, 1, logits, 248320, NULL, 0, err, sizeof(err)) != 0,
           "a mixed row at the wrong position refused: %s", err);
+    /* L284: the kv-state payload's plumbing (zero weights: the numbers are tests/qwen_payload_gate's) -- a
+     * snapshot at the frontier, an eval, the snapshot back: the frontier's logits and the same next row. */
+    {
+        const int w = pulsar_engine_logits_width(e);
+        float *l0 = (float *)xmalloc((size_t)w * 4 * sizeof(float));
+        float *l1 = l0 + w, *l0b = l0 + 2 * w, *l1b = l0 + 3 * w;
+        pulsar_session_snapshot snap;
+        memset(&snap, 0, sizeof(snap));
+        err[0] = '\0';
+        const uint64_t pb = pulsar_session_payload_bytes(sess);
+        bool ok = pb > 0 && pulsar_session_copy_logits(sess, l0, w) == w &&
+                  pulsar_session_save_snapshot(sess, &snap, err, sizeof(err)) == 0 && snap.len == pb;
+        check(ok, "payload saved at pos %d (%llu bytes) %s", pulsar_session_pos(sess), (unsigned long long)pb, err);
+        ok = ok && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 && pulsar_session_copy_logits(sess, l1, w) == w &&
+             pulsar_session_load_snapshot(sess, &snap, err, sizeof(err)) == 0 && pulsar_session_pos(sess) == 9 &&
+             pulsar_session_copy_logits(sess, l0b, w) == w && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 &&
+             pulsar_session_copy_logits(sess, l1b, w) == w;
+        check(ok && !memcmp(l0, l0b, (size_t)w * sizeof(float)) && !memcmp(l1, l1b, (size_t)w * sizeof(float)),
+              "payload restored: the frontier's logits and the next eval's row byte-identical %s", err);
+        pulsar_session_snapshot_free(&snap);
+        free(l0);
+    }
     free(logits);
-    check(pulsar_session_payload_bytes(sess) == 0, "payload refused (no PAYLOAD cap)");
     /* L272 P1 S3: Qwen speculates through the round API -- the family declares CAP_SPEC and its verify hooks;
      * whether rounds run is the drafter's call, and the fixture carries no MTP sidecar (qwen_family_container.py
      * skips those tensors), so this engine has none. */

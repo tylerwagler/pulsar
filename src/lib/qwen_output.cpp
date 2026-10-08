@@ -120,6 +120,86 @@ const char *qwen_output_parser::param_type(const std::string &fn, const std::str
     return NULL;
 }
 
+/* One "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i]: 1 = read (*key, the typed *v,
+ * *i past it), 0 = not complete yet, -1 = not a parameter; *why names what is missing or wrong.  The one
+ * reading close_call and the stream share. */
+int qwen_output_parser::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
+                                   pyjson_value *v, const char **why) const {
+    static const char kParam[] = "<parameter=";
+    const size_t n = strlen(kParam), rem = b.size() - *i;
+    if (b.compare(*i, std::min(rem, n), kParam, std::min(rem, n))) {
+        *why = "expected <parameter= or </function>";
+        return -1;
+    }
+    *why = "unterminated <parameter=KEY>";
+    if (rem < n) return 0;
+    const size_t at = *i + n;
+    const size_t key_end = b.find('>', at);
+    if (b.find('\n', at) < key_end) return -1;
+    if (key_end == std::string::npos) return 0;
+    *why = "unterminated parameter value";
+    const size_t close = b.find("</parameter>", key_end + 1);
+    if (close == std::string::npos) return 0;
+    *key = b.substr(at, key_end - at);
+    size_t vlo = key_end + 1, vhi = close;
+    if (vlo < vhi && b[vlo] == '\n') vlo++;
+    if (vhi > vlo && b[vhi - 1] == '\n') vhi--;
+    const std::string text = b.substr(vlo, vhi - vlo);
+    *i = close + 12;
+    /* A value is JSON only when the schema does not declare it a string
+     * AND the text is exactly what tojson would have written for it: the
+     * template writes every non-string with tojson, so text in any other
+     * spelling can only have been a raw string. */
+    *v = pyjson_value();
+    const char *type = param_type(fn, *key);
+    char jerr[8];
+    bool as_json = !(type && !strcmp(type, "string")) && pyjson_parse(text.data(), text.size(), v, jerr, sizeof jerr);
+    if (as_json) {
+        std::string canon;
+        pyjson_dump(*v, &canon);
+        as_json = v->kind != pyjson_value::STR && canon == text;   /* strings are written raw, never tojson */
+    }
+    if (!as_json) {
+        *v = pyjson_value();
+        v->kind = pyjson_value::STR;
+        v->s = text;
+    }
+    return 1;
+}
+
+/* The open call's parameters that closed since the last call, as TOOL_ARGS fragments. */
+void qwen_output_parser::stream_params(std::vector<qwen_out_event> *ev) {
+    static const char kFnEnd[] = "</function>";
+    while (!arg_stop_) {
+        size_t i = arg_pos_;
+        while (i < block_.size() && (block_[i] == ' ' || block_[i] == '\n' || block_[i] == '\t' || block_[i] == '\r')) i++;
+        const size_t rem = block_.size() - i;
+        if (!rem || !block_.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
+            return;   /* the call's close is close_call's */
+        std::string key;
+        pyjson_value v;
+        const char *why = NULL;
+        const int r = read_param(block_, &i, fn_, &key, &v, &why);
+        if (r == 0) return;
+        if (r < 0) {
+            arg_stop_ = true;   /* close_call names the fault */
+            return;
+        }
+        pyjson_value one;
+        one.kind = pyjson_value::OBJ;
+        one.o.emplace_back(key, std::move(v));
+        std::string d;
+        pyjson_dump(one, &d);   /* {"key": value} */
+        qwen_out_event e;
+        e.kind = qwen_out_event::TOOL_ARGS;
+        e.index = index_;
+        e.text = arg_n_ ? ", " + d.substr(1, d.size() - 2) : d.substr(0, d.size() - 1);
+        ev->push_back(std::move(e));
+        arg_n_++;
+        arg_pos_ = i;
+    }
+}
+
 /* Parse the body of one <tool_call> ... </tool_call>. */
 void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
     const std::string &b = block_;
@@ -153,38 +233,10 @@ void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
             i += 11;
             break;
         }
-        if (b.compare(i, 11, "<parameter=")) return fail("expected <parameter= or </function>");
-        i += 11;
-        const size_t key_end = b.find('>', i);
-        if (key_end == std::string::npos || b.find('\n', i) < key_end) return fail("unterminated <parameter=KEY>");
-        const std::string key = b.substr(i, key_end - i);
-        i = key_end + 1;
-        const size_t close = b.find("</parameter>", i);
-        if (close == std::string::npos) return fail("unterminated parameter value");
-        size_t vlo = i, vhi = close;
-        if (vlo < vhi && b[vlo] == '\n') vlo++;
-        if (vhi > vlo && b[vhi - 1] == '\n') vhi--;
-        const std::string text = b.substr(vlo, vhi - vlo);
-        i = close + 12;
-        /* A value is JSON only when the schema does not declare it a string
-         * AND the text is exactly what tojson would have written for it: the
-         * template writes every non-string with tojson, so text in any other
-         * spelling can only have been a raw string. */
+        std::string key;
         pyjson_value v;
-        const char *type = param_type(name, key);
-        char jerr[8];
-        bool as_json = !(type && !strcmp(type, "string")) &&
-                       pyjson_parse(text.data(), text.size(), &v, jerr, sizeof jerr);
-        if (as_json) {
-            std::string canon;
-            pyjson_dump(v, &canon);
-            as_json = v.kind != pyjson_value::STR && canon == text;   /* strings are written raw, never tojson */
-        }
-        if (!as_json) {
-            v = pyjson_value();
-            v.kind = pyjson_value::STR;
-            v.s = text;
-        }
+        const char *why = NULL;
+        if (read_param(b, &i, name, &key, &v, &why) != 1) return fail(why);
         bool replaced = false;   /* a repeated key: first position, last value */
         for (auto &kv : args.o)
             if (kv.first == key) { kv.second = v; replaced = true; }
@@ -210,6 +262,61 @@ void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
     ev->push_back(std::move(e));
     calls_.push_back(std::move(call));
     index_++;
+}
+
+/* Advance pay_ over block_'s new bytes (the open call's body so far; hold_ keeps a partial
+ * "</tool_call>" out of it).  A parameter value starts past "<parameter=KEY>" and ends at the first
+ * "</parameter>" -- close_call's reading. */
+void qwen_output_parser::scan_payload() {
+    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
+    payload_scan &ps = pay_;
+    const std::string &b = block_;
+    for (;;) {
+        if (!ps.value) {
+            const size_t at = b.find(kParam, ps.pos);
+            if (at == std::string::npos) {
+                ps.pos = b.size() > strlen(kParam) ? std::max(ps.pos, b.size() - strlen(kParam)) : ps.pos;
+                break;
+            }
+            const size_t gt = b.find('>', at);
+            if (gt == std::string::npos) {
+                ps.pos = at;
+                break;
+            }
+            const char *type = param_type(fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
+            ps.value = true;
+            ps.is_string = type && !strcmp(type, "string");
+            ps.json_str = ps.esc = false;
+            ps.pos = ps.vstart = gt + 1;
+            continue;
+        }
+        bool closed = false;
+        while (ps.pos < b.size()) {
+            if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
+                ps.pos += strlen(kParamEnd);
+                ps.value = false;
+                closed = true;
+                break;
+            }
+            if (b[ps.pos] == '<' && b.size() - ps.pos < strlen(kParamEnd) &&
+                !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
+                break;   /* a partial closer waits for its next bytes */
+            const char c = b[ps.pos++];
+            if (ps.is_string) continue;
+            if (ps.json_str) {
+                if (ps.esc) ps.esc = false;
+                else if (c == '\\') ps.esc = true;
+                else if (c == '"') ps.json_str = false;
+            } else if (c == '"') {
+                ps.json_str = true;
+            }
+        }
+        if (!closed) break;
+    }
+    /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
+     * "</" of a closer (this block's or the held "</tool_call>") */
+    const size_t pending = b.size() - std::min(ps.pos, b.size());
+    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && hold_.size() < 2;
 }
 
 bool qwen_output_parser::raw_span(size_t *lo, size_t *hi) const {
@@ -254,6 +361,8 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
             hold_.erase(0, at + strlen(kCallOpen));
             block_.clear();
             began_ = false;
+            fn_.clear();
+            pay_ = payload_scan();
             mode_ = M_TOOL;
             continue;
         }
@@ -274,17 +383,26 @@ void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_even
                     ev_begin.kind = qwen_out_event::TOOL_BEGIN;
                     ev_begin.index = index_;
                     ev_begin.name = block_.substr(i + 10, e - i - 10);
+                    fn_ = ev_begin.name;
                     ev->push_back(std::move(ev_begin));
                     began_ = true;
+                    arg_pos_ = e + 1;
+                    arg_n_ = 0;
+                    arg_stop_ = false;
                 }
             }
         }
         if (at == std::string::npos) {
             hold_.erase(0, take);
+            if (began_) {
+                scan_payload();
+                stream_params(ev);
+            }
             return;
         }
         raw_hi_ = fed_ - hold_.size() + at + strlen(kCallClose);
         hold_.erase(0, at + strlen(kCallClose));
+        if (began_) stream_params(ev);   /* a last parameter closed in this piece goes out before the end */
         close_call(ev);
         mode_ = M_AFTER_TOOL;
     }

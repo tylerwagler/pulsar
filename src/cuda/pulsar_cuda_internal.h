@@ -97,7 +97,7 @@ constexpr bool pulsar_idx_mxfp4_heads_supported(uint32_t n_head) {
  * geometry macros (PULSAR_ATTN_PACK_*, PULSAR_KV4_NV_*, PULSAR_MXKV_*,
  * PULSAR_WINKV_*, PULSAR_MAINKV_*) live in src/pulsar_gpu.h, the one
  * definition both sides of the seam read (L159 inc 5).  Bumping any of these
- * layouts MUST bump PULSAR_SESSION_PAYLOAD_VERSION.
+ * layouts MUST bump PULSAR_SESSION_KV_PAYLOAD_VERSION.
  */
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.

@@ -9,14 +9,27 @@
 # A contract x family cell with no battery gate must appear as a `gap` row naming the ledger row that closes it --
 # the check fails on an undeclared hole, so a gap is written down, not remembered.
 #
+# L284: a gate listed for ONE family (a kernel: gate excepted) is a decision for every other family, written down
+# below the table as one of
+#   na   <target> <family> <reason>          the contract does not apply there: the family lacks, by design, the
+#                                            mechanism the gate grades (and what grades the family's own instead)
+#   gap  <target> <family> <Lnnn> <note>     it applies and is owed; the ledger row that closes it
+# and the check fails on a one-family gate with neither, or on such a row for a gate that already runs there.
+#
 # target	contract	family	tier	note
 runner:session-contract-gate	session,spec	all	battery	every hosted model; B6: multi-bank verify == single
 runner:cuda-row-neutrality-gate	session	all	battery	1-row == N-row decode, ~100 / ~2.2k / ~10k tokens, every hosted model
-runner:cuda-chunk-neutrality-gate	session	deepseek4	battery	schedules A-P/X through internals
+runner:cuda-chunk-neutrality-gate	session	all	battery	schedules A-P/X at 8600 tokens, chunk 4096; payload (H I M P) / rewind (J K) / standalone restore (L N) schedules skip by name where the family lacks them; origins per sync planner, F G from the prefill grid on both (L284)
+runner:cuda-algo-stability-gate	session	all	battery	width neutrality: bank 0's decode row byte-identical at widths 1/2/4/5/8/16 (KL past the exact range), every hosted model (L284)
+runner:cuda-algo-stability-gate-deep	session	all	battery	the same with bank 0 at 2200 tokens (L284)
+runner:cuda-mixed-neutrality-gate	session	deepseek4	battery	a decode bank's row == with a K-row prompt run co-scheduled (GATE 4/2/3); runs batched == alone (5/5R)
+runner:cuda-mixed-neutrality-gate-wide	session	deepseek4	battery	12 decode banks + a prompt run
+runner:cuda-mixed-prefill-gate	session	deepseek4	battery	a K-row prompt run through the mixed entry == the classic prefill
 runner:cuda-frontier-gate	session	deepseek4	battery
 runner:cuda-rewind-gate	session	deepseek4	battery
-runner:cuda-seam-gate	session	deepseek4	battery
-runner:cuda-multiseq-gate	session	deepseek4	battery
+runner:cuda-seam-gate	session	all	battery	a re-tokenized echo keeps the live KV; leg 3 (shorter echo) needs rewind, skipped by name without it (L284)
+runner:cuda-multiseq-gate	session	all	battery	co-scheduling neutrality N=2 vs 3, mixed == multiseq entry, stale-classic guard; ALL_ROWS leg needs prompt runs in a step (L284)
+runner:cuda-multiseq-gate-nodspark	session	all	battery	the same with speculation disabled at open (L284)
 runner:cuda-accounting-gate	session	deepseek4	battery
 runner:cuda-evict-restore-gate	session	deepseek4	battery
 runner:cuda-session-payload-gate	session	deepseek4	battery
@@ -47,3 +60,23 @@ qwen-image-smoke-gate	server	qwen4_exp	manual	one image question end to end; a m
 #
 # gaps: a contract x family cell with no battery gate, and the row that closes it
 gap	tp	qwen4_exp	L278	contract 7: the pair (tools/tp2-l272); tp-plan host-side
+#
+# one-family gates (L284): na = by design, gap = owed
+gap	runner:cuda-mixed-neutrality-gate	qwen4_exp	L284	Qwen's steps carry no prompt runs (decode_mixed refuses a multi-row run; decode_fused NULL until L284 #2); its per-row verify neutrality is session-contract B6
+gap	runner:cuda-mixed-neutrality-gate-wide	qwen4_exp	L284	as cuda-mixed-neutrality-gate (L284 #2)
+gap	runner:cuda-mixed-prefill-gate	qwen4_exp	L284	as cuda-mixed-neutrality-gate (L284 #2)
+na	runner:cuda-frontier-gate	qwen4_exp	grades DeepSeek's compressor frontier counters (ratio-4/128 groups) and packed comp-cache rows through its session graph; Qwen has no compressor -- its bank isolation is session-contract B1-B3 and the multiseq / algo-stability neutrality
+na	runner:cuda-rewind-gate	qwen4_exp	pulsar_session_rewind: Qwen's GDN state is recurrent, pulsar_engine_can_rewind is false by design (a cut resumes from a grid checkpoint: session-contract C3)
+gap	runner:cuda-accounting-gate	qwen4_exp	L284	Qwen's QSA KV and indexer keys are demand-paged managed tensors priced by the same touched-KV number (L270); the gate reads DeepSeek's raw/comp/index tensors and rewinds -- a public-API physical-vs-touched leg is owed (session-contract B5 checks only the pricing)
+na	runner:cuda-evict-restore-gate	qwen4_exp	per-bank physical eviction and restore: Qwen's family bank pool refuses eviction by design (session-contract B5 asserts the refusal)
+gap	runner:cuda-session-payload-gate	qwen4_exp	L284	whole-session payloads: Qwen has no PAYLOAD cap yet (the L284 payload workstream)
+na	qwen-family-gate-device	deepseek4	Qwen's zero-weight wiring check; DeepSeek's loader contract is loader-contract-gate
+na	runner:cuda-bank-spec-gate	qwen4_exp	DSpark's per-bank speculative state (s->spec, its checkpoints) through DeepSeek's session; Qwen's MTP verify per bank is session-contract B6, its greedy == spec and distribution cuda-spec-sampling-gate
+na	runner:cuda-dspark-batch-gate	qwen4_exp	the DSpark drafter's batched redraft; Qwen's drafter is MTP (pulsar_engine_drafter)
+gap	runner:cuda-decode-reference-gate-story	qwen4_exp	L284	decode rows at served widths vs the reference: Qwen's verify step takes <= 16 rows (24/32 refused) and the gate's exact-width range is DeepSeek's cuBLASLt boundary -- needs the family's served widths
+na	qwen-ref-gate	deepseek4	Qwen against its BF16 source (a quant-quality reading); DeepSeek's quality is graded against the B300 by the reference gates
+na	qwen-chat-gate	deepseek4	Qwen's template / tokenizer vs HF goldens; DeepSeek's template is render-gate
+na	render-gate	qwen4_exp	DeepSeek V4.1's encoder goldens; Qwen's template is qwen-chat-gate
+na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
+na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
+na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates

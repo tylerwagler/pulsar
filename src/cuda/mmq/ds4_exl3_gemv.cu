@@ -529,7 +529,13 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     }
 }
 
-/* One warp per (token, 128-block of out); slots summed in order. */
+/* Slots whose loads the sum issues together (L284 #7): a decode step's sum is a
+ * few warps, latency-bound on its chain of selected -> table -> partial loads
+ * when they wait one slot at a time. */
+constexpr int kSumBatch = 8;
+
+/* One warp per (token, 128-block of out); slots summed in order, their loads
+ * issued kSumBatch slots at a time. */
 __global__ void __launch_bounds__(256)
 exl3_moe_sum_kernel(float *__restrict__ out,
                     const float *__restrict__ down_z,
@@ -546,16 +552,29 @@ exl3_moe_sum_kernel(float *__restrict__ out,
     const int col0 = blk * 128 + lane * 4;
     const void *const *pd = reinterpret_cast<const void *const *>(down_table);
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int s = 0; s < n_expert; ++s) {
-        const int64_t pair = (int64_t)tok * n_expert + s;
-        const int e = selected[pair];
-        if (e < 0) continue;                          /* another rank's expert (L266 EP): its partial is that rank's */
-        const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]) + mid_dim;
-        const float4 z4 = *reinterpret_cast<const float4 *>(down_z + pair * out_dim + col0);
-        float z[4] = {z4.x, z4.y, z4.z, z4.w};
-        exl3dev::had128(z);
+    for (int s0 = 0; s0 < n_expert; s0 += kSumBatch) {
+        int ex[kSumBatch];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] += z[j] * __half2float(svh_d[col0 + j]);
+        for (int b = 0; b < kSumBatch; ++b)
+            ex[b] = s0 + b < n_expert ? selected[(int64_t)tok * n_expert + s0 + b] : -1;
+        float4 z4[kSumBatch];
+        __half sv[kSumBatch][4];
+#pragma unroll
+        for (int b = 0; b < kSumBatch; ++b) {
+            if (ex[b] < 0) continue;                  /* past the slots, or another rank's expert (L266 EP): its partial is that rank's */
+            const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)ex[b] + 1]) + mid_dim;
+            z4[b] = *reinterpret_cast<const float4 *>(down_z + ((int64_t)tok * n_expert + s0 + b) * out_dim + col0);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) sv[b][j] = svh_d[col0 + j];
+        }
+#pragma unroll
+        for (int b = 0; b < kSumBatch; ++b) {
+            if (ex[b] < 0) continue;
+            float z[4] = {z4[b].x, z4[b].y, z4[b].z, z4[b].w};
+            exl3dev::had128(z);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[j] += z[j] * __half2float(sv[b][j]);
+        }
     }
     bool bad = false;
 #pragma unroll

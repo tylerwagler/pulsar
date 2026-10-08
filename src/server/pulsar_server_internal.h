@@ -510,7 +510,7 @@ struct server;
 struct request;
 /** How a family's generated text is read. */
 typedef enum {
-    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, truncation repair, recovery, tool memory, the canonical rewrite, live tool state
+    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, recovery, tool memory, the canonical rewrite, live tool state
     SERVER_PARSER_QWEN = 1,   ///< ONE qwen_output_parser per generation (gen_state::qwen); the turn ends at the family's stop token
 } server_parser_kind;
 typedef struct server_family_ops {
@@ -523,9 +523,10 @@ typedef struct server_family_ops {
      *  about which template produced the bytes (L218 s123).  Meaningless to another family. */
     bool v41;
     server_parser_kind parser;
-    /** Resolve the request's thinking controls (c->controls, the model alias) into r->think_mode and
-     *  the family's own effort; refuse by name a control the template cannot express. */
-    bool (*resolve)(pulsar_engine *e, const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
+    /** Thinking is ON (the shared rule, chat_family.cpp): the level the template has nearest the asked
+     *  effort (a row of the one effort-name table, an integer, or nothing sent: the template's default),
+     *  into r->think_mode and the family's own r->family_effort. */
+    void (*effort)(pulsar_engine *e, const struct chat_effort_ask *a, struct request *r);
     /** Render the conversation into r->prompt_text / prompt_spans / prompt; refuse by name what the
      *  template cannot express (a forced tool call, a live tool continuation, ...). */
     bool (*render)(pulsar_engine *e, struct server *s, struct chat_conversation *c, struct request *r, char *err,
@@ -563,13 +564,13 @@ typedef struct server_family_ops {
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
     /** L272: an UNNAMED forced call's seed ends where the function name's OPENER starts; the opener, the
-     *  name and the closer (Qwen: "=" and ">") are then sampled under a mask that keeps them a prefix of
-     *  opener + a declared tool's name + closer, so "required" with several tools cannot name an undeclared
-     *  one (Qwen sampled "ask_user").  The seed stops BEFORE the opener (token healing): Qwen's tokenizer
-     *  merges "=" with a name's first piece ("=get"), so a prompt ending in a lone "=" is a state the model
-     *  saw only before names it does not merge ("=", "convert"), and "required" chose convert_currency for
-     *  every question.  forced_name_close NULL = the family's seed does not end at the name: no constraint
-     *  (an undeclared name is dropped at the finish instead); forced_name_open may be "" (no opener). */
+     *  name and the closer (Qwen: "=" and ">"; DeepSeek: ` name="` and `">`, L284) are then sampled under a
+     *  mask that keeps them a prefix of opener + a declared tool's name + closer, so "required" with several
+     *  tools cannot name an undeclared one (Qwen sampled "ask_user").  The seed stops BEFORE the opener
+     *  (token healing): Qwen's tokenizer merges "=" with a name's first piece ("=get"), so a prompt ending
+     *  in a lone "=" is a state the model saw only before names it does not merge ("=", "convert"), and
+     *  "required" chose convert_currency for every question.  The closer is the whole tag end for the same
+     *  reason (DeepSeek's `">` is one token).  Every family has both. */
     const char *forced_name_open;
     const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
@@ -613,7 +614,8 @@ typedef struct server_output_parser_ops {
      *  projected into the sink (final = false); at the finish, `final` flushes what the projection held.
      *  false = a client write failed. */
     bool (*feed)(void *st, server *s, struct gen_state *g, size_t upto, bool final);
-    /** The decode sits inside a tool call's structured region: its arguments decode greedily. */
+    /** The decode sits on a tool call's STRUCTURE: greedy.  A call's payload -- a string-typed value, or a
+     *  JSON string inside any other value -- is sampled (L284 P6: one rule, every family). */
     bool (*in_tool_call)(const void *st, const struct gen_state *g);
     /** The turn is complete before the stop token (DeepSeek: a closed DSML block). */
     bool (*turn_complete)(const void *st, const struct gen_state *g);
@@ -1466,6 +1468,27 @@ bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsign
 /** Period of the MemAvailable-floor provisioning refusal line. */
 #define PULSAR_SERVER_MEM_FLOOR_WARN_SEC 10.0
 
+/** L284 lane cost: the scheduler's priced choice between the plain and spec decode lanes, one rule for every
+ *  family (server_sched.cpp lane_price_pick).  The spec lane's acceptance is measured here, per bank per decode
+ *  round; both lanes' step costs are the engine's fits (pulsar_engine_lane_cost).  All-zero is the start state. */
+typedef struct {
+    float tau;            ///< EW tokens a bank commits per spec round, base included (0: never measured)
+    float rho;            ///< EW rows a bank carries per spec round, base included
+    int lane;             ///< the priced lane while spec could carry the decoders: 2 or 3 (0: none yet -> 3)
+    int probe;            ///< the lane being measured against `lane` (0: none)
+    uint32_t probe_n0;    ///< that lane's step count when the probe began
+    uint32_t held_n0;     ///< `lane`'s step count when it was chosen or last weighed (hold and re-probe count from it)
+    int meas_n;           ///< the decoder count the measured prices below are for
+    double meas_tok[PULSAR_LANE_COUNT];        ///< EW tokens a step committed there, per pulsar_decode_lane
+    double meas_ms[PULSAR_LANE_COUNT];         ///< EW wall of those steps, ms
+    uint32_t meas_steps[PULSAR_LANE_COUNT];    ///< steps measured there
+    double t_plain;       ///< the last prices, tokens/s (0: no number) -- announced with the lane
+    double t_spec;
+    bool meas_plain;      ///< ...and whether each was measured at the decoders' count (else predicted)
+    bool meas_spec;
+    const char *why;      ///< the last pick's reason, announced with the lane
+} lane_price;
+
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
  * ONE worker thread does every piece of engine work; client threads only parse,
@@ -1641,6 +1664,9 @@ struct server {
      * this" from "no speculative decoding ran at all". */
     int w_decode_lane;  ///< worker-owned current lane
     int m_decode_lane;  ///< published copy, read by send_metrics
+    /** L284 lane cost: the priced choice between the plain (2) and spec (3) lanes while the spec lane could carry
+     *  every decoder (server_sched.cpp lane_price_pick).  Worker-owned. */
+    lane_price w_lane_price;
     uint64_t m_prompt_tokens;  ///< cumulative prompt tokens prefilled
     uint64_t m_prefix_queries;  ///< cumulative prompt tokens seen (hit-rate denom)
     uint64_t m_prefix_hits;  ///< cumulative prompt tokens served from prefix cache
@@ -2398,6 +2424,11 @@ struct qwen_gen {
     bool stream_ok = true;           ///< no client write failed while projecting
     std::string last_error;          ///< the last malformed-call report (the retry's detail)
     int undeclared = 0;              ///< calls dropped for naming an undeclared tool (L272)
+    std::vector<qwen_out_event> pending;   ///< a forced seed's announcement, sent by the first feed
+    bool open = false;               ///< the last of `calls` is announced and still being read (L284 P5)
+    bool open_args = false;          ///< its argument object's "{" went out
+    int wire_open = -1;              ///< its index on the stream
+    int wire_n = 0;                  ///< calls announced on the stream (a broken one keeps its index)
     ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
 };
 
@@ -2515,15 +2546,17 @@ struct gen_state {
      * reconciled onto the checkpoint when the slot returns to a classic op
      * (finish/store). */
     bool batch_active;      ///< this slot is in the shared multiseq lane (it leaves at finish, or for the family's
-                            ///< speculation once it decodes alone: server::batch_leave, L271)
+                            ///< speculation once that lane can carry every decoder: server::batch_leave, L271/L284)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
     int  batch_feed_token;  ///< next token to commit
     int  batch_feed_pos;    ///< position to commit it at (the bank's KV frontier)
     pulsar_tokens batch_pending;  ///< tokens committed via multiseq since the bank's last host checkpoint
-    /** plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
-     * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
-     * once by the fused quantum on giveup; the classic path handles it correctly. */
-    bool no_fuse;
+    /** plan-34 inc 5: why this prefill slot is not fusable (NULL: it may fuse) -- a
+     * fused step rejected its run as not-position-true, or fuse_prepare found its bank
+     * needs a rewind / a resume below the frontier / a fresh compressor group; route it
+     * CLASSIC.  Set once; the classic path handles it correctly.  The reason is what
+     * the spec quantum's rider verdict prints (L284). */
+    const char *no_fuse;
     /** L260 fusion: this prompt rides the spec lane's fused steps -- its bank was
      * installed once and found an exact extension point (or invalidated for a fresh
      * conversation).  A prompt that is not an extension of its bank's history is
@@ -2634,13 +2667,7 @@ const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *order
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
-pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort);
-bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out);
-bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled);
-bool parse_output_config_effort(const char **p, pulsar_think_mode *effort);
-bool model_alias_disables_thinking(const char *model);
-bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(pulsar_engine *engine);
 /* Advertised model id ("id"/"root"/metrics): the built-in id derived from the
  * loaded GGUF shape. */
@@ -2659,6 +2686,15 @@ bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen);
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
+struct chat_conversation;
+/** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
+ *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) then the schemas
+ *  Responses input items loaded (tool_search output).  Appended to `out`; every family renders from this. */
+void conversation_tool_schema_lines(const struct chat_conversation *c, buf *out);
+/** L284: schema lines as an OpenAI tools array ([{"type":"function","function":{name, description, parameters}}]),
+ *  for a template that renders OpenAI's shape (Qwen).  A line's parameters are `parameters` or, Anthropic-shaped,
+ *  `input_schema`.  malloc'd; NULL + err when a line has no name. */
+char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 /* Attach one inline image block to `msg` and write its placeholder into `out`.
@@ -2739,11 +2775,6 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
 char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
                                   pulsar_think_mode think_mode, bool v41,
                                   chat_text_span **spans_out, uint32_t *n_spans_out);
-/** The legacy /v1/completions template: a fixed system line and the prompt
- * as the one user turn, through the same renderer. */
-char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode, bool v41);
-char *render_completion_prompt_text_spans(const char *prompt, pulsar_think_mode think_mode, bool v41,
-                                          chat_text_span **spans_out, uint32_t *n_spans_out);
 /** As render_chat_prompt_text, but also hands back the rendered text's
  * CLIENT-DATA ranges (see buf's span fields) so pulsar_tokenize_rendered_chat_spans
  * can keep a client from injecting a control token.  `spans_out`/`n_spans_out` may
@@ -2774,6 +2805,21 @@ typedef struct {
                        ///< "reasoning.effort" (Responses) or "chat_template_kwargs"; static
     char *raw;         ///< the value's JSON text, owned
 } chat_control;
+
+/** L284 P3: the thinking controls as sent, read by the ONE rule every family and protocol shares
+ *  (chat_family.cpp): the switch, and the effort -- a row of the effort-name table or an integer. */
+typedef struct chat_effort_ask {
+    int thinking;   ///< -1 not sent, 0 off, 1 on (thinking / think / enable_thinking / the kwargs)
+    int level;      ///< -1 no name sent; else the row of the effort-name table
+    int value;      ///< an integer effort 1..100 (level -1 then); 0 = none sent
+} chat_effort_ask;
+/** Read the controls in arrival order (a later one replaces an earlier one's value).  false + err:
+ *  a name outside the table, an integer outside 1..100, a chat_template_kwargs key no template takes. */
+bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *a, char *err, size_t errlen);
+/** Thinking on or off: the explicit switch; else effort "none" is off; else model "deepseek-chat" (the
+ *  DeepSeek API's non-thinking name, on any family) is off; else on.  The switch on with effort none
+ *  contradicts itself: false + err. */
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen);
 
 /** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
  * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's
@@ -2869,18 +2915,20 @@ const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_
 bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls);
-bool try_repair_dsml(const char *s, size_t len, buf *out);
-bool parse_generated_message_for_response(const char *text,
-                                                 bool has_tools,
-                                                 bool saw_tool_start,
-                                                 bool require_thinking_closed,
-                                                 const char **finish_io,
-                                                 char *err,
-                                                 size_t errlen,
-                                                 char **content_out,
-                                                 char **reasoning_out,
-                                                 tool_calls *calls,
-                                                 bool *recovered_out);
+/** L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call
+ *  (generate.cpp): retry allowed -- once, non-streaming, a chat with tools, forced or not. */
+bool turn_tool_retry_allowed(const struct gen_state *g);
+/** The finish every family's parser ends in (generate.cpp), once its own reading filled `out` (content,
+ *  reasoning, the calls -- the stream's ids on them, raw_dsml when their sampled bytes are the tool memory's
+ *  key): a call to an undeclared tool dropped, then the shared rule -- a turn left broken with no call
+ *  retries through the model-visible tool error when allowed, else is TEXT (reasoning, then the answer's
+ *  raw bytes, no call) plus the stream's unsent tail from `tail_from` (>= the text's length = none);
+ *  otherwise ids, tool memory and the finish label (error / length as the generation ended, else
+ *  tool_calls with calls, else stop).  `broken`: the family's reading found a broken call, `why` its
+ *  detail (the retry's tool error); `logged`: the family already logged it (else the finish logs the
+ *  detail once).  Returns the retry's result when one ran, else `ok` (the family's stream status). */
+bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
+                        const char *why, bool logged, size_t tail_from, bool ok);
 void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders);

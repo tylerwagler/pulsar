@@ -77,7 +77,7 @@ bool gpu_graph_upload_prompt_tokens(
          * L216: an image block's slots carry `vocab_size + role` sentinel ids,
          * so the bound is not simply n_vocab.  The roles are 0..IMAGE_END and
          * nothing else may sit at or above vocab_size, which keeps this a real
-         * check rather than a hole.  pulsar_session::sync refuses such an id
+         * check rather than a hole.  The sync (pulsar_image_refuse_orphans) refuses such an id
          * when the request carries no image, so reaching here with one means a
          * merge will fill the row; the embedder zero-masks it until then. */
         if (tokens[i] < 0 ||

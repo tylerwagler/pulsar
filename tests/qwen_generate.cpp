@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (getenv("QWEN_SPEC_K")) setenv("PULSAR_QWEN_MTP_K", getenv("QWEN_SPEC_K"), 1);   /* the MTP draft depth */
+    if (getenv("QWEN_SPEC_K")) setenv("PULSAR_SPEC_DEPTH", getenv("QWEN_SPEC_K"), 1);   /* the MTP draft depth */
     /* L266 step 7: QWEN_TP_PEERS ("host:port,host:port") runs this as rank 0 of a tensor-parallel pair; rank 1
      * is any pulsar binary in its worker loop (pulsar --tp-rank 1 ...) */
     opt.tp_rank = -1;
@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
         const double t0 = now_s();
         int n = 0, rounds = 0;
         while (n < generated) {
-            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n, 248046,
+            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
             if (k < 0) {
                 fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
@@ -266,7 +266,7 @@ int main(int argc, char **argv) {
             if (k == 0) break;
             n += k;
             rounds++;
-            if (out[n - 1] == 248046) break;
+            if (pulsar_token_is_stop(e, out[n - 1])) break;
         }
         const double dt = now_s() - t0;
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);

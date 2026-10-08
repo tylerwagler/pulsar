@@ -4,10 +4,9 @@
  * DeepSeek-specific reading of it the server used to do inline in server_jobs.cpp: the decode-time
  * DSML tracker (the greedy region of a tool call), the marker scan that ends a turn at a closed tool
  * block (with its think gate: a block inside reasoning is not a call unless it is complete), the live
- * projection into the protocol sink (deepseek_stream.cpp's one walk), and the finish -- the tag repair
- * of a truncated block, the final DSML parse, the model-visible tool-error retry when the block is
- * malformed, the stream's ids onto the parsed calls, tool memory.  Nothing here is reached except
- * through k_parser_deepseek. */
+ * projection into the protocol sink (deepseek_stream.cpp's one walk), and the finish -- the final DSML
+ * parse, the shared rule for a broken call (L284 P4: retry or text, never a repaired tag), the stream's
+ * ids onto the parsed calls, tool memory.  Nothing here is reached except through k_parser_deepseek. */
 #include "pulsar_server_internal.h"
 
 static void *ds_parser_create(server *, gen_state *g, char *, size_t) {
@@ -144,227 +143,34 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool 
     return true;
 }
 
-/* The model-visible retry (non-streaming, once per request): a tool error plus the prompt reminder
- * appended to the live session, and the generation loops (out->retry).  false = it could not run;
- * the caller's finish is an error then. */
-static bool ds_parser_retry(deepseek_parser *, server *s, session_slot *sl, gen_state *g, const char *detail,
-                            const char *why, server_turn *out) {
-    job *j = g->j;
-    int recovery_tokens = 0;
-    char recovery_err[160] = {0};
-    server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s %s; continuing with model-visible tool error",
-               g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, why);
-    s->trace_event(g->trace_id, "%s; continuing with model-visible tool error", why);
-    if (!s->continue_after_invalid_dsml(sl, &j->req, &g->thinking, detail, &recovery_tokens, recovery_err,
-                                        sizeof(recovery_err))) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
-                 recovery_err[0] ? recovery_err : "unknown error");
-        return false;
-    }
-    server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-               g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, recovery_tokens);
-    s->trace_event(g->trace_id, "tool-error continuation appended %d tokens", recovery_tokens);
-    out->retry = true;
-    return true;
-}
-
-/* The turn's final reading: the tag repair of a truncated block, the final DSML parse (a malformed
- * block promotes the raw text to content, or loops the generation through the retry), the stream's ids
- * onto the parsed calls, tool memory, the finish label. */
+/* The turn's final reading (L284 P4, the rule every family shares -- see turn_tool_retry_allowed): the
+ * DSML parse of the block (an unterminated one -- the cap cut it -- is not parsed and never repaired), the
+ * stream's ids onto the parsed calls; then the finish every family shares (parser_finish_turn: the
+ * undeclared-call drop, the retry or text, tool memory, the finish label). */
 static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g, server_turn *out) {
     deepseek_parser *ps = (deepseek_parser *)st;
     job *j = g->j;
-    const bool retry_allowed = !j->req.stream && !g->recovery_attempted;
-
-    /* L077 (tool-call truncation): when the tag repair below completes a
-     * LENGTH-CAPPED call, the emitted arguments are well-formed JSON with a
-     * silently cut-off value -- the finish reason is the client's ONLY signal
-     * that the turn was cut (openai_stream.cpp's finalize comment already
-     * states this contract; the unconditional "tool_calls" relabel broke it). */
-    bool truncated_tool_repair = false;
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        ps->saw_tool_start && !ps->saw_tool_end && strcmp(g->finish, "error") != 0)
-    {
-        /* Deterministically complete a simple truncation.  Anything more than
-         * missing closing tags stays model-owned: for non-streaming requests,
-         * append a tool error plus prompt reminder to the live session and let
-         * the model issue a fresh call. */
-        bool completed_truncation = false;
-        buf repaired = {0};
-        if (try_repair_dsml(g->text.ptr, g->text.len, &repaired)) {
-            /* Parse repaired text to verify it produces valid tool calls */
-            tool_calls test_calls = {0};
-            char *test_content = NULL;
-            char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
-            free(test_content);
-            free(test_reasoning);
-            if (repair_ok && test_calls.len > 0) {
-                /* Repair succeeded - replace text with repaired version */
-                free(g->text.ptr);
-                g->text.ptr = buf_take(&repaired);
-                g->text.len = strlen(g->text.ptr);
-                g->text.cap = g->text.len ? g->text.len + 1 : 0;
-                ps->saw_tool_end = true;
-                completed_truncation = true;
-                if (strcmp(g->finish, "length") == 0) truncated_tool_repair = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           test_calls.len);
-                s->trace_event(g->trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
-            }
-            tool_calls_free(&test_calls);
-        }
-        buf_free(&repaired);
-        if (!completed_truncation) {
-            if (retry_allowed) {
-                if (ds_parser_retry(ps, s, sl, g, "unterminated tool call", "unterminated tool call", out)) return true;
-            } else {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "unterminated tool call");
-            }
-        }
-    }
-
     out->finish = g->finish;
     if (j->req.kind != REQ_CHAT) return true;
-    bool parse_failed = false;
-    bool parsed_ok = parse_generated_message_for_response(
-        g->text.ptr ? g->text.ptr : "",
-        j->req.has_tools,
-        ps->saw_tool_start,
-        pulsar_think_mode_enabled(j->req.think_mode),
-        &out->finish,
-        g->err,
-        sizeof(g->err),
-        &out->content,
-        &out->reasoning,
-        &out->calls,
-        &parse_failed);
-    if (!parsed_ok && parse_failed && j->req.has_tools && ps->saw_tool_start) {
-        /* parse_generated_message failed even though DSML was present.
-         * Semantic repair is intentionally avoided: if the parser cannot
-         * execute the block, feed the model a tool error and the protocol
-         * reminder so it owns the corrected next action. */
-        if (retry_allowed) {
-            const char *detail = g->err[0] ? g->err : "invalid tool call";
-            if (ds_parser_retry(ps, s, sl, g, detail, "invalid tool call", out)) {
-                free(out->content);
-                free(out->reasoning);
-                out->content = out->reasoning = NULL;
-                tool_calls_free(&out->calls);
-                return true;
-            }
-            out->finish = "error";
-        }
-        if (!parsed_ok) {
-            /* Print raw DSML snippet for debugging */
-            size_t dsml_snippet_len = 0;
-            const char *dsml_start = NULL;
-            const char *p;
-            /* g->text.len - 20 underflows (size_t) when the text is under
-             * 20 bytes -- a bare 19-byte short tool-call marker with no
-             * body reaches here -- making the bound ~2^64 and walking the
-             * strncmp off the heap buffer. Scan every valid start offset
-             * instead; g->text is a NUL-terminated buf, so each strncmp is
-             * self-bounded at the terminator. */
-            for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len; p++) {
-                if ((strncmp(p, PULSAR_TOOL_CALLS_START, strlen(PULSAR_TOOL_CALLS_START)) == 0) ||
-                    (strncmp(p, PULSAR_TOOL_CALLS_START_SHORT, strlen(PULSAR_TOOL_CALLS_START_SHORT)) == 0) ||
-                    (strncmp(p, "<tool_calls>", 12) == 0)) {
-                    dsml_start = p;
-                    break;
-                }
-            }
-            if (dsml_start) {
-                dsml_snippet_len = g->text.len - (dsml_start - g->text.ptr);
-                if (dsml_snippet_len > 500) dsml_snippet_len = 500;
-            }
-            /* Also log a snippet of the full text to see what the model output */
-            size_t text_snippet_len = g->text.len > 300 ? 300 : g->text.len;
-            server_log(PULSAR_LOG_WARNING,
-                       "pulsar-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
-                       g->ctx_span,
-                       g->req_flags[0] ? " " : "",
-                       g->req_flags,
-                       out->finish,
-                       g->text.len,
-                       ps->saw_tool_start,
-                       ps->saw_tool_end,
-                       (int)text_snippet_len,
-                       g->text.ptr ? g->text.ptr : "(null)");
-            server_log(PULSAR_LOG_WARNING,
-                       "pulsar-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
-                       g->ctx_span,
-                       g->req_flags[0] ? " " : "",
-                       g->req_flags,
-                       (int)dsml_snippet_len,
-                       dsml_start ? dsml_start : "(none)");
-            s->trace_event(g->trace_id,
-                        "invalid tool call returned as assistant text finish=%s",
-                        out->finish);
-        }
+    const bool block = j->req.has_tools && ps->saw_tool_start;
+    const bool unterminated = block && !ps->saw_tool_end;
+    const char *why = "";
+    bool broken = unterminated;
+    if (unterminated) {
+        why = "unterminated tool call (the turn ended inside the tool_calls block)";
+    } else if (!parse_generated_message_ex(g->text.ptr ? g->text.ptr : "", pulsar_think_mode_enabled(j->req.think_mode),
+                                           &out->content, &out->reasoning, &out->calls)) {
+        free(out->content);
+        free(out->reasoning);
+        out->content = out->reasoning = NULL;
+        tool_calls_free(&out->calls);
+        broken = block;
+        why = "invalid tool call";
     }
-    out->parse_failed = parse_failed;
-    if (parse_failed && ps->walk_on && ps->walk.emit_pos < g->text.len) {
-        /* the walk stopped at the block's marker; the final reading returned the rest to content */
-        out->tail = g->text.ptr + ps->walk.emit_pos;
-        out->tail_len = g->text.len - ps->walk.emit_pos;
-    }
-    if (out->calls.len) {
-        if (ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
-        /* L272: a call to an undeclared tool is not executable.  A turn left with no valid call takes the
-         * model-visible retry; otherwise the call is dropped -- after the stream's ids were applied: the
-         * live projection stopped at the first such call, so every call before it kept its index */
-        char undeclared[512] = "";
-        int kept = 0;
-        for (int i = 0; i < out->calls.len; i++) {
-            char detail[512];
-            if (tool_call_declared(&j->req, out->calls.v[i].name, detail, sizeof(detail))) {
-                out->calls.v[kept++] = out->calls.v[i];
-                continue;
-            }
-            if (!undeclared[0]) snprintf(undeclared, sizeof(undeclared), "%s", detail);
-            free(out->calls.v[i].id);
-            free(out->calls.v[i].name);
-            free(out->calls.v[i].arguments);
-        }
-        const bool dropped = kept < out->calls.len;
-        out->calls.len = kept;
-        if (dropped) {
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s %s", g->ctx_span,
-                       g->req_flags[0] ? " " : "", g->req_flags, undeclared);
-            s->trace_event(g->trace_id, "%s", undeclared);
-            if (kept == 0 && retry_allowed && !j->req.force_tool_call) {
-                if (ds_parser_retry(ps, s, sl, g, undeclared, "call to an undeclared tool", out)) {
-                    free(out->content);
-                    free(out->reasoning);
-                    out->content = out->reasoning = NULL;
-                    tool_calls_free(&out->calls);
-                    return true;
-                }
-                out->finish = "error";
-                return true;
-            }
-            /* the sampled bytes hold the dropped call: no tool memory for this turn (a prefix miss) */
-            free(out->calls.raw_dsml);
-            out->calls.raw_dsml = NULL;
-            if (kept == 0 && out->finish && !strcmp(out->finish, "tool_calls")) out->finish = "stop";
-        }
-    }
-    if (out->calls.len) {
-        s->assign_tool_call_ids(&out->calls, j->req.api);
-        s->tool_memory_remember(&out->calls);   /* a no-op without the sampled bytes */
-        /* L077: a length-capped, tag-repaired call reports "length" -- the
-         * repaired calls are still emitted (replayed transcripts stay
-         * parseable), but the label must not claim a complete call. */
-        out->finish = truncated_tool_repair ? "length" : "tool_calls";
-    }
-    return true;
+    if (out->calls.len && ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
+    /* as text, the walk stopped at the block's marker: the rest goes out at the finish */
+    const size_t tail_from = ps->walk_on ? ps->walk.emit_pos : SIZE_MAX;
+    return parser_finish_turn(s, sl, g, out, broken, why, /*logged=*/false, tail_from, true);
 }
 
 const server_output_parser_ops k_parser_deepseek = {

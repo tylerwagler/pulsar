@@ -86,11 +86,6 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
 
 
 
-/* ---- DeepSeek ------------------------------------------------------------------------------------- */
-
-/* The controls on DeepSeek's effort scale, in arrival order.  The default effort is the loaded
- * family's: V4.1 defaults to high (the reference's default); the V4 (0731) encoder's default is low,
- * which renders no effort line at all (L239).  DeepSeek's template takes no chat_template_kwargs. */
 /* What every family's render does between its own folding of the messages and its template: the tool
  * memory (the sampled call bytes onto the replayed calls, from RAM or a KV file's trailer; the family's
  * find_call_block and raw replay carry them) and the protocols' live continuations (their tails are the
@@ -104,54 +99,186 @@ static void render_prelude(server *s, chat_conversation *c, request *r) {
     if (r->api == API_RESPONSES) responses_prepare_live_continuation(r, &c->msgs);
 }
 
-static bool deepseek_resolve(pulsar_engine *e, const chat_conversation *c, request *r, char *err, size_t errlen) {
-    pulsar_think_mode effort = pulsar_engine_think_default(e);
-    bool enabled = true, got_thinking = false;
-    for (int i = 0; i < c->n_controls; i++) {
-        const char *k = c->controls[i].key;
-        const char *q = c->controls[i].raw;
+
+
+/* ---- the thinking controls: ONE reading for every family (L284 P3) ------------------------------- */
+
+/* Every effort NAME any protocol sends -- OpenAI reasoning_effort, Responses reasoning.effort, Anthropic
+ * output_config.effort, chat_template_kwargs.reasoning_effort -- and the nearest level each template
+ * has.  DeepSeek's are the reference encoder's presets on its 1..100 axis (low 50, high 75, max 100);
+ * Qwen's the template's reasoning_effort names (low, medium, xhigh).  "none" is thinking off on both. */
+struct effort_name {
+    const char *name;
+    pulsar_think_mode deepseek;
+    qwen_effort qwen;
+};
+static const effort_name k_effort_names[] = {
+    {"none", PULSAR_THINK_NONE, QWEN_EFFORT_NONE},
+    {"minimal", PULSAR_THINK_LOW, QWEN_EFFORT_LOW},
+    {"low", PULSAR_THINK_LOW, QWEN_EFFORT_LOW},
+    {"medium", PULSAR_THINK_LOW, QWEN_EFFORT_MEDIUM},
+    {"high", PULSAR_THINK_HIGH, QWEN_EFFORT_XHIGH},
+    {"xhigh", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},
+    {"max", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},
+};
+/* the rows the integer axis and the thinking rule name */
+enum { k_effort_row_none = 0, k_effort_row_low = 2, k_effort_row_high = 4, k_effort_row_max = 6 };
+
+static int effort_row(const char *name) {
+    for (int i = 0; i < (int)(sizeof k_effort_names / sizeof k_effort_names[0]); i++)
+        if (!strcmp(name, k_effort_names[i].name)) return i;
+    return -1;
+}
+
+/* An integer effort on a template without integer levels: the row of the nearest reference preset
+ * (low 50, high 75, max 100). */
+static const effort_name &effort_row_nearest(int value) {
+    return k_effort_names[value < 63 ? k_effort_row_low : value < 88 ? k_effort_row_high : k_effort_row_max];
+}
+
+/* One effort value: null (not sent), a name of k_effort_names, or an integer 1..100. */
+static bool effort_value(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        a->level = -1;
+        a->value = 0;
+        return true;
+    }
+    if (**p == '"') {
+        char *name = NULL;
+        if (!json_string(p, &name)) return false;
+        const int row = effort_row(name);
+        if (row < 0)
+            snprintf(err, errlen, "%s: \"%.40s\" is not an effort -- send none, minimal, low, medium, high, xhigh, "
+                                  "max or an integer 1..100", key, name);
+        free(name);
+        if (row < 0) return false;
+        a->level = row;
+        a->value = 0;
+        return true;
+    }
+    double v = 0.0;
+    if (!json_number(p, &v) || v != (double)(int)v || (int)v < PULSAR_THINK_EFFORT_MIN ||
+        (int)v > PULSAR_THINK_EFFORT_MAX) {
+        snprintf(err, errlen, "%s: an effort is a name or an integer 1..100", key);
+        return false;
+    }
+    a->level = -1;
+    a->value = (int)v;
+    return true;
+}
+
+static bool thinking_bool(const char **p, chat_effort_ask *a) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    bool on = true;
+    if (!json_bool(p, &on)) return false;
+    a->thinking = on ? 1 : 0;
+    return true;
+}
+
+bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *a, char *err, size_t errlen) {
+    a->thinking = -1;
+    a->level = -1;
+    a->value = 0;
+    for (int i = 0; i < n; i++) {
+        const char *k = controls[i].key;
+        const char *q = controls[i].raw;
         bool ok = true;
+        json_ws(&q);
         if (!strcmp(k, "thinking")) {
-            ok = parse_thinking_control_value(&q, &enabled);
-            got_thinking = true;
+            /* Anthropic's {"type": "enabled" | "disabled"} or a bool; null is not sent */
+            if (!json_lit(&q, "null")) {
+                bool on = a->thinking != 0;
+                ok = parse_thinking_control_value(&q, &on);
+                a->thinking = on ? 1 : 0;
+            }
         } else if (!strcmp(k, "think") || !strcmp(k, "enable_thinking")) {
-            /* enable_thinking is the Qwen/vLLM spelling of our `think` */
-            ok = json_bool(&q, &enabled);
-            got_thinking = true;
-        } else if (!strcmp(k, "reasoning_effort")) {
-            ok = parse_reasoning_effort_value(&q, &effort);
+            ok = thinking_bool(&q, a);
+        } else if (!strcmp(k, "reasoning_effort") || !strcmp(k, "reasoning.effort")) {
+            ok = effort_value(&q, k, a, err, errlen);
         } else if (!strcmp(k, "output_config")) {
-            ok = parse_output_config_effort(&q, &effort);
-        } else if (!strcmp(k, "reasoning.effort")) {
-            /* Only an explicit effort counts as the client opting into thinking control; Responses'
-             * "minimal" / "none" effort is thinking off. */
-            ok = parse_reasoning_effort_value(&q, &effort);
-            got_thinking = true;
-            if (effort == PULSAR_THINK_NONE) enabled = false;
+            char *raw = *q == '{' ? json_object_member_raw(q, "effort") : NULL;
+            const char *ep = raw;
+            ok = !raw || effort_value(&ep, "output_config.effort", a, err, errlen);
+            free(raw);
+        } else if (!strcmp(k, "chat_template_kwargs")) {
+            /* vLLM's spelling of the template variables: the two every family's template takes */
+            if (!json_lit(&q, "null")) {
+                ok = *q == '{';
+                if (ok) q++;
+                json_ws(&q);
+                while (ok && *q && *q != '}') {
+                    char *kk = NULL;
+                    ok = json_string(&q, &kk);
+                    json_ws(&q);
+                    ok = ok && *q == ':';
+                    if (ok) q++;
+                    if (ok && !strcmp(kk, "enable_thinking")) {
+                        ok = thinking_bool(&q, a);
+                    } else if (ok && !strcmp(kk, "reasoning_effort")) {
+                        ok = effort_value(&q, "chat_template_kwargs.reasoning_effort", a, err, errlen);
+                    } else if (ok) {
+                        snprintf(err, errlen, "chat_template_kwargs.%.40s is not a template variable this server "
+                                              "renders (enable_thinking, reasoning_effort)", kk);
+                        ok = false;
+                    }
+                    free(kk);
+                    json_ws(&q);
+                    if (*q == ',') q++;
+                    json_ws(&q);
+                }
+                ok = ok && *q == '}';
+            }
         }
         if (!ok) return false;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) enabled = true;
-    /* the loaded encoder's efforts (the one rule the CLI and eval apply too, L272 B10) */
-    char why[160];
-    if (enabled && !pulsar_engine_think_mode_supported(e, effort, why, sizeof why)) {
-        if (err && errlen) snprintf(err, errlen, "reasoning_effort: %s", why);
+    return true;
+}
+
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen) {
+    const bool none = a->level == k_effort_row_none;
+    if (a->thinking == 1 && none) {
+        snprintf(err, errlen, "reasoning_effort: none is thinking off, and thinking was requested on");
         return false;
     }
-    r->think_mode = think_mode_from_enabled(enabled, effort);
+    if (a->thinking >= 0) *on = a->thinking == 1;
+    else if (none) *on = false;
+    /* the DeepSeek API's non-thinking model name, on any family: a default, never over a control */
+    else *on = !(model && !strcmp(model, "deepseek-chat"));
     return true;
+}
+
+/* Thinking by the one rule, then the level the loaded family's template has. */
+static bool chat_resolve_thinking(pulsar_engine *e, const chat_conversation *c, request *r, char *err,
+                                  size_t errlen) {
+    chat_effort_ask a;
+    bool on = false;
+    if (!chat_effort_ask_read(c->controls, c->n_controls, &a, err, errlen) ||
+        !chat_effort_ask_thinking(&a, r->model, &on, err, errlen))
+        return false;
+    r->think_mode = PULSAR_THINK_NONE;
+    r->family_effort = (int)QWEN_EFFORT_NONE;
+    if (on) r->family->effort(e, &a, r);
+    return true;
+}
+
+/* ---- DeepSeek ------------------------------------------------------------------------------------- */
+
+/* A name is its preset; an integer is itself on V4.1 (every 1..100 renders), the nearest preset on V4
+ * (0731: low, high, max); nothing sent is the loaded encoder's default (V4.1 high; 0731 low, L239). */
+static void deepseek_effort(pulsar_engine *e, const chat_effort_ask *a, request *r) {
+    r->think_mode = a->level >= 0 ? k_effort_names[a->level].deepseek
+                    : a->value    ? (r->family->v41 ? (pulsar_think_mode)a->value
+                                                    : effort_row_nearest(a->value).deepseek)
+                                  : pulsar_engine_think_default(e);
 }
 
 static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err,
                             size_t errlen) {
     /* Responses can also carry schemas in its input items (tool_search output). */
     buf schemas = {0};
-    if (c->tool_schemas && c->tool_schemas[0]) buf_puts(&schemas, c->tool_schemas);
-    if (c->loaded_tool_schemas.len) {
-        if (schemas.len) buf_putc(&schemas, '\n');
-        buf_append(&schemas, c->loaded_tool_schemas.ptr, c->loaded_tool_schemas.len);
-    }
+    conversation_tool_schema_lines(c, &schemas);
     r->has_tools = c->tool_choice != CHAT_TOOL_CHOICE_NONE && schemas.len;
     if (r->api == API_ANTHROPIC) anthropic_fold_tool_results(&c->msgs);
     render_prelude(s, c, r);
@@ -190,193 +317,16 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
 
 /* ---- Qwen ----------------------------------------------------------------------------------------- */
 
-/* Anthropic's effort levels on the Qwen template's (Tyler 2026-10-05): each reaches the nearest level
- * the template has.  OpenAI's and Responses' reasoning_effort carry the template's own names and are
- * not mapped (qwen_effort_resolve refuses any other). */
-static const char *qwen_effort_from_anthropic(const char *level) {
-    if (!strcmp(level, "low")) return "low";
-    if (!strcmp(level, "medium")) return "medium";
-    if (!strcmp(level, "high") || !strcmp(level, "xhigh") || !strcmp(level, "max")) return "xhigh";
-    return NULL;
+/* A name is its column, an integer the nearest preset's, nothing sent the template's default (xhigh).
+ * Downstream reads only whether a think block is open, so think_mode carries PULSAR_THINK_DEFAULT (the
+ * enabled marker, not a DeepSeek effort); the render reads family_effort. */
+static void qwen_effort_level(pulsar_engine *, const chat_effort_ask *a, request *r) {
+    r->family_effort = (int)(a->level >= 0 ? k_effort_names[a->level].qwen
+                             : a->value    ? effort_row_nearest(a->value).qwen
+                                           : qwen_effort_default());
+    r->think_mode = PULSAR_THINK_DEFAULT;
 }
 
-/* The controls on the template's variables, in arrival order: enable_thinking (thinking / think /
- * enable_thinking, or chat_template_kwargs) and reasoning_effort.  qwen_effort_resolve is the one
- * resolution; Downstream reads only whether a think block is open, so the request carries
- * PULSAR_THINK_DEFAULT (the enabled marker, not a DeepSeek effort) or NONE. */
-static bool qwen_resolve(pulsar_engine *, const chat_conversation *c, request *r, char *err, size_t errlen) {
-    qwen_effort qe_v = QWEN_EFFORT_NONE;
-    qwen_effort *qe = &qe_v;
-    int thinking = -1;          /* -1 not sent, 0 off, 1 on */
-    std::string effort;
-    bool has_effort = false;
-    for (int i = 0; i < c->n_controls; i++) {
-        const char *k = c->controls[i].key;
-        const char *q = c->controls[i].raw;
-        bool ok = true;
-        json_ws(&q);
-        if (!strcmp(k, "thinking")) {
-            if (!json_lit(&q, "null")) {
-                bool on = true;
-                ok = parse_thinking_control_value(&q, &on);
-                thinking = on ? 1 : 0;
-            }
-        } else if (!strcmp(k, "think") || !strcmp(k, "enable_thinking")) {
-            bool on = true;
-            ok = json_bool(&q, &on);
-            thinking = on ? 1 : 0;
-        } else if (!strcmp(k, "reasoning_effort") || !strcmp(k, "reasoning.effort")) {
-            has_effort = false;
-            if (!json_lit(&q, "null")) {
-                char *name = NULL;
-                ok = *q == '"' && json_string(&q, &name);
-                if (ok) {
-                    effort = name;
-                    has_effort = true;
-                } else {
-                    snprintf(err, errlen, "%s: this model (Qwen3.8-Flash-Next) takes a name -- low, medium, xhigh or none", k);
-                }
-                free(name);
-            }
-        } else if (!strcmp(k, "output_config")) {
-            char *raw = json_object_member_raw(q, "effort");
-            const char *ep = raw;
-            if (raw && (json_ws(&ep), !json_lit(&ep, "null"))) {
-                char *level = NULL;
-                const char *mapped = NULL;
-                ok = *ep == '"' && json_string(&ep, &level) && (mapped = qwen_effort_from_anthropic(level)) != NULL;
-                if (ok) {
-                    effort = mapped;
-                    has_effort = true;
-                } else {
-                    snprintf(err, errlen, "output_config.effort: %s%s%s has no Qwen3.8-Flash-Next level -- send low, "
-                                          "medium, high, xhigh or max", level ? "\"" : "", level ? level : "a non-name",
-                             level ? "\"" : "");
-                }
-                free(level);
-            }
-            free(raw);
-        } else if (!strcmp(k, "chat_template_kwargs")) {
-            /* vLLM's spelling of the template variables.  Only the two this renderer takes are accepted; any
-             * other would be silently unrendered. */
-            if (!json_lit(&q, "null")) {
-                ok = *q == '{';
-                if (ok) q++;
-                json_ws(&q);
-                while (ok && *q && *q != '}') {
-                    char *kk = NULL;
-                    ok = json_string(&q, &kk);
-                    json_ws(&q);
-                    ok = ok && *q == ':';
-                    if (ok) q++;
-                    if (ok && !strcmp(kk, "enable_thinking")) {
-                        bool on = true;
-                        ok = json_bool(&q, &on);
-                        thinking = on ? 1 : 0;
-                    } else if (ok && !strcmp(kk, "reasoning_effort")) {
-                        json_ws(&q);
-                        has_effort = false;
-                        if (!json_lit(&q, "null")) {
-                            char *name = NULL;
-                            ok = *q == '"' && json_string(&q, &name);
-                            if (ok) {
-                                effort = name;
-                                has_effort = true;
-                            }
-                            free(name);
-                        }
-                    } else if (ok) {
-                        snprintf(err, errlen, "chat_template_kwargs.%.40s is not a template variable this server "
-                                              "renders for the Qwen family (enable_thinking, reasoning_effort)", kk);
-                        ok = false;
-                    }
-                    free(kk);
-                    json_ws(&q);
-                    if (*q == ',') q++;
-                    json_ws(&q);
-                }
-                ok = ok && *q == '}';
-            }
-        }
-        if (!ok) return false;
-    }
-    if (!qwen_effort_resolve(has_effort ? effort.c_str() : NULL, thinking, qe, err, errlen)) return false;
-    r->think_mode = *qe == QWEN_EFFORT_NONE ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT;
-    r->family_effort = (int)*qe;   /* the render reads it */
-    return true;
-}
-
-/* An Anthropic or Responses tools array in the shape the template renders (OpenAI's:
- * {"type":"function","function":{"name","description","parameters"}}), each value's JSON as the client
- * wrote it.  Anthropic's server tools (web search) are dropped as for every family; a Responses tool
- * that is not a function (namespace, tool_search, ...) is refused by name. */
-static char *qwen_tools_openai_shape(const chat_conversation *c, api_style api, char *err, size_t errlen) {
-    const char *p = c->tools_raw;
-    json_ws(&p);
-    if (*p != '[') {
-        snprintf(err, errlen, "tools: an array is required");
-        return NULL;
-    }
-    p++;
-    buf out = {0};
-    buf_putc(&out, '[');
-    int n = 0;
-    for (int i = 0;; i++) {
-        json_ws(&p);
-        if (*p == ']') break;
-        char *raw = NULL;
-        if (!json_raw_value(&p, &raw)) {
-            buf_free(&out);
-            return NULL;
-        }
-        json_ws(&p);
-        if (*p == ',') p++;
-        if (api == API_ANTHROPIC && anthropic_server_tool_entry(raw)) {
-            free(raw);
-            continue;
-        }
-        if (api == API_RESPONSES) {
-            char *type = json_object_member_raw(raw, "type");
-            const bool function = type && !strcmp(type, "\"function\"");
-            if (!function) {
-                snprintf(err, errlen, "tools.%d: a %s tool is not served for the Qwen family (function tools only)", i,
-                         type ? type : "typeless");
-                free(type);
-                free(raw);
-                buf_free(&out);
-                return NULL;
-            }
-            free(type);
-        }
-        char *name = json_object_member_raw(raw, "name");
-        char *desc = json_object_member_raw(raw, "description");
-        char *params = json_object_member_raw(raw, api == API_ANTHROPIC ? "input_schema" : "parameters");
-        if (!name) {
-            snprintf(err, errlen, "tools.%d: a tool needs a name", i);
-            free(raw);
-            free(desc);
-            free(params);
-            buf_free(&out);
-            return NULL;
-        }
-        buf_puts(&out, n++ ? ", " : "");
-        buf_puts(&out, "{\"type\": \"function\", \"function\": {\"name\": ");
-        buf_puts(&out, name);
-        if (desc) {
-            buf_puts(&out, ", \"description\": ");
-            buf_puts(&out, desc);
-        }
-        buf_puts(&out, ", \"parameters\": ");
-        buf_puts(&out, params ? params : "{}");
-        buf_puts(&out, "}}");
-        free(raw);
-        free(name);
-        free(desc);
-        free(params);
-    }
-    buf_putc(&out, ']');
-    return buf_take(&out);
-}
 
 /* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
  * offsets, not the spelling, are the authority) and where each image sits in what is left. */
@@ -426,8 +376,7 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
             for (int k = 0; k < m->calls.len; k++)
                 (*qc)[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
             if (!strcmp(m->role, "system") && (tail || !qm->empty())) {
-                (*notes)[(size_t)i] = std::string("<system-reminder>\n") + (m->content ? m->content : "") +
-                                      "\n</system-reminder>";
+                (*notes)[(size_t)i] = qwen_system_reminder(m->content);
                 qm->push_back({"user", (*notes)[(size_t)i].c_str(), NULL, NULL, 0, NULL});
                 continue;
             }
@@ -458,18 +407,22 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
  * with the family's markers; the tools in the template's shape, typed for the output parser.  A forced
  * tool_choice prefills the turn into an open <tool_call> (qwen_forced_call_prefill); a tool-result-only
  * request continues the live KV with the family's tail (render_prelude).  Images are the template's vision
- * literal in place (L268), expanded by the core's walk.  Refused by name: tools loaded by tool_search (the
- * template renders one tools array). */
+ * literal in place (L268), expanded by the core's walk.  The tools are the conversation's schema lines -- every
+ * protocol's kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape; an OpenAI request's
+ * array goes to the template as sent (HF's input). */
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
-    if (c->loaded_tool_schemas.len) {
-        snprintf(err, errlen, "tools loaded by tool_search are not served for the Qwen family");
-        return false;
-    }
-    if (c->tools_raw && c->tool_choice != CHAT_TOOL_CHOICE_NONE) {
-        r->qwen_tools_json = r->api == API_OPENAI ? xstrdup(c->tools_raw)
-                                                  : qwen_tools_openai_shape(c, r->api, err, errlen);
-        if (!r->qwen_tools_json) return false;
+    if (c->tool_choice != CHAT_TOOL_CHOICE_NONE) {
+        if (r->api == API_OPENAI && c->tools_raw) {
+            r->qwen_tools_json = xstrdup(c->tools_raw);
+        } else {
+            buf lines = {0};
+            conversation_tool_schema_lines(c, &lines);
+            if (lines.len) r->qwen_tools_json = tool_schema_lines_openai_tools(lines.ptr, lines.len, err, errlen);
+            const bool failed = lines.len && !r->qwen_tools_json;
+            buf_free(&lines);
+            if (failed) return false;
+        }
     }
     r->has_tools = r->qwen_tools_json != NULL;
     render_prelude(s, c, r);
@@ -672,16 +625,18 @@ static char *deepseek_tool_error_suffix(const request *r, const thinking_state *
     return build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail, spans_out, n_spans_out);
 }
 
-/* The exact bytes a forced tool call is seeded with: close thinking, open the tool_calls block, and
- * (when a specific tool was requested) open the named invoke.  The prompt rewrite drops the render's
+/* The exact bytes a forced tool call is seeded with: close thinking, open the tool_calls block and the
+ * invoke tag (named when a specific tool was requested, else up to its name).  The prompt rewrite drops the render's
  * trailing "<think>" opener and skips the seed's close when the render already ended with one. */
 static void deepseek_forced_call_seed(const request *r, buf *out) {
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(r->family->v41);
     buf_puts(out, "</think>\n\n");
     buf_puts(out, d->tool_calls_start);
     buf_puts(out, "\n");
+    buf_puts(out, d->invoke_start);
+    /* unnamed: stop before the name's opener -- the model samples ` name="NAME">` under the declared-name
+     * mask (forced_name_open / _close, the same constraint as Qwen's); named: the whole tag */
     if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, d->invoke_start);
         buf_puts(out, " name=\"");
         buf_puts(out, r->forced_tool_name);
         buf_puts(out, "\">\n");
@@ -706,7 +661,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .format                = */ PULSAR_CHAT_DS4_V41,
     /* .v41                   = */ true,
     /* .parser                = */ SERVER_PARSER_DSML,
-    /* .resolve               = */ deepseek_resolve,
+    /* .effort                = */ deepseek_effort,
     /* .render                = */ deepseek_render,
     /* .trivial_header_tokens = */ deepseek_trivial_header_tokens,
     /* .output                = */ &k_parser_deepseek,
@@ -715,8 +670,8 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
+    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
+    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_deepseek_v4 = {
@@ -724,7 +679,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .format                = */ PULSAR_CHAT_DS4_V4,
     /* .v41                   = */ false,
     /* .parser                = */ SERVER_PARSER_DSML,
-    /* .resolve               = */ deepseek_resolve,
+    /* .effort                = */ deepseek_effort,
     /* .render                = */ deepseek_render,
     /* .trivial_header_tokens = */ deepseek_trivial_header_tokens,
     /* .output                = */ &k_parser_deepseek,
@@ -733,8 +688,8 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
+    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
+    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_qwen = {
@@ -742,7 +697,7 @@ static const server_family_ops k_family_qwen = {
     /* .format                = */ PULSAR_CHAT_QWEN,
     /* .v41                   = */ false,
     /* .parser                = */ SERVER_PARSER_QWEN,
-    /* .resolve               = */ qwen_resolve,
+    /* .effort                = */ qwen_effort_level,
     /* .render                = */ qwen_render,
     /* .trivial_header_tokens = */ qwen_trivial_header_tokens,
     /* .output                = */ &k_parser_qwen,
@@ -777,7 +732,7 @@ const server_family_ops *server_family_for_engine(const pulsar_engine *e) {
 bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *s, chat_conversation *c,
                               request *r, char *err, size_t errlen) {
     r->family = server_family_for_format(fmt);
-    if (!r->family->resolve(e, c, r, err, errlen)) return false;
+    if (!chat_resolve_thinking(e, c, r, err, errlen)) return false;
     /* The protocol's tool-result checks: every result's call is in this request's
      * history or bound to the live frontier (parse-without-server skips them). */
     if (s && r->api == API_ANTHROPIC &&

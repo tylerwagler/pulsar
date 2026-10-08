@@ -201,7 +201,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -710,6 +710,20 @@ session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
 session-contract-gate-ds: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
+# L284: a session payload at an off-grid, past-the-prefill frontier round-trips through the public API
+# (tests/payload_frontier_gate.cpp): the same logits and decode rows, the same greedy speculation, a byte-identical
+# re-save, the carried checkpoint's resume == cold, the digest.  The one kv-state payload, one target per family.
+.PHONY: payload-frontier-gate-qwen payload-frontier-gate-ds
+payload-frontier-gate-qwen: tests/payload_frontier_gate
+	./tests/payload_frontier_gate $(QWEN_GATE_MODEL)
+payload-frontier-gate-ds: tests/payload_frontier_gate
+	./tests/payload_frontier_gate $(FRONTIER_MODEL)
+# L284 #3: a family pool's bank physical residency (tests/bank_residency_gate.cpp): free_physical returns an idle
+# bank's KV (touched + MemAvailable), alloc_physical + its segment chain bring it back, and its greedy continuation
+# is byte-identical to a bank never freed.  DeepSeek's is cuda-evict-restore-gate.
+.PHONY: bank-residency-gate-qwen
+bank-residency-gate-qwen: tests/bank_residency_gate
+	PULSAR_MSEQ_BANKS=4 ./tests/bank_residency_gate $(QWEN_GATE_MODEL)
 # L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
 # no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
 # only for a change that MEANS to move a slice.
@@ -1146,6 +1160,13 @@ cuda-fused-step-gate: tests/fused_step_gate
 decode-reference-gate: tests/decode_reference_gate
 	PULSAR_MSEQ_BANKS=2 ./tests/decode_reference_gate $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin
 	PULSAR_MSEQ_BANKS=2 ./tests/decode_reference_gate $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin
+# L284 probe (measurement, never fails on a number): EVERY row of a verify-shaped step at widths
+# 1..32, one bank and four banks a step, against the same rows decoded one token at a time, and the
+# base row against the B300 reference -- which arm is closer to the source.
+verify-width-probe: tests/verify_width_probe
+	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --max-depth 6144 --extra 1024,3072,5120
+	PULSAR_MSEQ_BANKS=4 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --banks 4 --widths 4,8,16,24,32 --max-depth 6144 --extra 1024,3072,5120
+	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin --extra 1024,1536,2560,3072
 
 # Artifact-only, no GPU, seconds: does the ROUTER agree with the artifact's own
 # REAP declaration? A router left in source expert order against compacted
@@ -2148,10 +2169,10 @@ tests/mseq_rewind_probe.o: tests/mseq_rewind_probe.cpp src/engine/pulsar_engine_
 tests/resume_suffix_probe.o: tests/resume_suffix_probe.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/resume_suffix_probe.cpp
 
-tests/token_seam_gate.o: tests/token_seam_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/token_seam_gate.o: tests/token_seam_gate.cpp tests/gate_util.h tests/gate_entry.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/token_seam_gate.cpp
 
-tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
 tests/mseq_rowcost_probe.o: tests/mseq_rowcost_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2174,7 +2195,7 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
-tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/engine/pulsar_engine_internal.h src/pulsar.h src/lib/pulsar_segstore.h
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2225,7 +2246,7 @@ tests/vision_qwen_tower_gate.o: tests/vision_qwen_tower_gate.cpp src/engine/puls
 tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_merge_gate.cpp
 
-tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
 tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -2236,6 +2257,8 @@ tests/mixed_zero_prefill_gate.o: tests/mixed_zero_prefill_gate.cpp tests/gate_fi
 
 tests/fused_step_gate.o: tests/fused_step_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/fused_step_gate.cpp
+tests/verify_width_probe.o: tests/verify_width_probe.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/verify_width_probe.cpp
 tests/decode_reference_gate.o: tests/decode_reference_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/decode_reference_gate.cpp
 
@@ -2252,7 +2275,7 @@ GATE_BUILD_REF := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown
 tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' \
 		-c -o $@ tests/prefill_bitexact_gate.cpp
-tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/pulsar.h
+tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/pulsar.h tests/gate_util.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/spec_sampling_gate.cpp
 
 src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc src/cuda/pulsar_cuda_mx.cuh $(CUDA_FLAG_STAMP)
@@ -2362,6 +2385,18 @@ tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(C
 tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/payload_frontier_gate.o: tests/payload_frontier_gate.cpp tests/gate_entry.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/payload_frontier_gate.cpp
+
+tests/payload_frontier_gate: tests/payload_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bank_residency_gate.o: tests/bank_residency_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/bank_residency_gate.cpp
+
+tests/bank_residency_gate: tests/bank_residency_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 # L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
 # BF16 streamed reference.  Needs a real container and the anchors on disk:
 #   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
@@ -2456,6 +2491,9 @@ tests/mixed_zero_prefill_gate: tests/mixed_zero_prefill_gate.o src/lib/pulsar_he
 tests/fused_step_gate: tests/fused_step_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/verify_width_probe: tests/verify_width_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/decode_reference_gate: tests/decode_reference_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -2467,7 +2505,7 @@ tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o
 
 tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp src/pulsar.h
+tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp tests/gate_util.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/mseq_short_ctx_probe.cpp
 tests/spec_teacher_forced_probe.o: tests/spec_teacher_forced_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/spec_teacher_forced_probe.cpp
@@ -2672,7 +2710,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/qwen_family_gate tests/payload_frontier_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

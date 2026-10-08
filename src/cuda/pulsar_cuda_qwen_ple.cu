@@ -4,9 +4,8 @@
  * host and reads the 16 rows per token from disk); this file is everything
  * after the gather:
  *
- *   emit   the 16 x 160 bf16 rows -> the E4M3 slot key_proj / value_proj read
- *          (160 = 5 x 32: no MX group straddles two heads' rows)
- *   k, v   the two dense Linears (EXL3 dense arm)
+ *   k, v   the two dense Linears of the gathered bf16 rows -- the CALLER's (L284 #2: the op runs them
+ *          through its row-kind segments, family_qwen_s4.cpp), handed in as f32 rows
  *   gate   per (stream, token): k_s = norm_key(k)_s, q_s = norm_query(x)_s,
  *          g = <k_s, q_s> / sqrt(2560) -> sign(g) sqrt(max(|g|, 1e-6)),
  *          gv_s = sigmoid(g) v, gvn_s = norm_conv(gv)_s (the norm of gv is
@@ -18,7 +17,6 @@
  */
 #include "pulsar_cuda_qwen.h"
 #include "pulsar_cuda_mx.cuh"
-#include "mmq/ds4_exl3_dense.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -158,9 +156,7 @@ qwen_ple_state_rows_kernel(const float *__restrict__ gvn, const int32_t *__restr
 }
 
 struct ple_ws {
-    float *key, *value, *gvn, *sig;
-    void *lin;
-    size_t lin_bytes;
+    float *gvn, *sig;
 };
 
 static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
@@ -173,14 +169,8 @@ static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
         return base ? (uint8_t *)base + off : nullptr;
     };
     ple_ws m{};
-    m.key   = (float *)take((size_t)T * kHC * 4);
-    m.value = (float *)take((size_t)T * kH * 4);
     m.gvn   = (float *)take((size_t)T * kHC * 4);
     m.sig   = (float *)take((size_t)T * kS * 4);
-    const size_t lk = ds4_exl3_dense_workspace_bytes(T, kH, kHC);   /* a function of (rows, in, out) alone */
-    const size_t lv = ds4_exl3_dense_workspace_bytes(T, kH, kH);
-    m.lin_bytes = lk > lv ? lk : lv;
-    m.lin = take(m.lin_bytes);
     if (o) *o = m;
     return failed ? 0 : used;
 }
@@ -200,18 +190,13 @@ extern "C" size_t pulsar_qwen_ple_workspace_bytes(int T) {
     return T > 0 ? ple_ws_layout(T, nullptr, 0, nullptr) : 0;
 }
 
-extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16_t *emb, uint16_t *streams, int T,
-                                      const pulsar_qwen_rows *rows, float *conv_state,
+extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const float *key, const float *value,
+                                      uint16_t *streams, int T, const pulsar_qwen_rows *rows, float *conv_state,
                                       void *ws, size_t ws_bytes, cudaStream_t stream) {
-    if (!w || !emb || !streams || T <= 0 || !rows || !rows->row_seq || !rows->row_j || !rows->seq_first ||
+    if (!w || !key || !value || !streams || T <= 0 || !rows || !rows->row_seq || !rows->row_j || !rows->seq_first ||
         !rows->seq_rows || !rows->seq_bank || rows->n_seq <= 0 || !conv_state || !w->norm_key || !w->norm_query || !w->norm_conv ||
         !w->conv_w) {
         fprintf(stderr, "pulsar: qwen PLE: a null input -- refusing\n");
-        return -1;
-    }
-    if (w->key_proj.in != kH || w->key_proj.out != kHC || w->value_proj.in != kH || w->value_proj.out != kH) {
-        fprintf(stderr, "pulsar: qwen PLE: key %d->%d / value %d->%d, built for %d->%d / %d->%d -- refusing\n",
-                w->key_proj.in, w->key_proj.out, w->value_proj.in, w->value_proj.out, kH, kHC, kH, kH);
         return -1;
     }
     ple_ws m;
@@ -223,24 +208,21 @@ extern "C" int pulsar_qwen_ple_launch(const pulsar_qwen_ple_dev *w, const uint16
     static int announced = 0;
     if (!announced) {
         announced = 1;
-        fprintf(stderr, "pulsar: L251 qwen PLE = gathered bf16 rows -> E4M3 -> EXL3 key K=%g / value K=%g -> "
-                        "signed-sqrt stream gate, dilated conv (%d taps x %d, f32 state)\n",
-                w->key_proj.k2 / 2.0, w->value_proj.k2 / 2.0, kTaps, kDil);
+        fprintf(stderr, "pulsar: L251 qwen PLE = the caller's f32 key / value rows -> signed-sqrt stream gate, "
+                        "dilated conv (%d taps x %d, f32 state)\n", kTaps, kDil);
     }
-    /* L251 / ac69748f: the gathered rows ARE bf16, so the key/value projections read them directly
-     * and the E4M3 emit step (which existed only to build the A8 slot) is gone.  The bf16 row is the
-     * one activation encoding, emitted by whatever produced `emb` (rule 3). */
-    int rc = pulsar_rows_linear_launch(&w->key_proj, (const uint16_t *)emb, T, m.key, m.lin, m.lin_bytes, stream);
-    if (!rc) rc = pulsar_rows_linear_launch(&w->value_proj, (const uint16_t *)emb, T, m.value, m.lin, m.lin_bytes, stream);
-    if (rc) return rc;
     qwen_ple_gate_kernel<<<dim3(kS, T), kThreads, 0, stream>>>(
-        m.key, m.value, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_key,
+        key, value, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_key,
         (const __nv_bfloat16 *)w->norm_query, (const __nv_bfloat16 *)w->norm_conv, m.gvn, m.sig);
     qwen_ple_conv_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
-        m.gvn, m.value, m.sig, (const __nv_bfloat16 *)w->conv_w, conv_state, rows->row_seq, rows->row_j,
+        m.gvn, value, m.sig, (const __nv_bfloat16 *)w->conv_w, conv_state, rows->row_seq, rows->row_j,
         rows->seq_bank, (__nv_bfloat16 *)streams);
-    if (rows->state_rows && T > 1)
-        qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, T), kThreads, 0, stream>>>(
+    if (rows->state_rows && (rows->n_state_rows < 0 || rows->n_state_rows > T)) {
+        fprintf(stderr, "pulsar: qwen PLE: a capture of %d rows in a %d-row batch -- refusing\n", rows->n_state_rows, T);
+        return -1;
+    }
+    if (rows->state_rows && rows->n_state_rows > 1)
+        qwen_ple_state_rows_kernel<<<dim3(kHC / kThreads, rows->n_state_rows), kThreads, 0, stream>>>(
             m.gvn, rows->row_seq, rows->row_j, rows->seq_first, rows->seq_rows, rows->seq_bank, conv_state,
             rows->state_rows);
     qwen_ple_state_kernel<<<dim3(kHC / kThreads, rows->n_seq), kThreads, 0, stream>>>(

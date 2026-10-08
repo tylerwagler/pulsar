@@ -11,7 +11,10 @@
  * L278 (contract 6): a QWEN leg after it -- raw Qwen generations driven through the server's own sequence for any
  * family (gen_state + the request's family output parser: create, feed per piece, finish, the final feed, then the
  * protocol's finish with the turn's calls; server_jobs.cpp gen_finish), on a request the Qwen renderer prepared
- * (its tools JSON types the arguments).  The DeepSeek cases above keep their recorded bytes. */
+ * (its tools JSON types the arguments).
+ *
+ * L284: the DeepSeek leg runs that same sequence (it used to emulate the finish with its own final parse), so both
+ * families' finishes -- the broken-call rule, the Responses tail -- are what the goldens pin. */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -86,25 +89,7 @@ struct streams {
     openai_stream oa;
     anthropic_stream an;
     responses_stream rs;
-    chat_sink k;               /* L267: the protocol's sink ... */
-    deepseek_stream_walk w;    /* ... and DeepSeek's walk into it */
 };
-
-/* The one place the harness touches a protocol's projection: the server's per-piece update. */
-static bool golden_update(proto, int, request *, streams *st, const char *raw, size_t len, bool final) {
-    return deepseek_stream_update(&st->w, &st->k, raw, len, final);
-}
-
-/* ... and its finish, after the server's final parse: the walk's flush, then the protocol's finish */
-static bool golden_finish(proto p, int fd, request *r, streams *st, const char *raw, size_t len, tool_calls *calls,
-                          const char *finish) {
-    if (!deepseek_stream_update(&st->w, &st->k, raw, len, true)) return false;
-    switch (p) {
-    case P_OPENAI: return openai_sse_finish(&st->k, calls, finish, 10, 20);
-    case P_ANTHROPIC: return anthropic_sse_finish(&st->k, calls, finish, NULL, 20);
-    default: return responses_sse_finish(fd, r, &st->rs, NULL, 0, calls, finish, 10, 20, 1700000000L);
-    }
-}
 
 static void drain(int fd, std::string *out) {
     char tmp[4096];
@@ -119,71 +104,6 @@ static std::string normalise(std::string s) {
     s = std::regex_replace(s, created, "\"$1\":T");
     return s;
 }
-
-static std::string run(const gcase &c, proto p, size_t piece) {
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return "(socketpair failed)\n";
-    fcntl(sv[1], F_SETFL, O_NONBLOCK);
-    int big = 1 << 22;
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
-    request r;
-    request_init(&r, REQ_CHAT, 256);
-    free(r.model);
-    r.model = xstrdup("m");
-    r.stream = true;
-    r.api = p == P_OPENAI ? API_OPENAI : p == P_ANTHROPIC ? API_ANTHROPIC : API_RESPONSES;
-    r.think_mode = c.think ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
-    r.has_tools = c.tools;
-    r.reasoning_summary_emit = p == P_RESPONSES_SUMMARY;
-    if (c.tools)
-        tool_schema_orders_add_json(&r.tool_orders,
-            "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
-            "\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}}");
-    streams st;
-    memset(&st, 0, sizeof(st));
-    std::string out;
-    bool ok = true;
-    if (p == P_OPENAI) {
-        openai_stream_start(&r, &st.oa);
-        openai_sink_init(&st.k, sv[0], NULL, &r, "chatcmpl-X", &st.oa);
-    } else if (p == P_ANTHROPIC) {
-        ok = anthropic_sse_start_live(sv[0], &r, "msg_X", 10, &st.an);
-        anthropic_sink_init(&st.k, sv[0], NULL, &r, "msg_X", &st.an);
-    } else {
-        responses_stream_init(&r, &st.rs);
-        st.rs.active = true;
-        ok = responses_sse_created(sv[0], &r, &st.rs, 1700000000L);
-        responses_sink_init(&st.k, sv[0], NULL, &r, "resp_X", &st.rs);
-    }
-    deepseek_stream_walk_init(&st.w, &r);
-    const size_t n = strlen(c.raw);
-    for (size_t at = 0; ok && at < n;) {
-        at = piece ? std::min(n, at + piece) : n;
-        ok = golden_update(p, sv[0], &r, &st, c.raw, at, false);
-        drain(sv[1], &out);
-    }
-    const char *finish = c.finish;
-    char err[256] = "", *content = NULL, *reasoning = NULL;
-    tool_calls calls = {0};
-    bool recovered = false;
-    const bool saw_tool = c.tools && find_any_tool_start(c.raw) != NULL;
-    parse_generated_message_for_response(c.raw, c.tools, saw_tool, c.think, &finish, err, sizeof(err), &content,
-                                         &reasoning, &calls, &recovered);
-    if (calls.len) finish = "tool_calls";
-    if (ok) ok = golden_finish(p, sv[0], &r, &st, c.raw, n, &calls, finish);
-    drain(sv[1], &out);
-    if (!ok) out += "(a write failed)\n";
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
-    deepseek_stream_walk_free(&st.w);
-    responses_stream_free(&st.rs);
-    request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
-    return normalise(out);
-}
-
 
 /* ---- L278: the Qwen leg ---------------------------------------------------------------------------- */
 
@@ -220,7 +140,7 @@ static const char *qtools_for(proto p) {
     }
 }
 
-static std::string run_family(const gcase &c, proto p, size_t piece) {
+static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat_format fmt) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return "(socketpair failed)\n";
     fcntl(sv[1], F_SETFL, O_NONBLOCK);
@@ -235,14 +155,24 @@ static std::string run_family(const gcase &c, proto p, size_t piece) {
     r->model = xstrdup("m");
     r->api = p == P_OPENAI ? API_OPENAI : p == P_ANTHROPIC ? API_ANTHROPIC : API_RESPONSES;
     r->reasoning_summary_emit = p == P_RESPONSES_SUMMARY;
-    /* the request as the server has it after rendering: the Qwen renderer sets the family, the think mode, the
-     * tools JSON the parser types arguments with, and the declared tools a call is checked against */
+    if (fmt != PULSAR_CHAT_QWEN) {
+        /* DeepSeek: the request as its renderer leaves it -- the family, the think mode, the declared tools */
+        r->family = server_family_for_format(fmt);
+        r->think_mode = c.think ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
+        r->has_tools = c.tools;
+        if (c.tools)
+            tool_schema_orders_add_json(&r->tool_orders,
+                "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+                "\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}}");
+    }
+    /* Qwen: the request as the server has it after rendering: the Qwen renderer sets the family, the think mode,
+     * the tools JSON the parser types arguments with, and the declared tools a call is checked against */
     chat_conversation conv = {};
     chat_msg u = {0};
     u.role = xstrdup("user");
     u.content = xstrdup("Go.");
     chat_msgs_push(&conv.msgs, u);
-    if (c.tools) {
+    if (fmt == PULSAR_CHAT_QWEN && c.tools) {
         conv.tools_raw = xstrdup(qtools_for(p));
         tool_schema_orders_add_json(&r->tool_orders,
             "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
@@ -250,7 +180,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece) {
     }
     if (!c.think) chat_conversation_control(&conv, "enable_thinking", xstrdup("false"));
     char err[256] = "";
-    if (!render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &conv, r, err, sizeof err)) {
+    if (fmt == PULSAR_CHAT_QWEN && !render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &conv, r, err, sizeof err)) {
         chat_conversation_free(&conv);
         request_free(r);
         close(sv[0]);
@@ -266,6 +196,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.j = &j;
+    g.thinking = thinking_state_from_prompt(r);   /* the server's gen_decode_init */
     streams st;
     memset(&st, 0, sizeof(st));
     std::string out;
@@ -292,6 +223,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece) {
     for (size_t at = 0; ok && at < n;) {
         const size_t to = piece ? std::min(n, at + piece) : n;
         buf_append(&g.text, c.raw + at, to - at);
+        g.thinking.feed(c.raw + at, to - at);
         at = to;
         ok = ops->feed(ps, &srv, &g, g.text.len, false);
         drain(sv[1], &out);
@@ -334,7 +266,7 @@ int main(void) {
         for (int p = P_OPENAI; p <= P_RESPONSES_SUMMARY; p++) {
             for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
                 printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
-                fputs(run(c, (proto)p, piece).c_str(), stdout);
+                fputs(run_family(c, (proto)p, piece, PULSAR_CHAT_DS4_V41).c_str(), stdout);
                 n++;
             }
         }
@@ -343,7 +275,7 @@ int main(void) {
         for (int p = P_OPENAI; p <= P_RESPONSES_SUMMARY; p++) {
             for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
                 printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
-                fputs(run_family(c, (proto)p, piece).c_str(), stdout);
+                fputs(run_family(c, (proto)p, piece, PULSAR_CHAT_QWEN).c_str(), stdout);
                 n++;
             }
         }
