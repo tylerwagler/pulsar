@@ -715,11 +715,8 @@ static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
      * what keeps a resumed image prefill the cold one's chunk for chunk.  A
      * text-only cold pass starts aligned and never cuts, so it is unchanged. */
     if (g->prefill_cap != 0) {
-        const uint32_t mod = pos0 % g->prefill_cap;
-        if (mod != 0) {
-            const uint32_t to_boundary = g->prefill_cap - mod;
-            if (to_boundary < local_cap) local_cap = to_boundary;
-        }
+        const uint32_t to_boundary = pulsar_prefill_to_boundary(pos0, g->prefill_cap);
+        if (to_boundary < local_cap) local_cap = to_boundary;
     }
     uint32_t chunk = remaining < local_cap ? remaining : local_cap;
     /* Keep every NON-final chunk boundary aligned to the layer compress
@@ -754,18 +751,19 @@ static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
             else chunk = be - pos0;
         }
     }
-    /* L264: the final chunk stops at the last grid point inside it, so the
-     * prefill leaves a checkpoint where the next turn of this conversation
-     * resumes.  A chunk that starts on the 128 grid is exactly the cold
-     * prefill's computation (L195), so the split moves no byte -- the
-     * chunk-neutrality gate's resumes are this same cut.  Not when that grid
-     * point falls inside an image block (the block stays whole). */
+    /* L264 / P13: the final chunk stops at the last grid point inside it
+     * (pulsar_ckpt_final_cut, every walk's), so the prefill leaves a
+     * checkpoint where the next turn of this conversation resumes.  A chunk
+     * that starts on the 128 grid is exactly the cold prefill's computation
+     * (L195), so the split moves no byte -- the chunk-neutrality gate's
+     * resumes are this same cut.  Not when that grid point falls inside an
+     * image block (the block stays whole). */
     if (pos0 + chunk == end) {
-        const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
+        const uint32_t cut = pulsar_ckpt_final_cut(&g->ckpt, pos0, end);
         bool inside = false;
         for (int b = 0; b < p->n_blk; b++)
-            if ((uint32_t)p->blk_s[b] < grid_end && grid_end < (uint32_t)p->blk_e[b]) inside = true;
-        if (grid_end > pos0 && grid_end < end && !inside) chunk = grid_end - pos0;
+            if ((uint32_t)p->blk_s[b] < cut && cut < (uint32_t)p->blk_e[b]) inside = true;
+        if (!inside) chunk = cut - pos0;
     }
     return pos0 + chunk;
 }
@@ -800,15 +798,16 @@ static bool ds4_plan_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
 static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
     ds4_plan *p = (ds4_plan *)ud;
     pulsar_gpu_graph *g = p->g;
-    /* L264: a chunk that ended on the grid -- every non-final boundary does,
-     * and the final split above makes the last grid point one too -- is a
-     * checkpoint.  Never inside an image block (the planner never ends a
-     * chunk there, L261): a resume may not re-evaluate a merged row (L226). */
+    /* L264 / P13: a chunk that ended on the grid -- every non-final boundary
+     * does, and the final split above makes the last grid point one too -- is
+     * a checkpoint, by the shared capture rule (pulsar_ckpt_landed).  Never
+     * inside an image block (the planner never ends a chunk there, L261): a
+     * resume may not re-evaluate a merged row (L226). */
     bool in_block = false;
     for (int b = 0; b < p->n_blk; b++)
         if ((uint32_t)p->blk_s[b] < chunk_end && chunk_end < (uint32_t)p->blk_e[b]) in_block = true;
     p->at_resume_point = chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block;
-    if (p->at_resume_point && !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
+    if (p->at_resume_point && !pulsar_ckpt_landed(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
     if (p->progress) {
         p->progress(p->progress_ud, "prefill_chunk", (int)chunk_end, p->prompt->len);
     }

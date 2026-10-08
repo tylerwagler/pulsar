@@ -3,11 +3,15 @@
  * L264's model of a session's KV is architecture-neutral except for one question: WHAT IS THE
  * STATE OF A BANK AT A POSITION?  Everything else is shared code that never names a layer:
  *
- *   - grid checkpoints: per bank, a few slots holding "the state at grid point G"; retention keeps
- *     the newest few and thins the older ones by merging the smallest gap; a checkpoint is valid
- *     while the bank still holds its history up to G (the frontier rule); a resume restores the
- *     deepest one at or below the prefill frontier and prefills from there (checkpoint.cpp,
- *     session.cpp);
+ *   - grid checkpoints: per bank, a few slots holding "the state at grid point G".  ONE ladder for
+ *     every family (P13): a prefill walk -- the core loop, DeepSeek's planner, a fused step's prompt
+ *     chunk -- captures at EVERY chunk end on the grid where the state is a prefill's
+ *     (pulsar_ckpt_landed), its final chunk is cut at the prompt's last grid point
+ *     (pulsar_ckpt_final_cut), and a capture into a full store keeps the newest half of it whole
+ *     and thins the older half by merging the smallest gap.  Only the slot COUNT is the model's (its
+ *     slot size prices it).  A checkpoint is valid while the bank still holds its history up to G
+ *     (the frontier rule); a resume restores the deepest one at or below the prefill frontier and
+ *     prefills from there (checkpoint.cpp, session.cpp);
  *   - disk segments: the tokens [G_prev, G), every APPEND-ONLY row pool's rows for that span, and
  *     the checkpoint at G -- a chain of them rebuilds a bank (session_payload.cpp, then
  *     src/lib/pulsar_segstore + pulsar_kvchain, the server, the agent, TP mirroring).
@@ -19,7 +23,7 @@
  *
  * DeepSeek V4 (kv_state_ds4.cpp): pools = every kv source's compressed rows (ratio 4 / 128) and
  * index-K rows (ratio 4); slot = the raw SWA window [G - W, G) of every layer + the overlapping
- * (coff-2) sources' compressor and indexer lanes (~3.8 MB); grid 128; 16 slots, 8 kept newest.
+ * (coff-2) sources' compressor and indexer lanes (~3.8 MB); grid 128; 16 slots.
  *
  * Qwen3.8-Flash-Next (`qwen4_exp`, the L251 lane -- family_qwen.h on work/l251-serve) maps as:
  *   pools  per QSA layer (12): KV rows, 1 token/row, pulsar_qwen_kv_row_bytes (1056 B, E4M3 + E8M0);
@@ -59,8 +63,7 @@ typedef struct {
 typedef struct pulsar_kv_state_ops {
     const char *name;            ///< printed in refusals ("deepseek-v4", "qwen4-exp")
     uint32_t resume_grid;        ///< tokens; every pool's tokens_per_row divides it
-    uint32_t ckpt_slots;         ///< slots per bank, <= PULSAR_CKPT_SLOTS_MAX
-    uint32_t ckpt_recent;        ///< the newest this many are never thinned, <= ckpt_slots
+    uint32_t ckpt_slots;         ///< slots per bank, <= PULSAR_CKPT_SLOTS_MAX (the ladder's rule is checkpoint.cpp's)
     /** The ONE slot layout, walked identically by sizing, capture and restore: `dir` < 0 sizes
      *  only (*bytes = the slot's size), 0 copies the installed bank's state -> slot, > 0 copies
      *  slot -> state.  Device copies on the session stream; false on a failed copy. */
@@ -96,11 +99,11 @@ typedef struct pulsar_kv_state_ops {
      *  grid span closes them): a payload carries them to its frontier beside the pools; a segment does
      *  not.  Same contract as pools. */
     uint32_t (*trailing_pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
-    /** L284 #2: a fused step's prompt chunk took the installed bank's history to T (pulsar_session_note_prefilled,
-     *  the core's record of it).  False (`why` filled) when the state does not stand at T -- the record would
-     *  describe another state; else *capture says whether the state at T is a prefill's, so a grid checkpoint
-     *  there is the cold prefill's (DeepSeek: no stale compressor group; Qwen: T is the prefill-only history's
-     *  end). */
+    /** A prompt chunk took the installed bank's history to T -- a prefill walk's chunk landed, or a fused step's
+     *  (L284 #2, pulsar_session_note_prefilled) -- and pulsar_ckpt_landed asks about it.  False (`why` filled)
+     *  when the state does not stand at T -- the record would describe another state; else *capture says whether
+     *  the state at T is a prefill's, so a grid checkpoint there is the cold prefill's (DeepSeek: no stale
+     *  compressor group; Qwen: T is the prefill-only history's end). */
     bool (*noted_at)(void *state, uint32_t T, bool *capture, char *why, size_t whylen);
 } pulsar_kv_state_ops;
 
@@ -121,8 +124,10 @@ typedef struct pulsar_ckpt_store {
 
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks);
 void pulsar_ckpt_release(pulsar_ckpt_store *st);
-/** Capture the installed `bank`'s state at grid point G.  False (said) on a violated precondition. */
-bool pulsar_ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G);
+/** THE capture rule (P13), every walk's: a prompt chunk took the installed `bank` to T.  The model confirms the
+ *  state stands at T (ops->noted_at; false, said, when not), and a T on the grid where the state is a prefill's
+ *  is captured (false, said, when the capture fails). */
+bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, uint32_t T);
 /** Restore the installed `bank` to its checkpoint at G; the checkpoints above G go.  False when
  *  none at G or a copy failed. */
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G);
@@ -142,6 +147,13 @@ void pulsar_ckpt_commit(pulsar_ckpt_store *st, uint32_t bank, uint32_t slot, uin
 /** The grid G <= pos at which a resume of a history prefilled to `pos` starts. */
 static inline uint32_t pulsar_ckpt_grid_floor(const pulsar_ckpt_store *st, uint32_t pos) {
     return pos / st->ops->resume_grid * st->ops->resume_grid;
+}
+/** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
+ *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
+ *  caller keeps an image block whole around it. */
+static inline uint32_t pulsar_ckpt_final_cut(const pulsar_ckpt_store *st, uint32_t pos0, uint32_t end) {
+    const uint32_t g = pulsar_ckpt_grid_floor(st, end);
+    return g > pos0 && g < end ? g : end;
 }
 
 /** DeepSeek V4's answer (kv_state_ds4.cpp); its state is the pulsar_gpu_graph. */

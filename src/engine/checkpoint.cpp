@@ -15,7 +15,7 @@
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks) {
     if (n_banks < 1u) n_banks = 1u;
     if (n_banks > PULSAR_MSEQ_MAX || ops->ckpt_slots < 1u || ops->ckpt_slots > PULSAR_CKPT_SLOTS_MAX ||
-        ops->ckpt_recent < 1u || ops->ckpt_recent > ops->ckpt_slots || ops->resume_grid == 0u) return false;
+        ops->resume_grid == 0u) return false;
     st->ops = ops;
     st->state = state;
     uint64_t slot = 0;
@@ -43,9 +43,12 @@ void pulsar_ckpt_release(pulsar_ckpt_store *st) {
 }
 
 /* The slot a capture at G writes: the one already holding G, else an empty one, else the victim
- * of the retention rule -- never one of the ckpt_recent newest, and among the older ones the
- * checkpoint whose removal opens the smallest gap between its neighbours (the newest is G itself,
- * about to land). */
+ * of THE ladder rule (P13, every family's; only the slot count n is the model's): the newest n / 2
+ * checkpoints are kept whole -- the prompt ends of the turns a client continues or edits next -- and
+ * among the older ones goes the checkpoint whose removal opens the smallest gap between its
+ * neighbours, so they thin into a ladder reaching back into the history a client rewrites (L261:
+ * tool results 12-20k tokens back).  DeepSeek's 16 keep 8 newest + G and thin 7; Qwen's 2 keep the
+ * newest + G, i.e. the previous turn's prompt end survives the next one's. */
 static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     const uint32_t n = st->ops->ckpt_slots;
     const uint32_t *pos = st->pos[bank];
@@ -59,7 +62,7 @@ static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint3
         for (; j > 0 && pos[order[j - 1]] > pos[v]; j--) order[j] = order[j - 1];
         order[j] = v;
     }
-    const uint32_t older = n - (st->ops->ckpt_recent - 1u);   /* G is the newest */
+    const uint32_t older = n - n / 2u;   /* the candidates: all but the newest n / 2 (G lands above them) */
     uint32_t victim = order[0];
     uint32_t best_gap = UINT32_MAX;
     for (uint32_t i = 0; i < older; i++) {
@@ -75,7 +78,9 @@ static bool ckpt_grid_ok(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G)
            G >= st->ops->min_checkpoint(st->state);
 }
 
-bool pulsar_ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
+/* Capture the installed `bank`'s state at grid point G (pulsar_ckpt_landed's).  False (said) on a violated
+ * precondition. */
+static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     if (!ckpt_grid_ok(st, bank, G)) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u refused: not a grid point the slab can hold\n",
                 G, bank);
@@ -96,6 +101,17 @@ bool pulsar_ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     }
     st->pos[bank][s] = G;
     return true;
+}
+
+bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, uint32_t T) {
+    bool capture = false;
+    char why[192] = "";
+    if (!st->ops->noted_at(st->state, T, &capture, why, sizeof(why))) {
+        fprintf(stderr, "pulsar: bank %u's prompt chunk to %u is not its state: %s\n", bank, T, why);
+        return false;
+    }
+    if (!capture || T % st->ops->resume_grid != 0u || T < st->ops->min_checkpoint(st->state)) return true;
+    return ckpt_capture(st, bank, T);
 }
 
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {

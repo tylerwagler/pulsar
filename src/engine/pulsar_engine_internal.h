@@ -3318,21 +3318,26 @@ struct pulsar_prefill_walk {
 /** Run the walk over [start, end): 0 when it reached `end`, PULSAR_SESSION_SYNC_INTERRUPTED when `stop`
  *  said so at a chunk boundary (the device drained), 1 when a hook failed or a cut was out of range. */
 int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);
+/** Rows from `pos0` to the next ABSOLUTE multiple of `cap` (P13, every walk's chunk rule): a walk that starts
+ *  off the cap grid -- a resume, a continuation, the chunk after an image cut -- lands on the cold prefill's
+ *  chunk ends, which sit on the resume grid where the walk captures (pulsar_ckpt_landed). */
+static inline uint32_t pulsar_prefill_to_boundary(uint32_t pos0, uint32_t cap) {
+    return cap - pos0 % cap;
+}
 
 /** One prefill chunk of the family's forward (L272 P2): rows [pos0, pos0 + rows) of `prompt` on the
  *  live bank; `last` heads the final row into s->logits.  false = the chunk failed (logged). */
 typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0,
                                         uint32_t rows, bool last, void *ud);
 
-/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start`, in chunks of
- *  `cap` rows, a chunk cut at `capture_at` (0 = none) and the state there captured into `ckpt`/`bank`.
- *  After each chunk the session's view advances (checkpoint = the prompt so far), the progress hooks
+/** The family-neutral prefill loop (prefill_loop.cpp, L272 P2): `prompt` from `start`, in chunks ending on
+ *  the absolute multiples of `cap`, the last cut at the prompt's last grid point, and every chunk end handed
+ *  to the shared capture rule (pulsar_ckpt_landed on `ckpt`/`bank`).  After each chunk the session's view advances (checkpoint = the prompt so far), the progress hooks
  *  hear prefill_chunk / prefill_display, and the cancel hook is polled -- before every chunk too.
  *  Returns 0 when the prompt is in, PULSAR_SESSION_SYNC_INTERRUPTED when the hook stopped it at a chunk
  *  boundary (the view stands there, the logits stale), 1 when a chunk failed. */
 int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
-                        uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
-                        pulsar_prefill_chunk_fn chunk, void *ud);
+                        pulsar_ckpt_store *ckpt, uint32_t bank, pulsar_prefill_chunk_fn chunk, void *ud);
 
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,
