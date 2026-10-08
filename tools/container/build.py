@@ -23,7 +23,6 @@ straight into the file.
 import argparse
 import json
 import os
-import re
 import struct
 import sys
 
@@ -32,13 +31,12 @@ from hf_source import HFCheckpoint, Exl3Checkpoint  # noqa: E402
 import names as N          # noqa: E402
 import policy as P         # noqa: E402
 import producers as PR     # noqa: E402
-import kv as KV            # noqa: E402
 import qwen as Q           # noqa: E402
+import deepseek as D       # noqa: E402
 import entries as EN       # noqa: E402
 
 ALIGN = 32
 NATIVE_DTYPES = {'bf16': 'BF16', 'f32': 'F32', 'i32': 'I32'}
-PARTS = ('w1', 'w3', 'w2')
 
 
 def align_for(nbytes):
@@ -46,12 +44,6 @@ def align_for(nbytes):
         if nbytes % a == 0:
             return a
     return 1
-
-
-def shard_order(shape):
-    """names.py owns the plan (vision first and primary, one per layer, top, one per drafter layer)."""
-    order = N.shard_order(shape)
-    return order, {s: N.shard_file(shape, s) for s in order}
 
 
 def parse_layers(spec):
@@ -68,95 +60,115 @@ def parse_layers(spec):
     return out
 
 
-def model_shape(hf):
-    """From config.json alone (names.py's rule): the checkpoint's word, not a guess from its names."""
-    return N.ModelShape.from_config(hf.config['top_level'])
+# ---------------------------------------------------------------------------
+# the plan: ONE walk for every family; the family module supplies only what is its own (deepseek.py, qwen.py)
+# ---------------------------------------------------------------------------
+CONSUMED = ('ple_rows', 'kv', 'omit')      # formats that write no container tensor (the recipe's word)
 
 
-# ---------------------------------------------------------------------------
-# the plan
-# ---------------------------------------------------------------------------
-def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
-    shape = model_shape(hf)
-    order, files = shard_order(shape)
+def shard_file(order, shard):
+    return f'model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors'
+
+
+def expert_dtype(layouts):
+    """pulsar.expert_dtype: the one vocabulary for a shard's routed families."""
+    if not layouts:
+        return 'none'
+    if layouts <= {'cutlass_mxfp4'}:
+        return 'mxfp4_cutlass'
+    return 'exl3' if all(x.startswith('exl3m_') for x in layouts) else 'mixed'
+
+
+def add_families(shard, families):
+    """Routed families -> one U8 entry per expert-projection, contiguous in expert order, plus the pulsar.experts
+    record (the engine's stride is expert_bytes)."""
+    for f in families:
+        eb = PR.bytes_for(f['layout'], [f['inp'], f['n']])
+        shard['experts'].append({'gguf_name': f['gguf_name'], 'part': f['part'], 'n_experts': len(f['srcs']),
+                                 'expert_bytes': eb, 'layout': f['layout'], 'contiguous': True,
+                                 'dims_per_expert_ne': [f['inp'], f['n']], **f['extras']})
+        for name, src in zip(f['entry_names'], f['srcs']):
+            shard['entries'].append({'name': name, 'layout': f['layout'], 'gguf_name': f['gguf_name'],
+                                     'dtype': 'U8', 'shape': [eb], 'nbytes': eb, 'src': src})
+
+
+def dense_entry(hf, fam, m, name, layout, ctx):
+    """One dense entry: an EXL3 Linear's ranges or the producer table's payload for (source, layout)."""
+    hshape = hf.shape(name)                        # the SOURCE shape (producers take it)
+    dshape = fam.declared_shape(m, hshape)         # what the container holds (the family's quirks)
+    dims_ne = list(reversed(dshape))
+    entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
+    if layout.startswith('exl3m_'):
+        src = fam.exl3_source(m, ctx)
+        if src is None:
+            raise SystemExit(f'{name}: {layout} is an EXL3 format; pass --exl3')
+        if hf.dtype(name) != 'BF16' or len(hshape) != 2 or not name.endswith('.weight'):
+            raise SystemExit(f'{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {hf.dtype(name)} {hshape}')
+        out, inp = hshape
+        ranges, nbytes = EN.exl3_ranges(src, name[:-len('.weight')], layout, inp, out, fam.EXL3_RATES)
+        entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes, src=('ranges', ranges))
+    else:
+        entry.update(EN.dense(hf, name, layout, dshape, ctx.mxfp8_mode))
+    return entry, dims_ne
+
+
+def plan(hf, fam, ctx):
+    shape = fam.shape(hf, ctx)
+    order = fam.shard_order(shape)
+    files = {s: shard_file(order, s) for s in order}
     shards = {s: {'entries': [], 'tensors': {}, 'experts': []} for s in order}
     hf_names = hf.names()
-    experts = {}        # (shard, layer, part) -> {e: (weight_name, scale_name)}
-    consumed = 0        # names the source carries and the engine never binds (names.py: emit=False)
+    mapped = {}
     for name in hf_names:
-        m = N.map_hf(name, shape)
+        m = fam.map_hf(name, shape)
         if m is None:
-            raise SystemExit(f'{name}: not a tensor this builder maps -- refusing (names.py)')
+            raise SystemExit(f'{name}: not a tensor the {fam.__name__} naming table maps -- refusing')
+        mapped[name] = m
+    fmt = fam.formats(hf, mapped, ctx)
+    groups = {}         # per-expert tensors, grouped by the family (fam.group_key) and planned after the walk
+    consumed = 0        # names the source carries and the container does not (drop rules, consumed formats)
+    for name in hf_names:
+        m = mapped[name]
         if not m.emit:
             consumed += 1
             continue
-        if m.family == 'expert':
-            key = (m.shard, m.layer, m.part)
-            slot = experts.setdefault(key, {}).setdefault(m.expert, {})
-            slot['scale' if m.is_scale else 'weight'] = name
-            slot['mapped'] = m
-            continue
         if m.is_scale:
             continue                      # folded into its weight's producer
+        layout = fmt[name]
+        if layout in CONSUMED:
+            consumed += 1
+            continue
         if m.shard not in shards:
             raise SystemExit(f'{name}: shard {m.shard} outside the plan ({len(order)} shards)')
-        dtype = hf.dtype(name)
-        hshape = hf.shape(name)                        # the SOURCE shape (producers take it)
-        dshape = P.declared_shape(m, hshape)           # what the container holds (policy decision 5)
-        layout = P.layout_for(m, dtype, hshape, overrides)
-        dims_ne = list(reversed(dshape))
-        entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name,
-                 **EN.dense(hf, name, layout, dshape, mxfp8_mode)}
+        if m.role.startswith('expert_'):
+            if fam.EXPERT_STACKS:         # the HF tensor is the whole stack: its families, in walk order
+                add_families(shards[m.shard], fam.stack_families(hf, m, layout, ctx))
+            else:
+                groups.setdefault(fam.group_key(m), {})[m.expert] = (name, m)
+            continue
+        entry, dims_ne = dense_entry(hf, fam, m, name, layout, ctx)
         shards[m.shard]['entries'].append(entry)
         shards[m.shard]['tensors'][m.container_name] = {'layout': layout, 'dims_ne': dims_ne,
                                                         'gguf_name': m.gguf_name}
+    for key, slots in sorted(groups.items()):
+        add_families(shards[key[0]], fam.group_families(hf, key, slots, fmt, ctx))
 
-    # the routed expert families: one U8 per expert-projection, contiguous
-    for (shard, layer, part), slots in sorted(experts.items()):
-        n_exp = max(slots) + 1
-        if sorted(slots) != list(range(n_exp)):
-            raise SystemExit(f'{shard} {part}: experts not contiguous 0..{n_exp - 1}')
-        m0 = slots[0]['mapped']
-        wname0 = slots[0]['weight']
-        hshape = hf.shape(wname0)                      # I8 [out, in/2] for the FP4 source
-        dtype = hf.dtype(wname0)
-        out, inp = PR.matrix_dims(EN.kind_of(hf, wname0), hshape)
-        dims_ne = [inp, out]
-        use_exl3 = exl3 is not None and shard.startswith('layers.') and layer in exl3_layers
-        if use_exl3:
-            _, words = exl3.linear(N.exl3_expert_key(layer, 0, part), inp, out, P.EXL3_WORDS)
-            layout = P.EXL3_WORDS[words]
-            per = [EN.exl3_ranges(exl3, N.exl3_expert_key(layer, e, part), layout, inp, out, P.EXL3_WORDS)[0]
-                   for e in range(n_exp)]
-        else:
-            layout = P.layout_for(m0, dtype, hshape, overrides)
-        eb = PR.bytes_for(layout, dims_ne)
-        gguf_name = m0.gguf_name
-        shards[shard]['experts'].append({'gguf_name': gguf_name, 'part': part, 'n_experts': n_exp,
-                                         'expert_bytes': eb, 'layout': layout, 'contiguous': True,
-                                         'dims_per_expert_ne': dims_ne})
-        for e in range(n_exp):
-            m = slots[e]['mapped']
-            entry = {'name': m.container_name, 'layout': layout, 'gguf_name': gguf_name,
-                     'dtype': 'U8', 'shape': [eb], 'nbytes': eb}
-            entry['src'] = ('ranges', per[e]) if use_exl3 else EN.expert_src(hf, slots[e]['weight'], layout, out, inp)
-            shards[shard]['entries'].append(entry)
-
-    kvs = KV.build_kv(hf, tokenizer_dir, reap_map)
+    kvs = fam.build_kv(hf, ctx)
     kv_arch = [k for k in kvs if not k['key'].startswith('tokenizer.')]
     for s in order:
         p = shards[s]
-        exp_layouts = {e['layout'] for e in p['experts']}
         gu = {}
         for e in p['experts']:
-            if e['part'] in ('w1', 'w3'):
-                gu.setdefault(e['gguf_name'].split('.')[1], set()).add(e['layout'])
+            if e['part'] in fam.GATE_UP_PARTS:
+                gu.setdefault(e['gguf_name'].rsplit('.', 1)[0] if fam.EXPERT_STACKS else e['gguf_name'].split('.')[1],
+                              set()).add(e['layout'])
         for lay, ls in gu.items():
             if len(ls) > 1:
                 raise SystemExit(f'{s}: layer {lay} gate/up layouts differ: {sorted(ls)}')
         p['meta'] = {
             'format': 'pt',
             'pulsar.format': 'pulsar-safetensors-v1',
+            **fam.META,
             'pulsar.alignment': str(ALIGN),
             'pulsar.shard': files[s],
             'pulsar.shard_key': s,
@@ -165,10 +177,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
             'pulsar.tensors': json.dumps(p['tensors'], separators=(',', ':'), sort_keys=True),
             'pulsar.experts': json.dumps(p['experts'], separators=(',', ':')),
             'pulsar.kv_arch': json.dumps(kv_arch, separators=(',', ':')),
-            'pulsar.expert_dtype': ('none' if not exp_layouts else
-                                    'mxfp4_cutlass' if exp_layouts <= {'cutlass_mxfp4'} else
-                                    'exl3' if all(l.startswith('exl3m_') for l in exp_layouts) else
-                                    'mixed'),
+            'pulsar.expert_dtype': expert_dtype({e['layout'] for e in p['experts']}),
         }
         if s == 'vision':
             p['meta']['pulsar.kv'] = json.dumps(kvs, separators=(',', ':'))
@@ -281,8 +290,8 @@ def write_index(out_dir):
 # commands
 # ---------------------------------------------------------------------------
 # The family modules, registered by the checkpoint's config.json model_type -- the one authority for which naming
-# table applies.  names.py is DeepSeek's (V4 Flash / Vision-Exp and V4.1), qwen.py is qwen4_exp's.
-FAMILIES = {'deepseek_v4': N, 'deepseek_v41': N, 'qwen4_exp': Q}
+# table applies.  deepseek.py: V4 Flash / Vision-Exp and V4.1; qwen.py: qwen4_exp.
+FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q}
 
 
 def family_of(hf):
@@ -293,36 +302,35 @@ def family_of(hf):
 
 
 def make_plan(args):
-    """The family's plan, chosen by the checkpoint's model_type; a Qwen-only flag on a DeepSeek build (or the
-    reverse) refuses."""
+    """The one plan over the family the checkpoint's model_type names; a Qwen-only flag on a DeepSeek build (or
+    the reverse) refuses."""
     hf = hf_of(args)
-    if family_of(hf) is Q:
+    fam = family_of(hf)
+    ctx = argparse.Namespace(exl3=None, exl3_experts=None,
+                             exl3_layers=set(), overrides={}, mxfp8_mode=args.mxfp8_scale, recipe=None,
+                             tokenizer_dir=args.tokenizer or args.hf, reap_map=args.reap_map, ple_rows=args.ple_rows)
+    if fam is Q:
         if args.format_map or args.exl3_layers or args.reap_map or args.mxfp8_scale != 'rederive':
             raise SystemExit('qwen4_exp: --format-map / --exl3-layers / --reap-map / --mxfp8-scale are DeepSeek '
                              'options; the recipe (--recipe) names every tensor')
         if not args.recipe:
             raise SystemExit('qwen4_exp: pass --recipe (tools/container/format-maps/qwen38fn-*.json)')
-        exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
-        exl3_experts = Exl3Checkpoint(args.exl3_experts) if args.exl3_experts else None
-        return Q.plan(hf, exl3, exl3_experts, Q.Recipe(args.recipe), args.tokenizer or args.hf, args.ple_rows)
+        ctx.exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
+        ctx.exl3_experts = Exl3Checkpoint(args.exl3_experts) if args.exl3_experts else None
+        ctx.recipe = Q.Recipe(args.recipe)
+        return plan(hf, fam, ctx)
     if args.recipe or args.exl3_experts or args.ple_rows:
         raise SystemExit('--recipe / --exl3-experts / --ple-rows are qwen4_exp options')
-    hf, exl3, layers, overrides = load_sources(args)
-    return plan(hf, exl3, layers, overrides, args.mxfp8_scale, args.tokenizer or args.hf, args.reap_map)
-
-
-def load_sources(args):
-    hf = hf_of(args)
-    exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
-    layers = set()
-    if exl3:
-        have = set(N.exl3_layers(exl3.names()))
-        layers = parse_layers(args.exl3_layers) if args.exl3_layers else have
-        missing = sorted(layers - have)
+    ctx.exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
+    if ctx.exl3:
+        have = set(N.exl3_layers(ctx.exl3.names()))
+        ctx.exl3_layers = parse_layers(args.exl3_layers) if args.exl3_layers else have
+        missing = sorted(ctx.exl3_layers - have)
         if missing:
             raise SystemExit(f'{args.exl3}: layers {missing} requested but not present (have {sorted(have)})')
-    overrides = P.rekey_format_map(json.load(open(args.format_map)), model_shape(hf)) if args.format_map else {}
-    return hf, exl3, layers, overrides
+    if args.format_map:
+        ctx.overrides = P.rekey_format_map(json.load(open(args.format_map)), D.shape(hf, ctx))
+    return plan(hf, fam, ctx)
 
 
 def cmd_plan(args):

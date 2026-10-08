@@ -18,9 +18,7 @@ an exllamav3-layout EXL3 checkpoint of random trellis / suh / svh, a toy BPE tok
 """
 from __future__ import annotations
 
-import contextlib
 import copy
-import io
 import json
 import os
 import shutil

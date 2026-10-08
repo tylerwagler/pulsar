@@ -191,6 +191,7 @@ ENGRAM_TENSORS = {"engram.wkv.weight", "engram.q_weight", "engram.k_weight"}
 ENGRAM_SIDECAR = {"engram.embed.weight"}
 
 EXPERT_PART_GGUF = {"w1": "gate", "w2": "down", "w3": "up"}
+EXPERT_ROLE = {"w1": "expert_gate", "w3": "expert_up", "w2": "expert_down"}
 EXPERT_GGUF_PART = {v: k for k, v in EXPERT_PART_GGUF.items()}
 
 VISION_PREFIX = ("vision.", "aligner.")
@@ -237,7 +238,7 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
         return Mapped(container_name=f"{ns}.{idx}.ffn.experts.{e}.{part}.weight",
                       gguf_name=f"{prefix}ffn_{EXPERT_PART_GGUF[part]}_exps.weight",
                       family="expert", shard=shard, layer=idx, expert=e, part=part,
-                      is_scale=leaf in COMPANION)
+                      is_scale=leaf in COMPANION, role=EXPERT_ROLE[part])
 
     suffix, companion = _split_leaf(rest)
     if not is_mtp and suffix in ENGRAM_SIDECAR:

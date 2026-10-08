@@ -23,7 +23,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from names import Mapped, ModelShape, map_hf, shard_file, shard_order   # noqa: E402
+from names import ModelShape, map_hf, shard_file, shard_order   # noqa: E402
 from policy import NATIVE, PolicyError, declared_shape, layout_for, rekey_format_map  # noqa: E402
 
 SERVED = "/mnt/models/DeepSeek-v4-Flash/"

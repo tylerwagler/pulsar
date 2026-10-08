@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import glob
 import json
-import math
 import os
 import struct
 import sys

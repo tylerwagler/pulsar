@@ -44,12 +44,14 @@ import struct
 import entries as EN
 import exl3_rates
 import kv as KV
-import producers as PR
 from names import Mapped
 
 FAMILY = "qwen4_exp"
 PFX = "model.language_model."
 EXL3_RATES = exl3_rates.rates(exl3_rates.QWEN)   # words per 16x16 tile -> layout, the rates Qwen's arms read
+META = {"pulsar.family": FAMILY}
+EXPERT_STACKS = True            # an HF expert tensor is the whole [E, out, in] stack; its families plan in walk order
+GATE_UP_PARTS = ("gate_up_proj", "gate_proj", "up_proj")
 FORMATS = {"bf16", "mxfp8_lt", *exl3_rates.QWEN, "ple_rows", "kv", "omit"}
 
 
@@ -131,7 +133,7 @@ _BLOCK = re.compile(r"^(model\.language_model\.layers|mtp\.layers)\.(\d+)\.(.+)$
 _NGRAM = re.compile(r"^ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
-def map_hf(name: str) -> Mapped | None:
+def map_hf(name: str, shape=None) -> Mapped | None:
     """The naming table's row for an HF name, or None (the caller refuses)."""
     m = _BLOCK.match(name)
     if m:
@@ -157,113 +159,50 @@ def expert_names(m: Mapped, part: str) -> tuple[str, str]:
     return pre + part, pre + "{e}." + part + ".weight"
 
 
-def shard_order(n_layer):
-    return ["vision"] + [f"layers.{i}" for i in range(n_layer)] + ["top"]
+def shape(hf, ctx):
+    return {"family": FAMILY, "n_layer": int(hf.config["num_hidden_layers"]), "recipe": ctx.recipe.name}
 
 
-def shard_file(order, shard):
-    return f"model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors"
+def shard_order(shape):
+    return ["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"]
 
 
-# ---------------------------------------------------------------------------
-# the plan
-# ---------------------------------------------------------------------------
-def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
-    cfg = hf.config
-    n_layer = int(cfg["num_hidden_layers"])
-    order = shard_order(n_layer)
-    files = {s: shard_file(order, s) for s in order}
-    shards = {s: {"entries": [], "tensors": {}, "experts": []} for s in order}
-    fmt = recipe.resolve(hf.names())
-    consumed = {"ple_rows": 0, "kv": 0, "omit": 0}
-    for name in hf.names():
-        f = fmt[name]
-        if f in consumed:
-            consumed[f] += 1
-            continue
-        m = map_hf(name)
-        if m is None:
-            raise SystemExit(f"{name}: not a tensor the qwen4_exp naming table maps -- refusing")
-        shard = m.shard
-        if shard not in shards:
-            raise SystemExit(f"{name}: shard {shard} outside the plan ({len(order)} shards)")
-        dtype, shape = hf.dtype(name), hf.shape(name)
-        if f in ("bf16", "mxfp8_lt"):
-            entry = {"name": name, "layout": f, "gguf_name": name, **EN.dense(hf, name, f, shape)}
-            dims_ne = list(reversed(shape))
-        elif f.startswith("exl3m_") and ".mlp.experts." not in name:
-            if exl3 is None:
-                raise SystemExit(f"{name}: the recipe names {f}; pass --exl3")
-            if dtype != "BF16" or len(shape) != 2 or not name.endswith(".weight"):
-                raise SystemExit(f"{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {dtype} {shape}")
-            out, inp = shape
-            dims_ne = [inp, out]
-            ranges, nbytes = EN.exl3_ranges(exl3, name[:-len(".weight")], f, inp, out, EXL3_RATES)
-            entry = {"name": name, "layout": f, "gguf_name": name, "dtype": "U8", "shape": [nbytes],
-                     "nbytes": nbytes, "src": ("ranges", ranges)}
-        elif f.startswith("exl3m_"):
-            _plan_experts(hf, exl3_experts or exl3, recipe, m, f, shards[shard])
-            continue
-        else:
-            raise SystemExit(f"{name}: format {f} has no producer")
-        shards[shard]["entries"].append(entry)
-        shards[shard]["tensors"][name] = {"layout": entry["layout"], "dims_ne": dims_ne, "gguf_name": name}
-
-    kvs = build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts)
-    kv_arch = [k for k in kvs if not k["key"].startswith("tokenizer.")]
-    for s in order:
-        p = shards[s]
-        exp_layouts = {e["layout"] for e in p["experts"]}
-        p["meta"] = {
-            "format": "pt",
-            "pulsar.format": "pulsar-safetensors-v1",
-            "pulsar.family": FAMILY,
-            "pulsar.alignment": "32",
-            "pulsar.shard": files[s],
-            "pulsar.shard_key": s,
-            "pulsar.n_shards": str(len(order)),
-            "pulsar.primary": files["vision"],
-            "pulsar.tensors": json.dumps(p["tensors"], separators=(",", ":"), sort_keys=True),
-            "pulsar.experts": json.dumps(p["experts"], separators=(",", ":")),
-            "pulsar.kv_arch": json.dumps(kv_arch, separators=(",", ":")),
-            "pulsar.expert_dtype": "none" if not exp_layouts else ("exl3" if all(
-                x.startswith("exl3m_") for x in exp_layouts) else "mixed"),
-        }
-        if s == "vision":
-            p["meta"]["pulsar.kv"] = json.dumps(kvs, separators=(",", ":"))
-    shape = {"family": FAMILY, "n_layer": n_layer, "recipe": recipe.name}
-    return shape, order, files, shards, sum(consumed.values())
+def declared_shape(m, hshape):
+    return list(hshape)                 # no reshapes: the declared shape is the source's
 
 
-def _plan_experts(hf, src, recipe, m, layout, shard):
+def exl3_source(m, ctx):
+    return ctx.exl3
+
+
+def formats(hf, mapped, ctx):
+    return ctx.recipe.resolve(hf.names())
+
+
+def stack_families(hf, m, layout, ctx):
     """One HF expert stack ([E, out, in] BF16) -> its EXL3 families: gate_up_proj (fused) or gate_proj + up_proj
     (split, the recipe's word), down_proj."""
     stack_name = m.container_name
+    if not layout.startswith("exl3m_"):
+        raise SystemExit(f"{stack_name}: the recipe names {layout}; a routed stack is written from an EXL3 source")
+    src = ctx.exl3_experts or ctx.exl3
     if src is None:
         raise SystemExit(f"{stack_name}: the recipe names {layout}; pass --exl3 (or --exl3-experts)")
-    if m.role not in ("expert_gate_up", "expert_down"):
-        raise SystemExit(f"{stack_name}: not a routed-expert stack")
-    layer, stack = m.layer, m.part
     E, out, inp = hf.shape(stack_name)
-    if stack == "gate_up_proj" and recipe.gate_up == "split":
+    if m.part == "gate_up_proj" and ctx.recipe.gate_up == "split":
         if out % 2:
             raise SystemExit(f"{stack_name}: odd gate_up width {out}")
         parts = [("gate_proj", out // 2), ("up_proj", out // 2)]
     else:
-        parts = [(stack, out)]
+        parts = [(m.part, out)]
+    fams = []
     for part, n in parts:
-        eb = PR.bytes_for(layout, [inp, n])
         fam_name, entry_name = expert_names(m, part)
-        for e in range(E):
-            ranges, nbytes = EN.exl3_ranges(src, entry_name.replace("{e}", str(e))[:-len(".weight")], layout, inp, n,
-                                            EXL3_RATES)
-            assert nbytes == eb
-            name = entry_name.replace("{e}", str(e))
-            shard["entries"].append({"name": name, "layout": layout, "gguf_name": fam_name, "dtype": "U8",
-                                     "shape": [eb], "nbytes": eb, "src": ("ranges", ranges)})
-        shard["experts"].append({"gguf_name": fam_name, "part": part, "n_experts": E, "expert_bytes": eb,
-                                 "layout": layout, "contiguous": True, "dims_per_expert_ne": [inp, n],
-                                 "entry_name": entry_name, "layer": layer})
+        names = [entry_name.replace("{e}", str(e)) for e in range(E)]
+        srcs = [("ranges", EN.exl3_ranges(src, x[:-len(".weight")], layout, inp, n, EXL3_RATES)[0]) for x in names]
+        fams.append(dict(gguf_name=fam_name, part=part, layout=layout, inp=inp, n=n, entry_names=names, srcs=srcs,
+                         extras={"entry_name": entry_name, "layer": m.layer}))
+    return fams
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +245,11 @@ PLE_BUFFERS = {"layer_multipliers": "ple_layer_multipliers",
                "ngram_heads_offsets": "ple_ngram_heads_offsets"}
 
 
-def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
+def build_kv(hf, ctx):
     """pulsar.kv for qwen4_exp: `general.*`; the text_config verbatim under `qwen4_exp.` (config_kvs); the PLE
     buffers as u64 arrays; the builder's own facts under `pulsar.*` (recipe, sources, the PLE row file the
     table must match); the tokenizer from the checkpoint's own files."""
+    recipe, ple_manifest, exl3, exl3_experts = ctx.recipe, ctx.ple_rows, ctx.exl3, ctx.exl3_experts
     top = hf.config["top_level"]
     text = top["text_config"]
     A = FAMILY
@@ -368,7 +308,7 @@ def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
         if src is not None:
             kvs.append((f"pulsar.source.{tag}", "string", os.path.basename(os.path.normpath(src.dir))))
     kvs.append(("pulsar.source.hf", "string", os.path.basename(os.path.normpath(hf.dir))))
-    kvs += tokenizer_kvs(tokenizer_dir)
+    kvs += tokenizer_kvs(ctx.tokenizer_dir)
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):
