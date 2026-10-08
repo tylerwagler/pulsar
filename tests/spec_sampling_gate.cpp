@@ -62,10 +62,13 @@
  * repointed, invalidated and loaded from it) and draws from the SAME per-
  * trajectory rng stream as before, so the emitted tokens and alpha are what the
  * serial loop produced -- 16 plain trajectories or 4 speculative ones per
- * forward instead of one.  Both widths stay inside the 16-row M-neutral range
- * the battery asserts (mixed_neutrality_gate), which is what makes the rows
- * byte-identical to a 1-row step; a round that would exceed 16 rows FAILS the
- * gate, it does not fall back to a narrower batch.  Mode 0 is therefore also
+ * forward instead of one.  Both widths are 16 rows, past the width whose rows are
+ * byte-identical to a 1-row step (10 on DeepSeek, L284 dsgrade): wider steps take
+ * the faster arms (ENGINEERING-RULES rule 7, 2026-10-08), so the deep positions'
+ * chi2 carries that width's numerics on BOTH arms (plain 16-wide vs 8-wide alone:
+ * chi2 147.7 at position 3) -- it is informational, the hard gates are not.  A
+ * round that would exceed 16 rows FAILS the gate, it does not fall back to a
+ * narrower batch.  Mode 0 is therefore also
  * batch-sourced now (the "like-with-like" repair this header asked for above):
  * position 0 samples the snapshot's logits, positions 1+ sample decode_mixed
  * rows.  The greedy hard gates are unchanged and still run serially.
@@ -104,7 +107,7 @@ typedef struct { int id; long a, b; } bucket;
 /* L160: banks per forward in the sampled arm.  Plain trajectories are one row
  * each; speculative ones are 1 + K rows with K trimmed to max_tokens - 1 <=
  * DEPTH - 1 by round_begin, so 4 banks are at most 16 rows.  16 is the
- * ALL_ROWS head cap AND the M-neutral range the battery asserts. */
+ * ALL_ROWS head cap. */
 #ifndef SAMPLED_BANKS_PLAIN
 #define SAMPLED_BANKS_PLAIN 16
 #endif
