@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The direct container builder: HF checkpoint(s) -> pulsar's safetensors container.
 
-    plan    --hf DIR [--exl3 DIR [--exl3-layers 5,18-22]] [--format-map JSON]
+    plan    --hf DIR [--exl3 DIR [--exl3-layers 5,18-22]] [--format-map JSON] [--dump FILE]
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
     verify  ... --out DIR (--shard S | --all)        # against the HF SOURCE
     audit   --out DIR                                # structure + index closed both ways
@@ -116,7 +116,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
             for d in hshape:
                 n_el *= d
             entry.update(dtype='I32', shape=list(dshape), nbytes=4 * n_el,
-                         src=('produce', (lambda w=name: PR.i64_to_i32(hf.raw(w)))))
+                         src=('produce', PR.spec('i64_to_i32', [name])))
         elif layout == 'mxfp8_lt':
             scale = name[:-len('.weight')] + '.scale'
             if not hf.has(scale):
@@ -126,14 +126,13 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
             block = out // srows
             nbytes = PR.bytes_for(layout, dims_ne)
             entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes,
-                         src=('produce', (lambda w=name, s=scale, o=out, i=inp, b=block:
-                                          PR.mxfp8_lt(hf.raw(w), hf.raw(s), o, i, b, mxfp8_mode))))
+                         src=('produce', PR.spec('mxfp8_lt', [name, scale], out=out, inp=inp, block=block,
+                                                 mode=mxfp8_mode)))
         elif layout == 'fp8_e4m3_soa_k':
             rows, cols = hshape
             nbytes = PR.bytes_for(layout, dims_ne)
             entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes,
-                         src=('produce', (lambda w=name, r=rows, c=cols:
-                                          PR.fp8_e4m3_soa_k_from_bf16(hf.raw(w), r, c))))
+                         src=('produce', PR.spec('fp8_e4m3_soa_k_from_bf16', [name], rows=rows, cols=cols)))
         else:
             raise SystemExit(f'{name}: layout {layout} has no dense producer')
         shards[m.shard]['entries'].append(entry)
@@ -187,7 +186,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
                 wn, sn = slots[e]['weight'], slots[e].get('scale')
                 if not sn:
                     raise SystemExit(f'{wn}: cutlass_mxfp4 needs its .scale')
-                entry['src'] = ('produce', (lambda w=wn, s=sn, o=out, i=inp: PR.cutlass_mxfp4(hf.raw(w), hf.raw(s), o, i)))
+                entry['src'] = ('produce', PR.spec('cutlass_mxfp4', [wn, sn], out=out, inp=inp))
             shards[shard]['entries'].append(entry)
 
     kvs = KV.build_kv(hf, tokenizer_dir, reap_map)
@@ -226,7 +225,8 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
 # ---------------------------------------------------------------------------
 # the writer: streamed
 # ---------------------------------------------------------------------------
-def write_shard(path, entries, meta):
+def shard_layout(entries, meta):
+    """The entries in file order and the exact header bytes (length prefix excluded) -- fixed before any payload."""
     sized = sorted(entries, key=lambda e: -align_for(e['nbytes']))   # stable: expert runs stay adjacent
     header, cursor = {}, 0
     for e in sized:
@@ -237,6 +237,38 @@ def write_shard(path, entries, meta):
         cursor += e['nbytes']
     hj = json.dumps({**header, '__metadata__': meta}, separators=(',', ':'), sort_keys=True).encode()
     hj += b' ' * (-(8 + len(hj)) % ALIGN)
+    return sized, header, cursor, hj
+
+
+def source_bytes(e, hf):
+    """An entry's payload from its source: the byte ranges concatenated, or its producer run."""
+    kind, src = e['src']
+    if kind == 'produce':
+        return PR.produce(src, hf)
+    out = b''
+    for sp, off, n in src:
+        with open(sp, 'rb') as g:
+            g.seek(off)
+            out += g.read(n)
+    return out
+
+
+def write_dump(path, shape, order, files, shards, consumed):
+    """plan --dump: one JSON line for the model, then per shard (file order) its exact header and one line per entry
+    with the entry's source descriptor -- everything a build writes except the payload bytes themselves."""
+    with open(path, 'w') as f:
+        f.write(json.dumps({'model': str(shape), 'consumed': consumed, 'shards': order}) + '\n')
+        for s in order:
+            sized, _header, _total, hj = shard_layout(shards[s]['entries'], shards[s]['meta'])
+            f.write(json.dumps({'shard': s, 'file': files[s], 'header': hj.decode()}) + '\n')
+            for e in sized:
+                kind, src = e['src']
+                d = ['ranges', [list(r) for r in src]] if kind == 'ranges' else ['produce', src]
+                f.write(json.dumps({'name': e['name'], 'src': d}, sort_keys=True) + '\n')
+
+
+def write_shard(path, entries, meta, hf):
+    sized, header, cursor, hj = shard_layout(entries, meta)
     handles = {}
     with open(path, 'wb') as f:
         f.write(struct.pack('<Q', len(hj)))
@@ -261,7 +293,7 @@ def write_shard(path, entries, meta):
                 if n_written != e['nbytes']:
                     raise SystemExit(f'{e["name"]}: ranges give {n_written} bytes, the model says {e["nbytes"]}')
             else:
-                b = src()
+                b = PR.produce(src, hf)
                 if len(b) != e['nbytes']:
                     raise SystemExit(f'{e["name"]}: producer gave {len(b)} bytes, the model says {e["nbytes"]}')
                 f.write(b)
@@ -298,7 +330,7 @@ def write_index(out_dir):
 def make_plan(args):
     """The family's plan, chosen by the checkpoint's model_type (config.json) -- the one authority for which
     table applies; a Qwen-only flag on a DeepSeek build (or the reverse) refuses."""
-    hf = HFCheckpoint(args.hf)
+    hf = hf_of(args)
     if Q.is_qwen(hf):
         if args.format_map or args.exl3_layers or args.reap_map or args.mxfp8_scale != 'rederive':
             raise SystemExit('qwen4_exp: --format-map / --exl3-layers / --reap-map / --mxfp8-scale are DeepSeek '
@@ -315,7 +347,7 @@ def make_plan(args):
 
 
 def load_sources(args):
-    hf = HFCheckpoint(args.hf)
+    hf = hf_of(args)
     exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
     layers = set()
     if exl3:
@@ -341,6 +373,9 @@ def cmd_plan(args):
             lay[e['layout']] = lay.get(e['layout'], 0) + 1
         print(f'  {files[s]}  {s:10s} {len(p["entries"]):6d} tensors  {len(p["experts"]):2d} families  {b / 1e9:8.3f} GB  {dict(sorted(lay.items()))}')
     print(f'total {tot / 1e9:.2f} GB')
+    if args.dump:
+        write_dump(args.dump, shape, order, files, shards, consumed)
+        print(f'plan dump: {args.dump}')
     if args.exl3:
         print(f'exl3 from {args.exl3}' + (f'; layers {args.exl3_layers}' if args.exl3_layers else ''))
     return 0
@@ -355,7 +390,8 @@ def cmd_emit(args):
         if s not in shards:
             raise SystemExit(f'unknown shard {s}; one of {order}')
         t0 = time.time()
-        header, total = write_shard(os.path.join(args.out, files[s]), shards[s]['entries'], shards[s]['meta'])
+        header, total = write_shard(os.path.join(args.out, files[s]), shards[s]['entries'], shards[s]['meta'],
+                                    hf_of(args))
         print(f'{files[s]}  {s:10s} {len(header):6d} tensors {total / 1e9:8.3f} GB  {time.time() - t0:6.1f} s', flush=True)
     if args.all:
         n, total = write_index(args.out)
@@ -401,15 +437,7 @@ def cmd_verify(args):
                     misaligned += 1
                 f.seek(buf_off + o0)
                 got = f.read(o1 - o0)
-                kind, src = e['src']
-                if kind == 'ranges':
-                    exp = b''
-                    for sp, off, n in src:
-                        with open(sp, 'rb') as g:
-                            g.seek(off)
-                            exp += g.read(n)
-                else:
-                    exp = src()
+                exp = source_bytes(e, hf_of(args))
                 if got == exp:
                     n_ok += 1
                 else:
@@ -552,6 +580,9 @@ def main():
             p.add_argument('--recipe', metavar='JSON', help='qwen4_exp: the per-tensor format map (format-maps/qwen38fn-*.json)')
             p.add_argument('--exl3-experts', metavar='DIR', help='qwen4_exp: a separate EXL3 checkpoint for the routed experts only')
             p.add_argument('--ple-rows', metavar='MANIFEST', help='qwen4_exp: the PLE row file manifest (ple_rows.py build)')
+        if name == 'plan':
+            p.add_argument('--dump', metavar='FILE', help='write every shard\'s exact header and every entry\'s source '
+                           'descriptor (no payload bytes): two plans that dump the same write the same bytes')
         if name == 'verify':
             p.add_argument('--roundtrip', action='store_true',
                            help='also decode every BF16-sourced mxfp8_lt entry and hold it to the E4M3 rounding bound')

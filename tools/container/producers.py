@@ -366,6 +366,28 @@ def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
 
 
 # --------------------------------------------------------------------------
+# A plan entry names its producer as data -- {'producer', 'inputs', 'args'}: the producer's name, the source
+# tensors whose raw bytes are its positional inputs, and its keyword arguments -- so a plan can be written out
+# (build.py plan --dump) and two plans compared without producing a byte (L279).
+# --------------------------------------------------------------------------
+
+PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, fp8_e4m3_soa_k_from_bf16,
+                                      i64_to_i32)}
+
+
+def spec(producer: str, inputs: list, **args) -> dict:
+    """The serializable producer descriptor of one entry."""
+    if producer not in PRODUCERS:
+        raise ValueError(f"{producer}: not a producer ({sorted(PRODUCERS)})")
+    return {"producer": producer, "inputs": list(inputs), "args": args}
+
+
+def produce(desc: dict, source) -> bytes:
+    """Run a descriptor against `source` (anything with .raw(name) -> bytes, the HF checkpoint)."""
+    return PRODUCERS[desc["producer"]](*[source.raw(n) for n in desc["inputs"]], **desc["args"])
+
+
+# --------------------------------------------------------------------------
 # The byte model: == st_bytes_for / routed_expert_side_layout.
 # --------------------------------------------------------------------------
 

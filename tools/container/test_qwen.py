@@ -13,6 +13,8 @@ an exllamav3-layout EXL3 checkpoint of random trellis / suh / svh, a toy BPE tok
     option on a Qwen build, a PLE manifest whose head table is not the checkpoint's
   * the PLE row file: build -> verify (sampled + --full) PASS; a flipped byte in the file -> verify FAILS
   * split gate/up (turboderp's form) -> gate_proj / up_proj families when the recipe says split
+  * GOLDEN: the SHA-256 of every emitted file of the fused and the split build, fixed on the builder before L279's
+    refactor (the byte-identity instrument, rule 7; test_deepseek.py holds the DeepSeek pair)
 """
 from __future__ import annotations
 
@@ -32,8 +34,15 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import producers as P  # noqa: E402
+from test_deepseek import digest  # noqa: E402
 
 FAILS: list[str] = []
+# sha256 over (file name, sha256(file)) of every emitted file, in name order (test_deepseek.digest); taken at dev
+# bdb62d13 (pre-L279)
+GOLDEN = {
+    "fused": "a4d6fc36f9d898f229f188d6d2f76bf77e8d55a62da9c2d03df85522837e171b",
+    "split": "d818bfd9a3ba47de09a8c1b837be41ed9effa401d89286d277d09667d186cf1a",
+}
 PFX = "model.language_model."
 H, L, E, FF, HC, LR = 256, 4, 4, 128, 4, 64
 
@@ -301,6 +310,8 @@ def main():
         check(ok and "failing: 0" in out and "roundtrip:" in out, "verify --all --roundtrip PASS")
         ok, out = run("build.py", "audit", "--out", o1)
         check(ok and "AUDIT PASS" in out, "audit PASS")
+        got = digest(o1)
+        check(got == GOLDEN["fused"], f"GOLDEN fused: {got}")
         # the instrument must see a single flipped payload byte (mutation: a green verify is not vacuous)
         victim = os.path.join(o2, "model-00002-of-00006.safetensors")
         vb = bytearray(open(victim, "rb").read())
@@ -390,6 +401,8 @@ def main():
         ok, out = run("build.py", "verify", "--hf", hf_dir, "--exl3", ex_s, "--recipe", rp, "--ple-rows", man,
                       "--out", o3, "--all")
         check(ok and "failing: 0" in out, "verify PASS (split)")
+        got = digest(o3)
+        check(got == GOLDEN["split"], f"GOLDEN split: {got}")
         with open(os.path.join(o3, "model-00003-of-00006.safetensors"), "rb") as f:
             (n,) = struct.unpack("<Q", f.read(8))
             h = json.loads(f.read(n))

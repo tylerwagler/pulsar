@@ -161,7 +161,7 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
             nbytes = PR.bytes_for("mxfp8_lt", dims_ne)
             entry = {"name": name, "layout": "mxfp8_lt", "gguf_name": name, "dtype": "U8", "shape": [nbytes],
                      "nbytes": nbytes, "bf16_src": name,
-                     "src": ("produce", (lambda w=name, o=out, i=inp: PR.mxfp8_lt_from_bf16(hf.raw(w), o, i)))}
+                     "src": ("produce", PR.spec("mxfp8_lt_from_bf16", [name], out=out, inp=inp))}
         elif f.startswith("exl3m_") and ".mlp.experts." not in name:
             if exl3 is None:
                 raise SystemExit(f"{name}: the recipe names {f}; pass --exl3")
