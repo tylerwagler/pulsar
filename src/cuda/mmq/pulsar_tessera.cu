@@ -29,10 +29,19 @@ void tessera_host_refuse_pair(int mode, int r_lo, bool two, int tile_words, int 
     g_host_failed = true;
 }
 
+/* upstream's TORCH_CHECK(cond, msg) in launch (the piece-major guards, 37742e0f): a false condition refuses the
+ * launch the same way -- the value family never sets piece_major, so these never fire here */
+void tessera_host_check(bool ok, const char *msg) {
+    if (ok) return;
+    fprintf(stderr, "pulsar: tessera: %s -- refusing\n", msg);
+    g_host_failed = true;
+}
+
 } // namespace
 
 #define TESSERA_ROUTED_FUSED_FP8 0
 #define TESSERA_HOST_CUDA(expr) tessera_host_cuda((expr), #expr)
+#define TESSERA_HOST_CHECK(cond, msg) tessera_host_check((cond), (msg))
 #define TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K) tessera_host_refuse_pair((mode), (r_lo), (two), (tile_words), (K))
 #include "tessera_routed_fused_window.cuh"
 
