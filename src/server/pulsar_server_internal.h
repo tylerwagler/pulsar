@@ -564,13 +564,13 @@ typedef struct server_family_ops {
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
     /** L272: an UNNAMED forced call's seed ends where the function name's OPENER starts; the opener, the
-     *  name and the closer (Qwen: "=" and ">") are then sampled under a mask that keeps them a prefix of
-     *  opener + a declared tool's name + closer, so "required" with several tools cannot name an undeclared
-     *  one (Qwen sampled "ask_user").  The seed stops BEFORE the opener (token healing): Qwen's tokenizer
-     *  merges "=" with a name's first piece ("=get"), so a prompt ending in a lone "=" is a state the model
-     *  saw only before names it does not merge ("=", "convert"), and "required" chose convert_currency for
-     *  every question.  forced_name_close NULL = the family's seed does not end at the name: no constraint
-     *  (an undeclared name is dropped at the finish instead); forced_name_open may be "" (no opener). */
+     *  name and the closer (Qwen: "=" and ">"; DeepSeek: ` name="` and `">`, L284) are then sampled under a
+     *  mask that keeps them a prefix of opener + a declared tool's name + closer, so "required" with several
+     *  tools cannot name an undeclared one (Qwen sampled "ask_user").  The seed stops BEFORE the opener
+     *  (token healing): Qwen's tokenizer merges "=" with a name's first piece ("=get"), so a prompt ending
+     *  in a lone "=" is a state the model saw only before names it does not merge ("=", "convert"), and
+     *  "required" chose convert_currency for every question.  The closer is the whole tag end for the same
+     *  reason (DeepSeek's `">` is one token).  Every family has both. */
     const char *forced_name_open;
     const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text

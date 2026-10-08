@@ -1234,9 +1234,9 @@ void server::gen_decode_init(session_slot *sl) {
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
         g->plain_stream_pos = g->text.len;
         /* L272: an unnamed forced call (required with several declared tools) samples its name under
-         * the declared-name mask (gen_mask_tool_name), on a family whose seed ends at the name */
+         * the declared-name mask (gen_mask_tool_name); every family's seed ends at the name's opener */
         g->tool_name_constrained = (!j->req.forced_tool_name || !j->req.forced_tool_name[0]) &&
-                                   j->req.family->forced_name_close && j->req.tool_orders.len > 0;
+                                   j->req.tool_orders.len > 0;
         g->tool_name_from = g->text.len;
     }
     g->phase = GEN_DECODE;
@@ -1246,9 +1246,11 @@ void server::gen_decode_init(session_slot *sl) {
 
 bool gen_tool_name_open(const gen_state *g) {
     if (!g || !g->tool_name_constrained || g->tool_name_from > g->text.len) return false;
-    const char *close = g->j->req.family->forced_name_close;
-    const char *name = g->text.ptr ? g->text.ptr + g->tool_name_from : "";
-    return !strstr(name, close);
+    /* the closer is looked for past the opener: DeepSeek's opener ` name="` holds the quote its closer starts with */
+    const size_t no = strlen(g->j->req.family->forced_name_open);
+    const size_t n = g->text.len - g->tool_name_from;
+    if (n <= no) return true;
+    return !strstr(g->text.ptr + g->tool_name_from + no, g->j->req.family->forced_name_close);
 }
 
 /* L272: mask `row` (the logits a constrained slot draws its next token from) to the tokens that keep the

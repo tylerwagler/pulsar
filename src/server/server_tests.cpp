@@ -3525,7 +3525,35 @@ static void test_tool_name_token_allowed(void) {
     TEST_ASSERT(tool_name_token_allowed("=", 1, "search", 6, "=", d, ">"));
     TEST_ASSERT(!tool_name_token_allowed("", 0, "get", 3, "=", d, ">"));        /* the opener is not optional */
     TEST_ASSERT(!tool_name_token_allowed("", 0, "=ask", 4, "=", d, ">"));
+    /* L284 P7: DeepSeek's opener ` name="` and closer `">` (one token) under the same rule */
+    const server_family_ops *ds = server_family_for_format(PULSAR_CHAT_DS4_V41);
+    TEST_ASSERT(tool_name_token_allowed("", 0, " name", 5, ds->forced_name_open, d, ds->forced_name_close));
+    TEST_ASSERT(tool_name_token_allowed(" name=\"", 7, "get", 3, ds->forced_name_open, d, ds->forced_name_close));
+    TEST_ASSERT(!tool_name_token_allowed(" name=\"", 7, "reply", 5, ds->forced_name_open, d, ds->forced_name_close));
+    TEST_ASSERT(tool_name_token_allowed(" name=\"search", 13, "\">\n", 3, ds->forced_name_open, d,
+                                        ds->forced_name_close));
+    TEST_ASSERT(!tool_name_token_allowed(" name=\"se", 9, "\">", 2, ds->forced_name_open, d, ds->forced_name_close));
     request_free(&r);
+    /* the mask stays on until the closer appears PAST the opener (the opener holds the closer's quote) */
+    job j;
+    memset(&j, 0, sizeof j);
+    request_init(&j.req, REQ_CHAT, 16);
+    j.req.family = ds;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    g.tool_name_constrained = true;
+    buf_puts(&g.text, "seed");
+    g.tool_name_from = g.text.len;
+    TEST_ASSERT(gen_tool_name_open(&g));
+    buf_puts(&g.text, " name=\"");
+    TEST_ASSERT(gen_tool_name_open(&g));
+    buf_puts(&g.text, "search");
+    TEST_ASSERT(gen_tool_name_open(&g));
+    buf_puts(&g.text, "\">\n");
+    TEST_ASSERT(!gen_tool_name_open(&g));
+    buf_free(&g.text);
+    request_free(&j.req);
 }
 
 static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {

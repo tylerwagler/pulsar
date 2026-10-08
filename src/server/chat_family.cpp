@@ -626,16 +626,18 @@ static char *deepseek_tool_error_suffix(const request *r, const thinking_state *
     return build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail, spans_out, n_spans_out);
 }
 
-/* The exact bytes a forced tool call is seeded with: close thinking, open the tool_calls block, and
- * (when a specific tool was requested) open the named invoke.  The prompt rewrite drops the render's
+/* The exact bytes a forced tool call is seeded with: close thinking, open the tool_calls block and the
+ * invoke tag (named when a specific tool was requested, else up to its name).  The prompt rewrite drops the render's
  * trailing "<think>" opener and skips the seed's close when the render already ended with one. */
 static void deepseek_forced_call_seed(const request *r, buf *out) {
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(r->family->v41);
     buf_puts(out, "</think>\n\n");
     buf_puts(out, d->tool_calls_start);
     buf_puts(out, "\n");
+    buf_puts(out, d->invoke_start);
+    /* unnamed: stop before the name's opener -- the model samples ` name="NAME">` under the declared-name
+     * mask (forced_name_open / _close, the same constraint as Qwen's); named: the whole tag */
     if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, d->invoke_start);
         buf_puts(out, " name=\"");
         buf_puts(out, r->forced_tool_name);
         buf_puts(out, "\">\n");
@@ -669,8 +671,8 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
+    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
+    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_deepseek_v4 = {
@@ -687,8 +689,8 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,   /* an unnamed DSML seed opens the block, not the name */
+    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
+    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_qwen = {
