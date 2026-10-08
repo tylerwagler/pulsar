@@ -130,7 +130,6 @@ int GATE_ENTRY(int argc, char **argv) {
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
         if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "no bank pool\n"); goto done; }
         const int width = pulsar_engine_logits_width(e);
-        const int eos = pulsar_token_eos(e);
         logits = (float *)malloc((size_t)17 * (size_t)width * sizeof(float));
         prow = (float *)malloc((size_t)width * sizeof(float));
         r = pulsar_spec_round_new();
@@ -236,7 +235,7 @@ int GATE_ENTRY(int argc, char **argv) {
             /* forced end: the corpus decides acceptance and the carry */
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
             int accepted[17];
-            const int na = pulsar_session_spec_round_end_forced(s, r, first, eos, temperature, top_k, top_p, min_p,
+            const int na = pulsar_session_spec_round_end_forced(s, r, first, temperature, top_k, top_p, min_p,
                                                                 rngp, logits, 0u, toks.v + pos + 1, accepted, 17,
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }

@@ -94,13 +94,12 @@ static bool spec_stream(pulsar_session *s, int steps, int *stream,
     char err[256];
     int acc[32];
     uint64_t rng = 0x2545F4914F6CDD1Dull;
-    const int eos = pulsar_token_eos(g_e);
     const uint64_t acc0 = s->spec.spec_accepted_tokens, drf0 = s->spec.spec_draft_tokens;
     int emitted = 0;
     while (emitted < steps) {
         const int base = s->checkpoint.len;
         const int ntok = pulsar_session_generate_speculative(
-                s, 0.0f, 0, 1.0f, 0.0f, &rng, steps - emitted, eos, acc,
+                s, 0.0f, 0, 1.0f, 0.0f, &rng, steps - emitted, acc,
                 (int)(sizeof(acc) / sizeof(acc[0])), err, sizeof(err));
         if (ntok < 0) { fprintf(stderr, "spec failed: %s\n", err); return false; }
         if (ntok == 0) break; /* eos/stall */
@@ -233,7 +232,6 @@ int GATE_ENTRY(int argc, char **argv) {
         char err[256];
         int accbuf[32];
         uint64_t rng[2] = {0x2545F4914F6CDD1Dull, 0x2545F4914F6CDD1Dull};
-        const int eos = pulsar_token_eos(g_e);
         /* Alternate ONE generate_speculative quantum per bank, saving/restoring
          * the per-bank host carry across the switch (the time-slice lane). */
         while (ok && (emitted[0] < steps || emitted[1] < steps)) {
@@ -243,7 +241,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 const uint64_t a0 = s->spec.spec_accepted_tokens, d0 = s->spec.spec_draft_tokens;
                 const int base = s->checkpoint.len;
                 const int ntok = pulsar_session_generate_speculative(
-                        s, 0.0f, 0, 1.0f, 0.0f, &rng[k], steps - emitted[k], eos,
+                        s, 0.0f, 0, 1.0f, 0.0f, &rng[k], steps - emitted[k],
                         accbuf, (int)(sizeof(accbuf)/sizeof(accbuf[0])), err, sizeof(err));
                 if (ntok < 0) { fprintf(stderr, "T2 spec bank %d: %s\n", k, err); ok = false; break; }
                 for (int i = 0; i < ntok && emitted[k] < steps; i++)

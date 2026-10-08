@@ -1463,22 +1463,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             s->live_images.n = 0;
     };
 
-    /* L226: this sync re-establishes whatever a salvaged rewind left open -- the
-     * carry path re-prefills from a grid point at or above the salvage floor and
-     * the rebuild path prefills from 0 -- so a decode is legal again once it
-     * returns.  Cleared here rather than in either arm because BOTH make the
-     * session decodable again (and the carry path returns early). */
-    /* a sync begins a new request: any carry left by a max-tokens/stop-string
-     * truncated generation belongs to the previous request's distribution.
-     * (position stamping alone misses a same-length full rebuild.) */
-    s->spec.spec_carry_valid = false;
-    /* Same argument, same blind spot: the pendings' position stamp cannot see a
-     * rebuild that lands on the same length, and a sampled draft's q belongs to
-     * the previous request's distribution. Dropping them here costs one draft
-     * round at the start of a request and is the only guard that covers it. */
-    pulsar_spec_drop_pendings(&s->spec);
-    /* A sync begins a new request: re-arm the terminal yield quench. */
-    spec_quench_reset(s);
+    /* a sync begins a new request: the core dropped the speculative lookahead and re-armed the quench
+     * before calling this (pulsar_session_family_sync, every family) */
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -1546,8 +1532,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
              * point above the last held block) is not a resume point, and the
              * prefill restarts from 0 -- every block merged again. */
             if (resume_floor > 0 && B < resume_floor) B = 0u;
-            if (G == ck && !s->graph->ms_comp_state_stale[bank]) {
-                s->resume_origin = (int)ck;   /* standing at a prefill grid point: nothing to redo */
+            if (pulsar_session_bank_continues(s, bank, (int)ck)) {
+                /* the core's continuation rule (every family's; L284): standing at a prefill grid point with
+                 * the state live -- G == ck -- nothing to redo */
+                s->resume_origin = (int)ck;
             } else if (B > 0u && s->restore_checkpoint(B)) {
                 s->resume_origin = (int)B;
                 fprintf(stderr, "pulsar: resume at %u from grid checkpoint %u on bank %u (%u tokens recomputed)\n",
@@ -1713,68 +1701,6 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
      * or there are none in the prompt at all. */
     note_images((uint32_t)prompt->len);
     return 0;
-}
-
-
-/* Return true when canonicalization would replace already-sampled tokens.
- *
- * A DS4 session checkpoint is more than a token vector: the backend state also
- * contains raw SWA rows, compressed KV rows, indexer rows, and compressor
- * frontiers.  Replacing any part of the live tail requires restoring that whole
- * frontier first.  Extending exactly at the live end is safe; rewriting behind
- * it is not an in-place operation. */
-bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
-    if (live_len < 0 || canonical_len < 0 || common < 0) return true;
-    if (common > live_len || common > canonical_len) return true;
-    return common < live_len;
-}
-
-
-/* Replace the live suffix after a shared prefix.
- *
- * This is used after parsing a generated tool call.  The model may have emitted
- * DSML in an order that is semantically valid but not byte-for-byte equal to the
- * canonical prompt we will see on the next request.  Rewriting only the token
- * checkpoint is not enough: the backend still contains raw and compressed rows
- * for the old suffix.  Until we have a real frontier snapshot at the
- * rewrite point, any replacement behind the live end reports that a rebuild is
- * needed without mutating the session.  The server may still find an older disk KV
- * checkpoint before falling back to a full replay. */
-pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_tokens *prompt, int common,
-        char *err, size_t errlen) {
-    auto *s = this;
-    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
-        snprintf(err, errlen, "prompt exceeds context");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    if (!s->checkpoint_valid) {
-        snprintf(err, errlen, "session has no valid checkpoint");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    if (common < 0 || common > s->checkpoint.len || common > prompt->len) {
-        snprintf(err, errlen, "invalid rewrite prefix");
-        return PULSAR_SESSION_REWRITE_ERROR;
-    }
-    for (int i = 0; i < common; i++) {
-        if (s->checkpoint.v[i] != prompt->v[i]) {
-            snprintf(err, errlen, "rewrite prefix does not match live checkpoint");
-            return PULSAR_SESSION_REWRITE_ERROR;
-        }
-    }
-
-    if (common == s->checkpoint.len) {
-        return s->sync(prompt, NULL, 0, err, errlen) == 0 ?
-            PULSAR_SESSION_REWRITE_OK : PULSAR_SESSION_REWRITE_ERROR;
-    }
-
-    if (pulsar_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
-        snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
-                 common, s->checkpoint.len, prompt->len);
-        return PULSAR_SESSION_REWRITE_REBUILD_NEEDED;
-    }
-
-    snprintf(err, errlen, "unexpected canonical rewrite state");
-    return PULSAR_SESSION_REWRITE_ERROR;
 }
 
 
@@ -2088,9 +2014,6 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     }
     token_vec_push(&s->checkpoint, token);
     s->logits_stale = false;
-    /* a token evaluated outside the speculative path (tool injection, plain
-     * fallback loops) advances the state past any in-flight carry */
-    s->spec.spec_carry_valid = false;
     return 0;
 }
 
@@ -2114,9 +2037,6 @@ void pulsar_session::invalidate() {
     s->rewind(0);
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    pulsar_spec_drop_pendings(&s->spec);
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
      * attended over the PREVIOUS request's window rows for its first ~128
@@ -2194,9 +2114,7 @@ void pulsar_session::trim_history(int pos) {
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
     pulsar_image_identity_trim(&s->live_images, (uint32_t)(pos < 0 ? 0 : pos));
     s->checkpoint.len = pos;
-    pulsar_spec_drop_pendings(&s->spec);
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
+    spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;

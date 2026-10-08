@@ -2358,7 +2358,7 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
                                           int max_tokens, int accepted_cap, float temperature,
                                           int top_k, float top_p, float min_p, char *err, size_t errlen);
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
-                                        int eos_token, float temperature, int top_k, float top_p,
+                                        float temperature, int top_k, float top_p,
                                         float min_p, uint64_t *rng, const float *rows, uint32_t row0,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
@@ -2371,10 +2371,10 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
  * pulsar_session_spec_assemble_batch in pulsar.h); reqs may be NULL (the
  * worker's rows ride the mixed-batch frame). */
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              int eos_token, uint32_t row_budget,
+                                              uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               int eos_token, const float *rows);
+                                               const float *rows);
 void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** L260: a batch phase's verdict -- a positive fingerprint of what the phase
  * decided for every step (statuses, base tokens and rows; frontiers and
@@ -2532,8 +2532,8 @@ struct pulsar_session {
      * constructors/destructors.
      * NOTE: pulsar_session_prefill_cap and pulsar_session_resident_bytes stay
      * free functions — members would collide with the same-named data members.
-     * pulsar_session_rewrite_requires_rebuild / _snapshot_free do not take a
-     * session and stay free. */
+     * pulsar_session_snapshot_free does not take a
+     * session and stays free. */
     static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
     /** Tear down the session and release its GPU allocations. Behind pulsar_session_free(). */
     void destroy();
@@ -2572,10 +2572,6 @@ struct pulsar_session {
      * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
              char *err, size_t errlen);
-    /** Rewrite the session to `prompt` given an already-computed `common`
-     * prefix length, rather than re-deriving it. */
-    pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
-                                                      char *err, size_t errlen);
     /** Longest common TOKEN prefix between the session's history and `prompt`.
      * For the byte-level, seam-aware answer use prefix_match(). */
     int common_prefix(const pulsar_tokens *prompt);
@@ -2663,26 +2659,26 @@ struct pulsar_session {
      * @param min_p         relative probability floor
      * @param rng           sampler state; advanced by this call
      * @param max_tokens    cap on tokens committed
-     * @param eos_token     stop once this is committed
+     * (a stop -- the family's whole set, pulsar_token_is_stop -- ends the block)
      * @param accepted      receives the committed token ids
      * @param accepted_cap  its capacity
      * @param err           failure message buffer
      * @param errlen        its size
      * @return tokens committed. */
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
-                             uint64_t *rng, int max_tokens, int eos_token,
+                             uint64_t *rng, int max_tokens,
                              int *accepted, int accepted_cap, char *err, size_t errlen);
     /** Speculative generation seeded with a known `first_token` -- the forced-
      * continuation form, where the caller has already chosen the opening token.
      * @param first_token   the opening token, committed as-is
      * @param max_tokens    cap on tokens committed
-     * @param eos_token     stop once this is committed
+     * (a stop -- the family's whole set, pulsar_token_is_stop -- ends the block)
      * @param accepted      receives the committed token ids
      * @param accepted_cap  its capacity
      * @param err           failure message buffer
      * @param errlen        its size
      * @return tokens committed. */
-    int eval_speculative_block(int first_token, int max_tokens, int eos_token,
+    int eval_speculative_block(int first_token, int max_tokens,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
     /** Discard the conversation: clear the checkpoint, drop spec carry and
      * pendings, and disarm the rewind rings so a NEXT conversation can never
@@ -2745,13 +2741,16 @@ typedef struct {
 } pulsar_sync_progress;
 
 /** ---- helpers shared across the session_*.cpp TUs ----
- * payload_set_err (session_payload.cpp) is the payload/bank-KV error stamper;
- * spec_quench_reset (session_spec.cpp) re-arms the terminal yield quench at
- * request boundaries (sync/invalidate/rewind/load_payload). */
+ * payload_set_err (session_payload.cpp) is the payload/bank-KV error stamper. */
 void payload_set_err(char *err, size_t errlen, const char *msg);
-/** Re-arm at request boundaries (the same sites that drop the carry and
- * pendings). All-zero == armed, matching the xcalloc'd session.
- */
+/** A request boundary (session_spec.cpp): the speculative lookahead -- the carry token, the pre-drafted
+ *  pendings -- belongs to the previous request's distribution and goes, and the terminal yield quench
+ *  re-arms.  The core runs it for EVERY family wherever a request begins or the history the lookahead was
+ *  conditioned on is replaced: a sync and an invalidate (pulsar_session_family_sync / _invalidate), a fused
+ *  prompt chunk (note_prefilled), a rewind, a payload load.  Before L284 Qwen's sync and invalidate never ran
+ *  it, and the per-bank shadow kept a latched quench for every later request on that bank. */
+void spec_lookahead_reset(pulsar_session *s);
+/** The quench half alone: re-arm the terminal yield quench (the teacher-forced probe re-arms it every round). */
 void spec_quench_reset(pulsar_session *s);
 
 /** How one layer's attention reaches beyond its 128-token window (CSA2, L218).
@@ -3068,9 +3067,11 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
  * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
  * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0. */
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
-/** L284: whether the first `len` tokens of `bank`'s history are all prefill rows (none a decode step's) --
- * the only history a sync continues; one with decode rows resumes from pulsar_session_resume_point. */
-bool pulsar_session_bank_prefilled(pulsar_session *s, uint32_t bank, int len);
+/** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
+ * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
+ * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not
+ * stale.  Otherwise the sync resumes from pulsar_session_resume_point. */
+bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen);
@@ -3301,6 +3302,16 @@ typedef struct pulsar_sync_ops {
  *  with `err`. */
 int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                 int n_images, const pulsar_sync_ops *ops, char *err, size_t errlen);
+
+/** The family's sync / eval / invalidate as the core runs them (engine_api.cpp, L284) -- every rank, mirrored
+ *  or not, and every in-engine caller: what a family's op does to its state, plus what the session does for
+ *  every family around it.  A sync begins a request and an invalidate forgets the history, so both drop the
+ *  speculative lookahead and re-arm the quench (spec_lookahead_reset); an eval commits a token chosen outside
+ *  the speculative round, so the carry no longer follows the state. */
+int pulsar_session_family_sync(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                               int n_images, char *err, size_t errlen);
+int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t errlen);
+void pulsar_session_family_invalidate(pulsar_session *s);
 
 /** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
  *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so

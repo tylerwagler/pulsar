@@ -321,7 +321,7 @@ static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tens
 }
 
 /* inc-6 W5: the redraft block, extracted from the fused loop verbatim
- * (the no-draft guard stays with the caller -- it owns hit_eos/eos_token).
+ * (the no-draft guard stays with the caller -- it owns hit_eos and the stop set).
  * Best-effort: any failure returns 0 pendings and the step is still a
  * success (the original early-return contract). Recomputes the drafter
  * locals internally so the batched lane can call it per bank under repoint

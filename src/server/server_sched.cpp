@@ -2054,7 +2054,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
     const int vocab = pulsar_engine_logits_width(s->engine);
-    const int eos_token = pulsar_token_eos(s->engine);
     park_live_bank(s, dec, n, NULL);
 
     s->guard_maybe_evict(dec, n);
@@ -2289,7 +2288,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
         uint32_t rows = 0;
         if (ns > 0)
-            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, eos_token,
+            (void)pulsar_session_spec_assemble_batch(pool, steps, ns,
                                                      heads_max - (uint32_t)n_fin, reqs, &rows);
         int m = 0;
         for (int j = 0; j < ns; j++) {
@@ -2479,7 +2478,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->accepted = accepted[q];
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
-        (void)pulsar_session_spec_round_end_batch(pool, steps, m, eos_token, logits);
+        (void)pulsar_session_spec_round_end_batch(pool, steps, m, logits);
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
             gen_state *g = sl->gen;

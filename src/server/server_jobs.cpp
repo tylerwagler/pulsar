@@ -321,111 +321,66 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         goto done;
     }
 
-    char err[160];
-    memset(err, 0, sizeof(err));
-    pulsar_session_rewrite_result rr;
-    rr = pulsar_session_rewrite_from_common(s->sess, &canonical, common,
-                                         err, sizeof(err));
-    if (rr == PULSAR_SESSION_REWRITE_OK) {
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
-                   ctx, common, live_len, canonical.len);
-        s->trace_event(trace_id,
-                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
-                    common, live_len, canonical.len);
-    } else if (rr == PULSAR_SESSION_REWRITE_REBUILD_NEEDED) {
-        /* The generated DSML suffix and the canonical prompt share a prefix,
-         * but the generated tail is too large to overwrite safely inside the
-         * live raw-window ring.  Prefer an older disk checkpoint over replaying
-         * a very long conversation from token zero. */
+    /* L284: the canonical rewrite is a SYNC of the canonical prompt -- every family's one path.  The sync keeps
+     * the live tokens up to the deepest byte the canonical spelling shares (the token-seam stitch) and resumes
+     * from the grid checkpoint the resume rule picks, so the generated tail is evaluated again in its canonical
+     * spelling.  Before, a rewrite behind the live end needed REWIND (Qwen refused it and logged
+     * "canonicalization failed" every thinking-off tool turn) and DeepSeek rebuilt it from a disk checkpoint or
+     * from 0 even with a grid checkpoint below the cut.  A sync that would start from 0 tries a disk checkpoint
+     * first, as a request's does. */
+    {
+        const int resume = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical);
         char *path = NULL;
         pulsar_tokens effective = {0};
-        int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
-                                            rendered.spans, rendered.n_spans, NULL, 0,
-                                            &effective, &path, false);
-        if (loaded == 0) pulsar_session_invalidate(s->sess);
-
-        char sync_err[160] = {0};
+        const int loaded = resume > 0 ? 0
+            : s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans, rendered.n_spans,
+                                        NULL, 0, &effective, &path, false);
         const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
-        char rebuild_ctx[48];
-        request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
-        int replay_tokens = sync_prompt->len - loaded;
-        if (replay_tokens < 0) replay_tokens = sync_prompt->len;
-        int canonical_tail_tokens = canonical.len - common;
-        if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
-        int discarded_live_tokens = live_len - common;
-        if (discarded_live_tokens < 0) discarded_live_tokens = 0;
-        const char *source = loaded > 0 ? "disk" : "full";
-        const double rebuild_t0 = server_now_sec();
+        const int cached = loaded > 0 ? loaded : resume;
+        const char *source = loaded > 0 ? "disk" : cached > 0 ? "memory" : "full";
+        char sync_ctx[48];
+        request_ctx_span(sync_ctx, sizeof(sync_ctx), cached, sync_prompt->len);
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
-                   replay_tokens,
-                   rebuild_ctx,
-                   ctx,
-                   canonical_tail_tokens,
-                   discarded_live_tokens,
-                   common,
-                   live_len,
-                   canonical.len,
-                   loaded,
-                   source,
-                   path ? " file=" : "",
-                   path ? path : "");
-        server_prefill_progress rebuild_progress = {
+                   "pulsar-server: tool checkpoint canonicalization syncs %d tokens ctx=%s request_ctx=%s common=%d "
+                   "live=%d target=%d cached=%d source=%s%s%s",
+                   sync_prompt->len - cached, sync_ctx, ctx, common, live_len, canonical.len, cached, source,
+                   path ? " file=" : "", path ? path : "");
+        server_prefill_progress progress = {
             .srv = s,
             .slot = sl,
             .kind = j->req.kind,
             .prompt_tokens = sync_prompt->len,
-            .cached_tokens = loaded,
-            .phase = "tool checkpoint rebuild",
+            .cached_tokens = cached,
+            .phase = "tool checkpoint canonicalization",
             .has_tools = j->req.has_tools,
-            .t0 = rebuild_t0,
+            .t0 = server_now_sec(),
             .fd = j->fd,
             .stream = j->req.stream,
-            /* Tool checkpoint rebuild only runs after the response stream is
-             * already in flight, so the SSE headers were sent long ago.
-             * Pre-arm the flag so the progress callback only emits keepalive
-             * comments and never tries to write a second set of headers. */
+            /* this runs after the response stream is in flight, so the SSE headers were sent long ago:
+             * the progress callback emits keepalive comments only */
             .headers_sent = true,
         };
-        snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
-        pulsar_session_set_progress(s->sess, server_progress_cb, &rebuild_progress);
-        pulsar_session_set_display_progress(s->sess, server_progress_cb, &rebuild_progress);
-        if (pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
-            pulsar_session_set_progress(s->sess, NULL, NULL);
-            pulsar_session_set_display_progress(s->sess, NULL, NULL);
-            const double rebuild_sec = server_now_sec() - rebuild_t0;
-            if (loaded > 0) {
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
-                s->trace_event(trace_id,
-                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
-                            common, live_len, canonical.len, loaded, path ? path : "");
-            } else {
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
-                s->trace_event(trace_id,
-                            "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
-                            common, live_len, canonical.len, err);
-            }
-        } else {
-            pulsar_session_set_progress(s->sess, NULL, NULL);
-            pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        snprintf(progress.ctx, sizeof(progress.ctx), "%s", sync_ctx);
+        pulsar_session_set_progress(s->sess, server_progress_cb, &progress);
+        pulsar_session_set_display_progress(s->sess, server_progress_cb, &progress);
+        char sync_err[160] = {0};
+        const int rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
+        pulsar_session_set_progress(s->sess, NULL, NULL);
+        pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        if (rc == 0) {
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
-                       rebuild_ctx, ctx, source, loaded, replay_tokens,
-                       canonical.len, sync_err);
-            s->trace_event(trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+                       "pulsar-server: tool checkpoint canonicalized ctx=%s source=%s cached=%d target=%d %.3fs",
+                       ctx, source, cached, canonical.len, server_now_sec() - progress.t0);
+            s->trace_event(trace_id, "tool checkpoint canonicalized: source=%s common=%d live=%d canonical=%d cached=%d",
+                           source, common, live_len, canonical.len, cached);
+        } else {
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: tool checkpoint canonicalization failed ctx=%s source=%s cached=%d target=%d "
+                       "error=\"%s\"", ctx, source, cached, canonical.len, sync_err);
+            s->trace_event(trace_id, "tool checkpoint canonicalization failed: %s", sync_err);
         }
         pulsar_tokens_free(&effective);
         free(path);
-    } else {
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
-                   ctx, common, live_len, canonical.len, err);
-        s->trace_event(trace_id, "tool checkpoint canonicalization failed: %s", err);
     }
 
 done:
@@ -797,15 +752,12 @@ void server::gen_begin(session_slot *sl) {
             server_slot_match_is_trivial(common, old_pos,
                                          s->slot_trivial_common_tokens,
                                          s->slot_trivial_common_tokens);
-        cached = (pm.prompt_cut > 0 && !trivial) ? pm.prompt_cut : 0;
-        cache_source = cached > 0 ? "memory-token" : "none";
-        /* L266: a bank-pool family (Qwen) cannot rewind to a byte match -- it serves an extension or a
-         * grid checkpoint, so the count is where its sync actually starts */
+        /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
+         * starts -- the match itself when the sync continues the bank where it stands, else the grid
+         * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
         const int resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
-        if (resume >= 0) {
-            cached = trivial ? 0 : resume;
-            cache_source = cached <= 0 ? "none" : cached == common ? "memory-token" : "memory-checkpoint";
-        }
+        cached = (pm.prompt_cut > 0 && !trivial) ? resume : 0;
+        cache_source = cached <= 0 ? "none" : cached == pm.prompt_cut ? "memory-token" : "memory-checkpoint";
     }
     if (cached == 0 && old_pos > 0) {
         server_log(PULSAR_LOG_WARNING,

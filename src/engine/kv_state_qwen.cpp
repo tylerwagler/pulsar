@@ -185,6 +185,7 @@ static bool qwen_noted_at(void *state, uint32_t T, bool *capture, char *why, siz
 const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN = {
     /* .name               = */ "qwen4-exp",
     /* .resume_grid        = */ QWEN_RESUME_GRID,
+    /* .split_invariant    = */ true,    /* THE RESUME GRID above */
     /* .ckpt_slots         = */ QWEN_CKPT_SLOTS,
     /* .walk               = */ qwen_walk,
     /* .min_checkpoint     = */ qwen_min_checkpoint,

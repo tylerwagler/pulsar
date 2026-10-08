@@ -3519,7 +3519,7 @@ int pulsar_tp_allgather_rows(pulsar_tp *tp, uint32_t layer, uint64_t seq,
 typedef struct {
     uint64_t session_id;
     uint32_t count;
-    int32_t value;        /* REWRITE_FROM_COMMON: the common-prefix length; 0 elsewhere */
+    int32_t value;        /* NOTE_PREFILLED: the headed row; 0 elsewhere */
 } pulsar_tp_token_command_header;
 
 typedef struct {
@@ -3837,11 +3837,6 @@ int pulsar_tp_wait_command_status_digest(pulsar_tp *tp, uint64_t session_id,
     return tp_collect_status(tp, session_id, operation, status, 1, own_digest, err, errlen);
 }
 
-int pulsar_tp_send_rewrite_from_common(pulsar_tp *tp, uint64_t session_id,
-                                       const int *tokens, uint32_t n_tokens, int common) {
-    return tp_send_token_command(tp, PULSAR_TP_FRAME_REWRITE_FROM_COMMON, session_id,
-                                 tokens, n_tokens, (int32_t)common);
-}
 int pulsar_tp_send_note_committed(pulsar_tp *tp, uint64_t session_id,
                                   const int *tokens, uint32_t n_tokens) {
     return tp_send_token_command(tp, PULSAR_TP_FRAME_NOTE_COMMITTED, session_id, tokens, n_tokens);
@@ -4286,7 +4281,6 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     switch (ftype) {
     case PULSAR_TP_FRAME_SYNC:
     case PULSAR_TP_FRAME_VERIFY:
-    case PULSAR_TP_FRAME_REWRITE_FROM_COMMON:
     case PULSAR_TP_FRAME_NOTE_COMMITTED:
     case PULSAR_TP_FRAME_NOTE_PREFILLED:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);

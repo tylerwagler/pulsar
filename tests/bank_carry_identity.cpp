@@ -122,7 +122,6 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_session_bank_state_save(s, (uint32_t)b);
     }
     const int vocab = pulsar_engine_logits_width(e);
-    const int eos = pulsar_token_eos(e);
     float *logits = (float *)malloc((size_t)ROWS * (size_t)vocab * sizeof(float));
     pulsar_spec_round *r[NB];
     for (int b = 0; b < NB; b++) r[b] = pulsar_spec_round_new();
@@ -149,7 +148,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 steps[b].k_alloc = -1;
                 steps[b].accepted_cap = 17;
             }
-            if (pulsar_session_spec_assemble_batch(s, steps, NB, eos, ROWS, reqs, &rows) != 0) {
+            if (pulsar_session_spec_assemble_batch(s, steps, NB, ROWS, reqs, &rows) != 0) {
                 fprintf(stderr, "tick %d assemble batch refused\n", t);
                 return 1;
             }
@@ -190,7 +189,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 steps[b].accepted = acc_b[b];
                 steps[b].accepted_cap = 17;
             }
-            if (pulsar_session_spec_round_end_batch(s, steps, NB, eos, logits) != 0) {
+            if (pulsar_session_spec_round_end_batch(s, steps, NB, logits) != 0) {
                 fprintf(stderr, "tick %d round_end batch refused\n", t);
                 return 1;
             }
@@ -204,7 +203,7 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
-            na_b[b] = pulsar_session_spec_round_end(s, r[b], first[b], eos, temp, top_k, top_p, min_p, &rngs[b],
+            na_b[b] = pulsar_session_spec_round_end(s, r[b], first[b], temp, top_k, top_p, min_p, &rngs[b],
                                                     logits, row0[b], acc_b[b], 17, err, sizeof(err));
             if (na_b[b] < 0) { fprintf(stderr, "tick %d bank %d end: %s\n", t, b, err); return 1; }
             timed_save(s, (uint32_t)b);

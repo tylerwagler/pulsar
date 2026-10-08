@@ -63,13 +63,13 @@ static int load_bytes(pulsar_session *s, const char *bytes, long len, char *err,
 }
 
 /* greedy speculation to n tokens: the tokens, and each round's count (the drafter's acceptance) */
-static int spec_run(pulsar_session *s, int eos, int n, int *toks, int *rounds, int *n_rounds, char *err, size_t errlen) {
+static int spec_run(pulsar_session *s, int n, int *toks, int *rounds, int *n_rounds, char *err, size_t errlen) {
     uint64_t rng = 7;
     int got = 0;
     *n_rounds = 0;
     while (got < n) {
         int buf[17];
-        const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, eos, buf, 17, err,
+        const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, buf, 17, err,
                                                           errlen);
         if (k <= 0) return 1;
         rounds[(*n_rounds)++] = k;
@@ -162,10 +162,9 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* both sessions stand at the same state: greedy speculation from each */
     if (pulsar_engine_has_spec_rounds(e)) {
-        const int eos = pulsar_token_eos(e);
         int ta[N_SPEC], tb[N_SPEC], ra[N_SPEC], rb[N_SPEC], na = 0, nb = 0;
-        const bool ok = spec_run(A, eos, N_SPEC, ta, ra, &na, err, sizeof err) == 0 &&
-                        spec_run(B, eos, N_SPEC, tb, rb, &nb, err, sizeof err) == 0;
+        const bool ok = spec_run(A, N_SPEC, ta, ra, &na, err, sizeof err) == 0 &&
+                        spec_run(B, N_SPEC, tb, rb, &nb, err, sizeof err) == 0;
         say(ok && na == nb && !memcmp(ta, tb, sizeof ta) && !memcmp(ra, rb, (size_t)na * sizeof(int)),
             "3. DRAFTER: %d greedy tokens in %d / %d rounds, tokens and round sizes identical %s", N_SPEC, na, nb, err);
     } else {

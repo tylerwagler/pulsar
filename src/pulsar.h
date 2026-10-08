@@ -520,14 +520,6 @@ void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progr
  * valid token prefix, and returns PULSAR_SESSION_SYNC_INTERRUPTED when it stops. */
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud);
 
-typedef enum {
-    PULSAR_SESSION_REWRITE_ERROR = -1,
-    PULSAR_SESSION_REWRITE_OK = 0,
-    /* The live backend state cannot be rewritten safely in place.  The caller should
-     * restore an older checkpoint if it has one, then sync to the prompt. */
-    PULSAR_SESSION_REWRITE_REBUILD_NEEDED = 1,
-} pulsar_session_rewrite_result;
-
 /** Synchronize the live session to a full prompt token prefix.  If the current
  * checkpoint is a prefix, the prompt is evaluated from the bank's latest
  * CHUNK-GRID snapshot at or below the checkpoint (a multiple of the engine's
@@ -598,10 +590,6 @@ int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, ui
  * call did not resume (nothing to evaluate, or a checkpoint that was not a
  * prefix).  An instrument for the chunk-neutrality gate (L194). */
 int pulsar_session_resume_origin(pulsar_session *s);
-bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
-pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
-        pulsar_session *s, const pulsar_tokens *prompt, int common,
-        char *err, size_t errlen);
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
 
 /** L115 — THE prefix-reuse authority.  Every "can this state serve this
@@ -884,7 +872,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
  * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
  * computed host-side from the block. */
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token, int eos_token,
+                               int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                const float *rows, uint32_t row0,
@@ -900,7 +888,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
  * teacher-forced acceptance probe (tests/spec_teacher_forced_probe.cpp) reads
  * that proposal against the target's row at fixed positions. */
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token, int eos_token,
+                                      int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       const float *rows, uint32_t row0,
@@ -972,12 +960,12 @@ typedef struct {
  * entries).  *n_rows_out = rows written.  0, or -1 when the pair refused or
  * diverged (every step then counts as failed). */
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                       int eos_token, uint32_t row_budget,
+                                       uint32_t row_budget,
                                        pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
 /** Per step: restore, round_end against the shared forward's block `rows`
  * (the step's row0 / first_token from assemble), save.  0 or -1 as above. */
 int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                        int eos_token, const float *rows);
+                                        const float *rows);
 /** Per step: restore, pulsar_session_spec_redraft_commit, save.  0 or -1. */
 int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** Gate-facing: read a batched redraft's result out of the round before it is
@@ -1032,13 +1020,16 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
  * intermediate chunk.  An index rather than a pointer so a pair's worker can
  * name the same row of its own step's block.  0 or 1. */
 int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head);
+/** One speculative round (or a plain step when the drafter is quenched or absent); returns the tokens emitted.
+ *  A round -- here, in the round API and in the batched phases -- stops at the family's whole stop set
+ *  (pulsar_token_is_stop): nothing is committed past a stop (L284: the callers' single eos id is gone). */
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
-                                     int max_tokens, int eos_token,
+                                     int max_tokens,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen);
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void pulsar_session_invalidate(pulsar_session *s);
@@ -1059,11 +1050,12 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
  * no device work.  The router's score for a bank (L264 S3): a request whose bytes
  * match the bank's history to `limit` tokens resumes there from this position. */
 int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
-/** L266: where a sync of `prompt` on `bank` starts its prefill -- the tokens the bank's state serves.  A
- *  bank-pool family (Qwen) serves an exact extension of a history the bank prefilled whole (L284: one
- *  holding decode rows is recomputed from a checkpoint), else its deepest grid checkpoint within the shared
- *  prefix, the prefill-only history and prompt->len - 1, else nothing.
- *  -1 = DeepSeek's graph pool, whose live KV serves any byte-matched prefix (pulsar_session_bank_prefix_match). */
+/** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
+ *  every family by one rule (L284; DeepSeek answered -1 before and its callers trusted the byte match).  The
+ *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
+ *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves
+ *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
+ *  and the stitched prompt's length - 1, else nothing (0). */
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 int pulsar_session_pos(pulsar_session *s);

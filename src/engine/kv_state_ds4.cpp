@@ -156,6 +156,7 @@ static bool ds4_noted_at(void *state, uint32_t, bool *capture, char *, size_t) {
 const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .name               = */ "deepseek-v4",
     /* .resume_grid        = */ DS4_RESUME_GRID,
+    /* .split_invariant    = */ false,   /* L183: only a grid cut is the cold prefill's */
     /* .ckpt_slots         = */ DS4_CKPT_SLOTS,
     /* .walk               = */ ds4_walk,
     /* .min_checkpoint     = */ ds4_min_checkpoint,

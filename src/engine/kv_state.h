@@ -63,6 +63,11 @@ typedef struct {
 typedef struct pulsar_kv_state_ops {
     const char *name;            ///< printed in refusals ("deepseek-v4", "qwen4-exp")
     uint32_t resume_grid;        ///< tokens; every pool's tokens_per_row divides it
+    /** L284: a prompt cut ANYWHERE is the cold prefill's bytes (Qwen: split-invariant kernels, L266 C1), so a
+     *  history prefilled whole continues from its end wherever that falls; false = only a cut on resume_grid is
+     *  (DeepSeek: a chunk's bytes depend on a row's offset in the call, L183), so a history ending off the grid
+     *  resumes from a checkpoint below it.  The one fact pulsar_session_bank_continues reads. */
+    bool split_invariant;
     uint32_t ckpt_slots;         ///< slots per bank, <= PULSAR_CKPT_SLOTS_MAX (the ladder's rule is checkpoint.cpp's)
     /** The ONE slot layout, walked identically by sizing, capture and restore: `dir` < 0 sizes
      *  only (*bytes = the slot's size), 0 copies the installed bank's state -> slot, > 0 copies
