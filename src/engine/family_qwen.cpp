@@ -1374,22 +1374,19 @@ static bool qwen_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, u
 }
 
 /* Prefill the live bank from `start` through the core loop (prefill_loop.cpp, L272 P2): prefill_cap
- * chunks, progress, and the cancel hook at every chunk boundary.  When the prefill continues the bank's
- * prefill-only history, the chunk that crosses the prompt's last grid point is cut there and the state
- * captured -- the checkpoint the next divergent turn resumes from.  A cut changes no byte: every prompt
- * chunk takes the prefill arms (session_contract_gate C1), which is also why an interrupted sync
- * resumes exactly.  Returns the loop's 0 / PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
+ * chunks, progress, the cancel hook at every chunk boundary, and the shared checkpoint ladder (P13: a
+ * capture at every grid chunk end while the prefill continues the bank's prefill-only history, the last
+ * chunk cut at the prompt's last grid point).  A cut changes no byte: every prompt chunk takes the prefill
+ * arms (session_contract_gate C1), which is also why an interrupted sync resumes exactly.  Returns the
+ * loop's 0 / PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
 static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
     qwen_prefill_ctx c;
     c.live = s->qwen->live_bank;
     c.canonical = s->qwen->prefill_pos[c.live] == start && !s->qwen->frontier_stale[c.live];
-    pulsar_ckpt_store *ck = s->qwen->ckpt;
-    const uint32_t grid_end = pulsar_ckpt_grid_floor(ck, (uint32_t)prompt->len);
-    const uint32_t capture_at = c.canonical && grid_end > start ? grid_end : 0u;
     c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
-    const int rc = pulsar_prefill_loop(s, prompt, start, s->prefill_cap, capture_at, ck, c.live, qwen_prefill_chunk, &c);
+    const int rc = pulsar_prefill_loop(s, prompt, start, s->prefill_cap, s->qwen->ckpt, c.live, qwen_prefill_chunk, &c);
     free(c.pos);
     free(c.bank);
     return rc;

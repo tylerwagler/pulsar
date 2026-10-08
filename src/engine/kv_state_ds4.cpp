@@ -28,11 +28,8 @@
 static_assert(DS4_RESUME_GRID % 2u == 0u, "a grid point must be a complete ratio-2 group");
 static_assert(DS4_RESUME_GRID % 128u == 0u, "every compress ratio (4, 128) must divide the grid");
 
-/* The newest checkpoints are the prompt ends of the turns a client is most likely to continue;
- * the older ones thin out into a ladder reaching back into the history a client rewrites (L261:
- * tool results 12-20k tokens back).  ~3.8 MB a slot. */
+/* ~3.8 MB a slot, so 16 (the ladder over them is checkpoint.cpp's). */
 #define DS4_CKPT_SLOTS 16u
-#define DS4_CKPT_RECENT 8u
 static_assert(DS4_CKPT_SLOTS <= PULSAR_CKPT_SLOTS_MAX, "the store's slot bound");
 
 static pulsar_gpu_graph *G_(void *state) { return (pulsar_gpu_graph *)state; }
@@ -146,9 +143,10 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     return n;
 }
 
-/* A fused chunk to T: the graph's frontier counters are the step's own (the graph steps each run's rows); a bank
- * whose compressor group is stale holds lanes that describe no prefill, so it is not captured (the sync's
- * grid-point resume rebuilds it). */
+/* A prompt chunk to T -- the planner's, or a fused step's: the graph's frontier counters are the chunk's own (the
+ * graph steps each run's rows); a bank whose compressor group is stale holds lanes that describe no prefill, so it
+ * is not captured (the sync's grid-point resume rebuilds it; a planner chunk never runs on one -- the compressor
+ * store refuses). */
 static bool ds4_noted_at(void *state, uint32_t, bool *capture, char *, size_t) {
     pulsar_gpu_graph *g = G_(state);
     *capture = !g->ms_comp_state_stale[gpu_graph_cur_bank(g)];
@@ -159,7 +157,6 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .name               = */ "deepseek-v4",
     /* .resume_grid        = */ DS4_RESUME_GRID,
     /* .ckpt_slots         = */ DS4_CKPT_SLOTS,
-    /* .ckpt_recent        = */ DS4_CKPT_RECENT,
     /* .walk               = */ ds4_walk,
     /* .min_checkpoint     = */ ds4_min_checkpoint,
     /* .stands_at          = */ ds4_stands_at,

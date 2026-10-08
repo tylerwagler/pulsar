@@ -1,15 +1,16 @@
 /* prefill_loop.cpp -- L272 P2: the family-neutral prefill loop.
  *
- * A sync's prefill is the same walk for every family: chunks of the session's prefill cap from the
- * resume point, one chunk cut at the grid point the family captures, the session's view advanced as
- * each chunk lands, the progress hooks told, and the cancel hook polled at every chunk boundary --
+ * A sync's prefill is the same walk for every family: chunks ending on the absolute multiples of the
+ * session's prefill cap, the last cut at the prompt's last grid point, a grid checkpoint wherever a chunk
+ * lands on the grid in a prefill's state (P13: pulsar_ckpt_landed, the one capture rule), the session's
+ * view advanced as each chunk lands, the progress hooks told, and the cancel hook polled at every chunk boundary --
  * which is how the server yields a long prefill to other slots and honours a client that hung up
  * (gen_prefill_cancel_cb).  The family supplies only the chunk's forward.  Before L272 Qwen's prefill
  * had its own loop with no progress and no cancel: a disconnected Claude Code request prefilled to the
  * end and held every other slot behind it.
  *
- * Both this loop and DeepSeek's planner (imatrix.cpp gpu_graph_prefill_chunked_range: absolute cap
- * snaps, compress-ratio alignment, image blocks, a capture at every grid chunk end) run ONE walk,
+ * Both this loop and DeepSeek's planner (imatrix.cpp gpu_graph_prefill_chunked_range: the same absolute cap
+ * snap, final cut and capture rule, plus its compress-ratio alignment and image cuts) run ONE walk,
  * pulsar_prefill_walk_run: the order is the walk's, the planning and the effects are each caller's
  * hooks.  The events are the planner's: prefill_chunk / prefill_display at the start and after each
  * chunk. */
@@ -42,12 +43,13 @@ static void prefill_loop_progress(pulsar_session *s, int current, int total) {
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
 }
 
-/* The session loop's hooks over the walk: chunks of `cap`, one cut at `capture_at`, the view advanced and
- * the state captured as each chunk lands, the session's cancel hook as the stop. */
+/* The session loop's hooks over the walk: chunks to the absolute multiples of `cap`, the last cut at the
+ * prompt's last grid point, the view advanced and the shared capture rule applied as each chunk lands, the
+ * session's cancel hook as the stop. */
 struct prefill_loop_ctx {
     pulsar_session *s;
     const pulsar_tokens *prompt;
-    uint32_t cap, capture_at, bank;
+    uint32_t cap, bank;
     pulsar_ckpt_store *ckpt;
     pulsar_prefill_chunk_fn chunk;
     void *ud;
@@ -71,8 +73,9 @@ static bool prefill_loop_block_across(const prefill_loop_ctx *c, uint32_t cut, u
 
 static uint32_t prefill_loop_next_end(void *ud, uint32_t pos0, uint32_t end) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
-    uint32_t rows = end - pos0 < c->cap ? end - pos0 : c->cap;
-    if (c->capture_at && pos0 < c->capture_at && pos0 + rows > c->capture_at) rows = c->capture_at - pos0;
+    const uint32_t to_boundary = pulsar_prefill_to_boundary(pos0, c->cap);
+    uint32_t rows = end - pos0 < to_boundary ? end - pos0 : to_boundary;
+    if (pos0 + rows == end) rows = pulsar_ckpt_final_cut(c->ckpt, pos0, end) - pos0;
     /* L268: an image block is merged whole by the chunk that owns it, so a cut never splits one: it moves to the
      * block's start, or -- the block starts this chunk (it fits one: pulsar_image_spans_fit) -- past its end (a
      * capture point inside it is skipped) */
@@ -91,8 +94,7 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     pulsar_session *s = c->s;
     for (int i = s->checkpoint.len; i < (int)chunk_end; i++) token_vec_push(&s->checkpoint, c->prompt->v[i]);
     s->checkpoint_valid = true;
-    if (c->capture_at && chunk_end == c->capture_at && !pulsar_ckpt_capture(c->ckpt, c->bank, c->capture_at))
-        return false;
+    if (!pulsar_ckpt_landed(c->ckpt, c->bank, chunk_end)) return false;
     prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
     return true;
 }
@@ -100,8 +102,7 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
 static bool prefill_loop_stop(void *ud) { return pulsar_session_cancelled(((const prefill_loop_ctx *)ud)->s); }
 
 int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, uint32_t cap,
-                        uint32_t capture_at, pulsar_ckpt_store *ckpt, uint32_t bank,
-                        pulsar_prefill_chunk_fn chunk, void *ud) {
+                        pulsar_ckpt_store *ckpt, uint32_t bank, pulsar_prefill_chunk_fn chunk, void *ud) {
     const uint32_t end = (uint32_t)prompt->len;
     if (cap == 0u || start >= end) {
         fprintf(stderr, "pulsar: prefill loop: nothing to prefill (start %u, end %u, cap %u)\n", start, end, cap);
@@ -109,7 +110,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     }
     /* L268: a start inside an image block would re-evaluate its merged rows without their image */
     {
-        prefill_loop_ctx probe = { s, prompt, cap, 0u, bank, ckpt, chunk, ud };
+        prefill_loop_ctx probe = { s, prompt, cap, bank, ckpt, chunk, ud };
         uint32_t bs = 0, be = 0;
         if (start > 0 && prefill_loop_block_across(&probe, start, &bs, &be)) {
             fprintf(stderr, "pulsar: prefill loop: start %u is inside image block [%u, %u) -- refusing\n", start, bs, be);
@@ -121,7 +122,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     for (uint32_t i = 0; i < start; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     s->checkpoint_valid = start > 0u;
     prefill_loop_progress(s, (int)start, prompt->len);
-    prefill_loop_ctx c = { s, prompt, cap, capture_at, bank, ckpt, chunk, ud };
+    prefill_loop_ctx c = { s, prompt, cap, bank, ckpt, chunk, ud };
     const pulsar_prefill_walk w = { prefill_loop_next_end, prefill_loop_chunk, prefill_loop_landed, prefill_loop_stop, &c };
     const int rc = pulsar_prefill_walk_run(&w, start, end);
     /* the logits are the prompt's next-token row only when the final chunk ran (a stop leaves the view
