@@ -280,11 +280,23 @@ def write_index(out_dir):
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+# The family modules, registered by the checkpoint's config.json model_type -- the one authority for which naming
+# table applies.  names.py is DeepSeek's (V4 Flash / Vision-Exp and V4.1), qwen.py is qwen4_exp's.
+FAMILIES = {'deepseek_v4': N, 'deepseek_v41': N, 'qwen4_exp': Q}
+
+
+def family_of(hf):
+    mt = hf.config['top_level'].get('model_type')
+    if mt not in FAMILIES:
+        raise SystemExit(f'config.json model_type {mt!r}: no family module registered ({sorted(FAMILIES)})')
+    return FAMILIES[mt]
+
+
 def make_plan(args):
-    """The family's plan, chosen by the checkpoint's model_type (config.json) -- the one authority for which
-    table applies; a Qwen-only flag on a DeepSeek build (or the reverse) refuses."""
+    """The family's plan, chosen by the checkpoint's model_type; a Qwen-only flag on a DeepSeek build (or the
+    reverse) refuses."""
     hf = hf_of(args)
-    if Q.is_qwen(hf):
+    if family_of(hf) is Q:
         if args.format_map or args.exl3_layers or args.reap_map or args.mxfp8_scale != 'rederive':
             raise SystemExit('qwen4_exp: --format-map / --exl3-layers / --reap-map / --mxfp8-scale are DeepSeek '
                              'options; the recipe (--recipe) names every tensor')

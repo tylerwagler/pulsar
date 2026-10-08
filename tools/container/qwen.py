@@ -45,16 +45,12 @@ import entries as EN
 import exl3_rates
 import kv as KV
 import producers as PR
+from names import Mapped
 
 FAMILY = "qwen4_exp"
 PFX = "model.language_model."
 EXL3_RATES = exl3_rates.rates(exl3_rates.QWEN)   # words per 16x16 tile -> layout, the rates Qwen's arms read
 FORMATS = {"bf16", "mxfp8_lt", *exl3_rates.QWEN, "ple_rows", "kv", "omit"}
-EXPERT_STACKS = ("gate_up_proj", "down_proj")
-
-
-def is_qwen(hf) -> bool:
-    return hf.config["top_level"].get("model_type") == FAMILY
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +90,71 @@ class Recipe:
 
 
 # ---------------------------------------------------------------------------
-# names -> shards
+# the naming table: HF name -> (role, shard, the expert stack's per-part entry names).  The container name and the
+# gguf_name ARE the HF name (the Qwen family binds by the checkpoint's own names); what the table adds is what
+# each tensor IS (its role, the recipe's vocabulary) and where it lives.  A name the table lacks refuses.
 # ---------------------------------------------------------------------------
-_LAYER = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
+# the suffix after `model.language_model.layers.N.` (and the drafter's `mtp.layers.N.`) -> role
+BLOCK_ROLES = {
+    **{f"{hc}_hyper_connection.{t}": r for hc in ("attn", "mlp") for t, r in (
+        ("block_inject_weight.weight", "other"), ("hc_norm.weight", "norm"),
+        ("input_mix_weight_down.weight", "dense"), ("input_mix_weight_up.weight", "dense"))},
+    "linear_attn.A_log": "other", "linear_attn.dt_bias": "other", "linear_attn.conv1d.weight": "other",
+    "linear_attn.norm.weight": "norm",
+    **{f"linear_attn.{p}.weight": "dense" for p in ("in_proj_a", "in_proj_b", "in_proj_qkv", "in_proj_z", "out_proj")},
+    **{f"self_attn.{p}.weight": "dense" for p in ("q_proj", "k_proj", "v_proj", "o_proj", "indexer.index_qk_proj")},
+    **{f"self_attn.{p}.weight": "norm" for p in ("q_norm", "k_norm", "indexer.q_layernorm", "indexer.k_layernorm")},
+    "mlp.gate.weight": "router",
+    "mlp.experts.gate_up_proj": "expert_gate_up",
+    "mlp.experts.down_proj": "expert_down",
+    **{f"mlp.shared_expert.{p}.weight": "shared_expert" for p in ("gate_proj", "up_proj", "down_proj")},
+    "mlp.shared_expert_gate.weight": "router",
+    "ple.key_proj.weight": "dense", "ple.value_proj.weight": "dense", "ple.conv1d.weight": "other",
+    **{f"ple.{p}.weight": "norm" for p in ("norm_conv", "norm_key", "norm_query")},
+    **{f"ple.ple_embedding.{p}": "ple_buffer" for p in ("layer_multipliers", "ngram_heads_offsets",
+                                                       "ngram_heads_vocab_sizes")},
+}
+TOP_ROLES = {
+    "lm_head.weight": "head",
+    f"{PFX}embed_tokens.weight": "embed",
+    f"{PFX}hyper_connection_mixer.hc_norm.weight": "norm",
+    f"{PFX}hyper_connection_mixer.input_mix_weight_down.weight": "other",
+    f"{PFX}hyper_connection_mixer.input_mix_weight_up.weight": "other",
+}
+# the drafter's own (outside mtp.layers.N): no lane reads it yet; it maps so a recipe can omit it by name
+MTP_ROLES = {"mtp.fc_embedding.weight": "dense", "mtp.fc_hidden.weight": "dense",
+             "mtp.pre_fc_norm_embedding.weight": "norm", "mtp.pre_fc_norm_hidden.weight": "norm",
+             "mtp.hyper_connection_mixer.hc_norm.weight": "norm",
+             "mtp.hyper_connection_mixer.input_mix_weight_down.weight": "other",
+             "mtp.hyper_connection_mixer.input_mix_weight_up.weight": "other"}
+_BLOCK = re.compile(r"^(model\.language_model\.layers|mtp\.layers)\.(\d+)\.(.+)$")
+_NGRAM = re.compile(r"^ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
+
+
+def map_hf(name: str) -> Mapped | None:
+    """The naming table's row for an HF name, or None (the caller refuses)."""
+    m = _BLOCK.match(name)
+    if m:
+        mtp, layer, rest = m.group(1) == "mtp.layers", int(m.group(2)), m.group(3)
+        role = "ple_table" if _NGRAM.match(rest) else BLOCK_ROLES.get(rest)
+        if role is None:
+            return None
+        part = rest.rsplit(".", 1)[1] if role.startswith("expert_") else None
+        return Mapped(name, name, "mtp" if mtp else "layer", "mtp" if mtp else f"layers.{layer}", layer, None, part,
+                      False, role=role)
+    if name.startswith("model.visual."):
+        return Mapped(name, name, "vision", "vision", None, None, None, False, role="vision")
+    if name in TOP_ROLES:
+        return Mapped(name, name, "top", "top", None, None, None, False, role=TOP_ROLES[name])
+    if name in MTP_ROLES:
+        return Mapped(name, name, "mtp", "mtp", None, None, None, False, role=MTP_ROLES[name])
+    return None
+
+
+def expert_names(m: Mapped, part: str) -> tuple[str, str]:
+    """(family gguf_name, per-expert entry name with "{e}") of one part of the expert stack `m`."""
+    pre = m.container_name[:-len(m.part)]
+    return pre + part, pre + "{e}." + part + ".weight"
 
 
 def shard_order(n_layer):
@@ -105,17 +163,6 @@ def shard_order(n_layer):
 
 def shard_file(order, shard):
     return f"model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors"
-
-
-def shard_of(name):
-    m = _LAYER.match(name)
-    if m:
-        return f"layers.{int(m.group(1))}"
-    if name.startswith("model.visual."):
-        return "vision"
-    if name in ("lm_head.weight", f"{PFX}embed_tokens.weight") or name.startswith(f"{PFX}hyper_connection_mixer."):
-        return "top"
-    raise SystemExit(f"{name}: no shard for this name")
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +181,12 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
         if f in consumed:
             consumed[f] += 1
             continue
-        shard = shard_of(name)
+        m = map_hf(name)
+        if m is None:
+            raise SystemExit(f"{name}: not a tensor the qwen4_exp naming table maps -- refusing")
+        shard = m.shard
+        if shard not in shards:
+            raise SystemExit(f"{name}: shard {shard} outside the plan ({len(order)} shards)")
         dtype, shape = hf.dtype(name), hf.shape(name)
         if f in ("bf16", "mxfp8_lt"):
             entry = {"name": name, "layout": f, "gguf_name": name, **EN.dense(hf, name, f, shape)}
@@ -150,7 +202,7 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
             entry = {"name": name, "layout": f, "gguf_name": name, "dtype": "U8", "shape": [nbytes],
                      "nbytes": nbytes, "src": ("ranges", ranges)}
         elif f.startswith("exl3m_"):
-            _plan_experts(hf, exl3_experts or exl3, recipe, name, f, shards[shard])
+            _plan_experts(hf, exl3_experts or exl3, recipe, m, f, shards[shard])
             continue
         else:
             raise SystemExit(f"{name}: format {f} has no producer")
@@ -183,15 +235,15 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
     return shape, order, files, shards, sum(consumed.values())
 
 
-def _plan_experts(hf, src, recipe, stack_name, layout, shard):
+def _plan_experts(hf, src, recipe, m, layout, shard):
     """One HF expert stack ([E, out, in] BF16) -> its EXL3 families: gate_up_proj (fused) or gate_proj + up_proj
     (split, the recipe's word), down_proj."""
+    stack_name = m.container_name
     if src is None:
         raise SystemExit(f"{stack_name}: the recipe names {layout}; pass --exl3 (or --exl3-experts)")
-    m = re.match(r"^(model\.language_model\.layers\.(\d+)\.mlp\.experts\.)(gate_up_proj|down_proj)$", stack_name)
-    if not m:
+    if m.role not in ("expert_gate_up", "expert_down"):
         raise SystemExit(f"{stack_name}: not a routed-expert stack")
-    pre, layer, stack = m.group(1), int(m.group(2)), m.group(3)
+    layer, stack = m.layer, m.part
     E, out, inp = hf.shape(stack_name)
     if stack == "gate_up_proj" and recipe.gate_up == "split":
         if out % 2:
@@ -201,10 +253,10 @@ def _plan_experts(hf, src, recipe, stack_name, layout, shard):
         parts = [(stack, out)]
     for part, n in parts:
         eb = PR.bytes_for(layout, [inp, n])
-        fam_name = pre + part
-        entry_name = pre + "{e}." + part + ".weight"
+        fam_name, entry_name = expert_names(m, part)
         for e in range(E):
-            ranges, nbytes = EN.exl3_ranges(src, f"{pre}{e}.{part}", layout, inp, n, EXL3_RATES)
+            ranges, nbytes = EN.exl3_ranges(src, entry_name.replace("{e}", str(e))[:-len(".weight")], layout, inp, n,
+                                            EXL3_RATES)
             assert nbytes == eb
             name = entry_name.replace("{e}", str(e))
             shard["entries"].append({"name": name, "layout": layout, "gguf_name": fam_name, "dtype": "U8",

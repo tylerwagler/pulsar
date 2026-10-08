@@ -93,6 +93,7 @@ class Mapped:
     part: str | None
     is_scale: bool
     emit: bool = True
+    role: str = ""              # what the tensor IS, in the recipe's vocabulary
 
 
 def shard_order(shape: ModelShape) -> list[str]:
