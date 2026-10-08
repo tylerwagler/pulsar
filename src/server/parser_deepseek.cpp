@@ -145,8 +145,8 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool 
 
 /* The turn's final reading (L284 P4, the rule every family shares -- see turn_tool_retry_allowed): the
  * DSML parse of the block (an unterminated one -- the cap cut it -- is not parsed and never repaired), the
- * stream's ids onto the parsed calls, a call to an undeclared tool dropped, tool memory, the finish label.
- * A turn left with no valid call loops through the model-visible retry when allowed, else it is text. */
+ * stream's ids onto the parsed calls; then the finish every family shares (parser_finish_turn: the
+ * undeclared-call drop, the retry or text, tool memory, the finish label). */
 static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g, server_turn *out) {
     deepseek_parser *ps = (deepseek_parser *)st;
     job *j = g->j;
@@ -154,10 +154,10 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
     if (j->req.kind != REQ_CHAT) return true;
     const bool block = j->req.has_tools && ps->saw_tool_start;
     const bool unterminated = block && !ps->saw_tool_end;
-    char why[512] = "";
+    const char *why = "";
     bool broken = unterminated;
     if (unterminated) {
-        snprintf(why, sizeof why, "unterminated tool call (the turn ended inside the tool_calls block)");
+        why = "unterminated tool call (the turn ended inside the tool_calls block)";
     } else if (!parse_generated_message_ex(g->text.ptr ? g->text.ptr : "", pulsar_think_mode_enabled(j->req.think_mode),
                                            &out->content, &out->reasoning, &out->calls)) {
         free(out->content);
@@ -165,62 +165,12 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
         out->content = out->reasoning = NULL;
         tool_calls_free(&out->calls);
         broken = block;
-        snprintf(why, sizeof why, "invalid tool call");
+        why = "invalid tool call";
     }
-    if (out->calls.len) {
-        if (ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
-        /* L272: a call to an undeclared tool is not executable: dropped -- after the stream's ids were
-         * applied: the live projection stopped at the first such call, so every call before it kept its
-         * index */
-        int kept = 0;
-        for (int i = 0; i < out->calls.len; i++) {
-            char detail[512];
-            if (tool_call_declared(&j->req, out->calls.v[i].name, detail, sizeof(detail))) {
-                out->calls.v[kept++] = out->calls.v[i];
-                continue;
-            }
-            if (!broken) snprintf(why, sizeof why, "%s", detail);
-            broken = true;
-            free(out->calls.v[i].id);
-            free(out->calls.v[i].name);
-            free(out->calls.v[i].arguments);
-        }
-        if (kept < out->calls.len) {
-            /* the sampled bytes hold the dropped call: no tool memory for this turn (a prefix miss) */
-            free(out->calls.raw_dsml);
-            out->calls.raw_dsml = NULL;
-        }
-        out->calls.len = kept;
-    }
-    if (broken) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s %s", g->ctx_span, g->req_flags[0] ? " " : "",
-                   g->req_flags, why);
-        s->trace_event(g->trace_id, "%s", why);
-    }
-    if (broken && out->calls.len == 0) {
-        if (turn_tool_retry_allowed(g)) {
-            free(out->content);
-            free(out->reasoning);
-            out->content = out->reasoning = NULL;
-            return turn_tool_retry(s, sl, g, why, out);
-        }
-        free(out->content);
-        free(out->reasoning);
-        out->content = out->reasoning = NULL;
-        turn_as_text(g, out);
-        if (ps->walk_on && ps->walk.emit_pos < g->text.len) {
-            /* the walk stopped at the block's marker; the rest goes out as text at the finish */
-            out->tail = g->text.ptr + ps->walk.emit_pos;
-            out->tail_len = g->text.len - ps->walk.emit_pos;
-        }
-        return true;
-    }
-    if (out->calls.len) {
-        s->assign_tool_call_ids(&out->calls, j->req.api);
-        s->tool_memory_remember(&out->calls);   /* a no-op without the sampled bytes */
-    }
-    out->finish = turn_finish(g, out->calls.len);
-    return true;
+    if (out->calls.len && ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
+    /* as text, the walk stopped at the block's marker: the rest goes out at the finish */
+    const size_t tail_from = ps->walk_on ? ps->walk.emit_pos : SIZE_MAX;
+    return parser_finish_turn(s, sl, g, out, broken, why, /*logged=*/false, tail_from, true);
 }
 
 const server_output_parser_ops k_parser_deepseek = {

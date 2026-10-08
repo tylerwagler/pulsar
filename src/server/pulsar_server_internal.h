@@ -2892,13 +2892,19 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls);
 /** L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call
- *  (generate.cpp): retry allowed -- once, non-streaming, a chat with tools, forced or not; the retry; the
- *  turn as text (reasoning, then the answer's raw bytes, no call); the finish label (error / length as
- *  the generation ended, else tool_calls with calls, else stop). */
+ *  (generate.cpp): retry allowed -- once, non-streaming, a chat with tools, forced or not. */
 bool turn_tool_retry_allowed(const struct gen_state *g);
-bool turn_tool_retry(server *s, struct session_slot *sl, struct gen_state *g, const char *detail, server_turn *out);
-void turn_as_text(const struct gen_state *g, server_turn *out);
-const char *turn_finish(const struct gen_state *g, int n_calls);
+/** The finish every family's parser ends in (generate.cpp), once its own reading filled `out` (content,
+ *  reasoning, the calls -- the stream's ids on them, raw_dsml when their sampled bytes are the tool memory's
+ *  key): a call to an undeclared tool dropped, then the shared rule -- a turn left broken with no call
+ *  retries through the model-visible tool error when allowed, else is TEXT (reasoning, then the answer's
+ *  raw bytes, no call) plus the stream's unsent tail from `tail_from` (>= the text's length = none);
+ *  otherwise ids, tool memory and the finish label (error / length as the generation ended, else
+ *  tool_calls with calls, else stop).  `broken`: the family's reading found a broken call, `why` its
+ *  detail (the retry's tool error); `logged`: the family already logged it (else the finish logs the
+ *  detail once).  Returns the retry's result when one ran, else `ok` (the family's stream status). */
+bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
+                        const char *why, bool logged, size_t tail_from, bool ok);
 void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders);
