@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """The direct container builder: HF checkpoint(s) -> pulsar's safetensors container.
 
-    plan    --hf DIR [--exl3 DIR [--exl3-layers 5,18-22]] [--format-map JSON] [--dump FILE]
+    recipe  --hf DIR [--exl3 DIR] [--recipe JSON]    # print the pulsar.recipe.v1 the build runs (DeepSeek's default
+                                                     #  is generated from policy.py + the EXL3 source)
+    plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
     verify  ... --out DIR (--shard S | --all)        # against the HF SOURCE
     audit   --out DIR                                # structure + index closed both ways
@@ -27,10 +29,10 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hf_source import HFCheckpoint, Exl3Checkpoint  # noqa: E402
-import names as N          # noqa: E402
-import policy as P         # noqa: E402
+from hf_source import HFCheckpoint, Exl3Checkpoint, TesseraBundle  # noqa: E402
+import exl3_rates          # noqa: E402
 import producers as PR     # noqa: E402
+import recipe as R         # noqa: E402
 import qwen as Q           # noqa: E402
 import deepseek as D       # noqa: E402
 import entries as EN       # noqa: E402
@@ -46,26 +48,9 @@ def align_for(nbytes):
     return 1
 
 
-def parse_layers(spec):
-    out = set()
-    for part in (spec or '').split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part:
-            a, b = part.split('-', 1)
-            out |= set(range(int(a), int(b) + 1))
-        else:
-            out.add(int(part))
-    return out
-
-
 # ---------------------------------------------------------------------------
 # the plan: ONE walk for every family; the family module supplies only what is its own (deepseek.py, qwen.py)
 # ---------------------------------------------------------------------------
-CONSUMED = ('ple_rows', 'kv', 'omit')      # formats that write no container tensor (the recipe's word)
-
-
 def shard_file(order, shard):
     return f'model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors'
 
@@ -83,6 +68,8 @@ def add_families(shard, families):
     """Routed families -> one U8 entry per expert-projection, contiguous in expert order, plus the pulsar.experts
     record (the engine's stride is expert_bytes)."""
     for f in families:
+        if f['layout'] in exl3_rates.K2:
+            exl3_rates.admit(f['role'], f['layout'], f['gguf_name'])
         eb = PR.bytes_for(f['layout'], [f['inp'], f['n']])
         shard['experts'].append({'gguf_name': f['gguf_name'], 'part': f['part'], 'n_experts': len(f['srcs']),
                                  'expert_bytes': eb, 'layout': f['layout'], 'contiguous': True,
@@ -92,24 +79,61 @@ def add_families(shard, families):
                                      'dtype': 'U8', 'shape': [eb], 'nbytes': eb, 'src': src})
 
 
-def dense_entry(hf, fam, m, name, layout, ctx):
-    """One dense entry: an EXL3 Linear's ranges or the producer table's payload for (source, layout)."""
+def dense_entry(hf, fam, m, name, fmt, ctx):
+    """One dense entry: an EXL3 Linear's ranges, or the producer table's payload for (source, layout)."""
+    layout, src = fmt
     hshape = hf.shape(name)                        # the SOURCE shape (producers take it)
     dshape = fam.declared_shape(m, hshape)         # what the container holds (the family's quirks)
     dims_ne = list(reversed(dshape))
+    if layout == 'native':
+        if hf.dtype(name) not in PR.NATIVE_LAYOUT:
+            raise SystemExit(f'{name}: native format, but the engine has no layout for a {hf.dtype(name)} source')
+        layout = PR.NATIVE_LAYOUT[hf.dtype(name)]
     entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
-    if layout.startswith('exl3m_'):
-        src = fam.exl3_source(m, ctx)
-        if src is None:
-            raise SystemExit(f'{name}: {layout} is an EXL3 format; pass --exl3')
+    if layout in exl3_rates.K2:
+        exl3_rates.admit(m.role, layout, name)
         if hf.dtype(name) != 'BF16' or len(hshape) != 2 or not name.endswith('.weight'):
             raise SystemExit(f'{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {hf.dtype(name)} {hshape}')
         out, inp = hshape
-        ranges, nbytes = EN.exl3_ranges(src, name[:-len('.weight')], layout, inp, out, fam.EXL3_RATES)
+        ranges, nbytes = EN.exl3_ranges(ctx.sources[src], name[:-len('.weight')], layout, inp, out)
         entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes, src=('ranges', ranges))
+    elif layout == 'tessera':
+        PR.produce(PR.spec(PR.producer_for('tessera', layout, name), []), ctx.sources[src])
     else:
         entry.update(EN.dense(hf, name, layout, dshape, ctx.mxfp8_mode))
     return entry, dims_ne
+
+
+def resolve(hf, fam, mapped, ctx):
+    """name -> (format, source name) for every emitted tensor: the recipe's row, admitted by the family's loader,
+    its source defaulted (hf; exl3 for the EXL3 formats -- a routed expert's from --exl3-experts when given; tessera
+    for tessera) and present.  Every source the build was given must be read by some row."""
+    recipe = ctx.recipe or fam.default_recipe(hf, mapped, ctx)
+    ctx.recipe = recipe
+    if recipe.model_type != hf.config['top_level']['model_type']:
+        raise SystemExit(f'{recipe.path}: a recipe for {recipe.model_type!r}; the checkpoint is '
+                         f'{hf.config["top_level"]["model_type"]!r}')
+    out, used = {}, {'hf'}
+    for name, (fmt, src) in recipe.resolve(mapped).items():
+        m = mapped[name]
+        fam.admit(hf, m, fmt, name)
+        if fmt in R.CONSUMED:
+            out[name] = (fmt, None)
+            continue
+        if src is None:
+            src = ('tessera' if fmt == 'tessera' else
+                   'exl3_experts' if fmt in exl3_rates.K2 and m.role.startswith('expert_') and ctx.sources.get('exl3_experts')
+                   else 'exl3' if fmt in exl3_rates.K2 else 'hf')
+        if ctx.sources.get(src) is None:
+            raise SystemExit(f'{name}: the recipe reads {fmt} from source {src}; pass --{src.replace("_", "-")}')
+        if (src in ('exl3', 'exl3_experts')) != (fmt in exl3_rates.K2) or (src == 'tessera') != (fmt == 'tessera'):
+            raise SystemExit(f'{name}: format {fmt} is not read from source {src}')
+        used.add(src)
+        out[name] = (fmt, src)
+    idle = sorted(k for k, v in ctx.sources.items() if v is not None and k not in used)
+    if idle:
+        raise SystemExit(f'--{idle[0].replace("_", "-")}: given, but no row of {recipe.path} reads it')
+    return out
 
 
 def plan(hf, fam, ctx):
@@ -124,7 +148,7 @@ def plan(hf, fam, ctx):
         if m is None:
             raise SystemExit(f'{name}: not a tensor the {fam.__name__} naming table maps -- refusing')
         mapped[name] = m
-    fmt = fam.formats(hf, mapped, ctx)
+    fmt = resolve(hf, fam, mapped, ctx)
     groups = {}         # per-expert tensors, grouped by the family (fam.group_key) and planned after the walk
     consumed = 0        # names the source carries and the container does not (drop rules, consumed formats)
     for name in hf_names:
@@ -134,25 +158,27 @@ def plan(hf, fam, ctx):
             continue
         if m.is_scale:
             continue                      # folded into its weight's producer
-        layout = fmt[name]
-        if layout in CONSUMED:
+        if fmt[name][0] in R.CONSUMED:
             consumed += 1
             continue
         if m.shard not in shards:
             raise SystemExit(f'{name}: shard {m.shard} outside the plan ({len(order)} shards)')
         if m.role.startswith('expert_'):
             if fam.EXPERT_STACKS:         # the HF tensor is the whole stack: its families, in walk order
-                add_families(shards[m.shard], fam.stack_families(hf, m, layout, ctx))
+                add_families(shards[m.shard], fam.stack_families(hf, m, fmt[name], ctx))
             else:
                 groups.setdefault(fam.group_key(m), {})[m.expert] = (name, m)
             continue
-        entry, dims_ne = dense_entry(hf, fam, m, name, layout, ctx)
+        entry, dims_ne = dense_entry(hf, fam, m, name, fmt[name], ctx)
         shards[m.shard]['entries'].append(entry)
-        shards[m.shard]['tensors'][m.container_name] = {'layout': layout, 'dims_ne': dims_ne,
+        shards[m.shard]['tensors'][m.container_name] = {'layout': entry['layout'], 'dims_ne': dims_ne,
                                                         'gguf_name': m.gguf_name}
     for key, slots in sorted(groups.items()):
         add_families(shards[key[0]], fam.group_families(hf, key, slots, fmt, ctx))
 
+    if ctx.mxfp8_mode != 'rederive' and not any(
+            e['src'][0] == 'produce' and e['src'][1]['producer'] == 'mxfp8_lt' for p in shards.values() for e in p['entries']):
+        raise SystemExit(f'--mxfp8-scale {ctx.mxfp8_mode}: no entry of this build is an FP8-sourced mxfp8_lt')
     kvs = fam.build_kv(hf, ctx)
     kv_arch = [k for k in kvs if not k['key'].startswith('tokenizer.')]
     for s in order:
@@ -301,36 +327,35 @@ def family_of(hf):
     return FAMILIES[mt]
 
 
-def make_plan(args):
-    """The one plan over the family the checkpoint's model_type names; a Qwen-only flag on a DeepSeek build (or
-    the reverse) refuses."""
+def context(args):
+    """The family the checkpoint's model_type names and the build's context: its sources, its recipe (None = the
+    family's default), the options its producers and kv read."""
     hf = hf_of(args)
     fam = family_of(hf)
-    ctx = argparse.Namespace(exl3=None, exl3_experts=None,
-                             exl3_layers=set(), overrides={}, mxfp8_mode=args.mxfp8_scale, recipe=None,
+    sources = {'hf': hf, 'exl3': Exl3Checkpoint(args.exl3) if args.exl3 else None,
+               'exl3_experts': Exl3Checkpoint(args.exl3_experts) if args.exl3_experts else None,
+               'tessera': TesseraBundle(args.tessera) if args.tessera else None}
+    rec = R.Recipe.load(args.recipe, fam.SETTINGS) if args.recipe else None
+    if rec is not None and fam.SETTINGS:
+        fam.check_recipe(rec)
+    ctx = argparse.Namespace(sources=sources, recipe=rec, mxfp8_mode=args.mxfp8_scale,
                              tokenizer_dir=args.tokenizer or args.hf, reap_map=args.reap_map, ple_rows=args.ple_rows)
-    if fam is Q:
-        if args.format_map or args.exl3_layers or args.reap_map or args.mxfp8_scale != 'rederive':
-            raise SystemExit('qwen4_exp: --format-map / --exl3-layers / --reap-map / --mxfp8-scale are DeepSeek '
-                             'options; the recipe (--recipe) names every tensor')
-        if not args.recipe:
-            raise SystemExit('qwen4_exp: pass --recipe (tools/container/format-maps/qwen38fn-*.json)')
-        ctx.exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
-        ctx.exl3_experts = Exl3Checkpoint(args.exl3_experts) if args.exl3_experts else None
-        ctx.recipe = Q.Recipe(args.recipe)
-        return plan(hf, fam, ctx)
-    if args.recipe or args.exl3_experts or args.ple_rows:
-        raise SystemExit('--recipe / --exl3-experts / --ple-rows are qwen4_exp options')
-    ctx.exl3 = Exl3Checkpoint(args.exl3) if args.exl3 else None
-    if ctx.exl3:
-        have = set(N.exl3_layers(ctx.exl3.names()))
-        ctx.exl3_layers = parse_layers(args.exl3_layers) if args.exl3_layers else have
-        missing = sorted(ctx.exl3_layers - have)
-        if missing:
-            raise SystemExit(f'{args.exl3}: layers {missing} requested but not present (have {sorted(have)})')
-    if args.format_map:
-        ctx.overrides = P.rekey_format_map(json.load(open(args.format_map)), D.shape(hf, ctx))
+    return hf, fam, ctx
+
+
+def make_plan(args):
+    hf, fam, ctx = context(args)
     return plan(hf, fam, ctx)
+
+
+def cmd_recipe(args):
+    """Print the pulsar.recipe.v1 the build runs: the one given, or the family's default for these sources."""
+    hf, fam, ctx = context(args)
+    if ctx.recipe is None:
+        shape = fam.shape(hf, ctx)
+        ctx.recipe = fam.default_recipe(hf, {n: fam.map_hf(n, shape) for n in hf.names()}, ctx)
+    print(ctx.recipe.to_json())
+    return 0
 
 
 def cmd_plan(args):
@@ -349,8 +374,8 @@ def cmd_plan(args):
     if args.dump:
         write_dump(args.dump, shape, order, files, shards, consumed)
         print(f'plan dump: {args.dump}')
-    if args.exl3:
-        print(f'exl3 from {args.exl3}' + (f'; layers {args.exl3_layers}' if args.exl3_layers else ''))
+    print('sources: ' + ', '.join(f'{k} {getattr(args, k)}' for k in ('exl3', 'exl3_experts', 'tessera')
+                                  if getattr(args, k)))
     return 0
 
 
@@ -540,19 +565,21 @@ def cmd_audit(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name, fn in (('plan', cmd_plan), ('emit', cmd_emit), ('verify', cmd_verify), ('audit', cmd_audit)):
+    for name, fn in (('recipe', cmd_recipe), ('plan', cmd_plan), ('emit', cmd_emit), ('verify', cmd_verify),
+                     ('audit', cmd_audit)):
         p = sub.add_parser(name)
         if name != 'audit':
             p.add_argument('--hf', required=True, help='the HF checkpoint directory (config.json + shards)')
-            p.add_argument('--exl3', metavar='DIR', help='source the routed experts of --exl3-layers from this EXL3 checkpoint')
-            p.add_argument('--exl3-layers', metavar='SPEC', help='e.g. 5,18-22 (default: every layer the EXL3 checkpoint holds)')
-            p.add_argument('--format-map', metavar='JSON', help='per-tensor layout overrides (tools/container/format-maps)')
+            p.add_argument('--exl3', metavar='DIR', help='an exllamav3 checkpoint: the source `exl3` recipe rows read')
+            p.add_argument('--exl3-experts', metavar='DIR', help='a second exllamav3 checkpoint: source `exl3_experts` '
+                           '(the default source of a routed expert\'s EXL3 rows when given)')
+            p.add_argument('--tessera', metavar='DIR', help='a Tessera bundle: source `tessera` (the producer lands with L255)')
+            p.add_argument('--recipe', metavar='JSON', help='a pulsar.recipe.v1 (recipe.py; format-maps/*.json).  '
+                           'DeepSeek default: generated from policy.py + the EXL3 source (`recipe` prints it)')
             p.add_argument('--mxfp8-scale', choices=('rederive', 'verbatim'), default='rederive',
                            help='FP8 dense -> mxfp8_lt: re-derive the per-32 E8M0 (byte-identical to the archived codec) or broadcast the source block scale')
             p.add_argument('--tokenizer', metavar='DIR', help='tokenizer files (default: the HF dir)')
             p.add_argument('--reap-map', metavar='JSON')
-            p.add_argument('--recipe', metavar='JSON', help='qwen4_exp: the per-tensor format map (format-maps/qwen38fn-*.json)')
-            p.add_argument('--exl3-experts', metavar='DIR', help='qwen4_exp: a separate EXL3 checkpoint for the routed experts only')
             p.add_argument('--ple-rows', metavar='MANIFEST', help='qwen4_exp: the PLE row file manifest (ple_rows.py build)')
         if name == 'plan':
             p.add_argument('--dump', metavar='FILE', help='write every shard\'s exact header and every entry\'s source '
@@ -560,7 +587,7 @@ def main():
         if name == 'verify':
             p.add_argument('--roundtrip', action='store_true',
                            help='also decode every BF16-sourced mxfp8_lt entry and hold it to the E4M3 rounding bound')
-        if name != 'plan':
+        if name not in ('plan', 'recipe'):
             p.add_argument('--out', required=True)
         if name in ('emit', 'verify'):
             g = p.add_mutually_exclusive_group(required=True)

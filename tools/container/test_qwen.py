@@ -347,7 +347,7 @@ def main():
         bad_ex = os.path.join(tmp, "exl3-k3")
         make_exl3(bad_ex, hf_t, np.random.default_rng(7), dense_K=3)
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", bad_ex, "--recipe", recipe, "--ple-rows", man,
-                      expect_fail=True, contains="not a rate pulsar reads here")
+                      expect_fail=True, contains="the recipe names exl3m_k5, the EXL3 source holds exl3m_k3")
         check(ok, "dense at K3 (no row names it) -> refused")
         bad_ex = os.path.join(tmp, "exl3-k5-experts")
         make_exl3(bad_ex, hf_t, np.random.default_rng(7), expert_K=5)
@@ -365,8 +365,8 @@ def main():
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", bad_ex, "--recipe", recipe, "--ple-rows", man,
                       expect_fail=True, contains="codebook multiplier")
         check(ok, "a tensor on another codebook -> refused")
-        ok, out = run("build.py", "plan", *common, "--mxfp8-scale", "verbatim", expect_fail=True, contains="DeepSeek options")
-        check(ok, "a DeepSeek option on a qwen4_exp build -> refused")
+        ok, out = run("build.py", "plan", *common, "--mxfp8-scale", "verbatim", expect_fail=True, contains="no entry of this build is an FP8-sourced mxfp8_lt")
+        check(ok, "--mxfp8-scale verbatim with no FP8 source (the Qwen checkpoint is BF16) -> refused")
         r = json.load(open(recipe))
         for label, rows, msg in (
                 ("unnamed", [x for x in r["rows"] if x[0] != "model.visual.*"], "no row of"),
@@ -385,6 +385,20 @@ def main():
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", recipe, "--ple-rows", mp,
                       expect_fail=True, contains="a different table")
         check(ok, "a PLE manifest with another head table -> refused")
+
+        tb = os.path.join(tmp, "tessera")
+        os.makedirs(tb)
+        open(os.path.join(tb, PFX + "layers.0.mlp.experts.gate_up_proj.pt"), "wb").write(b"\0")
+        rt = dict(r, rows=[[p, "tessera"] if p.endswith("mlp.experts.gate_up_proj") else [p, f] for p, f in r["rows"]])
+        rp = os.path.join(tmp, "recipe-tessera.json")
+        json.dump(rt, open(rp, "w"))
+        ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--tessera", tb, "--recipe", rp, "--ple-rows",
+                      man, expect_fail=True, contains="the tessera producer lands with L255")
+        check(ok, "routed experts as Tessera planes -> refused by name (the producer is L255's)")
+        json.dump(dict(r, model_type="deepseek_v4"), open(rp, "w"))
+        ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      expect_fail=True, contains="a recipe for 'deepseek_v4'")
+        check(ok, "a recipe for another model_type -> refused")
 
         print("split gate/up (turboderp's layout):")
         ex_s = os.path.join(tmp, "exl3-split")

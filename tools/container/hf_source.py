@@ -176,3 +176,20 @@ class Exl3Checkpoint:
         if tn != trellis or un + vn != scales:
             raise SystemExit(f'{key}: {tn} + {un} + {vn} bytes on disk, the layout says {trellis} + {scales}')
         return [(tp, to, tn), (up, uo, un), (vp, vo, vn)], words
+
+
+class TesseraBundle:
+    """A Tessera source (L255): a directory of unit-blob files, one per routed expert stack -- the torch.save
+    {"gate" / "up" / "down": [one unit blob per expert]} L255's overlay_layer.py --blobs reads -- named
+    `<the stack's HF name>.pt`.  The reader only indexes them: turning blobs into the planes the engine binds is
+    Tessera's own load-time prep (torch + a CUDA device), the producer table's ("tessera", "tessera") slot, which
+    lands with L255 (producers.tessera_planes)."""
+
+    def __init__(self, path):
+        self.dir = path
+        self.files = {f[:-len('.pt')]: os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith('.pt')}
+        if not self.files:
+            raise SystemExit(f'{path}: no <stack>.pt unit-blob files -- not a Tessera bundle')
+
+    def names(self):
+        return sorted(self.files)

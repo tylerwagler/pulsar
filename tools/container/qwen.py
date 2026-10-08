@@ -8,8 +8,9 @@ Sources (no GGUF anywhere, L247):
            (research/l251/container/qwen_exl3_quant.py: gate_up fused) or turboderp's (gate / up separate).
   --exl3-experts   optional: a DIFFERENT exllamav3 checkpoint for the routed experts only (e.g. turboderp's K4
            experts beside our K5 dense).  Named explicitly; nothing falls back from one source to the other.
-  --recipe the per-tensor format map (format-maps/qwen38fn-*.json): every checkpoint tensor matches EXACTLY ONE row
-           (fnmatch), every row matches something; a tensor no row names refuses.
+  --recipe a pulsar.recipe.v1 (recipe.py; format-maps/qwen38fn-*.json, name-pattern rows): every checkpoint tensor
+           matches EXACTLY ONE row, every row matches something; a tensor no row names refuses.  Its family setting
+           expert_gate_up (fused | split) says how the routed gate_up stack is written.
   --ple-rows  the PLE row-file manifest (ple_rows.py build): its header facts become pulsar.kv entries so the
            loader can refuse a mismatched table.
 
@@ -34,8 +35,6 @@ What the container holds (the loader's contract, published in pulsar-notes resea
 """
 from __future__ import annotations
 
-import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -44,51 +43,20 @@ import struct
 import entries as EN
 import exl3_rates
 import kv as KV
+import producers as PR
+import recipe as R
 from names import Mapped
 
 FAMILY = "qwen4_exp"
 PFX = "model.language_model."
-EXL3_RATES = exl3_rates.rates(exl3_rates.QWEN)   # words per 16x16 tile -> layout, the rates Qwen's arms read
 META = {"pulsar.family": FAMILY}
+SETTINGS = ("expert_gate_up",)  # the recipe's family setting: the routed gate_up stack fused or split
 EXPERT_STACKS = True            # an HF expert tensor is the whole [E, out, in] stack; its families plan in walk order
 GATE_UP_PARTS = ("gate_up_proj", "gate_proj", "up_proj")
-FORMATS = {"bf16", "mxfp8_lt", *exl3_rates.QWEN, "ple_rows", "kv", "omit"}
-
-
-# ---------------------------------------------------------------------------
-# the recipe
-# ---------------------------------------------------------------------------
-class Recipe:
-    def __init__(self, path):
-        self.path = path
-        r = json.load(open(path))
-        if r.get("model_type") != FAMILY:
-            raise SystemExit(f"{path}: recipe is for {r.get('model_type')!r}, not {FAMILY}")
-        self.name = r["recipe"]
-        self.gate_up = r["expert_gate_up"]
-        if self.gate_up not in ("fused", "split"):
-            raise SystemExit(f"{path}: expert_gate_up {self.gate_up!r} is neither 'fused' nor 'split'")
-        self.rows = [tuple(x) for x in r["rows"]]
-        for pat, fmt in self.rows:
-            if fmt not in FORMATS:
-                raise SystemExit(f"{path}: row {pat!r} names format {fmt!r} ({sorted(FORMATS)})")
-        self.sha256 = hashlib.sha256(open(path, "rb").read()).hexdigest()
-
-    def resolve(self, names):
-        """name -> format for every checkpoint name, refusing unnamed / doubly-named tensors and dead rows."""
-        out, used = {}, set()
-        for n in names:
-            hits = [(p, f) for p, f in self.rows if fnmatch.fnmatchcase(n, p)]
-            if not hits:
-                raise SystemExit(f"{n}: no row of {self.path} names this tensor's format -- refusing")
-            if len(hits) > 1:
-                raise SystemExit(f"{n}: {len(hits)} rows of {self.path} match ({[p for p, _ in hits]}) -- refusing")
-            out[n] = hits[0][1]
-            used.add(hits[0][0])
-        dead = [p for p, _ in self.rows if p not in used]
-        if dead:
-            raise SystemExit(f"{self.path}: rows that match no checkpoint tensor: {dead}")
-        return out
+PART_ROLE = {"gate_up_proj": "expert_gate_up", "gate_proj": "expert_gate", "up_proj": "expert_up",
+             "down_proj": "expert_down"}
+# what the qwen4_exp loader binds (any role; the EXL3 rate by the engine's arm, exl3_rates.admit)
+ADMITS = {"bf16", "mxfp8_lt", "tessera", *exl3_rates.K2, *R.CONSUMED}
 
 
 # ---------------------------------------------------------------------------
@@ -171,25 +139,32 @@ def declared_shape(m, hshape):
     return list(hshape)                 # no reshapes: the declared shape is the source's
 
 
-def exl3_source(m, ctx):
-    return ctx.exl3
+def admit(hf, m, fmt, name):
+    if fmt not in ADMITS:
+        raise SystemExit(f"{name}: the qwen4_exp loader binds {sorted(ADMITS)}, not {fmt}")
 
 
-def formats(hf, mapped, ctx):
-    return ctx.recipe.resolve(hf.names())
+def default_recipe(hf, mapped, ctx):
+    raise SystemExit("qwen4_exp: pass --recipe (tools/container/format-maps/qwen38fn-*.json)")
 
 
-def stack_families(hf, m, layout, ctx):
-    """One HF expert stack ([E, out, in] BF16) -> its EXL3 families: gate_up_proj (fused) or gate_proj + up_proj
-    (split, the recipe's word), down_proj."""
+def check_recipe(recipe):
+    if recipe.settings.get("expert_gate_up") not in ("fused", "split"):
+        raise SystemExit(f"{recipe.path}: expert_gate_up {recipe.settings.get('expert_gate_up')!r} is neither "
+                         "'fused' nor 'split'")
+
+
+def stack_families(hf, m, fmt, ctx):
+    """One HF expert stack ([E, out, in] BF16) -> its families: gate_up_proj (fused) or gate_proj + up_proj (split,
+    the recipe's setting), down_proj; each expert-projection from the EXL3 source by its Linear key."""
     stack_name = m.container_name
-    if not layout.startswith("exl3m_"):
+    layout, src = fmt
+    if layout == "tessera":
+        return PR.produce(PR.spec(PR.producer_for("tessera", layout, stack_name), []), ctx.sources[src])
+    if layout not in exl3_rates.K2:
         raise SystemExit(f"{stack_name}: the recipe names {layout}; a routed stack is written from an EXL3 source")
-    src = ctx.exl3_experts or ctx.exl3
-    if src is None:
-        raise SystemExit(f"{stack_name}: the recipe names {layout}; pass --exl3 (or --exl3-experts)")
     E, out, inp = hf.shape(stack_name)
-    if m.part == "gate_up_proj" and ctx.recipe.gate_up == "split":
+    if m.part == "gate_up_proj" and ctx.recipe.settings["expert_gate_up"] == "split":
         if out % 2:
             raise SystemExit(f"{stack_name}: odd gate_up width {out}")
         parts = [("gate_proj", out // 2), ("up_proj", out // 2)]
@@ -199,9 +174,9 @@ def stack_families(hf, m, layout, ctx):
     for part, n in parts:
         fam_name, entry_name = expert_names(m, part)
         names = [entry_name.replace("{e}", str(e)) for e in range(E)]
-        srcs = [("ranges", EN.exl3_ranges(src, x[:-len(".weight")], layout, inp, n, EXL3_RATES)[0]) for x in names]
-        fams.append(dict(gguf_name=fam_name, part=part, layout=layout, inp=inp, n=n, entry_names=names, srcs=srcs,
-                         extras={"entry_name": entry_name, "layer": m.layer}))
+        srcs = [("ranges", EN.exl3_ranges(ctx.sources[src], x[:-len(".weight")], layout, inp, n)[0]) for x in names]
+        fams.append(dict(gguf_name=fam_name, part=part, role=PART_ROLE[part], layout=layout, inp=inp, n=n,
+                         entry_names=names, srcs=srcs, extras={"entry_name": entry_name, "layer": m.layer}))
     return fams
 
 
@@ -249,7 +224,10 @@ def build_kv(hf, ctx):
     """pulsar.kv for qwen4_exp: `general.*`; the text_config verbatim under `qwen4_exp.` (config_kvs); the PLE
     buffers as u64 arrays; the builder's own facts under `pulsar.*` (recipe, sources, the PLE row file the
     table must match); the tokenizer from the checkpoint's own files."""
-    recipe, ple_manifest, exl3, exl3_experts = ctx.recipe, ctx.ple_rows, ctx.exl3, ctx.exl3_experts
+    if ctx.reap_map:
+        raise SystemExit("--reap-map: REAP survivor maps are a DeepSeek table (validate_reap_metadata)")
+    recipe, ple_manifest = ctx.recipe, ctx.ple_rows
+    exl3, exl3_experts = ctx.sources.get("exl3"), ctx.sources.get("exl3_experts")
     top = hf.config["top_level"]
     text = top["text_config"]
     A = FAMILY
@@ -291,7 +269,7 @@ def build_kv(hf, ctx):
     kvs += [
         ("pulsar.recipe", "string", recipe.name),
         ("pulsar.recipe.sha256", "string", recipe.sha256),
-        ("pulsar.expert_gate_up", "string", recipe.gate_up),
+        ("pulsar.expert_gate_up", "string", recipe.settings["expert_gate_up"]),
         ("pulsar.mtp_present", "bool", False),
         ("pulsar.vision_present", "bool", "vision_config" in top),
         ("pulsar.ple_rows.file", "string", os.path.basename(ple_manifest)[:-len(".json")] + ".rows"),

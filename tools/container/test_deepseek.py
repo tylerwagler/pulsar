@@ -12,7 +12,11 @@ checkpoint for layers 1 and 2 (K2 / K2.5 + K3), a toy BPE tokenizer.  What it pi
     that selects EXL3 layers, overrides formats, re-derives nothing (verbatim) and carries a REAP survivor map
   * GOLDEN: the SHA-256 of every emitted file, fixed on the builder before L279's refactor.  A refactor that moves
     a byte of either build fails here by file name -- the builder's byte-identity instrument (rule 7)
-  * refusals: a format the source cannot be written in, an IQ2 row (no producer)
+  * pulsar.recipe.v1: `build.py recipe` prints the generated default, which passed back builds the same bytes; the
+    selected build is a hand-written role recipe (layer sets, a block row, an EXL3 source)
+  * refusals: a format the family's loader does not bind, an unknown format (IQ2), DeepSeek EXL3 dense (the engine
+    admits it nowhere on dev), Tessera on DeepSeek, exactly-one-row and dead-row violations, a source given but read
+    by no row
 """
 from __future__ import annotations
 
@@ -243,23 +247,61 @@ def main():
             fams = {x["part"]: x["layout"] for x in json.loads(h["__metadata__"]["pulsar.experts"])}
             check(fams == {"w1": "exl3m_k2h", "w3": "exl3m_k2h", "w2": "exl3m_k3"}, f"layers.2 families {fams}")
 
-        fm = os.path.join(tmp, "format-map.json")
-        json.dump({"blk.0.ffn_gate_exps.weight": "CUTLASS_MXFP4", "blk.0.attn_q_a.weight": "MXFP8_LT",
-                   "dspark.0.ffn_down_exps.weight": "CUTLASS_MXFP4"}, open(fm, "w"))
+        print("recipe round trip:")
+        ok, out = run("recipe", "--hf", hf, "--exl3", ex)
+        check(ok and '"schema": "pulsar.recipe.v1"' in out, "build.py recipe prints the generated default")
+        rp = os.path.join(tmp, "default.recipe.json")
+        open(rp, "w").write(out)
+        o2 = os.path.join(tmp, "default-from-recipe")
+        ok, _ = run("emit", "--hf", hf, "--exl3", ex, "--recipe", rp, "--out", o2, "--all")
+        check(ok and digest(o2) == GOLDEN["default"], "the printed default, passed back as --recipe, builds GOLDEN default")
+
+        # the selected build: the generated default with its expert rows rewritten -- layer 2's routed experts from
+        # the EXL3 checkpoint, every other expert from the HF FP4 source (before L279: --exl3-layers 2, plus a
+        # --format-map whose rows only restated the defaults) -- the FP8 block scales verbatim, a REAP survivor map
+        rows = [r for r in json.loads(out)["rows"] if not r.get("role", "").startswith("expert_")]
+        for role, k in (("expert_gate", "exl3m_k2h"), ("expert_up", "exl3m_k2h"), ("expert_down", "exl3m_k3")):
+            rows += [{"role": role, "layers": [2], "format": k, "source": "exl3"},
+                     {"role": role, "layers": ["0-1"], "format": "cutlass_mxfp4"},
+                     {"role": role, "block": "mtp", "format": "cutlass_mxfp4"}]
+        sel = {"schema": "pulsar.recipe.v1", "recipe": "test-selected", "model_type": "deepseek_v4", "rows": rows}
+        sp = os.path.join(tmp, "selected.recipe.json")
+        json.dump(sel, open(sp, "w"))
         reap = os.path.join(tmp, "reap.json")
         json.dump({"layout": "per-layer", "expert_count": [E] * L, "keep_count": [E] * L, "policy": [0] * L,
                    "survivors": [list(range(E))] * L}, open(reap, "w"))
-        build_and_grade(tmp, "selected", ["--hf", hf, "--exl3", ex, "--exl3-layers", "2", "--format-map", fm,
-                                          "--mxfp8-scale", "verbatim", "--reap-map", reap])
+        build_and_grade(tmp, "selected", ["--hf", hf, "--exl3", ex, "--recipe", sp, "--mxfp8-scale", "verbatim",
+                                          "--reap-map", reap])
 
         print("refusals:")
-        bad = os.path.join(tmp, "bad-map.json")
-        json.dump({"blk.0.attn_norm.weight": "MXFP8_LT"}, open(bad, "w"))
-        ok, _ = run("plan", "--hf", hf, "--format-map", bad, expect_fail=True, contains="is written as bf16")
-        check(ok, "a bf16 source asked for mxfp8_lt -> refused")
-        json.dump({"blk.0.ffn_down_exps.weight": "IQ2_XXS_MMQ"}, open(bad, "w"))
-        ok, _ = run("plan", "--hf", hf, "--format-map", bad, expect_fail=True, contains="does not produce")
-        check(ok, "an IQ2 expert row -> refused (no producer)")
+        bad = os.path.join(tmp, "bad.recipe.json")
+
+        def refused(label, rows_, contains):
+            json.dump(dict(sel, rows=rows_), open(bad, "w"))
+            ok_, out_ = run("plan", "--hf", hf, "--exl3", ex, "--recipe", bad, expect_fail=True, contains=contains)
+            check(ok_, f"{label} -> refused")
+            if not ok_:
+                print(out_[-600:])
+
+        def swap(role, new):
+            return [new if r.get("role") == role and "layers" not in r and "block" not in r else r for r in rows]
+        refused("a norm (bf16 source) asked for mxfp8_lt", swap("norm", {"role": "norm", "format": "mxfp8_lt"}),
+                "binds this norm tensor as ['native'], not mxfp8_lt")
+        refused("an IQ2 row (no producer)", swap("dense", {"role": "dense", "format": "iq2_xxs_mmq_k"}),
+                "names format 'iq2_xxs_mmq_k'")
+        refused("DeepSeek EXL3 dense", swap("dense", {"role": "dense", "format": "exl3m_k4", "source": "exl3"}),
+                "DeepSeek EXL3 dense refused")
+        refused("Tessera experts on DeepSeek", [dict(r, format="tessera", source="tessera") if r.get("layers") == [2]
+                                                else r for r in rows], "not tessera")
+        refused("a role row and a name row on one tensor",
+                rows + [{"name": "layers.0.ffn_norm.weight", "format": "native"}], "rows of")
+        refused("a row that matches nothing",
+                rows + [{"role": "expert_gate", "block": "mtp", "layers": [7], "format": "cutlass_mxfp4"}],
+                "match no checkpoint tensor")
+        refused("--exl3 given, read by no row",
+                [r for r in rows if r.get("source") != "exl3"]
+                + [{"role": r, "layers": [2], "format": "cutlass_mxfp4"} for r in ("expert_gate", "expert_up", "expert_down")],
+                "--exl3: given, but no row")
     finally:
         shutil.rmtree(tmp)
     print(f"test_deepseek: {'PASS' if not FAILS else 'FAIL'} ({len(FAILS)} failing)")

@@ -6,6 +6,7 @@ Both families' plans call these.  What decides the bytes is (source kind, target
 exllamav3 Linear (trellis | suh | svh, copied verbatim)."""
 from __future__ import annotations
 
+import exl3_rates
 import producers as PR
 
 
@@ -59,9 +60,10 @@ def expert_src(hf, name: str, layout: str, out: int, inp: int):
     return ("produce", PR.spec(prod, [name, scale_of(name)], out=out, inp=inp))
 
 
-def exl3_ranges(src, key: str, layout: str, k: int, n: int, rates: dict):
+def exl3_ranges(src, key: str, layout: str, k: int, n: int):
     """One EXL3 Linear `key` of the exllamav3 checkpoint `src` as `layout`: its byte ranges and their count."""
     PR.producer_for("exl3", layout, key)
+    rates = exl3_rates.LAYOUT_BY_WORDS
     ranges, words = src.linear(key, k, n, rates)
     if rates[words] != layout:
         raise SystemExit(f"{key}: the recipe names {layout}, the EXL3 source holds {rates[words]} -- refusing")

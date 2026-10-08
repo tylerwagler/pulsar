@@ -24,13 +24,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from names import ModelShape, map_hf, shard_file, shard_order   # noqa: E402
-from policy import NATIVE, PolicyError, declared_shape, layout_for, rekey_format_map  # noqa: E402
+from policy import PolicyError, declared_shape, layout_for  # noqa: E402
+from producers import NATIVE_LAYOUT as NATIVE  # noqa: E402
+import exl3_rates  # noqa: E402
 
 SERVED = "/mnt/models/DeepSeek-v4-Flash/"
 VEXP = "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp/snapshots/*/"
 V41 = "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/*/"
 EXL3 = "/mnt/models/mia-v41-exl3/model-000*-of-00039.safetensors"
-FORMAT_MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "format-maps", "v5mx4-format-map.json")
 
 EXPERT_ENTRY = re.compile(r"^(layers|mtp)\.(\d+)\.ffn\.experts\.\d+\.(w[123])\.weight$")
 
@@ -130,7 +131,7 @@ def main():
             continue
         fam[m.family] += 1
         try:
-            layout = layout_for(m, dtype, hshape, {})
+            layout = layout_for(m, dtype, hshape)
         except PolicyError as e:
             fail(f"{hf}: {e}")
             continue
@@ -183,35 +184,6 @@ def main():
     print(f"  {len(produced_tensors)}/{len(tensors)} declared tensors and "
           f"{len(produced_experts)}/{len(experts)} expert entries reproduced")
 
-    # ------------------------------------------------------------------ format map re-key
-    fmap = json.load(open(FORMAT_MAP))
-    try:
-        rekeyed = rekey_format_map(fmap, shape)
-    except PolicyError as e:
-        fail(f"rekey_format_map: {e}")
-        rekeyed = {}
-    unresolved = [k for k in rekeyed if "*" not in k and k not in src]
-    if unresolved:
-        fail(f"rekey_format_map: {len(unresolved)} keys are not source tensors, e.g. {unresolved[:3]}")
-    by_layout = collections.Counter(rekeyed.values())
-    print(f"format map {os.path.basename(FORMAT_MAP)}: {len(fmap)} rows -> {len(rekeyed)} HF keys, layouts {dict(by_layout)}")
-    # the map applied as overrides: buildable rows agree with the defaults, IQ2 rows refuse loudly
-    refused, applied = 0, 0
-    for pat, want in rekeyed.items():
-        if "*" in pat:
-            hf = pat.replace("*", "0")
-        else:
-            hf = pat
-        m = map_hf(hf, shape)
-        try:
-            layout_for(m, *src[hf], {pat: want})
-            applied += 1
-        except PolicyError:
-            refused += 1
-            if want != "iq2_xxs_mmq_k":
-                fail(f"format map row {pat}={want} refused although the builder produces {want}")
-    print(f"  as overrides: {applied} rows applied, {refused} refused (all {by_layout.get('iq2_xxs_mmq_k', 0)} IQ2 rows: no producer in the builder)")
-
     # ------------------------------------------------------------------ V4.1 names
     snap41 = one(V41)
     src41, cfg41 = hf_checkpoint(snap41)
@@ -236,7 +208,7 @@ def main():
             continue
         fam41[m.family] += 1
         try:
-            layout_for(m, dtype, hshape, {})
+            layout_for(m, dtype, hshape)
         except PolicyError as e:
             fail(f"V4.1 {hf}: {e}")
     if none41:
@@ -264,19 +236,22 @@ def main():
             primaries += 1
             entries.add(m.container_name)
             if m.family == "expert":
+                # the rate the trellis holds, admitted by the engine arm the expert's role runs (exl3_rates.admit)
+                layout = exl3_rates.LAYOUT_BY_WORDS.get(hshape[2]) if dtype == "I16" and len(hshape) == 3 else None
                 try:
-                    rates[(m.shard.split(".")[0], layout_for(m, dtype, hshape, {}))] += 1
-                except PolicyError:
-                    # MiaAI quantized the drafter's experts at 4 bits (mtp_bits: 4 -> 64
-                    # words per tile), a rate the engine has no arm for: refused, not built.
-                    refused3[(m.shard.split(".")[0], hshape[2])] += 1
+                    if layout is None:
+                        raise SystemExit(f"{hshape}")
+                    exl3_rates.admit(m.role, layout, k)
+                    rates[(m.shard.split(".")[0], layout)] += 1
+                except SystemExit:
+                    refused3[(m.shard.split(".")[0], hshape[2] if len(hshape) == 3 else hshape)] += 1
     if none3:
         fail(f"EXL3: {len(none3)} names map to None, e.g. {none3[:5]}")
     print(f"EXL3 {os.path.dirname(EXL3)}: {len(exl3_names)} tensors mapped, per family {dict(sorted(fam3.items()))}; "
           f"{primaries} primaries -> {len(entries)} container entries; expert rates {dict(rates)}; "
           f"refused (family, words/tile) {dict(refused3)}")
-    if any(fam == "layers" for fam, _ in refused3):
-        fail(f"EXL3: a text-stack expert rate was refused: {dict(refused3)}")
+    if refused3:
+        fail(f"EXL3: an expert rate no engine arm reads: {dict(refused3)}")
 
     # ------------------------------------------------------------------ pinned expectations
     def expect(hf, sh, **want):
@@ -309,21 +284,15 @@ def main():
         if map_hf(bad, shape) is not None:
             fail(f"pinned: {bad} should map to None")
     m = map_hf("layers.0.ffn.gate.tid2eid", shape)
-    if layout_for(m, "I64", [129280, 6], {}) != "i32":
+    if layout_for(m, "I64", [129280, 6]) != "i32":
         fail("pinned: tid2eid I64 -> i32")
     for hf, dtype, hshape in (("layers.0.attn_norm.weight", "F16", [4096]), ("layers.0.attn.wkv.weight", "F8_E4M3", [4096]),
                               ("layers.0.hc_attn_base", "I64", [24])):
         try:
-            layout_for(map_hf(hf, shape), dtype, hshape, {})
+            layout_for(map_hf(hf, shape), dtype, hshape)
             fail(f"pinned: {hf} {dtype} {hshape} should refuse")
         except PolicyError:
             pass
-    try:
-        layout_for(map_hf("layers.0.attn.wkv.weight", shape), "F8_E4M3", [512, 4096], {"layers.*.attn.wkv.weight": "bf16"})
-        fail("pinned: an override contradicting the source dtype should refuse")
-    except PolicyError:
-        pass
-
     total = sum(fam.values()) + sum(companions.values()) + sum(dropped.values())
     print(f"\nRESULT: {total} Vision-Exp names walked ({sum(fam.values())} entries, {sum(companions.values())} companions, "
           f"{sum(dropped.values())} consumed-not-emitted), {len(src41)} V4.1 names, {len(exl3_names)} EXL3 names, "
