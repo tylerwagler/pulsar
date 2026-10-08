@@ -24,6 +24,12 @@
  * D[,D] names depths whose top-1 is a near tie (the prefill reference gate's list): KL still
  * enforced, a top-1 flip accepted by name.  This, not GATE 5R's replayed rows, is the fidelity
  * grade for width-dependent decode arithmetic (Tyler 2026-10-03: "go ahead").
+ * L284: the serial run decodes all w rows anyway, so EVERY row of the wide step is graded against
+ * the same row decoded one token at a time -- the verify's base and draft rows, not only the one the
+ * reference holds.  Their KL(serial || wide) is REPORTED per width (no reference row to bound it
+ * against -- a bound borrowed from the last row FAILED code depth 512, whose earlier rows are near
+ * ties while the reference row is confident); a top-1 flip FAILS when the serial margin is
+ * >= GATE_DECISIVE_MARGIN, the one statement rounding-sized arithmetic cannot excuse.
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -73,10 +79,10 @@ static double maxabs_of(const float *a, const float *b, int n) {
     return m;
 }
 
-/* the last row of the w tokens ending at depth d over a prefill to d - w: one
- * w-wide decode step, or (serial) w one-row steps -- into `out` */
-static bool decode_last_row(pulsar_engine *e, const int *toks, uint32_t d, uint32_t w, float *out, int width,
-                            bool serial) {
+/* the w rows of the w tokens ending at depth d over a prefill to d - w: one
+ * w-wide decode step, or (serial) w one-row steps -- into `out` (w x width) */
+static bool decode_rows(pulsar_engine *e, const int *toks, uint32_t d, uint32_t w, float *out, int width,
+                        bool serial) {
     pulsar_session *s = NULL;
     const int ctx = (int)(((d + 4095u) / 4096u + 1u) * 4096u);
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed (ctx %d)\n", ctx); return false; }
@@ -88,14 +94,15 @@ static bool decode_last_row(pulsar_engine *e, const int *toks, uint32_t d, uint3
     char err[256];
     const uint32_t steps = serial ? w : 1u, per = serial ? 1u : w;
     for (uint32_t k = 0; ok && k < steps; k++) {
-        if (pulsar_session_decode_mixed(s, rq + k * per, per, lg, (int)(per * (uint32_t)width), &nr,
+        if (pulsar_session_decode_mixed(s, rq + k * per, per, lg + (size_t)k * per * (size_t)width,
+                                        (int)(per * (uint32_t)width), &nr,
                                         PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) != 0) {
             fprintf(stderr, "decode step (d %u, w %u, %s %u): %s\n", d, w, serial ? "serial" : "wide", k, err);
             ok = false;
         }
         if (ok && nr != per) { fprintf(stderr, "decode step headed %u rows, want %u\n", nr, per); ok = false; }
     }
-    if (ok) memcpy(out, lg + (size_t)(per - 1) * (size_t)width, (size_t)width * sizeof(float));
+    if (ok) memcpy(out, lg, (size_t)w * (size_t)width * sizeof(float));
     free(lg);
     pulsar_session_free(s);
     return ok;
@@ -157,8 +164,12 @@ int GATE_ENTRY(int argc, char **argv) {
     if (gate_engine_open(&e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     const int width = pulsar_engine_logits_width(e);
     const int ncmp = (int)h.width < width ? (int)h.width : width;
-    float *one = (float *)malloc((size_t)width * sizeof(float));
-    float *cur = (float *)malloc((size_t)width * sizeof(float));
+    float *one_all = (float *)malloc((size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)width * sizeof(float));
+    float *cur_all = (float *)malloc((size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)width * sizeof(float));
+    /* L284: every row of the step against the same row of the serial run (rows < w carry no reference row) */
+    double rows_kl[8] = {0}, rows_kl_max[8] = {0};
+    long rows_n[8] = {0}, rows_flip[8] = {0};
+    int rows_violations = 0;
     printf("decode reference gate: %s (engine '%.*s', %u depths)\n", argv[2], (int)REF_LEN, h.build_ref, h.n_depths);
     printf("  depth  w   KL(ref||ours)  top1(ref/ours)   KL vs serial   max|d| vs serial   bound\n");
     int violations = 0;
@@ -171,9 +182,29 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int k = 0; k < n_w && rc == 0; k++) {
             const uint32_t w = widths[k];
             if (d < w + 1) continue;
-            if (!decode_last_row(e, toks, d, w, cur, width, false)) { rc = 1; break; }
-            if (w > 1 && !decode_last_row(e, toks, d, w, one, width, true)) { rc = 1; break; }
-            if (w == 1) memcpy(one, cur, (size_t)width * sizeof(float));
+            if (!decode_rows(e, toks, d, w, cur_all, width, false)) { rc = 1; break; }
+            if (w > 1 && !decode_rows(e, toks, d, w, one_all, width, true)) { rc = 1; break; }
+            if (w == 1) memcpy(one_all, cur_all, (size_t)width * sizeof(float));
+            const float *one = one_all + (size_t)(w - 1) * width, *cur = cur_all + (size_t)(w - 1) * width;
+            double step_kl = 0;
+            for (uint32_t j = 0; w > 1 && j < w; j++) {
+                const float *sr = one_all + (size_t)j * width, *wr = cur_all + (size_t)j * width;
+                const double kj = kl_of(sr, wr, ncmp);
+                step_kl += kj;
+                rows_kl[k] += kj;
+                rows_kl_max[k] = fmax(rows_kl_max[k], kj);
+                rows_n[k]++;
+                const int as = argmax_of(sr, ncmp), aw = argmax_of(wr, ncmp);
+                if (as != aw) {
+                    /* a width change is rounding-sized: it may only flip a near-tie of the serial row */
+                    const double margin = (double)sr[as] - (double)sr[aw];
+                    const bool decisive = margin >= GATE_DECISIVE_MARGIN;
+                    rows_flip[k]++;
+                    rows_violations += decisive;
+                    printf("    row %u of d %u w %u: top-1 %d (serial) -> %d (wide), serial margin %.3f%s\n", j, d, w, as,
+                           aw, margin, decisive ? "  FAIL (decisive flip)" : "");
+                }
+            }
             const float *dst = cur;
             const double kl = kl_of(rr, dst, ncmp);
             const int ar = argmax_of(rr, ncmp), ao = argmax_of(dst, ncmp);
@@ -187,9 +218,13 @@ int GATE_ENTRY(int argc, char **argv) {
             for (int f = 0; f < n_kf; f++) flip_named |= known_flip[f] == d;
             const bool top_ok = ao == a1 || ao == ar || flip_named;
             const bool ok = w == 1 || (klw <= bound && top_ok);
-            printf("  %5u %2u   %.3e      %6d/%-6d %s  %.3e   %.3e        %.3e%s%s\n", d, w, kl, ar, ao,
-                   ar == ao ? " " : "*", klw, mw, bound, ok ? "" : top_ok ? "  FAIL (KL)" : "  FAIL (top-1)",
-                   flip_named && ao != a1 && ao != ar ? "  (known-flip depth: top-1 accepted by name)" : "");
+            /* L284: the other rows' KL is REPORTED, not bounded: the reference holds only the last row, and the
+             * model's own distance from the source moves row to row (code 512: the reference row is confident,
+             * rows 480..511 are near ties), so no bound derived from it transfers.  Only a decisive flip fails. */
+            const double rows_mean = w > 1 ? step_kl / w : 0.0;
+            printf("  %5u %2u   %.3e      %6d/%-6d %s  %.3e   %.3e        %.3e%s%s   rows mean %.3e\n", d, w, kl, ar,
+                   ao, ar == ao ? " " : "*", klw, mw, bound, ok ? "" : top_ok ? "  FAIL (KL)" : "  FAIL (top-1)",
+                   flip_named && ao != a1 && ao != ar ? "  (known-flip depth: top-1 accepted by name)" : "", rows_mean);
             violations += !ok;
             sum_kl[k] += kl;
             sum_kw[k] += klw;
@@ -201,9 +236,15 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int k = 0; k < n_w; k++)
             printf("    w=%2u  mean KL(ref||ours) %.3e  top1 misses %d  mean KL vs serial %.3e\n", widths[k],
                    sum_kl[k] / h.n_depths, flips[k], sum_kw[k] / h.n_depths);
+        printf("  every row vs the serial run (L284; KL reported, FAIL only on a decisive top-1 flip):\n");
+        for (int k = 0; k < n_w; k++)
+            if (rows_n[k])
+                printf("    w=%2u  rows %4ld  KL mean %.3e  max %.3e  top-1 flips %ld\n", widths[k], rows_n[k],
+                       rows_kl[k] / (double)rows_n[k], rows_kl_max[k], rows_flip[k]);
+        violations += rows_violations;
     }
-    free(one);
-    free(cur);
+    free(one_all);
+    free(cur_all);
     free(ref);
     free(traw);
     gate_engine_close(e);
