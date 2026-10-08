@@ -24,7 +24,7 @@ What is emitted, and why, in the served block's order
     that have an HF source: `general.type`, `context_length`, `rope.scaling.type`,
     `nextn_predict_layers`, `general.sampling.*`;
   * the reap.* keys when a survivor map is given (validate_reap_metadata);
-  * the eleven tokenizer.* entries (tools/container/tokenizer);
+  * the eleven tokenizer.* entries (tokenizer/core.py, with DeepSeek's TOKENIZER settings below);
   * the drafter's `deepseek_v4_dspark.embedding_length` + `dspark.target_layer_ids.N`
     (dspark_weights_bind reads exactly these four; the drafter's shape is pinned
     against its tensors, weights.cpp:1555-1569);
@@ -41,7 +41,27 @@ import json
 import os
 import struct
 
-from tokenizer.build_tokenizer_kvs import build as build_tokenizer_kvs
+from tokenizer import core as TOK
+
+# DeepSeek's tokenizer settings (the walk is tokenizer/core.py's).  Nine of the eleven tokenizer.* entries derive
+# mechanically from tokenizer.json + tokenizer_config.json; THREE DO NOT, so they live here as explicit, documented
+# repo-side constants -- OUR decisions, not borrowed artifact bytes:
+#   1. PRE_TOKENIZER_ID -- a llama.cpp-side pretokenizer identifier, not present in (or derivable from) any HF file.
+#   2. tokenizer/chat_template.jinja -- the checkpoint ships its chat format as PYTHON (encoding/encoding_dsv4.py),
+#      not Jinja; our template is a translation of it, a source artifact in its own right.
+#   3. USER_DEFINED_TOKENS -- hand-curated; the HF `special` flag does NOT reproduce it (1230/53 there vs the
+#      required 1277/6).  CONTROL tokens are skipped during detokenization; these six must survive as literal text
+#      because the engine's own parsers consume them (the reasoning split reads <think>/</think>, the DSML tool
+#      grammar the dsml markers).  Every other added token (special=False ones like <|fim_hole|> included) is
+#      CONTROL.
+PRE_TOKENIZER_ID = "joyai-llm"
+USER_DEFINED_TOKENS = frozenset({
+    "<think>", "</think>", "｜DSML｜", "<dsml:", "</dsml:", "<｜/table>｜",
+})
+TOKENIZER = TOK.Settings(
+    added_type=lambda a: TOK.TT_USER_DEFINED if a["content"] in USER_DEFINED_TOKENS else TOK.TT_CONTROL,
+    template=os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer", "chat_template.jinja"),
+    pre=PRE_TOKENIZER_ID)
 
 INT_RANGE = {
     'u8': (0, 2**8 - 1), 'i8': (-2**7, 2**7 - 1),
@@ -246,7 +266,7 @@ def build_kv(hf, tokenizer_dir, reap_map=None):
     if reap_map is not None:
         kvs += _reap_triples(reap_map)
 
-    kvs += build_tokenizer_kvs(tokenizer_dir)
+    kvs += TOK.kvs(tokenizer_dir, TOKENIZER)
 
     # The drafter: the anchor layers whose INPUT hiddens it conditions on.  No
     # derivation from the layer count -- a drafter trained on other anchors

@@ -43,6 +43,7 @@ import struct
 import entries as EN
 import exl3_rates
 import kv as KV
+from tokenizer import core as TOK
 import producers as PR
 import recipe as R
 from names import Mapped
@@ -57,6 +58,11 @@ PART_ROLE = {"gate_up_proj": "expert_gate_up", "gate_proj": "expert_gate", "up_p
              "down_proj": "expert_down"}
 # what the qwen4_exp loader binds (any role; the EXL3 rate by the engine's arm, exl3_rates.admit)
 ADMITS = {"bf16", "mxfp8_lt", "tessera", *exl3_rates.K2, *R.CONSUMED}
+# the tokenizer (tokenizer/core.py's walk), mechanical from the checkpoint's own files: HF-special added tokens
+# CONTROL, the rest USER_DEFINED; the checkpoint's chat_template.jinja; its pretokenize_regex; bos only when the
+# config names one (it names none).  S5 (the Qwen renderer) owns anything beyond this.
+TOKENIZER = TOK.Settings(added_type=lambda a: TOK.TT_CONTROL if a["special"] else TOK.TT_USER_DEFINED,
+                         pretokenize_regex=True, bos_optional=True)
 
 
 # ---------------------------------------------------------------------------
@@ -286,58 +292,9 @@ def build_kv(hf, ctx):
         if src is not None:
             kvs.append((f"pulsar.source.{tag}", "string", os.path.basename(os.path.normpath(src.dir))))
     kvs.append(("pulsar.source.hf", "string", os.path.basename(os.path.normpath(hf.dir))))
-    kvs += tokenizer_kvs(ctx.tokenizer_dir)
+    kvs += TOK.kvs(ctx.tokenizer_dir, TOKENIZER)
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):
         raise SystemExit("duplicate kv key: " + ", ".join(sorted(k for k in set(keys) if keys.count(k) > 1)))
-    return out
-
-
-TT_NORMAL, TT_CONTROL, TT_USER_DEFINED = 1, 3, 4
-
-
-def tokenizer_kvs(tok_dir):
-    """Mechanical, from the checkpoint's own files: tokens by id (added tokens overlay), merges, the chat template
-    verbatim.  Token type: added special -> CONTROL, added non-special -> USER_DEFINED, else NORMAL (record-only;
-    the engine reads tokens + merges).  S5 (the Qwen renderer) owns anything beyond this."""
-    tok = json.load(open(os.path.join(tok_dir, "tokenizer.json"), encoding="utf-8"))
-    cfg = json.load(open(os.path.join(tok_dir, "tokenizer_config.json"), encoding="utf-8"))
-    if tok["model"]["type"] != "BPE":
-        raise SystemExit(f"tokenizer model {tok['model']['type']}: BPE expected")
-    by_id = {i: t for t, i in tok["model"]["vocab"].items()}
-    types = {i: TT_NORMAL for i in by_id}
-    for a in tok["added_tokens"]:
-        by_id[a["id"]] = a["content"]
-        types[a["id"]] = TT_CONTROL if a["special"] else TT_USER_DEFINED
-    n = max(by_id) + 1
-    if len(by_id) != n:
-        raise SystemExit(f"tokenizer id space has {n - len(by_id)} holes")
-    merges = tok["model"]["merges"]
-    if merges and not isinstance(merges[0], str):
-        merges = [" ".join(m) for m in merges]
-
-    def tid(key):
-        t = cfg.get(key)
-        if t is None:
-            return None
-        for a in tok["added_tokens"]:
-            if a["content"] == t:
-                return a["id"]
-        raise SystemExit(f"tokenizer_config {key} {t!r} is not an added token")
-    tmpl = open(os.path.join(tok_dir, "chat_template.jinja"), encoding="utf-8").read()
-    out = [
-        ("tokenizer.ggml.model", "string", "gpt2"),
-        ("tokenizer.ggml.tokens", "array", ("string", [by_id[i] for i in range(n)])),
-        ("tokenizer.ggml.token_type", "array", ("i32", [types[i] for i in range(n)])),
-        ("tokenizer.ggml.merges", "array", ("string", merges)),
-        ("tokenizer.pretokenize_regex", "string", cfg["pretokenize_regex"]),
-        ("tokenizer.ggml.eos_token_id", "u32", tid("eos_token")),
-        ("tokenizer.ggml.padding_token_id", "u32", tid("pad_token")),
-        ("tokenizer.ggml.add_bos_token", "bool", bool(cfg.get("add_bos_token", False))),
-        ("tokenizer.ggml.add_eos_token", "bool", bool(cfg.get("add_eos_token", False))),
-        ("tokenizer.chat_template", "string", tmpl),
-    ]
-    if cfg.get("bos_token") is not None:
-        out.append(("tokenizer.ggml.bos_token_id", "u32", tid("bos_token")))
     return out
