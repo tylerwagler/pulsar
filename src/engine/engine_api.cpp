@@ -304,13 +304,6 @@ uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinne
 void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
 uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", 0); if (e && e->family->banks) return e->family->banks->demand_paged_bytes(e, ctx_size); return e ? e->demand_paged_bytes_per_bank(ctx_size) : 0; }
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return e ? e->weights_resident_bytes() : 0; }
-int pulsar_engine_generate_argmax(pulsar_engine *e, const pulsar_tokens *prompt,
-                               int n_predict, int ctx_size,
-                               pulsar_token_emit_fn emit,
-                               pulsar_generation_done_fn done,
-                               void *emit_ud,
-                               pulsar_session_progress_fn progress,
-                               void *progress_ud) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_GENERATE, "pulsar_engine_generate_argmax", 1); return e->generate_argmax(prompt, n_predict, ctx_size, emit, done, emit_ud, progress, progress_ud); }
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -329,7 +322,6 @@ uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e) {
 bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e) {
     return e && (e->family->caps & PULSAR_FAMILY_CAP_MIXED_PREFILL) != 0;
 }
-bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 

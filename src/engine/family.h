@@ -101,6 +101,24 @@ typedef struct pulsar_family_vision {
  *  slot reader reads slices REGISTERED with the backend, a rows reader slices BUILT and kept on the device). */
 typedef enum { PULSAR_ACT_KIND_SLOT = 0, PULSAR_ACT_KIND_ROWS = 1 } pulsar_act_kind;
 
+/** Importance-matrix collection (L284 P15): the dataset walk, the prompt cap and the llama.cpp `.dat` writer are
+ *  the core's (session.cpp pulsar_engine::collect_imatrix, imatrix.cpp imatrix_write_entry); a family supplies only
+ *  how ONE prompt is run through its forward with its linears observed, and what it observed.  The tensors it
+ *  names are the checkpoint's own (the entry name is the tensor's), `n_expert * n_columns` floats an expert-stacked
+ *  tensor, `n_columns` a dense one. */
+typedef struct {
+    /** Open a collection for prompts of at most `ctx_size` tokens; NULL on failure (reported). */
+    void *(*begin)(pulsar_engine *e, const char *dataset_path, int ctx_size);
+    /** Run one tokenized prompt from position 0 through the forward, observing. */
+    bool (*prompt)(pulsar_engine *e, void *c, const pulsar_tokens *tokens);
+    /** (token, expert) routing decisions observed so far (the progress line). */
+    uint64_t (*routes)(const void *c);
+    /** Write the `.dat`. */
+    bool (*save)(pulsar_engine *e, void *c, const char *path);
+    /** Release the collection. */
+    void (*end)(pulsar_engine *e, void *c);
+} pulsar_family_imatrix;
+
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
@@ -123,7 +141,6 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_TP      = 1u << 5,  ///< tensor parallelism across a pair / mesh
     PULSAR_FAMILY_CAP_IMATRIX = 1u << 6,  ///< importance-matrix collection
     PULSAR_FAMILY_CAP_CHAT    = 1u << 7,  ///< tokenizer + chat renderer (a family without it cannot take text)
-    PULSAR_FAMILY_CAP_GENERATE = 1u << 8, ///< pulsar_engine_generate_argmax (the session-less whole-graph path)
     PULSAR_FAMILY_CAP_SEGMENTS = 1u << 9, ///< disk KV segments: span files of the grid checkpoint store (L264; Qwen L266)
     PULSAR_FAMILY_CAP_MIXED_PREFILL = 1u << 10, ///< decode_mixed carries prefill runs beside its decode rows (the plain lane's mixed quantum); without it a prompt rides only the fused step
 };
@@ -179,9 +196,13 @@ typedef struct pulsar_family_tokenizer {
     /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none). */
     void (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
                             pulsar_tokens *out);
-    /** One system + one user message, rendered and tokenized the family's way (the CLI's one-shot). */
-    void (*encode_chat_prompt)(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
-                               pulsar_tokens *out);
+    /** The chat front turn by turn (pulsar.h pulsar_chat_open / _append_turn / _end_assistant): the head, one
+     *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
+    void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode);
+    void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                      bool generation_prompt, pulsar_think_mode think_mode);
+    void (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     bool (*is_stop)(pulsar_engine *e, int token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
     int (*eos)(pulsar_engine *e);
@@ -192,10 +213,6 @@ typedef struct pulsar_family_tokenizer {
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */
     void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
-    /** The family's chat is DeepSeek's marker template, which the incremental entries
-     *  (pulsar_chat_begin / _append_lead_in / _append_message / _append_assistant_prefix) build; a family
-     *  that renders its chat whole (Qwen: qwen_chat_render) refuses them by name. */
-    bool incremental_ds4_template;
 } pulsar_family_tokenizer;
 
 /** A family's own bank pool (L251): the server's per-bank bookkeeping for a
@@ -294,6 +311,8 @@ struct pulsar_family {
     const pulsar_family_vision *vision;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
+    /** The family's importance-matrix collection (PULSAR_FAMILY_CAP_IMATRIX), or NULL. */
+    const pulsar_family_imatrix *imatrix;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

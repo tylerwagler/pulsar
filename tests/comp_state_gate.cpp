@@ -188,9 +188,7 @@ int GATE_ENTRY(int argc, char **argv) {
     state_rows *A = NULL;
     {
         if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session failed\n"); goto done; }
-        pulsar_chat_begin(e, &prompt);
-        pulsar_chat_append_message(e, &prompt, "user", PROMPT);
-        pulsar_chat_append_assistant_prefix(e, &prompt, PULSAR_THINK_NONE);
+        pulsar_encode_chat_prompt(e, NULL, PROMPT, PULSAR_THINK_NONE, &prompt);
         if (prompt.len < L_ALIGNED + 2) {
             fprintf(stderr, "comp_state_gate: prompt is %d tokens, need >= %d\n", prompt.len, L_ALIGNED + 2);
             goto done;

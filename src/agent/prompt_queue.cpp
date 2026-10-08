@@ -224,7 +224,7 @@ static const char agent_tools_prompt_after_edit[] =
 
 
 
-static char *agent_build_tools_prompt(void) {
+char *agent_build_tools_prompt(void) {
     const char *edit = agent_tools_prompt_edit_line;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
@@ -263,28 +263,6 @@ static char *agent_build_system_prompt_reminder(void) {
 
 
 
-void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
-                                       const char *extra) {
-    /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
-     * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
-     * the model's dedicated DSML token.  Do not apply that tokenizer to user
-     * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
-     * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt();
-    pulsar_tokenize_rendered_chat(engine, tools_prompt, tokens);
-    free(tools_prompt);
-
-    if (!extra || !extra[0]) return;
-    size_t n = strlen(extra);
-    char *plain = (char *)agent_xmalloc(n + 3);
-    memcpy(plain, "\n\n", 2);
-    memcpy(plain + 2, extra, n + 1);
-    pulsar_chat_append_message(engine, tokens, "system", plain);
-    free(plain);
-}
-
-
-
 void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
@@ -306,7 +284,7 @@ void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     snprintf(msg, sizeof(msg),
              "Current local date and time at session start: %s. "
              "Use this only when date or time matters.", when);
-    pulsar_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_turn_add(w, "system", msg, false);
     agent_trace_text(w, "datetime-context", msg, strlen(msg));
     w->datetime_context_injected = true;
 }
@@ -314,9 +292,9 @@ void agent_worker_maybe_append_datetime_context(agent_worker *w) {
 
 
 /* The full tool/system reminder is separate from DSML syntax errors: it is a
- * pressure-controlled refresh of the same trusted prompt shape used at startup.
- * The built-in prompt is tokenized as rendered chat so DSML markers stay native
- * control tokens; arbitrary -sys text remains ordinary text. */
+ * pressure-controlled refresh of the same trusted prompt shape used at startup,
+ * added to the turn as system notes: the built-in prompt trusted (DeepSeek keeps
+ * its DSML markers native control tokens), arbitrary -sys text ordinary text. */
 void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     if (w->last_system_prompt_reminder_at <= 0) {
         agent_worker_note_system_prompt_seen(w);
@@ -332,17 +310,18 @@ void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    pulsar_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    agent_turn_add(w, "system", reminder, true);
     free(reminder);
 
     const char *extra = w->cfg->gen.system;
     if (extra && extra[0]) {
-        pulsar_tokenize_text(w->engine,
-            "\nAdditional system instructions reminder:\n", &w->transcript);
-        pulsar_tokenize_text(w->engine, extra, &w->transcript);
-        pulsar_tokenize_text(w->engine,
-            "\n[End additional system instructions reminder.]\n\n",
-            &w->transcript);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "\nAdditional system instructions reminder:\n");
+        agent_buf_puts(&b, extra);
+        agent_buf_puts(&b, "\n[End additional system instructions reminder.]\n\n");
+        char *note = agent_buf_take(&b);
+        agent_turn_add(w, "system", note, false);
+        free(note);
     }
     agent_worker_note_system_prompt_seen(w);
 }

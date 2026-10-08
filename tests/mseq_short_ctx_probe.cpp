@@ -72,7 +72,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 off += (size_t)snprintf(user + off, cap - off, "port%d ", i % 997);
             snprintf(user + off, cap - off, "%s", PROMPT);
         }
-        /* the family's one-turn render (L278: pulsar_chat_begin is DeepSeek's template and ends a Qwen run) */
+        /* the family's one-turn render (L278) */
         pulsar_encode_chat_prompt(e, NULL, user ? user : PROMPT, PULSAR_THINK_NONE, &prompt);
         /* The context from the rendered prompt (L278: the filler's tokens per word are the family's tokenizer's --
          * DeepSeek 1100 -> ~2217 tokens, Qwen 1100 -> 4205), so the deep entries (L170, L175) fit on every family. */

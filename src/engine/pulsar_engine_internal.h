@@ -1779,6 +1779,9 @@ struct pulsar_engine {
     pulsar_layer_plan plan;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
+    /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
+     *  the trunk's steps note their linears' input rows into it. */
+    struct pulsar_imatrix_tap *imatrix_tap;
     /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
      * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
      * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
@@ -1899,17 +1902,6 @@ struct pulsar_engine {
     uint64_t demand_paged_bytes_per_bank(int ctx_size);
     /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
-    /** One-shot greedy generation: prefill `prompt`, then decode argmax until
-     * `n_predict` tokens or EOS, delivering each through `emit`. The
-     * self-contained path the CLI and the diagnostics use, with no session
-     * management for the caller to do. @return 0 on success. */
-    int generate_argmax(const pulsar_tokens *prompt,
-                        int n_predict, int ctx_size,
-                        pulsar_token_emit_fn emit,
-                        pulsar_generation_done_fn done,
-                        void *emit_ud,
-                        pulsar_session_progress_fn progress,
-                        void *progress_ud);
     /** Run the dataset through the model accumulating per-tensor activation
      * magnitudes, and write the importance matrix used to steer quantisation.
      * @return 0 on success. */
@@ -4068,6 +4060,15 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path);
+/** The llama.cpp legacy `.dat` writer every family's collection shares (imatrix.cpp): open + entry count, one
+ *  entry per tensor (`n_expert` vectors of `n_col` means; a never-observed expert writes 1.0), then close with the
+ *  chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries);
+void imatrix_write_entry(FILE *fp, const char *name, const float *sum2, const uint32_t *counts, uint32_t n_expert,
+                         uint32_t n_col);
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path);
+extern const pulsar_family_imatrix k_ds4_imatrix;     // imatrix.cpp
+extern const pulsar_family_imatrix k_qwen_imatrix;    // imatrix_qwen.cpp
 bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g);
 bool gpu_graph_prefill_layer_major(
         pulsar_gpu_graph *g,
@@ -4245,22 +4246,6 @@ int sample_top_p_min_p(
         float        min_p,
         uint64_t    *rng,
         pulsar_sample_scratch *scratch);
-int generate_gpu_graph_raw_swa(
-        const pulsar_model   * model,
-        const pulsar_vocab   * vocab,
-        const pulsar_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        uint32_t            prefill_chunk,
-        const char        * directional_steering_file,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        pulsar_token_emit_fn   emit,
-        pulsar_generation_done_fn done,
-        void              * emit_ud,
-        pulsar_session_progress_fn progress,
-        void              * progress_ud);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
 /** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,

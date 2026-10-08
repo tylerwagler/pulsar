@@ -96,7 +96,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    pulsar_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    agent_turn_add(w, "user", user_text, false);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -111,8 +111,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * deliberately no artificial "too many tool calls" ceiling here: context
      * pressure, compaction, user Ctrl+C, and the model's final answer are the
      * real stopping conditions.  The transcript is the single source of truth:
-     * after a DSML stanza completes we terminate that assistant message, append
-     * the tool result as a tool message, then ask the model to continue. */
+     * after a DSML stanza completes we terminate that assistant message, add
+     * the tool result to the next turn as a tool message, then ask the model to
+     * continue -- the turn rendered whole by the family's chat front. */
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -127,7 +128,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
-        pulsar_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+        agent_turn_flush(w, think_mode);
 
         const pulsar_tokens *prompt_for_sync = &w->transcript;
         int old_pos = pulsar_session_pos(w->session);
@@ -167,7 +168,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
-            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -274,7 +275,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
         if (interrupted) {
-            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
@@ -299,7 +300,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "incomplete DSML tool call");
         }
 
-        pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+        pulsar_chat_end_assistant(w->engine, &w->transcript);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
@@ -367,14 +368,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        pulsar_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        agent_turn_add(w, "tool", tool_result, false);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
             agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            pulsar_chat_append_message(w->engine, &w->transcript, "user", queued_user);
+            agent_turn_add(w, "user", queued_user, false);
             pthread_mutex_lock(&w->mu);
             w->user_activity = true;
             w->session_dirty = true;

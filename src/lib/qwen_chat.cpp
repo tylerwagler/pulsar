@@ -167,7 +167,7 @@ bool ends_with(const std::string &s, const char *p) {
     return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
 }
 
-const char *generation_prompt(qwen_effort effort) {
+const char *generation_prompt_text(qwen_effort effort) {
     return effort == QWEN_EFFORT_NONE ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
                                       : "<|im_start|>assistant\n<think>\n";
 }
@@ -303,6 +303,51 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
     return true;
 }
 
+/* The head: the system block the template writes before the first message -- the effort line, the tools
+ * block (`tools` NULL = none) and the system message's content (`system` NULL = none), or nothing at all when
+ * there is no effort line, no tools and no system text. */
+void write_head(writer &w, const pyjson_value *tools, const char *system, qwen_effort effort) {
+    const std::string instructions = effort_line(effort);
+    const std::string content = py_strip(system);
+    if (tools) {
+        w.lit("<|im_start|>system\n");
+        if (!instructions.empty()) w.lit(instructions + "\n\n");
+        w.lit(kToolsHead);
+        for (const pyjson_value &tool : tools->a) {
+            w.lit("\n");
+            std::string dumped;
+            pyjson_dump(tool, &dumped);
+            w.client(dumped);
+        }
+        w.lit(kToolsTail);
+        if (!content.empty()) {
+            w.lit("\n\n");
+            w.client(content);
+        }
+        w.lit("<|im_end|>\n");
+    } else if (!content.empty()) {
+        w.lit("<|im_start|>system\n");
+        if (!instructions.empty()) w.lit(instructions + "\n\n");
+        w.client(content);
+        w.lit("<|im_end|>\n");
+    } else if (!instructions.empty()) {
+        w.lit("<|im_start|>system\n" + instructions + "<|im_end|>\n");
+    }
+}
+
+/* `n` messages that follow a message of role `prev` (never the conversation's first), then the generation
+ * prompt for `effort` when asked -- the full render's loop body, so a turn rendered here is the bytes the full
+ * render writes for it. */
+bool write_turn(writer &w, const qwen_msg_in *msgs, int n, const char *prev, qwen_effort effort,
+                bool generation_prompt, char *err, size_t errlen) {
+    for (int k = 0; k < n; k++)
+        if (!render_msg(w, msgs[k], k ? msgs[k - 1].role : prev, k + 1 < n ? msgs[k + 1].role : NULL, false, k, err,
+                        errlen))
+            return false;
+    if (generation_prompt) w.lit(generation_prompt_text(effort));
+    return true;
+}
+
 }  // namespace
 
 bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err, size_t errlen) {
@@ -319,43 +364,11 @@ bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err,
         if (tools.kind != pyjson_value::ARR)
             return refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
     }
-    const bool has_tools = in.tools_json && !tools.a.empty();
-    const std::string instructions = effort_line(in.effort);
     const qwen_msg_in &first = in.msgs[0];
     const bool first_system = first.role && !strcmp(first.role, "system");
     if (first_system && first.n_images > 0)
         return refuse(err, errlen, "image_position", "System message cannot contain images.");
-
-    if (has_tools) {
-        w.lit("<|im_start|>system\n");
-        if (!instructions.empty()) w.lit(instructions + "\n\n");
-        w.lit(kToolsHead);
-        for (const pyjson_value &tool : tools.a) {
-            w.lit("\n");
-            std::string dumped;
-            pyjson_dump(tool, &dumped);
-            w.client(dumped);
-        }
-        w.lit(kToolsTail);
-        if (first_system) {
-            const std::string content = py_strip(first.content);
-            if (!content.empty()) {
-                w.lit("\n\n");
-                w.client(content);
-            }
-        }
-        w.lit("<|im_end|>\n");
-    } else {
-        const std::string content = first_system ? py_strip(first.content) : std::string();
-        if (!content.empty()) {
-            w.lit("<|im_start|>system\n");
-            if (!instructions.empty()) w.lit(instructions + "\n\n");
-            w.client(content);
-            w.lit("<|im_end|>\n");
-        } else if (!instructions.empty()) {
-            w.lit("<|im_start|>system\n" + instructions + "<|im_end|>\n");
-        }
-    }
+    write_head(w, in.tools_json && !tools.a.empty() ? &tools : NULL, first_system ? first.content : NULL, in.effort);
 
     /* the template's multi_step_tool scan: some user message must be a real
      * query, not a bare <tool_response> wrapper */
@@ -373,7 +386,7 @@ bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err,
         if (!render_msg(w, in.msgs[i], i ? in.msgs[i - 1].role : NULL, i + 1 < in.n_msgs ? in.msgs[i + 1].role : NULL,
                         i == 0, i, err, errlen))
             return false;
-    if (in.add_generation_prompt) w.lit(generation_prompt(in.effort));
+    if (in.add_generation_prompt) w.lit(generation_prompt_text(in.effort));
     return finish(out, err, errlen);
 }
 
@@ -404,10 +417,28 @@ bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, q
     writer w{out};
     if (n <= 0) return refuse(err, errlen, "no_messages", "No messages provided.");
     w.lit("<|im_end|>\n");
-    for (int k = 0; k < n; k++)
-        if (!render_msg(w, msgs[k], k ? msgs[k - 1].role : "assistant", k + 1 < n ? msgs[k + 1].role : NULL, false, k,
-                        err, errlen))
-            return false;
-    w.lit(generation_prompt(effort));
+    if (!write_turn(w, msgs, n, "assistant", effort, true, err, errlen)) return false;
     return finish(out, err, errlen);
+}
+
+bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    writer w{out};
+    write_head(w, NULL, system, effort);
+    return finish(out, err, errlen);
+}
+
+bool qwen_chat_render_turn(const qwen_msg_in *msgs, int n, qwen_effort effort, bool generation_prompt,
+                           qwen_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    writer w{out};
+    if (n <= 0 && !generation_prompt) return refuse(err, errlen, "no_messages", "No messages provided.");
+    if (!write_turn(w, msgs, n, "assistant", effort, generation_prompt, err, errlen)) return false;
+    return finish(out, err, errlen);
+}
+
+std::string qwen_system_reminder(const char *content) {
+    return std::string("<system-reminder>\n") + (content ? content : "") + "\n</system-reminder>";
 }

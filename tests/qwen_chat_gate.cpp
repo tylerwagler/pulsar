@@ -18,6 +18,7 @@
  *                                 events   (--cases)
  *   P2 output parser units        malformed / truncated / split-marker outputs
  *   E1 effort resolution          the API's effort / thinking fields -> the template's efforts
+ *   C1 turn-by-turn composition   head + turns + sampled turns + closes == the full render: text and ids
  *
  * usage: qwen_chat_gate --tok DIR --vectors DIR [--cases DIR] [--calib FILE]
  *        DIR = the checkpoint's tokenizer.json + generation_config.json */
@@ -723,6 +724,117 @@ static void e1_effort(void) {
     printf("E1 effort resolution: %zu requests, %d mismatched\n", sizeof u / sizeof u[0], bad);
 }
 
+/* L284 P14: a conversation built turn by turn -- the head, each turn (qwen_chat_render_turn), each sampled
+ * assistant turn followed by its close "<|im_end|>\n" -- is the full render byte for byte, and every piece the
+ * front end renders (all but the sampled turns, whose ids are the model's) tokenizes on its own to exactly the
+ * full render's ids over its bytes: its edges are token edges of the whole, so a transcript appended piece by
+ * piece is the full render and its KV continues across turns.  The one edge that is the model's is where a
+ * generation prompt meets the sampled turn: the whole text may merge across it (an empty reasoning's
+ * "<think>\n" + "\n</think>" holds one "\n\n" token), so there the piece's last token is not compared. */
+static void c1_composition(const qwen_tokenizer *t) {
+    struct piece { std::string text; std::vector<pulsar_text_span> spans; bool sampled; };
+    const qwen_tool_call_in call = {"read_file", "{\"path\": \"a.txt\", \"lines\": 3}"};
+    const std::string note = qwen_system_reminder("Current local date and time: now.");
+    const qwen_msg_in convs[][9] = {
+        {{"system", "You are terse.", NULL, NULL, 0, NULL, NULL, 0},
+         {"user", "Hi there.", NULL, NULL, 0, NULL, NULL, 0},
+         {"assistant", "Hello!", "The user greets me.", NULL, 0, NULL, NULL, 0},
+         {"user", note.c_str(), NULL, NULL, 0, NULL, NULL, 0},
+         {"user", "Read a.txt.", NULL, NULL, 0, NULL, NULL, 0},
+         {"assistant", "Reading it.", "Use the tool.", &call, 1, NULL, NULL, 0},
+         {"tool", "line one\nline two.", NULL, NULL, 0, NULL, NULL, 0},
+         {"tool", "second result", NULL, NULL, 0, NULL, NULL, 0},
+         {"user", "Thanks.  Summarize.", NULL, NULL, 0, NULL, NULL, 0}},
+        {{"user", "What is 2+2?", NULL, NULL, 0, NULL, NULL, 0},
+         {"assistant", "4.", "", NULL, 0, NULL, NULL, 0},
+         {"user", "And 3+3?", NULL, NULL, 0, NULL, NULL, 0},
+         {"assistant", "6.\n", "  ", NULL, 0, NULL, NULL, 0},
+         {"user", "Done.", NULL, NULL, 0, NULL, NULL, 0}},
+    };
+    const int lens[] = {9, 5};
+    const qwen_effort efforts[] = {QWEN_EFFORT_XHIGH, QWEN_EFFORT_MEDIUM, QWEN_EFFORT_LOW, QWEN_EFFORT_NONE};
+    int bad = 0, n = 0;
+    for (int c = 0; c < 2; c++) {
+        for (qwen_effort eff : efforts) {
+            const qwen_msg_in *m = convs[c];
+            const int len = lens[c];
+            const bool thinking = eff != QWEN_EFFORT_NONE;
+            char err[300] = "";
+            std::vector<piece> pieces;
+            qwen_render_out r;
+            const bool sys = !strcmp(m[0].role, "system");
+            bool ok = qwen_chat_render_head(sys ? m[0].content : NULL, eff, &r, err, sizeof err);
+            pieces.push_back({r.text, r.spans, false});
+            int i = sys ? 1 : 0;
+            while (ok && i < len) {
+                int j = i;
+                while (j < len && strcmp(m[j].role, "assistant")) j++;
+                ok = qwen_chat_render_turn(m + i, j - i, eff, true, &r, err, sizeof err);
+                pieces.push_back({r.text, r.spans, false});
+                if (!ok || j == len) break;
+                /* the sampled turn: what the model wrote past the generation prompt, before its stop token */
+                qwen_msg_in a = m[j];
+                if (!thinking) a.reasoning = NULL;
+                ok = qwen_chat_render_assistant_turn(a, thinking, &r, err, sizeof err);
+                if (ok && a.n_calls == 0) r.text.resize(r.text.size() - strlen("<|im_end|>\n"));
+                pieces.push_back({r.text, r.spans, true});
+                pieces.push_back({"<|im_end|>\n", {}, false});
+                i = j + 1;
+            }
+            std::vector<qwen_msg_in> full_msgs(m, m + len);
+            if (!thinking)
+                for (auto &x : full_msgs) x.reasoning = NULL;
+            qwen_render_out full;
+            ok = ok && qwen_chat_render({full_msgs.data(), len, NULL, eff, true}, &full, err, sizeof err);
+            std::string text;
+            for (const piece &p : pieces) text += p.text;
+            const int before = g_fail;
+            CHECK(ok, "C1 conversation %d effort %s: refused: %s", c, qwen_effort_name(eff), err);
+            CHECK(!ok || text == full.text, "C1 conversation %d effort %s: the turns' text is not the full render",
+                  c, qwen_effort_name(eff));
+            if (ok && text == full.text) {
+                /* the full render's ids with the byte offset each starts at */
+                const std::vector<int> want = encode(t, full.text, &full.spans);
+                std::vector<size_t> at(want.size() + 1, 0);
+                for (size_t k = 0; k < want.size(); k++) {
+                    size_t nb = 0;
+                    qwen_tokenizer_token_bytes(t, want[k], &nb);
+                    at[k + 1] = at[k] + nb;
+                }
+                size_t lo = 0;
+                for (size_t q = 0; q < pieces.size(); q++) {
+                    const piece &p = pieces[q];
+                    const size_t hi = lo + p.text.size();
+                    if (!p.sampled && !p.text.empty()) {
+                        const bool open_end = q + 1 < pieces.size() && pieces[q + 1].sampled;
+                        std::vector<int> got = encode(t, p.text, &p.spans);
+                        if (open_end) got.pop_back();
+                        size_t got_hi = lo;
+                        for (int id : got) {
+                            size_t nb = 0;
+                            qwen_tokenizer_token_bytes(t, id, &nb);
+                            got_hi += nb;
+                        }
+                        const auto a = std::find(at.begin(), at.end(), lo);
+                        const auto b = std::find(at.begin(), at.end(), got_hi);
+                        const bool edges = a != at.end() && b != at.end();
+                        const std::vector<int> whole = edges ? std::vector<int>(want.begin() + (a - at.begin()),
+                                                                                want.begin() + (b - at.begin()))
+                                                             : std::vector<int>();
+                        CHECK(edges && got == whole, "C1 conversation %d effort %s piece %zu [%zu, %zu): %s", c,
+                              qwen_effort_name(eff), q, lo, hi,
+                              edges ? first_diff(got, whole).c_str() : "its edges are not token edges of the whole");
+                    }
+                    lo = hi;
+                }
+            }
+            bad += g_fail != before;
+            n++;
+        }
+    }
+    printf("C1 turn-by-turn composition: %d conversations x efforts, %d mismatched\n", n, bad);
+}
+
 int main(int argc, char **argv) {
     std::string tok_dir, vec_dir, cases_dir, calib;
     for (int i = 1; i < argc; i++) {
@@ -780,6 +892,7 @@ int main(int argc, char **argv) {
     }
     p2_units();
     e1_effort();
+    c1_composition(t);
     qwen_tokenizer_free(t);
     printf("\nqwen_chat_gate: %d checks, %d failed -- %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

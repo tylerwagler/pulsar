@@ -136,6 +136,26 @@ bool qwen_chat_render_assistant_turn(const qwen_msg_in &m, bool thinking, qwen_r
 bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, qwen_render_out *out, char *err,
                            size_t errlen);
 
+/** A conversation built turn by turn (L284 P14: the CLI REPL and the agent, through the family's chat front):
+ * the HEAD is the system block the full render writes before the first message -- the effort line and the
+ * system message's `system` content (NULL = none; no tools) -- and is empty when it has neither.
+ * full(history) = head + each turn; a turn after an assistant turn is preceded by that turn's close
+ * "<|im_end|>\n" (the sampled turn ends before its stop token, as qwen_chat_render_tail's live KV does). */
+bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_out *out, char *err, size_t errlen);
+
+/** One TURN of a conversation built turn by turn: `msgs` as the full render writes them after an assistant
+ * turn (a tool result opens the user turn; consecutive results share it), then the generation prompt for
+ * `effort` when `generation_prompt`.  Refusals: no_messages (no messages and no generation prompt),
+ * system_not_first (a system message here is not the conversation's first -- a front end writes a mid-
+ * conversation note as a user turn of qwen_system_reminder), unexpected_role, and render_calls'. */
+bool qwen_chat_render_turn(const qwen_msg_in *msgs, int n, qwen_effort effort, bool generation_prompt,
+                           qwen_render_out *out, char *err, size_t errlen);
+
+/** A system message that is not the conversation's first, as the content of the user turn that carries it
+ * (the template has no in-place system turn): the ONE spelling the server's renderer and the turn-by-turn
+ * front ends use. */
+std::string qwen_system_reminder(const char *content);
+
 /** Python's str.strip() whitespace (what Jinja's |trim removes): the one
  * definition the renderer and the output parser share. */
 bool qwen_py_isspace(uint32_t cp);

@@ -27,6 +27,8 @@ static bool agent_worker_should_compact(agent_worker *w) {
 
 
 
+/* The id `rendered` tokenizes to as ONE special token, or -1 when the loaded family has none (Qwen spells
+ * DeepSeek's DSML marker as text). */
 static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
     pulsar_tokenize_rendered_chat(engine, rendered, &t);
@@ -48,11 +50,11 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int target = bottom - tail_budget;
     if (target < sys_len) target = sys_len;
 
-    int user_id = agent_special_token_id(w->engine, "<｜User｜>");
-    if (user_id < 0) return target;
+    pulsar_turn_markers markers;
+    if (!pulsar_chat_turn_markers(w->engine, &markers)) return target;
 
     for (int i = target; i < bottom; i++) {
-        if (w->transcript.v[i] == user_id) return i;
+        if (pulsar_turn_marker_at(&markers, w->transcript.v, bottom, i) == 1) return i;
     }
     return target;
 }
@@ -117,9 +119,9 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char *prompt_text = agent_compact_make_prompt(reason);
     pulsar_tokens prompt = {0};
     pulsar_tokens_copy(&prompt, &w->transcript);
-    pulsar_chat_append_message(w->engine, &prompt, "user", prompt_text);
+    const pulsar_chat_message request = {"user", prompt_text, false};
+    agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
-    pulsar_chat_append_assistant_prefix(w->engine, &prompt, PULSAR_THINK_NONE);
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -176,7 +178,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
-    int think_end_id = agent_special_token_id(w->engine, "</think>");
+    int think_end_id = pulsar_token_think_close(w->engine);
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = agent_now_sec();
     for (int i = 0; i < summary_max; i++) {
@@ -247,7 +249,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
-    pulsar_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
+    const pulsar_chat_message summary_note = {"system", summary_msg.ptr, false};
+    pulsar_chat_append_turn(w->engine, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
     free(summary_msg.ptr);
     free(summary.ptr);
 
@@ -273,7 +276,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     pulsar_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
     if (bash_update) {
-        pulsar_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
+        agent_turn_add(w, "tool", bash_update, false);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
         agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
