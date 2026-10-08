@@ -65,8 +65,27 @@ typedef struct pulsar_spec_rows {
 /* ---- the core's helpers the implementations use ---- */
 /** The width of every host logits row the round API reads or stores (the engine's logits width). */
 static inline uint32_t spec_vocab(const pulsar_session *s) { return (uint32_t)s->engine->logits_width(); }
-/** The session's current draft depth (the adaptive controller's, else the drafter's default), 1..16. */
+/** The session's current draft depth (the adaptive controller's, else the starting depth), 1..16. */
 uint32_t pulsar_spec_cur_depth(const pulsar_session *s);
+/** The draft stop threshold in force: --spec-tau / PULSAR_SPEC_TAU, else the drafter's; 0 = no stop. */
+float pulsar_spec_tau(const pulsar_engine *e);
+/** THE stop rule (spec_ops.h): a draft whose confidence is under tau is its chain's last (tau <= 0: none is). */
+static inline bool pulsar_spec_conf_stops(float conf, float tau) { return tau > 0.0f && conf < tau; }
+/** The stop rule over a drafted chain: how many of its n drafts are kept -- up to and including the first that
+ *  stops it. */
+static inline uint32_t pulsar_spec_conf_keep(const float *conf, uint32_t n, float tau) {
+    for (uint32_t k = 0; k < n; k++)
+        if (pulsar_spec_conf_stops(conf[k], tau)) return k + 1u;
+    return n;
+}
+/** A draft record for the installed bank's next chain after `next_base` at the session's depth and these
+ *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+                                float top_p, float min_p);
+/** Keep sampled draft `pos`'s proposal q for the walk's residual: its support when it fits the compact
+ *  store (true), else false and q->qn[pos] = 0 -- the caller keeps q's full row at q->qrows + pos * vocab,
+ *  from which the walk rebuilds q under the record's params. */
+bool pulsar_spec_q_record(spec_redraft_req *q, uint32_t pos, const pulsar_sample_dist *qd);
 /** The core's reader over `rows->block`. */
 bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out);
 /** Stamp a drafter's result record into the installed bank's pendings (the one way pendings are written). */

@@ -1,5 +1,5 @@
 /* spec_depth_gate -- the adaptive draft depth rule (src/engine/spec_depth.h), case by case.
- * The DSpark policy's numbers are session_spec.cpp's (min 2, max 5, UP at tail >= 0.70, the depth-5 veto
+ * The DSpark policy's numbers are spec_dspark.cpp's k_dspark_depth (min 2, max 5, UP at tail >= 0.70, the depth-5 veto
  * at >= 0.90, an 8-round cooldown after a down within 2 rounds of an up); every case below is a branch of
  * the rule as it stood inline there before L251 moved it here, so a change to the shared rule that moves
  * DSpark's schedule fails this gate.  usage: ./tests/spec_depth_gate */

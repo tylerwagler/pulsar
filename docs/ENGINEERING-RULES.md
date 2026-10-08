@@ -223,11 +223,12 @@ byte-identical to cold).
    its depths -- 512, 2048, 4096, 4102, 6144 -- at the default chunk of
    4096; a run with the knob set is not a byte-gate run and says so.
 
-2. **`PULSAR_DSPARK_CONF_SCHED`** (`src/engine/session_spec.cpp:17-29`,
-   read at `:860`, `:954`, `:1981`; set by `tools/confhead/bench.sh:33`,
-   `collect.sh:45`, `smoke.sh:26`): a draft-schedule knob.  The confidence
-   head trims the verify batch to the drafts above tau, which changes WHICH
-   rows are drafted and verified -- never a committed row's numerics: verify
+2. **`--spec-tau` / `PULSAR_SPEC_TAU`** (the engine's `spec_tau`, read in
+   `src/engine/session.cpp` and resolved by `pulsar_spec_tau`; each drafter's
+   default in its `pulsar_drafter_ops::tau`; set by `tools/confhead/bench.sh`,
+   `collect.sh`, `smoke.sh`): a draft-schedule knob.  The one stop rule
+   (`pulsar_spec_conf_keep`) ends a chain at its first draft under tau, which
+   changes WHICH rows are drafted and verified -- never a committed row's numerics: verify
    rows are decode rows, and every decode row takes the M-independent kernels
    whatever the batch width (row kind chooses the arm, `src/pulsar_gpu.h`,
    `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend

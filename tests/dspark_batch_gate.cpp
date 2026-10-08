@@ -138,7 +138,7 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         }
         if (rows + pulsar_spec_round_n_rows(r[b]) > ROWS) return -1;
         row0[b] = rows;
-        rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, first, reqs + rows);
+        rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
         pulsar_session_bank_state_save(s, (uint32_t)b);
     }
     pulsar_session_spec_arm_capture(s, rows);
@@ -450,7 +450,7 @@ int GATE_ENTRY(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    opt.dspark_draft_tokens = depth;
+    opt.spec_depth = depth;
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     if (!pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "DSPARK-BATCH GATE: model has no drafter\n");
