@@ -22,24 +22,49 @@ def fused_stack(blobs, device):
     unit = lambda b: prepare_window_compact(parse_compact_wire(b), device=device, family="value")
     bundles = {k: wgg.prepare_grouped_window_gemm([unit(b) for b in blobs[k]], block_m=32, block_n=64, block_k=64,
                                                   arithmetic="folded") for k in PROJS}
-    return rf.FusedRoutedWindowMoE.from_bundles(bundles["gate"], bundles["up"], bundles["down"])
+    # Tessera 37742e0f (the routed class cutover): from_bundles takes the expert classes -- ordered contiguous
+    # partitions of the experts, each with its q256 profile per projection group (w13 = gate, up; w2 = down).
+    # One class over every expert here; its q256 is the stored schedule's own rung (what _profile_schedule
+    # re-derives through bresenham_rate_schedule and compares to runs_all), so a uniform rate-4 stack is 1024.
+    E = int(bundles["down"].experts)
+    q = {k: _stack_q256(bundles[k]) for k in PROJS}
+    classes = [{"start": 0, "end": E, "q256": {"w13": [q["gate"], q["up"]], "w2": [q["down"]]}}]
+    return rf.FusedRoutedWindowMoE.from_bundles(bundles["gate"], bundles["up"], bundles["down"],
+                                                expert_classes=classes)
+
+
+def _stack_q256(bundle):
+    """The rung (q256) of a grouped bundle's stored schedule: 256 x (body bits per column) / columns, from the
+    first expert's run table [(rate, _, count, _), ...]; every expert of a stack shares one schedule."""
+    runs = bundle.runs_all.view(int(bundle.experts), -1, 4)[0].tolist()
+    bits = sum(int(r[0]) * int(r[2]) for r in runs)
+    cols = int(bundle.cols)
+    q, rem = divmod(256 * bits, cols)
+    if rem:
+        raise SystemExit(f"stack schedule {runs} over {cols} columns is not a q256 rung")
+    return q
 
 
 def stack_planes(fused):
     """{proj: {plane: CPU tensor}} for the three projections of a fused stack."""
     out = {}
+    # 37742e0f: the kernel-ready planes live on the stack's _WindowClass (one here: every expert in one class);
+    # the class's gate / up / down are the bundles' native views, which keep init_all / has_init / scale_all
+    if len(fused.classes) != 1:
+        raise SystemExit(f"the engine reads ONE expert class, Tessera built {len(fused.classes)}")
+    c = fused.classes[0]
     for k in PROJS:
-        b = getattr(fused, k)
-        tile, slot = ((fused.tile_words_down, fused.slot_words_down) if k == "down"
-                      else (fused.tile_words_gate_up, fused.slot_words_gate_up))
+        b = getattr(c, k)
+        tile, slot = ((c.tile_words_down, c.slot_words_down) if k == "down"
+                      else (c.tile_words_gate_up, c.slot_words_gate_up))
         out[k] = {
-            "words": getattr(fused, f"words_{k}"),
-            "table": getattr(fused, f"table_{k}").view(torch.bfloat16),
+            "words": getattr(c, f"words_{k}"),
+            "table": getattr(c, f"table_{k}").view(torch.bfloat16),
             "init": b.init_all,
             "has_init": b.has_init,
             "wscale": b.scale_all,
-            "runs": getattr(fused, f"runs_{k}"),
-            "bdesc": getattr(fused, f"bdesc_{k}"),
+            "runs": getattr(c, f"runs_{k}"),
+            "bdesc": getattr(c, f"bdesc_{k}"),
             "geom": torch.tensor([int(tile), int(slot)], dtype=torch.int32),
         }
         out[k] = {p: t.detach().contiguous().cpu() for p, t in out[k].items()}

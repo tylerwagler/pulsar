@@ -121,8 +121,9 @@ def main():
         for name in planes.PLANES[:-1]:   # the geometry travels in moe.geom
             fx.add(f"moe.{k}.{name}", pl[name])
     E = len(blobs["gate"])
-    fx.scalars("moe.geom", (E, fused.gate.rows, fused.gate.cols, fused.tile_words_gate_up, fused.slot_words_gate_up,
-                            fused.tile_words_down, fused.slot_words_down))
+    c = fused.classes[0]   # 37742e0f: the geometry lives on the (one) expert class
+    fx.scalars("moe.geom", (E, fused.gate.rows, fused.gate.cols, c.tile_words_gate_up, c.slot_words_gate_up,
+                            c.tile_words_down, c.slot_words_down))
     xin = torch.load(f"{a.act}/moe_in.pt", mmap=True)
     g = torch.Generator().manual_seed(a.seed)
     router = None
