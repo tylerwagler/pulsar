@@ -197,10 +197,11 @@ typedef struct pulsar_family_tokenizer {
  * family whose banks are not DeepSeek's graph pool.  NULL (DeepSeek) = the
  * pulsar_session members in session_banks.cpp.  When set, engine_api.cpp's bank
  * entries call these, and the operations a family cannot do -- forks, per-bank
- * KV spill, physical eviction -- refuse with each entry's own failure value
- * (the server has a path for every one of them).  The demand-paged KV accounting
- * (L270) is the same contract as DeepSeek's (admission prices the touched share,
- * the 2b guard keeps touched KV under budget). */
+ * KV spill -- refuse with each entry's own failure value (the server has a path
+ * for every one of them).  The demand-paged KV accounting (L270) and the physical
+ * residency (L284 #3) are the same contract as DeepSeek's (admission prices the
+ * touched share, the 2b guard keeps touched KV under budget by spilling a bank to
+ * its segment chain and freeing its physical; the always-resident state stays). */
 typedef struct {
     int (*count)(pulsar_session *s);
     /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
@@ -224,6 +225,15 @@ typedef struct {
     uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
     /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
     uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
+    /** L284 #3: return an idle bank's demand-paged KV physical (cudaFree) -- the
+     *  pulsar_session_bank_free_physical contract: false ONLY on a refusal (the live bank, a
+     *  bank out of range) with nothing freed; true = the bank is evicted, its touched KV 0. */
+    bool (*free_physical)(pulsar_session *s, uint32_t bank);
+    /** L284 #3: re-back an evicted bank (fresh managed tensors, physical on touch).  Idempotent;
+     *  on a failure the bank is left wholly evicted.  The caller reloads its KV (segment chain). */
+    bool (*alloc_physical)(pulsar_session *s, uint32_t bank);
+    /** L284 #3: true while any of the bank's demand-paged KV is missing. */
+    bool (*is_evicted)(const pulsar_session *s, uint32_t bank);
 } pulsar_family_bank_ops;
 
 /** One model family.  Instances are static and const; pulsar_engine::family

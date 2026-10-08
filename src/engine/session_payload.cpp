@@ -874,7 +874,11 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
     for (uint32_t i = 0; rc == 0 && i < n; i++) {
         const uint32_t row0 = t0 / pools[i].tokens_per_row, rows = pool_row(pools[i], t1) - row0;
         if (!rows) continue;
-        const uint64_t off = pools[i].base + (uint64_t)row0 * pools[i].row_bytes, bytes = (uint64_t)rows * pools[i].row_bytes;
+        if (!pools[i].rows) {   /* L284 #3: an evicted bank's pools are gone until alloc_physical re-backs them */
+            payload_set_err(err, errlen, "a KV pool of the installed bank has no physical (an evicted bank)");
+            return 1;
+        }
+        const uint64_t off = (uint64_t)row0 * pools[i].row_bytes, bytes = (uint64_t)rows * pools[i].row_bytes;
         rc = write ? payload_write_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen)
                    : payload_read_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, remaining,
                                               err, errlen);

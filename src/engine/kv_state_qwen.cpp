@@ -111,15 +111,13 @@ static void qwen_set_frontier_stale(void *state, uint32_t G) {
 }
 
 /* QSA layer il's two pools at out[n], out[n + 1] (where they fit): its KV (one token a row) and pooled
- * indexer keys (idx_block a row), the installed bank's slice.  Returns n + 2. */
+ * indexer keys (idx_block a row), the installed bank's own tensors (L284 #3).  Returns n + 2. */
 static uint32_t qwen_layer_pools(pulsar_qwen_state *st, uint32_t il, pulsar_kv_pool *out, uint32_t n, uint32_t cap) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     const uint32_t bank = st->live_bank;
-    const uint64_t kv_row = pulsar_qwen_kv_row_bytes(s), ix_row = pulsar_qwen_index_row_bytes(s);
-    const uint64_t ix_rows = (st->ctx + s->idx_block - 1u) / s->idx_block;
     pulsar_qwen_layer_state *L = &st->layer[il];
-    if (n < cap) out[n] = { L->kv, 1u, kv_row, (uint64_t)bank * st->ctx * kv_row };
-    if (n + 1u < cap) out[n + 1u] = { L->idx_keys, s->idx_block, ix_row, (uint64_t)bank * ix_rows * ix_row };
+    if (n < cap) out[n] = { L->kv[bank], 1u, pulsar_qwen_kv_row_bytes(s) };
+    if (n + 1u < cap) out[n + 1u] = { L->idx_keys[bank], s->idx_block, pulsar_qwen_index_row_bytes(s) };
     return n + 2u;
 }
 

@@ -347,7 +347,7 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     }
     return s ? s->touched_kv_bytes() : 0;
 }
-bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); if (FAMILY_BANKS(s)) return false; return s ? s->bank_is_evicted(bank) : false; }
+bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? s->bank_is_evicted(bank) : false; }
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0); if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->touched_kv_bytes(s, bank); return s ? s->bank_touched_kv_bytes(bank) : 0; }
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", 0); if (FAMILY_BANKS(s)) return FAMILY_BANKS(s)->growth_bytes(s, q); return s->quantum_growth_bytes_per_bank(q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
@@ -1110,13 +1110,11 @@ static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t ban
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
-    if (FAMILY_BANKS(s)) return false;   /* banks are resident for the session's life */
     return s ? tp_mirror_bank_physical(s, 1, bank) : false;
 }
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
-    if (FAMILY_BANKS(s)) return false;
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0); const pulsar_tokens *t = pulsar_bank_history(s, bank); return t ? t->len : 0; }

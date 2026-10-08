@@ -20,7 +20,7 @@
  *   B3  an invalidate while bank 1 is live does not touch bank 0
  *   B4  the router's view: bank_pos / bank_tokens per bank, live and carried
  *   B5  the demand-paged accounting: each bank's touched KV is priced and sums within the session's, a decode
- *       quantum is priced; a per-bank physical eviction either refuses or leaves the bank holding nothing
+ *       quantum is priced; a per-bank physical eviction of an idle bank leaves it holding nothing
  *   B6  a verify step over several banks' runs (the speculation lane's) gives each bank its run's rows verified
  *       alone, byte for byte (L272 P1 S4)
  * The fused step (L284 #2; pulsar_session_decode_fused: a verify's rows and a prompt chunk in one forward), bank 0
@@ -428,12 +428,13 @@ static void part_banks(pulsar_engine *e, int W) {
         CHECK(t0 > 0 && t1 > 0 && all >= t0 + t1 && q > 0,
               "B5 touched KV per bank %llu / %llu B, session %llu B, an 8-token quantum %llu B",
               (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)all, (unsigned long long)q);
-        /* the eviction contract: a family whose banks share tensors refuses (Qwen); one that can release a
-         * bank's pages does, and that bank then holds none (DeepSeek) */
+        /* the eviction contract (L284 #3: every family's): an idle bank's pages are released, and it then holds
+         * none (bank_residency_gate grades the way back) */
         const bool freed = pulsar_session_bank_free_physical(s, 1);
         const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1);
-        CHECK(!freed || t1_after == 0, "B5 a per-bank physical eviction %s (bank 1 touched after: %llu B)",
-              freed ? "released the bank" : "refused (shared tensors)", (unsigned long long)t1_after);
+        CHECK(freed && t1_after == 0 && pulsar_session_bank_is_evicted(s, 1),
+              "B5 a per-bank physical eviction released idle bank 1 (touched after: %llu B)",
+              (unsigned long long)t1_after);
     }
 
     pulsar_session_free(s);

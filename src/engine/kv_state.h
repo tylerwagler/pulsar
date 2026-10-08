@@ -49,13 +49,11 @@
 
 /** One append-only row pool of the INSTALLED bank: row r holds tokens [r * tokens_per_row,
  *  (r + 1) * tokens_per_row), rows never change once the frontier is past them, and the
- *  rows are contiguous in `rows` at base + r * row_bytes (base: the bank's slice of a bank-major
- *  tensor -- Qwen's; 0 where the installed bank owns the tensor -- DeepSeek's). */
+ *  rows are contiguous in `rows` (a tensor the installed bank owns) at r * row_bytes. */
 typedef struct {
     struct pulsar_gpu_tensor *rows;
     uint32_t tokens_per_row;
     uint64_t row_bytes;
-    uint64_t base;
 } pulsar_kv_pool;
 
 typedef struct pulsar_kv_state_ops {

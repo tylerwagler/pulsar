@@ -8,18 +8,21 @@
 bool pulsar_session::bank_free_physical(uint32_t bank) {
     auto *s = this;
     if (!s) return false;
+    if (const pulsar_family_bank_ops *ops = FAMILY_BANKS(s)) return ops->free_physical(s, bank);   /* L284 #3 */
     return gpu_graph_bank_free_physical(s->graph, bank);
 }
 
 bool pulsar_session::bank_alloc_physical(uint32_t bank) {
     auto *s = this;
     if (!s) return false;
+    if (const pulsar_family_bank_ops *ops = FAMILY_BANKS(s)) return ops->alloc_physical(s, bank);
     return gpu_graph_bank_alloc_physical(s->graph, bank);
 }
 
 bool pulsar_session::bank_is_evicted(uint32_t bank) const {
     auto *s = this;
     if (!s) return false;
+    if (const pulsar_family_bank_ops *ops = FAMILY_BANKS(s)) return ops->is_evicted(s, bank);
     return gpu_graph_bank_is_evicted(s->graph, bank);
 }
 
