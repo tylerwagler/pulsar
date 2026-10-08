@@ -28,12 +28,13 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hf_source import HFCheckpoint, Exl3Checkpoint, EXL3_LAYOUT, exl3_expert_bytes  # noqa: E402
+from hf_source import HFCheckpoint, Exl3Checkpoint, EXL3_LAYOUT  # noqa: E402
 import names as N          # noqa: E402
 import policy as P         # noqa: E402
 import producers as PR     # noqa: E402
 import kv as KV            # noqa: E402
 import qwen as Q           # noqa: E402
+import entries as EN       # noqa: E402
 
 ALIGN = 32
 NATIVE_DTYPES = {'bf16': 'BF16', 'f32': 'F32', 'i32': 'I32'}
@@ -104,37 +105,8 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         dshape = P.declared_shape(m, hshape)           # what the container holds (policy decision 5)
         layout = P.layout_for(m, dtype, hshape, overrides)
         dims_ne = list(reversed(dshape))
-        entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
-        if layout in NATIVE_DTYPES and dtype == NATIVE_DTYPES[layout]:
-            path, off, n = hf.span(name)
-            entry.update(dtype=NATIVE_DTYPES[layout], shape=list(dshape), nbytes=n,
-                         src=('ranges', [(path, off, n)]))
-        elif layout == 'i32' and dtype == 'I64':
-            # the ONE narrowing: the routing table ffn.gate.tid2eid is I64 in the
-            # checkpoint and I32 in the engine (tensor_expect_layout); values must fit
-            n_el = 1
-            for d in hshape:
-                n_el *= d
-            entry.update(dtype='I32', shape=list(dshape), nbytes=4 * n_el,
-                         src=('produce', PR.spec('i64_to_i32', [name])))
-        elif layout == 'mxfp8_lt':
-            scale = name[:-len('.weight')] + '.scale'
-            if not hf.has(scale):
-                raise SystemExit(f'{name}: mxfp8_lt needs {scale}')
-            out, inp = hshape
-            srows = hf.shape(scale)[0]
-            block = out // srows
-            nbytes = PR.bytes_for(layout, dims_ne)
-            entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes,
-                         src=('produce', PR.spec('mxfp8_lt', [name, scale], out=out, inp=inp, block=block,
-                                                 mode=mxfp8_mode)))
-        elif layout == 'fp8_e4m3_soa_k':
-            rows, cols = hshape
-            nbytes = PR.bytes_for(layout, dims_ne)
-            entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes,
-                         src=('produce', PR.spec('fp8_e4m3_soa_k_from_bf16', [name], rows=rows, cols=cols)))
-        else:
-            raise SystemExit(f'{name}: layout {layout} has no dense producer')
+        entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name,
+                 **EN.dense(hf, name, layout, dshape, mxfp8_mode)}
         shards[m.shard]['entries'].append(entry)
         shards[m.shard]['tensors'][m.container_name] = {'layout': layout, 'dims_ne': dims_ne,
                                                         'gguf_name': m.gguf_name}
@@ -148,30 +120,17 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
         wname0 = slots[0]['weight']
         hshape = hf.shape(wname0)                      # I8 [out, in/2] for the FP4 source
         dtype = hf.dtype(wname0)
-        out = hshape[0]
-        inp = hshape[1] * 2 if dtype == 'I8' else hshape[1]
+        out, inp = PR.matrix_dims(EN.kind_of(hf, wname0), hshape)
         dims_ne = [inp, out]
         use_exl3 = exl3 is not None and shard.startswith('layers.') and layer in exl3_layers
         if use_exl3:
-            words = None
-            per = []
-            for e in range(n_exp):
-                ranges, w = exl3.expert(layer, e, part, inp, out)
-                if words is None:
-                    words = w
-                elif w != words:
-                    raise SystemExit(f'layers.{layer}.ffn.experts.{e}.{part}: {w} words per tile, expert 0 has {words}')
-                per.append(ranges)
+            _, words = exl3.expert(layer, 0, part, inp, out)
             layout = EXL3_LAYOUT[words]
-            trellis, scales = exl3_expert_bytes(inp, out, words)
-            eb = trellis + scales
+            per = [EN.exl3_ranges(exl3, f'layers.{layer}.ffn.experts.{e}.{part}', layout, inp, out, EXL3_LAYOUT)[0]
+                   for e in range(n_exp)]
         else:
             layout = P.layout_for(m0, dtype, hshape, overrides)
-            if layout != 'cutlass_mxfp4':
-                raise SystemExit(f'{shard} {part}: routed layout {layout} has no producer here')
-            eb = PR.bytes_for(layout, dims_ne)
-        if PR.bytes_for(layout, dims_ne) != eb:
-            raise SystemExit(f'{shard} {part}: byte model disagrees ({PR.bytes_for(layout, dims_ne)} vs {eb})')
+        eb = PR.bytes_for(layout, dims_ne)
         gguf_name = m0.gguf_name
         shards[shard]['experts'].append({'gguf_name': gguf_name, 'part': part, 'n_experts': n_exp,
                                          'expert_bytes': eb, 'layout': layout, 'contiguous': True,
@@ -180,13 +139,7 @@ def plan(hf, exl3, exl3_layers, overrides, mxfp8_mode, tokenizer_dir, reap_map):
             m = slots[e]['mapped']
             entry = {'name': m.container_name, 'layout': layout, 'gguf_name': gguf_name,
                      'dtype': 'U8', 'shape': [eb], 'nbytes': eb}
-            if use_exl3:
-                entry['src'] = ('ranges', per[e])
-            else:
-                wn, sn = slots[e]['weight'], slots[e].get('scale')
-                if not sn:
-                    raise SystemExit(f'{wn}: cutlass_mxfp4 needs its .scale')
-                entry['src'] = ('produce', PR.spec('cutlass_mxfp4', [wn, sn], out=out, inp=inp))
+            entry['src'] = ('ranges', per[e]) if use_exl3 else EN.expert_src(hf, slots[e]['weight'], layout, out, inp)
             shards[shard]['entries'].append(entry)
 
     kvs = KV.build_kv(hf, tokenizer_dir, reap_map)
@@ -443,8 +396,9 @@ def cmd_verify(args):
                 else:
                     n_bad += 1
                     print(f'  BYTES DIFFER {name} ({e["layout"]})')
-                if args.roundtrip and e.get('bf16_src'):
-                    over, rel = mxfp8_roundtrip(hf_of(args), e['bf16_src'], got)
+                kind, src = e['src']
+                if args.roundtrip and kind == 'produce' and src['producer'] == 'mxfp8_lt_from_bf16':
+                    over, rel = mxfp8_roundtrip(hf_of(args), src['inputs'][0], got)
                     rt_worst[name] = rel
                     if over:
                         n_bad += 1

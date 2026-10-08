@@ -374,6 +374,42 @@ def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
 PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, fp8_e4m3_soa_k_from_bf16,
                                       i64_to_i32)}
 
+# The ONE producer table (L279 step 1): (source kind, target format) -> the producer that writes it, COPY for the
+# source's own bytes verbatim.  A source kind is the stored dtype, `+scale` with a block-scale companion, or `exl3`
+# (an exllamav3 Linear's trellis | suh | svh).  Both families' plans ask here; a pair that is not a row refuses by
+# name (producer_for) -- there is no nearest format.
+COPY = "copy"
+PRODUCER_FOR = {
+    ("BF16", "bf16"): COPY,
+    ("F32", "f32"): COPY,
+    ("I32", "i32"): COPY,
+    ("I64", "i32"): "i64_to_i32",
+    ("F8_E4M3+scale", "mxfp8_lt"): "mxfp8_lt",
+    ("BF16", "mxfp8_lt"): "mxfp8_lt_from_bf16",
+    ("BF16", "fp8_e4m3_soa_k"): "fp8_e4m3_soa_k_from_bf16",
+    ("I8+scale", "cutlass_mxfp4"): "cutlass_mxfp4",
+    **{("exl3", layout): COPY for layout in exl3_rates.K2},
+}
+
+
+def source_kind(dtype: str, has_scale: bool) -> str:
+    return dtype + "+scale" if has_scale else dtype
+
+
+def producer_for(kind: str, fmt: str, what: str) -> str:
+    """The producer that writes `fmt` from a `kind` source, or a refusal naming the pair."""
+    prod = PRODUCER_FOR.get((kind, fmt))
+    if prod is None:
+        have = sorted(f for k, f in PRODUCER_FOR if k == kind)
+        raise SystemExit(f"{what}: no producer writes {fmt} from a {kind} source (from {kind}: {have or 'nothing'})")
+    return prod
+
+
+def matrix_dims(kind: str, shape: list) -> tuple:
+    """(out, in) of a source matrix: the FP4 source stores two E2M1 nibbles per I8 byte."""
+    out, cols = shape
+    return out, cols * 2 if kind == "I8+scale" else cols
+
 
 def spec(producer: str, inputs: list, **args) -> dict:
     """The serializable producer descriptor of one entry."""

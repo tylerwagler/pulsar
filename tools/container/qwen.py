@@ -41,8 +41,8 @@ import os
 import re
 import struct
 
+import entries as EN
 import exl3_rates
-from hf_source import EXL3_MUL1  # noqa: F401  (the codebook the EXL3 sources are checked against)
 import kv as KV
 import producers as PR
 
@@ -121,16 +121,6 @@ def shard_of(name):
 # ---------------------------------------------------------------------------
 # the plan
 # ---------------------------------------------------------------------------
-def _exl3_entry(src, key, k, n, want_layout):
-    ranges, words = src.linear(key, k, n, EXL3_RATES)
-    if EXL3_RATES[words] != want_layout:
-        raise SystemExit(f"{key}: the recipe names {want_layout}, the EXL3 source holds {EXL3_RATES[words]} -- refusing")
-    nbytes = PR.bytes_for(want_layout, [k, n])
-    if sum(r[2] for r in ranges) != nbytes:
-        raise SystemExit(f"{key}: EXL3 source spans {sum(r[2] for r in ranges)} bytes, {want_layout} on [{k}, {n}] is {nbytes}")
-    return ranges, nbytes
-
-
 def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
     cfg = hf.config
     n_layer = int(cfg["num_hidden_layers"])
@@ -146,22 +136,9 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
             continue
         shard = shard_of(name)
         dtype, shape = hf.dtype(name), hf.shape(name)
-        if f == "bf16":
-            if dtype != "BF16":
-                raise SystemExit(f"{name}: recipe says bf16, the checkpoint holds {dtype}")
-            path, off, n = hf.span(name)
-            entry = {"name": name, "layout": "bf16", "gguf_name": name, "dtype": "BF16", "shape": list(shape),
-                     "nbytes": n, "src": ("ranges", [(path, off, n)])}
+        if f in ("bf16", "mxfp8_lt"):
+            entry = {"name": name, "layout": f, "gguf_name": name, **EN.dense(hf, name, f, shape)}
             dims_ne = list(reversed(shape))
-        elif f == "mxfp8_lt":
-            if dtype != "BF16" or len(shape) != 2:
-                raise SystemExit(f"{name}: mxfp8_lt from a BF16 matrix, the checkpoint holds {dtype} {shape}")
-            out, inp = shape
-            dims_ne = [inp, out]
-            nbytes = PR.bytes_for("mxfp8_lt", dims_ne)
-            entry = {"name": name, "layout": "mxfp8_lt", "gguf_name": name, "dtype": "U8", "shape": [nbytes],
-                     "nbytes": nbytes, "bf16_src": name,
-                     "src": ("produce", PR.spec("mxfp8_lt_from_bf16", [name], out=out, inp=inp))}
         elif f.startswith("exl3m_") and ".mlp.experts." not in name:
             if exl3 is None:
                 raise SystemExit(f"{name}: the recipe names {f}; pass --exl3")
@@ -169,7 +146,7 @@ def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
                 raise SystemExit(f"{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {dtype} {shape}")
             out, inp = shape
             dims_ne = [inp, out]
-            ranges, nbytes = _exl3_entry(exl3, name[:-len(".weight")], inp, out, f)
+            ranges, nbytes = EN.exl3_ranges(exl3, name[:-len(".weight")], f, inp, out, EXL3_RATES)
             entry = {"name": name, "layout": f, "gguf_name": name, "dtype": "U8", "shape": [nbytes],
                      "nbytes": nbytes, "src": ("ranges", ranges)}
         elif f.startswith("exl3m_"):
@@ -227,7 +204,7 @@ def _plan_experts(hf, src, recipe, stack_name, layout, shard):
         fam_name = pre + part
         entry_name = pre + "{e}." + part + ".weight"
         for e in range(E):
-            ranges, nbytes = _exl3_entry(src, f"{pre}{e}.{part}", inp, n, layout)
+            ranges, nbytes = EN.exl3_ranges(src, f"{pre}{e}.{part}", layout, inp, n, EXL3_RATES)
             assert nbytes == eb
             name = entry_name.replace("{e}", str(e))
             shard["entries"].append({"name": name, "layout": layout, "gguf_name": fam_name, "dtype": "U8",
