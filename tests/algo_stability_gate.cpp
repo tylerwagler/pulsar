@@ -28,13 +28,18 @@
  * The first differing float index + the two values are printed so a real algo
  * divergence (large, systematic) is never hidden behind a pass/fail bit.
  *
- * The comp caches have one format each (packed attn / MXFP4 indexer).
+ * L284: the banks are populated through the PUBLIC bank API (gate_bank_sync), so the sweep runs on every hosted
+ * model through the runner's family host -- Qwen's batched decode is graded by the same widths and the same
+ * byte / KL rule as DeepSeek's.  Each width's step is proven to have run as one batch of exactly that width by
+ * the step's returned row count (every family) and, where the family's forward feeds it, by the engine's step
+ * funnel counter (DeepSeek's gpu_graph_decode_multiseq_batch); the gate says which.
+ *
  * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=16. Run under GPU discipline.
- *   usage: PULSAR_MSEQ_BANKS=16 ./tests/algo_stability_gate MODEL
+ *   usage: PULSAR_MSEQ_BANKS=16 ./tests/algo_stability_gate MODEL [deep]
  */
 #include "pulsar.h"
-#include "pulsar_engine_internal.h"
-#include "gate_fixture.h"
+#include "pulsar_engine_internal.h"   /* pulsar_gate_shape: DeepSeek's step funnel counter (non-vacuity) */
+#include "gate_util.h"
 #include "gate_entry.h"
 
 #include <stdio.h>
@@ -66,13 +71,12 @@ static int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158,
 static bool bank0_logits_at_width(int M, float *row0_out) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    const int vocab = (int)PULSAR_N_VOCAB;
-    bool ok = gate_pool_fits(s, (uint32_t)M);
+    const int vocab = pulsar_engine_logits_width(g_e);
+    bool ok = gate_bank_pool_fits(s, M);
     char err[256];
     int argtok[GATE_MAX_N];
     for (int k = 0; ok && k < M; k++)
-        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k],
-                                &argtok[k], "populate");
+        ok = gate_bank_sync(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k], &argtok[k], "populate");
     float *logits = ok ? (float *)malloc((size_t)M * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
@@ -82,9 +86,14 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
             reqs[k].pos = g_prompt_len[k];      /* bank 0 ALWAYS at the same pos */
             reqs[k].token = argtok[k];
         }
+        uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, (uint32_t)M, logits,
-                                                M * vocab, NULL, 0u, err, sizeof err);
+                                                M * vocab, &got, 0u, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(M=%d) failed rc=%d: %s\n", M, rc, err); ok = false; }
+        else if (got != (uint32_t)M) {
+            fprintf(stderr, "decode_mixed(M=%d) returned %u rows -- the step did not run at its width\n", M, got);
+            ok = false;
+        }
         else memcpy(row0_out, logits, (size_t)vocab * sizeof(float));  /* row 0 == bank 0 */
     }
     free(logits);
@@ -102,15 +111,15 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats); bank 0 at %d tokens%s\n",
-           g_prompt_len[0], deep ? " (deep: indexed lane engaged)" : "");
+    printf("CONFIG [%s]: bank 0 at %d tokens%s\n", pulsar_engine_family_name(g_e), g_prompt_len[0],
+           deep ? " (deep: past the indexed-attention thresholds)" : "");
 
     int need = 0;
     for (int k = 0; k < GATE_MAX_N; k++)
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     if (!gate_load_story(g_e, &g_toks, need)) { pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1; }
 
-    const int vocab = (int)PULSAR_N_VOCAB;
+    const int vocab = pulsar_engine_logits_width(g_e);
     /* 12 and 16 added 2026-09-02: the armed range above 8 rows had no width
      * sweep in the battery (L152 lived at 9..16).  L220 dropped 12: the
      * width-KEYED arms are (a) 1 vs >=2 (the single-row tier, informational
@@ -138,21 +147,30 @@ int GATE_ENTRY(int argc, char **argv) {
      * at exactly that width -- the engine's own funnel counter (the same one
      * --shape reports), not a second copy.  step_rows is the sum of the widths:
      * a width that silently collapsed into another shape, or never ran, would
-     * make its comparison vacuous while still printing byte-identical. */
+     * make its comparison vacuous while still printing byte-identical.
+     * L284: the funnel is DeepSeek's graph; a family whose forward does not
+     * feed it (Qwen: its prefill and its steps leave both counts at 0 while
+     * the banks above were prefilled) is said by name, and its widths stand on
+     * each step's returned row count (asserted in bank0_logits_at_width). */
     {
         pulsar_gate_shape sh;
         pulsar_gate_shape_read(&sh);
         int want_rows = 0;
         for (int wi = 0; wi < nW; wi++) want_rows += widths[wi];
-        if (sh.step_calls != (uint64_t)nW || sh.step_rows != (uint64_t)want_rows) {
+        if (sh.prefill_calls == 0 && sh.step_calls == 0) {
+            printf("WIDTH SWEEP SHAPE [%s]: the family's forward does not feed the step funnel counter; each of the "
+                   "%d widths returned exactly its own row count from one batched call (%d rows)\n",
+                   pulsar_engine_family_name(g_e), nW, want_rows);
+        } else if (sh.step_calls != (uint64_t)nW || sh.step_rows != (uint64_t)want_rows) {
             fprintf(stderr, "ALGO-STABILITY GATE FAIL: width sweep shape %llu step call(s) / "
                     "%llu row(s), want %d / %d -- a width did not run as its own batch\n",
                     (unsigned long long)sh.step_calls, (unsigned long long)sh.step_rows, nW, want_rows);
             g_fail = 1;
             goto done;
+        } else {
+            printf("WIDTH SWEEP SHAPE: %d batched step(s), %llu row(s) total (sum of widths %d)\n",
+                   nW, (unsigned long long)sh.step_rows, want_rows);
         }
-        printf("WIDTH SWEEP SHAPE: %d batched step(s), %llu row(s) total (sum of widths %d)\n",
-               nW, (unsigned long long)sh.step_rows, want_rows);
     }
 
     /* Reference = M=2 (the smallest BATCHED-tier width; M=1 is the single-row

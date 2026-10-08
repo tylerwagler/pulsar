@@ -63,10 +63,14 @@
  * engine; the byte gate pins one chunking, this pins that the chunking does not
  * matter.
  *
+ * L284: every family.  The schedules use the public session API only; one that
+ * needs a whole-session payload (H, I, and K's shared decode for M and P) or a
+ * rewind (J, K) is skipped by name on a family without it, and the expected
+ * resume origin is the family's sync planner's column (see the table).
+ *
  *   ./tests/chunk_neutrality_gate MODEL
  */
 #include "pulsar.h"
-#include "pulsar_engine_internal.h"
 #include "gate_entry.h"
 #include "pulsar_segstore.h"
 
@@ -328,73 +332,107 @@ int GATE_ENTRY(int argc, char **argv) {
         /* GATE_SCHEDULES x (frontier, decoded) */
         rows = (float *)malloc((size_t)(2 * GATE_SCHEDULES) * (size_t)width * sizeof(float));
         if (!rows) goto done;
-        struct { const char *label; int first; int evals; int origin; bool via_snapshot; int cut; int restore; int segments; int share; } sched[GATE_SCHEDULES] = {
+        /* L284: the gate runs on every hosted model.  What a schedule NEEDS of the family (a whole-session payload,
+         * a rewind) is a column; a schedule whose need the family lacks is skipped by name and compared to nothing.
+         * Where it resumes from is the family's sync planner's fact, so the expected origin is a column per planner:
+         *   origin      DeepSeek's sync (L183/L195): every resume re-prefills from the last PREFILL grid point at or
+         *               below the view, so a resume is the cold prefill's chunking;
+         *   origin_ext  the core sync driver (sync_driver.cpp; Qwen): a prompt that extends the view continues it
+         *               from the view's end (0 = a fresh session prefills from 0), anything else resumes from the
+         *               deepest grid checkpoint it shares.
+         * The bytes are graded the same way on both: every schedule == A, frontier row and one decode step. */
+        constexpr unsigned NEED_SNAPSHOT = 1u, NEED_REWIND = 2u;
+        struct { const char *label; int first; int evals; int origin; int origin_ext; bool via_snapshot; int cut; int restore; int segments; int share; unsigned needs; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
              * every crossing; a prompt under 128 tokens has none (cold) */
-            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, false, 0, 0, 0, 0},   /* a fresh session: the sync is a rebuild, not a resume */
-            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, false, 0, 0, 0, 0},
-            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, false, 0, 0, 0, 0},
-            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, false, 0, 0, 0, 0},
-            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, false, 0, 0, 0, 0},
+            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, 0, false, 0, 0, 0, 0, 0},   /* a fresh session: the sync is a rebuild, not a resume */
+            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, 6, false, 0, 0, 0, 0, 0},
+            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, 2048, false, 0, 0, 0, 0, 0},
+            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, 4000, false, 0, 0, 0, 0, 0},
+            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, 4500, false, 0, 0, 0, 0, 0},
             /* decode saves nothing (its rows are the decode kernels'); the
              * resume redoes the generated tokens from the last PREFILL grid
              * point -- the only way it equals the cold prefill */
-            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, false, 0, 0, 0, 0},
-            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, false, 0, 0, 0, 0},
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, 8100 + GATE_EVALS, false, 0, 0, 0, 0, 0},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, 4000 + GATE_EVALS, false, 0, 0, 0, 0, 0},
             /* the payload carries the prefill frontier and a raw window deep
              * enough for the warm-up: a disk-restored bank resumes too */
-            {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, true, 0, 0, 0, 0},
-            {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, true, 0, 0, 0, 0},
+            {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, 4500, true, 0, 0, 0, 0, NEED_SNAPSHOT},
+            {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, 8192, true, 0, 0, 0, 0, NEED_SNAPSHOT},
             /* the cut: prefilled to 4500, rewound to 4300 (an edited tail); the
              * resume starts at the deepest grid CHECKPOINT at or below the cut's
              * grid point 4224 -- the prefill's chunks ended at 4096 and 4480, so
              * 4096 (L264: before it, the projection ring reached 4224) */
-            {"J: sync 4500, cut to 4300, resume from 4096", 4500, 0, 4096, false, 4300, 0, 0, 0},
+            {"J: sync 4500, cut to 4300, resume from 4096", 4500, 0, 4096, 4096, false, 4300, 0, 0, 0, NEED_REWIND},
             /* L264: a turn whose generation ran past the raw ring's reach, echoed
              * back without it (the client stripped its reasoning): every raw slot
              * of [3840, 3968) was rewritten by decode rows 8192.. that the cut
              * removes.  The prefill's grid point 3968 is the exact resume. */
-            {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 4100, 0, 0, 1},
+            {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 4100, 0, 0, 1, NEED_REWIND | NEED_SNAPSHOT},
             /* L264: resumes from the grid checkpoints the prefills captured */
-            {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, false, 0, 4096, 0, 0},
-            {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 0, 3968, 0, 2},
-            {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, false, 0, 8576, 0, 0},
+            {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, 4096, false, 0, 4096, 0, 0, 0},
+            {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 3968, 0, 2, NEED_SNAPSHOT},
+            {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 8576, 0, 0, 0},
             /* L264 S4: the same resumes through disk segments */
-            {"O: sync 8600, segment chain to 8576 through disk, resume from 8576", GATE_N, 0, 8576, false, 0, 0, 8576, 0},
-            {"P: sync 4000, decode 4600, segment chain to 3968 through disk, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, false, 0, 0, 3968, 2},
+            {"O: sync 8600, segment chain to 8576 through disk, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 0, 8576, 0, 0},
+            {"P: sync 4000, decode 4600, segment chain to 3968 through disk, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 0, 3968, 2, NEED_SNAPSHOT},
         };
+        const pulsar_family_id fam = pulsar_engine_family(e);
+        if (fam != PULSAR_FAMILY_ID_DEEPSEEK4 && fam != PULSAR_FAMILY_ID_QWEN4_EXP) {
+            fprintf(stderr, "CHUNK-NEUTRALITY GATE: no resume-origin column for family %s -- add its planner's\n",
+                    pulsar_engine_family_name(e));
+            goto done;
+        }
+        const bool grid_planner = fam == PULSAR_FAMILY_ID_DEEPSEEK4;
+        const unsigned has = (pulsar_engine_has_snapshots(e) ? NEED_SNAPSHOT : 0u) |
+                             (pulsar_engine_can_rewind(e) ? NEED_REWIND : 0u);
+        bool ran[GATE_SCHEDULES] = {false};
         char err[256];
-        printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",
-               GATE_N, opt.prefill_chunk, GATE_SCHEDULES);
+        printf("chunk-neutrality gate [%s]: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step "
+               "each; origins: %s\n", pulsar_engine_family_name(e), GATE_N, opt.prefill_chunk, GATE_SCHEDULES,
+               grid_planner ? "the grid planner's (every resume from a prefill grid point)"
+                            : "the core sync driver's (an extending prompt continues the view)");
         /* share 1: the schedule whose sync + decode the share-2 schedules start from (L278: K's 4600-row decode
          * past the ring, once instead of three times) */
         pulsar_session_snapshot shared; memset(&shared, 0, sizeof shared);
         bool have_shared = false;
+        int fails = 0;
         for (int k = 0; k < GATE_SCHEDULES; k++) {
+            const unsigned missing = sched[k].needs & ~has;
+            if (missing) {
+                printf("  SKIP  %s [%s]: needs %s\n", sched[k].label, pulsar_engine_family_name(e),
+                       missing & NEED_SNAPSHOT ? "whole-session payloads (pulsar_engine_has_snapshots)"
+                                               : "session rewind (pulsar_engine_can_rewind)");
+                continue;
+            }
             if (sched[k].share == 2 && !have_shared) {
                 fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s shares a decode no earlier schedule kept\n", sched[k].label);
-                pulsar_session_snapshot_free(&shared);
-                goto done;
+                fails++;
+                continue;
             }
             if (sched[k].share == 2)
                 printf("  [shared] %s starts from the payload of the shared sync %d + decode %d\n", sched[k].label,
                        sched[k].first, sched[k].evals);
-            if (run_schedule(e, &toks, sched[k].first, sched[k].evals, sched[k].origin, sched[k].via_snapshot, sched[k].cut,
+            if (run_schedule(e, &toks, sched[k].first, sched[k].evals,
+                             grid_planner ? sched[k].origin : sched[k].origin_ext, sched[k].via_snapshot, sched[k].cut,
                              sched[k].restore, sched[k].segments, width,
                              rows + (size_t)(2 * k) * width,
                              rows + (size_t)(2 * k + 1) * width,
                              sched[k].share == 2 ? &shared : NULL, sched[k].share == 1 ? &shared : NULL,
                              err, sizeof err) != 0) {
                 fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s failed: %s\n", sched[k].label, err);
-                pulsar_session_snapshot_free(&shared);
-                goto done;
+                printf("  %-50s FAILED TO RUN: %s\n", sched[k].label, err);
+                fails++;
+                if (k == 0) break;   /* nothing to compare against */
+                continue;
             }
+            ran[k] = true;
             have_shared |= sched[k].share == 1;
         }
         pulsar_session_snapshot_free(&shared);
-        int fails = 0;
-        for (int k = 1; k < GATE_SCHEDULES; k++) {
+        for (int k = 1; ran[0] && k < GATE_SCHEDULES; k++) {
+            if (!ran[k]) continue;
             fails += compare_rows("frontier", sched[k].label, rows, rows + (size_t)(2 * k) * width, width);
             fails += compare_rows("decode+1", sched[k].label, rows + (size_t)width, rows + (size_t)(2 * k + 1) * width, width);
         }
@@ -430,7 +468,7 @@ int GATE_ENTRY(int argc, char **argv) {
             free(cold);
             free(back);
         }
-        printf(fails == 0 ? "CHUNK-NEUTRALITY GATE: PASS\n" : "CHUNK-NEUTRALITY GATE: FAIL (%d rows differ)\n", fails);
+        printf(fails == 0 ? "CHUNK-NEUTRALITY GATE: PASS\n" : "CHUNK-NEUTRALITY GATE: FAIL (%d rows differ or schedules failed)\n", fails);
         rc = fails == 0 ? 0 : 1;
     }
 done:
