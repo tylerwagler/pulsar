@@ -523,11 +523,11 @@ typedef struct {
     const pulsar_qwen_gr_weights *mixer;
     /** L251 MTP: the step's rows [0, n_dec) are a VERIFY (PREFILL mode, <= SPEC_ROWS rows): the recurrent ops
      *  also write those rows' per-row states and the QSA ops their stages + raw keys into st->spec.  L284 #2:
-     *  rows [n_dec, n_rows) of the same step are a prompt run, never captured. */
+     *  rows [n_dec, n_rows) of the same step are prompt runs, never captured. */
     bool verify;
     /** L272 P1 S4: PREFILL rows as runs -- run k is rows [run_first[k], run_first[k + 1]) of one bank at
-     *  consecutive positions: the verify's runs (one a bank) first, then (L284 #2, the fused step) at most one
-     *  prompt run from row n_dec.  n_runs 1 = the classic one-bank chunk, or a one-bank verify. */
+     *  consecutive positions: the verify's runs (one a bank) first, then (L284 #2, the fused step) its prompt runs
+     *  from row n_dec, one bank each.  n_runs 1 = the classic one-bank chunk, or a one-bank verify. */
     uint32_t n_runs;
     const uint32_t *run_first;
     /** L251 MTP: the head runs the DRAFT head (pulsar_qwen_weights::draft_head_mx): n_draft logits a row. */

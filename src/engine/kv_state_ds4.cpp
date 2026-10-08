@@ -146,6 +146,15 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     return n;
 }
 
+/* A fused chunk to T: the graph's frontier counters are the step's own (the graph steps each run's rows); a bank
+ * whose compressor group is stale holds lanes that describe no prefill, so it is not captured (the sync's
+ * grid-point resume rebuilds it). */
+static bool ds4_noted_at(void *state, uint32_t, bool *capture, char *, size_t) {
+    pulsar_gpu_graph *g = G_(state);
+    *capture = !g->ms_comp_state_stale[gpu_graph_cur_bank(g)];
+    return true;
+}
+
 const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .name               = */ "deepseek-v4",
     /* .resume_grid        = */ DS4_RESUME_GRID,
@@ -162,4 +171,5 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .frontier_at        = */ NULL,   /* the payload is the graph's own (session_payload.cpp) */
     /* .install_frontier   = */ NULL,
     /* .trailing_pools     = */ NULL,
+    /* .noted_at           = */ ds4_noted_at,
 };

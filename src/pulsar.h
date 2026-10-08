@@ -782,11 +782,13 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
  * first-token distribution on its final chunk.  Every prefill run's drafter
  * anchors fill its bank's prompt ring, as a classic prefill chunk does.
  * *out_n_rows = n_dec + the headed runs.  n_dec <= PULSAR_SPEC_ROW_BUDGET and
- * n_dec + headed runs <= PULSAR_SPEC_LOGITS_ROWS. */
+ * n_dec + headed runs <= pulsar_engine_fused_heads_max (the family's cap). */
+/** The most prompt runs one fused step carries (the shape's head_last bound). */
+#define PULSAR_FUSED_PF_MAX 16u
 typedef struct {
     uint32_t n_dec;
     uint32_t n_pf;
-    uint8_t  head_last[16];   /* indexed by prefill run, n_pf <= 16 */
+    uint8_t  head_last[PULSAR_FUSED_PF_MAX];   /* indexed by prefill run, n_pf <= PULSAR_FUSED_PF_MAX */
 } pulsar_fused_shape;
 int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs,
                                 uint32_t n_rows, const pulsar_fused_shape *shape,
@@ -1083,15 +1085,17 @@ bool pulsar_engine_has_spec_rounds(const pulsar_engine *e);
 /** How many decoders one shared speculative verify forward may carry (0 without speculation): the
  *  server runs its spec-batched lane up to this many decoders and the plain batched lane past it. */
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e);
-/** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round)?  The
- *  family's decode_fused op is present (DeepSeek; Qwen since L284 #2 increment 3).  pulsar_session_decode_fused
- *  refuses on its negation (L282: the server once armed fusion on "a bank pool exists", and two concurrent Qwen
- *  requests failed "no fused step"). */
+/** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round, each
+ *  recorded in its bank's history by pulsar_session_note_prefilled)?  The family's decode_fused op is present
+ *  (DeepSeek; Qwen since L284 #2).  pulsar_session_decode_fused refuses on its negation (L282: the server once
+ *  armed fusion on "a bank pool exists", and two concurrent Qwen requests failed "no fused step"). */
 bool pulsar_engine_has_fused_step(const pulsar_engine *e);
-/** Can the server put a prompt on the fused step: the step exists AND the family records a fused chunk in the
- *  bank's history (pulsar_session_note_prefilled -- the DeepSeek graph pool's; Qwen's lands in L284 #2 increment
- *  5, which turns this on for it).  The server's fusion and mixed lanes arm on this, never on the step alone. */
-bool pulsar_engine_fused_prompts_servable(const pulsar_engine *e);
+/** The most logits rows one fused step heads: its verify rows plus its headed prompt runs (the family's cap; 0
+ *  without a fused step).  The server's verify budget for a round is this less the round's finishing chunks. */
+uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e);
+/** Does pulsar_session_decode_mixed carry prefill runs beside its decode rows (the plain batched lane's mixed
+ *  quantum)?  A family without it refuses such a step by name; its prompts ride only the fused step. */
+bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e);
 /** Can the loaded family rewind a live session to an earlier position (pulsar_session_rewind)?  A
  *  recurrent family cannot; a caller with committed tokens the client never saw invalidates instead. */
 bool pulsar_engine_can_rewind(const pulsar_engine *e);

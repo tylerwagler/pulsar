@@ -33,6 +33,10 @@
  *   F4  the verify rows do not move the prompt rows: the same chunk as a fused step with no verify rows gives the
  *       same headed row, byte for byte.  DeepSeek: skipped -- its fused step carries decode rows by contract;
  *       fused_step_gate (5) grades the same fact against a plain mixed step
+ * Several prompt runs (L284 #2 increments 4 and 5, Qwen; DeepSeek skips them with F2): F5-F8 at part_fused_runs --
+ * a 130-row continuation and a dirty bank's 2048 rows from 0 behind 3 verify rows in both bank orders, the decode
+ * after, the runs without the verify, and the core's record of each chunk (note_prefilled: history, next-token
+ * logits, the grid checkpoint a divergent sync then resumes from == cold).
  * In the battery for every family as a runner gate (L278: tests/gates_runner.cpp hosts each family's model); the
  * standalone `make session-contract-gate-qwen` / `-ds` remain for iterating.  Replaces L266's
  * qwen_chunk_neutrality_gate and qwen_banks_gate. */
@@ -643,6 +647,233 @@ static void part_fused(pulsar_engine *e, int W) {
     pulsar_tokens_free(&L);
 }
 
+/* A one-bank 4096-token session (the fused sessions' size): sync each prefix in `cuts`, then eval kDecode; the
+ * logits after the last sync and after each eval. */
+static std::vector<std::vector<float>> classic(pulsar_engine *e, const pulsar_tokens *P, const std::vector<int> &cuts,
+                                               int W) {
+    std::vector<std::vector<float>> out;
+    pulsar_engine_set_bank_pool(1);
+    pulsar_session *c = NULL;
+    char err[256] = "";
+    bool ok = pulsar_session_create(&c, e, 4096) == 0;
+    for (int k : cuts) {
+        pulsar_tokens pre = *P;
+        pre.len = k;
+        ok = ok && pulsar_session_sync(c, &pre, err, sizeof(err)) == 0;
+    }
+    if (ok) out.push_back(logits_of(c, W));
+    for (int i = 0; ok && i < 4; i++) {
+        ok = pulsar_session_eval(c, kDecode[i], err, sizeof(err)) == 0;
+        if (ok) out.push_back(logits_of(c, W));
+    }
+    if (!ok) { fprintf(stderr, "session-contract: classic run: %s\n", err); out.clear(); }
+    if (c) pulsar_session_free(c);
+    return out;
+}
+
+static std::string ledger_text(const char *what, int lines) {
+    std::string text;
+    for (int i = 0; i < lines; i++) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s %d: the tide came in at %d past the hour and the keeper lit lamp %c.\n", what, i,
+                 (7 + 3 * i) % 60, 'A' + i % 26);
+        text += buf;
+    }
+    return text;
+}
+
+/* F5-F8 (L284 #2 increments 4 and 5): several prompt runs in one fused step, on a 3-bank session.  Bank 0 verifies
+ * 3 rows; bank 1 continues its 40-token prefix by a 130-row chunk (past the verify width and the attention's 64-row
+ * fold); bank 2 -- DIRTY: it held another conversation, decoded on it, and was invalidated, as a reused server bank
+ * is -- prefills a 2048-row chunk from 0 (a grid point).  In either bank order:
+ *   F5  the verify rows == verified alone, and each run's headed row == its classic sync, byte for byte
+ *   F6  four decode steps on each prompt bank after the step == its classic run
+ *   F7  the same two runs with no verify rows in front give the same headed rows
+ *   F8  the record (pulsar_session_note_prefilled, the core's for every family): each chunk joins its bank's
+ *       history with its headed row as the next-token logits; bank 2's chunk, which ends on the grid, leaves a
+ *       checkpoint there; and a DIVERGENT sync of bank 2 resumes from it == the divergent prompt cold */
+static void part_fused_runs(pulsar_engine *e, int W) {
+    if (!pulsar_engine_has_fused_step(e) || !pulsar_engine_has_spec_rounds(e) ||
+        pulsar_engine_family(e) == PULSAR_FAMILY_ID_DEEPSEEK4) {
+        printf("  skip  F5-F8 (%s: no fused step with classic-byte prompt rows -- see F2)\n",
+               pulsar_engine_family_name(e));
+        return;
+    }
+    pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
+    pulsar_tokens L = text_tokens(e, ledger_text("Ledger", 12).c_str());
+    pulsar_tokens L2 = text_tokens(e, ledger_text("Logbook", 160).c_str());
+    pulsar_tokens D = text_tokens(e, ledger_text("Manifest", 40).c_str());
+    const int pre_len = 40, m1 = 130, m2 = 2048;
+    if (L.len < pre_len + m1 || L2.len < m2 + 64 || D.len < 300) {
+        CHECK(false, "F5 texts too short (%d, %d, %d tokens)", L.len, L2.len, D.len);
+        return;
+    }
+    printf("session-contract: fused runs: bank 1 %d + %d rows, bank 2 dirty (%d tokens) then %d rows from 0\n", pre_len,
+           m1, D.len, m2);
+    const int runA[3] = {3409, 11, 12};
+    const std::vector<float> soloA = verify_alone(e, &A, runA, 3, W);
+    pulsar_tokens pre = L, c2 = L2;
+    pre.len = pre_len;
+    c2.len = m2;
+    const std::vector<std::vector<float>> cl1 = classic(e, &L, {pre_len, pre_len + m1}, W);
+    const std::vector<std::vector<float>> cl2 = classic(e, &L2, {m2}, W);
+    CHECK(soloA.size() == (size_t)3 * W && cl1.size() == 5 && cl2.size() == 5, "F5 the references ran");
+    if (cl1.size() != 5 || cl2.size() != 5 || soloA.size() != (size_t)3 * W) return;
+
+    /* the 3-bank session, before the step: bank 0 holds A, bank 1 the prefix, bank 2 a dead conversation */
+    auto setup = [&](bool verify) -> pulsar_session * {
+        pulsar_engine_set_bank_pool(3);
+        pulsar_session *x = NULL;
+        char err[256] = "";
+        bool ok = pulsar_session_create(&x, e, 4096) == 0;
+        ok = ok && pulsar_session_bank_state_restore(x, 2) && pulsar_session_sync(x, &D, err, sizeof(err)) == 0 &&
+             pulsar_session_eval(x, kDecode[0], err, sizeof(err)) == 0 && pulsar_session_eval(x, kDecode[1], err, sizeof(err)) == 0;
+        if (ok) { pulsar_session_invalidate(x); pulsar_session_bank_state_save(x, 2); }
+        ok = ok && pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, &pre, err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(x, 1);
+        if (ok && verify) {
+            ok = pulsar_session_bank_state_restore(x, 0) && pulsar_session_sync(x, &A, err, sizeof(err)) == 0;
+            if (ok) pulsar_session_bank_state_save(x, 0);
+        }
+        if (!ok) { fprintf(stderr, "session-contract: F5 setup: %s\n", err); if (x) pulsar_session_free(x); x = NULL; }
+        return x;
+    };
+    /* ONE fused step: the verify (when nr), then the runs in `order` (1 = bank 1's chunk, 2 = bank 2's), each headed.
+     * The step's logits rows, verify first, then the runs in order. */
+    auto step = [&](pulsar_session *x, int nr, const int order[2]) {
+        std::vector<pulsar_multiseq_req> q;
+        for (int i = 0; i < nr; i++) q.push_back({0u, A.len + i, runA[i]});
+        for (int r = 0; r < 2; r++) {
+            if (order[r] == 1) for (int j = 0; j < m1; j++) q.push_back({1u, pre_len + j, L.v[pre_len + j]});
+            else for (int j = 0; j < m2; j++) q.push_back({2u, j, L2.v[j]});
+        }
+        pulsar_fused_shape sh;
+        memset(&sh, 0, sizeof sh);
+        sh.n_dec = (uint32_t)nr;
+        sh.n_pf = 2;
+        sh.head_last[0] = sh.head_last[1] = 1;
+        std::vector<float> out((size_t)(nr + 2) * W);
+        uint32_t got = 0;
+        char err[256] = "";
+        const int rc = pulsar_session_decode_fused(x, q.data(), (uint32_t)q.size(), &sh, out.data(), (nr + 2) * W, &got,
+                                                   err, sizeof(err));
+        if (rc != 0 || got != (uint32_t)nr + 2u) {
+            fprintf(stderr, "session-contract: F5 fused step: rc %d, %u rows headed: %s\n", rc, got, err);
+            out.clear();
+        }
+        return out;
+    };
+    auto row = [&](const std::vector<float> &v, int i) {
+        return std::vector<float>(v.begin() + (size_t)i * W, v.begin() + (size_t)(i + 1) * W);
+    };
+    const int orders[2][2] = {{1, 2}, {2, 1}};
+    std::vector<float> head1[2], head2[2];
+    for (int o = 0; o < 2; o++) {
+        const int *ord = orders[o];
+        pulsar_session *x = setup(true);
+        if (!x) { CHECK(false, "F5 (order %d,%d) the 3-bank session", ord[0], ord[1]); continue; }
+        const std::vector<float> got = step(x, 3, ord);
+        CHECK(!got.empty(), "F5 (order %d,%d) one fused step: 3 verify rows + %d + %d prompt rows, 5 rows headed",
+              ord[0], ord[1], ord[0] == 1 ? m1 : m2, ord[0] == 1 ? m2 : m1);
+        if (got.empty()) { pulsar_session_free(x); continue; }
+        const int i1 = ord[0] == 1 ? 3 : 4, i2 = ord[0] == 1 ? 4 : 3;
+        head1[o] = row(got, i1);
+        head2[o] = row(got, i2);
+        double d1 = 0, d2 = 0;
+        CHECK(memcmp(got.data(), soloA.data(), soloA.size() * 4) == 0,
+              "F5 (order %d,%d) the verify rows == verified alone, byte for byte", ord[0], ord[1]);
+        CHECK(same(head1[o], cl1[0], &d1), "F5 (order %d,%d) bank 1's %d-row continuation == its sync, byte for byte "
+              "(max |diff| %.3g)", ord[0], ord[1], m1, d1);
+        CHECK(same(head2[o], cl2[0], &d2), "F5 (order %d,%d) dirty bank 2's %d rows from 0 == a cold sync, byte for "
+              "byte (max |diff| %.3g)", ord[0], ord[1], m2, d2);
+        if (o == 0) {
+            /* F6: each prompt bank decodes on, one row a step */
+            for (int b = 1; b <= 2; b++) {
+                const std::vector<std::vector<float>> &cl = b == 1 ? cl1 : cl2;
+                const int T = b == 1 ? pre_len + m1 : m2;
+                bool steps = true;
+                double worst = 0;
+                for (int i = 0; steps && i < 4; i++) {
+                    const pulsar_multiseq_req r = {(uint32_t)b, T + i, kDecode[i]};
+                    std::vector<float> lg((size_t)W);
+                    uint32_t n_out = 0;
+                    char err[256] = "";
+                    steps = pulsar_session_decode_mixed(x, &r, 1, lg.data(), W, &n_out, 0, err, sizeof(err)) == 0 &&
+                            n_out == 1;
+                    if (!steps) { fprintf(stderr, "session-contract: F6 decode: %s\n", err); break; }
+                    double di = 0;
+                    steps = same(lg, cl[(size_t)i + 1], &di);
+                    worst = fmax(worst, di);
+                }
+                CHECK(steps, "F6 bank %d: 4 decode steps after the fused step == its classic run (max |diff| %.3g)", b,
+                      worst);
+            }
+        } else {
+            /* F8: the record, then a divergent sync of bank 2 from the checkpoint the record left */
+            char err[256] = "";
+            bool ok = pulsar_session_bank_state_restore(x, 2) &&
+                      pulsar_session_note_prefilled(x, L2.v, m2, ord[0] == 2 ? 0 : 1) == 0;
+            double d = 0;
+            CHECK(ok && pulsar_session_pos(x) == m2 && same(logits_of(x, W), cl2[0], &d),
+                  "F8 bank 2's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
+                  pulsar_session_pos(x), d);
+            CHECK(ok && pulsar_session_checkpoint_best(x, m2) == m2,
+                  "F8 bank 2's chunk ended on the grid: a checkpoint at %d (best %d)", m2,
+                  pulsar_session_checkpoint_best(x, m2));
+            /* the conversation decodes on past the record (the classic eval) -- so the divergent sync below cannot
+             * continue the history and must resume from the checkpoint */
+            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, kDecode[i], err, sizeof(err)) == 0;
+            CHECK(ok && same(logits_of(x, W), cl2[2], &d), "F8 bank 2 evaluates on from the record == its classic run "
+                  "(max |diff| %.3g) %s", d, ok ? "" : err);
+            if (ok) pulsar_session_bank_state_save(x, 2);
+            ok = pulsar_session_bank_state_restore(x, 1) &&
+                 pulsar_session_note_prefilled(x, L.v + pre_len, m1, ord[0] == 1 ? 0 : 1) == 0;
+            CHECK(ok && pulsar_session_pos(x) == pre_len + m1 && same(logits_of(x, W), cl1[0], &d),
+                  "F8 bank 1's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
+                  pulsar_session_pos(x), d);
+            if (ok) pulsar_session_bank_state_save(x, 1);
+            /* bank 1 continues by sync (an extension of a history it prefilled whole) */
+            pulsar_tokens w1 = L;
+            w1.len = pre_len + m1 + 6;
+            ok = pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, &w1, err, sizeof(err)) == 0;
+            const std::vector<float> ref1 = reference(e, &w1, NULL, 0, W);
+            pulsar_engine_set_bank_pool(3);
+            CHECK(ok && same(logits_of(x, W), ref1, &d), "F8 bank 1's sync past the record == its prompt cold (max "
+                  "|diff| %.3g) %s", d, ok ? "" : err);
+            if (ok) pulsar_session_bank_state_save(x, 1);
+            /* bank 2: the chunk's tokens then a different tail -- resumes from the checkpoint at m2 */
+            pulsar_tokens Q = {0};
+            pulsar_tokens_copy(&Q, &c2);
+            for (int i = 0; i < 40; i++) pulsar_tokens_push(&Q, D.v[100 + i]);
+            ok = pulsar_session_bank_state_restore(x, 2) && pulsar_session_sync(x, &Q, err, sizeof(err)) == 0;
+            std::vector<float> got_q = ok ? logits_of(x, W) : std::vector<float>();
+            const int kq[2] = {kDecode[2], kDecode[3]};
+            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, kq[i], err, sizeof(err)) == 0;
+            std::vector<float> got_q2 = ok ? logits_of(x, W) : std::vector<float>();
+            const std::vector<float> refQ = reference(e, &Q, NULL, 0, W), refQ2 = reference(e, &Q, kq, 2, W);
+            pulsar_engine_set_bank_pool(3);
+            double dq = 0, dq2 = 0;
+            CHECK(ok && same(got_q, refQ, &dq) && same(got_q2, refQ2, &dq2),
+                  "F8 a divergent sync of bank 2 resumes from the fused chunk's checkpoint == cold: logits + 2 decode "
+                  "steps (max |diff| %.3g, %.3g) %s", dq, dq2, ok ? "" : err);
+            pulsar_tokens_free(&Q);
+        }
+        pulsar_session_free(x);
+    }
+    CHECK(!head1[0].empty() && head1[0] == head1[1] && head2[0] == head2[1], "F5 the bank order moves no byte");
+    /* F7: no verify rows in front */
+    pulsar_session *x = setup(false);
+    const std::vector<float> bare = x ? step(x, 0, orders[0]) : std::vector<float>();
+    if (x) pulsar_session_free(x);
+    double d1 = 0, d2 = 0;
+    CHECK(bare.size() == (size_t)2 * W && same(row(bare, 0), head1[0], &d1) && same(row(bare, 1), head2[0], &d2),
+          "F7 the two runs without the verify rows == with them, byte for byte (max |diff| %.3g, %.3g)", d1, d2);
+    pulsar_tokens_free(&A);
+    pulsar_tokens_free(&L);
+    pulsar_tokens_free(&L2);
+    pulsar_tokens_free(&D);
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s <model> [prefill_chunk]\n", argv[0]); return 2; }
@@ -657,6 +888,7 @@ int GATE_ENTRY(int argc, char **argv) {
     part_chunks(e, W, argc > 2);
     part_banks(e, W);
     part_fused(e, W);
+    part_fused_runs(e, W);
     gate_engine_close(e);
     printf(n_fail ? "SESSION-CONTRACT GATE FAIL (%d)\n" : "SESSION-CONTRACT GATE PASS\n", n_fail);
     return n_fail != 0;

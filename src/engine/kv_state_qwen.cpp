@@ -169,6 +169,20 @@ static uint32_t qwen_trailing_pools(void *state, pulsar_kv_pool *out, uint32_t c
     return st->mtp ? qwen_layer_pools(st, st->n_trunk_layers, out, 0, cap) : 0u;
 }
 
+/* A fused chunk to T (L284 #2): the bank's counter is the step's (qwen_session_decode_fused moved it); a capture at
+ * T is the cold prefill's exactly when T ends the bank's prefill-only history -- the run continued it from its
+ * end -- and no segment load left the lanes stale (qwen_stands_at's own rule). */
+static bool qwen_noted_at(void *state, uint32_t T, bool *capture, char *why, size_t whylen) {
+    pulsar_qwen_state *st = Q_(state);
+    const uint32_t bank = st->live_bank;
+    if (st->bank_pos[bank] != T) {
+        snprintf(why, whylen, "bank %u holds %u tokens, the record says %u", bank, st->bank_pos[bank], T);
+        return false;
+    }
+    *capture = st->prefill_pos[bank] == T && !st->frontier_stale[bank];
+    return true;
+}
+
 const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN = {
     /* .name               = */ "qwen4-exp",
     /* .resume_grid        = */ QWEN_RESUME_GRID,
@@ -185,4 +199,5 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN = {
     /* .frontier_at        = */ qwen_frontier_at,
     /* .install_frontier   = */ qwen_install_frontier,
     /* .trailing_pools     = */ qwen_trailing_pools,
+    /* .noted_at           = */ qwen_noted_at,
 };

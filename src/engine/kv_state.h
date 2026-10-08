@@ -96,6 +96,12 @@ typedef struct pulsar_kv_state_ops {
      *  grid span closes them): a payload carries them to its frontier beside the pools; a segment does
      *  not.  Same contract as pools. */
     uint32_t (*trailing_pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
+    /** L284 #2: a fused step's prompt chunk took the installed bank's history to T (pulsar_session_note_prefilled,
+     *  the core's record of it).  False (`why` filled) when the state does not stand at T -- the record would
+     *  describe another state; else *capture says whether the state at T is a prefill's, so a grid checkpoint
+     *  there is the cold prefill's (DeepSeek: no stale compressor group; Qwen: T is the prefill-only history's
+     *  end). */
+    bool (*noted_at)(void *state, uint32_t T, bool *capture, char *why, size_t whylen);
 } pulsar_kv_state_ops;
 
 /** A model's grid checkpoints: per bank, ops->ckpt_slots slots of slot_bytes.  pos[bank][s] is

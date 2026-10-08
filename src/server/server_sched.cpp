@@ -1974,7 +1974,7 @@ static bool slot_fusable_prefill(const session_slot *c) {
 }
 
 bool server::fusion_enabled() const {
-    return pool_banks > 0 && pulsar_engine_fused_prompts_servable(engine);
+    return pool_banks > 0 && pulsar_engine_has_fused_step(engine);
 }
 
 bool server::fuse_prepare(session_slot *sl) {
@@ -1992,6 +1992,11 @@ bool server::fuse_prepare(session_slot *sl) {
         pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
     } else if (pulsar_session_common_prefix(pool, g->prompt_for_sync) != pos) {
         g->no_fuse = true;                   /* needs a rewind / stitch: the classic sync owns that */
+    } else if (const int at = pulsar_session_bank_resume_at(pool, (uint32_t)sl->bank, g->prompt_for_sync);
+               at >= 0 && at != pos) {
+        /* L284: a bank-pool family's sync would not continue this history where it stands (decode rows past
+         * its prefill: it resumes from a checkpoint below); a fused chunk starts only where the sync would */
+        g->no_fuse = true;
     } else if (pulsar_session_bank_comp_stale(pool, (uint32_t)sl->bank)) {
         /* A fused round would extend the stale compressor group at the frontier
          * and fail the step on both ranks (the pair 2026-10-02 17:11:55); the
@@ -2081,6 +2086,10 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
      * finished in 13.7 s with 4064-row continuation rounds, 9.3 s with 2048). */
     const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool);
     const uint32_t fuse_rows = prefill_cap > PULSAR_SPEC_ROW_BUDGET ? prefill_cap - PULSAR_SPEC_ROW_BUDGET : 0u;
+    /* L284 #2: the rows one fused step heads -- the verify's and the finishing chunks' -- are the family's cap
+     * (DeepSeek: the spec-logits block; Qwen: its logits slab), the one authority the verify budget below is cut
+     * from.  A finishing chunk rides only while every decode bank keeps at least its base row. */
+    const uint32_t heads_max = fuse_on ? pulsar_engine_fused_heads_max(s->engine) : (uint32_t)PULSAR_SPEC_ROW_BUDGET;
     const uint32_t cont_rows = fuse_rows < PULSAR_SERVER_FUSED_CONT_ROWS ? fuse_rows : PULSAR_SERVER_FUSED_CONT_ROWS;
     pulsar_multiseq_req *fused_reqs = NULL;
     int round_ix = 0;
@@ -2156,6 +2165,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * classic alternation took ~14 s). */
         const bool long_ok = first_round && quantum_tokens >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS;
         struct fused_run { session_slot *sl; int p0, k; bool fin; };
+        static_assert(PULSAR_SESSION_POOL_CAP <= PULSAR_FUSED_PF_MAX, "a fused step carries every bank's chunk");
         fused_run fr[PULSAR_SESSION_POOL_CAP];
         int n_fr = 0, n_fin = 0;
         uint32_t pf_rows = 0;
@@ -2188,10 +2198,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 const int grid_end = (p0 + kk) / grid * grid;
                 if (grid_end > p0 && grid_end < p0 + kk) kk = grid_end - p0;
             }
+            const bool fin = p0 + kk == pg->prompt_for_sync->len;
+            if (fin && (uint32_t)(n_fin + 1 + n) > heads_max) continue;   /* no head row left this round */
             fr[n_fr].sl = c;
             fr[n_fr].p0 = p0;
             fr[n_fr].k = kk;
-            fr[n_fr].fin = p0 + kk == pg->prompt_for_sync->len;
+            fr[n_fr].fin = fin;
             c->state = SLOT_PREFILLING;
             n_fin += fr[n_fr].fin ? 1 : 0;
             pf_rows += (uint32_t)kk;
@@ -2246,7 +2258,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         uint32_t rows = 0;
         if (ns > 0)
             (void)pulsar_session_spec_assemble_batch(pool, steps, ns, eos_token,
-                                                     PULSAR_SPEC_ROW_BUDGET - (uint32_t)n_fin, reqs, &rows);
+                                                     heads_max - (uint32_t)n_fin, reqs, &rows);
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];

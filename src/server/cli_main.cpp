@@ -918,10 +918,9 @@ int main(int argc, char **argv) {
          * PULSAR_MIXED_BATCH=0 still forces the lane fully off;
          * PULSAR_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
         const char *mb = getenv("PULSAR_MIXED_BATCH");
-        /* L251/L284: prompt rows riding a decode step is the engine's fused step, servable only with the family's
-         * record of a fused chunk (pulsar_engine_fused_prompts_servable, the one statement fusion_enabled reads
-         * too); a family without both (Qwen until L284 #2 increment 5) runs neither lane */
-        s.mixed_batch_enabled = s.pool_banks > 0 && pulsar_engine_fused_prompts_servable(engine) &&
+        /* L251/L284: this lane's prompt rows ride decode_mixed beside the decode rows -- a family whose
+         * decode_mixed carries none (Qwen: its prompts ride the spec lane's fused step) does not run it */
+        s.mixed_batch_enabled = s.pool_banks > 0 && pulsar_engine_has_mixed_prefill(engine) &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
         s.mixed_deep_guard_rows = 16384;

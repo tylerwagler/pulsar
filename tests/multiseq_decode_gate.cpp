@@ -308,11 +308,12 @@ static bool check_stale_classic_fails_loud(void) {
  * the contract the batched speculative verify's accept walk stands on. */
 static bool check_all_rows_head_mode(pulsar_session *s) {
     /* L284: the last-of-run call carries bank 0's 3 rows as a K-row run headed
-     * at its last row -- a prompt run inside a decode step.  A family whose
-     * steps carry no prompt runs (no fused step: Qwen until L284 #2) has no
-     * last-of-run mode to compare ALL_ROWS against; said by name. */
-    if (!pulsar_engine_has_fused_step(g_e)) {
-        printf("ALL-ROWS HEAD MODE [%s]: skipped -- the family's steps carry no prompt runs (no fused step), so "
+     * at its last row -- a prompt run inside decode_mixed.  A family whose
+     * decode_mixed carries no prompt runs (pulsar_engine_has_mixed_prefill:
+     * Qwen's prompts ride the fused step instead) has no last-of-run mode to
+     * compare ALL_ROWS against; said by name. */
+    if (!pulsar_engine_has_mixed_prefill(g_e)) {
+        printf("ALL-ROWS HEAD MODE [%s]: skipped -- the family's decode_mixed carries no prompt runs, so "
                "there is no last-of-run emission to compare\n", pulsar_engine_family_name(g_e));
         return true;
     }

@@ -125,6 +125,7 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_CHAT    = 1u << 7,  ///< tokenizer + chat renderer (a family without it cannot take text)
     PULSAR_FAMILY_CAP_GENERATE = 1u << 8, ///< pulsar_engine_generate_argmax (the session-less whole-graph path)
     PULSAR_FAMILY_CAP_SEGMENTS = 1u << 9, ///< disk KV segments: span files of the grid checkpoint store (L264; Qwen L266)
+    PULSAR_FAMILY_CAP_MIXED_PREFILL = 1u << 10, ///< decode_mixed carries prefill runs beside its decode rows (the plain lane's mixed quantum); without it a prompt rides only the fused step
 };
 
 /** The session operations every family implements.  The C API
@@ -162,6 +163,10 @@ typedef struct {
     int (*decode_fused)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                         const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
                         char *err, size_t errlen);
+    /** The most logits rows one decode_fused step heads -- its verify rows plus its headed prompt runs (L284 #2:
+     *  the ONE authority the server sizes a round's verify budget by, pulsar_engine_fused_heads_max).  0 with no
+     *  decode_fused. */
+    uint32_t fused_heads_max;
 } pulsar_family_session_ops;
 
 /** A family's tokenizer and chat front (L272 P2): what the public tokenizer entries (tokenizer.cpp) do on
