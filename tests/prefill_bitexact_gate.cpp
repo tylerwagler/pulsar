@@ -36,7 +36,7 @@
  *     Since L264 every cold prompt runs the chunk loop (the one-shot raw_swa
  *     path is gone); a grid-multiple prompt inside one chunk is not split, so
  *     depth D is still a single routed-MoE call at n_tokens == D.
- *   - 4102/6144      -> TRUE: gpu_graph_prefill_chunked, i.e. SEVERAL routed-MoE
+ *   - 4102/6144      -> TRUE: the chunk loop (pulsar_prefill_loop), i.e. SEVERAL routed-MoE
  *     calls whose batch shapes are set by the chunk loop rather than by D.
  * The 6144 row is why the chunked path is not a blind spot: production chunks
  * every prompt > 4096, the cold chunk loop trims each non-final chunk to the
@@ -203,7 +203,7 @@
  * 4102 is the SMALL-REMAINDER row, added 2026-07-21 after a real miss.  The
  * other four depths chunk as 4096+2048, so this gate only ever exercised final
  * chunks of 512..4096 and was structurally blind to a narrow last chunk.
- * gpu_graph_prefill_chunked_range (src/engine/imatrix.c:717) keeps the final
+ * the cut rule (src/engine/prefill_loop.cpp pulsar_prefill_plan_next_end) keeps the final
  * chunk's EXACT remainder, so production hits n_tok 1..8 whenever
  * prompt_len mod chunk lands there -- and every short continuation prefill off
  * the prefix-cache/partial-prefix path lands there by construction.  That is

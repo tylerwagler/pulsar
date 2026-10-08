@@ -194,7 +194,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     /* a prompt chunk is a request's, as a sync's prefill is: the lookahead and a latched quench are the
      * previous request's (pulsar_session_family_sync does the same for the classic lane) */
     spec_lookahead_reset(s);
-    s->note_committed_tokens(toks, n);
+    pulsar_session_note_committed(s, toks, n);
     s->checkpoint_valid = true;
     s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
     if (head >= 0) {
@@ -214,19 +214,16 @@ static uint32_t ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     return pf > 0 ? (uint32_t)pf : 0u;
 }
 
-static void ds4_bank_note_committed(pulsar_session *s, const int *toks, int n) { s->note_committed_tokens(toks, n); }
 static pulsar_ckpt_store *ds4_bank_kv_store(pulsar_session *s) { return &s->graph->ckpt; }
 static uint32_t ds4_bank_live(pulsar_session *s) { return gpu_graph_cur_bank(s->graph); }
 static void ds4_bank_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
 static bool ds4_bank_restore_checkpoint(pulsar_session *s, uint32_t G) { return s->restore_checkpoint(G); }
-static uint32_t ds4_bank_quantum_min_suffix(const pulsar_session *s) { return s->prefill_quantum_min_suffix(); }
 static bool ds4_bank_pooled(const pulsar_session *s) { return s->graph->banks.n_banks > 0; }
 
 const pulsar_family_bank_ops k_ds4_bank_ops = {
     /* .count              = */ ds4_bank_count,
     /* .save               = */ ds4_bank_save,
     /* .restore            = */ ds4_bank_restore,
-    /* .note_committed     = */ ds4_bank_note_committed,
     /* .kv_store           = */ ds4_bank_kv_store,
     /* .prefill_frontier   = */ ds4_bank_prefill_frontier,
     /* .live               = */ ds4_bank_live,
@@ -239,7 +236,6 @@ const pulsar_family_bank_ops k_ds4_bank_ops = {
     /* .repoint            = */ ds4_bank_repoint,
     /* .rewind             = */ ds4_bank_rewind,
     /* .restore_checkpoint = */ ds4_bank_restore_checkpoint,
-    /* .quantum_min_suffix = */ ds4_bank_quantum_min_suffix,
     /* .pooled             = */ ds4_bank_pooled,
 };
 

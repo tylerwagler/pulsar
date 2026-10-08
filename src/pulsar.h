@@ -983,6 +983,10 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
 /** L264/L265: the resume grid of the loaded model (tokens): a resume starts at a multiple of it
  *  and a prefill leaves its checkpoints on it -- the server plans its fused chunks on it. */
 uint32_t pulsar_session_resume_grid(const pulsar_session *s);
+/** L284: true when a prompt cut ANYWHERE is the cold prefill's bytes, so a sync continues a history prefilled whole
+ *  wherever it ends (Qwen); false when only a cut on the resume grid is (DeepSeek), so a sync continues only from a
+ *  grid point and resumes a history that ends off it from the checkpoint below. */
+bool pulsar_session_split_invariant(const pulsar_session *s);
 
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
