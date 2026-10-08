@@ -159,4 +159,7 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .restored           = */ ds4_restored,
     /* .set_frontier_stale = */ ds4_set_frontier_stale,
     /* .pools              = */ ds4_pools,
+    /* .frontier_at        = */ NULL,   /* the payload is the graph's own (session_payload.cpp) */
+    /* .install_frontier   = */ NULL,
+    /* .trailing_pools     = */ NULL,
 };

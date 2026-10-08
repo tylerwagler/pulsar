@@ -85,6 +85,19 @@ typedef struct pulsar_kv_state_ops {
     void (*set_frontier_stale)(void *state, uint32_t G);
     /** The installed bank's append-only pools, in a fixed order; returns how many. */
     uint32_t (*pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
+    /* ---- L284: a session payload built on this model (session_payload.cpp, "the kv-state payload").  NULL
+     * all three = the model's payload is not built on it (DeepSeek's is its graph's own format). */
+    /** Does the installed bank stand at frontier T with every lane describing T -- nothing stale, nothing
+     *  speculative written past its true rows?  *prefill = the end of its prefill-only history (<= T).
+     *  `why` names the first violation. */
+    bool (*frontier_at)(void *state, uint32_t T, uint32_t *prefill, char *why, size_t whylen);
+    /** Before a payload load's walk (dir > 0) of the frontier slot: the bank's counters at T with `prefill`
+     *  of it prefilled; restored() follows the walk. */
+    bool (*install_frontier)(void *state, uint32_t T, uint32_t prefill);
+    /** Append-only rows that TRAIL the frontier (a row is written once the token after it exists, so no
+     *  grid span closes them): a payload carries them to its frontier beside the pools; a segment does
+     *  not.  Same contract as pools. */
+    uint32_t (*trailing_pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
 } pulsar_kv_state_ops;
 
 /** A model's grid checkpoints: per bank, ops->ckpt_slots slots of slot_bytes.  pos[bank][s] is
