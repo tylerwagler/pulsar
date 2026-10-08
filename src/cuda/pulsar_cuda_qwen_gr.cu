@@ -303,13 +303,13 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * different orders, so a prefilled row and a decoded row agree to rounding, not to the bit (Tyler
  * 2026-09-29: "Don't use a decode kernel for prefill"); within this kernel a row's arithmetic depends
  * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
- * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles): NJ = 4
- * for the plain Linear, 8 for the read's two GEMMs (half the activation re-staging); kMmaStage MX
- * blocks staged per barrier. */
+ * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles); a wider
+ * CTA re-stages the activation fewer times.  kMmaStage MX blocks staged per barrier. */
 constexpr int kDecodeRowsMax = 16;               ///< widths at or below take the decode GEMV
 constexpr int kMmaTok = 64, kMmaStage = 4;
-constexpr int kMmaNJ = 4, kMmaOut = 8 * kMmaNJ;  ///< the plain Linear's CTA output width
-constexpr int kGrNJ = 8, kGrOut = 8 * kGrNJ;     ///< the read's (NORM, GATE): 16 channels x 4 streams in GATE
+constexpr int kMmaNJ = 8, kMmaOut = 8 * kMmaNJ;  ///< the plain Linear's CTA output width
+constexpr int kGrNJ = 8, kGrOut = 8 * kGrNJ;     ///< the read's W_up (GATE): 16 channels x 4 streams
+constexpr int kDnNJ = 10, kDnOut = 8 * kDnNJ;    ///< the read's W_down (NORM): 320 outputs in 4 CTAs
 constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
 constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
 
@@ -744,7 +744,7 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
         gemm ? nullptr : (__nv_bfloat16 *)m.xn, m.rstd, m.injp);
     if (gemm) {
-        qwen_w8a16_prefill_kernel<GR_NORM, kGrNJ><<<dim3((kR + kGrOut - 1) / kGrOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
+        qwen_w8a16_prefill_kernel<GR_NORM, kDnNJ><<<dim3((kR + kDnOut - 1) / kDnOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
             (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)streams, kR, kHC, T, kDownSplit, m.part, ga);
     } else {
         const int tb = gr_down_tokens_per_cta(kHC, kDownSplit);
