@@ -460,15 +460,15 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
             }
             *reinterpret_cast<__nv_bfloat162 *>(ga.x_out + (size_t)t * kH + c) = __floats2bfloat162_rn(v[0], v[1]);
         }
-        return;
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = t0 + warp * 16 + g + 8 * (e >> 1), row = r0 + j * 8 + c2 + (e & 1);
+                if (t < T && row < out) part[((size_t)t * n_split + split) * out + row] = acc[j][e];
+            }
     }
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int t = t0 + warp * 16 + g + 8 * (e >> 1), row = r0 + j * 8 + c2 + (e & 1);
-            if (t < T && row < out) part[((size_t)t * n_split + split) * out + row] = acc[j][e];
-        }
 }
 
 /* 3. mid + up + gate + mean: one warp per stream, lane = channel, TB
