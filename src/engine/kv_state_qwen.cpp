@@ -28,8 +28,9 @@
 #define QWEN_RESUME_GRID 128u
 static_assert(QWEN_RESUME_GRID % 4u == 0u, "a grid point must close an indexer block");
 
-/* ~118 MB a slot, so 2 (the ladder over them is checkpoint.cpp's: the newest and the one below it). */
-#define QWEN_CKPT_SLOTS 2u
+/* ~118 MB a slot (the GDN recurrent state), so 4 -- not DeepSeek's 16 x ~3.8 MB, which here would be ~1.9 GB a bank (Tyler
+ * 2026-10-08: "4"); an edit up to 2 turns back resumes from a slot, not from 0 (the ladder is checkpoint.cpp's). */
+#define QWEN_CKPT_SLOTS 4u
 static_assert(QWEN_CKPT_SLOTS <= PULSAR_CKPT_SLOTS_MAX, "the store's slot bound");
 
 static pulsar_qwen_state *Q_(void *state) { return (pulsar_qwen_state *)state; }
