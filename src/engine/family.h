@@ -101,6 +101,24 @@ typedef struct pulsar_family_vision {
  *  slot reader reads slices REGISTERED with the backend, a rows reader slices BUILT and kept on the device). */
 typedef enum { PULSAR_ACT_KIND_SLOT = 0, PULSAR_ACT_KIND_ROWS = 1 } pulsar_act_kind;
 
+/** Importance-matrix collection (L284 P15): the dataset walk, the prompt cap and the llama.cpp `.dat` writer are
+ *  the core's (session.cpp pulsar_engine::collect_imatrix, imatrix.cpp imatrix_write_entry); a family supplies only
+ *  how ONE prompt is run through its forward with its linears observed, and what it observed.  The tensors it
+ *  names are the checkpoint's own (the entry name is the tensor's), `n_expert * n_columns` floats an expert-stacked
+ *  tensor, `n_columns` a dense one. */
+typedef struct {
+    /** Open a collection for prompts of at most `ctx_size` tokens; NULL on failure (reported). */
+    void *(*begin)(pulsar_engine *e, const char *dataset_path, int ctx_size);
+    /** Run one tokenized prompt from position 0 through the forward, observing. */
+    bool (*prompt)(pulsar_engine *e, void *c, const pulsar_tokens *tokens);
+    /** (token, expert) routing decisions observed so far (the progress line). */
+    uint64_t (*routes)(const void *c);
+    /** Write the `.dat`. */
+    bool (*save)(pulsar_engine *e, void *c, const char *path);
+    /** Release the collection. */
+    void (*end)(pulsar_engine *e, void *c);
+} pulsar_family_imatrix;
+
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
@@ -293,6 +311,8 @@ struct pulsar_family {
     const pulsar_family_vision *vision;
     /** NULL = the DeepSeek graph pool's members (session_banks.cpp). */
     const pulsar_family_bank_ops *banks;
+    /** The family's importance-matrix collection (PULSAR_FAMILY_CAP_IMATRIX), or NULL. */
+    const pulsar_family_imatrix *imatrix;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

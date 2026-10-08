@@ -1104,6 +1104,7 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     st.mixer = &e->qwen_weights->mixer;
     st.verify = n_verify > 0;
     st.n_dec = pulsar_qwen_step_n_dec(mode, n_verify, n_rows);
+    st.tap = e->imatrix_tap;
     std::vector<uint32_t> rope;
     st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
     if (st.verify && (mode != PULSAR_QWEN_STEP_PREFILL || n_verify > n_rows || n_verify > PULSAR_QWEN_SPEC_ROWS ||
@@ -1740,7 +1741,8 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .arch         = */ PULSAR_QWEN_ARCH,
     /* .name         = */ "Qwen4-exp",
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_TP |
-                          PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_VISION,
+                          PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_VISION |
+                          PULSAR_FAMILY_CAP_IMATRIX,
     /* .load         = */ qwen_family_load,
     /* .after_gpu    = */ qwen_family_after_gpu,
     /* .logits_width = */ qwen_logits_width,
@@ -1759,4 +1761,5 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ &PULSAR_QWEN_IMAGE_FRONT,   /* L268: vision_qwen.cpp */
     /* .banks        = */ &k_qwen_bank_ops,
+    /* .imatrix      = */ &k_qwen_imatrix,   /* L284 P15: imatrix_qwen.cpp */
 };

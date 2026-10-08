@@ -1779,6 +1779,9 @@ struct pulsar_engine {
     pulsar_layer_plan plan;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
+    /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
+     *  the trunk's steps note their linears' input rows into it. */
+    struct pulsar_imatrix_tap *imatrix_tap;
     /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
      * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
      * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
@@ -4041,6 +4044,15 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path);
+/** The llama.cpp legacy `.dat` writer every family's collection shares (imatrix.cpp): open + entry count, one
+ *  entry per tensor (`n_expert` vectors of `n_col` means; a never-observed expert writes 1.0), then close with the
+ *  chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries);
+void imatrix_write_entry(FILE *fp, const char *name, const float *sum2, const uint32_t *counts, uint32_t n_expert,
+                         uint32_t n_col);
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path);
+extern const pulsar_family_imatrix k_ds4_imatrix;     // imatrix.cpp
+extern const pulsar_family_imatrix k_qwen_imatrix;    // imatrix_qwen.cpp
 bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g);
 bool gpu_graph_prefill_layer_major(
         pulsar_gpu_graph *g,

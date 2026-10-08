@@ -108,13 +108,44 @@ static bool imatrix_collect_layer_batch(
 
 
 
-static void imatrix_write_i32(FILE *fp, int32_t v) {
+void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
 
 
-static void imatrix_write_entry(
+/* The llama.cpp legacy `.dat` frame every family's collection shares: the entry count, the entries
+ * (imatrix_write_entry), then the chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    imatrix_write_i32(fp, n_entries);
+    return fp;
+}
+
+
+
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path) {
+    imatrix_write_i32(fp, chunks);
+    const char *dataset = dataset_path ? dataset_path : "";
+    const int32_t dataset_len = (int32_t)strlen(dataset);
+    imatrix_write_i32(fp, dataset_len);
+    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
+        pulsar_die("failed to write imatrix dataset name");
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+
+
+void imatrix_write_entry(
         FILE       *fp,
         const char *name,
         const float *sum2,
@@ -150,14 +181,8 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-
-    const int32_t entries = (int32_t)(PULSAR_N_LAYER * 3);
-    imatrix_write_i32(fp, entries);
+    FILE *fp = imatrix_dat_open(path, (int32_t)(PULSAR_N_LAYER * 3));
+    if (!fp) return false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_layer_weights *layer = &weights->layer[il];
         char name[256];
@@ -181,20 +206,7 @@ bool imatrix_collector_save(
                             PULSAR_N_FF_EXP);
     }
 
-    const int32_t chunks = (int32_t)c->chunks;
-    imatrix_write_i32(fp, chunks);
-    const char *dataset = c->dataset_path ? c->dataset_path : "";
-    const int32_t dataset_len = (int32_t)strlen(dataset);
-    imatrix_write_i32(fp, dataset_len);
-    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        pulsar_die("failed to write imatrix dataset name");
-    }
-
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    return true;
+    return imatrix_dat_close(fp, path, (int32_t)c->chunks, c->dataset_path);
 }
 
 
@@ -1503,7 +1515,68 @@ pulsar_context_memory pulsar_context_memory_estimate(
 
 
 
+/* ---- DeepSeek's collection (family.h pulsar_family_imatrix): the layer-major prefill graph, observed -------- */
 
+struct ds4_imatrix_run {
+    pulsar_gpu_graph g;
+    pulsar_imatrix_collector c;
+    uint32_t prefill_cap;
+};
 
+static void *ds4_imatrix_begin(pulsar_engine *e, const char *dataset_path, int ctx_size) {
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    ds4_imatrix_run *r = new ds4_imatrix_run;
+    r->prefill_cap = prefill_cap;
+    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[0], raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                 gpu_graph_bank_pool_n(), false)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
+        delete r;
+        return NULL;
+    }
+    if (!imatrix_collector_init(&r->c, prefill_cap, dataset_path)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
+        gpu_graph_free(&r->g);
+        delete r;
+        return NULL;
+    }
+    fprintf(stderr,
+            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
+            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
+    return r;
+}
 
+static bool ds4_imatrix_prompt(pulsar_engine *e, void *c, const pulsar_tokens *tokens) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    token_vec prompt = *(const token_vec *)tokens;
+    if (!gpu_graph_reset_prefill_state(&r->g)) {
+        fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
+        return false;
+    }
+    if ((uint32_t)prompt.len > r->prefill_cap)
+        return gpu_graph_prefill_chunked_range(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL,
+                                               false, NULL, NULL, NULL, NULL, &r->c, NULL, NULL, NULL);
+    return gpu_graph_prefill_layer_major(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL, false,
+                                         &r->c, NULL, NULL);
+}
 
+static uint64_t ds4_imatrix_routes(const void *c) { return ((const ds4_imatrix_run *)c)->c.observed_routes; }
+
+static bool ds4_imatrix_save(pulsar_engine *e, void *c, const char *path) {
+    return imatrix_collector_save(&((ds4_imatrix_run *)c)->c, &e->weights, path);
+}
+
+static void ds4_imatrix_end(pulsar_engine *, void *c) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    imatrix_collector_free(&r->c);
+    gpu_graph_free(&r->g);
+    delete r;
+}
+
+const pulsar_family_imatrix k_ds4_imatrix = {
+    /* .begin  = */ ds4_imatrix_begin,
+    /* .prompt = */ ds4_imatrix_prompt,
+    /* .routes = */ ds4_imatrix_routes,
+    /* .save   = */ ds4_imatrix_save,
+    /* .end    = */ ds4_imatrix_end,
+};

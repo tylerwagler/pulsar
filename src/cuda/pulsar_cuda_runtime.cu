@@ -1482,6 +1482,14 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 
 
 
+int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
+    if (!device || !host) return 0;
+    return cuda_ok(cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read");
+}
+
+
+
+
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                      const pulsar_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {

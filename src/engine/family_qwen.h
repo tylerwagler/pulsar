@@ -500,6 +500,24 @@ typedef enum {
 typedef enum { PULSAR_QWEN_GR_ATTN = 0, PULSAR_QWEN_GR_MLP = 1 } pulsar_qwen_gr_side;
 
 
+/** L284 P15: the importance-matrix collection's observer (imatrix_qwen.cpp).  The trunk's ops note the input rows of
+ *  every linear they run through the core's front doors (step_linear, the shared expert, the routed MoE) into it;
+ *  all of them read device rows (bf16) and synchronise first, so a collection is slow and bit-exact otherwise. */
+struct pulsar_imatrix_tap;
+/** A dense linear's input: x_dev [rows][cols] bf16 under the tensor's name. */
+void pulsar_imatrix_note_dense(pulsar_imatrix_tap *tap, const pulsar_tensor *w, const uint16_t *x_dev, uint32_t rows,
+                               uint32_t cols);
+/** The routed gate / up input: x_dev [rows][cols] bf16 and each row's `k` picks sel_dev [rows][k], under the gate's
+ *  name and, for a gate + up pair (`up` non-NULL), the up's too. */
+void pulsar_imatrix_note_routed_in(pulsar_imatrix_tap *tap, const pulsar_tensor *gate, const pulsar_tensor *up,
+                                   const uint16_t *x_dev, const int32_t *sel_dev, uint32_t rows, uint32_t k,
+                                   uint32_t n_expert, uint32_t cols);
+/** The routed down input: mid_dev [rows * k][mid] bf16 (a pick's SwiGLU row, route weight folded in) under the
+ *  down's name. */
+void pulsar_imatrix_note_routed_mid(pulsar_imatrix_tap *tap, const pulsar_tensor *down, const uint16_t *mid_dev,
+                                    const int32_t *sel_dev, uint32_t rows, uint32_t k, uint32_t n_expert,
+                                    uint32_t mid);
+
 /** Everything an op needs for one step.  Built by the driver, read-only to
  * the ops (the tensors' CONTENTS are what ops write). */
 typedef struct {
@@ -536,6 +554,8 @@ typedef struct {
      *  graded against), rows [n_dec, n_rows) the prompt arms (the same bytes at every row count, L266).  The
      *  step's builder sets it (pulsar_qwen_step_n_dec); the ops cut their arm-sensitive launches at it. */
     uint32_t n_dec;
+    /** L284 P15: the importance-matrix observer while a collection runs, else NULL (the trunk's steps only). */
+    pulsar_imatrix_tap *tap;
 } pulsar_qwen_step;
 
 /** L284 #2: n_dec for a step -- a DECODE step is all decode rows; a PREFILL step's decode rows are its verify

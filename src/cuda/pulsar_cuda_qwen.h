@@ -199,6 +199,9 @@ typedef struct pulsar_rows_moe {
 } pulsar_rows_moe;
 /** Workspace bytes for T rows of the routed part. */
 size_t pulsar_rows_moe_routed_workspace_bytes(int T);
+/** The bf16 rows [T * k][mid] the last pulsar_rows_moe_routed_launch left in `ws` -- each pick's SwiGLU row with
+ *  its route weight folded in, the down projection's input (the importance-matrix collection reads it). */
+const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T);
 /** out [T][hidden] f32 = sum over each row's top-k picks (`sel` [T][k], localised IN PLACE under expert
  *  parallelism; `wts` [T][k]) of w_k * down_k(silu(gate_k x) * up_k x), x the bf16 rows.  Non-finite outputs
  *  record `nf_code` in *nf_flag (first writer wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ). */

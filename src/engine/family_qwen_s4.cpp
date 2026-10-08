@@ -230,6 +230,7 @@ bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int 
  * through its arm (arm_segments).  `ws` is the dense-arm workspace, sized for the step's rows. */
 bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int out, const char *what,
                  const uint16_t *x, float *y, void *ws, uint64_t ws_bytes) {
+    if (st->tap) pulsar_imatrix_note_dense(st->tap, t, x, st->n_rows, (uint32_t)in);
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_rows_linear l;
         return linear_dev(st, t, in, out, prompt, what, &l) &&
@@ -678,7 +679,12 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
             rc.n_rows = (int)rows;
             rc.out = y + (size_t)r0 * H;
             rc.prompt = prompt;
-            return pulsar_moe_routed_rows(&rc);
+            if (st->tap) pulsar_imatrix_note_routed_in(st->tap, rc.gate, rc.up, rc.x_bf16, rc.selected, rows, K, s->n_expert, H);
+            if (!pulsar_moe_routed_rows(&rc)) return false;
+            if (st->tap)
+                pulsar_imatrix_note_routed_mid(st->tap, rc.down, pulsar_rows_moe_routed_mid(rc.ws, rc.ws_bytes, (int)rows),
+                                               rc.selected, rows, K, s->n_expert, (uint32_t)rc.down->dim[0]);
+            return true;
         }))
         return false;
     /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone */
@@ -687,10 +693,18 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         pulsar_rows_linear sg, su, sd;
         pulsar_qwen_moe_parts p = parts;   /* the gate row-indexed, the shared expert's buffers reused from 0 */
         p.sgate = parts.sgate + r0;
-        return linear_dev(st, L.sh_gate, H, SMID, prompt, "qwen shared gate_proj", &sg) &&
-               linear_dev(st, L.sh_up, H, SMID, prompt, "qwen shared up_proj", &su) &&
-               linear_dev(st, L.sh_down, SMID, H, prompt, "qwen shared down_proj", &sd) &&
-               pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x + (size_t)r0 * H, (int)rows, y + (size_t)r0 * H, &p, 0) == 0;
+        if (!(linear_dev(st, L.sh_gate, H, SMID, prompt, "qwen shared gate_proj", &sg) &&
+              linear_dev(st, L.sh_up, H, SMID, prompt, "qwen shared up_proj", &su) &&
+              linear_dev(st, L.sh_down, SMID, H, prompt, "qwen shared down_proj", &sd) &&
+              pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x + (size_t)r0 * H, (int)rows, y + (size_t)r0 * H, &p, 0) == 0))
+            return false;
+        if (st->tap) {
+            /* the shared expert's down reads the SwiGLU rows the launch left in p.h_x (bf16) */
+            pulsar_imatrix_note_dense(st->tap, L.sh_gate, x + (size_t)r0 * H, rows, (uint32_t)H);
+            pulsar_imatrix_note_dense(st->tap, L.sh_up, x + (size_t)r0 * H, rows, (uint32_t)H);
+            pulsar_imatrix_note_dense(st->tap, L.sh_down, p.h_x, rows, (uint32_t)SMID);
+        }
+        return true;
     });
 }
 

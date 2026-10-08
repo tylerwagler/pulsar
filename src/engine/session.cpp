@@ -127,33 +127,14 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    const pulsar_model *model = &e->model;
-    const pulsar_weights *weights = &e->weights;
-    const uint32_t prefill_cap =
-        gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-
-    pulsar_gpu_graph g;
-    bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
-                                        gpu_graph_bank_pool_n(), false);
-    if (!ok) {
-        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
+    /* L284 P15: the dataset walk and the caps are the core's; the family runs one prompt through its forward */
+    const pulsar_family_imatrix *fi = e->family->imatrix;
+    void *collection = fi->begin(e, dataset_path, ctx_size);
+    if (!collection) {
         free(dataset);
         return 1;
     }
-
-    pulsar_imatrix_collector collector;
-    if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
-        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
-        gpu_graph_free(&g);
-        free(dataset);
-        return 1;
-    }
-
-    fprintf(stderr,
-            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
-            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
+    bool ok = true;
 
     int prompts_done = 0;
     int tokens_done = 0;
@@ -182,26 +163,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
                 prompt.len = max_tokens - tokens_done;
             }
             if (prompt.len > 0) {
-                if (!gpu_graph_reset_prefill_state(&g)) {
-                    fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
-                    ok = false;
-                } else if ((uint32_t)prompt.len > prefill_cap) {
-                    ok = gpu_graph_prefill_chunked_range(&g, model, weights,
-                                                           &prompt, 0,
-                                                           (uint32_t)prompt.len,
-                                                           NULL, false,
-                                                           NULL, NULL,
-                                                           NULL, NULL,
-                                                           &collector,
-                                                           NULL, NULL, NULL);
-                } else {
-                    ok = gpu_graph_prefill_layer_major(&g, model, weights,
-                                                         &prompt, 0,
-                                                         (uint32_t)prompt.len,
-                                                         NULL, false,
-                                                         &collector,
-                                                         NULL, NULL);
-                }
+                ok = fi->prompt(e, collection, &prompt);
                 if (!ok) {
                     fprintf(stderr, "pulsar: imatrix prefill failed at prompt %d\n", prompts_done + 1);
                     token_vec_free(&prompt);
@@ -215,7 +177,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
                             "pulsar: imatrix prompts=%d tokens=%d routes=%llu\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)fi->routes(collection));
                     fflush(stderr);
                 }
             }
@@ -230,19 +192,18 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     fputc('\n', stderr);
 
     if (ok) {
-        ok = imatrix_collector_save(&collector, weights, output_path);
+        ok = fi->save(e, collection, output_path);
         if (ok) {
             fprintf(stderr,
                     "pulsar: wrote imatrix %s from %d prompts, %d tokens, %llu routed expert observations\n",
                     output_path,
                     prompts_done,
                     tokens_done,
-                    (unsigned long long)collector.observed_routes);
+                    (unsigned long long)fi->routes(collection));
         }
     }
 
-    imatrix_collector_free(&collector);
-    gpu_graph_free(&g);
+    fi->end(e, collection);
     free(dataset);
     return ok ? 0 : 1;
 }
