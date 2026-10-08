@@ -139,18 +139,20 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         if (n_images > 0) images = seam.placed;
         common = pulsar_tokens_common_prefix(&s->checkpoint, prompt);
     }
-    /* the bank's state is the authority; the view must agree with it to be continued (a batched step on the live
-     * bank moves the state, not the view; DeepSeek: a stale compressor or a frontier ahead of the view, L148) */
-    if (s->checkpoint_valid && !ops->state_agrees(s)) s->checkpoint_valid = false;
+    /* the bank's state is the authority; the view must agree with it to be CONTINUED (a batched step on the live
+     * bank moves the state, not the view; DeepSeek: a stale compressor or a frontier ahead of the view, L148).  A
+     * view that may not be continued still names the bank's history -- its prefill frontier and checkpoints are
+     * what the resume below reads -- so it stays valid until the state moves. */
+    bool continuable = s->checkpoint_valid && ops->state_agrees(s);
     /* L268: an image request extends the live KV only under the licence */
-    if (n_images > 0 && s->checkpoint_valid) {
+    if (n_images > 0 && continuable) {
         pulsar_image_licence lic;
         pulsar_image_licence_decide(s, prompt, images, n_images, &lic);
         if (lic.extends_live && !lic.keep) {
             fprintf(stderr, "pulsar: %s: image request: the live history's images are not this prompt's (%s) -- "
                             "not continuing it\n", ops->name,
                     lic.straddles ? "a block straddles the common prefix" : "different images or blocks");
-            s->checkpoint_valid = false;
+            continuable = false;
         }
     }
     /* L284: only a view the bank PREFILLED whole is continued (pulsar_session_bank_continues, the rule DeepSeek's
@@ -158,11 +160,11 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
      * rows are not a prefill chunk's bytes, kv_state_qwen.cpp), so a view with any is resumed instead, from
      * the deepest checkpoint at or below the prefill frontier -- the tokens generated since are prefilled
      * again and the prompt is the cold prefill's bytes, as DeepSeek's sync does it (L195) */
-    const bool extends = s->checkpoint_valid && common == s->checkpoint.len && common < prompt->len &&
+    const bool extends = continuable && common == s->checkpoint.len && common < prompt->len &&
                          pulsar_session_bank_continues(s, live, common);
     /* the same prompt is a no-op only while the logits are its next-token row; when they are stale the
      * resume below stops one token short, so the last row is evaluated again */
-    if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
+    if (continuable && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
     uint32_t start = 0;
     if (extends) {
         start = (uint32_t)common;
@@ -175,6 +177,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
                             "prefilling from 0\n", ops->name, live, G);
             G = 0;
         }
+        s->checkpoint_valid = false;   /* the state moves below; the prefill loop re-establishes the view */
         if (G) {
             if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);
