@@ -1647,7 +1647,7 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
     if (pulsar_session_touched_kv_bytes(pool) + delta <= bound) return;
     /* Finding 2: free_physical zeroes a spilled bank's frontier, so a spill
      * drops touched by exactly that bank's touched bytes (the pool gauge IS
-     * the per-bank sum, gpu_graph_touched_kv_bytes). guard_spill_plan walks
+     * the per-bank sum, pulsar_session_touched_kv_bytes). guard_spill_plan walks
      * that arithmetic over the LRU victim order and evicts exactly the minimum
      * (usually ONE) per breach, NOT the whole idle set (the cascade bug). The
      * per-quantum count log lets the smoke assert no cascade. */

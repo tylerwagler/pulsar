@@ -344,7 +344,7 @@ static void gpu_graph_compute_dims(
  * bytes of ONE bank's ctx-scaled comp + index caches -- the part the overcommit
  * auto-size reserves as VA only and does NOT charge at admission (the eager
  * floor is charged; physical materializes as the frontier grows, tracked by
- * gpu_graph_touched_kv_bytes).  The comp/index term of the KV-policy sizing,
+ * pulsar_session_touched_kv_bytes).  The comp/index term of the KV-policy sizing,
  * from the same function (steering.cpp). */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
     return gpu_graph_comp_index_bytes_for_context(ctx_size);
@@ -1021,14 +1021,6 @@ uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t ban
         /* one emit writes a comp row AND an index-K row */
         bytes += (uint64_t)g->ms_comp_hw[bank][il] * (attn_row + idx_row);
     }
-    return bytes;
-}
-
-uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g) {
-    if (!g) return 0;
-    const uint32_t nb = gpu_graph_bank_pool_count(g);
-    uint64_t bytes = 0;
-    for (uint32_t b = 0; b < nb; b++) bytes += gpu_graph_bank_touched_kv_bytes(g, b);
     return bytes;
 }
 

@@ -474,7 +474,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, op, ferr);
             return 1;
         }
-        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->rewind(c->value);
+        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, c->value);   /* the leader sends one only with CAP_REWIND */
         else                                   pulsar_session_family_invalidate(slot->s);
         return 1;
     }
@@ -484,8 +484,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "bank state save", ferr);
             return 1;
         }
-        if (FAMILY_BANKS(slot->s)) FAMILY_BANKS(slot->s)->save(slot->s, (uint32_t)c->value);
-        else                       slot->s->bank_state_save((uint32_t)c->value);
+        slot->s->engine->family->banks->save(slot->s, (uint32_t)c->value);
         return 1;
 
     case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
@@ -497,10 +496,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         const char *op = restore ? "bank state restore" : "bank repoint";
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
-            const bool restored = restore && (FAMILY_BANKS(slot->s) ? FAMILY_BANKS(slot->s)->restore(slot->s, (uint32_t)c->value)
-                                                                    : slot->s->bank_state_restore((uint32_t)c->value));
-            status = restore ? (restored ? 0 : 1)
-                             : slot->s->bank_repoint((uint32_t)c->value);
+            const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
+            const uint32_t bank = (uint32_t)c->value;
+            /* a family without a repoint never sends one (its repoint is a restore frame) */
+            status = restore ? (ops->restore(slot->s, bank) ? 0 : 1) : ops->repoint ? ops->repoint(slot->s, bank) : 1;
             if (status < 0) status = 1;
         } else {
             fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
@@ -513,8 +512,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
             return 1;
         }
-        if (FAMILY_BANKS(slot->s)) FAMILY_BANKS(slot->s)->note_committed(slot->s, c->tokens, (int)c->n_tokens);
-        else                       slot->s->note_committed_tokens(c->tokens, (int)c->n_tokens);
+        slot->s->engine->family->banks->note_committed(slot->s, c->tokens, (int)c->n_tokens);
         return 1;
 
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {
@@ -737,8 +735,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         const char *op = freeing ? "bank free physical" : "bank alloc physical";
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
-            const bool okb = freeing ? slot->s->bank_free_physical((uint32_t)c->value)
-                                     : slot->s->bank_alloc_physical((uint32_t)c->value);
+            const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
+            const bool okb = freeing ? ops->free_physical(slot->s, (uint32_t)c->value)
+                                     : ops->alloc_physical(slot->s, (uint32_t)c->value);
             status = okb ? 0 : 1;
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         return worker_ack(e, c->session_id, status, err, errlen);

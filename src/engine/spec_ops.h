@@ -75,6 +75,10 @@ typedef struct pulsar_spec_target_ops {
     /** How many banks one shared verify forward may carry (DeepSeek: the pool; Qwen: 1 until the GDN and
      *  PLE kernels take N banks x R rows, L272 P1 S4).  The server's lane choice reads it. */
     uint32_t banks_max;
+    /** Optional.  The readback the last batched forward took INSTEAD of its full logits rows (what round_note
+     *  chose): its host rows, row count and row width in 4-byte words; false = the full rows (the caller's
+     *  block).  The cross-rank digest of a batched step reads it (pulsar_session_batch_digest). */
+    bool (*readback)(struct pulsar_session *s, const void **rows, uint32_t *n_rows, uint32_t *width);
 } pulsar_spec_target_ops;
 
 /** A DRAFTER: its own weights and per-bank context, behind the round API. */

@@ -1095,9 +1095,12 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     for (uint32_t i = 0; i < n_img; i++) s->live_images.b[s->live_images.n++] = imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, G);
     pulsar_ckpt_commit(st, bank, slot, G);
-    if (!FAMILY_BANKS(s)) s->prefill_frontier = (int)G;   /* a bank-pool family's frontier is set_frontier_stale's */
+    s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
-    if (last && !(FAMILY_BANKS(s) ? pulsar_ckpt_restore(st, bank, G) : s->restore_checkpoint(G))) {
+    /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
+     * drafter window with it), else the store's alone (Qwen: its sync owns the rest) */
+    const pulsar_family_bank_ops *bops = s->engine->family->banks;
+    if (last && !(bops->restore_checkpoint ? bops->restore_checkpoint(s, G) : pulsar_ckpt_restore(st, bank, G))) {
         payload_set_err(err, errlen, "load segment: restoring the chain's last checkpoint failed");
         segment_clear(s, st, bank);
         return 1;

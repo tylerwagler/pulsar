@@ -1264,6 +1264,21 @@ static void ds4_cut(pulsar_session *s, int pos) { s->rewind(pos); }
 static const pulsar_spec_depth_policy k_ds4_depth = {SPEC_DEPTH_MIN, SPEC_DEPTH_MAX, SPEC_DEPTH_CONF_UP,
                                                      5, 0.90f, 8u, 2u};
 
+/* gpu_graph_decode_multiseq_batch records the step's form on every step: exactly one of the two row counts
+ * nonzero, or both zero for full rows -- the per-row argmaxes (L219) or the compact min-p candidates (L149). */
+static bool ds4_readback(pulsar_session *s, const void **rows, uint32_t *n_rows, uint32_t *width) {
+    const pulsar_gpu_graph *g = s->graph;
+    if (g->spec_argmax_rows > 0) {
+        *rows = g->spec_argmax_host; *n_rows = g->spec_argmax_rows; *width = 1u;
+        return true;
+    }
+    if (g->spec_compact_rows > 0) {
+        *rows = g->spec_compact_host; *n_rows = g->spec_compact_rows; *width = (uint32_t)PULSAR_DSPARK_PREFILTER_ROW_I32;
+        return true;
+    }
+    return false;
+}
+
 const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .snapshot      = */ ds4_spec_snapshot,
     /* .restore       = */ ds4_spec_restore,
@@ -1276,6 +1291,7 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .cut           = */ ds4_cut,
     /* .depth         = */ &k_ds4_depth,
     /* .banks_max     = */ PULSAR_MSEQ_MAX,
+    /* .readback      = */ ds4_readback,
 };
 
 /* ---- the DSpark drafter -------------------------------------------------------------------------- */

@@ -175,6 +175,6 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .tp_slices    = */ pulsar_ds4_tp_slices,
     /* .act_kind     = */ PULSAR_ACT_KIND_SLOT,
     /* .vision       = */ &k_ds4_vision,
-    /* .banks        = */ NULL,
+    /* .banks        = */ &k_ds4_bank_ops,
     /* .imatrix      = */ &k_ds4_imatrix,
 };

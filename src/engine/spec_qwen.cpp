@@ -145,6 +145,7 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
     /* .cut           = */ qwen_spec_cut,
     /* .depth         = */ NULL,   /* a fixed depth: the drafter's K and tau */
     /* .banks_max     = */ 2u,   /* L272 P1 S4: 2 x (K + 1) <= 14 rows at the deepest K (6) -- within SPEC_ROWS */
+    /* .readback      = */ NULL,   /* its batched steps read back full rows */
 };
 
 /* ---- the MTP drafter --------------------------------------------------------------------------- */

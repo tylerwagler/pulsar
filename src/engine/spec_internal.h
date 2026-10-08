@@ -85,13 +85,9 @@ void pulsar_spec_shadow_restore(pulsar_session *s, const pulsar_spec_carry_state
                                 uint32_t src_cap);
 static inline const pulsar_spec_target_ops *spec_target(const pulsar_session *s) { return s->engine->family->spec; }
 static inline const pulsar_drafter_ops *spec_drafter(const pulsar_session *s) { return s->engine->drafter_ops; }
-/** The bank save / restore the batched lane runs per step: the family's bank ops or DeepSeek's members. */
-static inline bool spec_bank_restore(pulsar_session *s, uint32_t bank) {
-    return FAMILY_BANKS(s) ? FAMILY_BANKS(s)->restore(s, bank) : s->bank_state_restore(bank);
-}
-static inline void spec_bank_save(pulsar_session *s, uint32_t bank) {
-    if (FAMILY_BANKS(s)) FAMILY_BANKS(s)->save(s, bank); else s->bank_state_save(bank);
-}
+/** The bank save / restore the batched lane runs per step: the family's bank ops. */
+static inline bool spec_bank_restore(pulsar_session *s, uint32_t bank) { return s->engine->family->banks->restore(s, bank); }
+static inline void spec_bank_save(pulsar_session *s, uint32_t bank) { s->engine->family->banks->save(s, bank); }
 
 /* ---- the implementations ---- */
 extern const pulsar_spec_target_ops k_ds4_spec_target;   ///< DeepSeek V4's verify hooks (spec_dspark.cpp)

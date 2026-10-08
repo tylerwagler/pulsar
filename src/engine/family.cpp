@@ -33,8 +33,15 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
         return NULL;
     }
     for (size_t i = 0; i < sizeof(k_families) / sizeof(k_families[0]); i++) {
-        const char *a = k_families[i]->arch;
-        if (strlen(a) == arch.len && memcmp(a, arch.ptr, arch.len) == 0) return k_families[i];
+        const pulsar_family *f = k_families[i];
+        if (strlen(f->arch) != arch.len || memcmp(f->arch, arch.ptr, arch.len) != 0) continue;
+        /* the core calls the bank ops unguarded, and an entry whose cap is declared calls its op */
+        if (!f->banks || ((f->caps & PULSAR_FAMILY_CAP_REWIND) != 0) != (f->banks->rewind != NULL)) {
+            fprintf(stderr, "pulsar: the %s family's bank ops are %s -- refusing\n", f->name,
+                    f->banks ? "out of step with its PULSAR_FAMILY_CAP_REWIND" : "missing");
+            return NULL;
+        }
+        return f;
     }
     fprintf(stderr, "pulsar: general.architecture '%.*s' is not a family this engine serves (",
             (int)arch.len, arch.ptr);

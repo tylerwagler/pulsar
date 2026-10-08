@@ -102,6 +102,13 @@ static bool qwen_bank_is_evicted(const pulsar_session *s, uint32_t bank) {
     return s->qwen && bank < s->qwen->n_banks && qwen_bank_kv_evicted(s->qwen, bank);
 }
 
+/* L272 P2: the family's prefill runs the core loop, and a cut anywhere is the cold bytes (session_contract_gate C1,
+ * C5) -- any interrupted sync resumes exactly. */
+static uint32_t qwen_bank_quantum_min_suffix(const pulsar_session *) { return 1u; }
+
+/* every bank has its own state (pulsar_qwen_state) */
+static bool qwen_bank_pooled(const pulsar_session *s) { return s->qwen && s->qwen->n_banks > 0; }
+
 const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .count          = */ qwen_bank_count,
     /* .save           = */ qwen_bank_save,
@@ -116,4 +123,9 @@ const pulsar_family_bank_ops k_qwen_bank_ops = {
     /* .free_physical      = */ qwen_bank_free_physical,
     /* .alloc_physical     = */ qwen_bank_alloc_physical,
     /* .is_evicted         = */ qwen_bank_is_evicted,
+    /* .repoint            = */ NULL,   /* nothing on the device to point: the repoint is a restore */
+    /* .rewind             = */ NULL,   /* no PULSAR_FAMILY_CAP_REWIND */
+    /* .restore_checkpoint = */ NULL,   /* a grid checkpoint is restored only as the sync resumes from it */
+    /* .quantum_min_suffix = */ qwen_bank_quantum_min_suffix,
+    /* .pooled             = */ qwen_bank_pooled,
 };
