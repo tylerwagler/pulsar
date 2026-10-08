@@ -18,10 +18,12 @@ bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, vo
         ops->resume_grid == 0u) return false;
     st->ops = ops;
     st->state = state;
-    uint64_t slot = 0;
-    (void)ops->walk(state, -1, NULL, 0, ops->min_checkpoint(state), &slot);
+    uint64_t slot = 0, front = 0;
+    (void)ops->walk(state, -1, false, NULL, 0, ops->min_checkpoint(state), &slot);
+    (void)ops->walk(state, -1, true, NULL, 0, ops->min_checkpoint(state), &front);
     /* The batched copies want 256-B aligned starts; keep every slot on one. */
     st->slot_bytes = (slot + 255u) & ~(uint64_t)255u;
+    st->frontier_bytes = (front + 255u) & ~(uint64_t)255u;
     memset(st->pos, 0, sizeof(st->pos));
     for (uint32_t b = 0; b < n_banks; b++) {
         st->slab[b] = pulsar_gpu_tensor_alloc((uint64_t)ops->ckpt_slots * st->slot_bytes);
@@ -95,7 +97,7 @@ static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     }
     const uint32_t s = ckpt_pick_slot(st, bank, G);
     st->pos[bank][s] = 0u;   /* not a checkpoint until the copy is issued whole */
-    if (!st->ops->walk(st->state, 0, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
+    if (!st->ops->walk(st->state, 0, false, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u: copy failed\n", G, bank);
         return false;
     }
@@ -120,7 +122,7 @@ bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     for (uint32_t k = 0; k < st->ops->ckpt_slots; k++) if (st->pos[bank][k] == G) s = k;
     if (s == PULSAR_CKPT_SLOTS_MAX) return false;
     if (!st->ops->prepare_restore(st->state, G) ||
-        !st->ops->walk(st->state, 1, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
+        !st->ops->walk(st->state, 1, false, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
         fprintf(stderr, "pulsar: grid checkpoint restore to %u on bank %u: copy failed\n", G, bank);
         return false;
     }

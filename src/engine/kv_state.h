@@ -58,6 +58,10 @@ typedef struct {
     struct pulsar_gpu_tensor *rows;
     uint32_t tokens_per_row;
     uint64_t row_bytes;
+    /** A row is written once, when its last token lands (DeepSeek's compressor emit: the open group is the
+     *  slot's lanes), so a frontier T holds rows [0, T / tokens_per_row); false = the open row is written as
+     *  its tokens arrive and a payload carries it too.  A grid span ends on whole rows either way. */
+    bool whole_rows;
 } pulsar_kv_pool;
 
 typedef struct pulsar_kv_state_ops {
@@ -71,8 +75,11 @@ typedef struct pulsar_kv_state_ops {
     uint32_t ckpt_slots;         ///< slots per bank, <= PULSAR_CKPT_SLOTS_MAX (the ladder's rule is checkpoint.cpp's)
     /** The ONE slot layout, walked identically by sizing, capture and restore: `dir` < 0 sizes
      *  only (*bytes = the slot's size), 0 copies the installed bank's state -> slot, > 0 copies
-     *  slot -> state.  Device copies on the session stream; false on a failed copy. */
-    bool (*walk)(void *state, int dir, struct pulsar_gpu_tensor *slab, uint64_t off, uint32_t G,
+     *  slot -> state.  `frontier`: the state at ANY position G (a payload's frontier), not at a grid
+     *  point -- a superset of the grid slot where the model holds lanes a grid point has canonical
+     *  (DeepSeek's coff-1 lanes); its size is pulsar_ckpt_store::frontier_bytes.  Device copies on the
+     *  session stream; false on a failed copy. */
+    bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, uint64_t off, uint32_t G,
                  uint64_t *bytes);
     /** The smallest G a checkpoint can describe (DeepSeek: the raw window). */
     uint32_t (*min_checkpoint)(void *state);
@@ -91,18 +98,17 @@ typedef struct pulsar_kv_state_ops {
     void (*set_frontier_stale)(void *state, uint32_t G);
     /** The installed bank's append-only pools, in a fixed order; returns how many. */
     uint32_t (*pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
-    /* ---- L284: a session payload built on this model (session_payload.cpp, "the kv-state payload").  NULL
-     * all three = the model's payload is not built on it (DeepSeek's is its graph's own format). */
+    /* ---- L284: the session payload, every model's (session_payload.cpp, "the kv-state payload"). */
     /** Does the installed bank stand at frontier T with every lane describing T -- nothing stale, nothing
-     *  speculative written past its true rows?  *prefill = the end of its prefill-only history (<= T).
-     *  `why` names the first violation. */
-    bool (*frontier_at)(void *state, uint32_t T, uint32_t *prefill, char *why, size_t whylen);
-    /** Before a payload load's walk (dir > 0) of the frontier slot: the bank's counters at T with `prefill`
-     *  of it prefilled; restored() follows the walk. */
+     *  speculative written past its true rows?  `why` names the first violation.  (The prefill frontier
+     *  the payload carries is pulsar_session_bank_prefill_frontier's.) */
+    bool (*frontier_at)(void *state, uint32_t T, char *why, size_t whylen);
+    /** Before a payload load's frontier walk (dir > 0): the bank's counters at T with `prefill` of it
+     *  prefilled, where the model keeps that count; restored() follows the walk. */
     bool (*install_frontier)(void *state, uint32_t T, uint32_t prefill);
     /** Append-only rows that TRAIL the frontier (a row is written once the token after it exists, so no
      *  grid span closes them): a payload carries them to its frontier beside the pools; a segment does
-     *  not.  Same contract as pools. */
+     *  not.  Same contract as pools; NULL = none (DeepSeek). */
     uint32_t (*trailing_pools)(void *state, pulsar_kv_pool *out, uint32_t cap);
     /** A prompt chunk took the installed bank's history to T -- a prefill walk's chunk landed, or a fused step's
      *  (L284 #2, pulsar_session_note_prefilled) -- and pulsar_ckpt_landed asks about it.  False (`why` filled)
@@ -124,6 +130,7 @@ typedef struct pulsar_ckpt_store {
     uint64_t artifact;
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
     uint64_t slot_bytes;
+    uint64_t frontier_bytes;   ///< the frontier walk's size (a payload's frontier slot), aligned as slot_bytes
     uint32_t pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS_MAX];
 } pulsar_ckpt_store;
 

@@ -40,7 +40,8 @@ static uint64_t qwen_host_tail_bytes(void) {
     return (uint64_t)(g_qwen_shape.ngram_size - 1u) * sizeof(int32_t);
 }
 
-static bool qwen_walk(void *state, int dir, pulsar_gpu_tensor *slab, uint64_t slot_off, uint32_t,
+/* One layout at a grid point and at a payload's frontier (`frontier` changes nothing): every lane is in the slot. */
+static bool qwen_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t slot_off, uint32_t,
                       uint64_t *bytes_out) {
     pulsar_qwen_state *st = Q_(state);
     const pulsar_qwen_shape *s = &g_qwen_shape;
@@ -116,8 +117,8 @@ static uint32_t qwen_layer_pools(pulsar_qwen_state *st, uint32_t il, pulsar_kv_p
     const pulsar_qwen_shape *s = &g_qwen_shape;
     const uint32_t bank = st->live_bank;
     pulsar_qwen_layer_state *L = &st->layer[il];
-    if (n < cap) out[n] = { L->kv[bank], 1u, pulsar_qwen_kv_row_bytes(s) };
-    if (n + 1u < cap) out[n + 1u] = { L->idx_keys[bank], s->idx_block, pulsar_qwen_index_row_bytes(s) };
+    if (n < cap) out[n] = { L->kv[bank], 1u, pulsar_qwen_kv_row_bytes(s), false };
+    if (n + 1u < cap) out[n + 1u] = { L->idx_keys[bank], s->idx_block, pulsar_qwen_index_row_bytes(s), false };
     return n + 2u;
 }
 
@@ -135,7 +136,7 @@ static uint32_t qwen_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
  * counter is T, no segment load left them stale, and -- with the MTP layer -- its pending row is the trunk
  * stack at T - 1 and its stage holds no draft rows (a draft chain consumes the pending row and writes into
  * the stage until the round's absorb puts both back). */
-static bool qwen_frontier_at(void *state, uint32_t T, uint32_t *prefill, char *why, size_t whylen) {
+static bool qwen_frontier_at(void *state, uint32_t T, char *why, size_t whylen) {
     pulsar_qwen_state *st = Q_(state);
     const uint32_t bank = st->live_bank;
     if (st->bank_pos[bank] != T || st->frontier_stale[bank]) {
@@ -149,7 +150,6 @@ static bool qwen_frontier_at(void *state, uint32_t T, uint32_t *prefill, char *w
                  st->mtp_stage_dirty[bank] ? "holds draft rows" : "clean");
         return false;
     }
-    *prefill = st->prefill_pos[bank];
     return true;
 }
 

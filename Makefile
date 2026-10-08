@@ -712,10 +712,12 @@ session-contract-gate-ds: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(FRONTIER_MODEL)
 # L284: a session payload at an off-grid, past-the-prefill frontier round-trips through the public API
 # (tests/payload_frontier_gate.cpp): the same logits and decode rows, the same greedy speculation, a byte-identical
-# re-save, the carried checkpoint's resume == cold, the digest.  Qwen's kv-state payload; ~2 min.
-.PHONY: payload-frontier-gate-qwen
+# re-save, the carried checkpoint's resume == cold, the digest.  The one kv-state payload, one target per family.
+.PHONY: payload-frontier-gate-qwen payload-frontier-gate-ds
 payload-frontier-gate-qwen: tests/payload_frontier_gate
 	./tests/payload_frontier_gate $(QWEN_GATE_MODEL)
+payload-frontier-gate-ds: tests/payload_frontier_gate
+	./tests/payload_frontier_gate $(FRONTIER_MODEL)
 # L284 #3: a family pool's bank physical residency (tests/bank_residency_gate.cpp): free_physical returns an idle
 # bank's KV (touched + MemAvailable), alloc_physical + its segment chain bring it back, and its greedy continuation
 # is byte-identical to a bank never freed.  DeepSeek's is cuda-evict-restore-gate.

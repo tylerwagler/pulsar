@@ -1130,83 +1130,24 @@ void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms)
 pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
-/** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
- * persistence policy; the engine owns the serialized state (DeepSeek's graph
- * format, or the kv-state payload below). */
-#define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-/* v3 (2026-08-11): the packed comp row's rope tail narrowed f32 -> bf16,
- * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
- * old stride, so it MUST be rejected rather than reinterpreted. */
-/** v4 (2026-08-17): the attn comp cache is stored as packed rows
- * rather than dequantised f32. v3 files are refused by the header check --
- * deliberately, since the row stride changed and a v3 file read as v4 would
- * decode noise into a KV cache rather than fail.
- * v5 (2026-08-18): the same for the raw ring (which was still being written as
- * f32-expanded __half rows at the wrong stride) and the indexer comp cache
- * (MXKV-FP4, 68 B/row, previously dequantised to 512 B f32 and re-encoded on
- * load).  Every KV row in a payload is now stored in the format its cache holds
- * it in, so a restore is a byte copy and re-encodes nothing.  Older files are
- * refused for the same reason as before: the strides changed.
- * v6 (2026-08-18): the header carries the KV ROW STRIDES it was written with,
- * so a storage-format change is caught structurally instead of relying on
- * someone remembering to bump the version.  That reliance already failed once:
- * the raw ring went from f32-expanded halves at 1024 B to packed 584 B WITHOUT
- * a bump, and a file straddling that change would have decoded noise into a KV
- * cache rather than refusing to load.  The version still moves on format
- * changes -- this just means forgetting is no longer silent.
- * v7 (L111): unified NVFP4 rows -- raw AND comp strides changed.
- * v8 (L194, 2026-09-06, never landed on a release): carried a per-bank compressor
- * snapshot.  v9 (L195, 2026-09-06): no snapshot -- a restored checkpoint resumes
- * from the grid point below its PREFILL frontier (header field 15) after a
- * 32-token state-only warm-up, so the raw window it carries reaches that far
- * below the checkpoint (raw_window + 127 + 32 rows).
- * v10 (2026-09-10/11) was developed TWICE on two trees, and BOTH parts are in
- * v11: L218's per-layer stream and L219's trailing digest.
- *   - L218, DeepSeek-V4.1 CSA2: compressed rows and index-K rows are carried
- *     per kv SOURCE layer (one frontier count per layer; each source's comp
- *     rows, then its index-K rows, then its pending-group state), no separate
- *     indexer frontier, no warm-up window (raw_window + 127 rows).  The KV rows
- *     are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the raw
- *     ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
- *     header carries both strides (fields 13 and 16) plus the indexer's.
- *   - L219: a trailing 64-bit digest over every byte above; a damaged payload
- *     refuses instead of decoding byte-rot into a live cache.
- * v11 (L218 s122 + the L219 merge, 2026-09-15): the per-layer byte stream is
- * derived from the LOADED PROFILE instead of from V4.1's geometry.  v10 wrote
- * its index-K rows for every kv source, so a 0731 artifact -- whose ratio-128
- * (HCA) sources have no indexer and no index pool -- refused to save at all;
- * and it sized the compressor state at head_dim x ratio, which is a QUARTER of
- * the 32768 B lane a V4 ratio-4 source keeps (coff 2), and omitted 0731's
- * indexer-compressor state lane entirely.  A shorter-than-the-lane span is the
- * dangerous shape: the save succeeds and the restore leaves the tail of a
- * recurrent state primed.  So a payload carries each source's comp rows, its
- * index-K rows only where an indexer runs, then the attention compressor's
- * state, then -- V4 only -- the indexer compressor's, then (v12) the L120
- * committed-projection ring an OVERLAPPING compressor replays to rebuild its
- * carry, plus that ring's covered span once in the counter region.  Earlier
- * files are refused: the per-layer layout differs at the same strides. */
-/* v13 (L264, 2026-10-04): v12 without the projection ring, plus the resume
- * checkpoint.  A payload is the frontier state exactly -- tokens, logits, the
- * prefill frontier, the raw window [ck - raw_window, ck), every compressed and
- * index-K row, every recurrent lane -- so a restored session decodes on as the
- * saved one would; and ONE grid checkpoint, the deepest at or below the prefill
- * frontier (opaque slot bytes, checkpoint.cpp), which a sync that does not
- * extend the frontier restores, exact by construction where v12's ring replay
- * was exact only by coverage.  Field 12 is the checkpoint slot size, field 15
- * the checkpoint's grid point (0 = none).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(15)   /* v14 (L281): the image block records after the tokens; v15 (L268): with each block's 2D grid */
-/** 12 shape/counters + the checkpoint slot size + 2 row strides (main, indexer fp4) + the resume grid point + the window row stride. */
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
-/** L284: the payload of a family whose state model (kv_state.h) declares the frontier ops -- Qwen; DeepSeek's
- * is the graph format above.  Built from a segment's parts, read and written by the same helpers: the header
- * (the segment's layout digest extended by the trailing pools and the logits width, the token count, the
- * prefill frontier, the resume grid point, the logits width), the tokens, the image section (count, records),
- * the frontier's logits, the resume checkpoint's slot (when there is one), the FRONTIER's slot (the state
- * model's walk at the token count), every pool's and trailing pool's rows to the frontier, and the trailing
- * digest.  A restore installs the frontier exactly: the session decodes on as the saved one would, and a
- * sync that does not extend it resumes from the resume checkpoint as the saved one would. */
+/** Session payload helpers.  HTTP/agent code owns the outer file header and
+ * persistence policy; the engine owns the serialized state: the kv-state payload,
+ * every family's (L284).  Built from a segment's parts, read and written by the same
+ * helpers: the header (the segment's layout digest extended by every pool and trailing
+ * pool, the frontier slot's size and the logits width; the token count, the prefill
+ * frontier, the resume grid point, the logits width), the tokens, the image section
+ * (count, records), the frontier's logits, the resume checkpoint's slot (when there is
+ * one), the FRONTIER's slot (the state model's frontier walk at the token count), every
+ * pool's and trailing pool's rows to the frontier, and the trailing digest.  A restore
+ * installs the frontier exactly: the session decodes on as the saved one would, and a
+ * sync that does not extend it resumes from the resume checkpoint as the saved one
+ * would.
+ * v2 (L284): DeepSeek's payload is this one -- its own graph format ("DSV4", v3..v15)
+ * is retired and refused by name; the frontier slot is the frontier walk's
+ * (DeepSeek: the grid slot plus its coff-1 lanes) and a whole-row pool carries no open
+ * row.  Disk segments are unchanged. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(1)
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(2)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);

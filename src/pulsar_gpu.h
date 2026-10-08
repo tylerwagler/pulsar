@@ -1183,7 +1183,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * Quantise EXACTLY ONCE (pulsar_cuda_kvrows.cu); every later move is a byte
  * move, and there is no conversion path from any other row format (0731's
  * unified 384 B NVFP4 row refuses through the payload / segment versions).
- * Bumping either layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION and
+ * Bumping either layout MUST bump PULSAR_SESSION_KV_PAYLOAD_VERSION and
  * PULSAR_SESSION_SEGMENT_VERSION. */
 #define PULSAR_WINKV_BLOCK  32u
 #define PULSAR_MAINKV_BLOCK 16u
