@@ -133,6 +133,22 @@ because nobody graded it.
 changes cite the passing byte gates; numerics changes cite the reference
 gate's per-depth table and, on the decode lane, the spec oracle's alpha.
 
+**Batch-width neutrality is NOT a requirement (Tyler 2026-10-08: "I care way
+less about M-Neutral now.  If cuBLASLt or CUTLASS is faster, use it.").**  A
+decode or verify row may take the fastest arm for its width -- cuBLASLt,
+CUTLASS, any tensor-core GEMM -- even though its bytes then depend on how many
+rows ride with it.  `PULSAR_GPU_MNEUTRAL_ROWS_MAX` (16) is the width of the
+kernels that ARE M-independent, not a ceiling on a lane's rows: a lane past it
+takes the faster arms instead of being refused.  Choosing such an arm is a
+numerics change and is graded, not byte-gated: the spec oracle
+(`make cuda-spec-sampling-gate`: the sampled distribution still the target's)
+for any verify-path change, KL of the row against a one-token decode, and the
+reference gate where the prefill moves.  The width/row/mixed neutrality gates
+still run; past the M-independent width they report the drift (KL) instead of
+failing on bytes.  What stays bit-exact: a refactor, the same rows at the same
+width, and a resume against the cold prefill of the same chunking.  Rule 8
+picks the arm: measured at the production lane's widths, the fastest wins.
+
 ## 8. Measure at the shape production runs.
 
 Performance claims are made at the served lane's real row counts (drafting
@@ -215,7 +231,9 @@ byte-identical to cold).
    rows are decode rows, and every decode row takes the M-independent kernels
    whatever the batch width (row kind chooses the arm, `src/pulsar_gpu.h`,
    `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend
-   on how many drafts ride with it.  *Instruments:* `cuda-mixed-neutrality-gate` GATE 5/5R (a
+   on how many drafts ride with it (within the M-independent width; past it
+   the faster arms are allowed and the drift is graded -- rule 7, 2026-10-08).
+   *Instruments:* `cuda-mixed-neutrality-gate` GATE 5/5R (a
    run's rows batched == the same run alone, byte-identical, 1..16 rows) for
    the per-row claim; the spec oracle (`make cuda-spec-sampling-gate`) grades
    alpha at the default tau.
