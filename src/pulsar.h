@@ -1149,8 +1149,8 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * helpers: the header (the segment's layout digest extended by every pool and trailing
  * pool, the frontier slot's size and the logits width; the token count, the prefill
  * frontier, the resume grid point, the logits width), the tokens, the image section
- * (count, records), the frontier's logits, the resume checkpoint's slot (when there is
- * one), the FRONTIER's slot (the state model's frontier walk at the token count), every
+ * (count, records), the session's draft-depth controller, the frontier's logits, the
+ * resume checkpoint's slot (when there is one), the FRONTIER's slot (the state model's frontier walk at the token count), every
  * pool's and trailing pool's rows to the frontier, and the trailing digest.  A restore
  * installs the frontier exactly: the session decodes on as the saved one would, and a
  * sync that does not extend it resumes from the resume checkpoint as the saved one
@@ -1158,9 +1158,12 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * v2 (L284): DeepSeek's payload is this one -- its own graph format ("DSV4", v3..v15)
  * is retired and refused by name; the frontier slot is the frontier walk's
  * (DeepSeek: the grid slot plus its coff-1 lanes) and a whole-row pool carries no open
- * row.  Disk segments are unchanged. */
+ * row.  Disk segments are unchanged.
+ * v3 (L284): the draft-depth controller (depth and its counters, 4 u32) after the image
+ * section, so a restored session speculates as the saved one would; v2 refuses on the
+ * version. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(2)
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(3)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);

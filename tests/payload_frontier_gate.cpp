@@ -2,8 +2,9 @@
  * so it runs on any family with PULSAR_FAMILY_CAP_PAYLOAD: the one kv-state payload (session_payload.cpp), Qwen's
  * and DeepSeek's (whose byte-level gate is session_payload_gate).
  *
- * The frontier is off the grid and past the prefill (a prompt of P tokens, then D decoded), which is the
- * state a payload exists for: neither a grid checkpoint nor a segment chain holds it.
+ * The frontier is off the grid and past the prefill (a prompt of P tokens, then -- a model with spec rounds --
+ * N_PRE greedy tokens speculated, then D decoded), which is the state a payload exists for: neither a grid
+ * checkpoint nor a segment chain holds it.
  *
  *   1. SIZE      payload_bytes() is what the save writes.
  *   2. FRONTIER  a fresh session that loads it stands at the same position with the same logits, and the
@@ -11,7 +12,9 @@
  *                the n-gram context -- everything a decode reads).
  *   3. DRAFTER   (a model with spec rounds) greedy speculation from the two sessions commits the same tokens
  *                in the same rounds: the drafter's state (Qwen: the MTP layer's trailing KV, its pending row
- *                and stage) survived, or the acceptance would differ.
+ *                and stage; DeepSeek: DSpark's raw and prompt-window rings) and the session's draft-depth
+ *                controller, moved by the speculation before the save, survived, or the acceptance would
+ *                differ.  A failure names the first differing token and round.
  *   4. IDEMPOTENT a session loaded from the payload saves it again byte for byte (snapshot == file).
  *   5. RESUME    a sync that does not extend the frontier resumes from the carried grid checkpoint, from the
  *                same origin as the live session, and its logits equal a cold prefill's.
@@ -29,6 +32,7 @@
 #define N_DECODE 6     /* decode rows between the prompt and the frontier */
 #define N_CHECK 8      /* decode rows compared after the load */
 #define N_SPEC 32      /* greedy tokens speculated from both sessions */
+#define N_PRE 16       /* greedy tokens the live session speculates before the save */
 
 static pulsar_session *g_s[3];
 static int g_fail;
@@ -100,7 +104,8 @@ int GATE_ENTRY(int argc, char **argv) {
     memset(&snap, 0, sizeof snap);
     FILE *fp = NULL;
     const int W = pulsar_engine_logits_width(e);
-    const int T = P + N_DECODE;
+    const int T0 = P + N_DECODE;   /* the prompt's tokens [P, T0) are the decode rows, those from T0 on the checks' */
+    int T = 0;                     /* the frontier: A's position at the save */
     {
     if (!pulsar_engine_has_snapshots(e)) {
         say(false, "the family declares payloads (PULSAR_FAMILY_CAP_PAYLOAD)");
@@ -118,18 +123,26 @@ int GATE_ENTRY(int argc, char **argv) {
     text[tl] = 0;
     pulsar_tokenize_text(e, text, &base);
     free(text);
-    if (base.len < T + N_CHECK + 4) { say(false, "prompt has %d tokens, need %d", base.len, T + N_CHECK + 4); goto done; }
+    if (base.len < T0 + N_CHECK + 4) { say(false, "prompt has %d tokens, need %d", base.len, T0 + N_CHECK + 4); goto done; }
     lg = (float *)malloc((size_t)W * (2 * N_CHECK + 4) * sizeof(float));
     float *ref0 = lg, *refA = lg + W, *got = refA + (size_t)W * N_CHECK, *cold = got + W;
     for (int i = 0; i < 3; i++)
         if (pulsar_session_create(&g_s[i], e, ctx) != 0) { say(false, "session %d create", i); goto done; }
     pulsar_session *A = g_s[0], *B = g_s[1], *X = g_s[2];
 
-    /* A: prompt, D decode rows, the frontier saved */
+    /* A: prompt, (a model with spec rounds) N_PRE speculated tokens -- the frontier then holds the drafter's
+     * committed rows and a draft-depth controller that has moved, not only a primed prompt window -- then D decode
+     * rows (a plain step leaves every family at a savable frontier: Qwen's MTP layer is not mid-draft), the
+     * frontier saved */
     pulsar_tokens pp = { base.v, P, P };
     if (pulsar_session_sync(A, &pp, err, sizeof err) != 0) { say(false, "A sync: %s", err); goto done; }
-    for (int i = P; i < T; i++)
+    if (pulsar_engine_has_spec_rounds(e)) {
+        int pt[N_PRE], pr[N_PRE], pn = 0;
+        if (spec_run(A, N_PRE, pt, pr, &pn, err, sizeof err) != 0) { say(false, "A speculate: %s", err); goto done; }
+    }
+    for (int i = P; i < T0; i++)
         if (pulsar_session_eval(A, base.v[i], err, sizeof err) != 0) { say(false, "A eval: %s", err); goto done; }
+    T = pulsar_session_pos(A);
     pulsar_session_copy_logits(A, ref0, W);
     const uint64_t pb = pulsar_session_payload_bytes(A);
     fp = tmpfile();
@@ -141,7 +154,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* A decodes on from its live state -- the reference */
     for (int i = 0; i < N_CHECK; i++) {
-        if (pulsar_session_eval(A, base.v[T + i], err, sizeof err) != 0) { say(false, "A eval: %s", err); goto done; }
+        if (pulsar_session_eval(A, base.v[T0 + i], err, sizeof err) != 0) { say(false, "A eval: %s", err); goto done; }
         pulsar_session_copy_logits(A, refA + (size_t)W * i, W);
     }
 
@@ -153,7 +166,7 @@ int GATE_ENTRY(int argc, char **argv) {
         "2. FRONTIER: loaded at pos %d, logits byte-identical to the saved session's", pulsar_session_pos(B));
     int first_diff = -1;
     for (int i = 0; i < N_CHECK && first_diff < 0; i++) {
-        if (pulsar_session_eval(B, base.v[T + i], err, sizeof err) != 0) { say(false, "B eval: %s", err); goto done; }
+        if (pulsar_session_eval(B, base.v[T0 + i], err, sizeof err) != 0) { say(false, "B eval: %s", err); goto done; }
         pulsar_session_copy_logits(B, got, W);
         if (memcmp(got, refA + (size_t)W * i, (size_t)W * sizeof(float))) first_diff = i;
     }
@@ -165,8 +178,17 @@ int GATE_ENTRY(int argc, char **argv) {
         int ta[N_SPEC], tb[N_SPEC], ra[N_SPEC], rb[N_SPEC], na = 0, nb = 0;
         const bool ok = spec_run(A, N_SPEC, ta, ra, &na, err, sizeof err) == 0 &&
                         spec_run(B, N_SPEC, tb, rb, &nb, err, sizeof err) == 0;
-        say(ok && na == nb && !memcmp(ta, tb, sizeof ta) && !memcmp(ra, rb, (size_t)na * sizeof(int)),
-            "3. DRAFTER: %d greedy tokens in %d / %d rounds, tokens and round sizes identical %s", N_SPEC, na, nb, err);
+        int tok_diff = -1, round_diff = -1;
+        for (int i = 0; ok && i < N_SPEC && tok_diff < 0; i++) if (ta[i] != tb[i]) tok_diff = i;
+        for (int i = 0; ok && i < (na < nb ? na : nb) && round_diff < 0; i++) if (ra[i] != rb[i]) round_diff = i;
+        if (ok && round_diff < 0 && na != nb) round_diff = na < nb ? na : nb;
+        say(ok && tok_diff < 0 && round_diff < 0,
+            "3. DRAFTER: %d greedy tokens in %d / %d rounds, tokens and round sizes identical (first differing "
+            "token %d, first differing round %d%s) %s",
+            N_SPEC, na, nb, tok_diff, round_diff,
+            round_diff >= 0 ? (round_diff < na && round_diff < nb ? "" : ": one side ran out") : "", err);
+        if (round_diff >= 0 && round_diff < na && round_diff < nb)
+            fprintf(stderr, "         round %d: live %d tokens, loaded %d\n", round_diff, ra[round_diff], rb[round_diff]);
     } else {
         fprintf(stderr, "  --   3. DRAFTER: the model has no spec rounds\n");
     }

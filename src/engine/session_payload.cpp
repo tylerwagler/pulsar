@@ -583,6 +583,31 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
 /* L284: DeepSeek's retired graph-format payload (v3..v15, "DSV4"), refused by name */
 #define KVP_RETIRED_DSV4_MAGIC UINT32_C(0x34565344)
 
+/* The session's draft-depth controller (spec_depth.h) -- the speculation state a frontier carries, every family's
+ * (a drafter without an adaptive policy holds it at zero).  It persists across a session's requests on purpose
+ * (pulsar_spec_carry_state::spec_adaptive_depth), so a restored session drafts at the saved one's depth and runs
+ * its controller from the saved counters -- not from whatever its bank served last.  The rest of the speculation
+ * state is a request's lookahead (the carry, the pendings, the quench): a load resets it as every request
+ * boundary does (spec_lookahead_reset), and a live session voids it on its next plain step, so neither side
+ * holds it at the frontier's next round.  Format v3. */
+#define KVP_SPEC_U32 4u
+static void kvp_spec_pack(const pulsar_spec_carry_state *sp, uint32_t (&rec)[KVP_SPEC_U32]) {
+    rec[0] = (uint32_t)sp->spec_adaptive_depth;
+    rec[1] = sp->spec_depth_down_forgiven ? 1u : 0u;
+    rec[2] = sp->spec_depth_rounds_since_up;
+    rec[3] = sp->spec_depth_climb_cooldown;
+}
+/* false = the record holds no controller a session could (0 = not yet moved; a depth is 1..16) */
+static bool kvp_spec_valid(const uint32_t (&rec)[KVP_SPEC_U32]) {
+    return rec[0] <= 16u && rec[1] <= 1u && rec[2] <= 255u && rec[3] <= 255u;
+}
+static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_carry_state *sp) {
+    sp->spec_adaptive_depth = (int)rec[0];
+    sp->spec_depth_down_forgiven = rec[1] != 0u;
+    sp->spec_depth_rounds_since_up = (uint8_t)rec[2];
+    sp->spec_depth_climb_cooldown = (uint8_t)rec[3];
+}
+
 /* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */
 static uint64_t kvp_frontier_bytes(const pulsar_ckpt_store *st) {
     uint64_t bytes = 0;
@@ -617,6 +642,7 @@ static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool 
     uint64_t bytes = (uint64_t)KVP_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)T * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_img * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
+    bytes += (uint64_t)KVP_SPEC_U32 * sizeof(uint32_t);
     bytes += (uint64_t)width * sizeof(float);
     bytes += (G ? st->slot_bytes : 0u) + kvp_frontier_bytes(st);   /* the resume checkpoint, the frontier */
     bytes += pools_span_bytes(pools, n, 0u, T);
@@ -710,6 +736,9 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     for (uint32_t i = 0; rc == 0 && i < KVP_U32_FIELDS; i++) rc = payload_write_u32(&io, header[i], err, errlen);
     for (uint32_t i = 0; rc == 0 && i < p.T; i++) rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen);
     if (rc == 0) rc = payload_write_images(&io, s->live_images.b, s->live_images.n, err, errlen);
+    uint32_t spec_rec[KVP_SPEC_U32];
+    kvp_spec_pack(&s->spec, spec_rec);
+    for (uint32_t i = 0; rc == 0 && i < KVP_SPEC_U32; i++) rc = payload_write_u32(&io, spec_rec[i], err, errlen);
     if (rc == 0) rc = payload_write_bytes(&io, s->logits, (uint64_t)p.width * sizeof(float), err, errlen);
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     if (rc == 0 && p.G)
@@ -801,6 +830,13 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
         imgs.b[imgs.n++] = b;
     }
+    uint32_t spec_rec[KVP_SPEC_U32];
+    for (uint32_t k = 0; k < KVP_SPEC_U32; k++)
+        if (payload_read_u32(&io, &spec_rec[k], &remaining, err, errlen) != 0) return drop();
+    if (!kvp_spec_valid(spec_rec)) {
+        payload_set_err(err, errlen, "session payload: its draft-depth record holds no controller state");
+        return drop();
+    }
     if (payload_read_bytes(&io, logits, (uint64_t)width * sizeof(float), &remaining, err, errlen) != 0) return drop();
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "session payload: failed to synchronize accelerator");
@@ -856,6 +892,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->checkpoint_valid = true;
     s->logits_stale = false;
     spec_lookahead_reset(s);
+    kvp_spec_unpack(spec_rec, &s->spec);
     return 0;
 }
 
