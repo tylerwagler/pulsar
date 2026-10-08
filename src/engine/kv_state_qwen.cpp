@@ -28,9 +28,8 @@
 #define QWEN_RESUME_GRID 128u
 static_assert(QWEN_RESUME_GRID % 4u == 0u, "a grid point must close an indexer block");
 
-/* ~118 MB a slot: the newest is the last prompt end, one older one survives the next turn. */
+/* ~118 MB a slot, so 2 (the ladder over them is checkpoint.cpp's: the newest and the one below it). */
 #define QWEN_CKPT_SLOTS 2u
-#define QWEN_CKPT_RECENT 1u
 static_assert(QWEN_CKPT_SLOTS <= PULSAR_CKPT_SLOTS_MAX, "the store's slot bound");
 
 static pulsar_qwen_state *Q_(void *state) { return (pulsar_qwen_state *)state; }
@@ -169,8 +168,8 @@ static uint32_t qwen_trailing_pools(void *state, pulsar_kv_pool *out, uint32_t c
     return st->mtp ? qwen_layer_pools(st, st->n_trunk_layers, out, 0, cap) : 0u;
 }
 
-/* A fused chunk to T (L284 #2): the bank's counter is the step's (qwen_session_decode_fused moved it); a capture at
- * T is the cold prefill's exactly when T ends the bank's prefill-only history -- the run continued it from its
+/* A prompt chunk to T -- the core loop's, or a fused step's (L284 #2): the bank's counter is the chunk's; a capture
+ * at T is the cold prefill's exactly when T ends the bank's prefill-only history -- the run continued it from its
  * end -- and no segment load left the lanes stale (qwen_stands_at's own rule). */
 static bool qwen_noted_at(void *state, uint32_t T, bool *capture, char *why, size_t whylen) {
     pulsar_qwen_state *st = Q_(state);
@@ -186,8 +185,8 @@ static bool qwen_noted_at(void *state, uint32_t T, bool *capture, char *why, siz
 const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN = {
     /* .name               = */ "qwen4-exp",
     /* .resume_grid        = */ QWEN_RESUME_GRID,
+    /* .split_invariant    = */ true,    /* THE RESUME GRID above */
     /* .ckpt_slots         = */ QWEN_CKPT_SLOTS,
-    /* .ckpt_recent        = */ QWEN_CKPT_RECENT,
     /* .walk               = */ qwen_walk,
     /* .min_checkpoint     = */ qwen_min_checkpoint,
     /* .stands_at          = */ qwen_stands_at,

@@ -77,7 +77,7 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
             if (pulsar_engine_has_spec_rounds(engine)) {
                 const int n = pulsar_session_generate_speculative(
                         session, 0.0f, 0, 1.0f, 0.0f, &rng, 12 - emitted,
-                        pulsar_token_eos(engine), toks,
+                        toks,
                         (int)(sizeof(toks) / sizeof(toks[0])),
                         err, sizeof(err));
                 /* Contract (session.cpp): eos arrives as a returned token; 0 means

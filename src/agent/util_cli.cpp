@@ -161,7 +161,8 @@ agent_config parse_options(int argc, char **argv) {
             .temperature = PULSAR_DEFAULT_TEMPERATURE,
             .top_p = PULSAR_DEFAULT_TOP_P,
             .min_p = PULSAR_DEFAULT_MIN_P,
-            .think_mode = PULSAR_THINK_LOW,
+            /* the loaded family's default effort, resolved after open (as pulsar's) */
+            .think_mode = PULSAR_THINK_DEFAULT,
         },
     };
 
@@ -197,13 +198,25 @@ agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            /* thinking on at the LOADED family's default effort, resolved after open */
+            c.gen.think_mode = PULSAR_THINK_DEFAULT;
+            c.gen.think_mode_set = false;
+        } else if (!strcmp(arg, "--think-low")) {
             c.gen.think_mode = PULSAR_THINK_LOW;
+            c.gen.think_mode_set = true;
+        } else if (!strcmp(arg, "--think-effort")) {
+            c.gen.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
+                                               PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {

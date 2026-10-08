@@ -776,7 +776,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
-    /* Increment 3: rewrite (common rides the token header; verdict result+1),
+    /* Increment 3: note-prefilled (the head rides the token header; a verdict),
      * note-committed (void), set-logits (the float vector, bit-exact). */
     {
         const uint64_t sid = 0xC0DE8000ULL;
@@ -787,9 +787,9 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         for (int i = 0; i < 9; i++) lg[i] = -1.5f * (float)i + 0.125f;
         if (rank == 0) {
             int status = -99;
-            CHECK(pulsar_tp_send_rewrite_from_common(tp, sid, toks, 5u, 3) != 0, "rank 0 rewrite send failed");
-            CHECK(pulsar_tp_wait_command_status(tp, sid, "rewrite from common", &status, cerr, sizeof(cerr)) &&
-                  status == 2, "rank 0 rewrite verdict: want 2 (REBUILD_NEEDED+1), got %d (%s)", status, cerr);
+            CHECK(pulsar_tp_send_note_prefilled(tp, sid, toks, 5u, 3) != 0, "rank 0 note-prefilled send failed");
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "note prefilled", &status, cerr, sizeof(cerr)) &&
+                  status == 2, "rank 0 note-prefilled verdict: want 2 (the worker's), got %d (%s)", status, cerr);
             CHECK(pulsar_tp_send_note_committed(tp, sid, toks, 2u) != 0, "rank 0 note send failed");
             CHECK(pulsar_tp_send_set_logits(tp, sid, lg, 9u) != 0, "rank 0 set-logits send failed");
             status = -99;
@@ -797,12 +797,12 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                   status == 0, "rank 0 set-logits verdict: want 0, got %d (%s)", status, cerr);
         } else {
             pulsar_tp_command cmd;
-            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d rewrite recv: %s", rank, cerr);
+            if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d note-prefilled recv: %s", rank, cerr);
             else {
-                CHECK(cmd.type == PULSAR_TP_FRAME_REWRITE_FROM_COMMON && cmd.session_id == sid &&
+                CHECK(cmd.type == PULSAR_TP_FRAME_NOTE_PREFILLED && cmd.session_id == sid &&
                       cmd.value == 3 && cmd.n_tokens == 5 && cmd.tokens && cmd.tokens[4] == 35,
-                      "rank %d rewrite frame: value %d n_tokens %u", rank, cmd.value, cmd.n_tokens);
-                CHECK(pulsar_tp_send_command_ack(tp, sid, 2), "rank %d rewrite ack failed", rank);
+                      "rank %d note-prefilled frame: value %d n_tokens %u", rank, cmd.value, cmd.n_tokens);
+                CHECK(pulsar_tp_send_command_ack(tp, sid, 2), "rank %d note-prefilled ack failed", rank);
                 pulsar_tp_command_free(&cmd);
             }
             if (!pulsar_tp_recv_command(tp, &cmd, cerr, sizeof(cerr))) CHECK(0, "rank %d note recv: %s", rank, cerr);
@@ -982,7 +982,7 @@ int main(void) {
         std::fflush(stderr);
     }
     if (rc == 0)
-        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab + grouped all-gather + command plane + bank/rewrite/logits/spec/spill verdicts + images, exact)\n");
+        std::printf("tp_mesh_test: ok (n=2..5 mesh + all-reduce + vocab + grouped all-gather + command plane + bank/note-prefilled/logits/spec/spill verdicts + images, exact)\n");
     else
         std::printf("tp_mesh_test: FAILED\n");
     return rc;

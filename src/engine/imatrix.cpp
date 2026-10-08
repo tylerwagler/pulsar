@@ -108,13 +108,44 @@ static bool imatrix_collect_layer_batch(
 
 
 
-static void imatrix_write_i32(FILE *fp, int32_t v) {
+void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
 
 
-static void imatrix_write_entry(
+/* The llama.cpp legacy `.dat` frame every family's collection shares: the entry count, the entries
+ * (imatrix_write_entry), then the chunk count and the dataset's name. */
+FILE *imatrix_dat_open(const char *path, int32_t n_entries) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    imatrix_write_i32(fp, n_entries);
+    return fp;
+}
+
+
+
+bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path) {
+    imatrix_write_i32(fp, chunks);
+    const char *dataset = dataset_path ? dataset_path : "";
+    const int32_t dataset_len = (int32_t)strlen(dataset);
+    imatrix_write_i32(fp, dataset_len);
+    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
+        pulsar_die("failed to write imatrix dataset name");
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+
+
+void imatrix_write_entry(
         FILE       *fp,
         const char *name,
         const float *sum2,
@@ -150,14 +181,8 @@ bool imatrix_collector_save(
         const pulsar_imatrix_collector *c,
         const pulsar_weights           *weights,
         const char                  *path) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "pulsar: failed to open imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-
-    const int32_t entries = (int32_t)(PULSAR_N_LAYER * 3);
-    imatrix_write_i32(fp, entries);
+    FILE *fp = imatrix_dat_open(path, (int32_t)(PULSAR_N_LAYER * 3));
+    if (!fp) return false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const pulsar_layer_weights *layer = &weights->layer[il];
         char name[256];
@@ -181,20 +206,7 @@ bool imatrix_collector_save(
                             PULSAR_N_FF_EXP);
     }
 
-    const int32_t chunks = (int32_t)c->chunks;
-    imatrix_write_i32(fp, chunks);
-    const char *dataset = c->dataset_path ? c->dataset_path : "";
-    const int32_t dataset_len = (int32_t)strlen(dataset);
-    imatrix_write_i32(fp, dataset_len);
-    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        pulsar_die("failed to write imatrix dataset name");
-    }
-
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "pulsar: failed to close imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    return true;
+    return imatrix_dat_close(fp, path, (int32_t)c->chunks, c->dataset_path);
 }
 
 
@@ -715,11 +727,8 @@ static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
      * what keeps a resumed image prefill the cold one's chunk for chunk.  A
      * text-only cold pass starts aligned and never cuts, so it is unchanged. */
     if (g->prefill_cap != 0) {
-        const uint32_t mod = pos0 % g->prefill_cap;
-        if (mod != 0) {
-            const uint32_t to_boundary = g->prefill_cap - mod;
-            if (to_boundary < local_cap) local_cap = to_boundary;
-        }
+        const uint32_t to_boundary = pulsar_prefill_to_boundary(pos0, g->prefill_cap);
+        if (to_boundary < local_cap) local_cap = to_boundary;
     }
     uint32_t chunk = remaining < local_cap ? remaining : local_cap;
     /* Keep every NON-final chunk boundary aligned to the layer compress
@@ -754,18 +763,19 @@ static uint32_t ds4_plan_next_end(void *ud, uint32_t pos0, uint32_t end) {
             else chunk = be - pos0;
         }
     }
-    /* L264: the final chunk stops at the last grid point inside it, so the
-     * prefill leaves a checkpoint where the next turn of this conversation
-     * resumes.  A chunk that starts on the 128 grid is exactly the cold
-     * prefill's computation (L195), so the split moves no byte -- the
-     * chunk-neutrality gate's resumes are this same cut.  Not when that grid
-     * point falls inside an image block (the block stays whole). */
+    /* L264 / P13: the final chunk stops at the last grid point inside it
+     * (pulsar_ckpt_final_cut, every walk's), so the prefill leaves a
+     * checkpoint where the next turn of this conversation resumes.  A chunk
+     * that starts on the 128 grid is exactly the cold prefill's computation
+     * (L195), so the split moves no byte -- the chunk-neutrality gate's
+     * resumes are this same cut.  Not when that grid point falls inside an
+     * image block (the block stays whole). */
     if (pos0 + chunk == end) {
-        const uint32_t grid_end = pulsar_ckpt_grid_floor(&g->ckpt, end);
+        const uint32_t cut = pulsar_ckpt_final_cut(&g->ckpt, pos0, end);
         bool inside = false;
         for (int b = 0; b < p->n_blk; b++)
-            if ((uint32_t)p->blk_s[b] < grid_end && grid_end < (uint32_t)p->blk_e[b]) inside = true;
-        if (grid_end > pos0 && grid_end < end && !inside) chunk = grid_end - pos0;
+            if ((uint32_t)p->blk_s[b] < cut && cut < (uint32_t)p->blk_e[b]) inside = true;
+        if (!inside) chunk = cut - pos0;
     }
     return pos0 + chunk;
 }
@@ -800,15 +810,16 @@ static bool ds4_plan_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
 static bool ds4_plan_landed(void *ud, uint32_t chunk_end) {
     ds4_plan *p = (ds4_plan *)ud;
     pulsar_gpu_graph *g = p->g;
-    /* L264: a chunk that ended on the grid -- every non-final boundary does,
-     * and the final split above makes the last grid point one too -- is a
-     * checkpoint.  Never inside an image block (the planner never ends a
-     * chunk there, L261): a resume may not re-evaluate a merged row (L226). */
+    /* L264 / P13: a chunk that ended on the grid -- every non-final boundary
+     * does, and the final split above makes the last grid point one too -- is
+     * a checkpoint, by the shared capture rule (pulsar_ckpt_landed).  Never
+     * inside an image block (the planner never ends a chunk there, L261): a
+     * resume may not re-evaluate a merged row (L226). */
     bool in_block = false;
     for (int b = 0; b < p->n_blk; b++)
         if ((uint32_t)p->blk_s[b] < chunk_end && chunk_end < (uint32_t)p->blk_e[b]) in_block = true;
     p->at_resume_point = chunk_end % g->ckpt.ops->resume_grid == 0u && !in_block;
-    if (p->at_resume_point && !pulsar_ckpt_capture(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
+    if (p->at_resume_point && !pulsar_ckpt_landed(&g->ckpt, gpu_graph_cur_bank(g), chunk_end)) return false;
     if (p->progress) {
         p->progress(p->progress_ud, "prefill_chunk", (int)chunk_end, p->prompt->len);
     }
@@ -1503,7 +1514,68 @@ pulsar_context_memory pulsar_context_memory_estimate(
 
 
 
+/* ---- DeepSeek's collection (family.h pulsar_family_imatrix): the layer-major prefill graph, observed -------- */
 
+struct ds4_imatrix_run {
+    pulsar_gpu_graph g;
+    pulsar_imatrix_collector c;
+    uint32_t prefill_cap;
+};
 
+static void *ds4_imatrix_begin(pulsar_engine *e, const char *dataset_path, int ctx_size) {
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    ds4_imatrix_run *r = new ds4_imatrix_run;
+    r->prefill_cap = prefill_cap;
+    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[0], raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                 gpu_graph_bank_pool_n(), false)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
+        delete r;
+        return NULL;
+    }
+    if (!imatrix_collector_init(&r->c, prefill_cap, dataset_path)) {
+        fprintf(stderr, "pulsar: failed to allocate imatrix collector\n");
+        gpu_graph_free(&r->g);
+        delete r;
+        return NULL;
+    }
+    fprintf(stderr,
+            "pulsar: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
+            dataset_path, PULSAR_MODEL_SHAPE_NAME, PULSAR_N_LAYER, PULSAR_N_EXPERT, ctx_size, prefill_cap);
+    return r;
+}
 
+static bool ds4_imatrix_prompt(pulsar_engine *e, void *c, const pulsar_tokens *tokens) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    token_vec prompt = *(const token_vec *)tokens;
+    if (!gpu_graph_reset_prefill_state(&r->g)) {
+        fprintf(stderr, "pulsar: failed to reset imatrix graph state\n");
+        return false;
+    }
+    if ((uint32_t)prompt.len > r->prefill_cap)
+        return gpu_graph_prefill_chunked_range(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL,
+                                               false, NULL, NULL, NULL, NULL, &r->c, NULL, NULL, NULL);
+    return gpu_graph_prefill_layer_major(&r->g, &e->model, &e->weights, &prompt, 0, (uint32_t)prompt.len, NULL, false,
+                                         &r->c, NULL, NULL);
+}
 
+static uint64_t ds4_imatrix_routes(const void *c) { return ((const ds4_imatrix_run *)c)->c.observed_routes; }
+
+static bool ds4_imatrix_save(pulsar_engine *e, void *c, const char *path) {
+    return imatrix_collector_save(&((ds4_imatrix_run *)c)->c, &e->weights, path);
+}
+
+static void ds4_imatrix_end(pulsar_engine *, void *c) {
+    ds4_imatrix_run *r = (ds4_imatrix_run *)c;
+    imatrix_collector_free(&r->c);
+    gpu_graph_free(&r->g);
+    delete r;
+}
+
+const pulsar_family_imatrix k_ds4_imatrix = {
+    /* .begin  = */ ds4_imatrix_begin,
+    /* .prompt = */ ds4_imatrix_prompt,
+    /* .routes = */ ds4_imatrix_routes,
+    /* .save   = */ ds4_imatrix_save,
+    /* .end    = */ ds4_imatrix_end,
+};

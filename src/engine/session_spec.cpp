@@ -200,13 +200,19 @@ void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
     f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
-/* Re-arm at request boundaries (the same sites that drop the carry and
- * pendings). All-zero == armed, matching the xcalloc'd session. */
+/* All-zero == armed, matching the xcalloc'd session. */
 void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quench_debt = 0.0f;
     s->spec.spec_quench_ewma = 0.0f;
     s->spec.spec_quench_steps = 0;
     s->spec.spec_quenched = false;
+}
+
+/* A request boundary: the lookahead goes, the quench re-arms. */
+void spec_lookahead_reset(pulsar_session *s) {
+    s->spec.spec_carry_valid = false;
+    pulsar_spec_drop_pendings(&s->spec);
+    spec_quench_reset(s);
 }
 
 
@@ -466,7 +472,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
  * capture/comp-save buffers (classic: 0). Owns r->frontier's lifetime on
  * every path. Returns tokens emitted, or -1 (session poisoned). */
 static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                          int first_token, int eos_token,
+                          int first_token,
                           float temperature, int top_k, float top_p, float min_p,
                           uint64_t *rng,
                           const pulsar_spec_rows *src, uint32_t row0,
@@ -537,12 +543,15 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * thinking-live continuation embeds the ghosts into the next prompt. The
      * EOS row itself stays committed (it was evaluated in the batch, matching
      * the batched lane's convention); hit_eos below invalidates the carry, so
-     * nothing ever samples from a post-EOS row. */
-    if ((int)first_token == (int)eos_token) {
+     * nothing ever samples from a post-EOS row.  "EOS" is the family's whole
+     * stop set (pulsar_token_is_stop; L284: the round cut only at the one eos
+     * id, so a Qwen draft of <|endoftext|> committed past it and the server
+     * invalidated the bank for the ghost tail). */
+    if (pulsar_token_is_stop(e, first_token)) {
         commit = 0;
     } else {
         for (int i = 0; i < commit; i++) {
-            if (pend[i] == (int32_t)eos_token) { commit = i + 1; break; }
+            if (pulsar_token_is_stop(e, (int)pend[i])) { commit = i + 1; break; }
         }
     }
 
@@ -681,10 +690,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
     /* Emit first_token + accepted drafts. */
     accepted[n_accept++] = first_token;
-    bool hit_eos = first_token == eos_token;
+    bool hit_eos = pulsar_token_is_stop(e, first_token);
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
         accepted[n_accept++] = (int)pend[i];
-        if (pend[i] == (int32_t)eos_token) hit_eos = true;
+        if (pulsar_token_is_stop(e, (int)pend[i])) hit_eos = true;
     }
 
     /* L155 guard: the committed frontier (saved_len + 1 + commit) must equal
@@ -733,7 +742,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_min_p = min_p;
     uint32_t n_draft = pulsar_spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || trimmed || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
+    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || n_draft == 0 || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain.  (After an
@@ -776,7 +785,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 /* The single lane (the classic API: CLI, eval, warmup): begin, the target's own verify forward over
  * the round's rows, end -- the batched lane runs the same begin and end around a shared forward. */
 static int spec_single_round(pulsar_session *s, int first_token,
-                             int max_tokens, int eos_token,
+                             int max_tokens,
                              float temperature, int top_k,
                              float top_p, float min_p,
                              uint64_t *rng,
@@ -803,7 +812,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
     }
     const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
     s->spec.spec_round_banks = 1;
-    const int na = spec_round_end(s, &r, first_token, eos_token,
+    const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, rng,
                                   &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
     free(r.snap);
@@ -823,7 +832,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
  * eval_speculative_block behavior). Returns the number of tokens emitted. */
 int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
-                                     int max_tokens, int eos_token,
+                                     int max_tokens,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     auto *s = this;
@@ -859,7 +868,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
             return -1;
         }
     }
-    if (first == eos_token) {
+    if (pulsar_token_is_stop(s->engine, first)) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
         accepted[0] = first;
@@ -869,11 +878,11 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
     if (!spec_drafter(s) || s->spec.spec_quenched) {
-        if (s->engine->family->session->eval(s, first, err, errlen) != 0) return -1;
+        if (pulsar_session_family_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
     }
-    return spec_single_round(s, first, max_tokens, eos_token,
+    return spec_single_round(s, first, max_tokens,
                                               temperature, top_k, top_p, min_p, rng,
                                               accepted, accepted_cap, err, errlen);
 }
@@ -881,7 +890,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
 
 
 int pulsar_session::eval_speculative_block(int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     auto *s = this;
@@ -895,7 +904,7 @@ int pulsar_session::eval_speculative_block(int first_token,
         return -1;
     }
     if (!spec_drafter(s) || s->spec.spec_quenched) {
-        if (s->engine->family->session->eval(s, first_token, err, errlen) != 0) return -1;
+        if (pulsar_session_family_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
@@ -906,7 +915,7 @@ int pulsar_session::eval_speculative_block(int first_token,
      * setter anywhere and so could never have restored it. */
     /* an externally chosen first_token invalidates any pending carry */
     s->spec.spec_carry_valid = false;
-    return spec_single_round(s, first_token, max_tokens, eos_token,
+    return spec_single_round(s, first_token, max_tokens,
                                                  0.0f, 0, 1.0f, 0.0f, NULL,
                                                  accepted, accepted_cap, err, errlen);
 }
@@ -985,7 +994,7 @@ bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out) {
 /* The batched lane's round end: the target reads this round's rows out of the last shared forward
  * (its own readback or the caller's block), then the one round_end runs. */
 static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
-                                int first_token, int eos_token,
+                                int first_token,
                                 float temperature, int top_k, float top_p,
                                 float min_p, uint64_t *rng,
                                 const float *rows, uint32_t row0,
@@ -1007,7 +1016,7 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
         src.block.row0 = row0;
         src.block.vocab = spec_vocab(s);
     }
-    return spec_round_end(s, r, first_token, eos_token,
+    return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, rng,
                           &src, row0,
                           true /* L150: redraft deferred to the batch */,
@@ -1018,19 +1027,19 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
 
 
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token, int eos_token,
+                               int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
-    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
                                 min_p, rng, rows, row0, NULL, accepted, accepted_cap,
                                 err, errlen);
 }
 
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token, int eos_token,
+                                      int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       const float *rows, uint32_t row0,
@@ -1041,7 +1050,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         snprintf(err, errlen, "spec round_end_forced: no truth");
         return -1;
     }
-    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
                                 min_p, rng, rows, row0, truth, accepted, accepted_cap,
                                 err, errlen);
 }
@@ -1151,7 +1160,7 @@ static void spec_step_reset(pulsar_spec_step *st) {
 }
 
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              int eos_token, uint32_t row_budget,
+                                              uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     uint32_t rows = 0;
     for (int i = 0; i < n; i++) {
@@ -1180,7 +1189,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
-            } else if (first == eos_token) {
+            } else if (pulsar_token_is_stop(s->engine, first)) {
                 st->status = PULSAR_SPEC_STEP_EOS;
             } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
                                                              st->accepted_cap, st->temperature,
@@ -1207,7 +1216,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
 }
 
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               int eos_token, const float *rows) {
+                                               const float *rows) {
     /* L260: each bank's walk records its committed capture rows; one banked seed
      * after the loop shares the drafter's main_proj / attn_kv reads across every
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
@@ -1223,7 +1232,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
-        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token, eos_token,
+        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token,
                                                            st->temperature, st->top_k, st->top_p,
                                                            st->min_p, st->rng, rows, st->row0,
                                                            st->accepted, st->accepted_cap,

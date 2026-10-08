@@ -208,19 +208,20 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
     const uint32_t bank = pulsar_session_live_bank(s);
     const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
-    bool capture = false;
-    char why[192] = "";
-    if (!ck || !ck->ops || !ck->ops->noted_at(ck->state, G, &capture, why, sizeof(why))) {
-        fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) is not its state: %s -- refusing\n", bank,
-                from, G, ck && ck->ops ? why : "no checkpoint store");
+    /* the shared capture rule (P13): the state stands at G or the record is refused, and G on the grid in a
+     * prefill's state is captured -- before the record changes anything */
+    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, G)) {
+        fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) %s -- refusing\n", bank, from, G,
+                ck && ck->ops ? "did not land (above)" : "has no checkpoint store");
         return 1;
     }
     if (from == 0) s->live_images.n = 0;   /* a history from 0 holds no image block (a fused chunk is text) */
+    /* a prompt chunk is a request's, as a sync's prefill is: the lookahead and a latched quench are the
+     * previous request's (pulsar_session_family_sync does the same for the classic lane) */
+    spec_lookahead_reset(s);
     s->note_committed_tokens(toks, n);
     s->checkpoint_valid = true;
     s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
-    if (capture && G % ck->ops->resume_grid == 0u && G >= ck->ops->min_checkpoint(ck->state))
-        (void)pulsar_ckpt_capture(ck, bank, G);
     if (head >= 0) {
         const size_t w = (size_t)s->engine->logits_width();
         memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * w, w * sizeof(s->logits[0]));

@@ -139,6 +139,7 @@ typedef struct {
     float min_p;                    ///< floor on candidate probability, relative to the top token
     uint64_t seed;                  ///< RNG seed for reproducible sampling
     pulsar_think_mode think_mode;   ///< whether the model may emit a reasoning block, and if so how it is shown
+    bool think_mode_set;            ///< an explicit flag chose it (else the loaded family's default, after open)
 } agent_generation_options;
 
 /** The fully-resolved agent configuration, assembled once from CLI flags. */
@@ -205,6 +206,12 @@ typedef struct {
     agent_config *cfg;          ///< resolved configuration, immutable after startup
     pulsar_session *session;    ///< KV session backing the transcript
     pulsar_tokens transcript;   ///< the conversation as tokens; source of truth for context use
+    /** The turn being built: the messages since the last assistant turn (system notes, the user's text, tool
+     *  results), rendered WHOLE into the transcript by the family's chat front when the assistant turn opens
+     *  (agent_turn_flush).  `content` is owned. */
+    pulsar_chat_message *turn;
+    int turn_len;
+    int turn_cap;
 
     char *cache_dir;            ///< directory holding saved sessions (`<sha>.session`) and `segments/`
     pulsar_segstore *kv;        ///< the KV segment store under cache_dir; NULL when unusable
@@ -830,14 +837,15 @@ bool agent_slash_command_known(const char *cmd);
 double agent_now_sec(void);
 void usage(FILE *fp, const char *topic);
 agent_config parse_options(int argc, char **argv);
-void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
-                                       const char *extra);
+/** The built-in DSML tool prompt: trusted control text (pulsar_chat_message::trusted). */
+char *agent_build_tools_prompt(void);
 void agent_worker_note_system_prompt_seen(agent_worker *w);
 void agent_worker_maybe_append_datetime_context(agent_worker *w);
 /** The full tool/system reminder is separate from DSML syntax errors: it is a
- * pressure-controlled refresh of the same trusted prompt shape used at startup.
- * The built-in prompt is tokenized as rendered chat so DSML markers stay native
- * control tokens; arbitrary -sys text remains ordinary text.
+ * pressure-controlled refresh of the same trusted prompt shape used at startup,
+ * added to the turn being built as system notes: the built-in prompt trusted
+ * (DeepSeek keeps its DSML markers native control tokens), arbitrary -sys text
+ * ordinary text.
  */
 void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w);
 /** Wake the UI thread after changing worker-visible state.  The byte in
@@ -932,6 +940,16 @@ void agent_kv_persist(agent_worker *w, const char *what);
 /** The system prompt's stored chain tip ("" when none). */
 void agent_kv_system_tip(agent_worker *w, char tip[41]);
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
+/** Add a message to the turn being built (agent_worker::turn); `content` is copied. */
+void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted);
+/** The turn being built plus `extra` (n_extra messages after it), rendered as ONE turn onto `tokens`, with the
+ *  assistant turn opened for `think_mode` -- what the next prefill will hold. */
+void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+                       pulsar_think_mode think_mode);
+/** Render the turn being built onto the transcript with the assistant turn opened, and empty it. */
+void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode);
+/** Drop the turn being built (a new or switched session starts without one). */
+void agent_turn_clear(agent_worker *w);
 void agent_publish_system_status(agent_worker *w, const char *msg);
 /** When a model turn finishes with a tool call, queued user messages should not
  * preempt that tool.  The worker asks the UI thread for the queue contents only

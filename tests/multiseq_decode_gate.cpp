@@ -269,7 +269,7 @@ static bool check_stale_classic_fails_loud(void) {
 
         err[0] = '\0';
         int acc[4];
-        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, -1, acc,
+        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, acc,
                                                               4, err, sizeof(err));
         CHECK(rcs <= 0,
               "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval_speculative_block "

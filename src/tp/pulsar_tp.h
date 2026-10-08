@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 24u           /* v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 25u           /* v25: REWRITE_FROM_COMMON retired -- the tool-checkpoint canonicalization is a mirrored sync -- and the spec frames no longer carry an eos id (the round stops at the engine's whole stop set) (L284); v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -452,9 +452,6 @@ int pulsar_tp_send_note_prefilled(pulsar_tp *tp, uint64_t session_id,
 int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
 int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
-/* Increment 3.  `common` rides the token header beside the tokens. */
-int pulsar_tp_send_rewrite_from_common(pulsar_tp *tp, uint64_t session_id,
-                                       const int *tokens, uint32_t n_tokens, int common);
 int pulsar_tp_send_note_committed(pulsar_tp *tp, uint64_t session_id,
                                   const int *tokens, uint32_t n_tokens);
 int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
@@ -477,7 +474,7 @@ typedef struct {
 int pulsar_tp_send_spec(pulsar_tp *tp, uint32_t frame_type, const pulsar_tp_spec_command *cmd,
                         const uint32_t *banks, const uint64_t *rngs);
 /* v17 (L260): a SPEC_*_BATCH frame -- `cmd` is the header (count = steps,
- * at most PULSAR_TP_SPEC_STEPS_MAX; i0 = eos token; v24: ROUND_END_BATCH's
+ * at most PULSAR_TP_SPEC_STEPS_MAX; i0 unused (L284); v24: ROUND_END_BATCH's
  * i1..i3 = the leader's spec cost flat_us, row_us, valid; i1 = the row budget for
  * ASSEMBLE) and `steps[count]` are the per-bank records in the same struct
  * (bank, sampling, rng as it was before the phase; i0 = max_tokens / first
@@ -637,11 +634,10 @@ typedef enum {
     PULSAR_TP_FRAME_BANK_REPOINT = 22,
     /* 23 was BANK_FORK, retired with the bank fork (L264, v22). */
     /* 24 was BANK_FORK_PARTIAL, retired with the partial fork (L264, v20). */
-    /* Increment 3: the rest of the server's mutating surface.  REWRITE is a
-     * verdict frame whose result enum includes -1 (ERROR), so the wire status
-     * is result + 1 (a negative wire status stays a worker refusal).
+    /* 25 was REWRITE_FROM_COMMON, retired with the rewrite (L284, v25: the
+     * canonicalization is a mirrored sync). */
+    /* Increment 3: the rest of the server's mutating surface.
      * NOTE_COMMITTED is void.  SET_LOGITS carries the vector itself. */
-    PULSAR_TP_FRAME_REWRITE_FROM_COMMON = 25,
     PULSAR_TP_FRAME_NOTE_COMMITTED = 26,
     PULSAR_TP_FRAME_SET_LOGITS = 27,
     /* Increment 4: the speculative round family.  Every frame that draws

@@ -209,6 +209,9 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
                                   const float *src, uint64_t n);
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/** Copy `bytes` from a raw DEVICE pointer (a slice of a scratch tensor a kernel wrote) to the host, after the
+ *  work queued before it -- the importance-matrix collection's observation (L284 P15).  1 on success. */
+int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes);
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

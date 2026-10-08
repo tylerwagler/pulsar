@@ -693,123 +693,6 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
 
 
 
-/* Try to repair a truncated DSML block.
- *
- * DSML nesting order is: tool_calls > invoke > parameter.
- * Single-pass scan: count opens vs closes, then append missing closing tags.
- *
- * Returns true if repair was applied, false if the text had no recognizable DSML
- * or was already balanced.  This deliberately does not rewrite malformed but
- * balanced DSML into assistant text; semantic recovery belongs to the model. */
-bool try_repair_dsml(const char *s, size_t len, buf *out) {
-    if (!s || !len) return false;
-
-    /* Only scan DSML tags after the last </think>.  DSML mentioned inside
-     * reasoning is not executable — it inflates tag counts and causes false
-     * positive repairs.  If no </think> is found, scan from the start
-     * (thinking mode is not active or thinking was never opened). */
-    const char *think_end = find_last_substr(s, "</think>");
-    const char *scan_start = think_end ? (think_end + 8) : s;
-    size_t scan_len = (size_t)((s + len) - scan_start);
-
-    /* Detect the spelling from the first tool-calls opener; the table is the
-     * one authority for spellings (L184), in the parser's preference order. */
-    const pulsar_dsml_syntax *syn = NULL;
-    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES && !syn; i++) {
-        if (strstr(scan_start, pulsar_dsml_syntaxes[i].tool_calls_start)) syn = &pulsar_dsml_syntaxes[i];
-    }
-    if (!syn) return false; /* No recognizable DSML start tag */
-    const char *ts = syn->tool_calls_start, *te = syn->tool_calls_end;
-    const char *is = syn->invoke_start,     *ie = syn->invoke_end;
-    const char *ps = syn->param_start,      *pe = syn->param_end;
-
-    /* Single-pass: count all 6 tag types in one scan */
-    size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
-    const char *e = scan_start + scan_len;
-    for (const char *p = scan_start; p < e; ) {
-        size_t d;
-        if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
-        else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
-        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
-        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
-        else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
-        else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
-        else p++;
-    }
-    if (tos == toe && ios == ioe && pos == poe) return false;
-    if (toe > tos || ioe > ios || poe > pos) {
-        /* Extra closing tags are not a truncation pattern.  Refuse repair so the
-         * unsigned differences below cannot wrap and append a huge suffix. */
-        return false;
-    }
-    /* Repair: copy original text and append missing closing tags in reverse
-     * order.  First TRIM a trailing partial closing tag: the model was cut
-     * mid-"</...>", and appending a fresh close after the fragment would bake
-     * tag debris into the parsed parameter VALUE (seen live: a truncated bash
-     * call carrying "</｜DSML｜" inside command).  The fragment counts no tag
-     * above, so the appended deficit is unchanged by the trim. */
-    size_t keep = trim_truncated_dsml_close_tail(s, (size_t)(scan_start - s), len);
-    buf_append(out, s, keep);
-    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
-    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
-    for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
-    return true;
-}
-
-
-
-static const char *tool_parse_failure_recovery_finish(const char *finish) {
-    /* Once DSML failed to parse there is no executable tool call to report.
-     * Preserve a true length stop, because callers can distinguish truncation
-     * from a completed turn.  Every other non-error tool-parse failure becomes
-     * a normal assistant stop with the raw model text returned as content. */
-    if (finish && !strcmp(finish, "length")) return "length";
-    return "stop";
-}
-
-
-
-bool parse_generated_message_for_response(const char *text,
-                                                 bool has_tools,
-                                                 bool saw_tool_start,
-                                                 bool require_thinking_closed,
-                                                 const char **finish_io,
-                                                 char *err,
-                                                 size_t errlen,
-                                                 char **content_out,
-                                                 char **reasoning_out,
-                                                 tool_calls *calls,
-                                                 bool *recovered_out) {
-    if (recovered_out) *recovered_out = false;
-
-    bool parsed_ok = parse_generated_message_ex(text ? text : "",
-                                                require_thinking_closed,
-                                                content_out, reasoning_out,
-                                                calls);
-    if (parsed_ok) return true;
-
-    free(*content_out);
-    free(*reasoning_out);
-    *content_out = xstrdup(text ? text : "");
-    *reasoning_out = NULL;
-    tool_calls_free(calls);
-
-    /* A malformed tool block is model output, not a server failure.  The
-     * generation worker may hide this turn from the client, append a tool error
-     * plus protocol reminder to the live session, and let the model try again.
-     * If that continuation is unavailable, parsed_content keeps the raw text as
-     * a last-resort assistant fallback instead of crashing the request. */
-    const char *finish = finish_io && *finish_io ? *finish_io : "stop";
-    if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
-        if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
-        if (err && errlen) snprintf(err, errlen, "invalid tool call");
-        if (recovered_out) *recovered_out = true;
-    }
-    return false;
-}
-
-
-
 void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
     append_json_object_or_empty(&tmp, json);
@@ -941,10 +824,15 @@ const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_
 
 
 
-static bool dsml_tool_stream_fail(dsml_tool_stream *ts) {
+static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k);
+
+/* The block is not a call (the finish reads it as text, L284 P4): the projection stops, and a call it
+ * already announced is closed on the stream as sent -- the rule every family's stream keeps. */
+static bool dsml_tool_stream_fail(dsml_tool_stream *ts, chat_sink *k) {
+    const bool ok = !ts->args_open || dsml_tool_close_invoke(ts, k);
     ts->active = false;
     ts->state = DSML_TOOL_ERROR;
-    return true;
+    return ok;
 }
 
 
@@ -986,12 +874,12 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     free(tag);
-    if (!name) return dsml_tool_stream_fail(ts);
+    if (!name) return dsml_tool_stream_fail(ts, k);
     if (!tool_call_declared(k->r, name, NULL, 0)) {
         /* L272: a call to an undeclared tool is a malformed block -- the live projection stops before
          * announcing it, and the finish drops it (or retries) */
         free(name);
-        return dsml_tool_stream_fail(ts);
+        return dsml_tool_stream_fail(ts, k);
     }
 
     /* the id the client sees, fixed per index once created (apply_stream_tool_ids copies it into the
@@ -1022,7 +910,7 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char
     if (!name || !is_string) {
         free(name);
         free(is_string);
-        return dsml_tool_stream_fail(ts);
+        return dsml_tool_stream_fail(ts, k);
     }
     bool string_value = !strcmp(is_string, "true");
     bool ok = dsml_tool_emit_param_prefix(ts, k, name, string_value);
@@ -1070,12 +958,12 @@ static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k) {
 
 /* Generation ended (final) while a streamed tool call is still open: the
  * client has already received the call header and a prefix of the argument
- * deltas, so the truncation cannot be reclassified as text (the non-stream
- * path's try_repair_dsml equivalent).  What CAN be guaranteed is well-formed
- * wire JSON: flush the un-emitted value bytes, close an open string value,
- * close the args object, stop the block.  The argument VALUE stays truncated
- * -- exactly what the repaired non-stream parse of the same bytes yields --
- * and the finish reason (length) still tells the client the turn was cut. */
+ * deltas, which a stream cannot take back.  The rule every family's stream
+ * keeps (L284 P4): an announced call is closed AS SENT -- flush the
+ * un-emitted value bytes, close an open string value, close the args object,
+ * stop the block -- so the wire JSON is well-formed; the finish reason
+ * (length) says the turn was cut, and the final reading returns no call
+ * (the turn is text: no tag repair). */
 bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
                                const char *raw, size_t raw_len) {
     if (!ts->active) return true;
@@ -1122,7 +1010,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
-            return dsml_tool_stream_fail(ts);
+            return dsml_tool_stream_fail(ts, k);
         }
 
         if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
@@ -1142,7 +1030,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
-            return dsml_tool_stream_fail(ts);
+            return dsml_tool_stream_fail(ts, k);
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {

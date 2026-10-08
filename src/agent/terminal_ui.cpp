@@ -1242,6 +1242,8 @@ void agent_worker_free(agent_worker *w) {
     agent_bash_jobs_free(w);
     pulsar_session_free(w->session);
     pulsar_tokens_free(&w->transcript);
+    agent_turn_clear(w);
+    free(w->turn);
     free(w->cache_dir);
     pulsar_segstore_close(w->kv);
     free(w->session_title);

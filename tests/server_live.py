@@ -21,6 +21,9 @@ the undeclared-tool hole), here with its own server so it is reproducible.
      logs the anthropic live continuation and places the image on the live history), and the answer is right
  11. (L268/L281) a disk chain over an image serves the next request that brings the SAME image on a fresh bank:
      the server logs a chain hit past the image block (its text is the placeholder's, every family) and answers
+ 12. (L284) /v1/completions continues the prompt raw (no template, no thinking); think:true there is refused 400
+ 13. (L284) every effort name of the one table (and an integer) serves; thinking on + effort none is refused 400
+ 14. (L284) an OpenAI streamed call's arguments arrive in fragments as read, adding up to the object
 
 Not in `make gates` (one server load per family): `make server-live-gate` runs it on FRONTIER_MODEL and the
 hosted Qwen model.  Exit 0 only when every check passed."""
@@ -278,9 +281,53 @@ def c11():
           "image disk chain on a fresh bank (hit=%s, cached %d) -> %r (%.1fs)" % (hit, cached, txt[-60:], dt))
 
 
+def c12():
+    """L284 P2: /v1/completions continues the prompt raw on every family -- no template, no thinking block."""
+    d, dt = post("/v1/completions", {"model": "m", "max_tokens": 16, "temperature": 0,
+                                     "prompt": "1, 2, 3, 4, 5, 6,"})
+    txt = json.loads(d)["choices"][0]["text"]
+    refused = 0
+    try:
+        post("/v1/completions", {"model": "m", "max_tokens": 4, "prompt": "x", "think": True})
+    except urllib.error.HTTPError as e:
+        refused = e.code
+    check("7" in txt and "</think>" not in txt and refused == 400,
+          "completions raw continuation -> %r; think:true -> %d (%.1fs)" % (txt[:60], refused, dt))
+
+
+def c13():
+    """L284 P3: one effort-name table -- every name and an integer serve on every family; thinking on + none is 400."""
+    codes = []
+    for eff in ("minimal", "low", "medium", "high", "xhigh", "max", 60):
+        d, dt = post("/v1/chat/completions", {"model": "m", "max_tokens": 1, "reasoning_effort": eff,
+                                              "messages": [{"role": "user", "content": "Hi"}]})
+        codes.append(200)
+    refused = 0
+    try:
+        post("/v1/chat/completions", {"model": "m", "max_tokens": 1, "think": True, "reasoning_effort": "none",
+                                      "messages": [{"role": "user", "content": "Hi"}]})
+    except urllib.error.HTTPError as e:
+        refused = e.code
+    check(refused == 400, "effort names %s -> 200 each; think:true + none -> %d" % (codes, refused))
+
+
+def c14():
+    """L284 P5: an OpenAI streamed call's arguments arrive as they are read and add up to the object."""
+    d, dt = post("/v1/chat/completions", {"model": "m", "max_tokens": 400, "tools": OT, "stream": True,
+                                          "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                                          "messages": [{"role": "user", "content": "Weather in Paris?"}]})
+    ev = [json.loads(l[6:]) for l in d.splitlines() if l.startswith("data: {")]
+    frags = [tc["function"].get("arguments", "") for e in ev for ch in e.get("choices", [])
+             for tc in (ch.get("delta") or {}).get("tool_calls") or [] if "function" in tc]
+    args = "".join(frags)
+    check(len([f for f in frags if f]) >= 2 and "city" in json.loads(args or "{}"),
+          "openai stream: %d argument fragments -> %s" % (len([f for f in frags if f]), args))
+
+
 for n, f in (("plain", c1), ("forced", c2), ("forced-stream", c3), ("continuation", c4), ("required", c5),
              ("undeclared", c6), ("required-two", c7), ("image", c8), ("image-tool-result", c9),
-             ("image-live-continuation", c10), ("image-disk-chain", c11)):
+             ("image-live-continuation", c10), ("image-disk-chain", c11), ("completions-raw", c12),
+             ("effort-names", c13), ("stream-args", c14)):
     guarded(n, f)
 print("SERVER LIVE GATE: " + ("PASS" if ok else "FAIL"))
 stop(0 if ok else 1)

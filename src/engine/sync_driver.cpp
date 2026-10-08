@@ -153,12 +153,13 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             s->checkpoint_valid = false;
         }
     }
-    /* L284: only a view the bank PREFILLED whole is continued.  Decode rows are the decode arms' (a step's
+    /* L284: only a view the bank PREFILLED whole is continued (pulsar_session_bank_continues, the rule DeepSeek's
+     * sync reads too).  Decode rows are the decode arms' (a step's
      * rows are not a prefill chunk's bytes, kv_state_qwen.cpp), so a view with any is resumed instead, from
      * the deepest checkpoint at or below the prefill frontier -- the tokens generated since are prefilled
      * again and the prompt is the cold prefill's bytes, as DeepSeek's sync does it (L195) */
     const bool extends = s->checkpoint_valid && common == s->checkpoint.len && common < prompt->len &&
-                         pulsar_session_bank_prefilled(s, live, common);
+                         pulsar_session_bank_continues(s, live, common);
     /* the same prompt is a no-op only while the logits are its next-token row; when they are stale the
      * resume below stops one token short, so the last row is evaluated again */
     if (s->checkpoint_valid && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;

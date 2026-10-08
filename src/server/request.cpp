@@ -364,61 +364,6 @@ void request_free(request *r) {
 
 
 
-pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort) {
-    if (!enabled || effort == PULSAR_THINK_NONE) return PULSAR_THINK_NONE;
-    return effort;
-}
-
-
-
-/* The V4.1 reference encoder accepts three names -- low/high/max, the presets
- * 50/75/100 on the effort axis -- or an integer in [1, 100].  OpenAI-style
- * names collapse onto the presets: "minimal"/"medium" join "low", "xhigh"
- * joins "max".  Callers that need *no* reasoning must use "none". */
-bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
-    if (!s) return false;
-    if (!strcmp(s, "max") || !strcmp(s, "xhigh")) {
-        *out = PULSAR_THINK_MAX;
-        return true;
-    }
-    if (!strcmp(s, "high")) {
-        *out = PULSAR_THINK_HIGH;
-        return true;
-    }
-    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
-        *out = PULSAR_THINK_LOW;
-        return true;
-    }
-    if (!strcmp(s, "none")) {
-        *out = PULSAR_THINK_NONE;
-        return true;
-    }
-    return false;
-}
-
-
-
-/* A JSON string names a preset; a JSON integer in [1, 100] is the effort
- * itself (the reference encoder accepts both). */
-bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    if (**p == '"') {
-        char *effort = NULL;
-        if (!json_string(p, &effort)) return false;
-        bool ok = parse_reasoning_effort_name(effort, out);
-        free(effort);
-        return ok;
-    }
-    double v = 0.0;
-    if (!json_number(p, &v)) return false;
-    if (v != (double)(int)v || (int)v < PULSAR_THINK_EFFORT_MIN || (int)v > PULSAR_THINK_EFFORT_MAX) return false;
-    *out = (pulsar_think_mode)(int)v;
-    return true;
-}
-
-
-
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -456,54 +401,6 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
     if (**p != '}') return false;
     (*p)++;
     return true;
-}
-
-
-
-bool parse_output_config_effort(const char **p, pulsar_think_mode *effort) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    if (**p != '{') return json_skip_value(p);
-    (*p)++;
-    json_ws(p);
-    while (**p && **p != '}') {
-        char *key = NULL;
-        if (!json_string(p, &key)) return false;
-        json_ws(p);
-        if (**p != ':') {
-            free(key);
-            return false;
-        }
-        (*p)++;
-        if (!strcmp(key, "effort")) {
-            if (!parse_reasoning_effort_value(p, effort)) {
-                free(key);
-                return false;
-            }
-        } else if (!json_skip_value(p)) {
-            free(key);
-            return false;
-        }
-        free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
-    }
-    if (**p != '}') return false;
-    (*p)++;
-    return true;
-}
-
-
-
-bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-chat");
-}
-
-
-
-bool model_alias_enables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-reasoner");
 }
 
 

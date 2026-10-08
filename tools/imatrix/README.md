@@ -90,6 +90,22 @@ The collector is CUDA-only because it hooks the layer-major CUDA prefill graph.
 It does not change inference math; it reads the already materialized MoE inputs
 and accumulates `sum(x[column]^2)` per routed expert.
 
+### Qwen4-exp
+
+The same command collects on a Qwen4-exp checkpoint (`PULSAR_FAMILY_CAP_IMATRIX`; the dataset walk, the caps
+and the `.dat` frame are shared, `pulsar_family_imatrix` is the per-family half).  Each prompt is prefilled
+whole through a session with an observer on the trunk's linears, so the entries are the exact bf16 rows the
+weights read: every dense linear (`step_linear`: GDN / QSA projections, PLE), the shared expert's gate / up /
+down, and per routed expert the gate_up input and the down input (the fold's SwiGLU rows, route weight folded
+in).  Entry names are the checkpoint's tensor names.  The dataset must be rendered for Qwen (its chat template,
+the same `===== DS4_IMATRIX_PROMPT` markers); the tracked `rendered_prompts*.txt` are DeepSeek-rendered.
+Collection runs on one GPU (a tensor-parallel engine refuses).  `read_dat.py FILE` parses and validates any
+`.dat` this tool writes:
+
+```sh
+python3 tools/imatrix/read_dat.py out.dat --quiet --expect-substr experts
+```
+
 The output format is llama.cpp's legacy binary `.dat` imatrix format.  DS4 packs
 per-expert vectors into one entry per routed expert tensor:
 
