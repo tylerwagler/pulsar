@@ -739,9 +739,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt);
 bool pulsar_ds4_family_after_gpu(pulsar_engine *e);
 /* L272 P4b: DeepSeek's TP slices for this rank (the family's tp_slices op) */
 bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan);
-int pulsar_ds4_session_create(pulsar_session *s);
+int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks);
 void pulsar_ds4_session_destroy(pulsar_session *s);
-uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks);
 
 /** A GGUF metadata array left UNPARSED: its type, length, and where its
  * elements start. Reading an array means walking the file from `data_pos`, and
@@ -1895,8 +1894,9 @@ struct pulsar_engine {
      * evaluate the (banks, ctx) fit table before committing to one.
      * @param ctx_size context size to price
      * @param n_banks  >= 1; 1 is the classic single-session layout
+     * @param managed_bytes optional: the demand-paged (cudaMallocManaged) subset, 0 when none was created
      * @return bytes, or 0 if no session could be created. */
-    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
+    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes = NULL);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
      * `ctx_size` -- the overcommit figure, below the reserved capacity. */
     uint64_t demand_paged_bytes_per_bank(int ctx_size);

@@ -973,10 +973,9 @@ void pulsar_engine::destroy() {
 /* The per-session tensor-parallel scratch (4g-2): the vocab gather's own-slice
  * buffer (pulsar_gpu_graph::tp_vocab_own) -- PULSAR_SPEC_LOGITS_ROWS rows at
  * the widest rank range, rounded up to whole row-lane messages -- and the row
- * lane's stage+publish ticket (tp_stage_ticket, zeroed).  One helper for
- * create AND the admission price (session_cost_bytes_banked), which dry-runs
- * the same steps: a buffer allocated in only one of them is the SESSION COST
- * MISMATCH the server refuses.  Nothing on a box with no row-lane pair. */
+ * lane's stage+publish ticket (tp_stage_ticket, zeroed).  Part of the create,
+ * so the admission price (session_cost_bytes_banked: the create run dry)
+ * carries it.  Nothing on a box with no row-lane pair. */
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
@@ -1003,26 +1002,33 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 
 
 
-/* Every session is created by its engine's family (family.h). */
-/* L272 P2: every family's session begins here -- the core allocates the session and its own state (the
- * view, the prefill cap, the logits row at the family's width), the family builds its state into it, and
- * the core measures what that allocated on the GPU (the allocator's delta across the create, so callers
- * can reconcile admission estimates against reality). */
-int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
-    if (!out || !e || ctx_size <= 0) return 1;
-    *out = NULL;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+/* Every session is created by its engine's family (family.h).  The ONE build both the create and the price
+ * run: the core allocates the session and its own state (the prefill cap, the logits row at the family's
+ * width), the family builds its state for n_banks into it.  NULL when the family refused. */
+static pulsar_session *session_build(pulsar_engine *e, int ctx_size, uint32_t n_banks) {
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
     s->logits = (float *)xmalloc((size_t)e->logits_width() * sizeof(s->logits[0]));
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
-    if (e->family->session->create(s) != 0) {
+    if (e->family->session->create(s, n_banks) != 0) {
         free(s->logits);
         free(s);
-        return 1;
+        return NULL;
     }
+    return s;
+}
+
+/* L272 P2: every family's session begins here -- session_build at the engine's bank pool, and the core
+ * measures what that allocated on the GPU (the allocator's delta across the create, so callers can
+ * reconcile admission estimates against reality). */
+int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
+    if (!out || !e || ctx_size <= 0) return 1;
+    *out = NULL;
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
+    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
+    if (!s) return 1;
     s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
     /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
      * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
@@ -1036,7 +1042,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
 /* The DeepSeek family's session state: the pulsar_gpu_graph (SWA rings, compressed KV and frontiers, bank
  * slabs), steering, the TP scratch and the drafter's buffers, built into a session the core allocated.
  * pulsar_session::create's body until L251. */
-int pulsar_ds4_session_create(pulsar_session *s) {
+int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const int ctx_size = s->ctx_size;
     s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
@@ -1049,7 +1055,7 @@ int pulsar_ds4_session_create(pulsar_session *s) {
     s->graph = (pulsar_gpu_graph *)xcalloc(1, sizeof(*s->graph));   /* L272 P6: the family's own */
     if (!gpu_graph_alloc_raw_cap(s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
-                                   gpu_graph_bank_pool_n(), e->dspark_ready))
+                                   n_banks, e->dspark_ready))
     {
         free(s->graph);
         s->graph = NULL;
@@ -1091,43 +1097,25 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
 }
 
 
-/* The price of pulsar_session::create at this context size IS the create: the
- * same three allocation steps run with the tensor primitives in dry mode
- * (pulsar_gpu_tensor_dry_begin), so the number admission control charges and
- * the number the allocator commits come from one piece of code -- the server
- * checks them equal after every create.  Not in the price, on either side:
- * allocations made on demand after create (gpu_graph_ensure_batch_ffn_out,
- * the multiseq descriptors, the batched-copy descriptor tables); the server's
- * memory floor absorbs those. */
-uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
+/* The price of pulsar_session::create at (ctx_size, n_banks) IS the create: session_build run with the
+ * tensor primitives in dry mode (pulsar_gpu_tensor_dry_begin) and torn down, so the number admission
+ * control charges and the number the allocator commits come from one piece of code for every family --
+ * the server checks them equal after every create.  *managed_bytes (optional) is the demand-paged
+ * (cudaMallocManaged) subset.  Not in the price, on either side: allocations made on demand after create
+ * (gpu_graph_ensure_batch_ffn_out, the multiseq descriptors, the batched-copy descriptor tables); the
+ * server's memory floor absorbs those. */
+uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes) {
     auto *e = this;
-    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
-    return e->family->session->cost_bytes(e, ctx_size, n_banks);
-}
-
-uint64_t pulsar_ds4_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
+    if (managed_bytes) *managed_bytes = 0;
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
-    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
-                                                                  e->prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
-    if (!shape_layer) return 0;
-    pulsar_gpu_graph g;
     pulsar_gpu_tensor_dry_begin();
-    const bool ok =
-        gpu_graph_alloc_raw_cap(&g, &e->weights, shape_layer, raw_cap,
-                                (uint32_t)ctx_size, prefill_cap, (uint32_t)n_banks,
-                                e->dspark_ready) &&
-        gpu_graph_load_directional_steering(&g, e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale) &&
-        (!e->dspark_ready ||
-         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids)) &&
-        session_alloc_tp_scratch(&g, e->tp);
-    uint64_t bytes = 0;
-    pulsar_gpu_tensor_dry_end(&bytes, NULL);
-    gpu_graph_release(&g);
+    pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
+    const bool ok = s != NULL;
+    if (s) s->destroy();
+    uint64_t bytes = 0, managed = 0;
+    pulsar_gpu_tensor_dry_end(&bytes, &managed);
+    if (managed_bytes && ok) *managed_bytes = managed;
     return ok ? bytes : 0;
 }
 
@@ -1161,7 +1149,10 @@ void pulsar_session::destroy() {
 
 void pulsar_ds4_session_destroy(pulsar_session *s) {
     if (!s->graph) return;
-    gpu_graph_free(s->graph);
+    /* a priced (dry) session never ran: its placeholders go without resetting the live session's
+     * segment graph */
+    if (pulsar_gpu_tensor_dry_active()) gpu_graph_release(s->graph);
+    else gpu_graph_free(s->graph);
     free(s->graph);
     s->graph = NULL;
 }

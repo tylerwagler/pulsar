@@ -110,7 +110,6 @@ static int ds4_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, 
 static const pulsar_family_session_ops k_ds4_session_ops = {
     /* .create          = */ pulsar_ds4_session_create,
     /* .destroy         = */ pulsar_ds4_session_destroy,
-    /* .cost_bytes      = */ pulsar_ds4_session_cost_bytes,
     /* .sync            = */ ds4_sync,
     /* .eval            = */ ds4_eval,
     /* .decode_multiseq = */ ds4_decode_multiseq,

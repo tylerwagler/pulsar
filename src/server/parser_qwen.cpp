@@ -154,8 +154,8 @@ static bool qwen_parser_feed(void *st, server *s, gen_state *g, size_t upto, boo
 
 /* The turn's final reading: the rest of the text (a stop string's held tail never reaches it: g->text
  * was cut at the match) and the end of the turn; the parser holds reasoning, content and the completed
- * calls in the template's normal form, and the calls' sampled bytes become their tool memory.  A turn
- * with a broken call and no valid one takes the shared rule (turn_tool_retry_allowed). */
+ * calls in the template's normal form, and the calls' sampled bytes become their tool memory; then the
+ * finish every family shares (parser_finish_turn), the broken calls already logged as they streamed. */
 static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state *g, server_turn *out) {
     qwen_gen *q = (qwen_gen *)st;
     job *j = g->j;
@@ -163,18 +163,6 @@ static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state 
     if (j->req.kind != REQ_CHAT) return true;
     bool ok = true;
     if (strcmp(g->finish, "error") != 0) ok = qwen_parser_feed(q, s, g, g->text.len, true);
-    if ((q->parser.errors() > 0 || q->undeclared > 0) && q->calls.len == 0) {
-        if (turn_tool_retry_allowed(g)) return turn_tool_retry(s, sl, g, q->last_error.c_str(), out);
-        turn_as_text(g, out);
-        const char *t = g->text.ptr ? g->text.ptr : "";
-        const char *call = strstr(t, "<tool_call>");
-        if (call) {
-            /* the stream stopped at the call; the rest goes out as text at the finish */
-            out->tail = call;
-            out->tail_len = g->text.len - (size_t)(call - t);
-        }
-        return ok;
-    }
     out->content = xstrdup(q->parser.content().c_str());
     out->reasoning = q->parser.reasoning().empty() ? NULL : xstrdup(q->parser.reasoning().c_str());
     out->calls = q->calls;
@@ -182,13 +170,15 @@ static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state 
     size_t raw_lo = 0, raw_hi = 0;
     /* the sampled bytes are the tool memory's key only when they are exactly the kept calls: a dropped
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
-    if (q->undeclared == 0 && q->parser.raw_span(&raw_lo, &raw_hi)) {
+    if (out->calls.len && q->undeclared == 0 && q->parser.raw_span(&raw_lo, &raw_hi)) {
         if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("qwen parser: raw span outside the turn's text");
         out->calls.raw_dsml = xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
-        s->tool_memory_remember(&out->calls);
     }
-    out->finish = turn_finish(g, out->calls.len);
-    return ok;
+    /* as text, the stream stopped at the call: the rest goes out at the finish */
+    const char *t = g->text.ptr ? g->text.ptr : "";
+    const char *call = strstr(t, "<tool_call>");
+    return parser_finish_turn(s, sl, g, out, q->parser.errors() > 0 || q->undeclared > 0, q->last_error.c_str(),
+                              /*logged=*/true, call ? (size_t)(call - t) : SIZE_MAX, ok);
 }
 
 const server_output_parser_ops k_parser_qwen = {

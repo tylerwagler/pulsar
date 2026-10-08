@@ -774,14 +774,13 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     free(st);
 }
 
-/* Allocate a session's state.  The same code prices it: under
- * pulsar_gpu_tensor_dry_begin the allocators total the bytes instead
- * (qwen_session_cost_bytes). */
 /* The layer kind of state slot il: the plan's for the trunk, QSA for the MTP layer at n_layer. */
 static pulsar_layer_kind qwen_state_kind(const pulsar_layer_plan *plan, uint32_t il) {
     return il < plan->n_layer ? plan->kind[il] : PULSAR_LAYER_QWEN_QSA;
 }
 
+/* Allocate a session's state.  The same code prices it: the core runs the create under
+ * pulsar_gpu_tensor_dry_begin and the allocators total the bytes instead (session_cost_bytes_banked). */
 static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
                                            uint32_t n_banks, uint32_t ctx, uint32_t max_rows, bool mtp) {
     pulsar_qwen_state *st = (pulsar_qwen_state *)xcalloc(1, sizeof(*st));
@@ -930,9 +929,8 @@ static bool qwen_state_reset_bank(pulsar_qwen_state *st, const pulsar_qwen_shape
 
 /* The family's state, built into a session the core allocated (L272 P2: the core sets ctx_size, the prefill
  * cap and the logits row, and measures the bytes this allocates). */
-static int qwen_session_create(pulsar_session *s) {
+static int qwen_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
-    const uint32_t n_banks = gpu_graph_bank_pool_n();
     s->qwen = qwen_state_alloc(&g_qwen_shape, &e->plan, n_banks, (uint32_t)s->ctx_size, s->prefill_cap,
                                e->qwen_weights->mtp.present);
     if (!s->qwen) return 1;
@@ -957,15 +955,16 @@ static int qwen_session_create(pulsar_session *s) {
             return 1;
         }
     }
-    fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
-                    "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
-            PULSAR_QWEN_ARCH, n_banks, s->ctx_size, s->prefill_cap,
-            (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN) *
-                     (pulsar_qwen_gdn_state_bytes(&g_qwen_shape) + pulsar_qwen_gdn_conv_bytes(&g_qwen_shape)) +
-                     pulsar_qwen_ple_conv_bytes(&g_qwen_shape)) / 1048576.0,
-            (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA) *
-                     (pulsar_qwen_kv_row_bytes(&g_qwen_shape) +
-                      pulsar_qwen_index_row_bytes(&g_qwen_shape) / g_qwen_shape.idx_block)) / 1024.0);
+    if (!pulsar_gpu_tensor_dry_active())   /* a pricing run allocates nothing */
+        fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
+                        "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
+                PULSAR_QWEN_ARCH, n_banks, s->ctx_size, s->prefill_cap,
+                (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN) *
+                         (pulsar_qwen_gdn_state_bytes(&g_qwen_shape) + pulsar_qwen_gdn_conv_bytes(&g_qwen_shape)) +
+                         pulsar_qwen_ple_conv_bytes(&g_qwen_shape)) / 1048576.0,
+                (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA) *
+                         (pulsar_qwen_kv_row_bytes(&g_qwen_shape) +
+                          pulsar_qwen_index_row_bytes(&g_qwen_shape) / g_qwen_shape.idx_block)) / 1024.0);
     return 0;
 }
 
@@ -978,19 +977,6 @@ static void qwen_session_destroy(pulsar_session *s) {
     s->qwen = NULL;
 }
 
-uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
-                                 uint32_t n_banks, uint32_t ctx, uint32_t max_rows, bool mtp,
-                                 uint64_t *managed_bytes) {
-    pulsar_gpu_tensor_dry_begin();
-    pulsar_qwen_state *st = qwen_state_alloc(s, plan, n_banks, ctx, max_rows, mtp);
-    uint64_t bytes = 0, managed = 0;
-    pulsar_gpu_tensor_dry_end(&bytes, &managed);
-    const bool ok = st != NULL;
-    qwen_state_free(st);
-    if (managed_bytes) *managed_bytes = ok ? managed : 0;
-    return ok ? bytes : 0;
-}
-
 uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     uint64_t bytes = 0;
@@ -1001,20 +987,12 @@ uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows) {
     return bytes;
 }
 
-/* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the allocation's own dry
- * run (the KV and index pools are cudaMallocManaged: VA reserved, physical on touch). */
+/* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the session's own dry create
+ * (the KV and index pools are cudaMallocManaged: VA reserved, physical on touch). */
 uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready || ctx_size <= 0) return 0;
     uint64_t managed = 0;
-    pulsar_qwen_state_price(&g_qwen_shape, &e->plan, 1u, (uint32_t)ctx_size, pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk),
-                            e->qwen_weights->mtp.present, &managed);
+    e->session_cost_bytes_banked(ctx_size, 1, &managed);
     return managed;
-}
-
-static uint64_t qwen_session_cost_bytes(pulsar_engine *e, int ctx_size, int n_banks) {
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
-    return pulsar_qwen_state_price(&g_qwen_shape, &e->plan, (uint32_t)n_banks, (uint32_t)ctx_size,
-                                   pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk), e->qwen_weights->mtp.present, NULL);
 }
 
 /* ---- the step driver ------------------------------------------------------------ */
@@ -1716,7 +1694,6 @@ bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int t
 static const pulsar_family_session_ops k_qwen_session_ops = {
     /* .create          = */ qwen_session_create,
     /* .destroy         = */ qwen_session_destroy,
-    /* .cost_bytes      = */ qwen_session_cost_bytes,
     /* .sync            = */ qwen_session_sync,
     /* .eval            = */ qwen_session_eval,
     /* .decode_multiseq = */ qwen_session_decode_multiseq,
