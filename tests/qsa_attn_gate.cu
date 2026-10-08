@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <functional>
 #include <thread>
+#include <array>
 #include <vector>
 
 namespace {
@@ -110,9 +111,22 @@ void gen_row(int fix, uint32_t pos, float *qg, float *k, float *v, float *idx) {
 /* ------------------------------------------------------------ host reference */
 struct Mut {
     bool swap_qg = false, rope_interleaved = false, plain_w = false, tie_high = false,
-         no_tail = false, pool_after_norm = false, bkey_rope_end = false;
+         no_tail = false, pool_after_norm = false, bkey_rope_end = false,
+         mrope_sectioned = false;   /* L268: the axes as contiguous 11/11/10 sections, not HF's interleave */
 };
 float g_inv[PULSAR_QSA_ROT_DIM / 2];
+/* L268 G9: the (T, H, W) rope position of every token while a check runs an image layout (NULL = text: the token's
+ * position on every axis).  The reference reads it here; run() hands the kernel the same table. */
+const std::vector<std::array<uint32_t, 3>> *g_rope3 = nullptr;
+
+/* The rope angle's position for pair i at token `pos`: HF apply_interleaved_mrope -- H when i % 3 == 1, W when
+ * i % 3 == 2, else T -- or, mutated, contiguous sections. */
+uint32_t ref_rope_pos(uint32_t pos, uint32_t i, const Mut &m) {
+    if (!g_rope3) return pos;
+    const std::array<uint32_t, 3> &t = (*g_rope3)[pos];
+    const uint32_t axis = m.mrope_sectioned ? (i < 11 ? 0u : i < 22 ? 1u : 2u) : (i % 3 == 1 ? 1u : i % 3 == 2 ? 2u : 0u);
+    return t[axis];
+}
 
 void ref_norm_rope(double *x, uint32_t n, const float *w, uint32_t pos, const Mut &m, bool rope = true) {
     double ss = 0;
@@ -121,7 +135,7 @@ void ref_norm_rope(double *x, uint32_t n, const float *w, uint32_t pos, const Mu
     for (uint32_t i = 0; i < n; i++) x[i] = x[i] * r * (m.plain_w ? (double)w[i] : 1.0 + (double)w[i]);
     if (!rope) return;
     for (uint32_t i = 0; i < PULSAR_QSA_ROT_DIM / 2; i++) {
-        const float ang = (float)pos * g_inv[i];   /* the f32 angle transformers forms */
+        const float ang = (float)ref_rope_pos(pos, i, m) * g_inv[i];   /* the f32 angle transformers forms */
         const double c = cos((double)ang), s = sin((double)ang);
         const uint32_t a = m.rope_interleaved ? 2 * i : i, b = m.rope_interleaved ? 2 * i + 1 : i + 32;
         const double x0 = x[a], x1 = x[b];
@@ -266,6 +280,16 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     io.out_sf_pitch = (int)KBP_OUT;
     io.tap_out_f32 = d.tap;
     io.tap_sel = d.sel;
+    std::vector<uint32_t> rope;   /* L268 G9: the layout's positions, the row's and its block start's */
+    if (g_rope3) {
+        rope.resize((size_t)n * 6);
+        for (uint32_t i = 0; i < n; i++)
+            for (int a = 0; a < 3; a++) {
+                rope[(size_t)i * 6 + a] = (*g_rope3)[rp[i]][a];
+                rope[(size_t)i * 6 + 3 + a] = (*g_rope3)[rp[i] >= 3 ? rp[i] - 3 : 0][a];
+            }
+        io.row_rope = rope.data();
+    }
     if (!pulsar_gpu_qsa_forward(&L, sd.data(), (uint32_t)sd.size(), rs.data(), rp.data(), n, &io, d.ws)) {
         printf("FAIL  pulsar_gpu_qsa_forward refused\n");
         exit(1);
@@ -744,6 +768,50 @@ int main() {
             uint64_t allow = 0;
             CHECK(check_encode(rec.data(), host_tok(FIX_A, 1234, Mut()), &allow) > 0, "one K byte flipped -> G1 fails");
         }
+    }
+
+    printf("G9 interleaved mRoPE (L268): an image layout's (T, H, W) positions (fixture A, a 16 x 12 block at 1000)\n");
+    {
+        /* text 0..999, an image block of 16 x 12 rows at text position 1000, text after it continuing from
+         * 1000 + max(16, 12): HF get_rope_index's layout (pulsar_test --lib-image-rope pins the engine's to it) */
+        const uint32_t s0 = 1000, gh = 16, gw = 12, e0 = s0 + gh * gw;
+        std::vector<std::array<uint32_t, 3>> lay(TA);
+        for (uint32_t p = 0; p < TA; p++) {
+            if (p < s0) lay[p] = {p, p, p};
+            else if (p < e0) lay[p] = {s0, s0 + (p - s0) / gw, s0 + (p - s0) % gw};
+            else { const uint32_t q = p - (e0 - s0) + gh; lay[p] = {q, q, q}; }
+        }
+        g_rope3 = &lay;
+        Run MR = run(SA, chunks(0, TA, {1000}), all);
+        std::vector<uint32_t> rows;
+        for (uint32_t p = 980; p < TA; p += (p >= s0 && p < e0 + 8) ? 3 : 41) rows.push_back(p);
+        auto worst_out = [&](const Mut &m) {
+            std::vector<double> err(rows.size());
+            par_for(rows.size(), [&](size_t i) { err[i] = check_row_out(SA[0], MR.kv[0], rows[i], MR.outs[0][rows[i]], m); });
+            return *std::max_element(err.begin(), err.end());
+        };
+        auto bkey_over = [&](const Mut &m) {
+            uint64_t over = 0;
+            for (uint32_t b = s0 / 4 - 2; b < e0 / 4 + 4; b++) {
+                std::vector<double> x = host_bkey(FIX_A, b, m);
+                double rms = 0;
+                for (double v : x) rms += v * v;
+                rms = sqrt(rms / ID);
+                for (uint32_t d = 0; d < ID; d++) {
+                    uint16_t u;
+                    memcpy(&u, &MR.bkey[0][(size_t)b * PULSAR_QSA_BKEY_BYTES + d * 2], 2);
+                    if (fabs(bf16_to_d(u) - x[d]) > ldexp(fabs(x[d]), -8) + 1e-6 * rms) over++;
+                }
+            }
+            return over;
+        };
+        const double w = worst_out(Mut());
+        CHECK(w <= g4_bar, "output under the image layout: %zu rows, max rel err %.3g (bar %.3g)", rows.size(), w, g4_bar);
+        CHECK(bkey_over(Mut()) == 0, "block keys across the image roped at their first token's (T, H, W)");
+        Mut ms;
+        ms.mrope_sectioned = true;
+        CHECK(worst_out(ms) > g4_bar && bkey_over(ms) > 0, "mRoPE as contiguous sections -> caught (output and block keys)");
+        g_rope3 = nullptr;
     }
 
     printf("G8 tensor parallelism (L266 step 7): each rank's KV head + its 12 query heads == the full layer's (fixture A)\n");

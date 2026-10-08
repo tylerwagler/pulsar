@@ -606,7 +606,7 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
     }
     for (int i = 0; i < held; i++) images[i].start_pos = starts[i];
     pulsar_tokens out = {0};
-    if (!pulsar_expand_image_placeholders(e, eff, images + held, n_images - held, &out, why, whylen))
+    if (!pulsar_expand_image_placeholders(e, eff, live_len, images + held, n_images - held, &out, why, whylen))
         return false;
     pulsar_tokens_free(eff);
     *eff = out;
@@ -614,6 +614,16 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
 }
 
 
+
+int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside) {
+    *inside = -1;
+    for (int i = 0; cut > 0 && i < n_images; i++)
+        if (images[i].start_pos < cut) {
+            *inside = i;
+            return 0;
+        }
+    return cut;
+}
 
 /* Resolve the prompt against every cache layer and decide the prefill plan.
  *
@@ -931,17 +941,15 @@ void server::gen_begin(session_slot *sl) {
      * itself was handed to sync_mm with every start_pos past its end -> HTTP
      * 400 "image 0 at N is not a sentinel block" for any prompt whose first
      * user turn sat past ~4k tokens, i.e. every Claude Code request.) */
-    if (image_request && cold_store_len > 0) {
-        for (int i = 0; i < j->req.n_images; i++) {
-            if (j->req.images[i].start_pos < cold_store_len) {
-                server_log(PULSAR_LOG_PREFILL,
-                           "pulsar-server: image request: image %d at %d begins inside the "
-                           "sys-prefix cut %d -- no cold phase, the main pass merges it",
-                           i, j->req.images[i].start_pos, cold_store_len);
-                cold_store_len = 0;
-                break;
-            }
-        }
+    if (image_request) {
+        int inside = -1;
+        const int cut = server_image_cold_cut(cold_store_len, j->req.images, j->req.n_images, &inside);
+        if (inside >= 0)
+            server_log(PULSAR_LOG_PREFILL,
+                       "pulsar-server: image request: image %d at %d begins inside the "
+                       "sys-prefix cut %d -- no cold phase, the main pass merges it",
+                       inside, j->req.images[inside].start_pos, cold_store_len);
+        cold_store_len = cut;
     }
     g->cold_store_len = cold_store_len;
     /* Transfer prompt ownership into the slot state; the prefill phases run in

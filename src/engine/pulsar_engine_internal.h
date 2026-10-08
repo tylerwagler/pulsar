@@ -1119,15 +1119,15 @@ typedef struct {
  * is the part to read before touching decode state.
  */
 
-/** The images a prefill must merge, bound to the tower that encodes them.  Lives
+/** The images a prefill must merge, bound to the engine whose family front encodes them.  Lives
  * on the graph (pulsar_gpu_graph::vision_req) as a BORROW for the duration of one
  * prefill, the same way `prompt` is borrowed: the owner sets it before entering
  * the prefill and clears it on every exit.  Declared here because the graph
  * carries the pointer. */
 typedef struct {
-    const pulsar_image_ref      *images;
-    int                          n_images;
-    const pulsar_vision_weights *weights;
+    const pulsar_image_ref *images;
+    int                     n_images;
+    const pulsar_engine    *engine;
 } pulsar_vision_request;
 
 typedef struct {
@@ -2175,6 +2175,9 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s);
 typedef struct {
     uint32_t start, end;
     uint64_t content;
+    /** L268: the block's 2D layout in rows (the family's pulsar_family_vision::grid, e.g. Qwen's merged patch grid,
+     *  rows = grid_h * grid_w) -- what multi-axis rope positions follow; 0 x 0 = a block with no 2D layout. */
+    uint32_t grid_h, grid_w;
 } pulsar_image_block;
 #define PULSAR_IMAGE_BLOCKS_MAX 64
 /** The blocks a KV holds, in position order (image_identity.cpp). */
@@ -2197,10 +2200,94 @@ void pulsar_image_identity_trim(pulsar_image_identity *id, uint32_t pos);
 bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_image_identity *b);
 /** The exclusive end of the last block, 0 when none. */
 uint32_t pulsar_image_identity_end(const pulsar_image_identity *id);
+/** L268: the interleaved multi-axis rope position (T, H, W) of KV row `row` after the blocks `id` records (HF
+ *  get_rope_index; a block without a grid is text).  Text rows have T = H = W; with no gridded block before them
+ *  that is the row itself. */
+void pulsar_image_rope3(const pulsar_image_identity *id, uint32_t row, uint32_t out[3]);
 /** How much of `ids` a disk chain may hold: everything, or up to the first image block `id` does not record
  *  (its rows' image is unknown).  -1 = a malformed block. */
 int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
                              const pulsar_image_identity *id);
+
+/* ---- L268: the image path every family shares (image_front.cpp) ---- */
+/** Replace each placeholder token in `prompt` at or past `from` by its image's block (appended to `out`, which the
+ *  caller owns and passes empty) and set each image's start_pos; [0, from) is copied unchanged (a continuation's
+ *  held history).  false + `err` (a client condition): no tower bound, no placeholder token, a count mismatch, an
+ *  image the family cannot prepare. */
+bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, int from, pulsar_image_ref *images,
+                         int n_images, pulsar_tokens *out, char *err, size_t errlen);
+/** Every image names a block the prompt carries and every block fits one prefill chunk of `chunk_cap` rows;
+ *  *end_out = the exclusive end of the last block.  The ONE statement of the rule (sync, TP preflight, planner). */
+bool pulsar_image_spans_fit(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_ref *images,
+                            int n_images, uint32_t chunk_cap, int *end_out, char *err, size_t errlen);
+/** false + `err` when a prompt with no images carries a sentinel or placeholder id. */
+bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *prompt, char *err, size_t errlen);
+/** The `block_len` rows image `img` puts at its block `ids[0..block_len)` (row_width bf16 each, into `out`): the
+ *  family's assembly over its tower output, the tower run at most once per image per process (the cache). */
+bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+                             uint16_t *out, bool *cache_hit, char *err, size_t errlen);
+/** Write `n_rows` rows of `width` bf16 into a [token][stream][width] carrier at chunk row `row0` (of `n_tokens`),
+ *  each replicated into every one of `n_streams` streams -- the hyper-connection expansion both families' models do
+ *  after the embedding (DeepSeek's HC, Qwen's 4 streams).  false, without writing, when it does not fit. */
+bool pulsar_image_write_stream_rows(pulsar_gpu_tensor *carrier, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
+                                    uint32_t n_tokens, uint32_t width, uint32_t n_streams);
+/** The image records of `bank`'s KV: the live bank's (the request's during a sync, whose rows are being written),
+ *  another bank's carry, or NULL (no carry: no images). */
+const pulsar_image_identity *pulsar_session_bank_images(const pulsar_session *s, uint32_t bank, uint32_t live_bank);
+/** Where a family's prefill puts block rows: `n_rows` rows at chunk row `row0` of a chunk of `n_tokens`. */
+typedef bool (*pulsar_image_row_writer)(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
+                                        uint32_t n_tokens);
+/** The rows of every image block inside the chunk [pos0, pos0+n_tokens) of `ids`, through `write` (a block another
+ *  chunk owns is skipped: the planner never splits one).  false = a block is missing or failed (said). */
+bool pulsar_image_merge_chunk(const pulsar_engine *e, const int32_t *ids, int n_ids, const pulsar_image_ref *images,
+                              int n_images, uint32_t pos0, uint32_t n_tokens, pulsar_image_row_writer write,
+                              void *ud);
+/** The reuse licence for an image request against a session's live history (L226, L261, L281). */
+typedef struct {
+    uint32_t live_len;   ///< the live tokens (0 = none valid)
+    uint32_t common;     ///< the prompt's common prefix with them
+    bool extends_live;   ///< the prompt extends the live tokens -- the only case the licence decides
+    bool straddles;      ///< an image block crosses the common prefix
+    bool keep;           ///< extends_live, nothing straddles, and the held images' records are exactly the live ones
+    int n_held, n_new;   ///< images inside / after the common prefix
+    uint32_t held_end;   ///< the exclusive end of the last held block: a resume must restore at or above it
+} pulsar_image_licence;
+void pulsar_image_licence_decide(const pulsar_session *s, const pulsar_tokens *prompt,
+                                 const pulsar_image_ref *images, int n_images, pulsar_image_licence *out);
+
+/* ---- L268: Qwen3.8-Flash-Next's own part of the image path (vision_qwen.cpp) ----
+ * Preprocessing, from the checkpoint's preprocessor_config.json (HF Qwen2VLImageProcessor). */
+#define PULSAR_QWEN_VISION_PATCH      16u
+#define PULSAR_QWEN_VISION_MERGE      2u
+#define PULSAR_QWEN_VISION_TEMPORAL   2u
+#define PULSAR_QWEN_VISION_MIN_PIXELS 65536u      /* size.shortest_edge */
+#define PULSAR_QWEN_VISION_MAX_PIXELS 16777216u   /* size.longest_edge */
+#define PULSAR_QWEN_VISION_MEAN       0.5
+#define PULSAR_QWEN_VISION_STD        0.5
+/** One image's patches as the tower takes them: `rows` = grid_h * grid_w patches in 2x2 merge-block order, `cols`
+ *  = 3 * temporal * patch^2 float32 values each (channel, frame, y, x). */
+typedef struct {
+    float *values;
+    int rows, cols;
+    int grid_h, grid_w;        ///< the patch grid (the resized image / patch)
+    int resized_h, resized_w;  ///< smart_resize's size
+} qwen_vision_pixels;
+/** HF's smart_resize: the nearest multiple of patch x merge (Python's half-to-even), scaled into
+ *  [min_pixels, max_pixels].  false + `err` past an aspect ratio of 200. */
+bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, size_t errlen);
+/** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
+bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
+void qwen_vision_pixels_free(qwen_vision_pixels *p);
+/** L268: Qwen's image front (vision_qwen.cpp) -- pulsar_family::vision of PULSAR_FAMILY_QWEN4_EXP. */
+extern const pulsar_family_vision PULSAR_QWEN_IMAGE_FRONT;
+/** Bind the tower's `model.visual.*` tensors (bf16, the tower's dims) when the artifact carries them; *present
+ *  says whether it does.  false = it carries a tower that does not bind (said). */
+bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present);
+/** Preprocess and encode one image: *rows = malloc'd (*n_rows x PULSAR_QWEN_VISION_OUT) bf16, the rows its
+ *  image_pad block takes, in merge-block raster order.  `dbg` (NULL in production) receives a malloc'd 3 x
+ *  n_patches x PULSAR_QWEN_VISION_DIM stage dump (pulsar_cuda_qwen_vision_forward). */
+bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
+                        int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen);
 
 /** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host
@@ -2374,6 +2461,12 @@ struct pulsar_session {
      * size produces an identical token prefix -- the records are what keep such a request from reusing KV rows
      * computed from the other image.  rewind() keeps the records of the blocks that survive it. */
     pulsar_image_identity live_images;
+    /** L268: the images of the sync in flight on the core driver (sync_driver.cpp), BORROWED for its prefill so a
+     *  family's chunk forward merges the blocks it owns (pulsar_image_merge_chunk); NULL / 0 outside a sync. */
+    const pulsar_image_ref *sync_images;
+    int sync_n_images;
+    const pulsar_tokens *sync_prompt;        ///< ... the prompt their blocks sit in
+    pulsar_image_identity sync_identity;     ///< ... and every block's record (the rows being written, for rope)
     int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
     /** L260 fusion: the last successful fused step's logits block (the caller's
      *  buffer), its decode-row count and its headed rows -- what
@@ -3178,10 +3271,11 @@ typedef struct pulsar_sync_ops {
     int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
 } pulsar_sync_ops;
 /** The core's default sync: continue the view, else resume from the shared prefix's deepest grid
- *  checkpoint, else reset and prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2).  Returns 0,
- *  PULSAR_SESSION_SYNC_INTERRUPTED, or 1 with `err`. */
-int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_sync_ops *ops,
-                                char *err, size_t errlen);
+ *  checkpoint, else reset and prefill from 0 -- interruptibly (sync_driver.cpp, L272 P2), with the request's
+ *  images under the core's licence (L268; n_images 0 = text).  Returns 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
+ *  with `err`. */
+int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                int n_images, const pulsar_sync_ops *ops, char *err, size_t errlen);
 
 /** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop
  *  hook, cut the chunk, run it, land it, poll again -- with the planning and the effects as hooks, so
@@ -3288,6 +3382,10 @@ int vision_image_grid(int width, int height, const pulsar_vision_args *args,
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
  * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
  * own .convert("RGB") is a different transform from libjpeg's. */
+/** Pillow's Image.resize(BICUBIC) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical), bit for
+ *  bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor).  Returns
+ *  a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 
@@ -3316,11 +3414,9 @@ void vision_prepared_free(pulsar_vision_prepared *p);
  * pulsar_image_ref::start_pos must carry.  `preps[k]` receives the prepared image
  * for the later merge.  Refuses when the placeholder count and the image count
  * disagree, or when an image cannot be prepared. */
-int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in,
-                                     int placeholder_id,
-                                     const pulsar_image_ref *images, int n_images,
-                                     const pulsar_vision_args *args, int vocab_size,
-                                     pulsar_vision_prepared *preps, int *starts);
+/** L268: DeepSeek's pulsar_family_vision::expand -- prepare `img` where its block begins (out->len) and append
+ *  the block's sentinel ids (`vocab_size + role`, in build_image_block's N-layout order). */
+bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *err, size_t errlen);
 
 /* The reference's sentinel ROLES (image_processor: IMAGE_START, IMAGE_PAD,
  * IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)).  A prompt slot belonging to an
@@ -3349,12 +3445,6 @@ int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in
  * Returns 0 if the ids there are not such a block.  The ONE place the sentinel
  * roles are resolved for a scan. */
 int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
-/** Where an image request's blocks may sit (vision.cpp): every image names a block
- * the prompt carries and every block fits inside one prefill chunk (`chunk_cap`),
- * at any position.  The one statement of the rule; 0 with `err` filled otherwise. */
-int vision_spans_fit(const int32_t *ids, int n, const pulsar_image_ref *images, int n_images,
-                     uint32_t chunk_cap, int *end_out, char *err, size_t errlen);
-
 /** The reference's get_image_visible(): per-token visible counts to the
  * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function
  * of the token ids, so it is graded directly against the reference by
@@ -3378,15 +3468,14 @@ void vision_window_topk_visible(int window_size, int n, const int32_t *left,
 int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
                       const pulsar_vision_prepared *prep,
                       uint16_t *out, int out_cap, int *out_len);
-/** As vision_merge_span, but the tower runs at most once per (image bytes, args)
- * per process: the aligner rows are cached and the span is still assembled for
- * THIS request's positions.  `cache_hit` reports whether the tower was skipped.
- * L226. */
-int vision_merge_span_cached(const pulsar_vision_weights *w, const pulsar_model *m,
-                             const pulsar_vision_prepared *prep,
-                             const uint8_t *src_bytes, size_t src_len,
-                             const pulsar_vision_args *args,
-                             uint16_t *out, int out_cap, int *out_len, int *cache_hit);
+/** DeepSeek's image-preprocessing args (the checkpoint's policy constants and the tower dims). */
+void vision_ds4_args(pulsar_vision_args *a);
+/** L268: DeepSeek's pulsar_family_vision::block_rows -- prepare `img` at its block's position, take the aligner
+ *  rows from `tower` (the core's cache) or run the tower (handing its rows back through *tower_out), and assemble
+ *  the block (the merge_image_embeddings scatter vision_merge_span does). */
+bool vision_ds4_block_rows(const pulsar_vision_weights *w, const pulsar_model *m, const pulsar_image_ref *img,
+                           int block_len, const uint16_t *tower, int n_tower, uint16_t **tower_out,
+                           int *n_tower_out, uint16_t *out, char *err, size_t errlen);
 void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
@@ -3877,15 +3966,14 @@ bool gpu_graph_upload_prompt_embeddings_hc(
  * Returns false, without writing, if the span does not fit the carrier. */
 bool gpu_graph_write_vision_span(pulsar_gpu_tensor *out_hc, const uint16_t *rows,
                                  uint32_t n_rows, uint32_t row0, uint32_t n_tokens);
-/** Merge every image span that lies inside [pos0, pos0 + n_tokens) into the HC
- * carrier: decode, preprocess, run the tower, and scatter the result.  `ids` is
- * the whole prompt (the span extent comes from vision_span_extent, not from the
- * image), so a request whose prompt does not carry the span it claims is
- * refused.  Returns false on any refusal; true (a no-op) when `vr` is NULL. */
-bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const pulsar_model *model,
-                                 const int32_t *ids, int n_ids,
-                                 const pulsar_vision_request *vr,
-                                 uint32_t pos0, uint32_t n_tokens);
+/** Merge every image block that lies inside [pos0, pos0 + n_tokens) into the HC
+ * carrier: the core's chunk merge (pulsar_image_merge_chunk) through DeepSeek's
+ * HC-replicating writer.  `ids` is the whole prompt (the block extent comes from
+ * the family geometry, not from the image), so a request whose prompt does not
+ * carry the block it claims is refused.  Returns false on any refusal; true (a
+ * no-op) when `vr` is NULL. */
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const int32_t *ids, int n_ids,
+                                 const pulsar_vision_request *vr, uint32_t pos0, uint32_t n_tokens);
 /** Compute THIS chunk's image-span visibility and upload it to
  * g->vision_visible, once per chunk, before any layer's attention runs.  A
  * chunk with no sentinel id (every text chunk, and every chunk of an image

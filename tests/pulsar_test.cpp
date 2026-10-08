@@ -881,7 +881,7 @@ static void test_image_span_cache_is_transparent(void) {
     }
     char err[256] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-span-cache gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
@@ -966,7 +966,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
     }
     char err[256] = {0};
     pulsar_tokens turn1 = {0};
-    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, &img, 1, &turn1, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, 0, &img, 1, &turn1, err, sizeof err)) {
         fprintf(stderr, "image-reuse gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&turn1_raw);
         return;
@@ -1072,7 +1072,7 @@ static void test_image_prefill_interrupt_resumes(void) {
     }
     char err[256] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-interrupt gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
@@ -1157,7 +1157,7 @@ static void test_image_chain_round_trip(void) {
     }
     char err[384] = {0};
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, &img, 1, &prompt, err, sizeof err)) {
+    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
         fprintf(stderr, "image-chain gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
         pulsar_tokens_free(&raw);
         return;
@@ -4459,6 +4459,44 @@ static bool test_ds_sentinel(const pulsar_engine *, int32_t id) { return id >= (
 static bool test_ds_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
     return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
 }
+/* L268: multi-axis rope positions (pulsar_image_rope3, the core's, for any family whose image blocks have a 2D grid)
+ * against HF's own Qwen4ExpModel.get_rope_index (tests/image_rope_goldens.py): text runs and image runs of several
+ * merged grids, every row's (T, H, W) exactly. */
+static void test_lib_image_rope(void) {
+    FILE *f = fopen("tests/test-vectors/image-rope-goldens.bin", "rb");
+    TEST_ASSERT(f != NULL);
+    if (!f) return;
+    char magic[4];
+    uint32_t n_cases = 0;
+    TEST_ASSERT(fread(magic, 1, 4, f) == 4 && !memcmp(magic, "IRG1", 4) && fread(&n_cases, 4, 1, f) == 1);
+    for (uint32_t c = 0; c < n_cases; c++) {
+        uint32_t L = 0, nb = 0;
+        if (fread(&L, 4, 1, f) != 1 || fread(&nb, 4, 1, f) != 1 || nb > PULSAR_IMAGE_BLOCKS_MAX) { TEST_ASSERT(false); break; }
+        pulsar_image_identity id;
+        memset(&id, 0, sizeof id);
+        for (uint32_t i = 0; i < nb; i++) {
+            uint32_t b[4];
+            if (fread(b, 4, 4, f) != 4) { TEST_ASSERT(false); break; }
+            id.b[id.n++] = (pulsar_image_block){ b[0], b[0] + b[1], (uint64_t)(i + 1), b[2], b[3] };
+        }
+        std::vector<int32_t> want((size_t)3 * L);
+        if (fread(want.data(), 4, want.size(), f) != want.size()) { TEST_ASSERT(false); break; }
+        int bad = 0;
+        for (uint32_t r = 0; r < L; r++) {
+            uint32_t got[3];
+            pulsar_image_rope3(&id, r, got);
+            for (int a = 0; a < 3; a++) {
+                if ((int32_t)got[a] != want[(size_t)a * L + r]) {
+                    if (bad++ < 3) fprintf(stderr, "image rope: case %u row %u axis %d = %u, want %d\n", c, r, a, got[a],
+                                           want[(size_t)a * L + r]);
+                }
+            }
+        }
+        TEST_ASSERT(bad == 0);
+    }
+    fclose(f);
+}
+
 static void test_lib_image_identity(void) {
     const pulsar_family_vision v = { test_ds_sentinel, test_ds_extent };
     const int V = (int)PULSAR_N_VOCAB;
@@ -4573,6 +4611,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--spec-cost", "spec-cost", "spec cost fit: a round's measured cost to its terms, or no price at all (L263)", test_spec_cost_fit},
+    {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

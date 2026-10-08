@@ -53,10 +53,31 @@ struct prefill_loop_ctx {
     void *ud;
 };
 
+/* L268: the image block a cut at `cut` would split -- [bs, be) with bs < cut < be -- or false. */
+static bool prefill_loop_block_across(const prefill_loop_ctx *c, uint32_t cut, uint32_t *bs, uint32_t *be) {
+    const pulsar_session *s = c->s;
+    for (int i = 0; i < s->sync_n_images; i++) {
+        int len = 0;
+        const int st = s->sync_images[i].start_pos;
+        if (!pulsar_image_block_extent(s->engine, c->prompt->v, c->prompt->len, st, &len)) continue;
+        if ((uint32_t)st < cut && (uint32_t)(st + len) > cut) {
+            *bs = (uint32_t)st;
+            *be = (uint32_t)(st + len);
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t prefill_loop_next_end(void *ud, uint32_t pos0, uint32_t end) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
     uint32_t rows = end - pos0 < c->cap ? end - pos0 : c->cap;
     if (c->capture_at && pos0 < c->capture_at && pos0 + rows > c->capture_at) rows = c->capture_at - pos0;
+    /* L268: an image block is merged whole by the chunk that owns it, so a cut never splits one: it moves to the
+     * block's start, or -- the block starts this chunk (it fits one: pulsar_image_spans_fit) -- past its end (a
+     * capture point inside it is skipped) */
+    uint32_t bs = 0, be = 0;
+    if (prefill_loop_block_across(c, pos0 + rows, &bs, &be)) rows = bs > pos0 ? bs - pos0 : be - pos0;
     return pos0 + rows;
 }
 
@@ -85,6 +106,15 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     if (cap == 0u || start >= end) {
         fprintf(stderr, "pulsar: prefill loop: nothing to prefill (start %u, end %u, cap %u)\n", start, end, cap);
         return 1;
+    }
+    /* L268: a start inside an image block would re-evaluate its merged rows without their image */
+    {
+        prefill_loop_ctx probe = { s, prompt, cap, 0u, bank, ckpt, chunk, ud };
+        uint32_t bs = 0, be = 0;
+        if (start > 0 && prefill_loop_block_across(&probe, start, &bs, &be)) {
+            fprintf(stderr, "pulsar: prefill loop: start %u is inside image block [%u, %u) -- refusing\n", start, bs, be);
+            return 1;
+        }
     }
     /* the view below `start` is the session's already; it grows with the prompt from here */
     s->checkpoint.len = 0;

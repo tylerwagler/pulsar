@@ -3066,6 +3066,9 @@ int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pul
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
                            int anchor);
+/* L273: an image request's cold phase -- `cut` (the sys-prefix cut) when every image begins at or past it, 0 when
+ * one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in server_tests.cpp. */
+int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,

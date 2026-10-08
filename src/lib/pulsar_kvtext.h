@@ -12,7 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** The bytes `tokens` render to (each id's text, concatenated); caller frees. */
+/** The bytes `tokens` render to: pulsar_history_text (each id's text; an image block once, as its placeholder);
+ *  caller frees; NULL when an image block is malformed. */
 char *pulsar_kvtext_render_tokens_text(pulsar_engine *engine,
                                      const pulsar_tokens *tokens,
                                      size_t *out_len);

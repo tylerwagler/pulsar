@@ -109,15 +109,7 @@ char *pulsar_kvtext_path_join(const char *dir, const char *name) {
 char *pulsar_kvtext_render_tokens_text(pulsar_engine *engine,
                                      const pulsar_tokens *tokens,
                                      size_t *out_len) {
-    pulsar::KvBuf b;
-    for (int i = 0; i < tokens->len; i++) {
-        size_t len = 0;
-        char *piece = pulsar_token_text(engine, tokens->v[i], &len);
-        b.append(piece, len);
-        free(piece);
-    }
-    if (out_len) *out_len = b.len();
-    return b.take();
+    return pulsar_history_text(engine, tokens, out_len);
 }
 
 bool pulsar_kvtext_byte_prefix_match(const char *text, size_t text_len,

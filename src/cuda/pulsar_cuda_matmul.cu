@@ -3070,6 +3070,57 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
     return 1;
 }
 
+/* L268: the image towers' GEMM (pulsar_cuda_vision.cu, both families): C (f32, row-major [m x n], ldc) =
+ * A (bf16, row-major [m x k], lda) . op(B), with B bf16 row-major -- [n x k] (ldb) and op(B) = B^T when b_trans,
+ * else [k x n] (ldb).  f32 accumulate (CUBLAS_COMPUTE_32F: f32 means f32), the heuristic's first pick per call: a
+ * tower runs once per image, so it owes no row-count neutrality.  Row-major C is column-major C^T = op(B)^T . A^T,
+ * which is what the descriptors below say. */
+int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const uint16_t *b, int ldb,
+                                       int b_trans, int m, int n, int k) {
+    if (!cublaslt_ensure()) {
+        fprintf(stderr, "pulsar: vision GEMM: cuBLASLt handle not ready -- refusing\n");
+        return 0;
+    }
+    if (m <= 0 || n <= 0 || k <= 0) return 0;
+    const size_t wz = 32u << 20;
+    cublasLtMatmulDesc_t op = NULL;
+    cublasLtMatrixLayout_t la = NULL, lb = NULL, lc = NULL;
+    cublasLtMatmulPreference_t pf = NULL;
+    int ok = 0;
+    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS) {
+        const cublasOperation_t ta = b_trans ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+        /* B in column-major is [k x n] (b_trans: B^T) or [n x k]; A is [k x m]; C^T is [n x m] */
+        if (b_trans) cublasLtMatrixLayoutCreate(&la, CUDA_R_16BF, (uint64_t)k, (uint64_t)n, ldb);
+        else cublasLtMatrixLayoutCreate(&la, CUDA_R_16BF, (uint64_t)n, (uint64_t)k, ldb);
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, (uint64_t)k, (uint64_t)m, lda);
+        cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, (uint64_t)n, (uint64_t)m, ldc);
+        cublasLtMatmulPreferenceCreate(&pf);
+        cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        cublasLtMatmulHeuristicResult_t hr;
+        int got = 0;
+        if (la && lb && lc && pf &&
+            cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, lc, lc, pf, 1, &hr, &got) == CUBLAS_STATUS_SUCCESS &&
+            got) {
+            cuda_arena ar;
+            if (cuda_arena_begin(&ar, wz, "vision gemm scratch")) {
+                void *ws = cuda_arena_take(&ar, wz, 256);
+                const float al = 1.0f, be = 0.0f;
+                ok = ws && cublasLtMatmul(g_cublaslt, op, &al, b, la, a, lb, &be, c, lc, c, lc, &hr.algo, ws, wz,
+                                          cudaStreamPerThread) == CUBLAS_STATUS_SUCCESS;
+            }
+        }
+        if (!ok) fprintf(stderr, "pulsar: vision GEMM (m %d n %d k %d, b_trans %d) failed\n", m, n, k, b_trans);
+    }
+    if (pf) cublasLtMatmulPreferenceDestroy(pf);
+    if (lc) cublasLtMatrixLayoutDestroy(lc);
+    if (lb) cublasLtMatrixLayoutDestroy(lb);
+    if (la) cublasLtMatrixLayoutDestroy(la);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return ok;
+}
+
 
 /* L260 (Tyler 2026-10-01: decode rows may take width-dependent arithmetic -- the
  * fastest arm at each width): DECODE rows from PULSAR_LT_DECODE_MIN_ROWS up

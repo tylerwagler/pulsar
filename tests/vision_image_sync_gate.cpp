@@ -14,7 +14,10 @@
  *     arrived: the embedder zero-masks an out-of-vocab id and only the merge
  *     puts anything there, so the failure would be a fluent wrong answer;
  *   - an image whose sentinel block is not in the prompt is REFUSED;
- *   - a span that would not fit one prefill chunk is REFUSED.
+ *   - a span that would not fit one prefill chunk is REFUSED;
+ *   - (L273) an image turn on a bank a ghost rewind left STALE resumes from its
+ *     grid checkpoint, and its logits are bit-identical to the cold prefill
+ *     with the same chunk boundary.
  *
  * MODEL-DEPENDENT (needs a Vision-Exp artifact) and GPU-resident.
  *
@@ -147,6 +150,81 @@ int main(int argc, char **argv) {
                 printf("  ok   case %u: image with no block refused (%s)\n", c, err3);
             }
             pulsar_tokens_free(&p3);
+        }
+
+        /* ---- L273: an image turn on a STALE bank (a reply's ghost rewind leaves it mid-group) resumes from its
+         *      grid checkpoint, byte for byte the cold prefill of the same prompt (before fab03497: rebuilt cold) */
+        {
+            char err4[512] = {0};
+            const char *step = "text sync";
+            pulsar_tokens text = {}, turn = {};
+            for (int i = 0; i < 300; i++) pulsar_tokens_push(&text, 100 + i % 7);
+            pulsar_session_invalidate(sess);
+            bool ok4 = pulsar_session_sync(sess, &text, err4, sizeof err4) == 0;
+            if (ok4) step = "decode";
+            for (int k = 0; ok4 && k < 3; k++)
+                ok4 = pulsar_session_eval(sess, pulsar_session_argmax(sess), err4, sizeof err4) == 0;
+            if (ok4) {
+                pulsar_session_rewind(sess, pulsar_session_pos(sess) - 1);   /* the ghost token */
+                /* the installed bank's flag (pulsar_session_bank_comp_stale answers for a bank POOL; this session
+                 * is classic, one bank) */
+                step = "stale after the ghost rewind";
+                ok4 = sess->graph->ms_comp_state_stale[gpu_graph_cur_bank(sess->graph)];
+            }
+            /* the turn the server builds: the live history, the renderer's placeholder, a little text -- expanded from
+             * the live length (a block's layout depends on where it starts, so the golden's block is not reused) */
+            pulsar_image_ref img4 = { enc.data(), enc.size(), 0 };
+            if (ok4) {
+                step = "expanding the turn's placeholder";
+                const pulsar_tokens *live = pulsar_session_tokens(sess);
+                const int live_len = live->len;
+                pulsar_tokens raw = {}, ph = {};
+                for (int i = 0; i < live_len; i++) pulsar_tokens_push(&raw, live->v[i]);
+                pulsar_tokenize_rendered_chat(e, PULSAR_IMAGE_PLACEHOLDER, &ph);
+                for (int i = 0; i < ph.len; i++) pulsar_tokens_push(&raw, ph.v[i]);
+                for (int i = 0; i < 3; i++) pulsar_tokens_push(&raw, 200 + i);
+                ok4 = ph.len == 1 && pulsar_expand_image_placeholders(e, &raw, live_len, &img4, 1, &turn, err4,
+                                                                      sizeof err4) == 1 && img4.start_pos == live_len;
+                pulsar_tokens_free(&raw);
+                pulsar_tokens_free(&ph);
+            }
+            if (ok4) {
+                step = "image turn on the stale bank";
+                ok4 = pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0;
+            }
+            const int origin = ok4 ? pulsar_session_resume_origin(sess) : -1;
+            std::vector<float> resumed((size_t)PULSAR_N_VOCAB);
+            if (ok4) {
+                step = "the cold prefill of the same prompt";
+                ok4 = pulsar_session_copy_logits(sess, resumed.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
+                /* the cold prefill with the resume's chunk boundary: [0, origin) as text, then the rest in one
+                 * chunk.  NOT the one-chunk prefill: an image block's rows depend on where its chunk starts (L283,
+                 * found here 2026-10-07: relL2 ~0.47 between the two, text chunk-invariant) -- that is graded
+                 * against the reference there, not here */
+                pulsar_session_invalidate(sess);
+                pulsar_tokens head = {};
+                for (int i = 0; i < origin && i < turn.len; i++) pulsar_tokens_push(&head, turn.v[i]);
+                ok4 = ok4 && origin > 0 && pulsar_session_sync(sess, &head, err4, sizeof err4) == 0 &&
+                      pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0 &&
+                      pulsar_session_copy_logits(sess, logits.data(), (int)PULSAR_N_VOCAB) == (int)PULSAR_N_VOCAB;
+                pulsar_tokens_free(&head);
+            }
+            int differ = 0;
+            for (size_t i = 0; ok4 && i < logits.size(); i++) differ += memcmp(&resumed[i], &logits[i], 4) != 0;
+            if (!ok4) {
+                printf("  FAIL case %u: stale-bank image turn: %s failed %s\n", c, step, err4);
+                bad++;
+            } else if (origin <= 0 || origin > text.len || differ) {
+                printf("  FAIL case %u: stale-bank image turn resumed at %d (want a grid checkpoint in (0,%d]), "
+                       "%d/%u logits differ from cold\n", c, origin, text.len, differ, (unsigned)PULSAR_N_VOCAB);
+                bad++;
+            } else {
+                printf("  ok   case %u: stale-bank image turn resumed from grid checkpoint %d, logits == cold\n", c,
+                       origin);
+            }
+            pulsar_session_invalidate(sess);
+            pulsar_tokens_free(&text);
+            pulsar_tokens_free(&turn);
         }
 
         printf("%s case %u: %dx%d start=%-3d span %-4d\n", bad ? "FAIL" : "ok  ", c, n_vh, n_vw,

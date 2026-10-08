@@ -130,15 +130,15 @@ int main(int argc, char **argv) {
         std::vector<uint16_t> fill((size_t)n_tokens * n_hc * n_embd, 0xA5A5u);
         std::vector<uint16_t> back(fill.size(), 0);
         pulsar_image_ref img = { enc.data(), enc.size(), start_pos };
-        pulsar_vision_request vreq = { &img, 1, &e->vision_weights };
+        pulsar_vision_request vreq = { &img, 1, e };
 
         int bad = 0;
         if (!pulsar_gpu_tensor_write(sess->graph->batch_cur_hc, 0, fill.data(),
                                      (uint64_t)fill.size() * 2))
             { printf("FAIL case %u: carrier write failed\n", c); failures++; continue; }
 
-        if (!gpu_graph_merge_image_spans(sess->graph->batch_cur_hc, &e->model, ids.data(), n_tokens,
-                                         &vreq, 0, (uint32_t)n_tokens)) {
+        if (!gpu_graph_merge_image_spans(sess->graph->batch_cur_hc, ids.data(), n_tokens, &vreq, 0,
+                                         (uint32_t)n_tokens)) {
             printf("  FAIL case %u (%dx%d start=%d): merge refused\n", c, n_vh, n_vw, start_pos);
             failures++;
             continue;
@@ -211,9 +211,9 @@ int main(int argc, char **argv) {
         std::vector<uint8_t> enc(1024, 0);          /* contents do not matter: it must refuse first */
         std::vector<int32_t> ids(32, 100);          /* text only: no sentinels at all */
         pulsar_image_ref img = { enc.data(), enc.size(), 4 };
-        pulsar_vision_request vreq = { &img, 1, &e->vision_weights };
-        const bool got = gpu_graph_merge_image_spans(sess->graph->batch_cur_hc, &e->model,
-                                                     ids.data(), (int)ids.size(), &vreq, 0, 32);
+        pulsar_vision_request vreq = { &img, 1, e };
+        const bool got = gpu_graph_merge_image_spans(sess->graph->batch_cur_hc, ids.data(), (int)ids.size(), &vreq,
+                                                     0, 32);
         if (got) {
             printf("  FAIL an image with no sentinel span in the prompt was accepted\n");
             failures++;

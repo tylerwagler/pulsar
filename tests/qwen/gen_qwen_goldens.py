@@ -109,6 +109,21 @@ class Refused(Exception):
 def api_to_hf(messages, wrap):
     """API messages (arguments as JSON text) -> what the template takes (arguments decoded ONCE)."""
     def w(s):   # content / reasoning: the template trims them
+        if isinstance(s, list):   # L268: content parts -- text wrapped, images (the template's vision literal) not
+            out_parts = []
+            for i, part in enumerate(s):
+                if part.get('type') == 'image':
+                    out_parts.append({'type': 'image'})
+                    continue
+                t = part['text']
+                if wrap:   # |trim acts on the whole rendered content: only the outer parts lose whitespace
+                    if i == 0:
+                        t = t.lstrip()
+                    if i == len(s) - 1:
+                        t = t.rstrip()
+                    t = O + t + C if t else t
+                out_parts.append({'type': 'text', 'text': t})
+            return out_parts
         if not wrap or not isinstance(s, str):
             return s
         s = s.strip()
@@ -147,6 +162,7 @@ HF_ERRORS = {
     'Unexpected message role.': 'unexpected_role',
     'No user query found in messages.': 'no_user_query',
     'Can only get item pairs from a mapping.': 'tool_arguments_not_object',
+    'System message cannot contain images.': 'image_position',
 }
 
 
@@ -352,6 +368,16 @@ case('user_tool_response_wrapped', [U('real question'), U('<tool_response>x</too
 case('unicode_tools', [U('x')], tools=json.dumps([{'name': 'flat', 'description': '日本語 \x01 ctrl',
                                                    'parameters': {'properties': {}}}], ensure_ascii=False))
 case('empty_tools', [U('x')], tools='[]')
+# L268: images -- the template's render_content writes each as <|vision_start|><|image_pad|><|vision_end|> in place
+IMG = {'type': 'image'}
+TX = lambda t: {'type': 'text', 'text': t}
+case('image_first', [U([IMG, TX('What is this?')])])
+case('image_last', [U([TX('Describe this: '), IMG])], effort='none')
+case('two_images_ws', [S('sys'), U([TX('  Compare '), IMG, TX(' and '), IMG, TX(' \n ')])])
+case('image_only', [U([IMG])], effort='low')
+case('tool_result_image', [U('take a screenshot'), A('', None, [('run', '{"cmd": "shot"}')]),
+                           T([TX('saved to /tmp/s.png'), IMG])], tools=TOOLS)
+case('refuse_image_in_system', [S([IMG, TX('sys')]), U('x')])
 # refusals
 case('refuse_no_messages', [])
 case('refuse_system_not_first', [U('x'), S('late')])

@@ -101,6 +101,8 @@ struct qsa_row {
     uint32_t nb;        /* complete blocks visible: (pos + 1) / 4 */
     uint32_t n_list;    /* tokens attended: pos + 1, or 2048 + (pos + 1) % 4 */
     uint32_t pad;
+    uint32_t rope[3];   /* L268: the row's (T, H, W) rope positions -- (pos, pos, pos) for text */
+    uint32_t brope[3];  /* ... and its indexer block's first token's (pos - 3 for text) */
 };
 
 struct qsa_rope_tab { float inv[PULSAR_QSA_ROT_DIM / 2]; };
@@ -116,11 +118,14 @@ __device__ __forceinline__ float qsa_warp_max(float v) {
     return v;
 }
 
-/* cos/sin of the rope angle for pair `i` at `pos`.  The angle is the f32
- * product transformers forms (inv_freq f32 times the position as f32); its
- * cos/sin are taken in double so a large angle is not the fast-math __sinf's. */
-__device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, uint32_t pos, uint32_t i,
+/* cos/sin of the rope angle for pair `i` at the position triple `p` (T, H, W).  L268: the interleaved mRoPE
+ * axis of pair i -- H when i % 3 == 1, W when i % 3 == 2, else T (HF apply_interleaved_mrope, mrope_section
+ * [11, 11, 10] over 32 pairs); a text row's three axes are equal, so its angle is the 1D rope's.  The angle is the
+ * f32 product transformers forms (inv_freq f32 times the position as f32); its cos/sin are taken in double so a
+ * large angle is not the fast-math __sinf's. */
+__device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, const uint32_t (&p)[3], uint32_t i,
                                             float *c, float *s) {
+    const uint32_t pos = p[i % 3u == 1u ? 1 : i % 3u == 2u ? 2 : 0];
     const float ang = __fmul_rn((float)pos, tab.inv[i]);
     double sd, cd;
     sincos((double)ang, &sd, &cd);
@@ -178,7 +183,7 @@ __global__ void qsa_block_keys_kernel(const qsa_row *rows, uint32_t n_rows, cons
     #pragma unroll
     for (int j = 0; j < 4; j++) x[j] = __fmul_rn(x[j], 0.25f);
     float c, s;
-    qsa_rope_cs(tab, row.pos - (PULSAR_QSA_BLOCK - 1u), (uint32_t)lane, &c, &s);
+    qsa_rope_cs(tab, row.brope, (uint32_t)lane, &c, &s);
     qsa_norm_rope<4>(x, kw, c, s);
     __nv_bfloat16 *dst = row.bkey + (uint64_t)(row.pos / PULSAR_QSA_BLOCK) * PULSAR_QSA_IDX_DIM;
     #pragma unroll
@@ -199,7 +204,7 @@ __global__ void __launch_bounds__(1024) qsa_prep_kernel(
     const uint32_t w = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     float c, s;
-    qsa_rope_cs(tab, row.pos, (uint32_t)lane, &c, &s);
+    qsa_rope_cs(tab, row.rope, (uint32_t)lane, &c, &s);
     if (w < Qs::N_HEAD) {
         const float *src = qg + (uint64_t)r * Qs::Q_IN + (uint64_t)w * 2u * PULSAR_QSA_HEAD_DIM;
         float x[8];
@@ -832,6 +837,12 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                 | (d.nb > PULSAR_QSA_TOP_BLOCKS ? QSA_ROW_SELECT : 0u);
         d.n_list = d.nb > PULSAR_QSA_TOP_BLOCKS ? QSA_BUDGET + (p + 1u) % PULSAR_QSA_BLOCK : p + 1u;
         d.pad = 0;
+        /* L268: the rope positions -- the caller's mRoPE triples, or the text position on every axis */
+        const uint32_t bstart = p >= PULSAR_QSA_BLOCK - 1u ? p - (PULSAR_QSA_BLOCK - 1u) : 0u;
+        for (int a = 0; a < 3; a++) {
+            d.rope[a] = io->row_rope ? io->row_rope[(uint64_t)r * 6u + (uint64_t)a] : p;
+            d.brope[a] = io->row_rope ? io->row_rope[(uint64_t)r * 6u + 3u + (uint64_t)a] : bstart;
+        }
         if (d.flags & QSA_ROW_SELECT) n_select++;
     }
     const qsa_ws need = qsa_ws_layout(nullptr, n_rows, max_ctx);

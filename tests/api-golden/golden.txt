@@ -1724,8 +1724,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== chat/image [chat/qwen] REFUSED
-  error: "message 0: image content is not served for the Qwen family"
+== chat/image [chat/qwen] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nwhat is this<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-266]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == chat/missing-messages [chat/qwen] REFUSED
   error: "missing messages"
 == chat/not-object [chat/qwen] REFUSED
@@ -3622,8 +3642,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== an/image [anthropic/qwen] REFUSED
-  error: "message 0: image content is not served for the Qwen family"
+== an/image [anthropic/qwen] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>what is this<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [297-309]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == an/missing-messages [anthropic/qwen] REFUSED
   error: "missing messages"
 == an/prefill [anthropic/qwen] OK
@@ -4062,8 +4102,28 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
-== rs/image [responses/qwen] REFUSED
-  error: "message 0: image content is not served for the Qwen family"
+== rs/image [responses/qwen] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 1
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nwhat<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  prompt_spans: [254-258]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
 == rs/missing-input [responses/qwen] REFUSED
   error: "missing input"
 == an/mid-system [anthropic/qwen] OK

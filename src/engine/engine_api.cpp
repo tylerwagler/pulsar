@@ -3,6 +3,7 @@
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
+#include <string>
 
 
 
@@ -653,8 +654,8 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
      * the pair down instead of failing its request). */
     if (n_images > 0) {
         char verr[384];
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->prefill_cap,
-                              NULL, verr, sizeof(verr))) {
+        if (!pulsar_image_spans_fit(s->engine, prompt->v, prompt->len, images, n_images, s->prefill_cap, NULL, verr,
+                                    sizeof(verr))) {
             if (err) snprintf(err, errlen, "%s", verr);
             return 1;
         }
@@ -723,6 +724,29 @@ int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int
     return n;
 }
 
+char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!e || !tokens) return NULL;
+    std::string out;
+    for (int i = 0; i < tokens->len; i++) {
+        int id = tokens->v[i], blk = 1;
+        if (pulsar_image_is_sentinel(e, id)) {   /* the family's geometry: the block stands for its placeholder */
+            if (!pulsar_image_block_extent(e, tokens->v, tokens->len, i, &blk) || blk <= 0) return NULL;
+            id = e->family->vision->placeholder_id(e);
+        }
+        size_t n = 0;
+        char *piece = pulsar_token_text(e, id, &n);
+        out.append(piece, n);
+        free(piece);
+        i += blk - 1;
+    }
+    if (out_len) *out_len = out.size();
+    char *r = (char *)xmalloc(out.size() + 1);
+    memcpy(r, out.data(), out.size());
+    r[out.size()] = '\0';
+    return r;
+}
+
 uint64_t pulsar_image_hash(const pulsar_image_ref *img) { return pulsar_image_content_hash(img); }
 
 int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap) {
@@ -737,7 +761,7 @@ int pulsar_session_persist_end(pulsar_session *s) {
                                     &s->live_images);
 }
 
-int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt,
+int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen) {
     PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_VISION, "image placeholders", 0);
@@ -746,63 +770,10 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
         if (err) snprintf(err, errlen, "image request is missing its prompt, images, or output buffer");
         return 0;
     }
-    /* The tower's absence is a client-visible condition (400), not an engine
-     * crash, so it is checked HERE rather than left to the graph. */
-    if (n_images > 0 && !e->vision_ready) {
-        if (err) snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
-        return 0;
-    }
-    const int placeholder = e->vocab.image_id;
-    if (placeholder < 0) {
-        if (err) snprintf(err, errlen,
-                          "the tokenizer has no \"%s\" image placeholder token", PULSAR_IMAGE_PLACEHOLDER);
-        return 0;
-    }
-    /* Count first so a mismatch reports both numbers (the expander reports the
-     * same condition, but only to stderr, where an HTTP client cannot see it). */
-    int seen = 0;
-    for (int i = 0; i < prompt->len; i++) {
-        if (prompt->v[i] == placeholder) seen++;
-    }
-    if (seen != n_images) {
-        if (err) snprintf(err, errlen,
-                          "the prompt carries %d image placeholder(s) but the request has %d image(s)",
-                          seen, n_images);
-        return 0;
-    }
-
-    pulsar_vision_args args;
-    args.patch_size       = (int)PULSAR_VISION_PATCH;
-    args.downsample_ratio = (int)PULSAR_VISION_DOWNSAMPLE;
-    args.max_n_token      = (int)PULSAR_VISION_MAX_N_TOKEN;
-    args.min_pixels       = (int)PULSAR_VISION_MIN_PIXELS;
-    args.max_wh_ratio     = PULSAR_VISION_MAX_WH_RATIO;
-
-    pulsar_vision_prepared *preps = NULL;
-    int *starts = NULL;
-    if (n_images > 0) {
-        preps = (pulsar_vision_prepared *)xmalloc((size_t)n_images * sizeof(preps[0]));
-        memset(preps, 0, (size_t)n_images * sizeof(preps[0]));
-        starts = (int *)xmalloc((size_t)n_images * sizeof(starts[0]));
-    }
-    /* The one producer of sentinel blocks.  It also decodes+preprocesses each
-     * image to learn its span; the mm prefill re-decodes from the same bytes and
-     * args, so the two agree by construction.  `preps` is only needed for the
-     * geometry here and is released before the model runs. */
-    const int ok = vision_expand_image_placeholders(out, prompt, placeholder,
-                                                    images, n_images, &args,
-                                                    (int)PULSAR_N_VOCAB, preps, starts);
-    if (ok) {
-        for (int i = 0; i < n_images; i++) images[i].start_pos = starts[i];
-    } else if (err) {
-        snprintf(err, errlen,
-                 "an image could not be decoded or is not one the vision tower accepts");
-    }
-    for (int i = 0; i < n_images; i++) vision_prepared_free(&preps[i]);
-    free(preps);
-    free(starts);
+    /* L268: the family's front, through the core's walk (image_front.cpp) */
+    const bool ok = pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen);
     if (!ok) pulsar_tokens_free(out);
-    return ok;
+    return ok ? 1 : 0;
 }
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) {
     PULSAR_NVTX_FN();

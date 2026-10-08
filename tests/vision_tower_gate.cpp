@@ -103,6 +103,13 @@ int main(int argc, char **argv) {
         const size_t n_tok = (size_t)n_h * n_w;
         const size_t n_llm = (size_t)((n_h + ratio - 1) / ratio) * ((n_w + ratio - 1) / ratio);
 
+        /* the golden's tower must be the one this build compiled (the engine reads its dims from constants) */
+        if (patch != (int)PULSAR_VISION_PATCH || dim != (int)PULSAR_VISION_DIM || heads != (int)PULSAR_VISION_HEADS ||
+            inter != (int)PULSAR_VISION_INTER || ratio != (int)PULSAR_VISION_DOWNSAMPLE) {
+            fprintf(stderr, "tower gate: case %u's tower (patch %d dim %d heads %d inter %d ratio %d) is not this "
+                            "build's\n", c, patch, dim, heads, inter, ratio);
+            return 2;
+        }
         const size_t stage_elems = n_tok * (size_t)dim;
         uint16_t *patches = (uint16_t *)malloc(n_tok * 3 * patch * patch * sizeof(uint16_t));
         uint16_t *want_stage = (uint16_t *)malloc((size_t)(2 + n_stage) * stage_elems * sizeof(uint16_t));

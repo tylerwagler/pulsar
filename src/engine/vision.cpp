@@ -252,54 +252,31 @@ void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_
  *         image_inputs.append(ImageInput(len(tokens), ...))
  *         tokens += (args.vocab_size + types).tolist()
  *
- * `out` is written fresh (the caller owns it and should have freed any previous
- * contents).  Each block's ids are `vocab_size + role`, in build_image_block's
+ * The block is appended to `out`.  Each block's ids are `vocab_size + role`, in build_image_block's
  * final N-layout order, and each block's START POSITION is the length of the
  * prompt at that moment -- the reference's ImageInput.start, which is what
  * pulsar_image_ref::start_pos must carry and where merge_image_embeddings writes.
  *
- * `preps` and `starts` receive one entry per image, in order, for the later
- * merge.  Refuses when the placeholder count and the image count disagree (the
- * reference raises the same error), or when any image cannot be prepared. */
-int vision_expand_image_placeholders(pulsar_tokens *out, const pulsar_tokens *in,
-                                     int placeholder_id,
-                                     const pulsar_image_ref *images, int n_images,
-                                     const pulsar_vision_args *args, int vocab_size,
-                                     pulsar_vision_prepared *preps, int *starts) {
-    if (!out || !in || !in->v || !args || vocab_size <= 0) return 0;
-    if (n_images < 0 || (n_images > 0 && (!images || !preps || !starts))) return 0;
-
-    int seen = 0, next = 0;
-    for (int i = 0; i < in->len; i++) {
-        if (in->v[i] != placeholder_id) {
-            pulsar_tokens_push(out, in->v[i]);
-            continue;
-        }
-        if (next >= n_images) {
-            fprintf(stderr, "pulsar: prompt carries more image placeholders than the request has "
-                            "images (%d images, placeholder at %d)\n", n_images, i);
-            return 0;
-        }
-        const int block_at = out->len;      /* the block start, before any of it is appended */
-        const pulsar_image_ref *img = &images[next];
-        if (!img->bytes || img->len == 0) return 0;
-        if (!vision_prepare_image(img->bytes, img->len, args, block_at, vocab_size, &preps[next]))
-            return 0;
-        for (int k = 0; k < preps[next].span_len; k++) {
-            const int role = preps[next].span_types[k];
-            if (role < 0 || role > VISION_T_IMAGE_END) return 0;
-            pulsar_tokens_push(out, vocab_size + role);
-        }
-        starts[next] = block_at;
-        next++;
-        seen++;
+ * L268: this is ONE image -- the walk over the prompt (counting, start_pos, the
+ * mismatch refusal) is the core's, pulsar_image_expand, for every family. */
+bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *err, size_t errlen) {
+    pulsar_vision_args args;
+    vision_ds4_args(&args);
+    const int block_at = out->len;      /* the block start, before any of it is appended */
+    pulsar_vision_prepared prep = {};
+    if (!vision_prepare_image(img->bytes, img->len, &args, block_at, (int)PULSAR_N_VOCAB, &prep)) {
+        snprintf(err, errlen, "an image could not be decoded or is not one the vision tower accepts");
+        return false;
     }
-    if (seen != n_images) {
-        fprintf(stderr, "pulsar: prompt carries %d image placeholder(s) but the request has %d "
-                        "image(s)\n", seen, n_images);
-        return 0;
+    bool ok = true;
+    for (int k = 0; ok && k < prep.span_len; k++) {
+        const int role = prep.span_types[k];
+        ok = role >= 0 && role <= VISION_T_IMAGE_END;
+        if (ok) pulsar_tokens_push(out, (int)PULSAR_N_VOCAB + role);
     }
-    return 1;
+    if (!ok) snprintf(err, errlen, "the image's block carries an unknown sentinel role");
+    vision_prepared_free(&prep);
+    return ok;
 }
 
 /* The image sentinel BLOCK beginning at `start_pos`, or 0 when the ids there are
@@ -333,40 +310,6 @@ int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, in
         if (ids[i] == end_id) { *len_out = i - start_pos + 1; return 1; }
     }
     return 0;   /* no START, or a START with no END: not a block we will merge */
-}
-
-/* Where an image request's blocks may sit -- the ONE statement of the rule (the
- * session's sync, the TP leader's preflight and the prefill itself all call it):
- * every image has bytes and names a sentinel block the prompt carries, and every
- * block fits inside ONE prefill chunk (`chunk_cap`), wherever it sits.  The merge
- * and the block's bidirectional visibility are per chunk, so a block the chunk
- * planner keeps whole is merged in the chunk that owns it (L261 2026-10-02: an
- * agent's screenshot deep in a conversation must be served, not refused).
- * `*end_out` receives the exclusive end of the last block.  Returns 0 with `err`
- * naming the problem. */
-int vision_spans_fit(const int32_t *ids, int n, const pulsar_image_ref *images, int n_images,
-                     uint32_t chunk_cap, int *end_out, char *err, size_t errlen) {
-    int end = 0;
-    for (int i = 0; i < n_images; i++) {
-        if (!images || !images[i].bytes || images[i].len == 0 || images[i].start_pos < 0) {
-            snprintf(err, errlen, "image %d has no bytes or a bad span position", i);
-            return 0;
-        }
-        int len = 0;
-        if (!vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, images[i].start_pos, &len) || len <= 0) {
-            snprintf(err, errlen, "image %d at %d is not a sentinel block in this prompt",
-                     i, images[i].start_pos);
-            return 0;
-        }
-        if (len > (int)chunk_cap) {
-            snprintf(err, errlen, "image %d's block is %d tokens but one prefill chunk holds only %u "
-                                  "(send a smaller image)", i, len, chunk_cap);
-            return 0;
-        }
-        if (images[i].start_pos + len > end) end = images[i].start_pos + len;
-    }
-    if (end_out) *end_out = end;
-    return 1;
 }
 
 /* The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
@@ -524,7 +467,7 @@ static void pil_resample_axis(uint8_t *dst, int dst_w, int dst_h,
 /* ImagingResample() for one dimension pair: horizontal first, then vertical,
  * skipping a pass whose size is unchanged (Pillow's need_horizontal/vertical).
  * `box` is always the whole source, which is what Image.resize uses. */
-static uint8_t *pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
                                int dst_w, int dst_h) {
     uint8_t *cur = (uint8_t *)src;
     uint8_t *alloc1 = NULL, *alloc2 = NULL;
@@ -643,7 +586,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
     /* The resize/pad branch, then ImageOps.pad's contain + centred paste. */
     uint8_t *canvas = NULL;
     if (max_wh > 0.0f && (float)width >= max_wh * (float)height) {
-        canvas = pil_resize_rgb(rgb, width, height, best_w, best_h);
+        canvas = vision_pil_resize_rgb(rgb, width, height, best_w, best_h);
     } else {
         const double im_ratio = (double)width / (double)height;
         const double dest_ratio = (double)best_w / (double)best_h;
@@ -657,7 +600,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                 if (nw != best_w) cw = nw;
             }
         }
-        uint8_t *resized = pil_resize_rgb(rgb, width, height, cw, ch);
+        uint8_t *resized = vision_pil_resize_rgb(rgb, width, height, cw, ch);
         if (!resized) return 0;
         if (cw == best_w && ch == best_h) {
             canvas = resized;
@@ -963,104 +906,11 @@ void vision_prepared_free(pulsar_vision_prepared *p) {
  *     params = stack([image_start, image_pad, image_pad, image_newline, image_end])
  *     block = params[types]; block[types == IMAGE] = encode_image(...)[perm]
  */
-/* ---- L226: the encoded-span cache ------------------------------------------
- *
- * The ViT forward is the WHOLE cost of an image (measured 2026-09-19 on the GB10:
- * 16,497 ms to encode a 1024x1024 image into 346 span rows, against 26 ms to
- * decode and preprocess it).  KV reuse removes it whenever the conversation's
- * prefix is extended, but a cold prefill for an image the process has ALREADY
- * encoded pays it again -- a second conversation about the same picture, a
- * changed prefix, an evicted bank, or the "no legal grid point" case where the
- * engine correctly rebuilds cold.
- *
- * What is cached is exactly `vision_forward`'s output: the aligner rows.  They
- * depend on the image bytes and the geometry args ONLY -- the span position
- * enters later, in the assembly of sentinel/newsline/IMAGE rows (span_types and
- * perm), which stays per request and costs memcpys.  So the key is the image
- * bytes plus the args, and a hit skips the forward but still rebuilds the exact
- * span for this position.
- *
- * Byte-capped FIFO, process-global, no lock: the engine's GPU state is shared and
- * merges are serial by construction (the server prefills serially), so the cache
- * inherits the same discipline.  It is cleared when the bound tower changes --
- * pulsar_test opens several engines in one process, and a stale row from another
- * tower would be a silently wrong embedding. */
-#define VISION_SPAN_CACHE_BYTES (64u * 1024u * 1024u)
-typedef struct {
-    uint64_t key;
-    size_t   src_len;   ///< the image's byte length, checked with the key
-    int      rows;      ///< aligner rows stored
-    size_t   bytes;     ///< their size
-    uint16_t *data;
-} vision_span_cache_entry;
-static vision_span_cache_entry g_span_cache[16];
-static int      g_span_cache_n = 0;
-static size_t   g_span_cache_bytes = 0;
-static const pulsar_vision_weights *g_span_cache_owner = NULL;
-
-static uint64_t vision_span_key(const uint8_t *bytes, size_t len, const pulsar_vision_args *a) {
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < len; i++) { h ^= bytes[i]; h *= 1099511628211ull; }
-    const uint64_t fields[5] = { (uint64_t)a->patch_size, (uint64_t)a->downsample_ratio,
-                                 (uint64_t)a->max_n_token, (uint64_t)a->min_pixels,
-                                 (uint64_t)(uint32_t)(int32_t)(a->max_wh_ratio * 1000.0f) };
-    for (int f = 0; f < 5; f++)
-        for (int b = 0; b < 8; b++) { h ^= (fields[f] >> (8 * b)) & 0xffu; h *= 1099511628211ull; }
-    return h ? h : 1u;
-}
-
-static void vision_span_cache_reset(void) {
-    for (int i = 0; i < g_span_cache_n; i++) free(g_span_cache[i].data);
-    g_span_cache_n = 0;
-    g_span_cache_bytes = 0;
-}
-
-/* Look up (key, rows).  Returns the stored rows or NULL. */
-static const uint16_t *vision_span_cache_get(uint64_t key, size_t src_len, int rows) {
-    for (int i = 0; i < g_span_cache_n; i++) {
-        if (g_span_cache[i].key == key && g_span_cache[i].src_len == src_len &&
-            g_span_cache[i].rows == rows) {
-            return g_span_cache[i].data;
-        }
-    }
-    return NULL;
-}
-
-static void vision_span_cache_put(uint64_t key, size_t src_len, const uint16_t *data, int rows) {
-    const size_t bytes = (size_t)rows * PULSAR_N_EMBD * sizeof(uint16_t);
-    if (rows <= 0 || bytes > VISION_SPAN_CACHE_BYTES) return;   /* not worth caching */
-    while (g_span_cache_bytes + bytes > VISION_SPAN_CACHE_BYTES && g_span_cache_n > 0) {
-        g_span_cache_bytes -= g_span_cache[0].bytes;
-        free(g_span_cache[0].data);
-        memmove(&g_span_cache[0], &g_span_cache[1],
-                (size_t)(g_span_cache_n - 1) * sizeof(g_span_cache[0]));
-        g_span_cache_n--;
-    }
-    if (g_span_cache_n == (int)(sizeof(g_span_cache) / sizeof(g_span_cache[0]))) {
-        g_span_cache_bytes -= g_span_cache[0].bytes;
-        free(g_span_cache[0].data);
-        memmove(&g_span_cache[0], &g_span_cache[1],
-                (size_t)(g_span_cache_n - 1) * sizeof(g_span_cache[0]));
-        g_span_cache_n--;
-    }
-    uint16_t *copy = (uint16_t *)malloc(bytes);
-    if (!copy) return;
-    memcpy(copy, data, bytes);
-    g_span_cache[g_span_cache_n].key = key;
-    g_span_cache[g_span_cache_n].src_len = src_len;
-    g_span_cache[g_span_cache_n].rows = rows;
-    g_span_cache[g_span_cache_n].bytes = bytes;
-    g_span_cache[g_span_cache_n].data = copy;
-    g_span_cache_n++;
-    g_span_cache_bytes += bytes;
-}
-
-
-
 /* Assemble one image's span rows from its aligner rows: IMAGE slots come from the
  * aligner (in `perm` order), every other slot is the fixed sentinel/newline
- * embedding.  Split out of vision_merge_span so the cached path below produces
- * exactly the same bytes as the encoding path -- one assembler, two sources. */
+ * embedding.  Split out of vision_merge_span so vision_ds4_block_rows (the shared
+ * front, over the core's tower-output cache) produces exactly the same bytes as
+ * the encoding path -- one assembler, two sources. */
 static int vision_span_assemble(const pulsar_vision_weights *w, const pulsar_model *m,
                                 const pulsar_vision_prepared *prep,
                                 const uint16_t *aligner, int rows,
@@ -1113,43 +963,53 @@ int vision_merge_span(const pulsar_vision_weights *w, const pulsar_model *m,
     return ok;
 }
 
-/* L226: the same result, but the tower runs only once per image per process.  A
- * hit still assembles THIS request's span (position-dependent rows are not
- * cached) and is byte-identical to the encoding path by construction -- the
- * assembler is shared, and the cached bytes are the tower's own output. */
-int vision_merge_span_cached(const pulsar_vision_weights *w, const pulsar_model *m,
-                             const pulsar_vision_prepared *prep,
-                             const uint8_t *src_bytes, size_t src_len,
-                             const pulsar_vision_args *args,
-                             uint16_t *out, int out_cap, int *out_len, int *cache_hit) {
+void vision_ds4_args(pulsar_vision_args *a) {
+    a->patch_size       = (int)PULSAR_VISION_PATCH;
+    a->downsample_ratio = (int)PULSAR_VISION_DOWNSAMPLE;
+    a->max_n_token      = (int)PULSAR_VISION_MAX_N_TOKEN;
+    a->min_pixels       = (int)PULSAR_VISION_MIN_PIXELS;
+    a->max_wh_ratio     = PULSAR_VISION_MAX_WH_RATIO;
+}
+
+/* L268: DeepSeek behind the shared image front (image_front.cpp owns the tower-output cache, L226).  The aligner
+ * rows depend on the image only; the block -- compressor pads, the N-layout, the learned sentinel rows -- on where it
+ * sits, so it is prepared at img->start_pos and assembled every time, from the cached rows or a fresh tower run.  One
+ * assembler, two sources: a hit is byte-identical to the encoding path by construction. */
+bool vision_ds4_block_rows(const pulsar_vision_weights *w, const pulsar_model *m, const pulsar_image_ref *img,
+                           int block_len, const uint16_t *tower, int n_tower, uint16_t **tower_out,
+                           int *n_tower_out, uint16_t *out, char *err, size_t errlen) {
     const int T = (int)PULSAR_N_EMBD;
-    if (cache_hit) *cache_hit = 0;
-    if (!w || !m || !prep || !prep->span_types || !prep->perm) return 0;
-    if (!src_bytes || src_len == 0 || !args) return vision_merge_span(w, m, prep, out, out_cap, out_len);
-    /* Another tower's rows must never be served: pulsar_test opens several
-     * engines in one process. */
-    if (g_span_cache_owner != w) {
-        vision_span_cache_reset();
-        g_span_cache_owner = w;
+    pulsar_vision_args args;
+    vision_ds4_args(&args);
+    pulsar_vision_prepared prep = {};
+    if (!vision_prepare_image(img->bytes, img->len, &args, img->start_pos, (int)PULSAR_N_VOCAB, &prep)) {
+        snprintf(err, errlen, "the image failed to decode/preprocess");
+        return false;
     }
-    const int want_rows = prep->n_llm_h * prep->n_llm_w;
-    const uint64_t key = vision_span_key(src_bytes, src_len, args);
-    const uint16_t *cached = vision_span_cache_get(key, src_len, want_rows);
-    if (cached) {
-        if (cache_hit) *cache_hit = 1;
-        return vision_span_assemble(w, m, prep, cached, want_rows, out, out_cap, out_len);
+    bool ok = prep.span_len == block_len;
+    if (!ok) snprintf(err, errlen, "the image prepares to a %d-row block, the prompt carries %d", prep.span_len,
+                      block_len);
+    const int want_rows = prep.n_llm_h * prep.n_llm_w;
+    uint16_t *aligner = NULL;
+    if (ok && tower) {
+        ok = n_tower == want_rows;
+        if (!ok) snprintf(err, errlen, "the cached tower output has %d rows, the image needs %d", n_tower, want_rows);
+    } else if (ok) {
+        aligner = (uint16_t *)malloc((size_t)want_rows * (size_t)T * sizeof(uint16_t));
+        int rows = 0;
+        ok = aligner && vision_forward(w, m, prep.patches, prep.n_vit_h, prep.n_vit_w, aligner, want_rows * T, &rows,
+                                       NULL, 0) && rows == want_rows;
+        if (!ok) snprintf(err, errlen, "the vision tower failed");
     }
-    uint16_t *aligner = (uint16_t *)malloc((size_t)want_rows * (size_t)T * sizeof(uint16_t));
-    if (!aligner) return 0;
-    int rows = 0;
-    if (!vision_forward(w, m, prep->patches, prep->n_vit_h, prep->n_vit_w,
-                        aligner, want_rows * T, &rows, NULL, 0) ||
-        rows != want_rows) {
-        free(aligner);
-        return 0;
+    int out_len = 0;
+    if (ok) ok = vision_span_assemble(w, m, &prep, tower ? tower : aligner, want_rows, out, block_len * T, &out_len) &&
+                 out_len == block_len;
+    if (ok && aligner) {
+        *tower_out = aligner;
+        *n_tower_out = want_rows;
+        aligner = NULL;
     }
-    vision_span_cache_put(key, src_len, aligner, rows);
-    const int ok = vision_span_assemble(w, m, prep, aligner, rows, out, out_cap, out_len);
     free(aligner);
+    vision_prepared_free(&prep);
     return ok;
 }

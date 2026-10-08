@@ -1380,7 +1380,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
         }
         /* Before any state moves: a block that cannot sit whole in one chunk is
          * refused here (and by the TP leader before it mirrors anything). */
-        if (!vision_spans_fit(prompt->v, prompt->len, images, n_images, s->graph->prefill_cap, NULL, err, errlen))
+        if (!pulsar_image_spans_fit(e, prompt->v, prompt->len, images, n_images, s->graph->prefill_cap, NULL, err,
+                                    errlen))
             return 1;
         /* L226 + L261: reuse the live KV across an image request.  The images the
          * checkpoint already holds must be exactly the live set -- the fingerprint
@@ -1395,94 +1396,46 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
          * only when the request brings the same image there (pulsar_kvchain_restore), so a restored history's
          * records are what this licence compares; a LATER prompt whose sentinel ids outlive their images is still
          * refused by the scan below. */
-        /* The live history this prompt can keep: its common token prefix with the
-         * checkpoint (an echo that stops short of the live tail -- stripped
-         * reasoning, a rollback -- shares a prefix without extending it). */
-        const uint32_t live_len = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
-        uint32_t common = 0;
-        {
-            const uint32_t lim = live_len < (uint32_t)prompt->len ? live_len : (uint32_t)prompt->len;
-            while (common < lim && s->checkpoint.v[common] == prompt->v[common]) common++;
-        }
-        const uint32_t ck = common;
-        /* The licence decides on an EXTENSION of the live tokens (ck == live_len).
-         * A prompt that stops short of them or diverges -- a seam (sampled vs
-         * canonical ids below the live tail: every tool-continuation turn appends
-         * its reply as sampled ids and a regular turn re-sends the history
-         * canonically tokenized; the pair 2026-10-06 20:47, bytes matched to
-         * 222,215, ids to ~155,700, and the licence's own restore re-prefilled 66k
-         * tokens where a text turn pays ~1k), a shorter echo, a rollback -- is the
-         * seam rescue's below: it rewinds to the byte-matched live token,
-         * re-places every image block on the stitched tokens and re-enters, and
-         * this licence then decides on an extension.  checkpoint_valid stays for
-         * it; an empty bank falls through to the cold rebuild unannounced. */
-        const bool extends_live = s->checkpoint_valid && ck == live_len;
-        if (s->checkpoint_valid && !extends_live)
+        /* L268: the licence is the core's (image_front.cpp, pulsar_image_licence_decide) -- the common prefix with
+         * the live tokens, whether the prompt EXTENDS them, the blocks that straddle it, and whether the held
+         * images' records are exactly the live ones.  A prompt that stops short of the live tokens or diverges -- a
+         * seam (sampled vs canonical ids below the live tail: every tool-continuation turn appends its reply as
+         * sampled ids and a regular turn re-sends the history canonically tokenized; the pair 2026-10-06 20:47, bytes
+         * matched to 222,215, ids to ~155,700, and the licence's own restore re-prefilled 66k tokens where a text turn
+         * pays ~1k), a shorter echo, a rollback -- is the seam rescue's below: it rewinds to the byte-matched live
+         * token, re-places every image block on the stitched tokens and re-enters, and this licence then decides on an
+         * extension.  checkpoint_valid stays for it; an empty bank falls through to the cold rebuild unannounced. */
+        pulsar_image_licence lic;
+        pulsar_image_licence_decide(s, prompt, images, n_images, &lic);
+        if (s->checkpoint_valid && !lic.extends_live)
             fprintf(stderr, "pulsar: image request: the prompt leaves the live history at token %u of %u "
-                            "-- taking the seam rescue\n", ck, live_len);
-        if (!extends_live) {
-            resume_floor = 0u;
-        } else {
-        int n_new = 0;
-        bool straddles = false;
-        for (int i = 0; i < n_images && !straddles; i++) {
-            int len = 0;
-            (void)pulsar_image_block_extent(e, prompt->v, prompt->len, images[i].start_pos, &len);
-            const uint32_t bs = (uint32_t)images[i].start_pos, be = bs + (uint32_t)len;
-            if (be > ck && bs >= ck) n_new++;
-            else if (be > ck) straddles = true;
-        }
-        /* L281: the held images' records -- each block's rows and the bytes merged there -- must be exactly the
-         * live ones (image_identity.cpp) */
-        pulsar_image_identity held;
-        const bool held_ok = pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images,
-                                                         n_images, ck, &held);
-        const int n_held = held_ok ? (int)held.n : 0;
-        const int held_end = held_ok ? (int)pulsar_image_identity_end(&held) : 0;
-        /* The one image-specific constraint on the resume below: the grid
-         * checkpoint it restores must lie at or above the end of the last HELD
-         * block, so no merged row is re-evaluated (a B below the floor prefills
-         * from 0).  Everything else is the text path's and runs below unchanged:
-         * a bank whose compressor state is stale resumes from its grid checkpoint
-         * (L264; before, the licence declined it and rebuilt from 0 -- the pair
-         * 2026-10-06 17:58, 581k tokens), a prompt short of the live tail takes
-         * the seam rescue's rewind+stitch, and a history this bank does not hold
-         * rebuilds cold. */
-        resume_floor = held_end > 0
-            ? pulsar_ckpt_grid_floor(&s->graph->ckpt, (uint32_t)held_end + s->graph->ckpt.ops->resume_grid - 1u)
-            : 0u;
-        const bool reuse =
-            s->checkpoint_valid &&
-            !straddles && held_ok &&
-            pulsar_image_identity_equal(&s->live_images, &held);
-        if (!reuse) {
-            if (s->checkpoint_valid)
+                            "-- taking the seam rescue\n", lic.common, lic.live_len);
+        if (lic.extends_live) {
+            /* The one image-specific constraint on the resume below: the grid checkpoint it restores must lie at or
+             * above the end of the last HELD block, so no merged row is re-evaluated (a B below the floor prefills
+             * from 0).  Everything else is the text path's and runs below unchanged: a bank whose compressor state
+             * is stale resumes from its grid checkpoint (L264; before, the licence declined it and rebuilt from 0 --
+             * the pair 2026-10-06 17:58, 581k tokens), a prompt short of the live tail takes the seam rescue's
+             * rewind+stitch, and a history this bank does not hold rebuilds cold. */
+            resume_floor = lic.held_end > 0
+                ? pulsar_ckpt_grid_floor(&s->graph->ckpt, lic.held_end + s->graph->ckpt.ops->resume_grid - 1u)
+                : 0u;
+            if (!lic.keep) {
                 fprintf(stderr, "pulsar: image request: the live history's images are not this prompt's (%s) "
                                 "-- rebuilding cold\n",
-                        straddles ? "a block straddles the common prefix" : "different images or blocks");
-            s->checkpoint_valid = false;
-        } else {
-            fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
-                            "(merged where their blocks fall) -- reuse licensed\n",
-                    n_held, live_len, n_new);
-        }
-        }   /* extends_live */
-    } else {
-        /* A prompt carrying sentinel ids with no image to fill them would prefill
-         * rows whose embeddings never arrived -- the embedder zero-masks an
-         * out-of-vocab id, and only the merge puts anything there -- so refuse it
-         * here instead of silently serving a wrong answer.  A tokenizer never
-         * emits an id at or above vocab_size, so ANY such id is a sentinel.  The
-         * PLACEHOLDER id is in-vocab and would embed as ordinary text, so it is
-         * refused too: it is a renderer artifact that
-         * pulsar_expand_image_placeholders() must have replaced. */
-        for (int i = 0; i < prompt->len; i++) {
-            if (pulsar_image_is_sentinel(e, prompt->v[i]) || prompt->v[i] == e->vocab.image_id) {
-                snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request "
-                                      "carries no images", i, prompt->v[i]);
-                return 1;
+                        lic.straddles ? "a block straddles the common prefix" : "different images or blocks");
+                s->checkpoint_valid = false;
+            } else {
+                fprintf(stderr, "pulsar: image request: %d image(s) live in the %u-token prefix, %d new "
+                                "(merged where their blocks fall) -- reuse licensed\n",
+                        lic.n_held, lic.live_len, lic.n_new);
             }
         }
+    } else {
+        /* A prompt carrying sentinel ids with no image to fill them would prefill rows whose embeddings never
+         * arrived (the embedder zero-masks an out-of-vocab id, and only the merge puts anything there), so refuse it
+         * here instead of silently serving a wrong answer (L268: the core's scan, pulsar_image_refuse_orphans). */
+        if (!pulsar_image_refuse_orphans(e, prompt, err, errlen)) return 1;
     }
 
     /* The images are BORROWED for exactly this sync's prefill -- the resume
@@ -1500,7 +1453,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, const pulsar_image_ref *im
             : g(g_), prev(g_->vision_req) { g->vision_req = r; }
         ~vision_scope() { g->vision_req = prev; }
     };
-    pulsar_vision_request vreq = { images, n_images, &e->vision_weights };
+    pulsar_vision_request vreq = { images, n_images, e };
     vision_scope vscope(s->graph, n_images > 0 ? &vreq : NULL);
     /* L281: what the KV holds of this request's images -- the blocks that end at or below `limit` (the checkpoint
      * after a prefill, interrupted or not).  A text sync leaves the records alone: its prefix keeps its blocks. */

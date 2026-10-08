@@ -1100,6 +1100,15 @@ vision-visible-gate: tests/vision_visible_gate
 vision-placeholder-gate: tests/vision_placeholder_gate
 	./tests/vision_placeholder_gate tests/test-vectors/vision-image-goldens.bin
 
+# L268: Qwen's image preprocessing vs HF's own processor (tests/vision_qwen_pixel_goldens.py), bit for bit; host-only.
+vision-qwen-pixel-gate: tests/vision_qwen_pixel_gate
+	./tests/vision_qwen_pixel_gate tests/test-vectors/vision-qwen-pixel-goldens.bin
+
+# L268: Qwen's tower + merger vs HF's own modules (tests/vision_qwen_tower_goldens.py), graded against the reference's
+# bf16-vs-fp32 floor like vision-tower-gate; runs on the served Qwen container (it carries model.visual.*).
+vision-qwen-tower-gate: tests/vision_qwen_tower_gate
+	./tests/vision_qwen_tower_gate $(QWEN_GATE_MODEL) tests/test-vectors/vision-qwen-tower-goldens.bin
+
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-tower-gate: set VISION_MODEL=/path/to/a/vision-exp/checkpoint"; \
@@ -1797,7 +1806,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device \
+	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device vision-qwen-tower-gate \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -1812,7 +1821,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # shared hub) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
-	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate seam-check \
+	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate api-golden-gate sse-golden-gate spec-depth-gate \
 	loader-contract-gate render-gate
 # Every gate target is phony, declared HERE where the list is defined (the
@@ -2183,6 +2192,9 @@ tests/vision_image_sync_gate.o: tests/vision_image_sync_gate.cpp src/engine/puls
 tests/vision_placeholder_gate.o: tests/vision_placeholder_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_placeholder_gate.cpp
 
+tests/vision_qwen_pixel_gate.o: tests/vision_qwen_pixel_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_qwen_pixel_gate.cpp
+
 tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_hc_gate.cpp
 
@@ -2206,6 +2218,9 @@ tests/vision_span_gate.o: tests/vision_span_gate.cpp src/engine/pulsar_engine_in
 
 tests/vision_tower_gate.o: tests/vision_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_tower_gate.cpp
+
+tests/vision_qwen_tower_gate.o: tests/vision_qwen_tower_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_qwen_tower_gate.cpp
 
 tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_merge_gate.cpp
@@ -2335,6 +2350,9 @@ tests/vision_image_sync_gate: tests/vision_image_sync_gate.o src/lib/pulsar_help
 tests/vision_placeholder_gate: tests/vision_placeholder_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/vision_qwen_pixel_gate: tests/vision_qwen_pixel_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -2406,6 +2424,21 @@ tests/vision_span_gate: tests/vision_span_gate.o src/lib/pulsar_help.o $(CORE_OB
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_tower_gate: tests/vision_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/vision_qwen_tower_gate: tests/vision_qwen_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# L268: one image question end to end (tests/image_chat_smoke.cpp), graded on the answer's content.  Manual (a
+# model load of its own); the live server tier (server-live-gate) asks both families about an image too.
+QWEN_IMAGE_SMOKE ?= $(QWEN_GATE_MODEL)
+.PHONY: qwen-image-smoke-gate
+qwen-image-smoke-gate: tests/image_chat_smoke
+	python3 -c "import struct,zlib;w,h=480,360;rows=b''.join(b'\\x00'+b''.join(bytes((220,20,20)) if (x-w/2)**2+(y-h/2)**2<(0.35*h)**2 else b'\\xff\\xff\\xff' for x in range(w)) for y in range(h));c=lambda t,d:struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff);open('/tmp/qwen-image-smoke.png','wb').write(b'\\x89PNG\\r\\n\\x1a\\n'+c(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+c(b'IDAT',zlib.compress(rows,9))+c(b'IEND',b''))"
+	./tests/image_chat_smoke $(QWEN_IMAGE_SMOKE) /tmp/qwen-image-smoke.png "What color is the circle in this image? Answer with one word." red
+tests/image_chat_smoke.o: tests/image_chat_smoke.cpp src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/image_chat_smoke.cpp
+tests/image_chat_smoke: tests/image_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_merge_gate: tests/vision_merge_gate.o src/lib/pulsar_help.o $(CORE_OBJS)

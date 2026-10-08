@@ -2568,6 +2568,39 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                uint16_t *out, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks);
 
+/** L268: the image towers' GEMM (both families' towers, pulsar_cuda_vision.cu): C (f32, row-major [m x n], ldc) =
+ *  A (bf16 row-major [m x k], lda) . op(B), B bf16 row-major -- [n x k] with op(B) = B^T when b_trans, else [k x n].
+ *  f32 accumulate on cuBLASLt.  Returns 0 on refusal (said). */
+int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const uint16_t *b, int ldb, int b_trans,
+                            int m, int n, int k);
+
+/* L268: Qwen3.8-Flash-Next's vision tower (config.json vision_config; every `model.visual.*` tensor's dims follow).
+ * The weights are bf16 and read through the model's mapping, as DeepSeek's tower's are. */
+#define PULSAR_QWEN_VISION_LAYERS     27u
+#define PULSAR_QWEN_VISION_DIM        1152u
+#define PULSAR_QWEN_VISION_HEADS      16u
+#define PULSAR_QWEN_VISION_INTER      4304u
+#define PULSAR_QWEN_VISION_PATCH_IN   1536u     /* 3 channels x 2 frames x 16 x 16 */
+#define PULSAR_QWEN_VISION_POS_SIDE   48u       /* num_position_embeddings 2304 = 48 x 48 */
+#define PULSAR_QWEN_VISION_OUT        2560u     /* out_hidden_size: the language model's width */
+#define PULSAR_QWEN_VISION_ROPE_THETA 10000.0f
+typedef struct {
+    const void *norm1_w, *norm1_b, *qkv_w, *qkv_b, *proj_w, *proj_b;
+    const void *norm2_w, *norm2_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
+} pulsar_qwen_vision_block_dev;
+typedef struct {
+    const void *patch_w, *patch_b, *pos_embed;
+    pulsar_qwen_vision_block_dev block[PULSAR_QWEN_VISION_LAYERS];
+    const void *merger_norm_w, *merger_norm_b, *merger_fc1_w, *merger_fc1_b, *merger_fc2_w, *merger_fc2_b;
+} pulsar_qwen_vision_weights_dev;
+/** Tower + merger over ONE image: `patches` (n_tok x PATCH_IN bf16, 2x2 merge-block order), `pos` (n_tok x 2
+ *  int32: the patch's row and column), the learned-position taps (n_tok x 4 int32 table rows, n_tok x 4 f32
+ *  weights).  Writes n_tok/4 x OUT bf16 rows.  `dbg` (NULL in production) receives 3 x n_tok x DIM bf16: the
+ *  blocks' input, block 0's output, the last block's output.  Returns 0 on any refusal. */
+int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, const uint16_t *patches,
+                                    const int32_t *pos, const int32_t *interp_idx, const float *interp_w,
+                                    int n_tok, uint16_t *out, int out_cap, uint16_t *dbg);
+
 /* Tensor-parallel row lane, GPU half (L241 4g-2; src/cuda/pulsar_cuda_tp.cu).
  * One exchange = stage+publish + combine on the calling thread's stream;
  * nothing here waits on the host.  `slab_dev` is the registered slab's device
@@ -2723,6 +2756,12 @@ typedef struct {
      *  KV head and its 12 query heads: qg [n_rows][6144], k / v [n_rows][256], KV records of
      *  pulsar_qsa_kv_token_bytes(2) per token, an o_proj input [n_rows][3072]; the indexer whole. */
     int tp_ranks;
+    /** L268: interleaved multi-axis RoPE.  NULL = text positions (the row's position on every axis -- what the
+     *  three mRoPE axes are without images).  Else HOST [n_rows][6]: the row's (T, H, W) and the (T, H, W) of the
+     *  first token of its indexer block (pos - 3; read when the row completes the block -- that token may be an
+     *  earlier call's).  Rotary pair j takes H when j % 3 == 1, W when j % 3 == 2, else T (HF's
+     *  apply_interleaved_mrope over mrope_section [11, 11, 10]).  The KV row is still `row_pos`. */
+    const uint32_t *row_rope;
 } pulsar_qsa_io;
 
 /** Bytes of one token's KV record for one rank at the tensor-parallel degree tp_ranks (0 / 1: 1056). */
