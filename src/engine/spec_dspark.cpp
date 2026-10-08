@@ -1275,7 +1275,6 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .commit        = */ ds4_commit,
     /* .cut           = */ ds4_cut,
     /* .depth         = */ &k_ds4_depth,
-    /* .banks_max     = */ PULSAR_MSEQ_MAX,
 };
 
 /* ---- the DSpark drafter -------------------------------------------------------------------------- */

@@ -137,7 +137,7 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
  * conditions), small enough that a 400-token losing request recovers nearly
  * all of the loss.
  *
- * The step side of the guard is MEASURED (L263): pulsar_engine::spec_cost is
+ * The step side of the guard is MEASURED (L263): pulsar_engine::lane_cost[PULSAR_LANE_SPEC] is
  * an exponentially weighted least-squares fit of a decode round's wall time
  * on the rows its forward carried, round = flat + row * rows, fed by the
  * server's round loop (the single lane off TP feeds its own steps).  Nothing
@@ -163,23 +163,23 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
 /* The break-even yield for a bank with `n_batch` rows in a round shared by
  * `banks` banks (see above).  Integer microseconds in, so every rank of a TP
  * group computes the same value from the same wire terms. */
-static float spec_quench_guard(const pulsar_spec_cost_fit *c, int banks, uint32_t n_batch) {
+static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_t n_batch) {
     const float share = (float)c->flat_us / (float)(banks > 0 ? banks : 1);
     const float row = (float)c->row_us;
     return (share + row * (float)n_batch) / (share + row);
 }
 
-/* L263: one observation into the fit.  Decay 255/256 per round (a window of
- * ~256 rounds, 15-25 s of decode: at c1 the rows spread only 2..6, so a
- * 64-round window let the slope swing 1..6 ms/row between adjacent windows
- * -- the pair, 2026-10-05); valid once 16 rounds are in, the row counts have
- * spread (an EW variance of at least 1/4: adaptive depth and concurrency
- * move them every few rounds) and both terms are positive -- anything else
- * is noise, not a price. */
+/* L263: one observation into the fit (L284: either lane's -- the plain lane's
+ * steps feed the same structure).  Decay 255/256 per step (a window of ~256
+ * steps, 15-25 s of decode: at c1 the rows spread only 2..6, so a 64-round
+ * window let the slope swing 1..6 ms/row between adjacent windows -- the pair,
+ * 2026-10-05); valid once 16 steps are in, the row counts have spread (an EW
+ * variance of at least 1/4: adaptive depth and concurrency move them every few
+ * rounds) and both terms are positive -- anything else is noise, not a price. */
 #define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
 #define SPEC_COST_MIN_OBS 16u
 #define SPEC_COST_MIN_VAR 0.25
-void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
+void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
     if (!f || rows == 0 || !(ms > 0.0)) return;
     const double x = (double)rows, y = ms;
     f->w   = f->w   * SPEC_COST_DECAY + 1.0;
@@ -198,6 +198,30 @@ void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms) {
     f->flat_us = (int32_t)(flat * 1000.0 + 0.5);
     f->row_us = (int32_t)(row * 1000.0 + 0.5);
     f->valid = f->flat_us > 0 && f->row_us > 0;
+}
+
+pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
+    pulsar_lane_cost c;
+    memset(&c, 0, sizeof c);
+    c.flat_us = f->flat_us;
+    c.row_us = f->row_us;
+    c.n = f->n;
+    c.valid = f->valid;
+    if (f->w > 0.0) {
+        c.mean_rows = (float)(f->sx / f->w);
+        c.mean_ms = (float)(f->sy / f->w);
+    }
+    return c;
+}
+
+/* L284: the slope is needed only AWAY from the fit's centre -- a fit whose rows
+ * never spread (a steady N on the plain lane) still knows its cost at N. */
+double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows) {
+    if (!c || !(rows > 0.0)) return 0.0;
+    if (c->valid) return ((double)c->flat_us + (double)c->row_us * rows) / 1000.0;
+    if (c->n >= SPEC_COST_MIN_OBS && c->mean_ms > 0.0f && fabs(rows - (double)c->mean_rows) <= 0.5)
+        return (double)c->mean_ms;
+    return 0.0;
 }
 
 /* All-zero == armed, matching the xcalloc'd session. */
@@ -609,9 +633,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (!s->spec.spec_quenched) {
         s->spec.spec_quench_steps++;
         bool fire = false;
-        if (e->spec_cost.valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
+        const pulsar_lane_cost_fit *cost = &e->lane_cost[PULSAR_LANE_SPEC];
+        if (cost->valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(&e->spec_cost, s->spec.spec_round_banks, n_batch);
+                                 spec_quench_guard(cost, s->spec.spec_round_banks, n_batch);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
@@ -820,7 +845,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
      * included.  Off TP only: a group's ranks must hold the same fit, and this
      * lane has no frame to carry one, so on a group neither rank observes
      * here (the batched lane ships the leader's with every round's end). */
-    if (na >= 0 && !e->tp) pulsar_engine_spec_cost_observe(e, n_rows, (now_sec() - t0) * 1e3);
+    if (na >= 0 && !e->tp) pulsar_engine_lane_cost_observe(e, PULSAR_LANE_SPEC, n_rows, (now_sec() - t0) * 1e3);
     return na;
 }
 

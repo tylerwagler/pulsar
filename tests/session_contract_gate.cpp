@@ -21,8 +21,8 @@
  *   B4  the router's view: bank_pos / bank_tokens per bank, live and carried
  *   B5  the demand-paged accounting: each bank's touched KV is priced and sums within the session's, a decode
  *       quantum is priced; a per-bank physical eviction of an idle bank leaves it holding nothing
- *   B6  a verify step over several banks' runs (the speculation lane's) gives each bank its run's rows verified
- *       alone, byte for byte (L272 P1 S4)
+ *   B6  a verify step over two, three and four banks' runs (the speculation lane's, up to ten rows) gives each
+ *       bank its run's rows verified alone, byte for byte (L272 P1 S4, L284)
  * The fused step (L284 #2; pulsar_session_decode_fused: a verify's rows and a prompt chunk in one forward), bank 0
  * verifying 3 rows in front of bank 1's chunk of 62 and of 70 rows (either side of the attention's 64-row fold):
  *   F1  the verify rows' logits == the same rows verified alone, byte for byte (B6's oracle)
@@ -342,6 +342,8 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
 }
 
 /* B1-B5 on the same engine */
+static std::vector<float> verify_alone(pulsar_engine *e, const pulsar_tokens *P, const int *run, int nr, int W);
+
 static void part_banks(pulsar_engine *e, int W) {
     pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
     pulsar_tokens B = text_tokens(e, "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return");
@@ -448,56 +450,51 @@ static void part_banks(pulsar_engine *e, int W) {
 
     pulsar_session_free(s);
 
-    /* B6 (L272 P1 S4): a verify step over several banks' runs -- the speculation lane's step, every row headed --
-     * gives each bank the rows its run gives verified alone, byte for byte: bank 0's run [ta, 11, 12] and bank 1's
-     * [tb, 13] in one step against each in a one-bank session */
+    /* B6 (L272 P1 S4; L284 to four banks): a verify step over several banks' runs -- the speculation lane's step,
+     * every row headed -- gives each bank the rows its run gives verified alone, byte for byte.  Two, three and
+     * four banks: bank 0's run [ta, 11, 12], bank 1's [tb, 13], bank 2's (A again) [ta, 14], bank 3's (B again)
+     * [tb, 17, 18] -- ten rows at four banks, the widest step whose rows keep their one-token bytes in both
+     * families (DeepSeek's decode GEMMs leave the GEMV for cuBLASLt / the E4M3 MMA from 11 rows; Qwen's at 17).
+     * Wider verify steps are graded, not byte-gated (L284). */
     if (!pulsar_engine_has_spec_rounds(e)) {
         printf("  skip  B6 (no drafter on this model: a verify step needs one)\n");
     } else {
-        const int runA[3] = {ta, 11, 12}, runB[2] = {tb, 13};
-        auto solo = [&](const pulsar_tokens *P, const int *run, int nr) {
-            std::vector<float> rows;
-            pulsar_engine_set_bank_pool(1);
+        struct b6_run { const pulsar_tokens *P; int run[3]; int nr; };
+        const b6_run runs[4] = {{&A, {ta, 11, 12}, 3}, {&B, {tb, 13}, 2}, {&A, {ta, 14}, 2}, {&B, {tb, 17, 18}, 3}};
+        std::vector<float> solo[4];
+        for (int b = 0; b < 4; b++) solo[b] = verify_alone(e, runs[b].P, runs[b].run, runs[b].nr, W);
+        for (int nb = 2; nb <= 4; nb++) {
+            pulsar_engine_set_bank_pool((uint32_t)nb);
             pulsar_session *x = NULL;
-            char e2[256] = "";
-            if (pulsar_session_create(&x, e, 4096) != 0) return rows;
-            if (pulsar_session_sync(x, P, e2, sizeof(e2)) == 0) {
-                std::vector<pulsar_multiseq_req> q((size_t)nr);
-                for (int i = 0; i < nr; i++) q[(size_t)i] = {0u, P->len + i, run[i]};
-                rows.resize((size_t)nr * W);
-                uint32_t got = 0;
-                if (pulsar_session_decode_mixed(x, q.data(), (uint32_t)nr, rows.data(), nr * W, &got,
-                                                PULSAR_MSEQ_HEAD_ALL_ROWS, e2, sizeof(e2)) != 0 || got != (uint32_t)nr) {
-                    fprintf(stderr, "session-contract: B6 solo verify: %s\n", e2);
-                    rows.clear();
-                }
+            std::vector<pulsar_multiseq_req> q;
+            bool ran = pulsar_session_create(&x, e, 4096) == 0;
+            for (int b = 0; ran && b < nb; b++) {
+                ran = pulsar_session_bank_state_restore(x, (uint32_t)b) &&
+                      pulsar_session_sync(x, runs[b].P, err, sizeof(err)) == 0;
+                if (ran) pulsar_session_bank_state_save(x, (uint32_t)b);
+                for (int i = 0; i < runs[b].nr; i++) q.push_back({(uint32_t)b, runs[b].P->len + i, runs[b].run[i]});
             }
-            pulsar_session_free(x);
-            return rows;
-        };
-        const std::vector<float> soloA = solo(&A, runA, 3), soloB = solo(&B, runB, 2);
-        pulsar_engine_set_bank_pool(2);
-        pulsar_session *x = NULL;
-        std::vector<float> both;
-        bool ran = pulsar_session_create(&x, e, 4096) == 0;
-        ran = ran && pulsar_session_bank_state_restore(x, 0) && pulsar_session_sync(x, &A, err, sizeof(err)) == 0;
-        if (ran) pulsar_session_bank_state_save(x, 0);
-        ran = ran && pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, &B, err, sizeof(err)) == 0;
-        if (ran) pulsar_session_bank_state_save(x, 1);
-        if (ran) {
-            const pulsar_multiseq_req q[5] = {{0u, A.len, runA[0]}, {0u, A.len + 1, runA[1]}, {0u, A.len + 2, runA[2]},
-                                              {1u, B.len, runB[0]}, {1u, B.len + 1, runB[1]}};
-            both.resize((size_t)5 * W);
+            const uint32_t nr = (uint32_t)q.size();
+            CHECK(nr <= pulsar_engine_fused_heads_max(e), "B6 %d banks' runs (%u rows) fit the verify width %u", nb,
+                  nr, pulsar_engine_fused_heads_max(e));
+            std::vector<float> all((size_t)nr * W);
             uint32_t got = 0;
-            ran = pulsar_session_decode_mixed(x, q, 5u, both.data(), 5 * W, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
-                                              sizeof(err)) == 0 && got == 5u;
+            ran = ran && pulsar_session_decode_mixed(x, q.data(), nr, all.data(), (int)nr * W, &got,
+                                                     PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err)) == 0 && got == nr;
+            std::string verdict;
+            bool same_all = ran;
+            size_t at = 0;
+            for (int b = 0; b < nb; b++) {
+                const size_t n = (size_t)runs[b].nr * W;
+                const bool same_b = ran && solo[b].size() == n && memcmp(all.data() + at, solo[b].data(), n * 4) == 0;
+                same_all = same_all && same_b;
+                verdict += " bank " + std::to_string(b) + (same_b ? " identical" : " DIFFERS");
+                at += n;
+            }
+            CHECK(same_all, "B6 a verify of %d banks' runs (%u rows) == each run verified alone:%s %s", nb, nr,
+                  verdict.c_str(), ran ? "" : err);
+            if (x) pulsar_session_free(x);
         }
-        const bool same_a = ran && soloA.size() == (size_t)3 * W && memcmp(both.data(), soloA.data(), soloA.size() * 4) == 0;
-        const bool same_b = ran && soloB.size() == (size_t)2 * W &&
-                            memcmp(both.data() + (size_t)3 * W, soloB.data(), soloB.size() * 4) == 0;
-        CHECK(same_a && same_b, "B6 a verify of two banks' runs (3 + 2 rows) == each run verified alone: bank 0 %s, bank 1 %s %s",
-              same_a ? "identical" : "DIFFERS", same_b ? "identical" : "DIFFERS", ran ? "" : err);
-        if (x) pulsar_session_free(x);
     }
     pulsar_tokens_free(&A);
     pulsar_tokens_free(&B);

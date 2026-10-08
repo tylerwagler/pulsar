@@ -72,9 +72,8 @@ typedef struct pulsar_spec_target_ops {
     void (*cut)(struct pulsar_session *s, int pos);
     /** The adaptive depth controller's constants, or NULL = a fixed depth (the drafter's default). */
     const pulsar_spec_depth_policy *depth;
-    /** How many banks one shared verify forward may carry (DeepSeek: the pool; Qwen: 1 until the GDN and
-     *  PLE kernels take N banks x R rows, L272 P1 S4).  The server's lane choice reads it. */
-    uint32_t banks_max;
+    /* The rows one shared verify forward carries -- and so the decoders it carries, one base row each -- are the
+     * family's session fact pulsar_family_session_ops::fused_heads_max (L284), not a field here. */
 } pulsar_spec_target_ops;
 
 /** A DRAFTER: its own weights and per-bank context, behind the round API. */

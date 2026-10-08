@@ -1757,17 +1757,18 @@ struct pulsar_vocab {
  * One engine owns the weights; MANY sessions share it. Everything here is
  * immutable after open() except the cumulative metrics counters -- which is
  * what makes concurrent sessions safe against a single engine. */
-/* L263: the spec lane's self-measured step cost (pulsar.h pulsar_spec_cost is
- * the read-only view).  Exponentially weighted least squares of a round's wall
- * time on the rows its forward carried: round_ms = flat + row * rows. */
+/* L263 / L284: a decode lane's self-measured step cost (pulsar.h pulsar_lane_cost
+ * is the read-only view), one structure for both lanes.  Exponentially weighted
+ * least squares of a step's wall time on the rows its forward carried:
+ * step_ms = flat + row * rows. */
 typedef struct {
     double w, sx, sy, sxx, sxy;  ///< EW sums: weight, rows, ms, rows^2, rows*ms
-    uint32_t n;                  ///< rounds observed
+    uint32_t n;                  ///< steps observed
     int32_t flat_us, row_us;     ///< the fit, in microseconds, when `valid`
-    bool valid;                  ///< enough evidence (spec_cost_fit_observe says what)
+    bool valid;                  ///< enough evidence (lane_cost_fit_observe says what)
     int32_t ann_flat_us, ann_row_us;  ///< the last announced terms (0: never)
     uint32_t ann_n;                   ///< `n` at that announcement
-} pulsar_spec_cost_fit;
+} pulsar_lane_cost_fit;
 
 struct pulsar_engine {
     /** The model family, chosen once at open from `general.architecture`
@@ -1793,11 +1794,12 @@ struct pulsar_engine {
     pulsar_dspark_weights dspark_weights;  ///< resolved drafter tensors
     pulsar_backend backend;     ///< CPU or CUDA
     int dspark_draft_tokens;    ///< configured draft depth k
-    /** L263: the spec lane's measured step cost (pulsar_engine_spec_cost).
-     * Written by the leader's observations (the server's round loop, or the
-     * single lane off TP) or, on a TP worker, by the leader's values riding
-     * SPEC_ROUND_END_BATCH; read by the quench guard and the allocator. */
-    pulsar_spec_cost_fit spec_cost;
+    /** L263 / L284: each decode lane's measured step cost (pulsar_engine_lane_cost), indexed by
+     * pulsar_decode_lane.  Written by the leader's observations (the server's step loops, or the
+     * single lane off TP) or, for the spec lane on a TP worker, by the leader's values riding
+     * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
+     * the server's lane choice. */
+    pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -2122,7 +2124,7 @@ typedef struct pulsar_spec_carry_state {
      * plain zeroing. Controller design after Entrpi ds4 v0.1.1 (MIT).
      *
      * The guard prices the step from the engine's MEASURED cost (L263,
-     * pulsar_engine::spec_cost) -- the quench point moves with the machine,
+     * pulsar_engine::lane_cost[PULSAR_LANE_SPEC]) -- the quench point moves with the machine,
      * not with a fixed stream; both paths sample the exact target
      * distribution, so only speed is at stake.  Multiseq note: this state belongs to the classic single-request flow;
      * the dormant multi-bank driver would need per-bank copies (not wired —
@@ -2937,7 +2939,9 @@ char *pulsar_strdup(const char *s);
 void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
 
-void spec_cost_fit_observe(pulsar_spec_cost_fit *f, uint32_t rows, double ms);
+void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms);
+/** The read-only view of one fit (its terms, count and weighted centre). */
+pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f);
 /** A TP worker takes the leader's terms as they rode the wire. */
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);

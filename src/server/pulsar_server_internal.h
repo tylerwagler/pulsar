@@ -1468,6 +1468,27 @@ bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsign
 /** Period of the MemAvailable-floor provisioning refusal line. */
 #define PULSAR_SERVER_MEM_FLOOR_WARN_SEC 10.0
 
+/** L284 lane cost: the scheduler's priced choice between the plain and spec decode lanes, one rule for every
+ *  family (server_sched.cpp lane_price_pick).  The spec lane's acceptance is measured here, per bank per decode
+ *  round; both lanes' step costs are the engine's fits (pulsar_engine_lane_cost).  All-zero is the start state. */
+typedef struct {
+    float tau;            ///< EW tokens a bank commits per spec round, base included (0: never measured)
+    float rho;            ///< EW rows a bank carries per spec round, base included
+    int lane;             ///< the priced lane while spec could carry the decoders: 2 or 3 (0: none yet -> 3)
+    int probe;            ///< the lane being measured against `lane` (0: none)
+    uint32_t probe_n0;    ///< that lane's step count when the probe began
+    uint32_t held_n0;     ///< `lane`'s step count when it was chosen or last weighed (hold and re-probe count from it)
+    int meas_n;           ///< the decoder count the measured prices below are for
+    double meas_tok[PULSAR_LANE_COUNT];        ///< EW tokens a step committed there, per pulsar_decode_lane
+    double meas_ms[PULSAR_LANE_COUNT];         ///< EW wall of those steps, ms
+    uint32_t meas_steps[PULSAR_LANE_COUNT];    ///< steps measured there
+    double t_plain;       ///< the last prices, tokens/s (0: no number) -- announced with the lane
+    double t_spec;
+    bool meas_plain;      ///< ...and whether each was measured at the decoders' count (else predicted)
+    bool meas_spec;
+    const char *why;      ///< the last pick's reason, announced with the lane
+} lane_price;
+
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
  * ONE worker thread does every piece of engine work; client threads only parse,
@@ -1643,6 +1664,9 @@ struct server {
      * this" from "no speculative decoding ran at all". */
     int w_decode_lane;  ///< worker-owned current lane
     int m_decode_lane;  ///< published copy, read by send_metrics
+    /** L284 lane cost: the priced choice between the plain (2) and spec (3) lanes while the spec lane could carry
+     *  every decoder (server_sched.cpp lane_price_pick).  Worker-owned. */
+    lane_price w_lane_price;
     uint64_t m_prompt_tokens;  ///< cumulative prompt tokens prefilled
     uint64_t m_prefix_queries;  ///< cumulative prompt tokens seen (hit-rate denom)
     uint64_t m_prefix_hits;  ///< cumulative prompt tokens served from prefix cache

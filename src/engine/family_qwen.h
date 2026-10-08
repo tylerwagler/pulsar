@@ -372,7 +372,8 @@ typedef enum {
 #define PULSAR_QWEN_SPEC_DRAFT_MAX 6u
 /** L272 P1 S4: the rows one verify step carries, every bank's run together -- the head's row cap, which is
  *  also the widest step whose kernels keep their decode-width arms (each row's logits the bytes a one-token
- *  decode gives).  N banks verify together while N x (K + 1) <= this. */
+ *  decode gives).  The family's verify width (fused_heads_max, L284): the server's allocator fits N banks'
+ *  drafts within it, one base row each. */
 #define PULSAR_QWEN_SPEC_ROWS PULSAR_QWEN_HEAD_ROWS_MAX
 
 /** L251 MTP: what a verify step keeps so a rejected draft rolls back (qwen_spec_*): the recurrent

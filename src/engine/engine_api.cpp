@@ -314,7 +314,6 @@ void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { 
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
-uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e) {
     return pulsar_engine_has_fused_step(e) ? e->family->session->fused_heads_max : 0u;
@@ -1459,7 +1458,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
      * leader's measured spec cost rides the header (v24): the guard every
      * rank's round_end prices the quench with is computed from these same
      * integers, so a quench latches on every rank or on none. */
-    const pulsar_spec_cost_fit *cost = &s->engine->spec_cost;
+    const pulsar_lane_cost_fit *cost = &s->engine->lane_cost[PULSAR_LANE_SPEC];
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH, operation, steps, n,
                               cost->flat_us, cost->row_us, cost->valid ? 1 : 0))
         return tp_spec_steps_fail(steps, n, operation);
@@ -1500,14 +1499,15 @@ void pulsar_session_invalidate(pulsar_session *s) {
                         pulsar_tp_send_invalidate(tp, s->tp_session_id), NULL, 0)) return;
     pulsar_session_family_invalidate(s);
 }
-void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms) {
-    if (!e) return;
-    pulsar_spec_cost_fit *f = &e->spec_cost;
-    spec_cost_fit_observe(f, rows, ms);
+void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms) {
+    if (!e || (unsigned)lane >= (unsigned)PULSAR_LANE_COUNT) return;
+    pulsar_lane_cost_fit *f = &e->lane_cost[lane];
+    lane_cost_fit_observe(f, rows, ms);
     if (!f->valid) return;
     /* Rule 5: the fit announces itself when it first arms and, at most once a
      * window, whenever a term has moved by half from what was last announced
-     * -- the number the quench prices with is in the log, not inferred. */
+     * -- the number the quench and the lane choice price with is in the log,
+     * not inferred. */
     const bool first = f->ann_flat_us == 0;
     const bool moved = !first && f->n - f->ann_n >= 256u &&
                        (abs(f->flat_us - f->ann_flat_us) * 2 > f->ann_flat_us ||
@@ -1516,23 +1516,22 @@ void pulsar_engine_spec_cost_observe(pulsar_engine *e, uint32_t rows, double ms)
         f->ann_flat_us = f->flat_us;
         f->ann_row_us = f->row_us;
         f->ann_n = f->n;
-        fprintf(stderr, "pulsar: spec cost measured: round = %.1f + %.2f x rows ms (%u rounds%s)\n",
-                (double)f->flat_us / 1000.0, (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
+        fprintf(stderr, "pulsar: %s lane cost measured: step = %.1f + %.2f x rows ms (%u steps%s)\n",
+                lane == PULSAR_LANE_SPEC ? "spec" : "plain", (double)f->flat_us / 1000.0,
+                (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
     }
 }
-pulsar_spec_cost pulsar_engine_spec_cost(const pulsar_engine *e) {
-    pulsar_spec_cost c;
-    memset(&c, 0, sizeof c);
-    if (!e) return c;
-    c.flat_us = e->spec_cost.flat_us;
-    c.row_us = e->spec_cost.row_us;
-    c.n = e->spec_cost.n;
-    c.valid = e->spec_cost.valid;
-    return c;
+pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane) {
+    if (!e || (unsigned)lane >= (unsigned)PULSAR_LANE_COUNT) {
+        pulsar_lane_cost c;
+        memset(&c, 0, sizeof c);
+        return c;
+    }
+    return lane_cost_fit_view(&e->lane_cost[lane]);
 }
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid) {
     if (!e) return;
-    pulsar_spec_cost_fit *f = &e->spec_cost;
+    pulsar_lane_cost_fit *f = &e->lane_cost[PULSAR_LANE_SPEC];
     f->flat_us = flat_us;
     f->row_us = row_us;
     f->valid = valid && flat_us > 0 && row_us > 0;

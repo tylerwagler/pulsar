@@ -132,7 +132,7 @@
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
  * measured sublinear c4 scaling); the row cost (measured live since L263,
- * pulsar_engine_spec_cost; L214's refit put it at 7.17 ms) has no cliff, so a 32-row slab (+8.3 MB logits) lets the
+ * pulsar_engine_lane_cost; L214's refit put it at 7.17 ms) has no cliff, so a 32-row slab (+8.3 MB logits) lets the
  * ranked allocator keep K near its survival optimum at c4. Every consumer
  * derives from THIS constant (slab alloc, driver reject, lane arrays,
  * dspark batch-capture buffer) -- audited 2026-08-27, rows/L117.md. */

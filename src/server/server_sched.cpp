@@ -1421,20 +1421,21 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * lane (3) takes every decoder when a drafter runs behind the round API
  * (pulsar_engine_has_spec_rounds), every decoder speculates (spec_enabled: a
  * logprobs request does not), none sits in the plain multiseq batch, and the
- * decoders are no more than one shared verify forward carries
- * (pulsar_engine_spec_banks_max: the pool on DeepSeek; two on Qwen, L272 P1 S4);
+ * decoders are no more than one shared verify forward carries, one base row each
+ * (pulsar_engine_fused_heads_max, the family's verify width -- L284: DeepSeek 32,
+ * Qwen 16; the allocator shortens the drafts to fit, spec_alloc_rows);
  * the plain batched lane (2) otherwise; the classic lane (1) with no pool.  Lane 3
- * keeps the spec_decode counters advancing; lane 2 does not.  Decoders left in the
- * plain batch rejoin lane 3 through server::batch_leave before this pick once it
- * can carry them all (server_batch_may_leave: L271, L284). */
-/* L271 / L284: when decoders sitting in the plain multiseq batch leave it (server::batch_leave) for the spec
- * lane -- as soon as that lane can take every decoder: the drafter runs behind the round API, they are no more
- * than one verify forward carries, and each speculates with no constrained tool name open (the lane pick's own
- * conditions, so a leave is never undone by the next pick).  Before, only a LONE decoder left: decoders that had
- * once outnumbered the family's spec banks stayed plain for the rest of their lives. */
-static bool server_batch_may_leave(bool spec_rounds, uint32_t banks_max, session_slot *const *dec, int n_dec,
-                                   int n_batched) {
-    if (!spec_rounds || n_batched <= 0 || n_dec <= 0 || (uint32_t)n_dec > banks_max) return false;
+ * keeps the spec_decode counters advancing; lane 2 does not.  Where lane 3 COULD
+ * carry every decoder (server_spec_lane_carries), whether it does is priced
+ * (L284 lane cost, lane_price_pick): the spec lane is offered to this pick only
+ * when it is the faster, and decoders left in the plain batch rejoin it through
+ * server::batch_leave before this pick (L271, L284). */
+/* L271 / L284: whether the spec lane could take every decoder: the drafter runs behind the round API, they are
+ * no more than one verify forward carries, and each speculates with no constrained tool name open (the lane
+ * pick's own conditions, batch membership aside: a decoder in the plain batch leaves it when the price picks
+ * spec, so a leave is never undone by the next pick). */
+static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, session_slot *const *dec, int n_dec) {
+    if (!spec_rounds || n_dec <= 0 || (uint32_t)n_dec > verify_rows) return false;
     for (int i = 0; i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         if (!dg || !dg->spec_enabled || gen_tool_name_open(dg)) return false;
@@ -1442,9 +1443,172 @@ static bool server_batch_may_leave(bool spec_rounds, uint32_t banks_max, session
     return true;
 }
 
-static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t banks_max,
+/* ==== L284 lane cost: ONE priced choice between the plain and spec lanes, every family ====================
+ *
+ * Tyler 2026-10-08: "Make the model behaviors match."  The spec lane's tokens a round over its round's cost
+ * against the plain lane's decoders a step over its step's cost, one rule for every family.  Each lane's price
+ * for the N decoders at hand, tokens/s, is
+ *   - MEASURED where that lane has run at this N: the tokens it committed over its steps' wall, EW
+ *     (lane_price::meas_*, reset when N moves);
+ *   - else PREDICTED from the engine's fits (pulsar_engine_lane_cost, one structure, step_ms = flat + row *
+ *     rows) and the spec lane's measured yield per bank per round (lane_price::tau / rho):
+ *         plain = N / plain_ms(N)
+ *         spec  = N * tau / spec_ms(N * rho)       (rows past the verify width: the allocator rations the
+ *                                                   drafts, so the accepted drafts prorate with those kept)
+ * A prediction only ever starts a MEASUREMENT (a probe of the other lane); the decoders change lanes on
+ * measured prices at their N.  A linear fit extrapolated past the rows it has seen was 15% off on DeepSeek at
+ * N8 (spec priced 84 tok/s against the 99.5 it serves) and moved eight decoders to a slower plain lane.
+ * No family constant enters: Qwen's 16-row and DeepSeek's 32-row widths, their drafters' acceptance and their
+ * kernels' costs are all in the measured numbers.  (L284 specrows measured why it must be priced: Qwen's spec
+ * lane at ~0.55 acceptance lost to plain at N >= 3, 64.6 vs 67.2 tok/s at N3 and 76.0 vs 91.1 at N6, where a
+ * lone DeepSeek stream gains 11% from it.)
+ *
+ * The controller's own constants, not a deployment's:
+ *   - hysteresis: the other lane must price LANE_PRICE_MARGIN faster, and the lane in force has run
+ *     LANE_PRICE_HOLD_STEPS steps since it was chosen or last weighed, before a probe or a switch (a switch
+ *     costs every decoder a bank restore);
+ *   - no number, no decision: a lane with no price at this N, or a predicted price past the margin, is
+ *     probed -- run until LANE_PRICE_PROBE_STEPS of its steps are in -- and the probe's end weighs the two,
+ *     the lane in force keeping ties within the margin;
+ *   - prices go stale with the content (acceptance) and the context (cost): once the lane in force has run
+ *     LANE_PRICE_REPROBE_STEPS steps since its last weighing, the other lane is probed again.  Counted in
+ *     steps, not quanta (a spec quantum at twelve decoders is one round): one 32-step probe per 512 steps is
+ *     ~6% of the decode time, so at the measured 10-15% gap probing costs about 1% at most. */
+#define LANE_PRICE_MARGIN        0.04
+#define LANE_PRICE_HOLD_STEPS    32u
+#define LANE_PRICE_PROBE_STEPS   32u
+#define LANE_PRICE_REPROBE_STEPS 512u
+#define LANE_PRICE_ALPHA         0.0625f   /* the measured prices' and yield's EW weight: a probe's 32 steps
+                                              carry ~7/8 of the price it ends on */
+
+/* One decode step on lane `li` (PULSAR_LANE_PLAIN / _SPEC) by `n` decoders: `tokens` committed in `ms`. */
+static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
+    if (n <= 0 || tokens < 0 || !(ms > 0.0)) return;
+    if (n != lp->meas_n) {   /* another decoder count: what was measured prices it no longer */
+        memset(lp->meas_tok, 0, sizeof lp->meas_tok);
+        memset(lp->meas_ms, 0, sizeof lp->meas_ms);
+        memset(lp->meas_steps, 0, sizeof lp->meas_steps);
+        lp->meas_n = n;
+    }
+    const double a = lp->meas_steps[li] ? (double)LANE_PRICE_ALPHA : 1.0;
+    lp->meas_tok[li] += a * ((double)tokens - lp->meas_tok[li]);
+    lp->meas_ms[li] += a * (ms - lp->meas_ms[li]);
+    lp->meas_steps[li]++;
+}
+
+/* One plain decode step: `n` decoders committed a token each in `ms`. */
+static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
+    lane_price_measure(lp, PULSAR_LANE_PLAIN, n, n, ms);
+}
+
+/* One spec decode round: `tokens` committed by `banks` banks over `rows` verify rows in `ms`. */
+static void lane_price_observe_spec(lane_price *lp, int tokens, int rows, int banks, double ms) {
+    if (banks <= 0 || rows <= 0 || tokens < 0) return;
+    lane_price_measure(lp, PULSAR_LANE_SPEC, banks, tokens, ms);
+    const float tau = (float)tokens / (float)banks, rho = (float)rows / (float)banks;
+    if (lp->tau <= 0.0f) {
+        lp->tau = tau;
+        lp->rho = rho;
+        return;
+    }
+    lp->tau += LANE_PRICE_ALPHA * (tau - lp->tau);
+    lp->rho += LANE_PRICE_ALPHA * (rho - lp->rho);
+}
+
+/* The lanes' predicted prices for `n` decoders, tokens/s (0: no number). */
+static double lane_price_plain(const pulsar_lane_cost *c, int n) {
+    const double ms = pulsar_lane_cost_ms(c, (double)n);
+    return ms > 0.0 ? 1000.0 * (double)n / ms : 0.0;
+}
+static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, uint32_t verify_rows) {
+    if (!(lp->tau > 0.0f) || !(lp->rho >= 1.0f)) return 0.0;
+    double rows = (double)n * lp->rho, toks = (double)n * lp->tau;
+    if (rows > (double)verify_rows) {
+        const double drafts = rows - (double)n, kept = (double)verify_rows - (double)n;
+        toks = (double)n + (toks - (double)n) * (kept > 0.0 ? kept / drafts : 0.0);
+        rows = (double)verify_rows;
+    }
+    const double ms = pulsar_lane_cost_ms(c, rows);
+    return ms > 0.0 ? 1000.0 * toks / ms : 0.0;
+}
+/* Lane `li`'s measured price at `n` decoders, tokens/s (0: not measured there). */
+static double lane_price_measured(const lane_price *lp, int li, int n) {
+    if (lp->meas_n != n || lp->meas_steps[li] < LANE_PRICE_PROBE_STEPS || !(lp->meas_ms[li] > 0.0)) return 0.0;
+    return 1000.0 * lp->meas_tok[li] / lp->meas_ms[li];
+}
+
+/* The priced lane (2 plain, 3 spec) for `n` decoders the spec lane could carry; called once a quantum.  The
+ * fits' step counts (pulsar_lane_cost::n) time the hold and the probes.  Updates lp's prices and reason. */
+static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
+                           uint32_t verify_rows) {
+    if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
+        lp->lane = 3;
+        lp->held_n0 = spec->n;
+    }
+    const double mp = lane_price_measured(lp, PULSAR_LANE_PLAIN, n);
+    const double msp = lane_price_measured(lp, PULSAR_LANE_SPEC, n);
+    lp->meas_plain = mp > 0.0;
+    lp->meas_spec = msp > 0.0;
+    lp->t_plain = lp->meas_plain ? mp : lane_price_plain(plain, n);
+    lp->t_spec = lp->meas_spec ? msp : lane_price_spec(spec, lp, n, verify_rows);
+    const int inc = lp->lane, other = inc == 3 ? 2 : 3;
+    const double t_inc = inc == 3 ? lp->t_spec : lp->t_plain, t_other = other == 3 ? lp->t_spec : lp->t_plain;
+    const bool other_measured = other == 3 ? lp->meas_spec : lp->meas_plain;
+    const bool inc_measured = inc == 3 ? lp->meas_spec : lp->meas_plain;
+    if (lp->probe) {
+        const uint32_t steps = (lp->probe == 3 ? spec->n : plain->n) - lp->probe_n0;
+        if (steps < LANE_PRICE_PROBE_STEPS || (!other_measured && steps < 4u * LANE_PRICE_PROBE_STEPS)) {
+            lp->why = "measuring";
+            return lp->probe;
+        }
+        lp->probe = 0;
+        if (other_measured && (t_inc <= 0.0 || t_other > t_inc * (1.0 + LANE_PRICE_MARGIN))) {
+            lp->lane = other;
+            lp->why = "measured faster";
+        } else {
+            lp->why = "measured: the lane in force holds";
+        }
+        lp->held_n0 = lp->lane == 3 ? spec->n : plain->n;
+        return lp->lane;
+    }
+    if (!inc_measured) {
+        /* the lane in force is unmeasured at this N (it just moved): whichever lane is measured here first, the
+         * better-predicted one is (one decoder left beside a plain batch of four went 32 plain steps before the
+         * spec lane was probed); a misprediction costs the probe that corrects it */
+        if (!other_measured && t_inc > 0.0 && t_other > t_inc * (1.0 + LANE_PRICE_MARGIN)) {
+            lp->lane = other;
+            lp->held_n0 = other == 3 ? spec->n : plain->n;
+            lp->why = "priced faster: measuring";
+            return other;
+        }
+        lp->why = "measuring the lane in force";
+        return inc;
+    }
+    const uint32_t ran = (inc == 3 ? spec->n : plain->n) - lp->held_n0;
+    if (ran < LANE_PRICE_HOLD_STEPS) {
+        lp->why = "held";
+        return inc;
+    }
+    const bool faster = t_other > t_inc * (1.0 + LANE_PRICE_MARGIN);
+    if (faster && other_measured) {   /* both measured at this N: the switch needs no probe */
+        lp->lane = other;
+        lp->held_n0 = other == 3 ? spec->n : plain->n;
+        lp->why = "measured faster";
+        return other;
+    }
+    if (t_other <= 0.0 || faster || ran >= LANE_PRICE_REPROBE_STEPS) {
+        lp->probe = other;
+        lp->probe_n0 = other == 3 ? spec->n : plain->n;
+        lp->why = t_other <= 0.0 ? "no price here: measuring" : faster ? "priced faster: measuring" : "re-measuring";
+        return other;
+    }
+    lp->why = "priced";
+    return inc;
+}
+
+static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
                                    session_slot *const *dec, int n_dec, int n_batched) {
-    bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= banks_max && n_batched == 0;
+    bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         /* L272: a slot sampling a constrained tool name holds speculation (lane 3 samples in the engine) */
@@ -1849,6 +2013,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         }
         if (m == 0) break;
 
+        const double step_t0 = server_now_sec();   /* L284: this step's cost observation */
         char err[96];
         /* plan-34 inc 1: route the decode-only lane through the mixed entry
          * (n_rows == n_dec, still exactly 1 row per bank — no prefill rows, no
@@ -1901,6 +2066,12 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
              * it is overwritten by the next step's sweep. */
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
+        /* L284: the plain lane's step cost, measured as the spec lane's round is -- the rows the forward
+         * carried against the step's wall, sampling and emission included -- into the same fit structure
+         * (pulsar_engine_lane_cost), so the lane choice weighs one clock against the other */
+        const double step_ms = (server_now_sec() - step_t0) * 1e3;
+        pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_PLAIN, (uint32_t)m, step_ms);
+        lane_price_observe_plain(&s->w_lane_price, m, step_ms);
     }
     const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
     for (int i = 0; i < n; i++) {
@@ -1914,38 +2085,44 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
  * spec lane's shared forward (L179 branch 1). surv[i][j] is bank i's survival
  * (cumprod of drafter confidences) at pending position j, npend[i] its pending
  * count (0 for a bank not in GEN_DECODE), n_live the number of decoding banks
- * (one base row each). Returns 1 on OVERFLOW (base rows + every pending >
- * PULSAR_SPEC_ROW_BUDGET), else 0.
+ * (one base row each), row_budget the verify rows the round may carry (L284:
+ * the family's pulsar_engine_fused_heads_max less the round's finishing
+ * chunks -- one rule for both families). Returns 2 on OVERFLOW (base rows +
+ * every pending > row_budget), 1 when only the cost cut binds (a pending row
+ * priced below thr), else 0.
  *
- * ISOLATION INVARIANT (the lane gate caught the first version of this
- * violating it): the carry-derived pending counts can be stale or inherited
- * from a bank's PREVIOUS request, so a cap derived from them must never bind
- * when the budget does not -- otherwise a bank's round shape couples to its
- * partner's bank history. When everything fits, every bank is admitted whole
- * (k_alloc[i] == npend[i]) and the caller applies the old unconditional cap,
- * so the sweep is bit-identical to the pre-allocator lane; the ranked
- * allocation engages ONLY on overflow, where the old behavior (arbitrary
- * whole-bank sit-out) was itself partner-coupled and strictly worse.
+ * When everything fits and no row is priced out, every bank is admitted whole
+ * (k_alloc[i] == npend[i]) and the caller applies the old unconditional cap.
+ * L284 (Tyler 2026-10-08: batch invariance is not a requirement): the cost
+ * cut binds whether or not the budget does -- a draft row whose survival is
+ * worth less than the row costs is not verified at any width.  Before, the
+ * cut engaged only on overflow (the L179 isolation invariant, which kept a
+ * bank's round shape independent of its partners' carries); measured on one
+ * Spark at temperature 0.7 the always-on cut is +11% for a lone DeepSeek
+ * stream and within noise at 4 / 8 / 12 (rows/L284.md).
  *
- * Under overflow: admit the global best (bank, position) until the row budget
- * (PULSAR_SPEC_ROW_BUDGET - n_live) is spent; survival is monotone within a
+ * Admission: the global best (bank, position) until the row budget
+ * (row_budget - n_live) is spent; survival is monotone within a
  * bank so each bank's admitted set is a prefix. The cost table (L117/L136)
  * stops admission once the best remaining candidate's survival is below thr
  * (= marginal row ms / live ms-per-token EMA): every remaining candidate is
  * then <= it, and *thr_cut_rows counts the rows that cut left unadmitted (0
  * when the cut did not fire). */
 static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n, int n_live,
-                           float thr, int *k_alloc, int *thr_cut_rows) {
+                           int row_budget, float thr, int *k_alloc, int *thr_cut_rows) {
     uint32_t demand = (uint32_t)n_live;
     for (int i = 0; i < n; i++) demand += npend[i];
     *thr_cut_rows = 0;
-    const bool overflow = demand > (int)PULSAR_SPEC_ROW_BUDGET;
-    if (!overflow) {
+    const bool overflow = demand > (uint32_t)row_budget;
+    bool priced_out = false;
+    for (int i = 0; i < n && !priced_out; i++)
+        for (uint32_t j = 0; j < npend[i] && !priced_out; j++) priced_out = surv[i][j] < thr;
+    if (!overflow && !priced_out) {
         for (int i = 0; i < n; i++) k_alloc[i] = (int)npend[i];
         return 0;
     }
     for (int i = 0; i < n; i++) k_alloc[i] = 0;
-    int budget = (int)PULSAR_SPEC_ROW_BUDGET - n_live;
+    int budget = row_budget - n_live;
     while (budget > 0) {
         int bi = -1;
         float bv = -1.0f;
@@ -1965,7 +2142,7 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
         k_alloc[bi]++;
         budget--;
     }
-    return 1;
+    return overflow ? 2 : 1;
 }
 
 
@@ -2078,7 +2255,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     pulsar_spec_step steps[PULSAR_SESSION_POOL_CAP];
     int step_slot[PULSAR_SESSION_POOL_CAP];
     int accepted[PULSAR_SESSION_POOL_CAP][PULSAR_SPEC_LOGITS_ROWS + 1];
-    /* ALL_ROWS caps the shared forward at 16 rows (the spec-logits ceiling).
+    /* The shared forward carries at most heads_max rows (the family's verify width, <= the slab).
      * L123: the landing buffer lives on the server (allocated once) — the
      * per-quantum malloc re-faulted 16.5 MB of demand-zero pages every
      * quantum. */
@@ -2102,12 +2279,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
      * not finish only makes the decode streams wait, so the rows it may add stay
      * at PULSAR_SERVER_FUSED_CONT_ROWS (a short request beside a 61k prompt
      * finished in 13.7 s with 4064-row continuation rounds, 9.3 s with 2048). */
+    /* L284 #2: the rows one step heads -- the verify's and the finishing chunks' -- are the family's cap
+     * (DeepSeek: the spec-logits block; Qwen: its logits slab, the widest step its kernels keep decode-width
+     * arms), the one authority the verify budget below is cut from, fused or not (L284: the lane pick admits up
+     * to this many decoders and the allocator rations their drafts within it).  A finishing chunk rides only
+     * while every decode bank keeps at least its base row.  The landing buffers here hold
+     * PULSAR_SPEC_LOGITS_ROWS rows; startup refused a family past them (cli_main). */
+    const uint32_t heads_max = pulsar_engine_fused_heads_max(s->engine);
     const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool);
-    const uint32_t fuse_rows = prefill_cap > PULSAR_SPEC_ROW_BUDGET ? prefill_cap - PULSAR_SPEC_ROW_BUDGET : 0u;
-    /* L284 #2: the rows one fused step heads -- the verify's and the finishing chunks' -- are the family's cap
-     * (DeepSeek: the spec-logits block; Qwen: its logits slab), the one authority the verify budget below is cut
-     * from.  A finishing chunk rides only while every decode bank keeps at least its base row. */
-    const uint32_t heads_max = fuse_on ? pulsar_engine_fused_heads_max(s->engine) : (uint32_t)PULSAR_SPEC_ROW_BUDGET;
+    const uint32_t fuse_rows = prefill_cap > heads_max ? prefill_cap - heads_max : 0u;
     const uint32_t cont_rows = fuse_rows < PULSAR_SERVER_FUSED_CONT_ROWS ? fuse_rows : PULSAR_SERVER_FUSED_CONT_ROWS;
     pulsar_multiseq_req *fused_reqs = NULL;
     /* rule 5 (L284): each prefilling prompt's verdict over this quantum -- the rows it rode in how many
@@ -2119,63 +2299,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
         const double round_t0 = server_now_sec();   /* L263: this round's cost observation */
-        /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
-         * At <=16 total rows the shared forward's marginal row cost is
-         * near-flat, so the win is ALLOCATION under the cap, not budget
-         * sizing (vLLM #47808's cost-table argmax is increment 2 if that
-         * ever stops being true). Score every (bank, position) slot by the
-         * drafter's survival probability -- cumprod of per-position
-         * confidences, read switch-free from the saved carries, which are
-         * fresh at sweep start because every bank saved at the previous
-         * round's end -- and admit the global best until the row budget is
-         * spent. Survival is monotone, so each bank's admitted set is a
-         * prefix. Banks with no/invalid pendings get K=0 and still run
-         * their base row. When everything fits, every slot is admitted and
-         * the lane behaves exactly as before this allocator existed. */
-        int k_alloc[PULSAR_SESSION_POOL_CAP];
-        bool k_overflow = false;
-        {
-            float surv[PULSAR_SESSION_POOL_CAP][16];
-            uint32_t npend[PULSAR_SESSION_POOL_CAP];
-            int n_live = 0;
-            for (int i = 0; i < n; i++) {
-                npend[i] = 0;
-                gen_state *ag = dec[i]->gen;
-                if (!ag || ag->phase != GEN_DECODE) continue;
-                n_live++;
-                float conf[16];
-                const uint32_t np =
-                    pulsar_session_bank_pending_confs(pool, (uint32_t)dec[i]->bank, conf);
-                float p = 1.0f;
-                for (uint32_t j2 = 0; j2 < np; j2++) {
-                    p *= conf[j2];
-                    surv[i][j2] = p;
-                }
-                npend[i] = np;
-            }
-            /* L117 (L049 inc 2): under overflow the ranked admission also
-             * consults the cost -- stop admitting once the next candidate's
-             * survival is worth less than a marginal row costs (value
-             * denominator = live EMA of ms per emitted token).  Binds ONLY
-             * under overflow -- when everything fits the old unconditional
-             * cap is byte-identical (isolation invariant, see
-             * spec_alloc_rows). vLLM #47808 is the same design upstream.
-             * L111/L121 established the cost is DEPTH-FLAT; the row price
-             * is ONE fact shared with the engine's yield quench, and since
-             * L263 it is MEASURED (pulsar_engine_spec_cost: the rounds this
-             * loop reports) -- L136's 6.0 and L214's 7.17 were refits that
-             * went stale with the kernels (L219/B4: every price in [3, 9] ms
-             * sits on one plateau; a 30 ms positive control costs 12-19%).
-             * No fit yet, or no EMA yet: no cut, the cap alone admits. */
-            const pulsar_spec_cost cost = pulsar_engine_spec_cost(s->engine);
-            const float thr = cost.valid && s->spec_ms_per_tok_ema > 1.0f ?
-                              (float)cost.row_us / (1000.0f * s->spec_ms_per_tok_ema) : 0.0f;
-            int thr_cut_rows = 0;
-            k_overflow = spec_alloc_rows(surv, npend, n, n_live, thr,
-                                         k_alloc, &thr_cut_rows) != 0;
-            if (k_overflow) s->w_spec_overflow_rounds++;
-            s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
-        }
+        const int round_emitted0 = emitted_total;   /* L284: and its yield */
         /* ---- L260 fusion: the queued prompts that ride this round's forward,
          * one chunk each, up to fuse_rows prompt rows in all.  A chunk that
          * finishes its prompt gets a head row, reserved out of the verify
@@ -2239,6 +2363,68 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             n_fin += fr[n_fr].fin ? 1 : 0;
             pf_rows += (uint32_t)kk;
             n_fr++;
+        }
+        /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
+         * At <=16 total rows the shared forward's marginal row cost is
+         * near-flat, so the win is ALLOCATION under the cap, not budget
+         * sizing (vLLM #47808's cost-table argmax is increment 2 if that
+         * ever stops being true). Score every (bank, position) slot by the
+         * drafter's survival probability -- cumprod of per-position
+         * confidences, read switch-free from the saved carries, which are
+         * fresh at sweep start because every bank saved at the previous
+         * round's end -- and admit the global best until the row budget is
+         * spent. Survival is monotone, so each bank's admitted set is a
+         * prefix. Banks with no/invalid pendings get K=0 and still run
+         * their base row. When everything fits, every slot is admitted and
+         * the lane behaves exactly as before this allocator existed.  L284:
+         * the budget is the family's verify width (heads_max) less this
+         * round's finishing chunks, so it runs after the riders are chosen --
+         * a finishing chunk used to leave the allocation at the full width and
+         * sit a whole bank out of the round (assemble's SKIPPED). */
+        int k_alloc[PULSAR_SESSION_POOL_CAP];
+        bool k_overflow = false;
+        {
+            float surv[PULSAR_SESSION_POOL_CAP][16];
+            uint32_t npend[PULSAR_SESSION_POOL_CAP];
+            int n_live = 0;
+            for (int i = 0; i < n; i++) {
+                npend[i] = 0;
+                gen_state *ag = dec[i]->gen;
+                if (!ag || ag->phase != GEN_DECODE) continue;
+                n_live++;
+                float conf[16];
+                const uint32_t np =
+                    pulsar_session_bank_pending_confs(pool, (uint32_t)dec[i]->bank, conf);
+                float p = 1.0f;
+                for (uint32_t j2 = 0; j2 < np; j2++) {
+                    p *= conf[j2];
+                    surv[i][j2] = p;
+                }
+                npend[i] = np;
+            }
+            /* L117 (L049 inc 2): under overflow the ranked admission also
+             * consults the cost -- stop admitting once the next candidate's
+             * survival is worth less than a marginal row costs (value
+             * denominator = live EMA of ms per emitted token).  Binds ONLY
+             * under overflow -- when everything fits the old unconditional
+             * cap is byte-identical (isolation invariant, see
+             * spec_alloc_rows). vLLM #47808 is the same design upstream.
+             * L111/L121 established the cost is DEPTH-FLAT; the row price
+             * is ONE fact shared with the engine's yield quench, and since
+             * L263 it is MEASURED (pulsar_engine_lane_cost: the rounds this
+             * loop reports) -- L136's 6.0 and L214's 7.17 were refits that
+             * went stale with the kernels (L219/B4: every price in [3, 9] ms
+             * sits on one plateau; a 30 ms positive control costs 12-19%).
+             * No fit yet, or no EMA yet: no cut, the cap alone admits. */
+            const pulsar_lane_cost cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
+            const float thr = cost.valid && s->spec_ms_per_tok_ema > 1.0f ?
+                              (float)cost.row_us / (1000.0f * s->spec_ms_per_tok_ema) : 0.0f;
+            int thr_cut_rows = 0;
+            const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)heads_max - n_fin, thr,
+                                              k_alloc, &thr_cut_rows);
+            k_overflow = bound != 0;
+            if (bound == 2) s->w_spec_overflow_rounds++;
+            s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
         }
         /* ---- assemble: ONE call restores each bank, draws its base, begins
          * its round and lays its rows, saving it after (L260: one mirrored
@@ -2628,8 +2814,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * against its wall time, redraft included (the next round's drafting
          * is part of this one's step).  A round that carried prompt rows is
          * not a decode round and is left out. */
-        if (n_fr == 0 && rows > 0)
-            pulsar_engine_spec_cost_observe(s->engine, rows, (server_now_sec() - round_t0) * 1e3);
+        if (n_fr == 0 && rows > 0) {
+            pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, (server_now_sec() - round_t0) * 1e3);
+            /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
+             * rows by (lane_price_pick) */
+            lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m,
+                                    (server_now_sec() - round_t0) * 1e3);
+        }
         s->publish_metrics_snapshot();
         /* L260 fusion: a prompt finished this round -- end the quantum so its
          * first-token init runs at the top of the next pass and it joins the
@@ -3193,19 +3384,41 @@ void *worker_main(void *arg) {
          * finished -- Claude Code's side calls) rejoins speculation (L272 P1: every family).
          * L284: and so do decoders the spec lane can carry again -- a third stream beside Qwen's pair (spec
          * banks 2) moved all three to the plain batch, and the pair stayed there after it finished: every later
-         * prompt took the classic sync, none rode a fused step */
-        if (server_batch_may_leave(pulsar_engine_has_spec_rounds(s->engine), pulsar_engine_spec_banks_max(s->engine),
-                                   dec, n_dec, n_batched)) {
+         * prompt took the classic sync, none rode a fused step -- when the price picks the spec lane (below) */
+        /* L284 lane cost: where the spec lane could carry every decoder, the faster lane by measured price takes
+         * them (lane_price_pick, one rule for every family) */
+        const uint32_t verify_rows = pulsar_engine_fused_heads_max(s->engine);
+        const bool spec_carries = s->pool_banks > 0 &&
+                                  server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
+                                                           dec, n_dec);
+        int priced = 0;
+        if (spec_carries) {
+            const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
+            const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
+            priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows);
+        }
+        if (priced == 3 && n_batched > 0) {
             for (int i = 0; i < n_dec; i++)
                 if (dec[i]->gen->batch_active) s->batch_leave(dec[i]);
             n_batched = 0;
         }
-        const int lane = server_pick_decode_lane(s->pool_banks, pulsar_engine_has_spec_rounds(s->engine),
-                                                 pulsar_engine_spec_banks_max(s->engine), dec, n_dec, n_batched);
-        /* rule 5: the lane a decode sweep runs is announced when it changes (only lane 3 fuses prompts) */
-        if (lane != s->w_decode_lane && lane >= 2)
-            server_log(PULSAR_LOG_GENERATION, "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch)",
-                       s->w_decode_lane, lane, n_dec, n_batched);
+        const int lane = server_pick_decode_lane(s->pool_banks, pulsar_engine_has_spec_rounds(s->engine) && priced != 2,
+                                                 verify_rows, dec, n_dec, n_batched);
+        /* rule 5: the lane a decode sweep runs is announced when it changes (only lane 3 fuses prompts), with the
+         * prices it was chosen by when it was priced */
+        if (lane != s->w_decode_lane && lane >= 2) {
+            const lane_price *lp = &s->w_lane_price;
+            if (priced)
+                server_log(PULSAR_LOG_GENERATION,
+                           "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch; spec %.1f%s vs "
+                           "plain %.1f%s tok/s: %s)",
+                           s->w_decode_lane, lane, n_dec, n_batched, lp->t_spec, lp->meas_spec ? "" : " predicted",
+                           lp->t_plain, lp->meas_plain ? "" : " predicted", lp->why);
+            else
+                server_log(PULSAR_LOG_GENERATION,
+                           "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch)",
+                           s->w_decode_lane, lane, n_dec, n_batched);
+        }
         s->w_decode_lane = lane;
         const bool use_spec_batched = s->w_decode_lane == 3;
         const bool use_batched = s->w_decode_lane >= 2;

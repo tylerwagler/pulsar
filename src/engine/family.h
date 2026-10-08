@@ -181,8 +181,9 @@ typedef struct {
                         const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
                         char *err, size_t errlen);
     /** The most logits rows one decode_fused step heads -- its verify rows plus its headed prompt runs (L284 #2:
-     *  the ONE authority the server sizes a round's verify budget by, pulsar_engine_fused_heads_max).  0 with no
-     *  decode_fused. */
+     *  the ONE authority the server sizes a round's verify budget by, pulsar_engine_fused_heads_max).  It is also
+     *  the widest verify step a family runs at all (L284: the decoders the spec lane carries, one base row each,
+     *  and the rows its allocator rations the drafts within).  0 with no decode_fused. */
     uint32_t fused_heads_max;
 } pulsar_family_session_ops;
 
