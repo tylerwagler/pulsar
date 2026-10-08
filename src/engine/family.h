@@ -149,16 +149,15 @@ enum : uint32_t {
  * (engine_api.cpp) calls these at step granularity; the TP mirror wraps the
  * same calls on a family with PULSAR_FAMILY_CAP_TP. */
 typedef struct {
-    /** Build the family's state into a session the core allocated (L272 P2: engine, ctx_size, prefill_cap
-     * and the logits row are set; the core measures the GPU bytes this allocates as resident_bytes and
-     * assigns the TP mirror id).  0 on success; on failure the family frees what it built. */
-    int (*create)(pulsar_session *s);
+    /** Build the family's state for `n_banks` banks into a session the core allocated (L272 P2: engine,
+     * ctx_size, prefill_cap and the logits row are set; the core measures the GPU bytes this allocates as
+     * resident_bytes and assigns the TP mirror id).  It is also the session's PRICE: the core runs it with the
+     * tensor allocators dry (pulsar_engine::session_cost_bytes_banked), so it allocates GPU memory only through
+     * them.  0 on success; on failure the family frees what it built. */
+    int (*create)(pulsar_session *s, uint32_t n_banks);
     /** Free the family's state; the core frees the session's own (the view, the carry, the sampler and
      * speculation scratch, the logits) and the session itself. */
     void (*destroy)(pulsar_session *s);
-    /** GPU bytes create() takes at (ctx_size, n_banks): the allocation run dry,
-     * so the price and the allocation are one function.  0 = cannot create. */
-    uint64_t (*cost_bytes)(pulsar_engine *e, int ctx_size, int n_banks);
     /** Make the session's state hold exactly `prompt` (prefill what is new). */
     int (*sync)(pulsar_session *s, const pulsar_tokens *prompt,
                 const pulsar_image_ref *images, int n_images, char *err, size_t errlen);

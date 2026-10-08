@@ -650,11 +650,4 @@ const char *pulsar_qwen_op_owner(pulsar_qwen_op_id op);
 pulsar_qwen_op_id pulsar_qwen_first_missing_op(const pulsar_qwen_ops *ops, const pulsar_layer_plan *plan,
                                                const pulsar_qwen_shape *shape, uint32_t *at_layer);
 
-/** Bytes a session's state takes at (n_banks, ctx, max_rows, with the MTP layer or not): the
- * allocation code run dry, so the price and the allocation are one function.
- * *managed_bytes (optional) is the demand-paged subset (the KV slabs). */
-uint64_t pulsar_qwen_state_price(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
-                                 uint32_t n_banks, uint32_t ctx, uint32_t max_rows, bool mtp,
-                                 uint64_t *managed_bytes);
-
 #endif /* PULSAR_FAMILY_QWEN_H */
