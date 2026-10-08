@@ -64,9 +64,11 @@
  * matter.
  *
  * L284: every family.  The schedules use the public session API only; one that
- * needs a whole-session payload (H, I, and K's shared decode for M and P) or a
- * rewind (J, K) is skipped by name on a family without it, and the expected
- * resume origin is the family's sync planner's column (see the table).
+ * needs a whole-session payload (H, I, and K's shared decode for M and P), a
+ * rewind (J, K) or a standalone checkpoint restore (L, N) is skipped by name on a
+ * family without it, and the expected resume origin is the family's sync
+ * planner's column (see the table).  F and G resume from the prefill grid point on
+ * both: decode rows are never continued (L284).
  *
  *   ./tests/chunk_neutrality_gate MODEL
  */
@@ -337,11 +339,12 @@ int GATE_ENTRY(int argc, char **argv) {
          * Where it resumes from is the family's sync planner's fact, so the expected origin is a column per planner:
          *   origin      DeepSeek's sync (L183/L195): every resume re-prefills from the last PREFILL grid point at or
          *               below the view, so a resume is the cold prefill's chunking;
-         *   origin_ext  the core sync driver (sync_driver.cpp; Qwen): a prompt that extends the view continues it
-         *               from the view's end (0 = a fresh session prefills from 0), anything else resumes from the
-         *               deepest grid checkpoint it shares.
+         *   origin_ext  the core sync driver (sync_driver.cpp; Qwen): a prompt that extends a view the bank
+         *               prefilled whole continues it from the view's end (0 = a fresh session prefills from 0);
+         *               anything else -- a view holding decode rows included (L284) -- resumes from the deepest
+         *               grid checkpoint at or below the shared prefix and the prefill frontier.
          * The bytes are graded the same way on both: every schedule == A, frontier row and one decode step. */
-        constexpr unsigned NEED_SNAPSHOT = 1u, NEED_REWIND = 2u;
+        constexpr unsigned NEED_SNAPSHOT = 1u, NEED_REWIND = 2u, NEED_RESTORE = 4u;
         struct { const char *label; int first; int evals; int origin; int origin_ext; bool via_snapshot; int cut; int restore; int segments; int share; unsigned needs; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
@@ -354,8 +357,8 @@ int GATE_ENTRY(int argc, char **argv) {
             /* decode saves nothing (its rows are the decode kernels'); the
              * resume redoes the generated tokens from the last PREFILL grid
              * point -- the only way it equals the cold prefill */
-            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, 8100 + GATE_EVALS, false, 0, 0, 0, 0, 0},
-            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, 4000 + GATE_EVALS, false, 0, 0, 0, 0, 0},
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, 8064, false, 0, 0, 0, 0, 0},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, 3968, false, 0, 0, 0, 0, 0},
             /* the payload carries the prefill frontier and a raw window deep
              * enough for the warm-up: a disk-restored bank resumes too */
             {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, 4500, true, 0, 0, 0, 0, NEED_SNAPSHOT},
@@ -371,9 +374,9 @@ int GATE_ENTRY(int argc, char **argv) {
              * removes.  The prefill's grid point 3968 is the exact resume. */
             {"K: sync 4000, decode 4600 past the ring, cut to 4100, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 4100, 0, 0, 1, NEED_REWIND | NEED_SNAPSHOT},
             /* L264: resumes from the grid checkpoints the prefills captured */
-            {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, 4096, false, 0, 4096, 0, 0, 0},
+            {"L: sync 8600, restore the checkpoint at 4096, resume from 4096", GATE_N, 0, 4096, 4096, false, 0, 4096, 0, 0, NEED_RESTORE},
             {"M: sync 4000, decode 4600 past the ring, restore 3968, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 3968, 0, 2, NEED_SNAPSHOT},
-            {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 8576, 0, 0, 0},
+            {"N: sync 8600, restore the split checkpoint at 8576, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 8576, 0, 0, NEED_RESTORE},
             /* L264 S4: the same resumes through disk segments */
             {"O: sync 8600, segment chain to 8576 through disk, resume from 8576", GATE_N, 0, 8576, 8576, false, 0, 0, 8576, 0, 0},
             {"P: sync 4000, decode 4600, segment chain to 3968 through disk, resume from 3968", 4000, GATE_EVALS_PAST_RING, 3968, 3968, false, 0, 0, 3968, 2, NEED_SNAPSHOT},
@@ -385,8 +388,10 @@ int GATE_ENTRY(int argc, char **argv) {
             goto done;
         }
         const bool grid_planner = fam == PULSAR_FAMILY_ID_DEEPSEEK4;
+        /* a standalone restore (pulsar_session_restore_checkpoint) is the grid planner's: the core sync driver
+         * restores a grid checkpoint only as a sync resumes from it (engine_api.cpp, L272 B1) */
         const unsigned has = (pulsar_engine_has_snapshots(e) ? NEED_SNAPSHOT : 0u) |
-                             (pulsar_engine_can_rewind(e) ? NEED_REWIND : 0u);
+                             (pulsar_engine_can_rewind(e) ? NEED_REWIND : 0u) | (grid_planner ? NEED_RESTORE : 0u);
         bool ran[GATE_SCHEDULES] = {false};
         char err[256];
         printf("chunk-neutrality gate [%s]: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step "
@@ -403,7 +408,8 @@ int GATE_ENTRY(int argc, char **argv) {
             if (missing) {
                 printf("  SKIP  %s [%s]: needs %s\n", sched[k].label, pulsar_engine_family_name(e),
                        missing & NEED_SNAPSHOT ? "whole-session payloads (pulsar_engine_has_snapshots)"
-                                               : "session rewind (pulsar_engine_can_rewind)");
+                       : missing & NEED_REWIND ? "session rewind (pulsar_engine_can_rewind)"
+                                               : "a standalone checkpoint restore (the family restores one only inside a sync)");
                 continue;
             }
             if (sched[k].share == 2 && !have_shared) {

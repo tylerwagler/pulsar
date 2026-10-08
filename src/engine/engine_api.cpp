@@ -1132,6 +1132,9 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return limit && st && st->ops ? pulsar_ckpt_best(st, bank, limit) : 0u;
 }
+bool pulsar_session_bank_prefilled(pulsar_session *s, uint32_t bank, int len) {
+    return pulsar_session_bank_prefill_frontier(s, bank) >= len;
+}
 uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops ? st->ops->resume_grid : 0u;
@@ -1547,7 +1550,8 @@ int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar
     if (!s || !prompt || !FAMILY_BANKS(s)) return -1;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);
     const int common = pulsar_tokens_common_prefix(t, prompt);
-    if (t && common == t->len) return common;   /* an extension (or the same prompt): sync continues it */
+    /* an extension (or the same prompt) of a history the bank prefilled whole: sync continues it */
+    if (t && common == t->len && pulsar_session_bank_prefilled(s, bank, common)) return common;
     return (int)pulsar_session_resume_point(s, bank, common, prompt->len);
 }
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {

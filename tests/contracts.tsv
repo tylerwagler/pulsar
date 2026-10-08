@@ -19,7 +19,7 @@
 # target	contract	family	tier	note
 runner:session-contract-gate	session,spec	all	battery	every hosted model; B6: multi-bank verify == single
 runner:cuda-row-neutrality-gate	session	all	battery	1-row == N-row decode, ~100 / ~2.2k / ~10k tokens, every hosted model
-runner:cuda-chunk-neutrality-gate	session	all	battery	schedules A-P/X at 8600 tokens, chunk 4096; payload (H I M P) / rewind (J K) schedules skip by name where the family lacks them; origins per sync planner (L284)
+runner:cuda-chunk-neutrality-gate	session	all	battery	schedules A-P/X at 8600 tokens, chunk 4096; payload (H I M P) / rewind (J K) / standalone restore (L N) schedules skip by name where the family lacks them; origins per sync planner, F G from the prefill grid on both (L284)
 runner:cuda-algo-stability-gate	session	all	battery	width neutrality: bank 0's decode row byte-identical at widths 1/2/4/5/8/16 (KL past the exact range), every hosted model (L284)
 runner:cuda-algo-stability-gate-deep	session	all	battery	the same with bank 0 at 2200 tokens (L284)
 runner:cuda-mixed-neutrality-gate	session	deepseek4	battery	a decode bank's row == with a K-row prompt run co-scheduled (GATE 4/2/3); runs batched == alone (5/5R)

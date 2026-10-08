@@ -3068,6 +3068,9 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
  * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
  * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0. */
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
+/** L284: whether the first `len` tokens of `bank`'s history are all prefill rows (none a decode step's) --
+ * the only history a sync continues; one with decode rows resumes from pulsar_session_resume_point. */
+bool pulsar_session_bank_prefilled(pulsar_session *s, uint32_t bank, int len);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen);
