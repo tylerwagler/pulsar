@@ -321,7 +321,6 @@ void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { 
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
-uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e) {
     return pulsar_engine_has_fused_step(e) ? e->family->session->fused_heads_max : 0u;

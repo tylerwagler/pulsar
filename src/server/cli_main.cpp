@@ -570,6 +570,15 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return 1;
     }
+    /* L284: the spec lane lands a verify step's rows in buffers of PULSAR_SPEC_LOGITS_ROWS rows; a family whose
+     * verify width (pulsar_engine_fused_heads_max) passes them is refused here, once, by name. */
+    if (pulsar_engine_has_spec_rounds(engine) && pulsar_engine_fused_heads_max(engine) > PULSAR_SPEC_LOGITS_ROWS) {
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: the %s family verifies %u rows a step; the spec lane holds %u "
+                   "-- refusing to serve", pulsar_engine_family_name(engine), pulsar_engine_fused_heads_max(engine),
+                   (unsigned)PULSAR_SPEC_LOGITS_ROWS);
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* The one authoritative speculation line: only the opened engine knows
      * whether a drafter exists (an external gguf OR dspark.* tensors merged
@@ -582,8 +591,8 @@ int main(int argc, char **argv) {
                    pulsar_engine_dspark_draft_tokens(engine));
     } else if (pulsar_engine_has_spec_rounds(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u decoder(s) a round)",
-                   pulsar_engine_family_name(engine), pulsar_engine_spec_banks_max(engine));
+                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u verify rows a round)",
+                   pulsar_engine_family_name(engine), pulsar_engine_fused_heads_max(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");

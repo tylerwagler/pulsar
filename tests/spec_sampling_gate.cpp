@@ -450,15 +450,17 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     const int ctx = filler > 0 ? 16384 : 2048;
     if (pulsar_session_create(&session, engine, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
-    /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm up
-     * to the banks one shared verify forward carries (pulsar_engine_spec_banks_max: DSpark 16, Qwen's MTP 2). */
+    /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm
+     * SAMPLED_BANKS_SPEC banks at most SAMPLED_ROWS_MAX rows, which the family's verify width must hold (L284:
+     * pulsar_engine_fused_heads_max, DSpark 32, Qwen's MTP 16 -- the one authority the server's lane reads). */
     const int width_plain = pulsar_session_bank_count(session) < SAMPLED_BANKS_PLAIN
                           ? pulsar_session_bank_count(session) : SAMPLED_BANKS_PLAIN;
-    const int width_spec = (int)pulsar_engine_spec_banks_max(engine) < SAMPLED_BANKS_SPEC
-                         ? (int)pulsar_engine_spec_banks_max(engine) : SAMPLED_BANKS_SPEC;
-    if (width_plain < 1 || width_spec < 1) {
-        fprintf(stderr, "spec sampling gate: pool has %d banks, spec verify carries %u -- need 1 each\n",
-                pulsar_session_bank_count(session), pulsar_engine_spec_banks_max(engine));
+    const int width_spec = pulsar_session_bank_count(session) < SAMPLED_BANKS_SPEC
+                         ? pulsar_session_bank_count(session) : SAMPLED_BANKS_SPEC;
+    if (width_plain < 1 || width_spec < 1 || pulsar_engine_fused_heads_max(engine) < SAMPLED_ROWS_MAX) {
+        fprintf(stderr, "spec sampling gate: pool has %d banks, a verify step carries %u rows -- need 1 bank and "
+                "%d rows\n", pulsar_session_bank_count(session), pulsar_engine_fused_heads_max(engine),
+                SAMPLED_ROWS_MAX);
         goto done;
     }
 

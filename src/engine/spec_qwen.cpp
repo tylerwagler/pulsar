@@ -20,7 +20,9 @@
  *
  * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed,
  * every kernel at its decode-width arm while the step stays within PULSAR_QWEN_SPEC_ROWS); each bank's
- * commit rolls its own run back, and the absorb and the draft serve each bank in turn. */
+ * commit rolls its own run back, and the absorb and the draft serve each bank in turn.  L284: any number of
+ * banks -- the server's allocator fits their drafts to the step's rows (fused_heads_max = SPEC_ROWS), so N
+ * decoders keep speculating with shallower drafts. */
 #include "pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include "spec_internal.h"
@@ -144,7 +146,6 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
     /* .commit        = */ qwen_spec_commit,
     /* .cut           = */ qwen_spec_cut,
     /* .depth         = */ NULL,   /* a fixed depth: the drafter's K and tau */
-    /* .banks_max     = */ 2u,   /* L272 P1 S4: 2 x (K + 1) <= 14 rows at the deepest K (6) -- within SPEC_ROWS */
 };
 
 /* ---- the MTP drafter --------------------------------------------------------------------------- */

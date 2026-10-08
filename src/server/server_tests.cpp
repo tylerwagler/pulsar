@@ -6743,9 +6743,9 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
 
 
 /* L284 -- worker_main's batch leave (server_batch_may_leave). Invariant: decoders in the plain batch leave it
- * exactly when the lane pick would then take lane 3 -- the drafter runs, they number no more than the family's spec
- * banks, and each speculates -- so a pair that a third stream pushed to the plain batch rejoins speculation when it
- * finishes (before, only a lone decoder left), and a leave is never undone by the next pick. */
+ * exactly when the lane pick would then take lane 3 -- the drafter runs, they number no more than the family's verify
+ * rows (one base row each), and each speculates -- so decoders a wider load pushed to the plain batch rejoin
+ * speculation once it ends (before, only a lone decoder left), and a leave is never undone by the next pick. */
 static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
     gen_state g[3];
     memset(g, 0, sizeof g);
@@ -6758,7 +6758,7 @@ static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
         g[i].batch_active = true;
         dec[i] = &slots[i];
     }
-    /* Qwen's two spec banks: three decoders stay plain, the pair left behind leaves */
+    /* a verify width of two rows (two decoders, one base row each): three decoders stay plain, a pair leaves */
     TEST_ASSERT(!server_batch_may_leave(true, 2u, dec, 3, 3));
     TEST_ASSERT(server_batch_may_leave(true, 2u, dec, 2, 2));
     /* the L271 lone decoder */
@@ -6789,20 +6789,19 @@ static void l179_fill_surv(float surv[][16], uint32_t *npend, int i, uint32_t np
 }
 
 /* L179 branch 1 -- the L117 cross-bank K allocator (spec_alloc_rows).
- * Invariants: (a) ISOLATION -- while base rows + every pending fit
- * PULSAR_SPEC_ROW_BUDGET the allocator returns 0 and admits every bank whole
- * (k_alloc[i] == npend[i]) at ANY threshold, so a stale partner carry can
- * never shape this bank's round; (b) OVERFLOW -- it returns 1, each bank
- * gets a prefix (k_alloc[i] <= npend[i]), the base rows plus the admitted
+ * Invariants: (a) while base rows + every pending fit the row budget B and
+ * no survival is under thr the allocator returns 0 and admits every bank
+ * whole (k_alloc[i] == npend[i]); a pending row under thr binds it even then
+ * (L284: the cost cut is always on) and it returns 1; (b) OVERFLOW -- it
+ * returns 2, each bank gets a prefix (k_alloc[i] <= npend[i]), the base rows plus the admitted
  * rows spend the budget exactly, and the admitted set is the global best:
  * no admitted candidate scores below any unadmitted one; (c) the COST-TABLE
  * cut -- once the best remaining candidate is below thr admission stops,
  * *thr_cut_rows counts what it left, and the budget may go unspent. */
-static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
-    /* Every case is sized from the budget, so the test holds whatever
-     * PULSAR_SPEC_ROW_BUDGET is: three decoding banks (3 base rows) plus an
+static void l179_spec_alloc_rows_at(const int B) {
+    /* Every case is sized from the budget, so the test holds whatever the
+     * family's verify width is: three decoding banks (3 base rows) plus an
      * idle fourth, at most 16 pendings each -- demand tops out at 3 + 48. */
-    const int B = (int)PULSAR_SPEC_ROW_BUDGET;
     TEST_ASSERT(B > 3 + 12 && B < 3 + 48);
     float surv[PULSAR_SESSION_POOL_CAP][16];
     uint32_t npend[PULSAR_SESSION_POOL_CAP];
@@ -6815,19 +6814,27 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     const float thr_fallback = 7.0f / 45.0f;
     const float thr_live = 7.0f / 30.0f;
 
-    /* (a) demand 3 + (B - 4) < B, one bank with hopeless confidence, a
-     * fourth bank not decoding (npend 0): everything admitted, no cut. */
+    /* (a) demand 3 + (B - 4) and exactly B fit, a fourth bank not decoding (npend 0): with every survival at or
+     * above thr everything is admitted whole and nothing is cut; (a') the same demand with one bank's survivals
+     * hopeless (0.01, under thr): the cost cut binds although the budget does not (L284) -- that bank verifies its
+     * base row alone, the others whole, and the cut counts its rows. */
     for (int d = B - 4; d <= B - 3; d++) {
         const uint32_t third = (uint32_t)d / 3u;
         l179_fill_surv(surv, npend, 0, third, 0.95f);
-        l179_fill_surv(surv, npend, 1, third, 0.01f);
-        l179_fill_surv(surv, npend, 2, (uint32_t)d - 2u * third, 0.80f);
+        l179_fill_surv(surv, npend, 1, third, 0.90f);
+        l179_fill_surv(surv, npend, 2, (uint32_t)d - 2u * third, 0.99f);
         npend[3] = 0;
-        /* demand exactly the budget (d = B - 3) still fits, at any threshold */
-        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, d == B - 4 ? thr_live : 0.99f,
-                                    k_alloc, &cut) == 0);
+        const float thr = 0.0f;   /* no fit yet: the budget alone admits */
+        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr, k_alloc, &cut) == 0);
         for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
         TEST_ASSERT(cut == 0);
+        l179_fill_surv(surv, npend, 1, third, 0.01f);
+        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, k_alloc, &cut) == 1);
+        TEST_ASSERT(k_alloc[1] == 0 && k_alloc[3] == 0);
+        int above = 0;
+        for (uint32_t j = 0; j < npend[0]; j++) above += surv[0][j] >= thr_live;
+        TEST_ASSERT(k_alloc[0] == above);
+        TEST_ASSERT(cut == (int)npend[1] + (int)(npend[0] - (uint32_t)above) + (int)(npend[2] - (uint32_t)k_alloc[2]));
     }
 
     /* (b) demand 3 + 48 > B with every admitted survival above thr: ranked.
@@ -6845,7 +6852,7 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
             if (all[y] > all[x]) { const float t = all[x]; all[x] = all[y]; all[y] = t; }
     const float kth = all[B - 3 - 1];
     TEST_ASSERT(kth > thr_fallback && all[B - 3] < kth);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_fallback, k_alloc, &cut) == 1);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_fallback, k_alloc, &cut) == 2);
     TEST_ASSERT(cut == 0);
     int admitted = 0;
     for (int i = 0; i < 4; i++) {
@@ -6870,7 +6877,7 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_fill_surv(surv, npend, 0, 16, 0.95f);
     l179_fill_surv(surv, npend, 1, 16, 0.90f);
     l179_fill_surv(surv, npend, 2, 16, 0.80f);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, 0.99f, k_alloc, &cut) == 1);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, 0.99f, k_alloc, &cut) == 2);
     for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 0);
     TEST_ASSERT(cut == 48);
     /* partial cut at the live threshold (0.239): demand 3 + 48 > B, but only
@@ -6880,10 +6887,17 @@ static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_fill_surv(surv, npend, 0, 16, 0.80f);
     l179_fill_surv(surv, npend, 1, 16, 0.50f);
     l179_fill_surv(surv, npend, 2, 16, 0.50f);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_live, k_alloc, &cut) == 1);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, k_alloc, &cut) == 2);
     TEST_ASSERT(k_alloc[0] == 6 && k_alloc[1] == 2 && k_alloc[2] == 2 && k_alloc[3] == 0);
     TEST_ASSERT(cut == 38);
     TEST_ASSERT(3 + 10 < B);
+}
+
+/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max: Qwen's 16-row
+ * logits slab, DeepSeek's spec-logits block). */
+static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
+    l179_spec_alloc_rows_at(16);
+    l179_spec_alloc_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the

@@ -781,8 +781,8 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
  * into the next logits row after the decode rows, in run order -- the prompt's
  * first-token distribution on its final chunk.  Every prefill run's drafter
  * anchors fill its bank's prompt ring, as a classic prefill chunk does.
- * *out_n_rows = n_dec + the headed runs.  n_dec <= PULSAR_SPEC_ROW_BUDGET and
- * n_dec + headed runs <= pulsar_engine_fused_heads_max (the family's cap). */
+ * *out_n_rows = n_dec + the headed runs.  n_dec + headed runs <=
+ * pulsar_engine_fused_heads_max (the family's cap). */
 /** The most prompt runs one fused step carries (the shape's head_last bound). */
 #define PULSAR_FUSED_PF_MAX 16u
 typedef struct {
@@ -1082,16 +1082,15 @@ int pulsar_engine_routed_quant_bits(pulsar_engine *e);
  *  provides the verify hooks (L272 P1).  The server's spec-batched lane and the classic
  *  pulsar_session_generate_speculative key on this; which drafter it is, pulsar_engine_drafter says. */
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e);
-/** How many decoders one shared speculative verify forward may carry (0 without speculation): the
- *  server runs its spec-batched lane up to this many decoders and the plain batched lane past it. */
-uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e);
 /** Does the engine run the fused step (pulsar_session_decode_fused: prompt chunks riding a decode round, each
  *  recorded in its bank's history by pulsar_session_note_prefilled)?  The family's decode_fused op is present
  *  (DeepSeek; Qwen since L284 #2).  pulsar_session_decode_fused refuses on its negation (L282: the server once
  *  armed fusion on "a bank pool exists", and two concurrent Qwen requests failed "no fused step"). */
 bool pulsar_engine_has_fused_step(const pulsar_engine *e);
 /** The most logits rows one fused step heads: its verify rows plus its headed prompt runs (the family's cap; 0
- *  without a fused step).  The server's verify budget for a round is this less the round's finishing chunks. */
+ *  without a fused step).  L284: the ONE authority for the rows a speculative verify step carries -- the server's
+ *  spec lane takes up to this many decoders (each keeps its base row; past it they ride the plain batched lane)
+ *  and its allocator rations the drafts within this less the round's finishing chunks. */
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e);
 /** Does pulsar_session_decode_mixed carry prefill runs beside its decode rows (the plain batched lane's mixed
  *  quantum)?  A family without it refuses such a step by name; its prompts ride only the fused step. */
