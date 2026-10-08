@@ -2137,6 +2137,10 @@ struct server {
     bool worker_try_bind();
     /** Detach a finished job from its slot and wake its client thread. */
     void worker_finish_slot(session_slot *sl);
+    /** L282: service a slot the scheduler picked -- one step unless it is already GEN_DONE, then release it if it is
+     *  GEN_DONE now.  The ONE statement for every lane: a slot that reached GEN_DONE without a step (a prefill the
+     *  decode quantum abandoned) is released by the next pick, never skipped. */
+    void worker_service_slot(session_slot *sl);
     /** Advance every slot in `dec` by one batched decode quantum.
      *
      * THE decode lane: all `n` slots step together through the shared multiseq

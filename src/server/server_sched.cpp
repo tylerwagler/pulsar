@@ -1352,6 +1352,15 @@ void server::worker_finish_slot(session_slot *sl) {
     pthread_mutex_unlock(&j->mu);
 }
 
+void server::worker_service_slot(session_slot *sl) {
+    if (sl->gen && sl->gen->phase != GEN_DONE) {
+        generate_job_step(sl);
+        if (sl->gen) slot_writer_flush(&sl->gen->writer);
+        sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    }
+    if (!sl->gen || sl->gen->phase == GEN_DONE) worker_finish_slot(sl);
+}
+
 
 
 /* The single GPU worker (increment 3): a round-robin scheduler over the slot
@@ -1960,7 +1969,7 @@ static bool slot_fusable_prefill(const session_slot *c) {
 }
 
 bool server::fusion_enabled() const {
-    return pool_banks > 0;
+    return pool_banks > 0 && pulsar_engine_has_fused_step(engine);
 }
 
 bool server::fuse_prepare(session_slot *sl) {
@@ -2153,6 +2162,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
                 snprintf(pg->err, sizeof pg->err, "client disconnected");
                 s->gen_prefill_fail(c, false);
+                s->worker_finish_slot(c);   /* L282: released where abandoned (nothing in this quantum steps it) */
                 continue;
             }
             if (!pg->fuse_ready && !s->fuse_prepare(c)) continue;
@@ -2352,6 +2362,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 gen_state *pg = fr[r].sl->gen;
                 snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
                 s->gen_prefill_fail(fr[r].sl, false);   /* shared by every rider: no one file is implicated */
+                s->worker_finish_slot(fr[r].sl);        /* L282 */
             }
             for (int q = 0; q < m; q++) {
                 session_slot *sl = dec[live_idx[q]];
@@ -2380,6 +2391,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 snprintf(pg->err, sizeof pg->err, "bank %u: the fused prompt chunk could not be recorded",
                          (unsigned)c->bank);
                 s->gen_prefill_fail(c, false);
+                s->worker_finish_slot(c);   /* L282 (the bank stays assigned: the save below reads it) */
             } else {
                 /* The classic sync's per-chunk callback: slot progress for
                  * /metrics, the SSE headers and keepalive (a long prompt riding
@@ -3155,29 +3167,18 @@ void *worker_main(void *arg) {
              * reconciles its checkpoint). Then also advance ONE non-decode
              * active slot (prefill/init/finish) so prompt ingest never starves
              * behind a long batched decode. */
-            for (int i = 0; i < n_dec; i++) {
-                session_slot *d = dec[i];
-                if (d->gen && d->gen->phase != GEN_DECODE) {
-                    s->generate_job_step(d);
-                    if (d->gen) slot_writer_flush(&d->gen->writer);
-                    d->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-                    if (!d->gen || d->gen->phase == GEN_DONE)
-                        s->worker_finish_slot(d);
-                }
-            }
+            for (int i = 0; i < n_dec; i++)
+                if (dec[i]->gen && dec[i]->gen->phase != GEN_DECODE) s->worker_service_slot(dec[i]);
             /* inc 5: skip the slot already advanced in-band by the fused
              * quantum (pf_fuse) so it does not also run a classic chunk. */
             session_slot *other = worker_pick_step(s, &rr, pf_fuse,
                                                    use_spec_batched && s->fusion_enabled()
                                                        ? slot_steppable_beside_fused
                                                        : slot_steppable_beside_decode);
-            if (other && other->gen && other->gen->phase != GEN_DONE) {
-                s->generate_job_step(other);
-                if (other->gen) slot_writer_flush(&other->gen->writer);
-                other->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-                if (!other->gen || other->gen->phase == GEN_DONE)
-                    s->worker_finish_slot(other);
-            }
+            /* L282: before, the finish sat INSIDE `phase != GEN_DONE`, so a slot already done was picked
+             * every quantum and never released -- 23 minutes on the pair (2026-10-07), six slots held and two
+             * prompts starved behind them while five banks decoded */
+            if (other) s->worker_service_slot(other);
             s->publish_metrics_snapshot();
             continue;
         }
@@ -3189,14 +3190,7 @@ void *worker_main(void *arg) {
          * (any GEN_DECODE slot arms use_batched above), so it services
          * prefill/init/finish slots only. The L112 paired-decode mirror
          * that lived here is deleted with the classic lane. */
-        if (sl->gen && sl->gen->phase != GEN_DONE) {
-            s->generate_job_step(sl);
-            if (sl->gen) slot_writer_flush(&sl->gen->writer);
-            sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-        }
-        if (!sl->gen || sl->gen->phase == GEN_DONE) {
-            s->worker_finish_slot(sl);
-        }
+        s->worker_service_slot(sl);
         s->publish_metrics_snapshot(); /* /metrics: once per quantum */
     }
     return NULL;

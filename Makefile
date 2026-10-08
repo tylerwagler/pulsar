@@ -1490,6 +1490,8 @@ server-live-gate: pulsar-server
 	@rc=0; for m in $(SERVER_LIVE_MODELS); do \
 	  sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
 	  python3 tests/server_live.py $$m --binary ./pulsar-server || rc=1; \
+	  sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	  python3 tests/server_abandon_live.py $$m --binary ./pulsar-server || rc=1; \
 	done; exit $$rc
 
 cuda-spec-width-gate: pulsar

@@ -320,6 +320,7 @@ int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_qua
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 uint32_t pulsar_engine_spec_banks_max(const pulsar_engine *e) { return pulsar_engine_has_spec_rounds(e) ? e->family->spec->banks_max : 0u; }
+bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && !e->family->banks; }
 bool pulsar_engine_has_argmax(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_GENERATE) != 0; }
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
@@ -954,7 +955,10 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     PULSAR_NVTX_FN();
     if (!s) return 1;
     /* the fused step is the DeepSeek graph pool's; a family bank pool runs its own mixed decode */
-    if (FAMILY_BANKS(s)) { snprintf(err, errlen, "%s: no fused step", s->engine->family->name); return 1; }
+    if (!pulsar_engine_has_fused_step(s->engine)) {
+        snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
+        return 1;
+    }
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return s->decode_fused(reqs, n_rows, shape, logits, logits_cap, out_n_rows, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "the fused step", err, errlen)) return 1;
