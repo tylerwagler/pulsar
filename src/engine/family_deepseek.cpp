@@ -117,6 +117,7 @@ static const pulsar_family_session_ops k_ds4_session_ops = {
     /* .decode_mixed    = */ ds4_decode_mixed,
     /* .invalidate      = */ ds4_invalidate,
     /* .decode_fused    = */ ds4_decode_fused,
+    /* .fused_heads_max = */ PULSAR_SPEC_ROW_BUDGET,   /* n_dec + headed runs <= the spec-logits block */
 };
 
 /* L281: DeepSeek's image geometry -- a sentinel is `vocab_size + role`, and a block is compressor pads, IMAGE_START,
@@ -156,7 +157,7 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_PAYLOAD |
                           PULSAR_FAMILY_CAP_REWIND | PULSAR_FAMILY_CAP_VISION | PULSAR_FAMILY_CAP_TP |
                           PULSAR_FAMILY_CAP_IMATRIX | PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_GENERATE |
-                          PULSAR_FAMILY_CAP_SEGMENTS,
+                          PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_MIXED_PREFILL,
     /* .load         = */ pulsar_ds4_family_load,
     /* .after_gpu    = */ pulsar_ds4_family_after_gpu,
     /* .logits_width = */ ds4_logits_width,

@@ -189,6 +189,20 @@ bool arm_segments(const pulsar_qwen_step *st, uint32_t lo, uint32_t hi, Launch &
     return (cut == lo || launch(false, lo, cut - lo)) && (cut == hi || launch(true, cut, hi - cut));
 }
 
+/* L284 #2: the calls of a launch whose bytes depend on the call's row count (the QSA attention): the decode rows
+ * [0, n_dec) as one call, then each prompt run [run_first[k], run_first[k + 1]) as its own -- a classic chunk's one
+ * call.  A step without runs (DECODE, the MTP layer's) is one call over its rows of one kind. */
+template <class Launch>
+bool attention_calls(const pulsar_qwen_step *st, Launch &&launch) {
+    const uint32_t n = st->n_rows;
+    if (st->n_dec > 0 && !launch(0u, st->n_dec)) return false;
+    if (st->n_dec >= n) return true;
+    if (!st->n_runs) return launch(st->n_dec, n - st->n_dec);
+    for (uint32_t k = pulsar_qwen_step_verify_runs(st); k < st->n_runs; k++)
+        if (!launch(st->run_first[k], st->run_first[k + 1] - st->run_first[k])) return false;
+    return true;
+}
+
 /* The GR weights of one site, as the launcher takes them, at one arm. */
 bool gr_dev(const pulsar_qwen_step *st, const pulsar_qwen_gr_weights &g, bool prompt, pulsar_qwen_gr_dev *d) {
     const uint64_t R = st->shape->n_hc_lowrank, HC = pulsar_qwen_hc_dim(st->shape);
@@ -959,8 +973,7 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
         return (pulsar_gdn_forward(&gw, &c, 0) == 0 || fail("pulsar_gdn_forward failed")) && gdn_out();
     }
     /* PREFILL: the verify's rows [0, n_dec) -- one sequence, or (L272 P1 S4) one ragged run a bank, each row's
-     * state captured for the rollback -- then (L284 #2) the prompt run [n_dec, n) as its own call, uncaptured:
-     * the call a classic chunk of the same rows makes, at the run's row offset */
+     * state captured for the rollback -- then (L284 #2) the prompt runs after them, uncaptured */
     const uint32_t nvr = pulsar_qwen_step_verify_runs(st);
     if (st->n_dec > 0) {
         pulsar_gdn_call v = c;
@@ -984,19 +997,20 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
         }
         if (pulsar_gdn_forward(&gw, &v, 0) != 0) return fail("pulsar_gdn_forward failed (the verify rows)");
     }
-    if (st->n_dec < n) {
-        if (st->n_runs != nvr + 1u) return fail("a GDN step carries one prompt run");
-        const uint32_t r0 = st->n_dec;
+    /* each prompt run its own n_seq = 1 call at its row offset: the call a classic chunk of its rows makes (a
+     * ragged call over several runs would chunk them by the longest, not as each alone) */
+    for (uint32_t k = nvr; k < st->n_runs; k++) {
+        const uint32_t r0 = st->run_first[k], m = st->run_first[k + 1] - r0;
         pulsar_gdn_call p = c;
         p.n_seq = 1;
-        p.seq_rows = (int)(n - r0);
+        p.seq_rows = (int)m;
         p.row_slot += r0;
         p.qkv += (size_t)r0 * CD;
         p.z += (size_t)r0 * VT;
         p.a += (size_t)r0 * NVG;
         p.b += (size_t)r0 * NVG;
         p.out_bf16 = (uint16_t *)p.out_bf16 + (size_t)r0 * VT;
-        if (pulsar_gdn_forward(&gw, &p, 0) != 0) return fail("pulsar_gdn_forward failed (the prompt run)");
+        if (pulsar_gdn_forward(&gw, &p, 0) != 0) return fail("pulsar_gdn_forward failed (a prompt run)");
     }
     return gdn_out();
 }
@@ -1084,12 +1098,12 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
                                     (const uint16_t *)wptr(st, L.idx_q_norm,   "qwen QSA idx_q_norm"),
                                     (const uint16_t *)wptr(st, L.idx_k_norm,   "qwen QSA idx_k_norm")};
     /* L284 #2: the attention picks its schedule by the call's row count (the CTA fold from QSA_FOLD_ROWS rows, the
-     * split + combine below it -- not the same bytes), so each row-kind segment is its own call: a verify row
-     * attends as the verify alone does, a prompt row as its classic chunk does.  Every other kernel of the call is
-     * per row, and a bank's rows lie in one segment. */
+     * split + combine below it -- not the same bytes), so the verify rows are one call and each prompt run its own
+     * (attention_calls): a verify row attends as the verify alone does, a prompt row as its classic chunk does.
+     * Every other kernel of the call is per row, and a bank's rows lie in one call. */
     const uint64_t OD = pulsar_qwen_qsa_out_dim(s);
     pulsar_gpu_tensor *ws_view = scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes);
-    ok = ok && ws_view && arm_segments(st, 0, n, [&](bool, uint32_t r0, uint32_t m) {
+    ok = ok && ws_view && attention_calls(st, [&](uint32_t r0, uint32_t m) {
         pulsar_gpu_tensor *sq = pulsar_gpu_tensor_view(vq, (uint64_t)r0 * QI * 4u, (uint64_t)m * QI * 4u);
         pulsar_gpu_tensor *sk = pulsar_gpu_tensor_view(vk, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);
         pulsar_gpu_tensor *sv = pulsar_gpu_tensor_view(vv, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);

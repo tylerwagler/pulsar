@@ -2102,37 +2102,6 @@ void pulsar_session::note_committed_tokens(const int *toks, int n) {
 }
 
 
-int pulsar_session::note_prefilled(const int *toks, int n, int head) {
-    auto *s = this;
-    if (!toks || n <= 0) return 1;
-    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
-        fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
-                head, s->fused_logits ? s->fused_heads : 0u);
-        return 1;
-    }
-    s->note_committed_tokens(toks, n);
-    /* The checkpoint now describes exactly the bank's committed KV, as after a
-     * classic sync: it started empty (an invalidated bank) or as the valid
-     * prefix this prompt extends.  Left invalid, the bank's frontier read 0 and
-     * the next chunk restarted the prompt at position 0 over rows it had already
-     * committed ("frontier not position-true ... n_comp 61 want 0"). */
-    s->checkpoint_valid = true;
-    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
-    /* L264: a fused chunk that ends on the grid leaves the bank exactly where
-     * a prefill to that point leaves it -- a checkpoint, as the chunk loop takes
-     * one at every grid chunk end, so the fused lane's prompts resume like the
-     * classic sync's.  (The server's fused planners end chunks on grid points.) */
-    const uint32_t G = (uint32_t)s->checkpoint.len;
-    if (G % s->graph->ckpt.ops->resume_grid == 0u && G >= s->graph->ckpt.ops->min_checkpoint(s->graph->ckpt.state) &&
-        !s->graph->ms_comp_state_stale[gpu_graph_cur_bank(s->graph)])
-        (void)pulsar_ckpt_capture(&s->graph->ckpt, gpu_graph_cur_bank(s->graph), G);
-    if (head >= 0)
-        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * PULSAR_N_VOCAB,
-               (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
-    return 0;
-}
-
-
 void pulsar_session::invalidate() {
     auto *s = this;
     /* L260 (fusion phase A): an invalidated bank is EMPTY on the device too --

@@ -184,6 +184,48 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
 
 
 
+/* L260 fusion / L284 #2: the record of a fused step's prompt chunk in the INSTALLED bank's history, for every
+ * family -- what a classic sync of the same tokens leaves behind.  The tokens join the checkpoint (it started
+ * empty, an invalidated bank, or as the valid prefix the prompt extends -- left invalid, the bank's frontier read
+ * 0 and the next chunk restarted the prompt over rows it had already committed: "frontier not position-true ...
+ * n_comp 61 want 0"); the prefill frontier moves to its end (L195); a chunk that ends on the resume grid leaves a
+ * checkpoint, as the chunk loop takes one at every grid chunk end, so the fused lane's prompts resume like the
+ * classic sync's (the server's planners end chunks on grid points) -- when the model's store says the state there
+ * is a prefill's (pulsar_kv_state_ops::noted_at); and the finishing chunk's headed row becomes the session's
+ * next-token logits.  The family's state already moved with the step; a record that disagrees with it refuses
+ * before anything changes. */
+int pulsar_session::note_prefilled(const int *toks, int n, int head) {
+    auto *s = this;
+    if (!toks || n <= 0) return 1;
+    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
+        fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
+                head, s->fused_logits ? s->fused_heads : 0u);
+        return 1;
+    }
+    pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
+    const uint32_t bank = pulsar_session_live_bank(s);
+    const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
+    bool capture = false;
+    char why[192] = "";
+    if (!ck || !ck->ops || !ck->ops->noted_at(ck->state, G, &capture, why, sizeof(why))) {
+        fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) is not its state: %s -- refusing\n", bank,
+                from, G, ck && ck->ops ? why : "no checkpoint store");
+        return 1;
+    }
+    if (from == 0) s->live_images.n = 0;   /* a history from 0 holds no image block (a fused chunk is text) */
+    s->note_committed_tokens(toks, n);
+    s->checkpoint_valid = true;
+    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
+    if (capture && G % ck->ops->resume_grid == 0u && G >= ck->ops->min_checkpoint(ck->state))
+        (void)pulsar_ckpt_capture(ck, bank, G);
+    if (head >= 0) {
+        const size_t w = (size_t)s->engine->logits_width();
+        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * w, w * sizeof(s->logits[0]));
+        s->logits_stale = false;   /* the next-token row of the history, as a sync's last chunk leaves it */
+    }
+    return 0;
+}
+
 /* L264: how far the bank's PREFILL reached (decode rows past it are the decode
  * kernels'; L195) -- the end of the last prompt it served, the same live-vs-
  * carry rule as pulsar_bank_history.  0 when nothing valid. */
