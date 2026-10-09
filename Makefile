@@ -899,11 +899,12 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 # They are seconds each, need no GPU and no model, and their binaries compile
 # their own sources one-shot (no shared objects), so the background sub-make
 # cannot race the runner's build.  pulsar-eval is a prerequisite of `gates` for
-# the same reason: the background sub-make may only RUN it.
+# the same reason: the background sub-make may only RUN it.  container-tests
+# (L279) is the artifact builder's suite: no GPU, the synthetic builds' golden
+# SHA-256s, and the oracle suites that read the mounted checkpoints' headers.
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
-             indexer-score-check attn-pack-fixture-check tp-core-test
+             indexer-score-check attn-pack-fixture-check tp-core-test container-tests
 	./pulsar-eval --self-test-extractors
-	cd tools/container && python3 test_exl3_rates.py   # L272 P4a: the builder's EXL3 rate table == the engine's
 	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
@@ -1194,13 +1195,16 @@ cuda-reap-router-audit:
 # (shard, gguf_name, layout, dims_ne), kv entry-for-entry, every producer
 # byte-identical to the served bytes; the qwen4_exp family (L251) end to end on a
 # synthetic miniature checkpoint (recipe refusals, emit twice byte-identical,
-# verify --roundtrip, the PLE row file).  The oracle paths live in the tests and
+# verify --roundtrip, the PLE row file); the DeepSeek family (L279) on its own
+# synthetic miniature.  Both synthetic suites hold GOLDEN SHA-256s of every
+# emitted file, fixed before the L279 refactor: the builder's byte-identity
+# instrument.  The oracle paths live in the tests and
 # refuse when the checkpoints are not mounted; the codecs need numpy, so pass
 # the interpreter that has it (CONTAINER_PY=.../.venv/bin/python).
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_qwen.py; do \
+	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
