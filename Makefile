@@ -668,14 +668,16 @@ spec-depth-gate: tests/spec_depth_gate
 	./tests/spec_depth_gate
 
 # Tessera's fused window kernel (L255): pulsar's launcher vs Tessera's own build, byte for byte, on Qwen
-# layer-12 weights.  TESSERA_FIXTURE comes from tools/tessera/kernel_fixture.py (needs Tessera + torch).
-TESSERA_FIXTURE ?= /mnt/models/tessera-l255/tessera_kernel.fx
+# layer-12 weights.  The fixtures come from tools/tessera/kernel_fixture.py (needs Tessera + torch), at the
+# vendored revision (VENDOR-TESSERA.md): the 32-expert one (dense qkv/out_proj + routed, 12 cases) and the full
+# 512-expert stack with the capture's own routing (--moe-only --real-routing, 5 cases).  17 of 17 is the bar.
+TESSERA_FIXTURES ?= /mnt/models/tessera-l255/fx-37742e0f/tessera_kernel.fx /mnt/models/tessera-l255/fx-37742e0f/full512.fx
 .PHONY: tessera-kernel-gate
 tests/tessera_kernel_gate: tests/tessera_kernel_gate.cu src/cuda/mmq/pulsar_tessera.o src/cuda/mmq/pulsar_tessera.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda/mmq -o $@ tests/tessera_kernel_gate.cu \
 		src/cuda/mmq/pulsar_tessera.o $(CUDA_LDLIBS)
 tessera-kernel-gate: tests/tessera_kernel_gate
-	./tests/tessera_kernel_gate $(TESSERA_FIXTURE)
+	@set -e; for f in $(TESSERA_FIXTURES); do ./tests/tessera_kernel_gate $$f; done
 
 .PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
 qwen-family-containers:

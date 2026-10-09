@@ -10,8 +10,10 @@ file grew from 1,520 to 3,778 lines (four families: value, E4M3, E4M3-MMA, E2M1;
 dense rates 9-14; the piece-major E4M3 layout; the paired-K32 schedule), the value
 family's `Params` gained `piece_major`, `fixup`, `tile_sem`, `roles` (all zero here:
 pulsar never requests piece-major and launches no multi-role dense), and `table0/1`
-became `const void*`.  Byte parity with Tessera's own build at this revision is
-**NOT YET re-run** (the gate needs sparky); the 1381c3b7 gate was 17/17. Tessera is
+became `const void*`.  Byte parity with Tessera's own build at this revision:
+**17/17 byte-identical** (sparky, 2026-10-08, fixtures regenerated at 37742e0f; the
+1381c3b7 gate was 17/17 too, and the new fixtures' outputs and planes equal the old
+ones byte for byte -- only the tables' dtype tag moved, int16 -> bf16). Tessera is
 licensed **MIT + Attribution Addendum 1.0** (`LicenseRef-Tessera-Attribution-1.0`);
 the full text is `LICENSE-TESSERA` in this directory, verbatim (addendum A3
 requires it to travel with every copy).
@@ -61,8 +63,9 @@ so the device code stays upstream's byte for byte.  Re-check at each re-sync.
 
 ## The gate
 
-`make tessera-kernel-gate TESSERA_FIXTURE=…` runs `tests/tessera_kernel_gate`
-against a fixture from `tools/tessera/kernel_fixture.py`, which runs **Tessera's
+`make tessera-kernel-gate` runs `tests/tessera_kernel_gate` on each of
+`TESSERA_FIXTURES` (the Makefile names the two the bar counts), fixtures from
+`tools/tessera/kernel_fixture.py`, which runs **Tessera's
 own build** of this kernel (its torch extension) on Qwen3.8-Flash-Next layer-12
 weights. The gate passes only when every output byte matches and pulsar's
 split-K choice equals Tessera's `dense_k_split`.
