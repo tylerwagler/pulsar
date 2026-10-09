@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import glob
 import json
-import math
 import os
 import struct
 import sys
@@ -398,8 +397,8 @@ def run_native(served: Tree, hf: Tree, name: str) -> None:
         got = P.i64_to_i32(raw)
         how = "i64_to_i32"
     else:
-        got = P.native(raw)
-        how = "native"
+        got = raw                       # COPY: the builder writes the source span verbatim
+        how = "copy"
     dt = time.perf_counter() - t0
     want = sh.read(name)
     span = se_["data_offsets"][1] - se_["data_offsets"][0]

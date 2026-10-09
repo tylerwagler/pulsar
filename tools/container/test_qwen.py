@@ -13,12 +13,12 @@ an exllamav3-layout EXL3 checkpoint of random trellis / suh / svh, a toy BPE tok
     option on a Qwen build, a PLE manifest whose head table is not the checkpoint's
   * the PLE row file: build -> verify (sampled + --full) PASS; a flipped byte in the file -> verify FAILS
   * split gate/up (turboderp's form) -> gate_proj / up_proj families when the recipe says split
+  * GOLDEN: the SHA-256 of every emitted file of the fused and the split build, fixed on the builder before L279's
+    refactor (the byte-identity instrument, rule 7; test_deepseek.py holds the DeepSeek pair)
 """
 from __future__ import annotations
 
-import contextlib
 import copy
-import io
 import json
 import os
 import shutil
@@ -32,8 +32,15 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import producers as P  # noqa: E402
+from test_deepseek import digest  # noqa: E402
 
 FAILS: list[str] = []
+# sha256 over (file name, sha256(file)) of every emitted file, in name order (test_deepseek.digest); taken at dev
+# bdb62d13 (pre-L279)
+GOLDEN = {
+    "fused": "a4d6fc36f9d898f229f188d6d2f76bf77e8d55a62da9c2d03df85522837e171b",
+    "split": "d818bfd9a3ba47de09a8c1b837be41ed9effa401d89286d277d09667d186cf1a",
+}
 PFX = "model.language_model."
 H, L, E, FF, HC, LR = 256, 4, 4, 128, 4, 64
 
@@ -301,6 +308,8 @@ def main():
         check(ok and "failing: 0" in out and "roundtrip:" in out, "verify --all --roundtrip PASS")
         ok, out = run("build.py", "audit", "--out", o1)
         check(ok and "AUDIT PASS" in out, "audit PASS")
+        got = digest(o1)
+        check(got == GOLDEN["fused"], f"GOLDEN fused: {got}")
         # the instrument must see a single flipped payload byte (mutation: a green verify is not vacuous)
         victim = os.path.join(o2, "model-00002-of-00006.safetensors")
         vb = bytearray(open(victim, "rb").read())
@@ -338,7 +347,7 @@ def main():
         bad_ex = os.path.join(tmp, "exl3-k3")
         make_exl3(bad_ex, hf_t, np.random.default_rng(7), dense_K=3)
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", bad_ex, "--recipe", recipe, "--ple-rows", man,
-                      expect_fail=True, contains="not a rate pulsar reads here")
+                      expect_fail=True, contains="the recipe names exl3m_k5, the EXL3 source holds exl3m_k3")
         check(ok, "dense at K3 (no row names it) -> refused")
         bad_ex = os.path.join(tmp, "exl3-k5-experts")
         make_exl3(bad_ex, hf_t, np.random.default_rng(7), expert_K=5)
@@ -356,8 +365,8 @@ def main():
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", bad_ex, "--recipe", recipe, "--ple-rows", man,
                       expect_fail=True, contains="codebook multiplier")
         check(ok, "a tensor on another codebook -> refused")
-        ok, out = run("build.py", "plan", *common, "--mxfp8-scale", "verbatim", expect_fail=True, contains="DeepSeek options")
-        check(ok, "a DeepSeek option on a qwen4_exp build -> refused")
+        ok, out = run("build.py", "plan", *common, "--mxfp8-scale", "verbatim", expect_fail=True, contains="no entry of this build is an FP8-sourced mxfp8_lt")
+        check(ok, "--mxfp8-scale verbatim with no FP8 source (the Qwen checkpoint is BF16) -> refused")
         r = json.load(open(recipe))
         for label, rows, msg in (
                 ("unnamed", [x for x in r["rows"] if x[0] != "model.visual.*"], "no row of"),
@@ -377,6 +386,41 @@ def main():
                       expect_fail=True, contains="a different table")
         check(ok, "a PLE manifest with another head table -> refused")
 
+        tb = os.path.join(tmp, "tessera")
+        os.makedirs(tb)
+        open(os.path.join(tb, PFX + "layers.0.mlp.experts.gate_up_proj.pt"), "wb").write(b"\0")
+        rt = dict(r, rows=[[p, "tessera"] if p.endswith("mlp.experts.gate_up_proj") else [p, f] for p, f in r["rows"]])
+        rp = os.path.join(tmp, "recipe-tessera.json")
+        json.dump(rt, open(rp, "w"))
+        ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--tessera", tb, "--recipe", rp, "--ple-rows",
+                      man, expect_fail=True, contains="the tessera producer lands with L255")
+        check(ok, "routed experts as Tessera planes -> refused by name (the producer is L255's)")
+        json.dump(dict(r, model_type="deepseek_v4"), open(rp, "w"))
+        ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      expect_fail=True, contains="a recipe for 'deepseek_v4'")
+        check(ok, "a recipe for another model_type -> refused")
+
+        print("the MTP drafter as recipe rows:")
+        rm = dict(r, rows=[x for x in r["rows"] if x[0] != "mtp.*"] + [["mtp.*", "mxfp8_lt"]])
+        rp = os.path.join(tmp, "recipe-mtp.json")
+        json.dump(rm, open(rp, "w"))
+        o4 = os.path.join(tmp, "out-mtp")
+        ok, out = run("build.py", "emit", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      "--out", o4, "--all")
+        check(ok, "emit with the mtp.* rows written")
+        shard_files = sorted(f for f in os.listdir(o4) if f.endswith(".safetensors"))
+        with open(os.path.join(o4, shard_files[0]), "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            kv4 = {e["key"]: e["value"] for e in json.loads(json.loads(f.read(n))["__metadata__"]["pulsar.kv"])}
+        with open(os.path.join(o4, shard_files[-1]), "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            h4 = json.loads(f.read(n))
+        check(len(shard_files) == L + 3 and kv4["pulsar.mtp_present"] is True and h4["__metadata__"]["pulsar.shard_key"]
+              == "mtp" and "mtp.fc_embedding.weight" in h4, "an `mtp` shard after `top`; pulsar.mtp_present true")
+        ok, out = run("build.py", "verify", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
+                      "--out", o4, "--all")
+        check(ok and "failing: 0" in out, "verify PASS (with the mtp shard)")
+
         print("split gate/up (turboderp's layout):")
         ex_s = os.path.join(tmp, "exl3-split")
         make_exl3(ex_s, hf_t, np.random.default_rng(9), fused=False)
@@ -390,6 +434,8 @@ def main():
         ok, out = run("build.py", "verify", "--hf", hf_dir, "--exl3", ex_s, "--recipe", rp, "--ple-rows", man,
                       "--out", o3, "--all")
         check(ok and "failing: 0" in out, "verify PASS (split)")
+        got = digest(o3)
+        check(got == GOLDEN["split"], f"GOLDEN split: {got}")
         with open(os.path.join(o3, "model-00003-of-00006.safetensors"), "rb") as f:
             (n,) = struct.unpack("<Q", f.read(8))
             h = json.loads(f.read(n))

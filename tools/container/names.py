@@ -17,6 +17,10 @@ about a name is answered here and nowhere else:
   emit            False = the builder consumes the name but writes nothing to the
                   container (the three drop rules below); the entry still maps,
                   so a checkpoint walk stays fail-closed over every name
+  role            what the tensor IS, in pulsar.recipe.v1's vocabulary (role_of):
+                  dense | shared_expert | expert_gate | expert_up | expert_down |
+                  router | route_table | norm | embed | head | draft_head |
+                  vision | other
 
 Container key == HF key everywhere except two folds forced by structure:
   (a) routed experts: `layers.L.ffn.experts.E.w{1,2,3}.{weight,scale}` -> ONE U8
@@ -93,6 +97,7 @@ class Mapped:
     part: str | None
     is_scale: bool
     emit: bool = True
+    role: str = ""              # what the tensor IS, in the recipe's vocabulary
 
 
 def shard_order(shape: ModelShape) -> list[str]:
@@ -190,7 +195,24 @@ ENGRAM_TENSORS = {"engram.wkv.weight", "engram.q_weight", "engram.k_weight"}
 ENGRAM_SIDECAR = {"engram.embed.weight"}
 
 EXPERT_PART_GGUF = {"w1": "gate", "w2": "down", "w3": "up"}
-EXPERT_GGUF_PART = {v: k for k, v in EXPERT_PART_GGUF.items()}
+EXPERT_ROLE = {"w1": "expert_gate", "w3": "expert_up", "w2": "expert_down"}
+
+# The roles (pulsar.recipe.v1's vocabulary) of the HF suffixes; every other suffix is `norm` when it is a norm
+# weight and `other` (hc mixes, sinks, compressor / indexer side matrices, the drafter's heads but markov_w2 ...)
+# otherwise.  The dense linears are the FP8 ones in both checkpoints.
+ROLE = {
+    **{f"attn.{p}.weight": "dense" for p in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "indexer.wq_b")},
+    **{f"ffn.shared_experts.{p}.weight": "shared_expert" for p in ("w1", "w2", "w3")},
+    "ffn.gate.weight": "router", "ffn.gate.bias": "router", "ffn.gate.bias_vl": "router",
+    "ffn.gate.tid2eid": "route_table",
+    "main_proj.weight": "dense", "engram.wkv.weight": "dense",
+    "markov_head.markov_w2.weight": "draft_head", "markov_head.head.weight": "draft_head",
+    "embed.weight": "embed", "head.weight": "head",
+}
+
+
+def role_of(suffix: str) -> str:
+    return ROLE.get(suffix) or ("norm" if suffix.endswith("norm.weight") else "other")
 
 VISION_PREFIX = ("vision.", "aligner.")
 VISION_TOP = {"image_start", "image_end", "image_newline", "image_pad"}
@@ -236,15 +258,15 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
         return Mapped(container_name=f"{ns}.{idx}.ffn.experts.{e}.{part}.weight",
                       gguf_name=f"{prefix}ffn_{EXPERT_PART_GGUF[part]}_exps.weight",
                       family="expert", shard=shard, layer=idx, expert=e, part=part,
-                      is_scale=leaf in COMPANION)
+                      is_scale=leaf in COMPANION, role=EXPERT_ROLE[part])
 
     suffix, companion = _split_leaf(rest)
     if not is_mtp and suffix in ENGRAM_SIDECAR:
         return Mapped(f"{ns}.{idx}.{suffix}", f"{ns}.{idx}.{suffix}", family, shard, idx,
-                      None, None, companion, emit=False)
+                      None, None, companion, emit=False, role=role_of(suffix))
     if not is_mtp and suffix in ENGRAM_TENSORS:
         return Mapped(f"{ns}.{idx}.{suffix}", f"{ns}.{idx}.{suffix}", family, shard, idx,
-                      None, None, companion)
+                      None, None, companion, role=role_of(suffix))
 
     if suffix in LAYER:
         gguf = prefix + LAYER[suffix]
@@ -259,59 +281,35 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
     else:
         return None
     return Mapped(container_name=f"{ns}.{idx}.{suffix}", gguf_name=gguf, family=family,
-                  shard=shard, layer=idx, expert=None, part=None, is_scale=companion, emit=emit)
+                  shard=shard, layer=idx, expert=None, part=None, is_scale=companion, emit=emit,
+                  role=role_of(suffix))
+
+
+# ---------------------------------------------------------------------------
+# The EXL3 expert source's naming (an exllamav3 checkpoint of DeepSeek: MiaAI's V4.1, our L245 / L247 splices):
+# the routed expert-projection <block>.L.ffn.experts.E.wP (block layers or mtp, the drafter's) is the Linear key
+# its trellis / suh / svh / mul1 hang off.  hf_source.Exl3Checkpoint answers by key; these are the DeepSeek hooks
+# that name them.
+# ---------------------------------------------------------------------------
+_EXL3_FIRST_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.0\.w1\.trellis$")
+
+
+def exl3_expert_key(block: str, layer: int, e: int, part: str) -> str:
+    return f"{block}.{layer}.ffn.experts.{e}.{part}"
+
+
+def exl3_layers(names) -> list[int]:
+    """The main layers whose routed experts an EXL3 checkpoint holds (by its expert 0 gate trellis)."""
+    return sorted({int(m.group(1)) for m in map(_EXL3_FIRST_EXPERT.match, names) if m})
 
 
 def map_hf(hf_name: str, shape: ModelShape) -> Mapped | None:
     if hf_name.startswith(VISION_PREFIX) or hf_name in VISION_TOP:
-        return Mapped(hf_name, hf_name, "vision", "vision", None, None, None, False)
+        return Mapped(hf_name, hf_name, "vision", "vision", None, None, None, False, role="vision")
     m = _BLOCK.match(hf_name)
     if m:
         return _map_block(m.group(1), int(m.group(2)), m.group(3), shape)
     suffix, companion = _split_leaf(hf_name)
     if suffix in TOP:
-        return Mapped(suffix, TOP[suffix], "top", "top", None, None, None, companion)
+        return Mapped(suffix, TOP[suffix], "top", "top", None, None, None, companion, role=role_of(suffix))
     return None
-
-
-# ---------------------------------------------------------------------------
-# The inverse, for re-keying GGUF-era per-tensor maps (policy.rekey_format_map).
-# Built from the same tables, so the two directions cannot disagree.
-# ---------------------------------------------------------------------------
-_TOP_INV = {v: k for k, v in TOP.items()}
-_LAYER_INV = {v: k for k, v in LAYER.items()}
-_DRAFTER_INV = {v: k for k, v in DRAFTER.items()
-                if k not in ("markov_head.embed.weight", "markov_head.head.weight")}
-_EXP_GGUF = re.compile(r"^(blk|dspark)\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
-_GGUF_BLOCK = re.compile(r"^(blk|dspark)\.(\d+)\.(.+)$")
-
-
-def hf_for_gguf(gguf_name: str, shape: ModelShape) -> str:
-    """The HF/container name (or, for an expert stack, the fnmatch pattern over
-    its per-expert entries) an engine name denotes.  Raises KeyError for a name
-    no table row produces."""
-    if gguf_name in _TOP_INV:
-        return _TOP_INV[gguf_name]
-    if gguf_name.startswith(VISION_PREFIX) or gguf_name in VISION_TOP:
-        return gguf_name
-    m = _EXP_GGUF.match(gguf_name)
-    if m:
-        ns = "layers" if m.group(1) == "blk" else "mtp"
-        return f"{ns}.{int(m.group(2))}.ffn.experts.*.{EXPERT_GGUF_PART[m.group(3)]}.weight"
-    m = _GGUF_BLOCK.match(gguf_name)
-    if m:
-        ns = "layers" if m.group(1) == "blk" else "mtp"
-        idx, rest = int(m.group(2)), m.group(3)
-        if rest in _LAYER_INV:
-            hf = f"{ns}.{idx}.{_LAYER_INV[rest]}"
-        elif ns == "mtp" and rest in _DRAFTER_INV:
-            hf = f"{ns}.{idx}.{_DRAFTER_INV[rest]}"
-        else:
-            raise KeyError(gguf_name)
-        got = map_hf(hf, shape)
-        if got is None or got.gguf_name != gguf_name:
-            raise KeyError(gguf_name)
-        return hf
-    if gguf_name.startswith("dspark.") and gguf_name[len("dspark."):] in DRAFTER_UNNUMBERED:
-        return "mtp.0." + gguf_name[len("dspark."):]
-    raise KeyError(gguf_name)

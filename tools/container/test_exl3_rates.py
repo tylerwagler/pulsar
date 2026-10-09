@@ -4,8 +4,8 @@
 The rate table lives in two languages: exl3_rates.py for the builder, and in the engine the layout-name
 table (src/engine/model.cpp pulsar_layout_names) plus the rate switch (src/engine/exl3_trellis.h
 exl3_type_k2).  One fact, so this pins them: every builder layout is an engine layout with the same rate
-in half bits, the engine has no EXL3 layout the builder lacks, and the families' admitted rates are
-rates some engine arm reads (exl3_arm_has_rate).  Plain python, no GPU, no checkpoints; in host-checks."""
+in half bits, the engine has no EXL3 layout the builder lacks, and the builder's per-arm rate sets (the rates a
+role admits, L279) are exactly exl3_arm_has_rate's.  Plain python, no GPU, no checkpoints; in host-checks."""
 import os
 import re
 import sys
@@ -29,13 +29,14 @@ def main():
     if engine != exl3_rates.K2:
         fails.append(f"engine layouts/rates {engine} != builder K2 {exl3_rates.K2}")
     arms = re.search(r"exl3_arm_has_rate\(int arm, int k2\) \{(.*?)\n\}", trellis, re.S)
-    read_rates = {int(k) for k in re.findall(r"k2 == (\d+)", arms.group(1))} if arms else set()
-    if not read_rates:
-        fails.append("could not read exl3_arm_has_rate's rates")
-    for family, layouts in (("DEEPSEEK_EXPERT", exl3_rates.DEEPSEEK_EXPERT), ("QWEN", exl3_rates.QWEN)):
-        for layout in layouts:
-            if exl3_rates.K2.get(layout) not in read_rates:
-                fails.append(f"{family} admits {layout} (k2 {exl3_rates.K2.get(layout)}), which no engine arm reads")
+    engine_arms = {name.lower(): tuple(int(k) for k in re.findall(r"k2 == (\d+)", body)) for name, body in
+                   re.findall(r"case EXL3_ARM_([A-Z_]+):\s*return ([^;]*);", arms.group(1))} if arms else {}
+    engine_arms.pop("moe_prefill", None)       # the MoE prefill arm admits nothing by role (weight_format.cpp)
+    if engine_arms != exl3_rates.ARMS:
+        fails.append(f"engine arms {engine_arms} != builder ARMS {exl3_rates.ARMS}")
+    for role, arm in exl3_rates.ROLE_ARM.items():
+        if arm not in exl3_rates.ARMS:
+            fails.append(f"role {role} runs arm {arm}, which ARMS lacks")
     for layout, k2 in exl3_rates.K2.items():
         if exl3_rates.words_for(layout) != 16 * (k2 >> 1) + (8 if k2 & 1 else 0):
             fails.append(f"{layout}: words per tile {exl3_rates.words_for(layout)}")

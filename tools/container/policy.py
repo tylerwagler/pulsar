@@ -1,4 +1,6 @@
-"""policy.py -- the layout each container entry is written in (L247).
+"""policy.py -- DeepSeek's DEFAULT recipe: the layout each container entry is written in when no --recipe names it
+(L247; since L279 step 5 it generates the default pulsar.recipe.v1 rows, deepseek.default_recipe, and is no longer
+consulted when a recipe is given).
 
 Checked against the checkpoints' own shard headers (not config.json's
 torch_dtype), the GGUF-era type policy (`suffix_type`, `policy_type`,
@@ -12,8 +14,7 @@ dtype and is not a decision at all:
      companion folds in; producers.mxfp8_lt).
   2. Routed experts -> the expert SOURCE's layout: I8 nibbles + E8M0 scale
      (the QAT FP4 checkpoint) -> `cutlass_mxfp4`; an EXL3 trellis names its
-     own rate in its shape ([k/16, n/16, words] -> exl3m_k2 / k2h / k3).  A
-     per-layer format map (overrides) may choose among the expert layouts.
+     own rate in its shape ([k/16, n/16, words]; deepseek.default_recipe).
   3. The drafter's `markov_w2` (bf16 source) -> `fp8_e4m3_soa_k`, k-major
      (L213; the one lossy-by-design row; the engine refuses the v-major dims).
   4. `ffn.gate.tid2eid` -> `i32`: the source stores expert ids as I64 (torch's
@@ -35,59 +36,21 @@ dtype and is not a decision at all:
 Everything else keeps its native dtype: BF16 -> `bf16`, F32 -> `f32`, I32 ->
 `i32`.  A dtype the engine has no layout for (F16, U8, a lone F8_E8M0 ...)
 refuses; there is no "closest" format.
-
-Overrides ({container-name or fnmatch pattern: layout}) are consulted first
-and must name a layout the source can be written in: a map that asks a bf16
-tensor for mxfp8_lt, or a FP4 expert for a layout the builder has no producer
-for, refuses instead of quietly falling back to the default.
 """
 from __future__ import annotations
 
-from fnmatch import fnmatchcase
-
-import exl3_rates
-from names import Mapped, ModelShape, hf_for_gguf
-
-# The engine's layout vocabulary (src/engine/model.cpp pulsar_layout_names)
-# restricted to what the builder produces (README, order of work step 1).
-NATIVE = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
-EXPERT_LAYOUTS = {"cutlass_mxfp4", *exl3_rates.DEEPSEEK_EXPERT}
-EXL3_WORDS = exl3_rates.rates(exl3_rates.DEEPSEEK_EXPERT)   # words per tile -> layout
-LAYOUTS = set(NATIVE.values()) | EXPERT_LAYOUTS | {"mxfp8_lt", "fp8_e4m3_soa_k"}
-
-# GGUF-era spellings a prisma format map uses -> the engine's.  IQ2 is named so
-# a map row can be REPORTED; layout_for refuses it because the builder has no
-# producer (the type-44 permutation lived in the archived repack_iq2_mmq.py).
-GGUF_FORMAT_NAMES = {
-    "MXFP8_LT": "mxfp8_lt", "CUTLASS_MXFP4": "cutlass_mxfp4", "IQ2_XXS_MMQ": "iq2_xxs_mmq_k",
-    "BF16": "bf16", "F32": "f32", "I32": "i32", "FP8_E4M3_SOA_K": "fp8_e4m3_soa_k",
-    "EXL3M_K2": "exl3m_k2", "EXL3M_K2H": "exl3m_k2h", "EXL3M_K3": "exl3m_k3",
-}
+import producers as PR
+from names import Mapped
 
 
 class PolicyError(ValueError):
     pass
 
 
-def _override_for(m: Mapped, overrides: dict) -> str | None:
-    hit = overrides.get(m.container_name)
-    if hit is not None:
-        return hit
-    for pat, layout in overrides.items():
-        if fnmatchcase(m.container_name, pat):
-            return layout
-    return None
-
-
 def _default_layout(m: Mapped, dtype: str, shape: list[int]) -> str:
     if m.family == "expert":
         if dtype == "I8" and len(shape) == 2:
             return "cutlass_mxfp4"
-        if dtype == "I16" and len(shape) == 3:
-            words = shape[2]
-            if words not in EXL3_WORDS:
-                raise PolicyError(f"{m.container_name}: {words} words per EXL3 tile is not a rate pulsar reads")
-            return EXL3_WORDS[words]
         raise PolicyError(f"{m.container_name}: routed expert source {dtype} {shape} has no layout")
     if m.gguf_name.endswith(".markov_head.markov_w2.weight"):
         if dtype != "BF16" or len(shape) != 2:
@@ -101,8 +64,8 @@ def _default_layout(m: Mapped, dtype: str, shape: list[int]) -> str:
         if len(shape) != 2:
             raise PolicyError(f"{m.container_name}: F8_E4M3 with shape {shape}; mxfp8_lt is a 2-D layout")
         return "mxfp8_lt"
-    if dtype in NATIVE:
-        return NATIVE[dtype]
+    if dtype in PR.NATIVE_LAYOUT:
+        return PR.NATIVE_LAYOUT[dtype]
     raise PolicyError(f"{m.container_name}: source dtype {dtype} has no engine layout")
 
 
@@ -117,42 +80,11 @@ def declared_shape(m: Mapped, shape: list[int]) -> list[int]:
     return list(shape)
 
 
-def layout_for(m: Mapped, dtype: str, shape: list[int], overrides: dict) -> str:
-    """The layout name for the entry `m` whose PRIMARY source tensor has this
-    dtype/shape (the `.weight` / `.trellis`; companions never decide)."""
+def layout_for(m: Mapped, dtype: str, shape: list[int]) -> str:
+    """The default layout for the entry `m` whose PRIMARY source tensor has this dtype/shape (the `.weight`;
+    companions never decide)."""
     if m.is_scale:
         raise PolicyError(f"{m.container_name}: layout_for takes the primary tensor, not a companion")
     if not m.emit:
         raise PolicyError(f"{m.container_name}: not a container tensor")
-    default = _default_layout(m, dtype, shape)
-    want = _override_for(m, overrides)
-    if want is None:
-        return default
-    if want not in LAYOUTS:
-        raise PolicyError(f"{m.container_name}: override names {want!r}, which the builder does not produce")
-    if m.family == "expert":
-        if want not in EXPERT_LAYOUTS:
-            raise PolicyError(f"{m.container_name}: {want!r} is not a routed-expert layout")
-        if want.startswith("exl3m_") != default.startswith("exl3m_"):
-            raise PolicyError(f"{m.container_name}: override {want!r} but the expert source is {default}")
-        return want
-    if want != default:
-        raise PolicyError(f"{m.container_name}: override {want!r} but the source ({dtype}) is written as {default}")
-    return want
-
-
-def rekey_format_map(gguf_map: dict, shape: ModelShape) -> dict:
-    """A prisma per-tensor map keyed by GGUF names ({"blk.10.ffn_down_exps.weight":
-    "IQ2_XXS_MMQ", ...}) -> {container name or expert pattern: engine layout}."""
-    out = {}
-    for gguf_name, fmt in gguf_map.items():
-        if fmt not in GGUF_FORMAT_NAMES:
-            raise PolicyError(f"format map: {gguf_name}: unknown format {fmt!r}")
-        try:
-            key = hf_for_gguf(gguf_name, shape)
-        except KeyError:
-            raise PolicyError(f"format map: {gguf_name}: no container name for this engine name") from None
-        if key in out:
-            raise PolicyError(f"format map: {gguf_name} re-keys to {key}, already set")
-        out[key] = GGUF_FORMAT_NAMES[fmt]
-    return out
+    return _default_layout(m, dtype, shape)

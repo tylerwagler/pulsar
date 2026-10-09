@@ -8,8 +8,9 @@ Sources (no GGUF anywhere, L247):
            (research/l251/container/qwen_exl3_quant.py: gate_up fused) or turboderp's (gate / up separate).
   --exl3-experts   optional: a DIFFERENT exllamav3 checkpoint for the routed experts only (e.g. turboderp's K4
            experts beside our K5 dense).  Named explicitly; nothing falls back from one source to the other.
-  --recipe the per-tensor format map (format-maps/qwen38fn-*.json): every checkpoint tensor matches EXACTLY ONE row
-           (fnmatch), every row matches something; a tensor no row names refuses.
+  --recipe a pulsar.recipe.v1 (recipe.py; format-maps/qwen38fn-*.json, name-pattern rows): every checkpoint tensor
+           matches EXACTLY ONE row, every row matches something; a tensor no row names refuses.  Its family setting
+           expert_gate_up (fused | split) says how the routed gate_up stack is written.
   --ple-rows  the PLE row-file manifest (ple_rows.py build): its header facts become pulsar.kv entries so the
            loader can refuse a mismatched table.
 
@@ -30,211 +31,168 @@ What the container holds (the loader's contract, published in pulsar-notes resea
   * layouts: bf16 (native), mxfp8_lt (U8, E4M3 [out][in] + swizzled E8M0, padded per bytes_for), exl3m_k4 /
     k5 / k6 / k8 (U8 [trellis | suh | svh], dims_ne [in, out]; K6 / K8 are turboderp's packs, L266).  Declared shapes are the SOURCE shapes (no reshapes).
   * shards: `vision` (primary: pulsar.kv + the vision tower, BF16 native), `layers.0..47`, `top` (embed, head,
-    top-level mixer).  MTP is omitted by the recipe (no lane yet); pulsar.kv says so.
+    top-level mixer), and `mtp` (the drafter's mtp.* tensors, its expert families marked "block": "mtp") when the
+    recipe writes them (L279; the L251 sidecar's rows) -- pulsar.mtp_present says which.
 """
 from __future__ import annotations
 
-import fnmatch
-import hashlib
 import json
 import os
 import re
 import struct
 
+import entries as EN
 import exl3_rates
-from hf_source import EXL3_MUL1  # noqa: F401  (the codebook the EXL3 sources are checked against)
 import kv as KV
+from tokenizer import core as TOK
 import producers as PR
+import recipe as R
+from names import Mapped
 
 FAMILY = "qwen4_exp"
 PFX = "model.language_model."
-EXL3_RATES = exl3_rates.rates(exl3_rates.QWEN)   # words per 16x16 tile -> layout, the rates Qwen's arms read
-FORMATS = {"bf16", "mxfp8_lt", *exl3_rates.QWEN, "ple_rows", "kv", "omit"}
-EXPERT_STACKS = ("gate_up_proj", "down_proj")
-
-
-def is_qwen(hf) -> bool:
-    return hf.config["top_level"].get("model_type") == FAMILY
-
-
-# ---------------------------------------------------------------------------
-# the recipe
-# ---------------------------------------------------------------------------
-class Recipe:
-    def __init__(self, path):
-        self.path = path
-        r = json.load(open(path))
-        if r.get("model_type") != FAMILY:
-            raise SystemExit(f"{path}: recipe is for {r.get('model_type')!r}, not {FAMILY}")
-        self.name = r["recipe"]
-        self.gate_up = r["expert_gate_up"]
-        if self.gate_up not in ("fused", "split"):
-            raise SystemExit(f"{path}: expert_gate_up {self.gate_up!r} is neither 'fused' nor 'split'")
-        self.rows = [tuple(x) for x in r["rows"]]
-        for pat, fmt in self.rows:
-            if fmt not in FORMATS:
-                raise SystemExit(f"{path}: row {pat!r} names format {fmt!r} ({sorted(FORMATS)})")
-        self.sha256 = hashlib.sha256(open(path, "rb").read()).hexdigest()
-
-    def resolve(self, names):
-        """name -> format for every checkpoint name, refusing unnamed / doubly-named tensors and dead rows."""
-        out, used = {}, set()
-        for n in names:
-            hits = [(p, f) for p, f in self.rows if fnmatch.fnmatchcase(n, p)]
-            if not hits:
-                raise SystemExit(f"{n}: no row of {self.path} names this tensor's format -- refusing")
-            if len(hits) > 1:
-                raise SystemExit(f"{n}: {len(hits)} rows of {self.path} match ({[p for p, _ in hits]}) -- refusing")
-            out[n] = hits[0][1]
-            used.add(hits[0][0])
-        dead = [p for p, _ in self.rows if p not in used]
-        if dead:
-            raise SystemExit(f"{self.path}: rows that match no checkpoint tensor: {dead}")
-        return out
+META = {"pulsar.family": FAMILY}
+SETTINGS = ("expert_gate_up",)  # the recipe's family setting: the routed gate_up stack fused or split
+EXPERT_STACKS = True            # an HF expert tensor is the whole [E, out, in] stack; its families plan in walk order
+GATE_UP_PARTS = ("gate_up_proj", "gate_proj", "up_proj")
+PART_ROLE = {"gate_up_proj": "expert_gate_up", "gate_proj": "expert_gate", "up_proj": "expert_up",
+             "down_proj": "expert_down"}
+# what the qwen4_exp loader binds (any role; the EXL3 rate by the engine's arm, exl3_rates.admit)
+ADMITS = {"bf16", "mxfp8_lt", "tessera", *exl3_rates.K2, *R.CONSUMED}
+# the tokenizer (tokenizer/core.py's walk), mechanical from the checkpoint's own files: HF-special added tokens
+# CONTROL, the rest USER_DEFINED; the checkpoint's chat_template.jinja; its pretokenize_regex; bos only when the
+# config names one (it names none).  S5 (the Qwen renderer) owns anything beyond this.
+TOKENIZER = TOK.Settings(added_type=lambda a: TOK.TT_CONTROL if a["special"] else TOK.TT_USER_DEFINED,
+                         pretokenize_regex=True, bos_optional=True)
 
 
 # ---------------------------------------------------------------------------
-# names -> shards
+# the naming table: HF name -> (role, shard, the expert stack's per-part entry names).  The container name and the
+# gguf_name ARE the HF name (the Qwen family binds by the checkpoint's own names); what the table adds is what
+# each tensor IS (its role, the recipe's vocabulary) and where it lives.  A name the table lacks refuses.
 # ---------------------------------------------------------------------------
-_LAYER = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
+# the suffix after `model.language_model.layers.N.` (and the drafter's `mtp.layers.N.`) -> role
+BLOCK_ROLES = {
+    **{f"{hc}_hyper_connection.{t}": r for hc in ("attn", "mlp") for t, r in (
+        ("block_inject_weight.weight", "other"), ("hc_norm.weight", "norm"),
+        ("input_mix_weight_down.weight", "dense"), ("input_mix_weight_up.weight", "dense"))},
+    "linear_attn.A_log": "other", "linear_attn.dt_bias": "other", "linear_attn.conv1d.weight": "other",
+    "linear_attn.norm.weight": "norm",
+    **{f"linear_attn.{p}.weight": "dense" for p in ("in_proj_a", "in_proj_b", "in_proj_qkv", "in_proj_z", "out_proj")},
+    **{f"self_attn.{p}.weight": "dense" for p in ("q_proj", "k_proj", "v_proj", "o_proj", "indexer.index_qk_proj")},
+    **{f"self_attn.{p}.weight": "norm" for p in ("q_norm", "k_norm", "indexer.q_layernorm", "indexer.k_layernorm")},
+    "mlp.gate.weight": "router",
+    "mlp.experts.gate_up_proj": "expert_gate_up",
+    "mlp.experts.down_proj": "expert_down",
+    **{f"mlp.shared_expert.{p}.weight": "shared_expert" for p in ("gate_proj", "up_proj", "down_proj")},
+    "mlp.shared_expert_gate.weight": "router",
+    "ple.key_proj.weight": "dense", "ple.value_proj.weight": "dense", "ple.conv1d.weight": "other",
+    **{f"ple.{p}.weight": "norm" for p in ("norm_conv", "norm_key", "norm_query")},
+    **{f"ple.ple_embedding.{p}": "ple_buffer" for p in ("layer_multipliers", "ngram_heads_offsets",
+                                                       "ngram_heads_vocab_sizes")},
+}
+TOP_ROLES = {
+    "lm_head.weight": "head",
+    f"{PFX}embed_tokens.weight": "embed",
+    f"{PFX}hyper_connection_mixer.hc_norm.weight": "norm",
+    f"{PFX}hyper_connection_mixer.input_mix_weight_down.weight": "other",
+    f"{PFX}hyper_connection_mixer.input_mix_weight_up.weight": "other",
+}
+# the drafter's own (outside mtp.layers.N): no lane reads it yet; it maps so a recipe can omit it by name
+MTP_ROLES = {"mtp.fc_embedding.weight": "dense", "mtp.fc_hidden.weight": "dense",
+             "mtp.pre_fc_norm_embedding.weight": "norm", "mtp.pre_fc_norm_hidden.weight": "norm",
+             "mtp.hyper_connection_mixer.hc_norm.weight": "norm",
+             "mtp.hyper_connection_mixer.input_mix_weight_down.weight": "other",
+             "mtp.hyper_connection_mixer.input_mix_weight_up.weight": "other"}
+_BLOCK = re.compile(r"^(model\.language_model\.layers|mtp\.layers)\.(\d+)\.(.+)$")
+_NGRAM = re.compile(r"^ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
-def shard_order(n_layer):
-    return ["vision"] + [f"layers.{i}" for i in range(n_layer)] + ["top"]
-
-
-def shard_file(order, shard):
-    return f"model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors"
-
-
-def shard_of(name):
-    m = _LAYER.match(name)
+def map_hf(name: str, shape=None) -> Mapped | None:
+    """The naming table's row for an HF name, or None (the caller refuses)."""
+    m = _BLOCK.match(name)
     if m:
-        return f"layers.{int(m.group(1))}"
+        mtp, layer, rest = m.group(1) == "mtp.layers", int(m.group(2)), m.group(3)
+        role = "ple_table" if _NGRAM.match(rest) else BLOCK_ROLES.get(rest)
+        if role is None:
+            return None
+        part = rest.rsplit(".", 1)[1] if role.startswith("expert_") else None
+        return Mapped(name, name, "mtp" if mtp else "layer", "mtp" if mtp else f"layers.{layer}", layer, None, part,
+                      False, role=role)
     if name.startswith("model.visual."):
-        return "vision"
-    if name in ("lm_head.weight", f"{PFX}embed_tokens.weight") or name.startswith(f"{PFX}hyper_connection_mixer."):
-        return "top"
-    raise SystemExit(f"{name}: no shard for this name")
+        return Mapped(name, name, "vision", "vision", None, None, None, False, role="vision")
+    if name in TOP_ROLES:
+        return Mapped(name, name, "top", "top", None, None, None, False, role=TOP_ROLES[name])
+    if name in MTP_ROLES:
+        return Mapped(name, name, "mtp", "mtp", None, None, None, False, role=MTP_ROLES[name])
+    return None
 
 
-# ---------------------------------------------------------------------------
-# the plan
-# ---------------------------------------------------------------------------
-def _exl3_entry(src, key, k, n, want_layout):
-    ranges, words = src.linear(key, k, n, EXL3_RATES)
-    if EXL3_RATES[words] != want_layout:
-        raise SystemExit(f"{key}: the recipe names {want_layout}, the EXL3 source holds {EXL3_RATES[words]} -- refusing")
-    nbytes = PR.bytes_for(want_layout, [k, n])
-    if sum(r[2] for r in ranges) != nbytes:
-        raise SystemExit(f"{key}: EXL3 source spans {sum(r[2] for r in ranges)} bytes, {want_layout} on [{k}, {n}] is {nbytes}")
-    return ranges, nbytes
+def expert_names(m: Mapped, part: str) -> tuple[str, str]:
+    """(family gguf_name, per-expert entry name with "{e}") of one part of the expert stack `m`."""
+    pre = m.container_name[:-len(m.part)]
+    return pre + part, pre + "{e}." + part + ".weight"
 
 
-def plan(hf, exl3, exl3_experts, recipe, tokenizer_dir, ple_manifest):
-    cfg = hf.config
-    n_layer = int(cfg["num_hidden_layers"])
-    order = shard_order(n_layer)
-    files = {s: shard_file(order, s) for s in order}
-    shards = {s: {"entries": [], "tensors": {}, "experts": []} for s in order}
-    fmt = recipe.resolve(hf.names())
-    consumed = {"ple_rows": 0, "kv": 0, "omit": 0}
-    for name in hf.names():
-        f = fmt[name]
-        if f in consumed:
-            consumed[f] += 1
-            continue
-        shard = shard_of(name)
-        dtype, shape = hf.dtype(name), hf.shape(name)
-        if f == "bf16":
-            if dtype != "BF16":
-                raise SystemExit(f"{name}: recipe says bf16, the checkpoint holds {dtype}")
-            path, off, n = hf.span(name)
-            entry = {"name": name, "layout": "bf16", "gguf_name": name, "dtype": "BF16", "shape": list(shape),
-                     "nbytes": n, "src": ("ranges", [(path, off, n)])}
-            dims_ne = list(reversed(shape))
-        elif f == "mxfp8_lt":
-            if dtype != "BF16" or len(shape) != 2:
-                raise SystemExit(f"{name}: mxfp8_lt from a BF16 matrix, the checkpoint holds {dtype} {shape}")
-            out, inp = shape
-            dims_ne = [inp, out]
-            nbytes = PR.bytes_for("mxfp8_lt", dims_ne)
-            entry = {"name": name, "layout": "mxfp8_lt", "gguf_name": name, "dtype": "U8", "shape": [nbytes],
-                     "nbytes": nbytes, "bf16_src": name,
-                     "src": ("produce", (lambda w=name, o=out, i=inp: PR.mxfp8_lt_from_bf16(hf.raw(w), o, i)))}
-        elif f.startswith("exl3m_") and ".mlp.experts." not in name:
-            if exl3 is None:
-                raise SystemExit(f"{name}: the recipe names {f}; pass --exl3")
-            if dtype != "BF16" or len(shape) != 2 or not name.endswith(".weight"):
-                raise SystemExit(f"{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {dtype} {shape}")
-            out, inp = shape
-            dims_ne = [inp, out]
-            ranges, nbytes = _exl3_entry(exl3, name[:-len(".weight")], inp, out, f)
-            entry = {"name": name, "layout": f, "gguf_name": name, "dtype": "U8", "shape": [nbytes],
-                     "nbytes": nbytes, "src": ("ranges", ranges)}
-        elif f.startswith("exl3m_"):
-            _plan_experts(hf, exl3_experts or exl3, recipe, name, f, shards[shard])
-            continue
-        else:
-            raise SystemExit(f"{name}: format {f} has no producer")
-        shards[shard]["entries"].append(entry)
-        shards[shard]["tensors"][name] = {"layout": entry["layout"], "dims_ne": dims_ne, "gguf_name": name}
-
-    kvs = build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts)
-    kv_arch = [k for k in kvs if not k["key"].startswith("tokenizer.")]
-    for s in order:
-        p = shards[s]
-        exp_layouts = {e["layout"] for e in p["experts"]}
-        p["meta"] = {
-            "format": "pt",
-            "pulsar.format": "pulsar-safetensors-v1",
-            "pulsar.family": FAMILY,
-            "pulsar.alignment": "32",
-            "pulsar.shard": files[s],
-            "pulsar.shard_key": s,
-            "pulsar.n_shards": str(len(order)),
-            "pulsar.primary": files["vision"],
-            "pulsar.tensors": json.dumps(p["tensors"], separators=(",", ":"), sort_keys=True),
-            "pulsar.experts": json.dumps(p["experts"], separators=(",", ":")),
-            "pulsar.kv_arch": json.dumps(kv_arch, separators=(",", ":")),
-            "pulsar.expert_dtype": "none" if not exp_layouts else ("exl3" if all(
-                x.startswith("exl3m_") for x in exp_layouts) else "mixed"),
-        }
-        if s == "vision":
-            p["meta"]["pulsar.kv"] = json.dumps(kvs, separators=(",", ":"))
-    shape = {"family": FAMILY, "n_layer": n_layer, "recipe": recipe.name}
-    return shape, order, files, shards, sum(consumed.values())
+def shape(hf, ctx):
+    """n_layer, the recipe, and whether the recipe writes the MTP drafter (an `mtp` shard after `top`)."""
+    if ctx.recipe is None:
+        default_recipe(hf, None, ctx)
+    out = {"family": FAMILY, "n_layer": int(hf.config["num_hidden_layers"]), "recipe": ctx.recipe.name}
+    res = ctx.recipe.resolve({n: map_hf(n) for n in hf.names()})
+    if any(f not in R.CONSUMED for n, (f, _s) in res.items() if map_hf(n).shard == "mtp"):
+        out["mtp"] = True
+    return out
 
 
-def _plan_experts(hf, src, recipe, stack_name, layout, shard):
-    """One HF expert stack ([E, out, in] BF16) -> its EXL3 families: gate_up_proj (fused) or gate_proj + up_proj
-    (split, the recipe's word), down_proj."""
-    if src is None:
-        raise SystemExit(f"{stack_name}: the recipe names {layout}; pass --exl3 (or --exl3-experts)")
-    m = re.match(r"^(model\.language_model\.layers\.(\d+)\.mlp\.experts\.)(gate_up_proj|down_proj)$", stack_name)
-    if not m:
-        raise SystemExit(f"{stack_name}: not a routed-expert stack")
-    pre, layer, stack = m.group(1), int(m.group(2)), m.group(3)
+def shard_order(shape):
+    return ["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"] + (["mtp"] if shape.get("mtp") else [])
+
+
+def declared_shape(m, hshape):
+    return list(hshape)                 # no reshapes: the declared shape is the source's
+
+
+def admit(hf, m, fmt, name):
+    if fmt not in ADMITS:
+        raise SystemExit(f"{name}: the qwen4_exp loader binds {sorted(ADMITS)}, not {fmt}")
+
+
+def default_recipe(hf, mapped, ctx):
+    raise SystemExit("qwen4_exp: pass --recipe (tools/container/format-maps/qwen38fn-*.json)")
+
+
+def check_recipe(recipe):
+    if recipe.settings.get("expert_gate_up") not in ("fused", "split"):
+        raise SystemExit(f"{recipe.path}: expert_gate_up {recipe.settings.get('expert_gate_up')!r} is neither "
+                         "'fused' nor 'split'")
+
+
+def stack_families(hf, m, fmt, ctx):
+    """One HF expert stack ([E, out, in] BF16) -> its families: gate_up_proj (fused) or gate_proj + up_proj (split,
+    the recipe's setting), down_proj; each expert-projection from the EXL3 source by its Linear key."""
+    stack_name = m.container_name
+    layout, src = fmt
+    if layout == "tessera":
+        return PR.produce(PR.spec(PR.producer_for("tessera", layout, stack_name), []), ctx.sources[src])
+    if layout not in exl3_rates.K2:
+        raise SystemExit(f"{stack_name}: the recipe names {layout}; a routed stack is written from an EXL3 source")
     E, out, inp = hf.shape(stack_name)
-    if stack == "gate_up_proj" and recipe.gate_up == "split":
+    if m.part == "gate_up_proj" and ctx.recipe.settings["expert_gate_up"] == "split":
         if out % 2:
             raise SystemExit(f"{stack_name}: odd gate_up width {out}")
         parts = [("gate_proj", out // 2), ("up_proj", out // 2)]
     else:
-        parts = [(stack, out)]
+        parts = [(m.part, out)]
+    fams = []
     for part, n in parts:
-        eb = PR.bytes_for(layout, [inp, n])
-        fam_name = pre + part
-        entry_name = pre + "{e}." + part + ".weight"
-        for e in range(E):
-            ranges, nbytes = _exl3_entry(src, f"{pre}{e}.{part}", inp, n, layout)
-            assert nbytes == eb
-            name = entry_name.replace("{e}", str(e))
-            shard["entries"].append({"name": name, "layout": layout, "gguf_name": fam_name, "dtype": "U8",
-                                     "shape": [eb], "nbytes": eb, "src": ("ranges", ranges)})
-        shard["experts"].append({"gguf_name": fam_name, "part": part, "n_experts": E, "expert_bytes": eb,
-                                 "layout": layout, "contiguous": True, "dims_per_expert_ne": [inp, n],
-                                 "entry_name": entry_name, "layer": layer})
+        fam_name, entry_name = expert_names(m, part)
+        names = [entry_name.replace("{e}", str(e)) for e in range(E)]
+        srcs = [("ranges", EN.exl3_ranges(ctx.sources[src], x[:-len(".weight")], layout, inp, n)[0]) for x in names]
+        fams.append(dict(gguf_name=fam_name, part=part, role=PART_ROLE[part], layout=layout, inp=inp, n=n,
+                         entry_names=names, srcs=srcs, extras={"entry_name": entry_name, "layer": m.layer,
+                                                               **({"block": "mtp"} if m.shard == "mtp" else {})}))
+    return fams
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +235,14 @@ PLE_BUFFERS = {"layer_multipliers": "ple_layer_multipliers",
                "ngram_heads_offsets": "ple_ngram_heads_offsets"}
 
 
-def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
+def build_kv(hf, ctx):
     """pulsar.kv for qwen4_exp: `general.*`; the text_config verbatim under `qwen4_exp.` (config_kvs); the PLE
     buffers as u64 arrays; the builder's own facts under `pulsar.*` (recipe, sources, the PLE row file the
     table must match); the tokenizer from the checkpoint's own files."""
+    if ctx.reap_map:
+        raise SystemExit("--reap-map: REAP survivor maps are a DeepSeek table (validate_reap_metadata)")
+    recipe, ple_manifest = ctx.recipe, ctx.ple_rows
+    exl3, exl3_experts = ctx.sources.get("exl3"), ctx.sources.get("exl3_experts")
     top = hf.config["top_level"]
     text = top["text_config"]
     A = FAMILY
@@ -322,8 +284,8 @@ def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
     kvs += [
         ("pulsar.recipe", "string", recipe.name),
         ("pulsar.recipe.sha256", "string", recipe.sha256),
-        ("pulsar.expert_gate_up", "string", recipe.gate_up),
-        ("pulsar.mtp_present", "bool", False),
+        ("pulsar.expert_gate_up", "string", recipe.settings["expert_gate_up"]),
+        ("pulsar.mtp_present", "bool", bool(ctx.shape.get("mtp"))),
         ("pulsar.vision_present", "bool", "vision_config" in top),
         ("pulsar.ple_rows.file", "string", os.path.basename(ple_manifest)[:-len(".json")] + ".rows"),
         ("pulsar.ple_rows.layer", "u32", man["layer"]),
@@ -339,58 +301,9 @@ def build_kv(hf, recipe, tokenizer_dir, ple_manifest, exl3, exl3_experts):
         if src is not None:
             kvs.append((f"pulsar.source.{tag}", "string", os.path.basename(os.path.normpath(src.dir))))
     kvs.append(("pulsar.source.hf", "string", os.path.basename(os.path.normpath(hf.dir))))
-    kvs += tokenizer_kvs(tokenizer_dir)
+    kvs += TOK.kvs(ctx.tokenizer_dir, TOKENIZER)
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):
         raise SystemExit("duplicate kv key: " + ", ".join(sorted(k for k in set(keys) if keys.count(k) > 1)))
-    return out
-
-
-TT_NORMAL, TT_CONTROL, TT_USER_DEFINED = 1, 3, 4
-
-
-def tokenizer_kvs(tok_dir):
-    """Mechanical, from the checkpoint's own files: tokens by id (added tokens overlay), merges, the chat template
-    verbatim.  Token type: added special -> CONTROL, added non-special -> USER_DEFINED, else NORMAL (record-only;
-    the engine reads tokens + merges).  S5 (the Qwen renderer) owns anything beyond this."""
-    tok = json.load(open(os.path.join(tok_dir, "tokenizer.json"), encoding="utf-8"))
-    cfg = json.load(open(os.path.join(tok_dir, "tokenizer_config.json"), encoding="utf-8"))
-    if tok["model"]["type"] != "BPE":
-        raise SystemExit(f"tokenizer model {tok['model']['type']}: BPE expected")
-    by_id = {i: t for t, i in tok["model"]["vocab"].items()}
-    types = {i: TT_NORMAL for i in by_id}
-    for a in tok["added_tokens"]:
-        by_id[a["id"]] = a["content"]
-        types[a["id"]] = TT_CONTROL if a["special"] else TT_USER_DEFINED
-    n = max(by_id) + 1
-    if len(by_id) != n:
-        raise SystemExit(f"tokenizer id space has {n - len(by_id)} holes")
-    merges = tok["model"]["merges"]
-    if merges and not isinstance(merges[0], str):
-        merges = [" ".join(m) for m in merges]
-
-    def tid(key):
-        t = cfg.get(key)
-        if t is None:
-            return None
-        for a in tok["added_tokens"]:
-            if a["content"] == t:
-                return a["id"]
-        raise SystemExit(f"tokenizer_config {key} {t!r} is not an added token")
-    tmpl = open(os.path.join(tok_dir, "chat_template.jinja"), encoding="utf-8").read()
-    out = [
-        ("tokenizer.ggml.model", "string", "gpt2"),
-        ("tokenizer.ggml.tokens", "array", ("string", [by_id[i] for i in range(n)])),
-        ("tokenizer.ggml.token_type", "array", ("i32", [types[i] for i in range(n)])),
-        ("tokenizer.ggml.merges", "array", ("string", merges)),
-        ("tokenizer.pretokenize_regex", "string", cfg["pretokenize_regex"]),
-        ("tokenizer.ggml.eos_token_id", "u32", tid("eos_token")),
-        ("tokenizer.ggml.padding_token_id", "u32", tid("pad_token")),
-        ("tokenizer.ggml.add_bos_token", "bool", bool(cfg.get("add_bos_token", False))),
-        ("tokenizer.ggml.add_eos_token", "bool", bool(cfg.get("add_eos_token", False))),
-        ("tokenizer.chat_template", "string", tmpl),
-    ]
-    if cfg.get("bos_token") is not None:
-        out.append(("tokenizer.ggml.bos_token_id", "u32", tid("bos_token")))
     return out

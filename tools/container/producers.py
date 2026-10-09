@@ -181,11 +181,6 @@ def unswizzle_sf(sf: np.ndarray, rows: int, kb_n: int) -> np.ndarray:
 # Producers.
 # --------------------------------------------------------------------------
 
-def native(raw: bytes) -> bytes:
-    """Passthrough: the container keeps the checkpoint's own dtype and bytes."""
-    return bytes(raw)
-
-
 def i64_to_i32(raw: bytes) -> bytes:
     """The one native-dtype conversion the C did (`i64_to_i32`, dsq_generate.c
     :78-90): the checkpoint's I64 index tables (ffn.gate.tid2eid) are stored
@@ -366,10 +361,78 @@ def fp8_e4m3_soa_k_from_bf16(w_bf16: bytes, rows: int, cols: int) -> bytes:
 
 
 # --------------------------------------------------------------------------
+# A plan entry names its producer as data -- {'producer', 'inputs', 'args'}: the producer's name, the source
+# tensors whose raw bytes are its positional inputs, and its keyword arguments -- so a plan can be written out
+# (build.py plan --dump) and two plans compared without producing a byte (L279).
+# --------------------------------------------------------------------------
+
+def tessera_planes(*_a, **_k) -> bytes:
+    """(Tessera bundle -> the kernel-ready planes the Qwen MoE's Tessera arm binds): the slot is the table's; the
+    producer is not on dev.  It needs L255's tools/tessera/planes.py (fused_stack + stack_planes: Tessera's own
+    load-time prep, torch + a CUDA device) and the engine binding (family_qwen.h PULSAR_QWEN_TESS_*)."""
+    raise SystemExit("tessera: the tessera producer lands with L255 (tools/tessera/planes.py; the engine's "
+                     "PULSAR_QWEN_TESS_* binding) -- not on dev; refusing")
+
+
+PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, fp8_e4m3_soa_k_from_bf16,
+                                      i64_to_i32, tessera_planes)}
+# the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
+NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
+
+# The ONE producer table (L279 step 1): (source kind, target format) -> the producer that writes it, COPY for the
+# source's own bytes verbatim.  A source kind is the stored dtype, `+scale` with a block-scale companion, `exl3`
+# (an exllamav3 Linear's trellis | suh | svh) or `tessera` (a Tessera bundle's unit blobs).  Both families' plans ask here; a pair that is not a row refuses by
+# name (producer_for) -- there is no nearest format.
+COPY = "copy"
+PRODUCER_FOR = {
+    ("BF16", "bf16"): COPY,
+    ("F32", "f32"): COPY,
+    ("I32", "i32"): COPY,
+    ("I64", "i32"): "i64_to_i32",
+    ("F8_E4M3+scale", "mxfp8_lt"): "mxfp8_lt",
+    ("BF16", "mxfp8_lt"): "mxfp8_lt_from_bf16",
+    ("BF16", "fp8_e4m3_soa_k"): "fp8_e4m3_soa_k_from_bf16",
+    ("I8+scale", "cutlass_mxfp4"): "cutlass_mxfp4",
+    **{("exl3", layout): COPY for layout in exl3_rates.K2},
+    ("tessera", "tessera"): "tessera_planes",
+}
+
+
+def source_kind(dtype: str, has_scale: bool) -> str:
+    return dtype + "+scale" if has_scale else dtype
+
+
+def producer_for(kind: str, fmt: str, what: str) -> str:
+    """The producer that writes `fmt` from a `kind` source, or a refusal naming the pair."""
+    prod = PRODUCER_FOR.get((kind, fmt))
+    if prod is None:
+        have = sorted(f for k, f in PRODUCER_FOR if k == kind)
+        raise SystemExit(f"{what}: no producer writes {fmt} from a {kind} source (from {kind}: {have or 'nothing'})")
+    return prod
+
+
+def matrix_dims(kind: str, shape: list) -> tuple:
+    """(out, in) of a source matrix: the FP4 source stores two E2M1 nibbles per I8 byte."""
+    out, cols = shape
+    return out, cols * 2 if kind == "I8+scale" else cols
+
+
+def spec(producer: str, inputs: list, **args) -> dict:
+    """The serializable producer descriptor of one entry."""
+    if producer not in PRODUCERS:
+        raise ValueError(f"{producer}: not a producer ({sorted(PRODUCERS)})")
+    return {"producer": producer, "inputs": list(inputs), "args": args}
+
+
+def produce(desc: dict, source) -> bytes:
+    """Run a descriptor against `source` (anything with .raw(name) -> bytes, the HF checkpoint)."""
+    return PRODUCERS[desc["producer"]](*[source.raw(n) for n in desc["inputs"]], **desc["args"])
+
+
+# --------------------------------------------------------------------------
 # The byte model: == st_bytes_for / routed_expert_side_layout.
 # --------------------------------------------------------------------------
 
-_NATIVE_DTYPE_LAYOUT = {"F32": "f32", "I32": "i32", "BF16": "bf16"}
 # twice the rate K (exl3m_k2h is K = 2.5).  k4 / k5 are the Qwen lane's rates (L251: routed experts K4,
 # EXL3-able dense Linears K5); k6 / k8 are turboderp's (L266).  Every rate has the same [trellis | suh | svh] byte model.
 _EXL3_K2 = exl3_rates.K2
@@ -392,9 +455,9 @@ def bytes_for(layout: str, dims_ne: list, dtype: str | None = None) -> int:
     (an expert stack).  'native' is resolved through the file dtype, as the
     engine does (`st_layout_type`)."""
     if layout == "native":
-        if dtype not in _NATIVE_DTYPE_LAYOUT:
+        if dtype not in NATIVE_LAYOUT:
             raise ValueError(f"bytes_for: native tensor with unsupported dtype {dtype!r}")
-        layout = _NATIVE_DTYPE_LAYOUT[dtype]
+        layout = NATIVE_LAYOUT[dtype]
     if not dims_ne or any(int(d) <= 0 for d in dims_ne):
         raise ValueError(f"bytes_for: {layout} has a bad shape {dims_ne}")
     elements = _prod(dims_ne)
