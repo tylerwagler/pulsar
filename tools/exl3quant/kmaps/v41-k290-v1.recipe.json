@@ -1,0 +1,149 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "deepseek_v41-exl3-ours",
+ "model_type": "deepseek_v41",
+ "about": "V4.1 routed experts in EXL3 by the K map kmap-v1.json (our quantization, tools/exl3quant); every other tensor as the builder's default recipe says",
+ "rows": [
+  {
+   "role": "dense",
+   "format": "mxfp8_lt"
+  },
+  {
+   "role": "draft_head",
+   "format": "fp8_e4m3_soa_k"
+  },
+  {
+   "role": "embed",
+   "format": "native"
+  },
+  {
+   "role": "head",
+   "format": "native"
+  },
+  {
+   "role": "norm",
+   "format": "native"
+  },
+  {
+   "role": "other",
+   "format": "native"
+  },
+  {
+   "role": "router",
+   "format": "native"
+  },
+  {
+   "role": "shared_expert",
+   "format": "mxfp8_lt"
+  },
+  {
+   "role": "vision",
+   "format": "native"
+  },
+  {
+   "role": "expert_gate",
+   "block": "layers",
+   "layers": [
+    "22-29"
+   ],
+   "format": "exl3m_k2",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_up",
+   "block": "layers",
+   "layers": [
+    "22-29"
+   ],
+   "format": "exl3m_k2",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_down",
+   "block": "layers",
+   "layers": [
+    "22-29"
+   ],
+   "format": "exl3m_k2",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_gate",
+   "block": "layers",
+   "layers": [
+    "3-21",
+    "30-38"
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_up",
+   "block": "layers",
+   "layers": [
+    "3-21",
+    "30-38"
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_down",
+   "block": "layers",
+   "layers": [
+    "3-21",
+    "30-38"
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_gate",
+   "block": "layers",
+   "layers": [
+    "0-2",
+    39
+   ],
+   "format": "exl3m_k4",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_up",
+   "block": "layers",
+   "layers": [
+    "0-2",
+    39
+   ],
+   "format": "exl3m_k4",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_down",
+   "block": "layers",
+   "layers": [
+    "0-2",
+    39
+   ],
+   "format": "exl3m_k4",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_gate",
+   "block": "mtp",
+   "format": "exl3m_k4",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_up",
+   "block": "mtp",
+   "format": "exl3m_k4",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_down",
+   "block": "mtp",
+   "format": "exl3m_k4",
+   "source": "exl3"
+  }
+ ]
+}
