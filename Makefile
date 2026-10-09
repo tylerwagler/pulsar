@@ -1844,7 +1844,7 @@ render-gate: pulsar_test
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device vision-qwen-tower-gate \
+	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device vision-qwen-tower-gate tessera-kernel-gate \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
