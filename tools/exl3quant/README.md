@@ -74,19 +74,35 @@ python tools/exl3quant/grade_layer.py --ref $V41 --exllamav3 $EXL3 --run $OUT --
 
 # the full run (Tyler's go): every layer at its K map rate, then the drafter
 python tools/exl3quant/v41_stream.py --ref $V41 --exllamav3 $EXL3 --calib calib.safetensors --out $OUT \
-    --kmap kmap.json --container $L279/tools/container --drafter
+    --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --container $L279/tools/container --drafter
 ```
 
 A killed run restarts at the layer after the last checkpointed stream (same command).  `--until HH:MM` starts no
 layer the previous layer's time says would end after then, `--min-free-gb` none with too little disk.
 
+## The rate: uniform K3 (`kmaps/v41-k3-uniform.json`)
+
+| per rank on the pair (TP=2, experts halved by intermediate width) | GiB |
+|---|---:|
+| routed experts, trunk 40 x 384 at K3 (3.01 bpw incl. scales) | 95.46 |
+| drafter experts, 3 x 128 at K3 | 2.39 |
+| every non-expert tensor in its served format, **replicated** (upper bound; TP splits heads, vocab, drafter heads) | 10.92 |
+| **total** (+ KV ~0.9 per 1M tokens + runtime buffers) | **108.8** of 110-115 |
+
+L269's table had ~94 GiB of experts at 2.9 bpw; uniform K3 is 1.4% more bits and fits.  Uniform is the
+baseline because mixed rates lost to uniform on Qwen's full-model KL (L251 2026-09-27).  If the measured runtime
+footprint does not fit, the minimal deviation is a few layers at K2.5 (`exl3m_k2h`, admitted by both routed
+arms), never the first layers, placed where error propagation is weakest -- unknown for V4.1: locate it with a
+per-layer stream-error profile (quantize one layer, forward the stream to the last layer, measure the final-
+hidden / logit KL, repeat over a spread of layers), and grade the result by full-model KL before use.
+
 ## Into a container (L279's builder)
 
 ```sh
-kmap.py budget   --kmap kmap.json --ref $V41 --container $L279/tools/container --dump plan-dump.json
-kmap.py recipe   --kmap kmap.json --ref $V41 --container $L279/tools/container --default default-recipe.json --out recipe.json
-kmap.py assemble --kmap kmap.json --ref $V41 --container $L279/tools/container --run $OUT --out $OUT/exl3-mixed
-build.py emit --hf $V41 --exl3 $OUT/exl3-mixed --recipe recipe.json --out $CONTAINER --all
+kmap.py budget   --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --ref $V41 --container $L279/tools/container --dump plan-dump.json
+kmap.py recipe   --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --ref $V41 --container $L279/tools/container --default default-recipe.json --out recipe.json
+kmap.py assemble --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --ref $V41 --container $L279/tools/container --run $OUT --out $OUT/exl3-src
+build.py emit --hf $V41 --exl3 $OUT/exl3-src --recipe recipe.json --out $CONTAINER --all
 ```
 
 `default-recipe.json` is `build.py recipe --hf $V41`; `plan-dump.json` is `build.py plan --hf $V41 --recipe

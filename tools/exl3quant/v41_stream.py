@@ -25,7 +25,7 @@ FFN inputs and routes are saved for grade_layer.py.  The config, layer schedule 
 deepseek_v41.py (checked against the reference's inference/config.json).
 
     python tools/exl3quant/v41_stream.py --ref $V41 --exllamav3 ~/exllamav3 --calib calib.safetensors \\
-        --kmap kmap.json --out /mnt/models/v41-exl3-ours --device cuda:0
+        --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --out /mnt/models/v41-exl3-ours --device cuda:0
 
 Output (under --out):
     hessians/<block>NN.safetensors   gate_up [5120,5120] and down [E, 2304*2305/2] (packed upper triangle),
@@ -772,8 +772,8 @@ def main():
     ap.add_argument("--container", default=None, help="the builder's tools/container whose exl3_rates grades the K map")
     ap.add_argument("--k", default="", help="comma list of EXL3 rates every quantized block ALSO gets")
     ap.add_argument("--quant-layers", default=None,
-                    help="trunk layers to collect Hessians for and quantize (ints / a-b ranges; default all); "
-                         "the others are only forwarded")
+                    help="trunk layers to collect Hessians for and quantize (ints / a-b ranges; default all, '' "
+                         "none); the others are only forwarded")
     ap.add_argument("--drafter", action="store_true", help="after layer 39, calibrate and quantize mtp.0-2")
     ap.add_argument("--drafter-positions", type=int, default=256, help="sampled draft positions per row")
     ap.add_argument("--from-hessians", action="store_true",
@@ -826,7 +826,8 @@ def main():
     cfg.check_reference(args)
     n_exl3 = sum(v == "exl3" for v in cfg.plan().values()) // 2
     n_trunk = cfg.num_hidden_layers
-    quant_layers = set(range(n_trunk)) if a.quant_layers is None else set(KM.parse_layers(a.quant_layers.split(",")))
+    quant_layers = (set(range(n_trunk)) if a.quant_layers is None
+                    else set(KM.parse_layers(x for x in a.quant_layers.split(",") if x)))
     kmap = KM.load(a.kmap, KM.Shape(a.ref), a.container) if a.kmap else None
     extra = [int(k) for k in a.k.split(",") if k]
     if not a.forward_only and kmap is None and not extra:

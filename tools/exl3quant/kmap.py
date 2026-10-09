@@ -4,7 +4,12 @@ per-rank bytes on the pair, and the EXL3 source directory tools/container/build.
 
 A K map is JSON:
 
-    {"about": "...", "layers": {"0-2": 4, "3-21": 3, "22-29": 2, "30-38": 3, "39": 4}, "mtp": {"0-2": 4}}
+    {"about": "...", "layers": {"0-39": 3}, "mtp": {"0-2": 3}}          (kmaps/v41-k3-uniform.json)
+
+Uniform is the default and the only map this tool ships.  A mixed map (some layers at another K) is expressible,
+but on Qwen every surrogate-chosen mixed-K recipe lost to uniform on full-model KL (L251 2026-09-27: early layers
+priced cheap, error propagation made them expensive), so a mixed map is a candidate until a full-model KL grade
+says otherwise -- this tool does not choose one.
 
 every trunk layer and every drafter stage named exactly once (ints or "a-b" ranges as keys), each at an integer
 K the engine's routed arms read for gate / up (the pair arm) AND down (the down arm) -- the builder's
