@@ -49,6 +49,7 @@ def main():
     ap.add_argument("--fullkl", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--fewer-gb", type=float, default=2.0, help="the fewer-bytes proposal saves at least this much")
+    ap.add_argument("--predict", default=None, help="only predict these allocations ({name: {gate_up|down: {L: K}}})")
     a = ap.parse_args()
     T = json.load(open(a.table))
     rec = json.load(open(f"{a.fullkl}/results.json"))["record"]["layers"]
@@ -91,6 +92,21 @@ def main():
             out[x0] = opts
         return out
 
+    if a.predict:
+        for name, al in json.load(open(a.predict)).items():
+            Ks = {f: {L: int(al.get(part, {}).get(str(L), 4)) for L in range(48)}
+                  for f, part in (("gu", "gate_up"), ("dn", "down"))}
+            raw = fit = 0.0
+            for key, c in curves.items():
+                x0, x1 = map(int, key.split("-"))
+                for f in ("gu", "dn"):
+                    x = MD.expert_x(rec, R, x0, x1, f, Ks[f])
+                    if x:
+                        raw += term(c[f], x, "raw")
+                        fit += term(c[f], x, "fit")
+            units = sum(2 * (Ks["gu"][L] - 4) + Ks["dn"][L] - 4 for L in range(48))
+            print(f"{name:10s} {units:+4d} units ({units * UNIT / 1e9:+.2f} GB)  predicted dKL raw {raw:+.3e} fit {fit:+.3e}")
+        return
     point = costs("raw")
     fit = costs("fit")
     props = {}
