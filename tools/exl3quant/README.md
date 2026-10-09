@@ -14,7 +14,11 @@ passes through.  The output is what `tools/container/build.py --exl3` (L279's pu
 | `refkernels.py` | the reference's tilelang `kernel` module in plain torch (exact operands, summation order only) |
 | `kmap.py` | the K map -> per-rank bytes (`budget`), the pulsar.recipe.v1 (`recipe`), the `--exl3` directory (`assemble`) |
 | `grade_layer.py` | a quantized block vs the FP4 source on held-out activations (weight, functional, MoE output) |
+| `quant_worker.py` | the saved Hessians quantized in units (one `quantize_exl3_batch` call each), one worker per GPU, resumable; `assemble` writes the same block shards `v41_stream.py` writes |
+| `summarize.py` | one table per run: grades, proxy errors, unit GPU time, forward seconds |
+| `b300/` | the rented multi-GPU host: bundle, bootstrap, fetch, run, pack, the reference captures (`b300/README.md`) |
 | `test_refkernels.py`, `test_quantize.py` | the kernel port (CPU) and the quantizer path on two real experts (GPU) |
+| `test_units.py` | a unit from a worker process == the same unit inside quantize_block, byte for byte (real Hessians) |
 
 ## How it works
 
@@ -77,7 +81,12 @@ python tools/exl3quant/v41_stream.py --ref $V41 --exllamav3 $EXL3 --calib calib.
     --kmap tools/exl3quant/kmaps/v41-k3-uniform.json --container $L279/tools/container --drafter
 ```
 
-A killed run restarts at the layer after the last checkpointed stream (same command).  `--until HH:MM` starts no
+A killed run restarts at the layer after the last checkpointed stream (same command).
+
+On several GPUs the forward only saves Hessians and the quantization fans out (the stream is the source model's,
+so blocks are independent): `v41_stream.py --hessians-only ...` on one GPU and `quant_worker.py work ... --wait`
+on each of the others (claiming units as their Hessians land), then `quant_worker.py assemble --prune` -- what
+`b300/run.sh` drives.  `--until HH:MM` starts no
 layer the previous layer's time says would end after then, `--min-free-gb` none with too little disk.
 
 ## The rate: uniform K3 (`kmaps/v41-k3-uniform.json`)

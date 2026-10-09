@@ -9,7 +9,8 @@ One pass over the 40 trunk layers, then the DSpark drafter's 3 stages:
      ONE gate/up Hessian over every token's FFN input, and a down Hessian per expert with every expert run on
      every token (convert_model.py's calibration_all_experts), each from the fp8 activation the GEMM sees;
   3. the Hessians are written to disk, then exllamav3's quantize_exl3_batch quantizes the layer's 1152 expert
-     projections at the layer's K (the K map) and any extra --k, from the same Hessians;
+     projections at the layer's K (the K map) and any extra --k, from the same Hessians, unit by unit (Unit) --
+     or, with --hessians-only, nothing is quantized here and quant_worker.py fans the units out over GPUs;
   4. the layer's output stream -- plus the compressed KV, index keys, top-k and candidate blocks V4.1 hands down
      the stack, and the drafter's target-layer inputs -- is checkpointed, so a run resumes at the next layer.
 
@@ -421,67 +422,105 @@ def observed_moe(moe, sink):
 
 
 # ------------------------------------------------------------------------------------------
-# EXL3 quantization
+# EXL3 quantization, in units
 # ------------------------------------------------------------------------------------------
 
-def quantize_block(hess, key, seed, K, devices, out_dir, debug_dir, name):
-    """A block's routed experts at rate K from the collected Hessians, batched as exllamav3's group_quant_linears
-    batches a block-sparse MLP: gate/up concatenated over the shared Hessian up to 32768 columns, down
-    projections stacked 16 at a time.  Returns (proxy errors, seconds quantizing, seconds writing)."""
+@dataclasses.dataclass(frozen=True)
+class Unit:
+    """One quantize_exl3_batch call: the batching exllamav3's group_quant_linears uses for a block-sparse MLP.
+    kind "gu": gate/up projections concatenated over the block's ONE shared Hessian, up to 32768 columns;
+    kind "dn": down projections stacked 16 at a time, each over its own Hessian.  A block's units partition its
+    routed-expert projections; the unit is the work item quant_worker.py fans out over GPUs, and the numerics of a
+    tensor depend only on its unit (the RNG is re-seeded per tensor, the Hessian's finalization is a function of
+    the Hessian and the seed), so a block assembled from units run anywhere is the block quantize_block writes."""
+    kind: str
+    index: int
+    members: tuple  # ((expert, "w1" | "w3" | "w2"), ...)
+
+    @property
+    def id(self):
+        return f"{self.kind}{self.index:02d}"
+
+    def experts(self):
+        return sorted({e for e, _ in self.members})
+
+
+def block_units(n_experts, inter):
+    """The block's units, in quantize_block's order."""
+    gu = [(e, w) for e in range(n_experts) for w in ("w1", "w3")]
+    per_group = max(1, 32768 // inter)
+    units = [Unit("gu", i, tuple(gu[g0:g0 + per_group])) for i, g0 in enumerate(range(0, len(gu), per_group))]
+    units += [Unit("dn", i, tuple((e, "w2") for e in range(e0, min(n_experts, e0 + 16))))
+              for i, e0 in enumerate(range(0, n_experts, 16))]
+    return units
+
+
+EXL3_PARTS = ("trellis", "suh", "svh", "mul1")  # one EXL3 projection's tensors, in the shard
+
+
+def hessian_data(H, first_key, count, dev):
+    """exllamav3's H_data for a collected Hessian (a fresh copy: finalization works in place)."""
+    return {"H": H.clone(), "first_key": first_key, "count": count, "finalized": False,
+            "num_total": count * H.size(0), "inf_nan": torch.zeros(2, dtype=torch.long, device=dev), "device": dev}
+
+
+def source_weight(lin):
+    """An FP4 expert projection as quantize_exl3 takes it: (in_features, out_features) fp32."""
+    return refkernels.dequant_fp4(lin.weight, lin.scale).T.contiguous()
+
+
+def quantize_unit(unit, key, experts, h_gu, h_down, seed, K, devices, debug_dir):
+    """One unit's projections at rate K -> {tensor key: (proxy error, {trellis, suh, svh, mul1})}.
+    experts: expert index -> its source Expert module; h_gu: the block's gate/up H_data (ONE object for the whole
+    unit -- quantize_exl3_batch's shared-Hessian layout keys on identity); h_down: expert -> that expert's down
+    H_data.  quant args: convert_model.make_quant_args with out scales "always" and the mul1 codebook (the only
+    one pulsar reads), no output-side Hessian; seed = the block's layer id, as the converter seeds by module."""
     from exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3_batch
 
-    dev = torch.device(devices[0])
-    moe, inter = hess.moe, hess.inter
-    t0 = time.time()
+    ws = [source_weight(getattr(experts[e], w)) for e, w in unit.members]
+    hs = [h_gu if unit.kind == "gu" else h_down(e) for e, _ in unit.members]
+    qas = [{"seed": seed, "K": K, "devices": devices, "device_ratios": None,
+            "apply_out_scales": True, "mul1": True, "debug_dir": debug_dir} for _ in unit.members]
+    res = quantize_exl3_batch(ws, hs, qas)
+    out = {}
+    for (e, w), (err, t) in zip(unit.members, res):
+        out[f"{key}.ffn.experts.{e}.{w}"] = (float(err), {sub: t[sub].cpu() for sub in EXL3_PARTS})
+    return out
 
-    def qa():
-        # convert_model.make_quant_args with out scales "always" and the mul1 codebook (the only one pulsar
-        # reads), no output-side Hessian; seed = the block's layer id, as the converter seeds by module
-        return {"seed": seed, "K": K, "devices": devices, "device_ratios": None,
-                "apply_out_scales": True, "mul1": True, "debug_dir": debug_dir}
 
-    def h_data(H, first_key):
-        return {"H": H.clone(), "first_key": first_key, "count": hess.count, "finalized": False,
-                "num_total": hess.count * H.size(0), "inf_nan": torch.zeros(2, dtype=torch.long, device=dev),
-                "device": dev}
-
-    def weight(lin):  # (in_features, out_features) fp32, as quantize_exl3 takes it
-        return refkernels.dequant_fp4(lin.weight, lin.scale).T.contiguous()
-
-    tensors, proxy = {}, {}
-
-    def keep(k, result):
-        err, out = result
-        proxy[k] = float(err)
-        for sub in ("trellis", "suh", "svh", "mul1"):
-            tensors[f"{k}.{sub}"] = out[sub].cpu()
-
-    gu_keys = [(e, w) for e in range(hess.n) for w in ("w1", "w3")]
-    per_group = max(1, 32768 // inter)
-    H_gu = h_data(hess.gate_up, f"{key}.ffn.experts.input")
-    for g0 in range(0, len(gu_keys), per_group):
-        group = gu_keys[g0:g0 + per_group]
-        ws = [weight(getattr(moe.experts[e], w)) for e, w in group]
-        res = quantize_exl3_batch(ws, [H_gu] * len(group), [qa() for _ in group])
-        for (e, w), r in zip(group, res):
-            keep(f"{key}.ffn.experts.{e}.{w}", r)
-    for e0 in range(0, hess.n, 16):
-        es = list(range(e0, min(hess.n, e0 + 16)))
-        ws = [weight(moe.experts[e].w2) for e in es]
-        hs = [h_data(hess.down[e], f"{key}.ffn.experts.{e}.w2") for e in es]
-        res = quantize_exl3_batch(ws, hs, [qa() for _ in es])
-        for e, r in zip(es, res):
-            keep(f"{key}.ffn.experts.{e}.w2", r)
-    t_quant = time.time() - t0
-
-    t1 = time.time()
+def write_block(results, K, out_dir, name, meta=None):
+    """A block's quantized tensors as one shard + its proxy errors (the files kmap.py and the builder read):
+    exl3-kK/model-<name>.safetensors, exl3-kK/proxy-<name>.json.  `meta` adds shard metadata (a dry run's partial
+    block says so).  Returns the shard's path."""
+    tensors = {f"{k}.{sub}": t for k, (_, parts) in results.items() for sub, t in parts.items()}
+    proxy = {k: err for k, (err, _) in results.items()}
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"model-{name}.safetensors")
-    save_file(tensors, path + ".tmp", metadata={"format": "pt", "exl3_K": str(K)})
+    save_file(tensors, path + ".tmp", metadata={"format": "pt", "exl3_K": str(K), **(meta or {})})
     os.replace(path + ".tmp", path)
     with open(os.path.join(out_dir, f"proxy-{name}.json"), "w") as f:
         json.dump(proxy, f, indent=0, sort_keys=True)
-    return proxy, t_quant, time.time() - t1
+    return path
+
+
+def quantize_block(hess, key, seed, K, devices, out_dir, debug_dir, name):
+    """A block's routed experts at rate K from the collected Hessians, unit by unit on `devices` (the gate/up
+    Hessian finalized once and shared by every gu unit).  Returns (proxy errors, seconds quantizing, seconds
+    writing)."""
+    dev = torch.device(devices[0])
+    t0 = time.time()
+    h_gu = hessian_data(hess.gate_up, f"{key}.ffn.experts.input", hess.count, dev)
+    experts = dict(enumerate(hess.moe.experts))
+    results = {}
+    for unit in block_units(hess.n, hess.inter):
+        results.update(quantize_unit(
+            unit, key, experts, h_gu,
+            lambda e: hessian_data(hess.down[e], f"{key}.ffn.experts.{e}.w2", hess.count, dev),
+            seed, K, devices, debug_dir))
+    t_quant = time.time() - t0
+    t1 = time.time()
+    write_block(results, K, out_dir, name)
+    return {k: err for k, (err, _) in results.items()}, t_quant, time.time() - t1
 
 
 # ------------------------------------------------------------------------------------------
@@ -708,12 +747,31 @@ class SavedHessians(ExpertHessians):
         packed = f.get_tensor("down")
         if tuple(packed.shape) != (self.n, self.inter * (self.inter + 1) // 2):
             raise SystemExit(f"{path}: down {tuple(packed.shape)}, the block has {self.n} x {self.inter}")
-        iu = torch.triu_indices(self.inter, self.inter, device=dev)
-        self.down = torch.zeros(self.n, self.inter, self.inter, dtype=torch.float32, device=dev)
-        for e in range(self.n):
-            d = self.down[e]
-            d[iu[0], iu[1]] = packed[e].to(dev)
-            d.T[iu[0], iu[1]] = packed[e].to(dev)   # symmetric: the lower triangle mirrors the upper
+        self.down = unpack_down(packed, self.inter, dev)
+
+
+def unpack_down(packed, inter, dev):
+    """Down Hessians as ExpertHessians.save packs them ([E, inter*(inter+1)/2], each the upper triangle
+    row-major) -> [E, inter, inter] fp32 on dev, the lower triangle mirroring the upper."""
+    iu = torch.triu_indices(inter, inter, device=dev)
+    down = torch.zeros(packed.size(0), inter, inter, dtype=torch.float32, device=dev)
+    for e in range(packed.size(0)):
+        d, p = down[e], packed[e].to(dev)
+        d[iu[0], iu[1]] = p
+        d.T[iu[0], iu[1]] = p
+    return down
+
+
+def load_expert(ref, args, ckpt, prefix, e, dev):
+    """Routed expert `e` of block `prefix` (layers.L / mtp.S): the reference Expert holding its FP4 source
+    weights, on dev."""
+    with torch.device(dev):
+        ex = ref.Expert(args.dim, args.moe_inter_dim, dtype=torch.float4_e2m1fn_x2, swiglu_limit=args.swiglu_limit)
+    pre = f"{prefix}.ffn.experts.{e}."
+    load_into(ex, {f"{w}.{s}": (ckpt.get(pre + f"{w}.{s}").view(torch.float4_e2m1fn_x2) if s == "weight"
+                                else ckpt.get(pre + f"{w}.{s}"))
+                   for w in ("w1", "w2", "w3") for s in ("weight", "scale")}, pre)
+    return ex
 
 
 class RoutedExperts(torch.nn.Module):
@@ -721,15 +779,7 @@ class RoutedExperts(torch.nn.Module):
 
     def __init__(self, ref, args, ckpt, prefix, n, dev):
         super().__init__()
-        with torch.device(dev):
-            self.experts = torch.nn.ModuleList(
-                ref.Expert(args.dim, args.moe_inter_dim, dtype=torch.float4_e2m1fn_x2, swiglu_limit=args.swiglu_limit)
-                for _ in range(n))
-        for e, ex in enumerate(self.experts):
-            pre = f"{prefix}.ffn.experts.{e}."
-            load_into(ex, {f"{w}.{s}": (ckpt.get(pre + f"{w}.{s}").view(torch.float4_e2m1fn_x2) if s == "weight"
-                                        else ckpt.get(pre + f"{w}.{s}"))
-                           for w in ("w1", "w2", "w3") for s in ("weight", "scale")}, pre)
+        self.experts = torch.nn.ModuleList(load_expert(ref, args, ckpt, prefix, e, dev) for e in range(n))
         self.dim, self.n_routed_experts = args.dim, n
 
 
@@ -765,6 +815,15 @@ def log(out, **rec):
         f.write(json.dumps(rec) + "\n")
 
 
+def torch_setup(exllamav3):
+    """The process-wide torch state every quantization runs under (the forward's and quant_worker.py's alike: a
+    unit's bytes depend on it -- TF32 matmuls inside exllamav3's regularization and LDLQ)."""
+    torch.set_default_dtype(torch.bfloat16)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    sys.path.insert(0, exllamav3)
+
+
 @torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -783,6 +842,9 @@ def main():
     ap.add_argument("--from-hessians", action="store_true",
                     help="no forward: re-quantize the --quant-layers (and with --drafter the drafter) from the "
                          "Hessians a previous run saved under --out, at the K map's / --k rates")
+    ap.add_argument("--hessians-only", action="store_true",
+                    help="the forward, Hessians and held-out captures; quantize nothing (quant_worker.py quantizes "
+                         "the saved Hessians in units, on any number of GPUs)")
     ap.add_argument("--forward-only", action="store_true",
                     help="no Hessians, no quantization: the forward and its perplexity (the gate)")
     ap.add_argument("--layers", type=int, default=None, help="stop after this many trunk layers")
@@ -812,10 +874,7 @@ def main():
         raise SystemExit(f"--quant-devices must start with the forward's CUDA device (the Hessians live there); "
                          f"forward {dev}, quant {quant_devices}")
     os.makedirs(a.out, exist_ok=True)
-    torch.set_default_dtype(torch.bfloat16)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    sys.path.insert(0, a.exllamav3)
+    torch_setup(a.exllamav3)
     mw = MemWatch()
 
     ref = load_reference(a.ref)
@@ -834,8 +893,10 @@ def main():
                     else set(KM.parse_layers(x for x in a.quant_layers.split(",") if x)))
     kmap = KM.load(a.kmap, KM.Shape(a.ref), a.container) if a.kmap else None
     extra = [int(k) for k in a.k.split(",") if k]
-    if not a.forward_only and kmap is None and not extra:
-        raise SystemExit("nothing to quantize at: pass --kmap and/or --k (or --forward-only)")
+    if a.hessians_only and (a.forward_only or a.from_hessians or kmap is not None or extra):
+        raise SystemExit("--hessians-only quantizes nothing: no --kmap / --k / --forward-only / --from-hessians")
+    if not a.forward_only and not a.hessians_only and kmap is None and not extra:
+        raise SystemExit("nothing to quantize at: pass --kmap and/or --k (or --forward-only / --hessians-only)")
 
     def ks_for(block):
         return sorted(set(([kmap[block]] if kmap else []) + extra))
@@ -926,7 +987,11 @@ def main():
         done = mw.stage()
         nll, n = perplexity(ref, args, ckpt, stream, rows, dev)
         log(a.out, stage="perplexity", nll=round(nll, 4), ppl=round(float(np.exp(nll)), 3), tokens=n, **done())
-        if a.drafter and not a.forward_only:
+        saved = [os.path.join(a.out, d, f"mtp{s:02d}.safetensors") for d in ("hessians", "holdout")
+                 for s in range(args.n_mtp_layers)]
+        if a.drafter and a.hessians_only and all(os.path.exists(p) for p in saved):
+            log(a.out, stage="drafter-skip", reason="its Hessians and held-out captures are saved")
+        elif a.drafter and not a.forward_only:
             run_drafter(ref, args, ckpt, stream, rows, n_cal, dev, a, ks_for, quant_devices, a.out, mw)
     mw.stop.set()
 

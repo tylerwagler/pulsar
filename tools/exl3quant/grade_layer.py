@@ -51,6 +51,9 @@ def main():
     ap.add_argument("--block", required=True, help="layers.L or mtp.S")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--swiglu-limit", type=float, default=None, help="default: config.json's")
+    ap.add_argument("--experts", type=int, default=None,
+                    help="DRY RUN ONLY: grade the first N experts (a partial block); moe_out then sums only their "
+                         "contributions")
     ap.add_argument("--out", default=None, help="JSON report (default: <run>/grade-<block>.json)")
     a = ap.parse_args()
     sys.path.insert(0, a.exllamav3)
@@ -62,6 +65,8 @@ def main():
     cfg = json.load(open(os.path.join(a.ref, "config.json")))["text_config"]
     limit = cfg["swiglu_limit"] if a.swiglu_limit is None else a.swiglu_limit
     n_exp = cfg["n_routed_experts"] if comp == "layers" else cfg["dspark_n_routed_experts"]
+    if a.experts is not None:
+        n_exp = min(n_exp, a.experts)
 
     hold = safe_open(os.path.join(a.run, "holdout", f"{name}.safetensors"), framework="pt")
     x = hold.get_tensor("x").to(dev)
@@ -84,7 +89,7 @@ def main():
             u, g = u.clamp(-limit, limit), g.clamp(max=limit)
         return gemm_input((F.silu(g) * u).bfloat16())
 
-    report = {"block": a.block, "holdout_tokens": x.size(0), "by_k": {}}
+    report = {"block": a.block, "holdout_tokens": x.size(0), "experts": n_exp, "by_k": {}}
     q_files = {int(os.path.basename(os.path.dirname(s))[len("exl3-k"):]): safe_open(s, framework="pt", device="cpu")
                for s in shards}
     y_src = torch.zeros(x.size(0), x.size(1), dtype=torch.float32, device=dev)
