@@ -175,3 +175,4 @@ tests/sse-golden/out.txt
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate
+/tests/tessera_kernel_gate

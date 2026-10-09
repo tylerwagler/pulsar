@@ -367,6 +367,43 @@ static bool qwen_read_ple_tables(const pulsar_model *m, const pulsar_qwen_shape 
 /* One layer's tensors under `lp` (the layer's name prefix, ending in '.'): the trunk's
  * "model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.".  `split` binds the
  * routed experts as separate gate / up stacks (the MTP layer) instead of the fused gate_up. */
+/* L255: one layer's routed experts in Tessera's value family -- every plane of gate, up and down
+ * (family_qwen.h PULSAR_QWEN_TESS_*), dims in ne order against the stack.  The words' per-expert stride is the
+ * encoder's (it follows the column rates), so only their expert count is checked; the launcher checks the rest
+ * of the geometry at every call. */
+static const char *const kTessProj[PULSAR_QWEN_TESS_PROJS] = {"gate", "up", "down"};
+static const char *const kTessPlane[PULSAR_QWEN_TESS_PLANES] = {"words", "table", "init",  "has_init",
+                                                                "wscale", "runs", "bdesc", "geom"};
+
+static void qwen_bind_tessera(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s, const char *lp,
+                              pulsar_qwen_layer_weights *L) {
+    const uint64_t nE = s->n_expert;
+    for (int p = 0; p < PULSAR_QWEN_TESS_PROJS; ++p) {
+        const uint64_t in = p == PULSAR_QWEN_TESS_DOWN ? s->n_ff_exp : s->n_embd;
+        const uint64_t out = p == PULSAR_QWEN_TESS_DOWN ? s->n_embd : s->n_ff_exp;
+        char name[256];
+        auto nm = [&](int plane) -> const char * {
+            snprintf(name, sizeof(name), "%smlp.experts.tessera.%s.%s", lp, kTessProj[p], kTessPlane[plane]);
+            return name;
+        };
+        pulsar_tensor **P = L->moe_tess[p];
+        P[PULSAR_QWEN_TESS_WORDS] = model_find_tensor(m, nm(PULSAR_QWEN_TESS_WORDS));
+        if (!P[PULSAR_QWEN_TESS_WORDS] || P[PULSAR_QWEN_TESS_WORDS]->ndim != 2 ||
+            P[PULSAR_QWEN_TESS_WORDS]->dim[1] != nE) {
+            fprintf(stderr, "pulsar: %s: %s is missing or not [%llu][words] -- refusing\n", PULSAR_QWEN_ARCH, name,
+                    (unsigned long long)nE);
+            *ok = false;
+        }
+        P[PULSAR_QWEN_TESS_TABLE]    = qbind(m, ok, nm(PULSAR_QWEN_TESS_TABLE), 2, 16384, nE);
+        P[PULSAR_QWEN_TESS_INIT]     = qbind(m, ok, nm(PULSAR_QWEN_TESS_INIT), 2, in, nE);
+        P[PULSAR_QWEN_TESS_HAS_INIT] = qbind(m, ok, nm(PULSAR_QWEN_TESS_HAS_INIT), 1, nE);
+        P[PULSAR_QWEN_TESS_WSCALE]   = qbind(m, ok, nm(PULSAR_QWEN_TESS_WSCALE), 2, out, nE);
+        P[PULSAR_QWEN_TESS_RUNS]     = qbind(m, ok, nm(PULSAR_QWEN_TESS_RUNS), 2, 8, nE);
+        P[PULSAR_QWEN_TESS_BDESC]    = qbind(m, ok, nm(PULSAR_QWEN_TESS_BDESC), 3, 12, in / 32, nE);
+        P[PULSAR_QWEN_TESS_GEOM]     = qbind(m, ok, nm(PULSAR_QWEN_TESS_GEOM), 1, 2);
+    }
+}
+
 static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s, pulsar_layer_kind kind,
                             const char *lp, bool ple, bool split, pulsar_qwen_layer_weights *L) {
     const uint64_t E = s->n_embd, hc = pulsar_qwen_hc_dim(s);
@@ -403,7 +440,16 @@ static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_s
         L->idx_k_norm  = qbind(m, ok, nm("self_attn.indexer.k_layernorm.weight"), 1, s->idx_head_dim);
     }
     L->moe_router     = qbind(m, ok, nm("mlp.gate.weight"), 2, E, s->n_expert);
-    if (split) {
+    if (model_find_tensor(m, nm("mlp.experts.tessera.gate.words"))) {
+        /* L255: this layer's experts are Tessera planes -- and nothing else may declare them */
+        if (split || model_find_tensor(m, nm("mlp.experts.gate_up_proj")) ||
+            model_find_tensor(m, nm("mlp.experts.down_proj"))) {
+            fprintf(stderr, "pulsar: %s: %s declares its routed experts as Tessera planes AND as EXL3 stacks (or is "
+                            "the split MTP layer, which has no Tessera arm) -- refusing\n", PULSAR_QWEN_ARCH, lp);
+            *ok = false;
+        }
+        qwen_bind_tessera(m, ok, s, lp, L);
+    } else if (split) {
         L->moe_gate   = qbind(m, ok, nm("mlp.experts.gate_proj"), 3, E, s->n_ff_exp, s->n_expert);
         L->moe_up     = qbind(m, ok, nm("mlp.experts.up_proj"), 3, E, s->n_ff_exp, s->n_expert);
         L->moe_down   = qbind(m, ok, nm("mlp.experts.down_proj"), 3, s->n_ff_exp, E, s->n_expert);

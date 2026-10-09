@@ -56,6 +56,7 @@ cuda-regression	kernel:gdn,exl3,qsa,s4,moe-route,expert-table	all	battery
 cuda-attn-gates	kernel:attn-f16,hc,vision	deepseek4	battery
 vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
 vision-qwen-tower-gate	kernel:vision-tower	qwen4_exp	battery	vs HF stage dumps, the reference's bf16 floor (L268)
+tessera-kernel-gate	kernel:tessera	qwen4_exp	battery	byte-identical to Tessera 37742e0f's own build, dense + MoE, E=32 and E=512 (L255)
 qwen-image-smoke-gate	server	qwen4_exp	manual	one image question end to end; a model load of its own
 #
 # gaps: a contract x family cell with no battery gate, and the row that closes it

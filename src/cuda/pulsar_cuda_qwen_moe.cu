@@ -25,6 +25,7 @@
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"
 #include "mmq/ds4_exl3_gemv.cuh"
+#include "mmq/pulsar_tessera.h"
 #endif
 
 #include <cuda_bf16.h>
@@ -230,6 +231,18 @@ static size_t routed_ws_layout(int T, void *base, size_t cap, routed_ws *o) {
     return b.failed ? 0 : b.used;
 }
 
+/* L255: the Tessera routed launch's bf16 [T][H] output -- the weighted, fixed-order sum over the top-k, exactly
+ * Tessera's token_sum -- is the block's routed term in f32, exactly; a non-finite value records nf_code (first
+ * writer wins), as the EXL3 sum does. */
+__global__ static void qwen_tessera_routed_kernel(float *__restrict__ out, const uint16_t *__restrict__ routed, size_t n,
+                                                  uint32_t *__restrict__ nf_flag, uint32_t nf_code) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = __uint_as_float((uint32_t)routed[i] << 16);
+    out[i] = v;
+    if (!isfinite(v)) atomicCAS(nf_flag, 0u, nf_code);
+}
+
 extern "C" const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T) {
     routed_ws m;
     return ws && routed_ws_layout(T, ws, ws_bytes, &m) != 0 ? (const uint16_t *)m.mid_x : nullptr;
@@ -344,14 +357,18 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T) {
 extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const float *wts,
                                              const uint16_t *x_bf16, int T, float *out, void *ws, size_t ws_bytes,
                                              uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
-    if (!w || !sel || !wts || !x_bf16 || !out || !nf_flag || T <= 0 || !w->down_table) {
+    if (!w || !sel || !wts || !x_bf16 || !out || !nf_flag || T <= 0) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a null input -- refusing\n");
         return -1;
     }
+    /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255) */
+    const bool tessera = w->tessera_gate != nullptr;
     const bool split = w->gate_table != nullptr;
-    if (split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr)) {
-        fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of a fused gate_up table or a gate + "
-                        "up pair -- refusing\n");
+    const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
+    if (tessera ? (!w->tessera_up || !w->tessera_down || exl3)
+                : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of an EXL3 fused gate_up table, an "
+                        "EXL3 gate + up pair, or a Tessera gate / up / down triple -- refusing\n");
         return -1;
     }
     if (w->n_local <= 0 || w->ex_lo < 0 || w->ex_lo + w->n_local > kE) {
@@ -380,7 +397,7 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         return -1;
     }
     static int announced[2] = {0, 0};
-    if (!announced[split]) {
+    if (!tessera && !announced[split]) {
         announced[split] = 1;
         fprintf(stderr, "pulsar: routed MoE (bf16 rows) = EXL3 %s K=%g, %s, down K=%g, top-%d of %d (experts [%d, +%d))\n",
                 split ? "gate + up pair GEMV" : "fused gate_up trellis GEMV", w->k2_gate_up / 2.0,
@@ -389,6 +406,36 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     const int mid = PULSAR_QWEN_EXPERT_MID;
     const int64_t pairs = (int64_t)T * kTopK;
     const int nE = w->n_local;   /* the experts this rank's tables hold */
+    if (tessera) {
+        /* L255: Tessera's fused window kernel on the router's own selection -- routing prep, gate/up + SwiGLU,
+         * weighted down, fixed-order token sum -- then the block's f32 routed term.  Its workspace and its bf16
+         * output live in the EXL3 arm's buffers (down_z, gu_z): exactly one routed arm runs.  No expert range:
+         * the stacks must hold every expert (expert parallelism is the EXL3 arm's alone today). */
+        static int announced_tessera = 0;
+        if (!announced_tessera) {
+            announced_tessera = 1;
+            fprintf(stderr, "pulsar: routed MoE (bf16 rows) = Tessera routed fused window kernel (value family, gate/up "
+                            "tile_words %d, down %d), top-%d of %d\n",
+                    w->tessera_gate->tile_words, w->tessera_down->tile_words, kTopK, kE);
+        }
+        const size_t tws = pulsar_tessera_moe_workspace_bytes(w->tessera_gate, w->tessera_down, T, kTopK);
+        const size_t have_ws = (size_t)T * kTopK * kH * 4, have_out = (size_t)T * kTopK * 2 * PULSAR_QWEN_EXPERT_MID * 4;
+        if (nE != kE || w->ex_lo != 0 || w->tessera_gate->E != kE || w->tessera_gate->K != kH ||
+            w->tessera_gate->N != PULSAR_QWEN_EXPERT_MID || tws > have_ws || (size_t)T * kH * 2 > have_out) {
+            fprintf(stderr, "pulsar: routed MoE (bf16 rows): the Tessera stacks are E %d, %d -> %d (built for %d, %d -> %d) "
+                            "over experts [%d, +%d), or their workspace %zu B exceeds the routed arm's %zu B -- refusing\n",
+                    w->tessera_gate->E, w->tessera_gate->K, w->tessera_gate->N, kE, kH, PULSAR_QWEN_EXPERT_MID, w->ex_lo,
+                    nE, tws, have_ws);
+            return -1;
+        }
+        uint16_t *routed = (uint16_t *)m.gu_z;
+        const int rc = pulsar_tessera_moe_launch(w->tessera_gate, w->tessera_up, w->tessera_down, x_bf16, T, kTopK, sel,
+                                                 wts, routed, m.down_z, have_ws, stream);
+        if (rc) { fprintf(stderr, "pulsar: routed MoE (bf16 rows): the Tessera routed launch refused (rc=%d) -- no fallback\n", rc); return -1; }
+        const size_t n = (size_t)T * kH;
+        qwen_tessera_routed_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, routed, n, nf_flag, nf_code);
+        return launch_ok("tessera routed term") ? 0 : -3;
+    }
     if (nE != kE) {
         qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(sel, (int)pairs, w->ex_lo, nE);
         if (!launch_ok("expert localize")) return -3;
