@@ -39,6 +39,7 @@ Output (under --out):
 
 import argparse
 import dataclasses
+import gc
 import json
 import os
 import resource
@@ -413,7 +414,9 @@ def observed_moe(moe, sink):
     moe.forward, moe.gate.forward = ffn, gate
 
     def undo():
-        moe.forward, moe.gate.forward = ffn_forward, gate_forward
+        # drop the instance attributes (restoring the class methods): a bound method stored on its own module
+        # is a reference cycle that keeps the whole block -- 7 GB of experts -- alive until a gc pass
+        del moe.forward, moe.gate.forward
     return undo
 
 
@@ -751,6 +754,7 @@ def requantize(ref, args, ckpt, a, quant_layers, ks_for, quant_devices, mw):
             log(a.out, stage="quant", block=key, K=K, quantize_seconds=round(tq, 1), write_seconds=round(tw, 1),
                 proxy_median=errs[len(errs) // 2], proxy_max=errs[-1], **done())
         del moe, hess
+        gc.collect()
         torch.cuda.empty_cache()
 
 
@@ -908,7 +912,8 @@ def main():
                 errs = sorted(proxy.values())
                 log(a.out, stage="quant", block=key, K=K, quantize_seconds=round(tq, 1), write_seconds=round(tw, 1),
                     proxy_median=errs[len(errs) // 2], proxy_max=errs[-1], **done())
-        del block, engram, hess, hold
+        del block, engram, hess, hold, sinks
+        gc.collect()
         torch.cuda.empty_cache()
         if a.save_every and ((layer + 1) % a.save_every == 0 or layer == stop - 1):
             done = mw.stage()
