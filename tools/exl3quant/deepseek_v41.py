@@ -91,7 +91,9 @@ class DeepseekV41Config(Config):
         # Engram
         self.engram_layers = self.read_cfg(list, t + "engram_layer_ids", [])
         self.engram_rows = self.read_cfg(list, t + "engram_num_embeddings", [])
-        self.engram_dim = self.read_cfg(int, t + "engram_n_heads", 0) * self.read_cfg(int, t + "engram_head_dim", 0)
+        # one table row is one hash head's embedding: each n-gram hash looks up engram_n_heads rows of head_dim
+        self.engram_heads = self.read_cfg(int, t + "engram_n_heads", 0)
+        self.engram_dim = self.read_cfg(int, t + "engram_head_dim", 0)
         assert len(self.engram_rows) == len(self.engram_layers)
 
         # DSpark drafter
