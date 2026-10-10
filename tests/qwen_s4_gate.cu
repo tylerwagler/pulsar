@@ -694,7 +694,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
               "(< 1e-5), worst row rel Frobenius %.2e, max |err| / max|ref| %.2e", T, split ? " split experts" : "",
               rows_f32, T, frob_worst, worst);
     } else {
-        /* the prefill GEMMs (routed: qwen_exl3_moe_prefill.cu, shared: qwen_exl3_dense_prefill.cu).
+        /* the prefill GEMMs (routed: exl3_moe_prefill.cu, shared: qwen_exl3_dense_prefill.cu).
          * The shared expert's cuBLAS GEMM is ~4e-6 per element (tests/exl3_dense_gate), not the GEMV's
          * 3e-7, so more of h's (and the fold mid's) bf16 roundings land across a tie.  ONE flipped
          * element moves its row by up to ~2^-9 of that element's share of the output, so the worst row
@@ -723,7 +723,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
 static void section_moe(void) {
     printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
     section_moe_at(5);    /* 50 assignments: the decode GEMV */
-    section_moe_at(37);   /* 370 assignments: the prefill GEMM (>= QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN) */
+    section_moe_at(37);   /* 370 assignments: the prefill GEMM (exl3_moe_prefill_takes: >= EXL3_MOE_PREFILL_MIN_ASSIGN) */
     section_moe_at(5, true);    /* the MTP layer's split experts (pair GEMV + pair fold), decode width */
     section_moe_at(37, true);   /* ... and a prompt width: the prefill GEMM per slice, k2 = 6 */
     printf("D'. MoE block at turboderp's rates: split gate / up (the pair arm), 4.05 = experts K4 + shared K6, "

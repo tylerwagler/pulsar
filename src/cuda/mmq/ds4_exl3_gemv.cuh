@@ -7,8 +7,9 @@
 // sorted the (token, slot) pairs by expert (ids_dst, expert_bounds) and staged
 // the producer's E4M3 activation as block_mx_act_mmq [K/128][n_assign].  The
 // tables are exl3_expert_table()'s interleaved [trellis, scales] pointer pairs.
-// Every row takes this arm -- decode and prefill alike -- so there is no
-// decode/prefill numerics boundary in the EXL3 lane.
+// Decode rows take these GEMVs; prompt chunks take the tensor-core prefill arm
+// (exl3_moe_prefill.cuh, exl3_moe_prefill_takes is the rule) -- the two agree
+// to rounding, and a row's bits never depend on its prompt chunk.
 
 #pragma once
 
@@ -92,20 +93,13 @@ int ds4_exl3_moe_gemv_single_bf16_launch(
         float *out, int M, int K, int64_t n_assign,
         int n_experts, cudaStream_t stream);
 
-/* L251: the Qwen routed arm for PROMPT CHUNKS (qwen_exl3_moe_prefill.cu) -- a grouped tensor-core GEMM
- * over the same expert-sorted schedule, writing the same unrotated z as the two bf16 GEMVs above.
- * rotate_input: the fused gate_up (x * suh, H128); false: the down (input rotated by the fold).
- * Rates k2 = 8, 10; M % 64, K % 128.  Agrees with the GEMV to rounding, not to the bit. */
-/* L251: the dense arm's prompt chunks through the same GEMM (one weight, identity rows): w is the
+/* The routed arm for PROMPT CHUNKS, every family, is exl3_moe_prefill.cuh: a grouped tensor-core GEMM
+ * over the same expert-sorted schedule, writing the same unrotated z as the GEMVs here. */
+/* L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the
  * dense layout (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh
  * applied).  ds4_exl3_dense_launch calls it for M > 16. */
 int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);
-constexpr int64_t QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN = 161;   /* more than 16 tokens x 10 slots */
-int qwen_exl3_moe_prefill_launch(
-        const void *table, int k2, bool rotate_input, const void *x_bf16,
-        const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
-        float *out, int M, int K, int64_t n_assign, int n_experts, cudaStream_t stream);
 
 int ds4_exl3_moe_gemv_fused_launch(
     const void    * table,

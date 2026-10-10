@@ -241,7 +241,8 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
  *          K3) and 4, 6 (turboderp's Qwen trunk, which ships gate and up apart with their own suh)
  *   GATE_UP_FUSED   one [in -> 2 mid] gate | up slice (our Qwen quant): 4, 5
  *   DENSE  the dense-Linear arm (mmq/ds4_exl3_dense.cuh): 2, 3, 4, 5, 6, 8
- *   MOE_PREFILL     the Qwen routed-expert prefill GEMM (mmq/qwen_exl3_moe_prefill.cu): 3, 4, 5, 6
+ *   MOE_PREFILL     the routed-expert prefill GEMM, every family (mmq/exl3_moe_prefill.cu): every
+ *          rate a routed GEMV arm reads -- 2, 2.5, 3, 4, 5, 6
  * Qwen's rates are turboderp's packs (L266): 4.05 bpw = K4 experts, K6 dense and
  * shared; 6.05 = K6 experts, K8 dense and shared; the MTP layer's experts K3.
  */
@@ -253,7 +254,7 @@ EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
     case EXL3_ARM_PAIR:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 12;
     case EXL3_ARM_GATE_UP_FUSED: return k2 == 8 || k2 == 10;
     case EXL3_ARM_DENSE:         return k2 == 4 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12 || k2 == 16;
-    case EXL3_ARM_MOE_PREFILL:   return k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
+    case EXL3_ARM_MOE_PREFILL:   return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
     default:                     return false;
     }
 }

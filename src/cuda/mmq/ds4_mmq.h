@@ -122,7 +122,7 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * the flat output row).  Separate entry points rather than a flag on the A8 ones -- upstream's own
  * shape, where exl3_gemv and exl3_gemv_int8 are two entry points.  `prompt` (L266): a prompt chunk
  * takes the grouped prefill GEMM at every assignment count, so a prompt cut anywhere is byte-identical
- * to one prefilled whole; false: the GEMM from QWEN_EXL3_MOE_PREFILL_MIN_ASSIGN up. */
+ * to one prefilled whole; false: the GEMM from EXL3_MOE_PREFILL_MIN_ASSIGN up (exl3_moe_prefill_takes). */
 int ds4_exl3_moe_fused_bf16(
     const void    * table,
     int             k2,
@@ -177,7 +177,8 @@ int ds4_exl3_moe_single_bf16(
  * half-bit units (4 / 5 / 6); everything else -- sorted pairs, the producer's
  * E4M3 activation, the per-pair f32 outputs -- is the same contract.  The
  * outputs are the UNROTATED z of each projection: the EXL3 fold and sum
- * (ds4_exl3_gemv.cuh) apply the format's output rotations. */
+ * (ds4_exl3_gemv.cuh) apply the format's output rotations.  `prompt` (L287): the bf16 entries' rule,
+ * exl3_moe_prefill_takes -- a prompt chunk takes the tensor-core prefill GEMM over the producer's slot. */
 int ds4_exl3_moe_pair(
     const void    * gate_table,
     const void    * up_table,
@@ -193,7 +194,8 @@ int ds4_exl3_moe_pair(
     cudaStream_t    stream,
     const void    * act_q,
     const void    * act_sf,
-    int             act_kbp);
+    int             act_kbp,
+    bool            prompt);
 
 int ds4_exl3_moe_single(
     const void    * table,
@@ -208,7 +210,8 @@ int ds4_exl3_moe_single(
     cudaStream_t    stream,
     const void    * act_q,
     const void    * act_sf,
-    int             act_kbp);
+    int             act_kbp,
+    bool            prompt);
 
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
